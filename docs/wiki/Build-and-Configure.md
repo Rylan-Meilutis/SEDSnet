@@ -39,6 +39,7 @@ Useful options:
 - `static_schema_path=<path>` sets `SEDSPRINTF_RS_STATIC_SCHEMA_PATH` for runtime registry seeding.
 - `static_ipc_schema_path=<path>` sets `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
 - `max_stack_payload=<n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
+- `crypto_shim` enables the feature-gated crypto shim APIs.
 - `env:KEY=VALUE` passes any compile-time env var used by
   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/config.rs)).
 - `target=<triple>` sets the Rust target triple for embedded builds.
@@ -53,6 +54,7 @@ Cargo.toml ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/C
 - `python`: enables pyo3 bindings.
 - `compression` (default): enables payload compression (implemented with `zstd-safe`).
 - `timesync`: enables time sync helpers and built-in time sync packet types.
+- `crypto-shim`: enables Rust crypto shim helpers plus optional C callback registration APIs.
 
 Examples:
 
@@ -214,6 +216,9 @@ Common CMake variables:
 - `SEDSPRINTF_RS_TARGET` (Rust target triple)
 - `SEDSPRINTF_RS_DEVICE_IDENTIFIER`
 - `SEDSPRINTF_RS_MAX_STACK_PAYLOAD`
+- `SEDSPRINTF_RS_ENABLE_C_WRAPPER` (ON/OFF, builds `sedsprintf_rs::c_wrapper`)
+- `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` (ON/OFF, exposes `sedsprintf_rs::cpp_wrapper`)
+- `SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM` (ON/OFF, enables `crypto-shim` and defines `SEDS_ENABLE_CRYPTO_SHIM`)
 - `SEDSPRINTF_RS_ENV_<KEY>` for any config env var
 
 After `add_subdirectory`, link the target:

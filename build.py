@@ -33,6 +33,7 @@ Options (can be combined where it makes sense):
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
+  crypto_shim             Enable crypto shim APIs (Rust trait helpers + optional C callbacks).
   maturin-build           Run `maturin build` with the .pyi .gitignore hack.
   maturin-develop         Run `maturin develop` with the .pyi .gitignore hack.
   maturin-install         Build wheel and install it with `uv pip install`.
@@ -705,12 +706,12 @@ def run_clippy_checks(
         repo_root: Path,
         build_mode: list[str],
         release_build: bool,
-        build_timesync: bool,
+        feature_parts: list[str],
         target: str,
         start_step: int | None = None,
         total_steps_override: int | None = None,
 ) -> None:
-    feature_suffix = ",timesync" if build_timesync else ""
+    feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
     embedded_target = target or "thumbv7em-none-eabihf"
     can_check_embedded = has_embedded_c_toolchain(embedded_target, env)
     if not can_check_embedded:
@@ -727,7 +728,7 @@ def run_clippy_checks(
     embedded_step = python_step + 1
 
     run_cmd(
-        cargo_clippy_cmd(build_mode=build_mode, build_args=(["--features", "timesync"] if build_timesync else [])),
+        cargo_clippy_cmd(build_mode=build_mode, build_args=(["--features", ",".join(feature_parts)] if feature_parts else [])),
         env=env,
         repo_root=repo_root,
         title=f"{default_step}/{total_steps} cargo clippy (default)",
@@ -795,6 +796,7 @@ def main(argv: list[str]) -> None:
     build_embedded = False
     build_python = False
     build_timesync = False
+    build_crypto_shim = False
     build_wheel = False
     develop_wheel = False
     release_build = False
@@ -831,6 +833,10 @@ def main(argv: list[str]) -> None:
         elif arg == "timesync":
             print("Building with time sync helpers.")
             build_timesync = True
+
+        elif arg == "crypto_shim":
+            print("Building with crypto shim APIs.")
+            build_crypto_shim = True
 
         elif arg == "maturin-build":
             print("Building Python wheel.")
@@ -923,12 +929,17 @@ def main(argv: list[str]) -> None:
     # ---- CHECK MODE: lint default + python + embedded variants ----
     if checks:
         _banner("CHECK MODE")
+        feature_parts = []
+        if build_timesync:
+            feature_parts.append("timesync")
+        if build_crypto_shim:
+            feature_parts.append("crypto-shim")
         run_clippy_checks(
             env=env,
             repo_root=repo_root,
             build_mode=build_mode,
             release_build=release_build,
-            build_timesync=build_timesync,
+            feature_parts=feature_parts,
             target=target,
         )
         _success("All clippy checks passed.")
@@ -937,7 +948,10 @@ def main(argv: list[str]) -> None:
     # ---- TEST MODE: also validate embedded + python builds ----
     if tests:
         _banner("TEST MODE")
-        feature_suffix = ",timesync" if build_timesync else ""
+        feature_parts = ["timesync"]
+        if build_crypto_shim:
+            feature_parts.append("crypto-shim")
+        feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
         embedded_target = target or "thumbv7em-none-eabihf"
         can_check_embedded = has_embedded_c_toolchain(embedded_target, env)
         if not can_check_embedded:
@@ -954,7 +968,7 @@ def main(argv: list[str]) -> None:
             repo_root=repo_root,
             build_mode=build_mode,
             release_build=release_build,
-            build_timesync=build_timesync,
+            feature_parts=feature_parts,
             target=target,
             start_step=1,
             total_steps_override=total_steps,
@@ -962,7 +976,7 @@ def main(argv: list[str]) -> None:
         _success("Clippy checks passed.")
 
         run_cmd(
-            ["cargo", "test", "--features", "timesync"],
+            ["cargo", "test", "--features", ",".join(feature_parts)],
             env=env,
             repo_root=repo_root,
             title=f"4/{total_steps} cargo test",
@@ -1048,7 +1062,12 @@ def main(argv: list[str]) -> None:
 
     build_args: list[str] = []
     embedded_profile = False
-    feature_suffix = ",timesync" if build_timesync else ""
+    feature_parts = []
+    if build_timesync:
+        feature_parts.append("timesync")
+    if build_crypto_shim:
+        feature_parts.append("crypto-shim")
+    feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
     build_shared = not build_embedded and not build_python
 
     if build_embedded:
@@ -1141,8 +1160,8 @@ def main(argv: list[str]) -> None:
     # default: plain cargo build
     if target:
         build_args = ["--target", target]
-    if build_timesync:
-        build_args.extend(["--features", "timesync"])
+    if feature_parts:
+        build_args.extend(["--features", ",".join(feature_parts)])
 
     run_cmd(
         cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=build_shared),

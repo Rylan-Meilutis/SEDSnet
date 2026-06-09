@@ -1,0 +1,159 @@
+#ifndef SEDSPRINTF_CPP_WRAPPER_HPP
+#define SEDSPRINTF_CPP_WRAPPER_HPP
+
+#include "sedsprintf.h"
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+namespace seds {
+
+inline SedsResult type_ref_by_name(SedsName name, SedsTypeRef & out)
+{
+    SedsDataTypeInfo info{};
+    SedsResult result = seds_dtype_get_info_by_name(name.ptr, name.len, nullptr, 0U, &info);
+    if (result != SEDS_OK || !info.exists) {
+        return result != SEDS_OK ? result : SEDS_INVALID_TYPE;
+    }
+    out.id = static_cast<SedsDataType>(info.id);
+    return SEDS_OK;
+}
+
+inline SedsResult endpoint_ref_by_name(SedsName name, SedsEndpointRef & out)
+{
+    SedsEndpointInfo info{};
+    SedsResult result = seds_endpoint_get_info_by_name(name.ptr, name.len, &info);
+    if (result != SEDS_OK || !info.exists) {
+        return result != SEDS_OK ? result : SEDS_BAD_ARG;
+    }
+    out.id = static_cast<SedsDataEndpoint>(info.id);
+    return SEDS_OK;
+}
+
+inline bool exists(SedsTypeRef ty)
+{
+    return seds_dtype_exists(static_cast<uint32_t>(ty.id));
+}
+
+inline bool exists(SedsEndpointRef endpoint)
+{
+    return seds_endpoint_exists(static_cast<uint32_t>(endpoint.id));
+}
+
+inline int32_t expected_size(SedsTypeRef ty)
+{
+    return seds_dtype_expected_size(ty.id);
+}
+
+namespace detail {
+template<typename T>
+struct elem_traits;
+
+template<> struct elem_traits<uint8_t>  { static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED; static constexpr size_t size = 1; };
+template<> struct elem_traits<uint16_t> { static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED; static constexpr size_t size = 2; };
+template<> struct elem_traits<uint32_t> { static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED; static constexpr size_t size = 4; };
+template<> struct elem_traits<uint64_t> { static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED; static constexpr size_t size = 8; };
+template<> struct elem_traits<int8_t>   { static constexpr SedsElemKind kind = SEDS_EK_SIGNED;   static constexpr size_t size = 1; };
+template<> struct elem_traits<int16_t>  { static constexpr SedsElemKind kind = SEDS_EK_SIGNED;   static constexpr size_t size = 2; };
+template<> struct elem_traits<int32_t>  { static constexpr SedsElemKind kind = SEDS_EK_SIGNED;   static constexpr size_t size = 4; };
+template<> struct elem_traits<int64_t>  { static constexpr SedsElemKind kind = SEDS_EK_SIGNED;   static constexpr size_t size = 8; };
+template<> struct elem_traits<float>    { static constexpr SedsElemKind kind = SEDS_EK_FLOAT;    static constexpr size_t size = 4; };
+template<> struct elem_traits<double>   { static constexpr SedsElemKind kind = SEDS_EK_FLOAT;    static constexpr size_t size = 8; };
+} // namespace detail
+
+template<typename T>
+inline SedsResult router_log(SedsRouter * r, SedsDataType ty, const T * data, size_t count)
+{
+    return seds_router_log_typed_ex(r, ty, data, count,
+                                    detail::elem_traits<T>::size,
+                                    detail::elem_traits<T>::kind,
+                                    nullptr, 0);
+}
+
+template<typename T>
+inline SedsResult router_log(SedsRouter * r, SedsTypeRef ty, const T * data, size_t count)
+{
+    return router_log(r, ty.id, data, count);
+}
+
+template<typename T>
+inline SedsResult router_log_queue(SedsRouter * r, SedsDataType ty, const T * data, size_t count)
+{
+    return seds_router_log_typed_ex(r, ty, data, count,
+                                    detail::elem_traits<T>::size,
+                                    detail::elem_traits<T>::kind,
+                                    nullptr, 1);
+}
+
+template<typename T>
+inline SedsResult router_log_queue(SedsRouter * r, SedsTypeRef ty, const T * data, size_t count)
+{
+    return router_log_queue(r, ty.id, data, count);
+}
+
+template<typename T>
+inline SedsResult router_log_ts(SedsRouter * r, SedsDataType ty, uint64_t ts_ms, const T * data, size_t count)
+{
+    return seds_router_log_typed_ex(r, ty, data, count,
+                                    detail::elem_traits<T>::size,
+                                    detail::elem_traits<T>::kind,
+                                    &ts_ms, 0);
+}
+
+template<typename T>
+inline SedsResult router_log_ts(SedsRouter * r, SedsTypeRef ty, uint64_t ts_ms, const T * data, size_t count)
+{
+    return router_log_ts(r, ty.id, ts_ms, data, count);
+}
+
+inline SedsResult router_log_cstr(SedsRouter * r, SedsDataType ty, const char * s)
+{
+    return seds_router_log_string_ex(r, ty, s, s ? std::strlen(s) : 0U, nullptr, 0);
+}
+
+inline SedsResult router_log_cstr(SedsRouter * r, SedsTypeRef ty, const char * s)
+{
+    return router_log_cstr(r, ty.id, s);
+}
+
+inline SedsResult enable_managed_variable(SedsRouter * r, SedsTypeRef ty)
+{
+    return seds_router_enable_managed_variable(r, ty.id);
+}
+
+inline void disable_managed_variable(SedsRouter * r, SedsTypeRef ty)
+{
+    seds_router_disable_managed_variable(r, ty.id);
+}
+
+inline SedsResult request_managed_variable(SedsRouter * r, SedsTypeRef ty)
+{
+    return seds_router_request_managed_variable(r, ty.id);
+}
+
+inline SedsResult seed_managed_variable_serialized(SedsRouter * r, const uint8_t * bytes, size_t len)
+{
+    return seds_router_seed_managed_variable_serialized(r, bytes, len);
+}
+
+inline int32_t cached_managed_variable_serialized_len(SedsRouter * r, SedsTypeRef ty)
+{
+    return seds_router_cached_managed_variable_serialized_len(r, ty.id);
+}
+
+inline int32_t cached_managed_variable_serialized(SedsRouter * r, SedsTypeRef ty, uint8_t * out, size_t out_len)
+{
+    return seds_router_cached_managed_variable_serialized(r, ty.id, out, out_len);
+}
+
+template<typename T>
+inline SedsResult pkt_get(const SedsPacketView * pkt, T * out, size_t count)
+{
+    return seds_pkt_get_typed(pkt, out, count,
+                              detail::elem_traits<T>::size,
+                              detail::elem_traits<T>::kind);
+}
+
+} // namespace seds
+
+#endif

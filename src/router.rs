@@ -51,7 +51,7 @@ use alloc::string::{String, ToString};
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     format,
     sync::Arc,
     vec,
@@ -63,11 +63,60 @@ use core::fmt::{Debug, Formatter};
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
+use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
 /// Logical side index (CAN, UART, RADIO, etc.)
 pub type RouterSideId = usize;
+
+const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
+const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
+const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
+const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
+const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
+const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
+const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
+const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
+const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + serialize::CRC32_BYTES;
+const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
+const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SideHeaderTemplate {
+    hash: u64,
+    base_flags: u8,
+    prefix: Arc<[u8]>,
+    between: Arc<[u8]>,
+    reliable_flags: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SideChunkAssembly {
+    total: u16,
+    received: BTreeMap<u16, Arc<[u8]>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SideTransportState {
+    tx_template_ids: BTreeMap<u64, u32>,
+    tx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    rx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
+    rx_chunks: BTreeMap<u32, SideChunkAssembly>,
+    next_chunk_id: u32,
+    next_template_id: u32,
+}
+
+type SideTemplateExtract<'a> = (
+    SideHeaderTemplate,
+    u8,
+    u64,
+    u64,
+    u16,
+    Option<(u32, u32)>,
+    &'a [u8],
+);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouterItem {
@@ -465,6 +514,19 @@ pub struct RouterSideOptions {
     pub reliable_enabled: bool,
     /// Marks the side as eligible for link-local-only endpoints and discovery routes.
     pub link_local_enabled: bool,
+    /// Enables a side-local header-template dictionary for serialized transport.
+    ///
+    /// The first frame for a stable header shape is sent in full. Later frames
+    /// on the same side can replace the repeated static header bytes with a
+    /// compact template hash plus only the fields that still vary packet to
+    /// packet.
+    pub header_template_enabled: bool,
+    /// Maximum number of bytes to emit per serialized TX callback.
+    ///
+    /// When non-zero and a wrapped serialized frame would exceed this size, the
+    /// router splits it into ordered chunks and reassembles those chunks on RX
+    /// before normal packet processing.
+    pub max_frame_bytes: usize,
     /// Allows packets received from this side to enter router processing.
     pub ingress_enabled: bool,
     /// Allows the router to transmit packets toward this side.
@@ -476,9 +538,24 @@ impl Default for RouterSideOptions {
         Self {
             reliable_enabled: false,
             link_local_enabled: false,
+            header_template_enabled: false,
+            max_frame_bytes: 0,
             ingress_enabled: true,
             egress_enabled: true,
         }
+    }
+}
+
+impl RouterSideOptions {
+    /// Convenience preset for compact serialized-side transport.
+    ///
+    /// This enables header-template reuse and, when `max_frame_bytes > 0`,
+    /// router-managed chunking/reassembly for fixed-size transports.
+    #[inline]
+    pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
+        self.header_template_enabled = true;
+        self.max_frame_bytes = max_frame_bytes;
+        self
     }
 }
 
@@ -871,6 +948,9 @@ struct RouterInner {
     route_selection_cursors: BTreeMap<Option<RouterSideId>, u64>,
     adaptive_route_stats: BTreeMap<RouterSideId, AdaptiveRouteStats>,
     side_runtime_stats: BTreeMap<RouterSideId, SideRuntimeStatsInner>,
+    side_transport: BTreeMap<RouterSideId, SideTransportState>,
+    managed_variable_types: BTreeSet<u32>,
+    managed_variable_latest: BTreeMap<u32, Packet>,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     recent_rx: BoundedDeque<u64>,
@@ -1335,6 +1415,13 @@ enum RemoteSidePlan {
     Target(Vec<RouterSideId>),
 }
 
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiscoveryCandidateMatch {
+    side: RouterSideId,
+    overlap: usize,
+}
+
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let sender = self.sender();
@@ -1496,6 +1583,27 @@ impl Router {
         entry.note_local_handler_failure(ty, retries);
     }
 
+    fn remember_managed_variable_packet(&self, pkt: &Packet) {
+        let mut st = self.state.lock();
+        if st
+            .managed_variable_types
+            .contains(&pkt.data_type().as_u32())
+        {
+            st.managed_variable_latest
+                .insert(pkt.data_type().as_u32(), pkt.clone());
+        }
+    }
+
+    fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
+        let st = self.state.lock();
+        st.managed_variable_latest.get(&ty.as_u32()).cloned()
+    }
+
+    fn is_managed_variable_type(&self, ty: DataType) -> bool {
+        let st = self.state.lock();
+        st.managed_variable_types.contains(&ty.as_u32())
+    }
+
     #[inline]
     fn ensure_side_ingress_enabled(&self, side: RouterSideId) -> TelemetryResult<()> {
         let st = self.state.lock();
@@ -1560,6 +1668,92 @@ impl Router {
                 .unwrap_or(false);
         }
         true
+    }
+
+    fn has_typed_route_overrides_locked(
+        st: &RouterInner,
+        src: Option<RouterSideId>,
+        ty: DataType,
+    ) -> bool {
+        st.typed_route_overrides
+            .keys()
+            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty.as_u32())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn endpoint_overlap_count<I>(reachable: I, eps: &[DataEndpoint]) -> usize
+    where
+        I: IntoIterator<Item = DataEndpoint>,
+    {
+        let mut overlap = 0usize;
+        for ep in reachable {
+            if eps.contains(&ep) {
+                overlap = overlap.saturating_add(1);
+            }
+        }
+        overlap
+    }
+
+    #[inline]
+    fn preferred_scoring_endpoints(
+        &self,
+        eps: &[DataEndpoint],
+        prefer_nonlocal: bool,
+    ) -> Vec<DataEndpoint> {
+        if !prefer_nonlocal {
+            return eps.to_vec();
+        }
+        let nonlocal: Vec<DataEndpoint> = eps
+            .iter()
+            .copied()
+            .filter(|&ep| !self.cfg.is_local_endpoint(ep))
+            .collect();
+        if nonlocal.is_empty() {
+            eps.to_vec()
+        } else {
+            nonlocal
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn pop_next_queued_discovery_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
+        {
+            let mut isr_rx = self.isr_rx_queue.try_lock()?;
+            let idx = isr_rx.iter().position(Self::queued_rx_item_is_discovery);
+            if let Some(idx) = idx {
+                return Ok(isr_rx.remove_pos(idx));
+            }
+        }
+
+        let mut st = self.state.lock();
+        let idx = st
+            .received_queue
+            .iter()
+            .position(Self::queued_rx_item_is_discovery);
+        if let Some(idx) = idx {
+            return Ok(st.received_queue.remove_pos(idx));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn queued_rx_item_is_discovery(item: &RouterRxItem) -> bool {
+        match &item.data {
+            RouterItem::Packet(pkt) => discovery::is_discovery_type(pkt.data_type()),
+            RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())
+                .map(|env| discovery::is_discovery_type(env.ty))
+                .unwrap_or(false),
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn drain_queued_discovery_rx_before_tx(&self) -> TelemetryResult<bool> {
+        let mut did_any = false;
+        while let Some(item) = self.pop_next_queued_discovery_rx_item()? {
+            self.process_rx_queue_item(item)?;
+            did_any = true;
+        }
+        Ok(did_any)
     }
 
     fn eligible_side_ids_locked(
@@ -1734,6 +1928,12 @@ impl Router {
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
             RouterItem::Serialized(bytes) => {
+                if serialize::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(None);
+                }
                 let pkt = serialize::deserialize_packet(bytes.as_ref())?;
                 if pkt.data_type() != DataType::ReliableAck
                     || !Self::is_end_to_end_ack_sender(pkt.sender())
@@ -1841,6 +2041,11 @@ impl Router {
         let (eps, ty) = self.item_route_info(data)?;
         let now_ms = self.clock.now_ms();
         let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
+        let prefer_best_overlap =
+            is_reliable_type(ty) && Self::reliable_control_target_packet_id(data)?.is_none();
+        let scoring_eps = self.preferred_scoring_endpoints(&eps, prefer_best_overlap);
+        let mut candidates: Vec<(u64, RouterSideId, usize)> = Vec::new();
+        let mut best_overlap = 0usize;
         let mut out = BTreeMap::new();
         for (&side, route) in st.discovery_routes.iter() {
             if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
@@ -1863,20 +2068,132 @@ impl Router {
                     if !Self::is_end_to_end_destination_sender(&board.sender_id) {
                         continue;
                     }
-                    if eps
-                        .iter()
-                        .copied()
-                        .any(|ep| board.reachable_endpoints.contains(&ep))
-                    {
-                        out.insert(Self::sender_hash(&board.sender_id), side);
-                        if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
-                            return Ok(out);
+                    let overlap = Self::endpoint_overlap_count(
+                        board.reachable_endpoints.iter().copied(),
+                        &scoring_eps,
+                    );
+                    if overlap > 0 {
+                        if prefer_best_overlap {
+                            best_overlap = best_overlap.max(overlap);
+                            candidates.push((Self::sender_hash(&board.sender_id), side, overlap));
+                        } else {
+                            out.insert(Self::sender_hash(&board.sender_id), side);
+                            if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                                return Ok(out);
+                            }
                         }
                     }
                 }
             }
         }
+
+        if prefer_best_overlap {
+            for (sender_hash, side, overlap) in candidates {
+                if overlap == best_overlap {
+                    out.insert(sender_hash, side);
+                    if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
         Ok(out)
+    }
+
+    #[cfg(feature = "discovery")]
+    #[allow(clippy::too_many_arguments)]
+    fn discovered_route_candidates_locked(
+        &self,
+        st: &RouterInner,
+        exclude: Option<RouterSideId>,
+        ty: DataType,
+        eps: &[DataEndpoint],
+        target_senders: &[u64],
+        prefer_nonlocal: bool,
+        preferred_timesync_source: Option<&str>,
+    ) -> Vec<DiscoveryCandidateMatch> {
+        let restrict_link_local = Self::endpoints_are_link_local_only(eps);
+        let now_ms = self.clock.now_ms();
+        let scoring_eps = self.preferred_scoring_endpoints(eps, prefer_nonlocal);
+        let mut out = Vec::new();
+
+        for (&side, route) in st.discovery_routes.iter() {
+            if exclude == Some(side)
+                || now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
+            {
+                continue;
+            }
+            if restrict_link_local
+                && st
+                    .sides
+                    .get(side)
+                    .and_then(|s| s.as_ref())
+                    .map(|s| !s.opts.link_local_enabled)
+                    .unwrap_or(true)
+            {
+                continue;
+            }
+            if !self.route_allowed_locked(st, exclude, Some(ty), side) {
+                continue;
+            }
+            if !target_senders.is_empty()
+                && !Self::side_matches_target_senders_locked(st, side, target_senders, now_ms)
+            {
+                continue;
+            }
+            if preferred_timesync_source
+                .is_some_and(|source| route.reachable_timesync_sources.iter().any(|s| s == source))
+            {
+                out.push(DiscoveryCandidateMatch {
+                    side,
+                    overlap: usize::MAX,
+                });
+                continue;
+            }
+            let overlap =
+                Self::endpoint_overlap_count(route.reachable.iter().copied(), &scoring_eps);
+            if overlap > 0 {
+                out.push(DiscoveryCandidateMatch { side, overlap });
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "discovery")]
+    fn select_discovered_candidate_sides_locked(
+        &self,
+        st: &mut RouterInner,
+        exclude: Option<RouterSideId>,
+        ty: DataType,
+        target_senders: &[u64],
+        prefer_best_overlap: bool,
+        matches: Vec<DiscoveryCandidateMatch>,
+    ) -> Vec<RouterSideId> {
+        let discovered_origin = if Self::has_typed_route_overrides_locked(st, exclude, ty)
+            || !target_senders.is_empty()
+        {
+            RouteSelectionOrigin::Flood
+        } else {
+            RouteSelectionOrigin::Discovered
+        };
+
+        let mut matches = matches;
+        if matches.iter().any(|m| m.overlap == usize::MAX) {
+            matches.retain(|m| m.overlap == usize::MAX);
+        }
+
+        let selected: Vec<RouterSideId> = if prefer_best_overlap {
+            let best_overlap = matches.iter().map(|m| m.overlap).max().unwrap_or(0);
+            matches
+                .into_iter()
+                .filter(|m| m.overlap == best_overlap)
+                .map(|m| m.side)
+                .collect()
+        } else {
+            matches.into_iter().map(|m| m.side).collect()
+        };
+
+        self.apply_route_selection_locked(st, exclude, selected, discovered_origin)
     }
 
     fn register_end_to_end_reliable_tx(&self, data: &RouterItem) -> TelemetryResult<()> {
@@ -2400,11 +2717,8 @@ impl Router {
                 return Ok(RemoteSidePlan::Target(Vec::new()));
             }
             let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
-            let discovered_origin = if is_reliable_type(ty) {
-                RouteSelectionOrigin::Flood
-            } else {
-                RouteSelectionOrigin::Discovered
-            };
+            let prefer_best_overlap =
+                is_reliable_type(ty) && target_senders.is_empty() && preferred_packet_id.is_none();
             if st.discovery_routes.is_empty() {
                 let fallback =
                     self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
@@ -2414,63 +2728,29 @@ impl Router {
                     Vec::new()
                 }));
             }
-            let now_ms = self.clock.now_ms();
-            let mut had_exact = false;
-            let mut exact_targets = Vec::new();
-            let mut had_known = false;
-            let mut generic_targets = Vec::new();
+            let matches = self.discovered_route_candidates_locked(
+                &st,
+                exclude,
+                ty,
+                &eps,
+                &target_senders,
+                prefer_best_overlap,
+                preferred_timesync_source.as_deref(),
+            );
 
-            for (&side, route) in st.discovery_routes.iter() {
-                if exclude == Some(side)
-                    || now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
-                {
-                    continue;
-                }
-                if restrict_link_local
-                    && st
-                        .sides
-                        .get(side)
-                        .and_then(|s| s.as_ref())
-                        .map(|s| !s.opts.link_local_enabled)
-                        .unwrap_or(true)
-                {
-                    continue;
-                }
-                if !self.route_allowed_locked(&st, exclude, Some(ty), side) {
-                    continue;
-                }
-                if !target_senders.is_empty()
-                    && !Self::side_matches_target_senders_locked(&st, side, &target_senders, now_ms)
-                {
-                    continue;
-                }
-                if preferred_timesync_source.as_deref().is_some_and(|source| {
-                    route.reachable_timesync_sources.iter().any(|s| s == source)
-                }) {
-                    had_exact = true;
-                    exact_targets.push(side);
-                    continue;
-                }
-                if eps.iter().copied().any(|ep| route.reachable.contains(&ep)) {
-                    had_known = true;
-                    generic_targets.push(side);
-                }
-            }
-
-            if had_exact {
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    exclude,
-                    exact_targets,
-                    discovered_origin,
-                )))
-            } else if had_known {
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    exclude,
-                    generic_targets,
-                    discovered_origin,
-                )))
+            if !matches.is_empty() {
+                Ok(RemoteSidePlan::Target(
+                    self.select_discovered_candidate_sides_locked(
+                        &mut st,
+                        exclude,
+                        ty,
+                        &target_senders,
+                        prefer_best_overlap,
+                        matches,
+                    ),
+                ))
+            } else if prefer_best_overlap {
+                Ok(RemoteSidePlan::Target(Vec::new()))
             } else {
                 let fallback =
                     self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
@@ -2978,6 +3258,21 @@ impl Router {
             }
             return Ok(true);
         }
+        if pkt.data_type() == DataType::ManagedVariableRequest {
+            let ty = discovery::decode_managed_variable_request(pkt)?;
+            if let Some(value) = self.managed_variable_latest(ty) {
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side,
+                        data: RouterItem::Packet(value),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+            return Ok(true);
+        }
         if pkt.data_type() == DataType::DiscoverySchema {
             let snapshot = discovery::decode_discovery_schema(pkt)?;
             let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
@@ -3267,8 +3562,10 @@ impl Router {
             if !side_ref.opts.egress_enabled {
                 return Ok(());
             }
-            side_ref.tx_handler.clone()
+            (side_ref.tx_handler.clone(), side_ref.opts)
         };
+
+        let (handler, opts) = handler;
 
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
@@ -3279,7 +3576,28 @@ impl Router {
             .unwrap_or(DataType::ReliableAck);
         let result = match handler {
             RouterTxHandlerFn::Serialized(f) => {
-                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(bytes.as_ref()))
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut attempts_total = 0usize;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                        Ok((_, attempts)) => {
+                            attempts_total = attempts_total.saturating_add(attempts);
+                            sent_bytes = sent_bytes.saturating_add(frame.len());
+                        }
+                        Err((err, attempts)) => {
+                            self.note_side_tx_failure(
+                                side,
+                                ty,
+                                attempts_total.saturating_add(attempts),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                return Ok(());
             }
             RouterTxHandlerFn::Packet(f) => {
                 let pkt = serialize::deserialize_packet(bytes.as_ref())?;
@@ -3372,24 +3690,28 @@ impl Router {
                         return Err(TelemetryError::Io("side tx busy"));
                     };
                     let started_ms = self.clock.now_ms();
-                    let result =
-                        self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(bytes.as_ref()));
-                    match result {
-                        Ok((_, attempts)) => {
-                            self.record_side_tx_sample(
-                                side,
-                                bytes.len(),
-                                started_ms,
-                                self.clock.now_ms(),
-                            );
-                            self.note_side_tx_success(side, ty, bytes.len(), relayed, attempts);
-                            return Ok(());
-                        }
-                        Err((err, attempts)) => {
-                            self.note_side_tx_failure(side, ty, attempts);
-                            return Err(err);
+                    let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                    let mut attempts_total = 0usize;
+                    let mut sent_bytes = 0usize;
+                    for frame in frames {
+                        match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                            Ok((_, attempts)) => {
+                                attempts_total = attempts_total.saturating_add(attempts);
+                                sent_bytes = sent_bytes.saturating_add(frame.len());
+                            }
+                            Err((err, attempts)) => {
+                                self.note_side_tx_failure(
+                                    side,
+                                    ty,
+                                    attempts_total.saturating_add(attempts),
+                                );
+                                return Err(err);
+                            }
                         }
                     }
+                    self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                    self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                    return Ok(());
                 }
                 Arc::from(v)
             }
@@ -3399,16 +3721,23 @@ impl Router {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(bytes.as_ref())) {
-            Ok((_, attempts)) => {
-                self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
-                self.note_side_tx_success(side, ty, bytes.len(), relayed, attempts);
-            }
-            Err((err, attempts)) => {
-                self.note_side_tx_failure(side, ty, attempts);
-                return Err(err);
+        let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+        let mut attempts_total = 0usize;
+        let mut sent_bytes = 0usize;
+        for frame in frames {
+            match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                Ok((_, attempts)) => {
+                    attempts_total = attempts_total.saturating_add(attempts);
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                Err((err, attempts)) => {
+                    self.note_side_tx_failure(side, ty, attempts_total.saturating_add(attempts));
+                    return Err(err);
+                }
             }
         }
+        self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+        self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
 
         {
             let mut st = self.state.lock();
@@ -3429,6 +3758,436 @@ impl Router {
         Ok(())
     }
 
+    #[inline]
+    fn crc32_bytes(data: &[u8]) -> u32 {
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        for _ in 0..10 {
+            let byte = *buf
+                .get(*off)
+                .ok_or(TelemetryError::Deserialize("short read"))?;
+            *off += 1;
+            result |= u64::from(byte & 0x7F) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+        Err(TelemetryError::Deserialize("uleb128 too long"))
+    }
+
+    fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
+        let mut out = Vec::with_capacity(
+            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + serialize::CRC32_BYTES,
+        );
+        out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
+        out.push(kind);
+        out.extend_from_slice(body);
+        let crc = Self::crc32_bytes(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        Arc::from(out)
+    }
+
+    fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
+        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + serialize::CRC32_BYTES {
+            return Ok(None);
+        }
+        if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
+            return Ok(None);
+        }
+        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let expected = u32::from_le_bytes([
+            bytes[data_len],
+            bytes[data_len + 1],
+            bytes[data_len + 2],
+            bytes[data_len + 3],
+        ]);
+        let data = &bytes[..data_len];
+        if Self::crc32_bytes(data) != expected {
+            return Err(TelemetryError::Deserialize("side transport crc32 mismatch"));
+        }
+        let kind = data[SIDE_TRANSPORT_MAGIC.len()];
+        Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
+    }
+
+    fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
+        if bytes.len() < serialize::CRC32_BYTES + 4 {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let data = &bytes[..data_len];
+        let mut off = 0usize;
+        let flags = *data
+            .get(off)
+            .ok_or(TelemetryError::Deserialize("short prelude"))?;
+        off += 1;
+        off += 1; // NEP
+        let ty_end_start = off;
+        let _ty = Self::read_uleb128_local(data, &mut off)?;
+        let data_size_off = off;
+        let data_size = Self::read_uleb128_local(data, &mut off)?;
+        let _timestamp_off = off;
+        let timestamp = Self::read_uleb128_local(data, &mut off)?;
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            u16::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+        } else {
+            0
+        };
+        let between_start = off;
+        let sender_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+            .map_err(|_| TelemetryError::Deserialize("sender length too large"))?;
+        let sender_wire_len = if (flags & SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED) != 0 {
+            usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Deserialize("sender wire length too large"))?
+        } else {
+            sender_len
+        };
+        if data.len() < off + SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        off += SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len;
+        if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
+            let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Deserialize("wire contract length"))?;
+            if data.len() < off + contract_len {
+                return Err(TelemetryError::Deserialize("short buffer"));
+            }
+            off += contract_len;
+        }
+        let reliable_off = serialize::reliable_header_offset(bytes)?;
+        let (reliable_flags, reliable_seq_ack, payload_off) = if let Some(rel_off) = reliable_off {
+            if data.len() < rel_off + serialize::RELIABLE_HEADER_BYTES {
+                return Err(TelemetryError::Deserialize("short buffer"));
+            }
+            let rel_flags = data[rel_off];
+            let seq = u32::from_le_bytes([
+                data[rel_off + 1],
+                data[rel_off + 2],
+                data[rel_off + 3],
+                data[rel_off + 4],
+            ]);
+            let ack = u32::from_le_bytes([
+                data[rel_off + 5],
+                data[rel_off + 6],
+                data[rel_off + 7],
+                data[rel_off + 8],
+            ]);
+            (
+                Some(rel_flags),
+                Some((seq, ack)),
+                rel_off + serialize::RELIABLE_HEADER_BYTES,
+            )
+        } else {
+            (None, None, off)
+        };
+        if payload_off > data.len() {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        let payload = &data[payload_off..];
+        let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
+        let between = Arc::<[u8]>::from(&data[between_start..reliable_off.unwrap_or(payload_off)]);
+        let base_flags =
+            flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
+        let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
+        hash = hash_bytes_u64(hash, &[base_flags]);
+        hash = hash_bytes_u64(hash, &prefix);
+        hash = hash_bytes_u64(hash, &between);
+        if let Some(rel_flags) = reliable_flags {
+            hash = hash_bytes_u64(hash, &[rel_flags]);
+        }
+        let template = SideHeaderTemplate {
+            hash,
+            base_flags,
+            prefix,
+            between,
+            reliable_flags,
+        };
+        let _ = ty_end_start;
+        Ok((
+            template,
+            flags,
+            data_size,
+            timestamp,
+            nonce,
+            reliable_seq_ack,
+            payload,
+        ))
+    }
+
+    fn reconstruct_side_compact_frame(
+        template: &SideHeaderTemplate,
+        body: &[u8],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        if body.is_empty() {
+            return Err(TelemetryError::Deserialize("short side compact frame"));
+        }
+        let mut off = 0usize;
+        let flags = body[off];
+        off += 1;
+        if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
+            != template.base_flags
+        {
+            return Err(TelemetryError::Deserialize("side compact flags mismatch"));
+        }
+        let data_size = Self::read_uleb128_local(body, &mut off)?;
+        let timestamp = Self::read_uleb128_local(body, &mut off)?;
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            Some(Self::read_uleb128_local(body, &mut off)?)
+        } else {
+            None
+        };
+        let reliable_seq_ack = if template.reliable_flags.is_some() {
+            if body.len() < off + 8 {
+                return Err(TelemetryError::Deserialize("short side compact reliable"));
+            }
+            let seq = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+            let ack =
+                u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+            off += 8;
+            Some((seq, ack))
+        } else {
+            None
+        };
+        let payload = &body[off..];
+        let mut raw = Vec::with_capacity(
+            1 + template.prefix.len() + template.between.len() + payload.len() + 32,
+        );
+        raw.push(flags);
+        raw.extend_from_slice(&template.prefix);
+        Self::write_uleb128_local(data_size, &mut raw);
+        Self::write_uleb128_local(timestamp, &mut raw);
+        if let Some(nonce) = nonce {
+            Self::write_uleb128_local(nonce, &mut raw);
+        }
+        raw.extend_from_slice(&template.between);
+        if let Some(rel_flags) = template.reliable_flags {
+            raw.push(rel_flags);
+            let (seq, ack) = reliable_seq_ack
+                .ok_or(TelemetryError::Deserialize("missing side compact reliable"))?;
+            raw.extend_from_slice(&seq.to_le_bytes());
+            raw.extend_from_slice(&ack.to_le_bytes());
+        }
+        raw.extend_from_slice(payload);
+        let crc = Self::crc32_bytes(&raw);
+        raw.extend_from_slice(&crc.to_le_bytes());
+        Ok(Arc::from(raw))
+    }
+
+    fn split_side_transport_frame(
+        &self,
+        side: RouterSideId,
+        frame: Arc<[u8]>,
+        max_frame_bytes: usize,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
+            return Err(TelemetryError::BadArg);
+        }
+        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
+        let mut st = self.state.lock();
+        let side_state = st
+            .side_transport
+            .get_mut(&side)
+            .ok_or(TelemetryError::BadArg)?;
+        let transfer_id = side_state.next_chunk_id.wrapping_add(1).max(1);
+        side_state.next_chunk_id = transfer_id;
+        drop(st);
+
+        let total = frame.len().div_ceil(payload_budget);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let mut frames = Vec::with_capacity(total);
+        for (idx, chunk) in frame.chunks(payload_budget).enumerate() {
+            let mut body = Vec::with_capacity(8 + chunk.len());
+            body.extend_from_slice(&transfer_id.to_le_bytes());
+            body.extend_from_slice(&(idx as u16).to_le_bytes());
+            body.extend_from_slice(&total_u16.to_le_bytes());
+            body.extend_from_slice(chunk);
+            frames.push(Self::wrap_side_transport_frame(
+                SIDE_TRANSPORT_KIND_CHUNK,
+                &body,
+            ));
+        }
+        Ok(frames)
+    }
+
+    fn encode_side_transport_frames(
+        &self,
+        side: RouterSideId,
+        opts: RouterSideOptions,
+        raw: Arc<[u8]>,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
+            return Ok(vec![raw]);
+        }
+
+        let wrapped = if opts.header_template_enabled {
+            let (template, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+                Self::extract_side_header_template(raw.as_ref())?;
+            let (template_id, use_compact) = {
+                let mut st = self.state.lock();
+                let side_state = st
+                    .side_transport
+                    .get_mut(&side)
+                    .ok_or(TelemetryError::BadArg)?;
+                if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
+                    (id, true)
+                } else {
+                    let next = side_state.next_template_id.wrapping_add(1).max(1);
+                    side_state.next_template_id = next;
+                    side_state.tx_template_ids.insert(template.hash, next);
+                    side_state
+                        .tx_templates
+                        .insert(template.hash, template.clone());
+                    (next, false)
+                }
+            };
+            if use_compact {
+                let mut body = Vec::with_capacity(payload.len() + 32);
+                body.push(flags);
+                Self::write_uleb128_local(u64::from(template_id), &mut body);
+                Self::write_uleb128_local(data_size, &mut body);
+                Self::write_uleb128_local(timestamp, &mut body);
+                if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+                    Self::write_uleb128_local(u64::from(nonce), &mut body);
+                }
+                if let Some((seq, ack)) = reliable_seq_ack {
+                    body.extend_from_slice(&seq.to_le_bytes());
+                    body.extend_from_slice(&ack.to_le_bytes());
+                }
+                body.extend_from_slice(payload);
+                Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body)
+            } else {
+                let mut body = Vec::with_capacity(raw.len() + 4);
+                Self::write_uleb128_local(u64::from(template_id), &mut body);
+                body.extend_from_slice(raw.as_ref());
+                Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
+            }
+        } else {
+            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref())
+        };
+
+        if opts.max_frame_bytes != 0 && wrapped.len() > opts.max_frame_bytes {
+            self.split_side_transport_frame(side, wrapped, opts.max_frame_bytes)
+        } else {
+            Ok(vec![wrapped])
+        }
+    }
+
+    fn decode_side_transport_frame(
+        &self,
+        side: RouterSideId,
+        bytes: &[u8],
+    ) -> TelemetryResult<Option<Arc<[u8]>>> {
+        let Some((kind, body)) = Self::parse_side_transport_wrapper(bytes)? else {
+            return Ok(Some(Arc::from(bytes)));
+        };
+        match kind {
+            SIDE_TRANSPORT_KIND_FULL => {
+                let mut off = 0usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                let raw = Arc::<[u8]>::from(&body[off..]);
+                if let Ok((template, ..)) = Self::extract_side_header_template(raw.as_ref()) {
+                    let mut st = self.state.lock();
+                    if let Some(side_state) = st.side_transport.get_mut(&side) {
+                        side_state
+                            .rx_templates_by_id
+                            .insert(template_id, template.clone());
+                        side_state.rx_templates.insert(template.hash, template);
+                    }
+                }
+                Ok(Some(raw))
+            }
+            SIDE_TRANSPORT_KIND_COMPACT => {
+                if body.is_empty() {
+                    return Err(TelemetryError::Deserialize("short side compact frame"));
+                }
+                let mut off = 1usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
+                compact_body.push(body[0]);
+                compact_body.extend_from_slice(&body[off..]);
+                let template = {
+                    let st = self.state.lock();
+                    st.side_transport
+                        .get(&side)
+                        .and_then(|state| state.rx_templates_by_id.get(&template_id))
+                        .cloned()
+                }
+                .ok_or(TelemetryError::Deserialize("unknown side compact template"))?;
+                Self::reconstruct_side_compact_frame(&template, &compact_body).map(Some)
+            }
+            SIDE_TRANSPORT_KIND_CHUNK => {
+                if body.len() < 8 {
+                    return Err(TelemetryError::Deserialize("short side chunk frame"));
+                }
+                let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let index = u16::from_le_bytes([body[4], body[5]]);
+                let total = u16::from_le_bytes([body[6], body[7]]);
+                let payload = Arc::<[u8]>::from(&body[8..]);
+                let assembled = {
+                    let mut st = self.state.lock();
+                    let side_state = st
+                        .side_transport
+                        .get_mut(&side)
+                        .ok_or(TelemetryError::BadArg)?;
+                    let entry = side_state.rx_chunks.entry(transfer_id).or_default();
+                    if entry.total == 0 {
+                        entry.total = total;
+                    } else if entry.total != total {
+                        side_state.rx_chunks.remove(&transfer_id);
+                        return Err(TelemetryError::Deserialize("side chunk total mismatch"));
+                    }
+                    entry.received.entry(index).or_insert(payload);
+                    if entry.received.len() == usize::from(total) {
+                        let entry = side_state
+                            .rx_chunks
+                            .remove(&transfer_id)
+                            .ok_or(TelemetryError::Deserialize("side chunk missing"))?;
+                        let mut out = Vec::new();
+                        for idx in 0..entry.total {
+                            let chunk = entry
+                                .received
+                                .get(&idx)
+                                .ok_or(TelemetryError::Deserialize("side chunk gap"))?;
+                            out.extend_from_slice(chunk);
+                        }
+                        Some(Arc::<[u8]>::from(out))
+                    } else {
+                        None
+                    }
+                };
+                match assembled {
+                    Some(frame) => self.decode_side_transport_frame(side, frame.as_ref()),
+                    None => Ok(None),
+                }
+            }
+            _ => Err(TelemetryError::Deserialize("unknown side transport frame")),
+        }
+    }
+
     fn call_side_tx_handler(
         &self,
         side: RouterSideId,
@@ -3436,6 +4195,10 @@ impl Router {
         data: &RouterItem,
         relayed: bool,
     ) -> TelemetryResult<()> {
+        let opts = {
+            let st = self.state.lock();
+            Self::side_ref(&st, side)?.opts
+        };
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
         };
@@ -3444,18 +4207,64 @@ impl Router {
             RouterItem::Packet(pkt) => pkt.data_type(),
             RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
         };
-        let result = self.retry_with_attempts(MAX_HANDLER_RETRIES, || match (handler, data) {
-            (RouterTxHandlerFn::Serialized(f), RouterItem::Serialized(bytes)) => f(bytes.as_ref()),
-            (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => f(pkt),
+        let result = match (handler, data) {
+            (RouterTxHandlerFn::Serialized(f), RouterItem::Serialized(bytes)) => {
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut attempts_total = 0usize;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                        Ok((_, attempts)) => {
+                            attempts_total = attempts_total.saturating_add(attempts);
+                            sent_bytes = sent_bytes.saturating_add(frame.len());
+                        }
+                        Err((err, attempts)) => {
+                            self.note_side_tx_failure(
+                                side,
+                                ty,
+                                attempts_total.saturating_add(attempts),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                return Ok(());
+            }
+            (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => {
+                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(pkt))
+            }
             (RouterTxHandlerFn::Serialized(f), RouterItem::Packet(pkt)) => {
                 let owned = serialize::serialize_packet(pkt);
-                f(owned.as_ref())
+                let frames = self.encode_side_transport_frames(side, opts, owned)?;
+                let mut attempts_total = 0usize;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                        Ok((_, attempts)) => {
+                            attempts_total = attempts_total.saturating_add(attempts);
+                            sent_bytes = sent_bytes.saturating_add(frame.len());
+                        }
+                        Err((err, attempts)) => {
+                            self.note_side_tx_failure(
+                                side,
+                                ty,
+                                attempts_total.saturating_add(attempts),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                return Ok(());
             }
             (RouterTxHandlerFn::Packet(f), RouterItem::Serialized(bytes)) => {
                 let pkt = serialize::deserialize_packet(bytes.as_ref())?;
-                f(&pkt)
+                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
             }
-        });
+        };
         match result {
             Ok((_, attempts)) => {
                 if let Ok(bytes) = Self::router_item_wire_len(data) {
@@ -4266,6 +5075,9 @@ impl Router {
                 route_selection_cursors: BTreeMap::new(),
                 adaptive_route_stats: BTreeMap::new(),
                 side_runtime_stats: BTreeMap::new(),
+                side_transport: BTreeMap::new(),
+                managed_variable_types: BTreeSet::new(),
+                managed_variable_latest: BTreeMap::new(),
                 received_queue: BoundedDeque::new(
                     MAX_QUEUE_BUDGET,
                     STARTING_QUEUE_SIZE,
@@ -4331,6 +5143,25 @@ impl Router {
         self.add_side_serialized_with_options(name, tx, RouterSideOptions::default())
     }
 
+    /// Register a serialized side with the compact small-packet transport preset enabled.
+    ///
+    /// `max_frame_bytes == 0` keeps header-template reuse enabled without chunking.
+    pub fn add_side_serialized_small_packets<F>(
+        &self,
+        name: &'static str,
+        tx: F,
+        max_frame_bytes: usize,
+    ) -> RouterSideId
+    where
+        F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        self.add_side_serialized_with_options(
+            name,
+            tx,
+            RouterSideOptions::default().with_small_packet_transport(max_frame_bytes),
+        )
+    }
+
     /// Register a serialized-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` enables the router's per-hop reliable framing on this side only.
@@ -4357,6 +5188,7 @@ impl Router {
         }));
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -4396,6 +5228,7 @@ impl Router {
         }));
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -4426,6 +5259,7 @@ impl Router {
             st.route_selection_cursors.remove(&Some(side));
             st.adaptive_route_stats.remove(&side);
             st.side_runtime_stats.remove(&side);
+            st.side_transport.remove(&side);
             st.reliable_return_routes
                 .retain(|_, route| route.side != side);
             st.transmit_queue.retain(
@@ -4716,6 +5550,60 @@ impl Router {
         let sender = self.sender_arc();
         let pkt = discovery::build_discovery_schema_request(sender.as_ref(), self.clock.now_ms())?;
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    /// Mark a data type as a network-managed variable.
+    ///
+    /// The router caches the latest packet for this type when it is locally transmitted or
+    /// received from the network. Peers can request the latest cached value and the router will
+    /// replay the original value packet, so user endpoint handlers see the same API shape as a
+    /// normal update.
+    pub fn enable_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        let mut st = self.state.lock();
+        st.managed_variable_types.insert(ty.as_u32());
+        Ok(())
+    }
+
+    pub fn disable_managed_variable(&self, ty: DataType) {
+        let mut st = self.state.lock();
+        st.managed_variable_types.remove(&ty.as_u32());
+        st.managed_variable_latest.remove(&ty.as_u32());
+    }
+
+    pub fn seed_managed_variable(&self, pkt: Packet) -> TelemetryResult<()> {
+        if is_internal_control_type(pkt.data_type()) {
+            return Err(TelemetryError::InvalidType);
+        }
+        pkt.validate()?;
+        let mut st = self.state.lock();
+        st.managed_variable_types.insert(pkt.data_type().as_u32());
+        st.managed_variable_latest
+            .insert(pkt.data_type().as_u32(), pkt);
+        Ok(())
+    }
+
+    pub fn cached_managed_variable(&self, ty: DataType) -> Option<Packet> {
+        self.managed_variable_latest(ty)
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn request_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        let sender = self.sender_arc();
+        let pkt =
+            discovery::build_managed_variable_request(sender.as_ref(), self.clock.now_ms(), ty)?;
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn request_managed_variable_by_name(&self, ty_name: &str) -> TelemetryResult<()> {
+        let ty = DataType::try_named(ty_name).ok_or(TelemetryError::InvalidType)?;
+        self.request_managed_variable(ty)
     }
 
     /// Export the current discovery-driven network topology view.
@@ -5164,6 +6052,8 @@ impl Router {
         loop {
             self.process_reliable_timeouts()?;
             self.process_end_to_end_reliable_timeouts()?;
+            #[cfg(feature = "discovery")]
+            let _ = self.drain_queued_discovery_rx_before_tx()?;
             let pkt_opt = {
                 let mut st = self.state.lock();
                 st.transmit_queue.pop_front()
@@ -5229,6 +6119,10 @@ impl Router {
                 let mut did_any = false;
                 self.process_reliable_timeouts()?;
                 self.process_end_to_end_reliable_timeouts()?;
+                #[cfg(feature = "discovery")]
+                if self.drain_queued_discovery_rx_before_tx()? {
+                    did_any = true;
+                }
 
                 if let Some(pkt) = {
                     let mut st = self.state.lock();
@@ -5260,6 +6154,8 @@ impl Router {
         loop {
             self.process_reliable_timeouts()?;
             self.process_end_to_end_reliable_timeouts()?;
+            #[cfg(feature = "discovery")]
+            let _ = self.drain_queued_discovery_rx_before_tx()?;
             let pkt_opt = {
                 let mut st = self.state.lock();
                 st.transmit_queue.pop_front()
@@ -5488,7 +6384,10 @@ impl Router {
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
+            return Ok(());
+        };
+        let data = RouterItem::Serialized(decoded);
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -5774,6 +6673,23 @@ impl Router {
                 }
             }
         }
+        match &item.data {
+            RouterItem::Packet(pkt) => {
+                if !is_internal_control_type(pkt.data_type()) {
+                    self.remember_managed_variable_packet(pkt);
+                }
+            }
+            RouterItem::Serialized(bytes) => {
+                if let Ok(env) = serialize::peek_envelope(bytes.as_ref())
+                    && !is_internal_control_type(env.ty)
+                    && self.is_managed_variable_type(env.ty)
+                {
+                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    pkt.validate()?;
+                    self.remember_managed_variable_packet(&pkt);
+                }
+            }
+        }
         let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
         if let (Some(src), RouterItem::Serialized(bytes)) = (item.src, &item.data) {
             let (_opts, handler_is_serialized, hop_reliable_enabled) = {
@@ -5832,6 +6748,10 @@ impl Router {
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
+                    if frame.ack_only() {
+                        self.handle_reliable_ack(src, frame.envelope.ty, hdr.ack);
+                        return Ok(());
+                    }
                     let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
                     let unsequenced = (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
@@ -6382,6 +7302,11 @@ impl Router {
     ) -> TelemetryResult<()> {
         match item {
             RouterTxItem::Broadcast(data) => {
+                if let RouterItem::Packet(pkt) = &data
+                    && !is_internal_control_type(pkt.data_type())
+                {
+                    self.remember_managed_variable_packet(pkt);
+                }
                 #[cfg(feature = "discovery")]
                 let is_discovery = matches!(&data, RouterItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()))
                     || matches!(&data, RouterItem::Serialized(bytes)
@@ -6491,6 +7416,11 @@ impl Router {
                 }
             }
             RouterTxItem::ToSide { src, dst, data } => {
+                if let RouterItem::Packet(pkt) = &data
+                    && !is_internal_control_type(pkt.data_type())
+                {
+                    self.remember_managed_variable_packet(pkt);
+                }
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {
                         return Ok(());
@@ -6694,7 +7624,10 @@ impl Router {
             return self.rx_serialized_queue_from_side(bytes, side);
         }
         self.ensure_side_ingress_enabled(side)?;
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
+            return Ok(());
+        };
+        let data = RouterItem::Serialized(decoded);
         let item = RouterRxItem {
             src: Some(side),
             priority: Self::router_item_priority(&data)?,

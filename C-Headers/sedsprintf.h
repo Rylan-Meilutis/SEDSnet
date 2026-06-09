@@ -1,7 +1,13 @@
 #ifndef SEDSPRINTF_C_H
 #define SEDSPRINTF_C_H
 /* ============================================================================
-    THIS FILE IS GENERATED FROM THE RUST ABI SURFACE - DO NOT EDIT DIRECTLY AS ALL CHANGES WILL BE OVERWRITTEN
+    Static raw C/C++ ABI header for sedsprintf_rs.
+
+    Runtime data types and endpoints are registered at runtime; this header only
+    carries built-in IDs and ABI shapes. Optional convenience APIs live in
+    c-wrapper/sedsprintf_c_wrapper.h and c-wrapper/sedsprintf_cpp_wrapper.hpp.
+    Rust-side payload stack sizing is still controlled at build time with
+    MAX_STACK_PAYLOAD / SEDSPRINTF_RS_MAX_STACK_PAYLOAD.
    ============================================================================ */
 #include <stdint.h>
 #include <stddef.h>
@@ -16,7 +22,63 @@ extern "C" {
 /* =================================================================
    Public built-in enums / constants. User schema entries are registered at runtime.
    ================================================================= */
-/* {{AUTOGEN:ENUMS}} */
+typedef enum SedsDataType {
+  /* Time source announce (priority, time_ms). */
+  SEDS_DT_TIME_SYNC_ANNOUNCE = 4,
+  /* Time sync request (seq, t1_ms). */
+  SEDS_DT_TIME_SYNC_REQUEST = 5,
+  /* Time sync response (seq, t1_ms, t2_ms, t3_ms). */
+  SEDS_DT_TIME_SYNC_RESPONSE = 6,
+  /* Endpoint discovery advertisement (dynamic list of endpoint IDs). */
+  SEDS_DT_DISCOVERY_ANNOUNCE = 7,
+  /* Time sync source discovery advertisement (dynamic list of sender IDs). */
+  SEDS_DT_DISCOVERY_TIMESYNC_SOURCES = 8,
+  /* Full board-topology discovery advertisement (boards, endpoints, and connections). */
+  SEDS_DT_DISCOVERY_TOPOLOGY = 9,
+  /* Runtime schema snapshot advertisement. */
+  SEDS_DT_DISCOVERY_SCHEMA = 10,
+  /* Discovery request for current topology snapshot. */
+  SEDS_DT_DISCOVERY_TOPOLOGY_REQUEST = 11,
+  /* Discovery request for current runtime schema snapshot. */
+  SEDS_DT_DISCOVERY_SCHEMA_REQUEST = 12,
+  /* Request the latest cached value for a managed variable data type. */
+  SEDS_DT_MANAGED_VARIABLE_REQUEST = 13,
+  /* Reserved managed variable value control type. Values replay as their original data type. */
+  SEDS_DT_MANAGED_VARIABLE_VALUE = 14,
+  /* Built-in TelemetryError */
+  SEDS_DT_TELEMETRY_ERROR = 0,
+} SedsDataType;
+
+typedef enum SedsDataEndpoint {
+  /* Time sync routing endpoint (always forwarded). */
+  SEDS_EP_TIME_SYNC = 200,
+  /* Discovery control endpoint for internal route advertisements. */
+  SEDS_EP_DISCOVERY = 201,
+  /* Built-in TelemetryError endpoint */
+  SEDS_EP_TELEMETRY_ERROR = 202,
+} SedsDataEndpoint;
+
+typedef enum SedsResult {
+  SEDS_OK = 0,
+  SEDS_ERR = -1,
+  SEDS_GENERIC_ERROR = -2,
+  SEDS_INVALID_TYPE = -3,
+  SEDS_SIZE_MISMATCH = -4,
+  SEDS_SIZE_MISMATCH_ERROR = -5,
+  SEDS_EMPTY_ENDPOINTS = -6,
+  SEDS_TIMESTAMP_INVALID = -7,
+  SEDS_MISSING_PAYLOAD = -8,
+  SEDS_HANDLER_ERROR = -9,
+  SEDS_BAD_ARG = -10,
+  SEDS_SERIALIZE = -11,
+  SEDS_DESERIALIZE = -12,
+  SEDS_IO = -13,
+  SEDS_INVALID_UTF8 = -14,
+  SEDS_TYPE_MISMATCH = -15,
+  SEDS_INVALID_LINK_ID = -16,
+  SEDS_PACKET_TOO_LARGE = -17,
+} SedsResult;
+
 /* ======================================================================== */
 typedef uint64_t (* SedsNowMsFn)(void * user);
 
@@ -24,6 +86,43 @@ typedef struct SedsRouter SedsRouter;
 
 typedef struct SedsRelay SedsRelay;
 
+typedef struct SedsName
+{
+    const char * ptr;
+    size_t len;
+} SedsName;
+
+typedef struct SedsTypeRef
+{
+    SedsDataType id;
+} SedsTypeRef;
+
+typedef struct SedsEndpointRef
+{
+    SedsDataEndpoint id;
+} SedsEndpointRef;
+
+typedef struct SedsSideRef
+{
+    int32_t id;
+} SedsSideRef;
+
+#define SEDS_NAME_LITERAL(s_) ((SedsName){ (s_), sizeof(s_) - 1U })
+#define SEDS_NAME_NULL ((SedsName){ NULL, 0U })
+#define SEDS_TYPE_REF(id_) ((SedsTypeRef){ (SedsDataType)(id_) })
+#define SEDS_ENDPOINT_REF(id_) ((SedsEndpointRef){ (SedsDataEndpoint)(id_) })
+#define SEDS_SIDE_REF(id_) ((SedsSideRef){ (int32_t)(id_) })
+#define SEDS_SIDE_INVALID ((SedsSideRef){ -1 })
+
+static inline SedsName seds_name_cstr(const char * s)
+{
+    return (SedsName){ s, s ? strlen(s) : 0U };
+}
+
+static inline bool seds_side_is_valid(SedsSideRef side)
+{
+    return side.id >= 0;
+}
 
 typedef struct SedsPacketView
 {
@@ -127,7 +226,47 @@ typedef struct SedsLocalEndpointDesc
     void * user;
 } SedsLocalEndpointDesc;
 
-/* {{AUTOGEN:ABI}} */
+/* =================================================================
+   Public ABI wrappers
+   ================================================================= */
+
+/** @brief Legacy byte logger without timestamp or queue flag. */
+SedsResult seds_router_log_bytes(SedsRouter * r, SedsDataType ty, const uint8_t * data, size_t len);
+
+/** @brief Legacy f32 logger without timestamp or queue flag. */
+SedsResult seds_router_log_f32(SedsRouter * r, SedsDataType ty, const float * vals, size_t n_vals);
+
+/** @brief Legacy typed logger without timestamp or queue flag. */
+SedsResult seds_router_log_typed(SedsRouter * r,
+                                 SedsDataType ty,
+                                 const void * data,
+                                 size_t count,
+                                 size_t elem_size,
+                                 SedsElemKind elem_kind);
+
+/** @brief Legacy typed logger that enqueues instead of sending immediately. */
+SedsResult seds_router_log_queue_typed(SedsRouter * r,
+                                       SedsDataType ty,
+                                       const void * data,
+                                       size_t count,
+                                       size_t elem_size,
+                                       SedsElemKind elem_kind);
+
+/** @brief Byte logger with optional timestamp + queue flag. */
+SedsResult seds_router_log_bytes_ex(SedsRouter * r,
+                                    SedsDataType ty,
+                                    const uint8_t * data,
+                                    size_t len,
+                                    const uint64_t * timestamp_ms_opt,
+                                    int queue);
+
+/** @brief f32 logger with optional timestamp + queue flag. */
+SedsResult seds_router_log_f32_ex(SedsRouter * r,
+                                  SedsDataType ty,
+                                  const float * vals,
+                                  size_t n_vals,
+                                  const uint64_t * timestamp_ms_opt,
+                                  int queue);
 
 /* ==============================
    String / error formatting
@@ -237,6 +376,53 @@ SedsResult seds_router_announce_discovery(SedsRouter * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_poll_discovery(SedsRouter * r, bool * out_did_queue);
+
+/**
+ * @brief Enable latest-value caching for a user data type.
+ *
+ * Once enabled, the router remembers the latest packet for this data type when it is locally
+ * transmitted or received from the network. Managed variables cannot be internal control types.
+ */
+SedsResult seds_router_enable_managed_variable(SedsRouter * r, SedsDataType ty);
+
+/**
+ * @brief Disable and clear latest-value caching for a user data type.
+ */
+void seds_router_disable_managed_variable(SedsRouter * r, SedsDataType ty);
+
+/**
+ * @brief Ask the network to replay the latest cached value for a managed variable data type.
+ *
+ * Responders send the original value packet, so normal endpoint handlers are invoked exactly as if
+ * an update had just occurred. Requires a build with the `discovery` feature.
+ */
+SedsResult seds_router_request_managed_variable(SedsRouter * r, SedsDataType ty);
+
+/**
+ * @brief Seed a managed variable cache entry from an already serialized packet.
+ */
+SedsResult seds_router_seed_managed_variable_serialized(
+    SedsRouter * r,
+    const uint8_t * bytes,
+    size_t len
+);
+
+/**
+ * @brief Return the serialized size of the cached value for `ty`, or 0 if none is cached.
+ */
+int32_t seds_router_cached_managed_variable_serialized_len(SedsRouter * r, SedsDataType ty);
+
+/**
+ * @brief Copy the cached managed-variable packet as serialized bytes.
+ *
+ * Returns the copied byte count, 0 when no value is cached, or a negative SedsResult error.
+ */
+int32_t seds_router_cached_managed_variable_serialized(
+    SedsRouter * r,
+    SedsDataType ty,
+    uint8_t * out,
+    size_t out_len
+);
 
 /**
  * @brief Return the required buffer length for the router topology export JSON.
@@ -408,6 +594,23 @@ int32_t seds_router_add_side_serialized(
     SedsTransmitFn tx,
     void * tx_user,
     bool reliable_enabled
+);
+
+/**
+ * @brief Add a serialized router side with compact/bounded side transport enabled.
+ *
+ * `max_frame_bytes == 0` enables compact header-template transport without chunking.
+ * Values greater than zero also split outgoing serialized frames so each TX callback
+ * receives at most that many bytes.
+ */
+int32_t seds_router_add_side_serialized_small_packets(
+    SedsRouter * r,
+    const char * name,
+    size_t name_len,
+    SedsTransmitFn tx,
+    void * tx_user,
+    bool reliable_enabled,
+    size_t max_frame_bytes
 );
 
 /**
@@ -858,6 +1061,20 @@ int32_t seds_relay_add_side_serialized(SedsRelay * r,
                             bool reliable_enabled);
 
 /**
+ * @brief Add a serialized relay side with bounded side transport enabled.
+ *
+ * `max_frame_bytes == 0` leaves relay frames unbounded. Values greater than zero split outgoing
+ * serialized frames so each TX callback receives at most that many bytes.
+ */
+int32_t seds_relay_add_side_serialized_small_packets(SedsRelay * r,
+                            const char * name,
+                            size_t name_len,
+                            SedsTransmitFn tx,
+                            void * tx_user,
+                            bool reliable_enabled,
+                            size_t max_frame_bytes);
+
+/**
  * @brief Add a new side/network to the relay whose TX callback receives packets.
  *
  * The callback uses the same SedsPacketView shape as router endpoint handlers.
@@ -1000,263 +1217,69 @@ SedsResult seds_relay_process_tx_queue_with_timeout(SedsRelay * r, uint32_t time
  */
 SedsResult seds_relay_process_all_queues_with_timeout(SedsRelay * r, uint32_t timeout_ms);
 
+#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+typedef SedsResult (* SedsCryptoSealFn)(
+    uint32_t key_id,
+    const uint8_t * nonce,
+    size_t nonce_len,
+    const uint8_t * aad,
+    size_t aad_len,
+    const uint8_t * plaintext,
+    size_t plaintext_len,
+    uint8_t * ciphertext_out,
+    size_t ciphertext_cap,
+    size_t * ciphertext_len_out,
+    uint8_t * tag_out,
+    size_t tag_cap,
+    size_t * tag_len_out,
+    void * user);
+
+typedef SedsResult (* SedsCryptoOpenFn)(
+    uint32_t key_id,
+    const uint8_t * nonce,
+    size_t nonce_len,
+    const uint8_t * aad,
+    size_t aad_len,
+    const uint8_t * ciphertext,
+    size_t ciphertext_len,
+    const uint8_t * tag,
+    size_t tag_len,
+    uint8_t * plaintext_out,
+    size_t plaintext_cap,
+    size_t * plaintext_len_out,
+    void * user);
+
+SedsResult seds_crypto_register_shim(SedsCryptoSealFn seal, SedsCryptoOpenFn open, void * user);
+void seds_crypto_clear_shim(void);
+SedsResult seds_crypto_seal(uint32_t key_id,
+                            const uint8_t * nonce,
+                            size_t nonce_len,
+                            const uint8_t * aad,
+                            size_t aad_len,
+                            const uint8_t * plaintext,
+                            size_t plaintext_len,
+                            uint8_t * ciphertext_out,
+                            size_t ciphertext_cap,
+                            size_t * ciphertext_len_out,
+                            uint8_t * tag_out,
+                            size_t tag_cap,
+                            size_t * tag_len_out);
+SedsResult seds_crypto_open(uint32_t key_id,
+                            const uint8_t * nonce,
+                            size_t nonce_len,
+                            const uint8_t * aad,
+                            size_t aad_len,
+                            const uint8_t * ciphertext,
+                            size_t ciphertext_len,
+                            const uint8_t * tag,
+                            size_t tag_len,
+                            uint8_t * plaintext_out,
+                            size_t plaintext_cap,
+                            size_t * plaintext_len_out);
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
-
-/* ============================================================================
-   Header-only helpers for C++ call sites (no extern "C")
-   ============================================================================ */
-#if defined(__cplusplus)
-namespace seds_detail
-{
-    template < typename
-    T >
-    struct elem_traits;
-    template<>
-    struct elem_traits<uint8_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED;
-        static constexpr size_t size = 1;
-    };
-    template<>
-    struct elem_traits<uint16_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED;
-        static constexpr size_t size = 2;
-    };
-    template<>
-    struct elem_traits<uint32_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED;
-        static constexpr size_t size = 4;
-    };
-    template<>
-    struct elem_traits<uint64_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_UNSIGNED;
-        static constexpr size_t size = 8;
-    };
-    template<>
-    struct elem_traits<int8_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_SIGNED;
-        static constexpr size_t size = 1;
-    };
-    template<>
-    struct elem_traits<int16_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_SIGNED;
-        static constexpr size_t size = 2;
-    };
-    template<>
-    struct elem_traits<int32_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_SIGNED;
-        static constexpr size_t size = 4;
-    };
-    template<>
-    struct elem_traits<int64_t>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_SIGNED;
-        static constexpr size_t size = 8;
-    };
-    template<>
-    struct elem_traits<float>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_FLOAT;
-        static constexpr size_t size = 4;
-    };
-    template<>
-    struct elem_traits<double>
-    {
-        static constexpr SedsElemKind kind = SEDS_EK_FLOAT;
-        static constexpr size_t size = 8;
-    };
-}
-
-template<typename T>
-static inline SedsResult seds_router_log(SedsRouter * r, SedsDataType ty, const T * data, size_t count)
-{
-    return seds_router_log_typed_ex(r, ty, data, count,
-                                    seds_detail::elem_traits<T>::size,
-                                    seds_detail::elem_traits<T>::kind,
-                                    /*ts*/NULL, /*queue*/0);
-}
-
-template<typename T>
-static inline SedsResult seds_router_log_queue(SedsRouter * r, SedsDataType ty, const T * data, size_t count)
-{
-    return seds_router_log_typed_ex(r, ty, data, count,
-                                    seds_detail::elem_traits<T>::size,
-                                    seds_detail::elem_traits<T>::kind,
-                                    /*ts*/NULL, /*queue*/1);
-}
-
-template<typename T>
-static inline SedsResult seds_router_log_ts(SedsRouter * r, SedsDataType ty, uint64_t ts_ms, const T * data,
-                                            size_t count)
-{
-    return seds_router_log_typed_ex(r, ty, data, count,
-                                    seds_detail::elem_traits<T>::size,
-                                    seds_detail::elem_traits<T>::kind,
-                                    &ts_ms, /*queue*/0);
-}
-
-template<typename T>
-static inline SedsResult seds_router_log_queue_ts(SedsRouter * r, SedsDataType ty, uint64_t ts_ms, const T * data,
-                                                  size_t count)
-{
-    return seds_router_log_typed_ex(r, ty, data, count,
-                                    seds_detail::elem_traits<T>::size,
-                                    seds_detail::elem_traits<T>::kind,
-                                    &ts_ms, /*queue*/1);
-}
-
-/* String convenience for C++ */
-static inline SedsResult seds_router_log_cstr(SedsRouter * r, SedsDataType ty, const char * s)
-{
-    return seds_router_log_string_ex(r, ty, s, s ? strlen(s) : 0, NULL, 0);
-}
-static inline SedsResult seds_router_log_cstr_ts(SedsRouter * r, SedsDataType ty, uint64_t ts, const char * s)
-{
-    return seds_router_log_string_ex(r, ty, s, s ? strlen(s) : 0, &ts, 0);
-}
-static inline SedsResult seds_router_log_cstr_queue(SedsRouter * r, SedsDataType ty, const char * s)
-{
-    return seds_router_log_string_ex(r, ty, s, s ? strlen(s) : 0, NULL, 1);
-}
-static inline SedsResult seds_router_log_cstr_queue_ts(SedsRouter * r, SedsDataType ty, uint64_t ts, const char * s)
-{
-    return seds_router_log_string_ex(r, ty, s, s ? strlen(s) : 0, &ts, 1);
-}
-
-/* Extractor remains the same */
-template<typename T>
-static inline SedsResult seds_pkt_get(const SedsPacketView * pkt, T * out, size_t count)
-{
-    return seds_pkt_get_typed(pkt, out, count,
-                              seds_detail::elem_traits<T>::size,
-                              seds_detail::elem_traits<T>::kind);
-}
-#endif /* __cplusplus */
-
-/* ============================================================================
-   C11 _Generic convenience macros (string-safe)
-   ============================================================================ */
-#if !defined(__cplusplus) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-
-#define SEDS__KIND_SIZE(x, KIND_OUT, SIZE_OUT) do {                                    \
-    _Static_assert(sizeof(*(x))==1 || sizeof(*(x))==2 ||                                \
-                   sizeof(*(x))==4 || sizeof(*(x))==8,                                  \
-                   "element size must be 1,2,4,8");                                     \
-    (SIZE_OUT) = (size_t)sizeof(*(x));                                                  \
-    (KIND_OUT) = _Generic(*(x),                                                         \
-        unsigned char: SEDS_EK_UNSIGNED,                                                \
-        uint16_t:      SEDS_EK_UNSIGNED,                                                \
-        uint32_t:      SEDS_EK_UNSIGNED,                                                \
-        uint64_t:      SEDS_EK_UNSIGNED,                                                \
-        signed char:   SEDS_EK_SIGNED,                                                  \
-        int16_t:       SEDS_EK_SIGNED,                                                  \
-        int32_t:       SEDS_EK_SIGNED,                                                  \
-        int64_t:       SEDS_EK_SIGNED,                                                  \
-        float:         SEDS_EK_FLOAT,                                                   \
-        double:        SEDS_EK_FLOAT,                                                   \
-        default:       SEDS_EK_UNSIGNED                                                 \
-    );                                                                                  \
-} while(0)
-
-/* === Generic typed (non-string) shortcuts === */
-#define seds_router_log(router, datatype, data, count)                                  \
-    (__extension__({                                                                    \
-        const void   *_s_data  = (const void*)(data);                                   \
-        size_t        _s_count = (size_t)(count);                                       \
-        size_t        _s_esize;                                                         \
-        SedsElemKind  _s_kind;                                                          \
-        SEDS__KIND_SIZE((data), _s_kind, _s_esize);                                      \
-        seds_router_log_typed_ex((router), (datatype), _s_data, _s_count,               \
-                                 _s_esize, _s_kind, NULL, 0);                            \
-    }))
-
-#define seds_router_log_queue(router, datatype, data, count)                            \
-    (__extension__({                                                                    \
-        const void   *_s_data  = (const void*)(data);                                   \
-        size_t        _s_count = (size_t)(count);                                       \
-        size_t        _s_esize;                                                         \
-        SedsElemKind  _s_kind;                                                          \
-        SEDS__KIND_SIZE((data), _s_kind, _s_esize);                                      \
-        seds_router_log_typed_ex((router), (datatype), _s_data, _s_count,               \
-                                 _s_esize, _s_kind, NULL, 1);                            \
-    }))
-
-#define seds_router_log_ts(router, datatype, ts_ms, data, count)                        \
-    (__extension__({                                                                    \
-        const void   *_s_data  = (const void*)(data);                                   \
-        size_t        _s_count = (size_t)(count);                                       \
-        size_t        _s_esize;                                                         \
-        SedsElemKind  _s_kind;                                                          \
-        const uint64_t _s_ts = (uint64_t)(ts_ms);                                       \
-        SEDS__KIND_SIZE((data), _s_kind, _s_esize);                                      \
-        seds_router_log_typed_ex((router), (datatype), _s_data, _s_count,               \
-                                 _s_esize, _s_kind, &_s_ts, 0);                          \
-    }))
-
-#define seds_router_log_queue_ts(router, datatype, ts_ms, data, count)                  \
-    (__extension__({                                                                    \
-        const void   *_s_data  = (const void*)(data);                                   \
-        size_t        _s_count = (size_t)(count);                                       \
-        size_t        _s_esize;                                                         \
-        SedsElemKind  _s_kind;                                                          \
-        const uint64_t _s_ts = (uint64_t)(ts_ms);                                       \
-        SEDS__KIND_SIZE((data), _s_kind, _s_esize);                                      \
-        seds_router_log_typed_ex((router), (datatype), _s_data, _s_count,               \
-                                 _s_esize, _s_kind, &_s_ts, 1);                          \
-    }))
-
-/* === STRING-SAFE shortcuts (no size mismatch) ===
- * These macros are for NUL-terminated strings (char* / const char*).
- * They compute strlen and call the string-aware EX function which pads/truncates
- * to the schema’s fixed size behind the scenes.
- */
-#define seds_router_log_cstr(router, datatype, cstr)                                    \
-    (__extension__({                                                                    \
-        const char *_s = (const char*)(cstr);                                           \
-        seds_router_log_string_ex((router), (datatype), _s, (_s?strlen(_s):0), NULL, 0);\
-    }))
-
-#define seds_router_log_cstr_queue(router, datatype, cstr)                              \
-    (__extension__({                                                                    \
-        const char *_s = (const char*)(cstr);                                           \
-        seds_router_log_string_ex((router), (datatype), _s, (_s?strlen(_s):0), NULL, 1);\
-    }))
-
-#define seds_router_log_cstr_ts(router, datatype, ts_ms, cstr)                          \
-    (__extension__({                                                                    \
-        const char *_s = (const char*)(cstr);                                           \
-        const uint64_t _s_ts = (uint64_t)(ts_ms);                                       \
-        seds_router_log_string_ex((router), (datatype), _s, (_s?strlen(_s):0), &_s_ts, 0);\
-    }))
-
-#define seds_router_log_cstr_queue_ts(router, datatype, ts_ms, cstr)                    \
-    (__extension__({                                                                    \
-        const char *_s = (const char*)(cstr);                                           \
-        const uint64_t _s_ts = (uint64_t)(ts_ms);                                       \
-        seds_router_log_string_ex((router), (datatype), _s, (_s?strlen(_s):0), &_s_ts, 1);\
-    }))
-
-/* Typed extractor unchanged */
-#define SEDS__PKT_KIND_SIZE(x, KIND_OUT, SIZE_OUT) SEDS__KIND_SIZE(x, KIND_OUT, SIZE_OUT)
-
-#define seds_pkt_get(pkt, out, count)                                                   \
-    (__extension__({                                                                    \
-        void        *_s_out   = (void*)(out);                                           \
-        size_t       _s_count = (size_t)(count);                                        \
-        size_t       _s_esize;                                                          \
-        SedsElemKind _s_kind;                                                           \
-        SEDS__PKT_KIND_SIZE((out), _s_kind, _s_esize);                                   \
-        seds_pkt_get_typed((pkt), _s_out, _s_count, _s_esize, _s_kind);                 \
-    }))
-#endif /* C11 generic */
 
 #endif /* SEDSPRINTF_C_H */

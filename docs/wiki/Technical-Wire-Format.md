@@ -20,11 +20,13 @@ src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/
     bit0: payload compressed
     bit1: sender compressed
     bit2: wire contract present
-    bit3..7: reserved
+    bit3: packet nonce present
+    bit4..7: reserved
 [NEP: u8]                         // number of set bits in the endpoint bitmap
 VARINT(ty: u32 as u64)            // ULEB128
 VARINT(data_size: u64)            // logical payload size after decompression
 VARINT(timestamp_ms: u64)
+[VARINT(nonce: u16 as u64)]       // only when bit3 is set
 VARINT(sender_len: u64)           // logical sender length after decompression
 [VARINT(sender_wire_len: u64)]    // only when sender is compressed
 ENDPOINT_BITMAP                   // fixed width, 1 bit per possible endpoint ID
@@ -43,6 +45,7 @@ Top-level frame flags:
 - `0x01`: payload compressed
 - `0x02`: sender compressed
 - `0x04`: wire contract present
+- `0x08`: packet nonce present
 
 Reliable-header flags:
 
@@ -145,6 +148,39 @@ Reliable control traffic now primarily uses built-in internal packet types such 
 
 Those are router/relay-owned control packets. Applications should not model them as user endpoint
 traffic.
+
+## Side Transport Wrappers
+
+Routers and relays can add a side-local wrapper around serialized frames for constrained links. This
+wrapper is not part of the application `Packet`; it is consumed by `rx_serialized_from_side(...)`
+before normal deserialization.
+
+```text
+[magic: "SDT"]
+[kind: u8]
+[body bytes]
+[CRC32: u32 LE]                   // checksum of magic + kind + body
+```
+
+Kinds:
+
+- `0x01`: full serialized frame plus a side-local ULEB template id
+- `0x02`: compact frame using a previously learned side-local template id
+- `0x03`: ordered chunk of a full or compact side-transport frame
+
+Router serialized sides support header-template reuse with
+`Router::add_side_serialized_small_packets(...)` or
+`RouterSideOptions::with_small_packet_transport(...)`. The first stable header shape is sent as a
+full `SDT` frame and assigns a compact side-local ULEB template id. Later packets with the same
+static header shape can use kind `0x02`, replacing repeated type/endpoint/sender/contract bytes with
+that template id plus the fields that still vary per packet.
+
+Router and relay serialized sides both support bounded frame sizes. Relay small-packet sides use the
+same side-local template id compaction when `max_frame_bytes` is non-zero. When the side-transport
+frame is too large, the sender emits kind `0x03` chunks whose individual callback payloads do not
+exceed the configured maximum. The receiver reassembles those chunks into the original
+side-transport frame and then resumes normal packet processing. This keeps CAN/I2C-style frame
+limits transparent to endpoint handlers and packet-oriented APIs.
 
 ## Varints
 

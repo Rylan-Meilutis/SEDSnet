@@ -30,9 +30,21 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::mem::size_of;
+use crc32fast::Hasher as Crc32Hasher;
 
 /// Logical side index (CAN, UART, RADIO, etc.)
 pub type RelaySideId = usize;
+const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
+const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
+const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
+const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
+const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
+const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
+const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
+const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
+const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + serialize::CRC32_BYTES;
+const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
+const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
 /// Packet Handler function type
 type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
@@ -60,6 +72,13 @@ pub struct RelaySideOptions {
     pub ingress_enabled: bool,
     /// Allows the relay to transmit packets toward this side.
     pub egress_enabled: bool,
+    /// Maximum number of bytes to emit per serialized TX callback.
+    ///
+    /// When non-zero and a serialized frame would exceed this size, the relay
+    /// splits it into ordered side-transport chunks and reassembles them on RX
+    /// before normal relay processing. This is intended for fixed-size links
+    /// such as CAN or I2C while keeping the user API packet-oriented.
+    pub max_frame_bytes: usize,
 }
 
 impl Default for RelaySideOptions {
@@ -69,7 +88,20 @@ impl Default for RelaySideOptions {
             link_local_enabled: false,
             ingress_enabled: true,
             egress_enabled: true,
+            max_frame_bytes: 0,
         }
+    }
+}
+
+impl RelaySideOptions {
+    /// Convenience preset for bounded serialized-side transport.
+    ///
+    /// `max_frame_bytes == 0` leaves serialized frames unbounded. Values greater
+    /// than zero enable relay-managed chunking/reassembly on this side.
+    #[inline]
+    pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
     }
 }
 
@@ -211,6 +243,42 @@ struct DiscoverySideState {
     last_seen_ms: u64,
     announcers: BTreeMap<String, DiscoverySenderState>,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SideChunkAssembly {
+    total: u16,
+    received: BTreeMap<u16, Arc<[u8]>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SideTransportState {
+    tx_template_ids: BTreeMap<u64, u32>,
+    tx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    rx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
+    rx_chunks: BTreeMap<u32, SideChunkAssembly>,
+    next_chunk_id: u32,
+    next_template_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SideHeaderTemplate {
+    hash: u64,
+    base_flags: u8,
+    prefix: Arc<[u8]>,
+    between: Arc<[u8]>,
+    reliable_flags: Option<u8>,
+}
+
+type SideTemplateExtract<'a> = (
+    SideHeaderTemplate,
+    u8,
+    u64,
+    u64,
+    u16,
+    Option<(u32, u32)>,
+    &'a [u8],
+);
 
 #[derive(Debug, Clone, Default)]
 struct AdaptiveRouteStats {
@@ -383,6 +451,7 @@ struct RelayInner {
     route_selection_cursors: BTreeMap<Option<RelaySideId>, u64>,
     adaptive_route_stats: BTreeMap<RelaySideId, AdaptiveRouteStats>,
     side_runtime_stats: BTreeMap<RelaySideId, SideRuntimeStatsInner>,
+    side_transport: BTreeMap<RelaySideId, SideTransportState>,
     rx_queue: BoundedDeque<RelayRxItem>,
     tx_queue: BoundedDeque<RelayTxItem>,
     replay_queue: BoundedDeque<RelayReplayItem>,
@@ -830,6 +899,7 @@ impl Relay {
                 route_selection_cursors: BTreeMap::new(),
                 adaptive_route_stats: BTreeMap::new(),
                 side_runtime_stats: BTreeMap::new(),
+                side_transport: BTreeMap::new(),
                 rx_queue: BoundedDeque::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
                 tx_queue: BoundedDeque::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
                 replay_queue: BoundedDeque::new(
@@ -1175,6 +1245,12 @@ impl Relay {
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
             RelayItem::Serialized(bytes) => {
+                if serialize::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(None);
+                }
                 let pkt = serialize::deserialize_packet(bytes.as_ref())?;
                 if pkt.data_type() != crate::DataType::ReliableAck
                     || !Self::is_end_to_end_ack_sender(pkt.sender())
@@ -1409,13 +1485,13 @@ impl Relay {
         side: RelaySideId,
         bytes: Arc<[u8]>,
     ) -> TelemetryResult<()> {
-        let handler = {
+        let (handler, opts) = {
             let st = self.state.lock();
             let side_ref = Self::side_ref(&st, side)?;
             if !side_ref.opts.egress_enabled {
                 return Ok(());
             }
-            side_ref.tx_handler.clone()
+            (side_ref.tx_handler.clone(), side_ref.opts)
         };
 
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
@@ -1426,8 +1502,24 @@ impl Relay {
             .map(|env| env.ty)
             .unwrap_or(crate::DataType::ReliableAck);
         let result = match handler {
-            RelayTxHandlerFn::Serialized(f) => f(bytes.as_ref()),
+            RelayTxHandlerFn::Serialized(f) => {
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    f(frame.as_ref())?;
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, 1);
+                return Ok(());
+            }
             RelayTxHandlerFn::Packet(f) => {
+                if serialize::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(());
+                }
                 let pkt = serialize::deserialize_packet(bytes.as_ref())?;
                 f(&pkt)
             }
@@ -1511,9 +1603,14 @@ impl Relay {
                         return Err(TelemetryError::Io("side tx busy"));
                     };
                     let started_ms = self.clock.now_ms();
-                    f(bytes.as_ref())?;
-                    self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
-                    self.note_side_tx_success(side, ty, bytes.len(), 1);
+                    let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                    let mut sent_bytes = 0usize;
+                    for frame in frames {
+                        f(frame.as_ref())?;
+                        sent_bytes = sent_bytes.saturating_add(frame.len());
+                    }
+                    self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                    self.note_side_tx_success(side, ty, sent_bytes, 1);
                     return Ok(());
                 }
                 Arc::from(v)
@@ -1524,9 +1621,14 @@ impl Relay {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        f(bytes.as_ref())?;
-        self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
-        self.note_side_tx_success(side, ty, bytes.len(), 1);
+        let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+        let mut sent_bytes = 0usize;
+        for frame in frames {
+            f(frame.as_ref())?;
+            sent_bytes = sent_bytes.saturating_add(frame.len());
+        }
+        self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+        self.note_side_tx_success(side, ty, sent_bytes, 1);
 
         {
             let mut st = self.state.lock();
@@ -1803,7 +1905,11 @@ impl Relay {
         }
         let packet_id = match data {
             RelayItem::Packet(pkt) => pkt.packet_id(),
-            RelayItem::Serialized(bytes) => serialize::packet_id_from_wire(bytes.as_ref())?,
+            RelayItem::Serialized(bytes) => match serialize::packet_id_from_wire(bytes.as_ref()) {
+                Ok(packet_id) => packet_id,
+                Err(TelemetryError::Deserialize("reliable control frame")) => return Ok(sides),
+                Err(err) => return Err(err),
+            },
         };
         let Some(acked) = st.end_to_end_acked_destinations.get(&packet_id) else {
             return Ok(sides);
@@ -2091,9 +2197,17 @@ impl Relay {
 
         let sender = match data {
             RelayItem::Packet(pkt) => pkt.sender().to_owned(),
-            RelayItem::Serialized(bytes) => serialize::deserialize_packet(bytes.as_ref())?
-                .sender()
-                .to_owned(),
+            RelayItem::Serialized(bytes) => {
+                if serialize::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(None);
+                }
+                serialize::deserialize_packet(bytes.as_ref())?
+                    .sender()
+                    .to_owned()
+            }
         };
         Ok(Some(sender))
     }
@@ -2248,6 +2362,12 @@ impl Relay {
             RelayItem::Serialized(bytes) => {
                 let env = serialize::peek_envelope(bytes.as_ref())?;
                 if !discovery::is_discovery_type(env.ty) {
+                    return Ok(());
+                }
+                if serialize::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
                     return Ok(());
                 }
                 serialize::deserialize_packet(bytes.as_ref())?
@@ -2477,6 +2597,25 @@ impl Relay {
         self.add_side_serialized_with_options(name, tx, RelaySideOptions::default())
     }
 
+    /// Register a serialized side with bounded-frame transport enabled.
+    ///
+    /// `max_frame_bytes == 0` leaves frames unbounded.
+    pub fn add_side_serialized_small_packets<F>(
+        &self,
+        name: &'static str,
+        tx: F,
+        max_frame_bytes: usize,
+    ) -> RelaySideId
+    where
+        F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        self.add_side_serialized_with_options(
+            name,
+            tx,
+            RelaySideOptions::default().with_small_packet_transport(max_frame_bytes),
+        )
+    }
+
     /// Register a serialized-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` enables relay-managed per-hop ACK/retransmit behavior on this side.
@@ -2500,6 +2639,7 @@ impl Relay {
         }));
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -2535,6 +2675,7 @@ impl Relay {
         }));
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -3075,9 +3216,12 @@ impl Relay {
     /// This is still “fast enough” for many cases, but it is not allocation-free / ISR-safe.
     pub fn rx_serialized_from_side(&self, src: RelaySideId, bytes: &[u8]) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(src)?;
+        let Some(bytes) = self.decode_side_transport_frame(src, bytes)? else {
+            return Ok(());
+        };
         let mut st = self.state.lock();
 
-        let data = RelayItem::Serialized(Arc::from(bytes));
+        let data = RelayItem::Serialized(bytes);
         let priority = Self::relay_item_priority(&data)?;
         st.push_rx(RelayRxItem {
             src,
@@ -3217,6 +3361,10 @@ impl Relay {
                 && is_reliable_type(frame.envelope.ty)
                 && let Some(hdr) = frame.reliable
             {
+                if frame.ack_only() {
+                    self.handle_reliable_ack(item.src, frame.envelope.ty, hdr.ack);
+                    return Ok(());
+                }
                 let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
                 let unsequenced = (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
@@ -3397,6 +3545,425 @@ impl Relay {
         Ok(())
     }
 
+    #[inline]
+    fn crc32_bytes(data: &[u8]) -> u32 {
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
+        let mut out = Vec::with_capacity(
+            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + serialize::CRC32_BYTES,
+        );
+        out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
+        out.push(kind);
+        out.extend_from_slice(body);
+        let crc = Self::crc32_bytes(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        Arc::from(out)
+    }
+
+    fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
+        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + serialize::CRC32_BYTES {
+            return Ok(None);
+        }
+        if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
+            return Ok(None);
+        }
+        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let expected = u32::from_le_bytes([
+            bytes[data_len],
+            bytes[data_len + 1],
+            bytes[data_len + 2],
+            bytes[data_len + 3],
+        ]);
+        let data = &bytes[..data_len];
+        if Self::crc32_bytes(data) != expected {
+            return Err(TelemetryError::Deserialize("side transport crc32 mismatch"));
+        }
+        let kind = data[SIDE_TRANSPORT_MAGIC.len()];
+        Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
+    }
+
+    fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        for _ in 0..10 {
+            let byte = *buf
+                .get(*off)
+                .ok_or(TelemetryError::Deserialize("short read"))?;
+            *off += 1;
+            result |= u64::from(byte & 0x7F) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+        Err(TelemetryError::Deserialize("uleb128 too long"))
+    }
+
+    fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
+        if bytes.len() < serialize::CRC32_BYTES + 4 {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let data = &bytes[..data_len];
+        let mut off = 0usize;
+        let flags = *data
+            .get(off)
+            .ok_or(TelemetryError::Deserialize("short prelude"))?;
+        off += 1;
+        off += 1; // NEP
+        let _ty = Self::read_uleb128_local(data, &mut off)?;
+        let data_size_off = off;
+        let data_size = Self::read_uleb128_local(data, &mut off)?;
+        let timestamp = Self::read_uleb128_local(data, &mut off)?;
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            u16::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+        } else {
+            0
+        };
+        let between_start = off;
+        let sender_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+            .map_err(|_| TelemetryError::Deserialize("sender length too large"))?;
+        let sender_wire_len = if (flags & SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED) != 0 {
+            usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Deserialize("sender wire length too large"))?
+        } else {
+            sender_len
+        };
+        if data.len() < off + SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        off += SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len;
+        if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
+            let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Deserialize("wire contract length"))?;
+            if data.len() < off + contract_len {
+                return Err(TelemetryError::Deserialize("short buffer"));
+            }
+            off += contract_len;
+        }
+        let reliable_off = serialize::reliable_header_offset(bytes)?;
+        let (reliable_flags, reliable_seq_ack, payload_off) = if let Some(rel_off) = reliable_off {
+            if data.len() < rel_off + serialize::RELIABLE_HEADER_BYTES {
+                return Err(TelemetryError::Deserialize("short buffer"));
+            }
+            let rel_flags = data[rel_off];
+            let seq = u32::from_le_bytes([
+                data[rel_off + 1],
+                data[rel_off + 2],
+                data[rel_off + 3],
+                data[rel_off + 4],
+            ]);
+            let ack = u32::from_le_bytes([
+                data[rel_off + 5],
+                data[rel_off + 6],
+                data[rel_off + 7],
+                data[rel_off + 8],
+            ]);
+            (
+                Some(rel_flags),
+                Some((seq, ack)),
+                rel_off + serialize::RELIABLE_HEADER_BYTES,
+            )
+        } else {
+            (None, None, off)
+        };
+        if payload_off > data.len() {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        let payload = &data[payload_off..];
+        let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
+        let between = Arc::<[u8]>::from(&data[between_start..reliable_off.unwrap_or(payload_off)]);
+        let base_flags =
+            flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
+        let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
+        hash = hash_bytes_u64(hash, &[base_flags]);
+        hash = hash_bytes_u64(hash, &prefix);
+        hash = hash_bytes_u64(hash, &between);
+        if let Some(rel_flags) = reliable_flags {
+            hash = hash_bytes_u64(hash, &[rel_flags]);
+        }
+        let template = SideHeaderTemplate {
+            hash,
+            base_flags,
+            prefix,
+            between,
+            reliable_flags,
+        };
+        Ok((
+            template,
+            flags,
+            data_size,
+            timestamp,
+            nonce,
+            reliable_seq_ack,
+            payload,
+        ))
+    }
+
+    fn reconstruct_side_compact_frame(
+        template: &SideHeaderTemplate,
+        body: &[u8],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        if body.is_empty() {
+            return Err(TelemetryError::Deserialize("short side compact frame"));
+        }
+        let mut off = 0usize;
+        let flags = body[off];
+        off += 1;
+        if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
+            != template.base_flags
+        {
+            return Err(TelemetryError::Deserialize("side compact flags mismatch"));
+        }
+        let data_size = Self::read_uleb128_local(body, &mut off)?;
+        let timestamp = Self::read_uleb128_local(body, &mut off)?;
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            Some(Self::read_uleb128_local(body, &mut off)?)
+        } else {
+            None
+        };
+        let reliable_seq_ack = if template.reliable_flags.is_some() {
+            if body.len() < off + 8 {
+                return Err(TelemetryError::Deserialize("short side compact reliable"));
+            }
+            let seq = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+            let ack =
+                u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+            off += 8;
+            Some((seq, ack))
+        } else {
+            None
+        };
+        let payload = &body[off..];
+        let mut raw = Vec::with_capacity(
+            1 + template.prefix.len() + template.between.len() + payload.len() + 32,
+        );
+        raw.push(flags);
+        raw.extend_from_slice(&template.prefix);
+        Self::write_uleb128_local(data_size, &mut raw);
+        Self::write_uleb128_local(timestamp, &mut raw);
+        if let Some(nonce) = nonce {
+            Self::write_uleb128_local(nonce, &mut raw);
+        }
+        raw.extend_from_slice(&template.between);
+        if let Some(rel_flags) = template.reliable_flags {
+            raw.push(rel_flags);
+            let (seq, ack) = reliable_seq_ack
+                .ok_or(TelemetryError::Deserialize("missing side compact reliable"))?;
+            raw.extend_from_slice(&seq.to_le_bytes());
+            raw.extend_from_slice(&ack.to_le_bytes());
+        }
+        raw.extend_from_slice(payload);
+        let crc = Self::crc32_bytes(&raw);
+        raw.extend_from_slice(&crc.to_le_bytes());
+        Ok(Arc::from(raw))
+    }
+
+    fn split_side_transport_frame(
+        &self,
+        side: RelaySideId,
+        frame: Arc<[u8]>,
+        max_frame_bytes: usize,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
+            return Err(TelemetryError::BadArg);
+        }
+        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
+        let mut st = self.state.lock();
+        let side_state = st
+            .side_transport
+            .get_mut(&side)
+            .ok_or(TelemetryError::BadArg)?;
+        let transfer_id = side_state.next_chunk_id.wrapping_add(1).max(1);
+        side_state.next_chunk_id = transfer_id;
+        drop(st);
+
+        let total = frame.len().div_ceil(payload_budget);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let mut frames = Vec::with_capacity(total);
+        for (idx, chunk) in frame.chunks(payload_budget).enumerate() {
+            let mut body = Vec::with_capacity(8 + chunk.len());
+            body.extend_from_slice(&transfer_id.to_le_bytes());
+            body.extend_from_slice(&(idx as u16).to_le_bytes());
+            body.extend_from_slice(&total_u16.to_le_bytes());
+            body.extend_from_slice(chunk);
+            frames.push(Self::wrap_side_transport_frame(
+                SIDE_TRANSPORT_KIND_CHUNK,
+                &body,
+            ));
+        }
+        Ok(frames)
+    }
+
+    fn encode_side_transport_frames(
+        &self,
+        side: RelaySideId,
+        opts: RelaySideOptions,
+        raw: Arc<[u8]>,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if opts.max_frame_bytes == 0 {
+            return Ok(vec![raw]);
+        }
+        let (template, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+            Self::extract_side_header_template(raw.as_ref())?;
+        let (template_id, use_compact) = {
+            let mut st = self.state.lock();
+            let side_state = st
+                .side_transport
+                .get_mut(&side)
+                .ok_or(TelemetryError::BadArg)?;
+            if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
+                (id, true)
+            } else {
+                let next = side_state.next_template_id.wrapping_add(1).max(1);
+                side_state.next_template_id = next;
+                side_state.tx_template_ids.insert(template.hash, next);
+                side_state.tx_templates.insert(template.hash, template);
+                (next, false)
+            }
+        };
+        let wrapped = if use_compact {
+            let mut body = Vec::with_capacity(payload.len() + 32);
+            body.push(flags);
+            Self::write_uleb128_local(u64::from(template_id), &mut body);
+            Self::write_uleb128_local(data_size, &mut body);
+            Self::write_uleb128_local(timestamp, &mut body);
+            if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+                Self::write_uleb128_local(u64::from(nonce), &mut body);
+            }
+            if let Some((seq, ack)) = reliable_seq_ack {
+                body.extend_from_slice(&seq.to_le_bytes());
+                body.extend_from_slice(&ack.to_le_bytes());
+            }
+            body.extend_from_slice(payload);
+            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body)
+        } else {
+            let mut body = Vec::with_capacity(raw.len() + 4);
+            Self::write_uleb128_local(u64::from(template_id), &mut body);
+            body.extend_from_slice(raw.as_ref());
+            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
+        };
+        if wrapped.len() > opts.max_frame_bytes {
+            self.split_side_transport_frame(side, wrapped, opts.max_frame_bytes)
+        } else {
+            Ok(vec![wrapped])
+        }
+    }
+
+    fn decode_side_transport_frame(
+        &self,
+        side: RelaySideId,
+        bytes: &[u8],
+    ) -> TelemetryResult<Option<Arc<[u8]>>> {
+        let Some((kind, body)) = Self::parse_side_transport_wrapper(bytes)? else {
+            return Ok(Some(Arc::from(bytes)));
+        };
+        match kind {
+            SIDE_TRANSPORT_KIND_FULL => {
+                let mut off = 0usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                let raw = Arc::<[u8]>::from(&body[off..]);
+                if let Ok((template, ..)) = Self::extract_side_header_template(raw.as_ref()) {
+                    let mut st = self.state.lock();
+                    if let Some(side_state) = st.side_transport.get_mut(&side) {
+                        side_state
+                            .rx_templates_by_id
+                            .insert(template_id, template.clone());
+                        side_state.rx_templates.insert(template.hash, template);
+                    }
+                }
+                Ok(Some(raw))
+            }
+            SIDE_TRANSPORT_KIND_COMPACT => {
+                if body.is_empty() {
+                    return Err(TelemetryError::Deserialize("short side compact frame"));
+                }
+                let mut off = 1usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
+                compact_body.push(body[0]);
+                compact_body.extend_from_slice(&body[off..]);
+                let template = {
+                    let st = self.state.lock();
+                    st.side_transport
+                        .get(&side)
+                        .and_then(|state| state.rx_templates_by_id.get(&template_id))
+                        .cloned()
+                }
+                .ok_or(TelemetryError::Deserialize("unknown side compact template"))?;
+                Self::reconstruct_side_compact_frame(&template, &compact_body).map(Some)
+            }
+            SIDE_TRANSPORT_KIND_CHUNK => {
+                if body.len() < 8 {
+                    return Err(TelemetryError::Deserialize("short side chunk frame"));
+                }
+                let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let index = u16::from_le_bytes([body[4], body[5]]);
+                let total = u16::from_le_bytes([body[6], body[7]]);
+                let payload = Arc::<[u8]>::from(&body[8..]);
+                let assembled = {
+                    let mut st = self.state.lock();
+                    let side_state = st
+                        .side_transport
+                        .get_mut(&side)
+                        .ok_or(TelemetryError::BadArg)?;
+                    let entry = side_state.rx_chunks.entry(transfer_id).or_default();
+                    if entry.total == 0 {
+                        entry.total = total;
+                    } else if entry.total != total {
+                        side_state.rx_chunks.remove(&transfer_id);
+                        return Err(TelemetryError::Deserialize("side chunk total mismatch"));
+                    }
+                    entry.received.entry(index).or_insert(payload);
+                    if entry.received.len() == usize::from(total) {
+                        let entry = side_state
+                            .rx_chunks
+                            .remove(&transfer_id)
+                            .ok_or(TelemetryError::Deserialize("side chunk missing"))?;
+                        let mut out = Vec::new();
+                        for idx in 0..entry.total {
+                            let chunk = entry
+                                .received
+                                .get(&idx)
+                                .ok_or(TelemetryError::Deserialize("side chunk gap"))?;
+                            out.extend_from_slice(chunk);
+                        }
+                        Some(Arc::<[u8]>::from(out))
+                    } else {
+                        None
+                    }
+                };
+                match assembled {
+                    Some(frame) => self.decode_side_transport_frame(side, frame.as_ref()),
+                    None => Ok(None),
+                }
+            }
+            _ => Err(TelemetryError::Deserialize("unknown side transport frame")),
+        }
+    }
+
     /// Helper: call a TX handler with the best representation we have.
     /// - Packet handler + Packet item: direct.
     /// - Serialized handler + Serialized item: direct.
@@ -3408,6 +3975,10 @@ impl Relay {
         handler: &RelayTxHandlerFn,
         data: &RelayItem,
     ) -> TelemetryResult<()> {
+        let opts = {
+            let st = self.state.lock();
+            Self::side_ref(&st, side)?.opts
+        };
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
         };
@@ -3418,15 +3989,39 @@ impl Relay {
         };
         let result = match (handler, data) {
             // Fast paths
-            (RelayTxHandlerFn::Serialized(f), RelayItem::Serialized(bytes)) => f(bytes.as_ref()),
+            (RelayTxHandlerFn::Serialized(f), RelayItem::Serialized(bytes)) => {
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    f(frame.as_ref())?;
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, 1);
+                return Ok(());
+            }
             (RelayTxHandlerFn::Packet(f), RelayItem::Packet(pkt)) => f(pkt),
 
             // Conversion paths
             (RelayTxHandlerFn::Serialized(f), RelayItem::Packet(pkt)) => {
                 let owned = serialize::serialize_packet(pkt);
-                f(&owned)
+                let frames = self.encode_side_transport_frames(side, opts, owned)?;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    f(frame.as_ref())?;
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, 1);
+                return Ok(());
             }
             (RelayTxHandlerFn::Packet(f), RelayItem::Serialized(bytes)) => {
+                if serialize::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(());
+                }
                 let pkt = serialize::deserialize_packet(bytes.as_ref())?;
                 f(&pkt)
             }

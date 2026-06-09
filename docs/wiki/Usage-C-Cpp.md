@@ -4,6 +4,11 @@ The C API is exposed via
 C-Headers/sedsprintf.h ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/C-Headers/sedsprintf.h))
 and a static library built by Cargo.
 
+`C-Headers/sedsprintf.h` is a static checked-in ABI header. Runtime data types and endpoints are
+registered at runtime, so the header no longer needs to be generated for each schema. Build-time
+payload storage settings such as `SEDSPRINTF_RS_MAX_STACK_PAYLOAD` / `MAX_STACK_PAYLOAD` are still
+preserved and forwarded into the Rust build.
+
 ## CMake integration (recommended)
 
 ```cmake
@@ -23,15 +28,29 @@ set(SEDSPRINTF_RS_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
 set(SEDSPRINTF_RS_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
 set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
+# Optional wrappers and feature-gated crypto shim support.
+# Leave wrappers OFF when you only want the raw ABI header/library.
+set(SEDSPRINTF_RS_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+# set(SEDSPRINTF_RS_ENABLE_CPP_WRAPPER ON CACHE BOOL "" FORCE)
+# set(SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM ON CACHE BOOL "" FORCE)
+
 add_subdirectory(${CMAKE_SOURCE_DIR}/sedsprintf_rs sedsprintf_rs_build)
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::sedsprintf_rs)
+
+# If SEDSPRINTF_RS_ENABLE_C_WRAPPER is ON and you want the reusable C wrapper:
+# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::c_wrapper)
+# If SEDSPRINTF_RS_ENABLE_CPP_WRAPPER is ON and you want the C++ header wrapper:
+# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::cpp_wrapper)
 ```
 
 Important CMake variables:
 
 - `SEDSPRINTF_EMBEDDED_BUILD` (ON/OFF)
 - `SEDSPRINTF_RS_FORCE_RELEASE` (ON/OFF)
+- `SEDSPRINTF_RS_ENABLE_C_WRAPPER` (ON/OFF)
+- `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` (ON/OFF)
+- `SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM` (ON/OFF)
 - `SEDSPRINTF_RS_TARGET` (Rust target triple)
 - `SEDSPRINTF_RS_DEVICE_IDENTIFIER`
 - `SEDSPRINTF_RS_MAX_STACK_PAYLOAD`
@@ -52,6 +71,86 @@ DEVICE_IDENTIFIER=FC26_MAIN cargo build --release
 ```
 
 The static library will be under `target/release/` (or under `target/<triple>/release` for embedded targets).
+
+## Header Choices
+
+There are three intentionally separate C/C++ surfaces:
+
+- `C-Headers/sedsprintf.h`: the raw ABI header. It is always available and does not expose
+  convenience macros or wrapper-owned globals.
+- `c-wrapper/sedsprintf_c_wrapper.h`: optional C convenience API. Enable
+  `SEDSPRINTF_RS_ENABLE_C_WRAPPER` and link `sedsprintf_rs::c_wrapper`.
+- `c-wrapper/sedsprintf_cpp_wrapper.hpp`: optional header-only C++ convenience API. Enable
+  `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` and link `sedsprintf_rs::cpp_wrapper`.
+
+## Optional Native C Wrapper
+
+When `SEDSPRINTF_RS_ENABLE_C_WRAPPER` is `ON`, CMake also builds
+`sedsprintf_rs::c_wrapper`, which provides `sedsprintf_c_wrapper.h`.
+
+The wrapper has two styles:
+
+- Global router/relay helpers for simple board firmware. The wrapper owns one global router and
+  one global relay, so application code does not need to pass handles through every function.
+- Explicit `SedsWrapperRouter` / `SedsWrapperRelay` structs for tests or applications that need
+  more than one instance.
+
+Minimal global-router usage:
+
+```C
+#include "sedsprintf_c_wrapper.h"
+
+static SedsResult tx_can(const uint8_t *bytes, size_t len, void *user)
+{
+    (void)bytes; (void)len; (void)user;
+    return SEDS_OK;
+}
+
+void app_init(void)
+{
+    SedsWrapperRouterConfig cfg = seds_wrapper_router_default_config();
+    cfg.sender = SEDS_NAME_LITERAL("FC26_MAIN");
+    cfg.configure_timesync = true;
+
+    seds_global_router_init(&cfg);
+    seds_global_router_add_serialized_small_side(
+        SEDS_NAME_LITERAL("CAN"),
+        tx_can,
+        NULL,
+        true,
+        64);
+}
+
+void app_log_flight_state(uint8_t state)
+{
+    SedsTypeRef ty;
+    if (seds_type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), &ty) == SEDS_OK) {
+        seds_global_router_log_typed(ty, &state, 1, sizeof(state), SEDS_EK_UNSIGNED, NULL, 0);
+    }
+}
+```
+
+Minimal global-relay usage:
+
+```C
+SedsWrapperRelayConfig cfg = seds_wrapper_relay_default_config();
+cfg.sender = SEDS_NAME_LITERAL("RF_RELAY");
+seds_global_relay_init(&cfg);
+
+SedsSideRef can = seds_global_relay_add_serialized_small_side(
+    SEDS_NAME_LITERAL("CAN"), tx_can, NULL, true, 64);
+SedsSideRef uart = seds_global_relay_add_serialized_side(
+    SEDS_NAME_LITERAL("UART"), tx_uart, NULL, true);
+
+/* Feed bytes received from CAN. The relay owns queueing and forwarding. */
+seds_global_relay_rx_serialized_from_side(can, rx_bytes, rx_len);
+seds_global_relay_process(0);
+```
+
+The global helpers cover side registration, fixed-size packet splitting, RX queueing, periodic
+processing, discovery/time-sync polling, route controls, typed logging, and topology/runtime-stat
+exports. Use `seds_global_router_handle()` or `seds_global_relay_handle()` only when you need to
+drop down to a raw ABI function that is not wrapped yet.
 
 ## Minimal C example
 
@@ -130,7 +229,16 @@ int main(void)
     seds_router_add_side_serialized(r, "TX", 2, tx_send, NULL, true);
 
     float data[3] = {1.0f, 2.0f, 3.0f};
-    seds_router_log(r, gps_data, data, sizeof(data));
+    seds_router_log_typed_ex(
+        r,
+        gps_data,
+        data,
+        3,
+        sizeof(float),
+        SEDS_EK_FLOAT,
+        NULL,
+        0
+    );
     seds_router_process_all_queues(r);
 
     seds_router_free(r);
@@ -140,6 +248,190 @@ int main(void)
 
 On `std` builds, passing `NULL` for `now_ms_cb` makes the router use its own internal monotonic
 clock. On `no_std` builds, provide a monotonic clock callback.
+
+## Native Board Helpers
+
+The optional `c-wrapper/` sources provide the reusable router-node wrapper pattern used by the
+gateway, RF, actuator, power, valve, DAQ, and flight-computer firmware. Enable it with:
+
+```cmake
+set(SEDSPRINTF_RS_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::c_wrapper)
+```
+
+Then include:
+
+```C
+#include "sedsprintf_c_wrapper.h"
+```
+
+The shared helper surface includes:
+
+- `SedsName`, `SedsTypeRef`, `SedsEndpointRef`, and `SedsSideRef` wrap runtime names, schema IDs,
+  and side IDs so new code does not pass raw strings or raw integers throughout the application.
+- `seds_type_ref_by_name(...)` and `seds_endpoint_ref_by_name(...)` resolve names once. Store the
+  resulting typed refs and use those for logging, routing, and packet checks.
+- `SedsWrapperRouter` plus `SedsWrapperRouterConfig` wraps router creation, sender setup, optional
+  timesync configuration, initial discovery announce, serialized side registration, RX enqueue,
+  periodic queue processing, and typed/string logging.
+- `seds_router_add_side_serialized_small_packets(...)` and
+  `seds_relay_add_side_serialized_small_packets(...)` expose compact/bounded side transport from C.
+  Use these for fixed-size links such as CAN or I2C.
+
+Example:
+
+```C
+static SedsResult can_tx(const uint8_t *bytes, size_t len, void *user)
+{
+    (void)user;
+    return board_can_send(bytes, len) == 0 ? SEDS_OK : SEDS_IO;
+}
+
+static SedsWrapperRouter telemetry;
+static SedsTypeRef flight_state_ty;
+
+void telemetry_init(void)
+{
+    SedsWrapperRouterConfig cfg = seds_wrapper_router_default_config();
+    cfg.sender = SEDS_NAME_LITERAL("ACTUATOR");
+    cfg.configure_timesync = true;
+    cfg.timesync_role = 0; /* consumer */
+
+    (void)seds_type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), &flight_state_ty);
+    (void)seds_wrapper_router_init(&telemetry, &cfg);
+    (void)seds_wrapper_router_add_serialized_small_side(
+        &telemetry,
+        SEDS_NAME_LITERAL("can"),
+        can_tx,
+        NULL,
+        true,
+        64
+    );
+}
+
+void telemetry_rx_can(const uint8_t *bytes, size_t len)
+{
+    (void)seds_wrapper_router_rx_serialized_from_side(
+        &telemetry,
+        telemetry.primary_side,
+        bytes,
+        len
+    );
+}
+
+void telemetry_publish_flight_state(uint8_t state)
+{
+    (void)seds_wrapper_router_log_typed(
+        &telemetry,
+        flight_state_ty,
+        &state,
+        1,
+        sizeof(state),
+        SEDS_EK_UNSIGNED,
+        NULL,
+        1
+    );
+}
+```
+
+The helper layer is optional. The lower-level ABI remains available for firmware that needs direct
+control over every router and relay call.
+
+## Managed Variables
+
+Routers can cache the latest packet for selected user data types and answer network resync requests
+with that original value packet. Endpoint handlers receive the replayed value exactly like a normal
+update, which lets a restarted board request global state such as `FLIGHT_STATE` immediately after
+joining.
+
+```C
+SedsTypeRef flight_state_ty;
+seds_type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), &flight_state_ty);
+
+seds_global_router_enable_managed_variable(flight_state_ty);
+
+/* After restart or link recovery, ask peers to replay the latest value. */
+seds_global_router_request_managed_variable(flight_state_ty);
+seds_global_router_process(0);
+```
+
+Producers should also enable the same managed variable type. When they publish or receive that data
+type, the router refreshes its cache. C firmware can seed the cache from a serialized packet with
+`seds_router_seed_managed_variable_serialized(...)`; Rust firmware can use
+`Router::seed_managed_variable(...)`.
+
+## Optional C++ Wrapper
+
+Enable `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` and include `sedsprintf_cpp_wrapper.hpp` when C++ code
+wants typed helpers without the C macro layer:
+
+```cpp
+#include "sedsprintf_cpp_wrapper.hpp"
+
+void publish_state(SedsRouter *router, uint8_t state)
+{
+    SedsTypeRef ty{};
+    if (seds::type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), ty) == SEDS_OK) {
+        (void)seds::router_log(router, ty, &state, 1);
+    }
+}
+```
+
+## Optional Crypto Shim
+
+Enable the crypto shim APIs with Cargo feature `crypto-shim`, build.py option `crypto_shim`, or
+CMake option `SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM`. C/C++ builds receive the
+`SEDS_ENABLE_CRYPTO_SHIM` define automatically when the CMake option is enabled.
+
+For C firmware, register board-specific crypto callbacks:
+
+```C
+#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+static SedsResult seal_cb(
+    const uint8_t *aad, size_t aad_len,
+    const uint8_t *plain, size_t plain_len,
+    uint8_t *out, size_t out_cap, size_t *out_len,
+    void *user)
+{
+    (void)user;
+    return board_crypto_seal(aad, aad_len, plain, plain_len, out, out_cap, out_len);
+}
+
+static SedsResult open_cb(
+    const uint8_t *aad, size_t aad_len,
+    const uint8_t *cipher, size_t cipher_len,
+    uint8_t *out, size_t out_cap, size_t *out_len,
+    void *user)
+{
+    (void)user;
+    return board_crypto_open(aad, aad_len, cipher, cipher_len, out, out_cap, out_len);
+}
+
+void crypto_init(void)
+{
+    (void)seds_crypto_register_shim(seal_cb, open_cb, NULL);
+}
+#endif
+```
+
+For embedded Rust-only projects, implement `sedsprintf_rs::crypto::CryptoShim` directly and call
+`seal_with` / `open_with`. This avoids exporting a C ABI when the whole firmware is Rust:
+
+```rust
+#[cfg(feature = "crypto-shim")]
+struct BoardCrypto;
+
+#[cfg(feature = "crypto-shim")]
+impl sedsprintf_rs::crypto::CryptoShim for BoardCrypto {
+    fn seal(&self, aad: &[u8], plaintext: &[u8], out: &mut [u8]) -> Result<usize, sedsprintf_rs::SedsError> {
+        board_crypto_seal(aad, plaintext, out)
+    }
+
+    fn open(&self, aad: &[u8], ciphertext: &[u8], out: &mut [u8]) -> Result<usize, sedsprintf_rs::SedsError> {
+        board_crypto_open(aad, ciphertext, out)
+    }
+}
+```
 
 The first `seds_router_new(...)` mode argument is retained for ABI compatibility with older
 headers. Current routers use runtime side route controls instead of sink/relay construction modes,
@@ -223,8 +515,11 @@ Topology export is also available in the C ABI:
 - `seds_relay_export_topology_len(...)` / `seds_relay_export_topology(...)`
 
 These return a JSON snapshot. The top-level `routers` array contains each discovered router, the
-endpoints/time-sync source IDs it owns, and its connections. Per-side route entries also include
-their upstream announcer detail.
+endpoint names/time-sync source IDs it owns, and its connected router sender IDs. Graph-facing
+endpoint fields such as `reachable_endpoints` and `advertised_endpoints` contain
+schema-advertised names; companion fields such as `reachable_endpoint_ids` and
+`advertised_endpoint_ids` preserve the numeric IDs. Per-side route entries also include their
+upstream announcer detail.
 
 Packets already in flight also carry a compact internal wire contract so topology or runtime-schema
 changes do not redirect them to the wrong holder or make them undecodable mid-flight. That contract

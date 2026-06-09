@@ -29,7 +29,8 @@ class PythonTopologyExportTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         if not seds.endpoint_exists(9102):
             seds.register_endpoint(9102, "PY_TOPOLOGY_RADIO_9102")
-        cls.radio = seds.endpoint_info_by_name("PY_TOPOLOGY_RADIO_9102")["id"]
+        cls.radio_name = "PY_TOPOLOGY_RADIO_9102"
+        cls.radio = seds.endpoint_info_by_name(cls.radio_name)["id"]
         cls.discovery_endpoint = int(seds.DataEndpoint.Discovery)
         cls.discovery_announce = int(seds.DataType.DiscoveryAnnounce)
 
@@ -47,10 +48,12 @@ class PythonTopologyExportTests(unittest.TestCase):
         self.assertIn("routers", topology)
         self.assertIn("routes", topology)
         self.assertIn("advertised_endpoints", topology)
+        self.assertIn("advertised_endpoint_ids", topology)
         self.assertIn("advertised_timesync_sources", topology)
         self.assertIsInstance(topology["routers"], list)
         self.assertIsInstance(topology["routes"], list)
         self.assertIsInstance(topology["advertised_endpoints"], list)
+        self.assertIsInstance(topology["advertised_endpoint_ids"], list)
         self.assertIsInstance(topology["advertised_timesync_sources"], list)
         self.assertEqual(len(topology["routes"]), 1)
 
@@ -59,6 +62,7 @@ class PythonTopologyExportTests(unittest.TestCase):
         self.assertIsInstance(route["side_id"], int)
         self.assertIsInstance(route["side_name"], str)
         self.assertIsInstance(route["reachable_endpoints"], list)
+        self.assertIsInstance(route["reachable_endpoint_ids"], list)
         self.assertIsInstance(route["reachable_timesync_sources"], list)
         self.assertIsInstance(route["last_seen_ms"], int)
         self.assertIsInstance(route["age_ms"], int)
@@ -73,7 +77,8 @@ class PythonTopologyExportTests(unittest.TestCase):
         remote_board = next(
             board for board in announcer["routers"] if board["sender_id"] == "REMOTE_NODE"
         )
-        self.assertEqual(remote_board["reachable_endpoints"], [self.radio])
+        self.assertEqual(remote_board["reachable_endpoints"], [self.radio_name])
+        self.assertEqual(remote_board["reachable_endpoint_ids"], [self.radio])
         self.assertIsInstance(remote_board["reachable_timesync_sources"], list)
         self.assertIsInstance(remote_board["connections"], list)
         self.assertIn(local_sender, remote_board["connections"])

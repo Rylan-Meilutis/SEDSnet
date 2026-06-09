@@ -1,16 +1,17 @@
 #[cfg(test)]
 mod reliable_drop_tests {
     use sedsprintf_rs::TelemetryResult;
-    use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
     use sedsprintf_rs::config::{
-        data_type_definition_by_name, endpoint_definition_by_name, register_data_type_with_description,
-        register_endpoint_with_description, DataEndpoint, DataType, RELIABLE_RETRANSMIT_MS,
+        DataEndpoint, DataType, RELIABLE_RETRANSMIT_MS, data_type_definition_by_name,
+        endpoint_definition_by_name, register_data_type_with_description,
+        register_endpoint_with_description,
     };
     use sedsprintf_rs::discovery::build_discovery_announce;
     use sedsprintf_rs::packet::Packet;
     use sedsprintf_rs::relay::{Relay, RelaySideOptions};
     use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
     use sedsprintf_rs::serialize;
+    use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
     use std::collections::{BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1380,7 +1381,9 @@ mod reliable_drop_tests {
                 gs.rx_serialized_queue_from_side(&frame, gs_side).unwrap();
             }
             for frame in drain_queue(&gw_to_ab) {
-                actuator.rx_serialized_queue_from_side(&frame, ab_side).unwrap();
+                actuator
+                    .rx_serialized_queue_from_side(&frame, ab_side)
+                    .unwrap();
             }
             for frame in drain_queue(&ab_to_gw) {
                 gw.rx_serialized_from_side(gw_ab_side, &frame).unwrap();
@@ -1392,7 +1395,9 @@ mod reliable_drop_tests {
                 gw.rx_serialized_from_side(gw_daq_side, &frame).unwrap();
             }
             for frame in drain_queue(&gw_to_fc) {
-                flight.rx_serialized_queue_from_side(&frame, fc_side).unwrap();
+                flight
+                    .rx_serialized_queue_from_side(&frame, fc_side)
+                    .unwrap();
             }
             for frame in drain_queue(&fc_to_gw) {
                 gw.rx_serialized_from_side(gw_fc_side, &frame).unwrap();
@@ -1435,8 +1440,11 @@ mod reliable_drop_tests {
             build_discovery_announce("AB", 0, &[DataEndpoint::named("RADIO")]).unwrap(),
         )
         .unwrap();
-        gw.rx_from_side(gw_daq_side, build_discovery_announce("DAQ", 0, &[]).unwrap())
-            .unwrap();
+        gw.rx_from_side(
+            gw_daq_side,
+            build_discovery_announce("DAQ", 0, &[]).unwrap(),
+        )
+        .unwrap();
         gw.rx_from_side(gw_fc_side, build_discovery_announce("FC", 0, &[]).unwrap())
             .unwrap();
 
@@ -1467,14 +1475,13 @@ mod reliable_drop_tests {
             "AB should appear in GS topology export"
         );
 
-        gs
-            .tx(Packet::from_f32_slice(
-                DataType::named("GPS_DATA"),
-                &[42.0, 1.0, 0.0],
-                &[DataEndpoint::named("RADIO")],
-                42,
-            )
-            .unwrap())
+        gs.tx(Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[42.0, 1.0, 0.0],
+            &[DataEndpoint::named("RADIO")],
+            42,
+        )
+        .unwrap())
             .unwrap();
 
         for _ in 0..8 {

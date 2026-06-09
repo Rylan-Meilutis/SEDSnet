@@ -1,5 +1,5 @@
 #include "telemetry.h"
-#include "sedsprintf.h"
+#include "sedsprintf_c_wrapper.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -126,15 +126,12 @@ static SedsResult apply_local_unix_to_router(SedsRouter *router) {
 }
 
 static SedsResult refresh_local_unix_from_router(void) {
-  SedsDateTime dt;
   if (!g_router.r) {
     return SEDS_ERR;
   }
-  if (seds_router_get_network_time(g_router.r, &dt) != SEDS_OK) {
+  if (seds_router_get_network_time_ms(g_router.r, &g_local_unix_ms) != SEDS_OK) {
     return SEDS_ERR;
   }
-  g_local_unix_ms = unix_ms_from_utc(dt.year, dt.month, dt.day, dt.hour, dt.minute,
-                                     dt.second, dt.millisecond);
   g_local_unix_valid = 1U;
   return SEDS_OK;
 }
@@ -144,11 +141,18 @@ SedsResult init_telemetry_router(void) {
     return SEDS_OK;
   }
 
+  SedsEndpointRef radio_endpoint;
+  SedsResult endpoint_result = seds_endpoint_ref_by_name(SEDS_NAME_LITERAL("RADIO"), &radio_endpoint);
+  if (endpoint_result != SEDS_OK) {
+    printf("Error: RADIO endpoint is not registered\n");
+    return endpoint_result;
+  }
+
   const SedsLocalEndpointDesc locals[] = {
-      {.endpoint = SEDS_EP_RADIO, .packet_handler = on_radio_packet, .user = NULL},
+      {.endpoint = radio_endpoint.id, .packet_handler = on_radio_packet, .user = NULL},
   };
 
-  SedsRouter *r = seds_router_new(SEDS_RM_Sink, host_now_ms, NULL, locals,
+  SedsRouter *r = seds_router_new(Seds_RM_Sink, host_now_ms, NULL, locals,
                                   sizeof(locals) / sizeof(locals[0]));
   if (!r) {
     printf("Error: failed to create router\n");
@@ -177,7 +181,7 @@ SedsResult init_telemetry_router(void) {
   return SEDS_OK;
 }
 
-SedsResult log_telemetry_synchronous(SedsDataType data_type, const void *data,
+SedsResult log_telemetry_synchronous(SedsTypeRef data_type, const void *data,
                                      size_t element_count, size_t element_size) {
   if (!data || element_count == 0U || element_size == 0U) {
     return SEDS_BAD_ARG;
@@ -185,10 +189,10 @@ SedsResult log_telemetry_synchronous(SedsDataType data_type, const void *data,
   if (!g_router.r && init_telemetry_router() != SEDS_OK) {
     return SEDS_ERR;
   }
-  return seds_router_log(g_router.r, data_type, data, element_count * element_size);
+  return seds_router_log(g_router.r, data_type.id, data, element_count * element_size);
 }
 
-SedsResult log_telemetry_asynchronous(SedsDataType data_type, const void *data,
+SedsResult log_telemetry_asynchronous(SedsTypeRef data_type, const void *data,
                                       size_t element_count, size_t element_size) {
   if (!data || element_count == 0U || element_size == 0U) {
     return SEDS_BAD_ARG;
@@ -196,17 +200,17 @@ SedsResult log_telemetry_asynchronous(SedsDataType data_type, const void *data,
   if (!g_router.r && init_telemetry_router() != SEDS_OK) {
     return SEDS_ERR;
   }
-  return seds_router_log_queue(g_router.r, data_type, data, element_count * element_size);
+  return seds_router_log_queue(g_router.r, data_type.id, data, element_count * element_size);
 }
 
-SedsResult log_telemetry_string_asynchronous(SedsDataType data_type, const char *str) {
+SedsResult log_telemetry_string_asynchronous(SedsTypeRef data_type, const char *str) {
   if (!str) {
     return SEDS_BAD_ARG;
   }
   if (!g_router.r && init_telemetry_router() != SEDS_OK) {
     return SEDS_ERR;
   }
-  return seds_router_log_string_queue(g_router.r, data_type, str);
+  return seds_router_log_string_ex(g_router.r, data_type.id, str, strlen(str), NULL, 1);
 }
 
 SedsResult dispatch_tx_queue(void) {

@@ -30,6 +30,7 @@ use alloc::{boxed::Box, string::String, sync::Arc as AArc, vec::Vec};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
+use std::collections::BTreeMap;
 use std::sync::{Arc as SArc, Mutex, OnceLock};
 
 #[cfg(feature = "timesync")]
@@ -40,7 +41,7 @@ use crate::{
     config::{
         DataEndpoint, DataType, data_type_definition, data_type_definition_by_name,
         data_type_exists, endpoint_definition, endpoint_definition_by_name, endpoint_exists,
-        message_class_code, message_class_from_code, message_data_type_code,
+        known_endpoints, message_class_code, message_class_from_code, message_data_type_code,
         message_data_type_from_code, register_data_type_id_with_description,
         register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
         reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
@@ -301,13 +302,40 @@ fn topology_snapshot_to_pydict(
     py: Python<'_>,
     snap: crate::discovery::TopologySnapshot,
 ) -> PyResult<Py<PyDict>> {
+    fn endpoint_name(names: &BTreeMap<DataEndpoint, &'static str>, ep: DataEndpoint) -> String {
+        names
+            .get(&ep)
+            .map(|name| (*name).to_string())
+            .unwrap_or_else(|| format!("endpoint_{}", ep.as_u32()))
+    }
+
+    fn endpoint_names(
+        names: &BTreeMap<DataEndpoint, &'static str>,
+        endpoints: &[DataEndpoint],
+    ) -> Vec<String> {
+        endpoints
+            .iter()
+            .copied()
+            .map(|ep| endpoint_name(names, ep))
+            .collect()
+    }
+
+    fn endpoint_ids(endpoints: &[DataEndpoint]) -> Vec<u32> {
+        endpoints.iter().map(|ep| ep.as_u32()).collect()
+    }
+
+    let endpoint_name_map = known_endpoints()
+        .into_iter()
+        .map(|def| (def.id, def.name))
+        .collect::<BTreeMap<_, _>>();
     let out = PyDict::new(py);
     out.set_item(
         "advertised_endpoints",
-        snap.advertised_endpoints
-            .iter()
-            .map(|ep| ep.as_u32())
-            .collect::<Vec<u32>>(),
+        endpoint_names(&endpoint_name_map, &snap.advertised_endpoints),
+    )?;
+    out.set_item(
+        "advertised_endpoint_ids",
+        endpoint_ids(&snap.advertised_endpoints),
     )?;
     out.set_item(
         "advertised_timesync_sources",
@@ -320,11 +348,11 @@ fn topology_snapshot_to_pydict(
         item.set_item("sender_id", board.sender_id)?;
         item.set_item(
             "reachable_endpoints",
-            board
-                .reachable_endpoints
-                .iter()
-                .map(|ep| ep.as_u32())
-                .collect::<Vec<u32>>(),
+            endpoint_names(&endpoint_name_map, &board.reachable_endpoints),
+        )?;
+        item.set_item(
+            "reachable_endpoint_ids",
+            endpoint_ids(&board.reachable_endpoints),
         )?;
         item.set_item(
             "reachable_timesync_sources",
@@ -342,11 +370,11 @@ fn topology_snapshot_to_pydict(
         route_dict.set_item("side_name", route.side_name)?;
         route_dict.set_item(
             "reachable_endpoints",
-            route
-                .reachable_endpoints
-                .iter()
-                .map(|ep| ep.as_u32())
-                .collect::<Vec<u32>>(),
+            endpoint_names(&endpoint_name_map, &route.reachable_endpoints),
+        )?;
+        route_dict.set_item(
+            "reachable_endpoint_ids",
+            endpoint_ids(&route.reachable_endpoints),
         )?;
         route_dict.set_item(
             "reachable_timesync_sources",
@@ -358,11 +386,11 @@ fn topology_snapshot_to_pydict(
             announcer_dict.set_item("sender_id", announcer.sender_id)?;
             announcer_dict.set_item(
                 "reachable_endpoints",
-                announcer
-                    .reachable_endpoints
-                    .iter()
-                    .map(|ep| ep.as_u32())
-                    .collect::<Vec<u32>>(),
+                endpoint_names(&endpoint_name_map, &announcer.reachable_endpoints),
+            )?;
+            announcer_dict.set_item(
+                "reachable_endpoint_ids",
+                endpoint_ids(&announcer.reachable_endpoints),
             )?;
             announcer_dict.set_item(
                 "reachable_timesync_sources",
@@ -374,11 +402,11 @@ fn topology_snapshot_to_pydict(
                 board_dict.set_item("sender_id", board.sender_id)?;
                 board_dict.set_item(
                     "reachable_endpoints",
-                    board
-                        .reachable_endpoints
-                        .iter()
-                        .map(|ep| ep.as_u32())
-                        .collect::<Vec<u32>>(),
+                    endpoint_names(&endpoint_name_map, &board.reachable_endpoints),
+                )?;
+                board_dict.set_item(
+                    "reachable_endpoint_ids",
+                    endpoint_ids(&board.reachable_endpoints),
                 )?;
                 board_dict.set_item(
                     "reachable_timesync_sources",

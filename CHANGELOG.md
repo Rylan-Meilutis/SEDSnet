@@ -227,8 +227,8 @@
   `./build.py test release` passes with the new behavior.
 - Added `./build.py check`, which runs `cargo clippy -D warnings` across the default, python, and embedded builds, and
   folded that clippy coverage into `./build.py test`.
-- Fixed generated C headers so the checked-in ABI header includes the current logging entry points, including
+- Fixed the static C ABI header so the checked-in header includes the current logging entry points, including
   `seds_router_log_typed`, `seds_router_log_queue_typed`, `seds_router_log_bytes`, and `seds_router_log_f32`.
-- Updated the C header generation path in `build.rs` so `C-Headers/sedsprintf.h` is regenerated with the current ABI
-  instead of drifting behind the exported symbols.
+- Moved `C-Headers/sedsprintf.h` to a static runtime-schema ABI header so user data types and endpoints are resolved
+  by runtime registration instead of generated schema constants.
 - Updated Python stub generation and example telemetry code to match the current public ABI and discovery helpers.

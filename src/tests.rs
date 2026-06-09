@@ -8,10 +8,8 @@ use std::sync::{Arc, Mutex};
 
 type SeenType = Arc<Mutex<Option<(DataType, Vec<f32>)>>>;
 
-fn ensure_common_test_schema() {
-    use crate::config::{
-        register_data_type_with_description, register_endpoint_with_description,
-    };
+pub(crate) fn ensure_common_test_schema() {
+    use crate::config::{register_data_type_with_description, register_endpoint_with_description};
     use crate::{MessageClass, MessageElement, ReliableMode};
     use std::sync::Once;
 
@@ -558,12 +556,13 @@ mod tests2 {
         relay.clear_route_priority(Some(ingress), side_b).unwrap();
         relay.clear_source_route_mode(Some(ingress)).unwrap();
 
-        let total =
-            crate::tests::count_packets_of_type(&seen_a.lock().unwrap(), DataType::named("GPS_DATA"))
-                + crate::tests::count_packets_of_type(
-                    &seen_b.lock().unwrap(),
-                    DataType::named("GPS_DATA"),
-                );
+        let total = crate::tests::count_packets_of_type(
+            &seen_a.lock().unwrap(),
+            DataType::named("GPS_DATA"),
+        ) + crate::tests::count_packets_of_type(
+            &seen_b.lock().unwrap(),
+            DataType::named("GPS_DATA"),
+        );
         assert_eq!(total, 1);
     }
 
@@ -1203,7 +1202,10 @@ mod timeout_tests {
             "expected some work to be done before the timeout budget expired"
         );
         assert!(first_tx <= 1, "first pass should do at most one GPS TX");
-        assert!(first_rx <= 2, "first pass should do at most one loop of RX work");
+        assert!(
+            first_rx <= 2,
+            "first pass should do at most one loop of RX work"
+        );
 
         // Drain the rest to prove there was more work left
         r.process_all_queues_with_timeout(0).unwrap();
@@ -2307,6 +2309,7 @@ mod tests_more {
     /// Endpoint order in the `endpoints` slice must not affect serialized bytes.
     #[test]
     fn serialize_packet_is_order_invariant_for_endpoints() {
+        crate::tests::ensure_common_test_schema();
         use crate::config::{DataEndpoint, DataType};
         use crate::{packet::Packet, serialize};
 
@@ -2314,9 +2317,11 @@ mod tests_more {
         let eps_b = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
 
         let pkt_a = Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], eps_a, 0)
-            .unwrap();
+            .unwrap()
+            .with_nonce(7);
         let pkt_b = Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], eps_b, 0)
-            .unwrap();
+            .unwrap()
+            .with_nonce(7);
 
         let wa = serialize::serialize_packet(&pkt_a);
         let wb = serialize::serialize_packet(&pkt_b);
@@ -2385,7 +2390,11 @@ mod tests_more {
 
         router.process_all_queues_with_timeout(0).unwrap();
 
-        assert_eq!(tx_count.load(Ordering::SeqCst), N, "all queued GPS TX should flush");
+        assert_eq!(
+            tx_count.load(Ordering::SeqCst),
+            N,
+            "all queued GPS TX should flush"
+        );
         assert_eq!(
             rx_count.load(Ordering::SeqCst),
             N + queued_rx,
@@ -3038,6 +3047,84 @@ mod relay_tests {
         Box::new(|| 0u64)
     }
 
+    #[test]
+    fn relay_serialized_side_chunking_reassembles_for_fixed_size_links() {
+        crate::tests::ensure_common_test_schema();
+        use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let chunk_count = Arc::new(AtomicUsize::new(0));
+        let chunk_count_c = chunk_count.clone();
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let max_seen_c = max_seen.clone();
+        let receiver_c = receiver.clone();
+        let relay = Relay::new(zero_clock());
+        let max_frame_bytes = 48usize;
+
+        let input_side = relay.add_side_packet("input", |_pkt| Ok(()));
+        relay.add_side_serialized_small_packets(
+            "fixed-link",
+            move |bytes: &[u8]| {
+                chunk_count_c.fetch_add(1, Ordering::SeqCst);
+                let mut current = max_seen_c.load(Ordering::SeqCst);
+                while bytes.len() > current
+                    && max_seen_c
+                        .compare_exchange(current, bytes.len(), Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    current = max_seen_c.load(Ordering::SeqCst);
+                }
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            max_frame_bytes,
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "fixed-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_frame_bytes,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        let payload = vec![b'R'; 180];
+        let pkt = Packet::new(
+            DataType::TelemetryError,
+            &[DataEndpoint::named("SD_CARD")],
+            "RELAY_CHUNK_SRC",
+            55,
+            Arc::<[u8]>::from(payload),
+        )
+        .unwrap()
+        .with_nonce(31);
+
+        relay.rx_from_side(input_side, pkt).unwrap();
+        relay.process_all_queues().unwrap();
+
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        assert!(chunk_count.load(Ordering::SeqCst) > 1);
+        assert!(max_seen.load(Ordering::SeqCst) <= max_frame_bytes);
+    }
+
     fn wire_for_value(v: u64) -> Arc<[u8]> {
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
@@ -3369,12 +3456,13 @@ mod dedupe_tests {
     use crate::config::{DataEndpoint, DataType};
     use crate::discovery::build_discovery_announce;
     use crate::relay::Relay;
-    use crate::router::{Clock, EndpointHandler, Router, RouterConfig};
+    use crate::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
     use crate::tests::serialized_frame_type;
     use crate::tests::timeout_tests::StepClock;
     use crate::{TelemetryResult, packet::Packet, serialize};
 
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Simple clock that always returns 0.
@@ -3527,6 +3615,191 @@ mod dedupe_tests {
             2,
             "different frames must never be deduplicated"
         );
+    }
+
+    #[test]
+    fn router_rx_serialized_does_not_dedupe_same_payload_same_ms_when_nonce_differs() {
+        crate::tests::ensure_common_test_schema();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_c = hits.clone();
+
+        let handler = EndpointHandler::new_packet_handler(
+            DataEndpoint::named("SD_CARD"),
+            move |_pkt: &Packet| {
+                hits_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        let r = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
+
+        let pkt_a = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[1.0_f32, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD")],
+            0,
+        )
+        .unwrap();
+        let pkt_b = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[1.0_f32, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD")],
+            0,
+        )
+        .unwrap();
+
+        let wire_a = serialize::serialize_packet(&pkt_a);
+        let wire_b = serialize::serialize_packet(&pkt_b);
+
+        r.rx_serialized(&wire_a).unwrap();
+        r.rx_serialized(&wire_b).unwrap();
+
+        assert_ne!(pkt_a.nonce(), pkt_b.nonce());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn serialized_side_header_templates_reduce_followup_frame_size() {
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let frames = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let frames_c = frames.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_serialized_small_packets(
+            "link",
+            move |bytes: &[u8]| {
+                frames_c.lock().unwrap().push(bytes.len());
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            0,
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        let pkt_a = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[1.0_f32, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10,
+        )
+        .unwrap()
+        .with_nonce(11);
+        let pkt_b = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[4.0_f32, 5.0, 6.0],
+            &[DataEndpoint::named("SD_CARD")],
+            11,
+        )
+        .unwrap()
+        .with_nonce(12);
+
+        sender.tx(pkt_a).unwrap();
+        sender.tx(pkt_b).unwrap();
+
+        let lens = frames.lock().unwrap();
+        assert_eq!(delivered.load(Ordering::SeqCst), 2);
+        assert_eq!(lens.len(), 2);
+        assert!(lens[1] < lens[0], "second frame should use compact header");
+    }
+
+    #[test]
+    fn serialized_side_chunking_reassembles_for_fixed_size_links() {
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let chunk_count = Arc::new(AtomicUsize::new(0));
+        let chunk_count_c = chunk_count.clone();
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let max_seen_c = max_seen.clone();
+        let receiver_c = receiver.clone();
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        let max_frame_bytes = 48usize;
+
+        sender.add_side_serialized_small_packets(
+            "fixed-link",
+            move |bytes: &[u8]| {
+                chunk_count_c.fetch_add(1, Ordering::SeqCst);
+                let mut current = max_seen_c.load(Ordering::SeqCst);
+                while bytes.len() > current
+                    && max_seen_c
+                        .compare_exchange(current, bytes.len(), Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    current = max_seen_c.load(Ordering::SeqCst);
+                }
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            max_frame_bytes,
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "fixed-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_frame_bytes,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        let payload = vec![b'X'; 180];
+        let pkt = Packet::new(
+            DataType::TelemetryError,
+            &[DataEndpoint::named("SD_CARD")],
+            "CHUNK_SRC",
+            55,
+            Arc::<[u8]>::from(payload),
+        )
+        .unwrap()
+        .with_nonce(21);
+
+        sender.tx(pkt).unwrap();
+
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        assert!(chunk_count.load(Ordering::SeqCst) > 1);
+        assert!(max_seen.load(Ordering::SeqCst) <= max_frame_bytes);
     }
 
     // -----------------------------------------------------------------------
@@ -3786,6 +4059,23 @@ mod relay_reliable_tests {
     #[test]
     fn relay_reliable_retransmit_across_chain_preserves_order() {
         crate::tests::ensure_common_test_schema();
+        let reliable_ty = {
+            use crate::config::register_data_type_with_description;
+            use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+            let radio = DataEndpoint::named("RADIO");
+            let sd_card = DataEndpoint::named("SD_CARD");
+            DataType::try_named("RELAY_CHAIN_RELIABLE_DATA").unwrap_or_else(|| {
+                register_data_type_with_description(
+                    "RELAY_CHAIN_RELIABLE_DATA",
+                    "ordered reliable relay-chain regression test type",
+                    MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+                    &[radio, sd_card],
+                    ReliableMode::Ordered,
+                    1,
+                )
+                .expect("register RELAY_CHAIN_RELIABLE_DATA")
+            })
+        };
         let relay1 = Arc::new(Relay::new(StepClock::new_box(
             0,
             RELIABLE_RETRANSMIT_MS + 1,
@@ -3814,7 +4104,7 @@ mod relay_reliable_tests {
                 let frame = serialize::peek_frame_info(bytes)?;
                 if let Some(hdr) = frame.reliable
                     && (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) == 0
-                    && frame.envelope.ty == DataType::named("GPS_DATA")
+                    && frame.envelope.ty == reliable_ty
                 {
                     link_sent_c.lock().unwrap().push(hdr.seq);
                     if hdr.seq == 1 && *drop_first_c.lock().unwrap() {
@@ -3876,20 +4166,16 @@ mod relay_reliable_tests {
             },
         );
         *relay2_dst_id.lock().unwrap() = Some(relay2_dst);
-        advertise_side(&relay1, relay1_mid);
-        advertise_side(&relay2, relay2_dst);
-        relay1.process_all_queues_with_timeout(0).unwrap();
-        relay2.process_all_queues_with_timeout(0).unwrap();
 
         let pkt1 = Packet::from_f32_slice(
-            DataType::named("GPS_DATA"),
+            reliable_ty,
             &[1.0_f32, 2.0, 3.0],
             &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
             0,
         )
         .unwrap();
         let pkt2 = Packet::from_f32_slice(
-            DataType::named("GPS_DATA"),
+            reliable_ty,
             &[4.0_f32, 5.0, 6.0],
             &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
             0,
@@ -4897,6 +5183,7 @@ mod router_tests {
             MAX_HANDLER_RETRIES, RELIABLE_MAX_END_TO_END_ACK_CACHE,
             RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_RETURN_ROUTES,
             register_data_type_with_description, register_endpoint_with_description,
+            remove_data_type_by_name, remove_endpoint_by_name,
         };
         use crate::discovery::{
             DISCOVERY_FAST_INTERVAL_MS, DISCOVERY_ROUTE_TTL_MS, TopologyBoardNode,
@@ -4942,6 +5229,42 @@ mod router_tests {
                     .expect("register GPS_DATA");
                 }
             });
+        }
+
+        fn ensure_reliable_overlap_test_schema() -> DataType {
+            static INIT: Once = Once::new();
+
+            INIT.call_once(|| {
+                let gs = DataEndpoint::try_named("GROUND_STATION").unwrap_or_else(|| {
+                    register_endpoint_with_description(
+                        "GROUND_STATION",
+                        "test ground station endpoint",
+                        false,
+                    )
+                    .expect("register GROUND_STATION")
+                });
+                let actuator = DataEndpoint::try_named("ACTUATOR_BOARD").unwrap_or_else(|| {
+                    register_endpoint_with_description(
+                        "ACTUATOR_BOARD",
+                        "test actuator endpoint",
+                        false,
+                    )
+                    .expect("register ACTUATOR_BOARD")
+                });
+                if DataType::try_named("RELIABLE_COMMAND_TEST").is_none() {
+                    register_data_type_with_description(
+                        "RELIABLE_COMMAND_TEST",
+                        "test reliable command type",
+                        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+                        &[gs, actuator],
+                        ReliableMode::Ordered,
+                        1,
+                    )
+                    .expect("register RELIABLE_COMMAND_TEST");
+                }
+            });
+
+            DataType::named("RELIABLE_COMMAND_TEST")
         }
 
         #[derive(Clone)]
@@ -5395,6 +5718,236 @@ mod router_tests {
             assert_eq!(
                 count_packets_of_type(&got_b, DataType::named("GPS_DATA")),
                 0
+            );
+        }
+
+        #[test]
+        fn queued_discovery_is_processed_before_queued_telemetry_routing() {
+            ensure_topology_test_schema();
+
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_c = seen_a.clone();
+            let seen_b_c = seen_b.clone();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side_a = router.add_side_packet("A", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_a_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            router.add_side_packet("B", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_b_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            let discovery_pkt =
+                build_discovery_announce("REMOTE_A", 0, &[DataEndpoint::named("RADIO")]).unwrap();
+            router.rx_queue_from_side(discovery_pkt, side_a).unwrap();
+            router
+                .tx_queue(
+                    Packet::from_f32_slice(
+                        DataType::named("GPS_DATA"),
+                        &[1.0, 2.0, 3.0],
+                        &[DataEndpoint::named("RADIO")],
+                        1,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+
+            router.process_tx_queue().unwrap();
+
+            assert_eq!(
+                count_packets_of_type(&seen_a.lock().unwrap(), DataType::named("GPS_DATA")),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_b.lock().unwrap(), DataType::named("GPS_DATA")),
+                0
+            );
+        }
+
+        #[test]
+        fn reliable_immediate_tx_prefers_highest_overlap_discovered_holder() {
+            ensure_topology_test_schema();
+            let reliable_ty = ensure_reliable_overlap_test_schema();
+            let gs = DataEndpoint::named("GROUND_STATION");
+            let actuator = DataEndpoint::named("ACTUATOR_BOARD");
+            let radio = DataEndpoint::named("RADIO");
+
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_c = seen_a.clone();
+            let seen_b_c = seen_b.clone();
+            let seen_c_c = seen_c.clone();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side_a = router.add_side_packet("A", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_a_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            let side_b = router.add_side_packet("B", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_b_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            let side_c = router.add_side_packet("C", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_c_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            router
+                .rx_from_side(
+                    &build_discovery_announce("GS_ONLY", 0, &[gs]).unwrap(),
+                    side_a,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("BEST_HOLDER", 0, &[gs, actuator]).unwrap(),
+                    side_b,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("UNRELATED", 0, &[radio]).unwrap(),
+                    side_c,
+                )
+                .unwrap();
+            seen_a.lock().unwrap().clear();
+            seen_b.lock().unwrap().clear();
+            seen_c.lock().unwrap().clear();
+
+            let pkt = Packet::from_f32_slice(reliable_ty, &[9.0], &[gs, actuator], 1).unwrap();
+            router.tx(pkt).unwrap();
+
+            assert_eq!(
+                count_packets_of_type(&seen_a.lock().unwrap(), reliable_ty),
+                0
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_b.lock().unwrap(), reliable_ty),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_c.lock().unwrap(), reliable_ty),
+                0
+            );
+        }
+
+        #[test]
+        fn reliable_queued_tx_prefers_highest_overlap_discovered_holder() {
+            ensure_topology_test_schema();
+            let reliable_ty = ensure_reliable_overlap_test_schema();
+            let gs = DataEndpoint::named("GROUND_STATION");
+            let actuator = DataEndpoint::named("ACTUATOR_BOARD");
+            let radio = DataEndpoint::named("RADIO");
+
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_c = seen_a.clone();
+            let seen_b_c = seen_b.clone();
+            let seen_c_c = seen_c.clone();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side_a = router.add_side_packet("A", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_a_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            let side_b = router.add_side_packet("B", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_b_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            let side_c = router.add_side_packet("C", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_c_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            router
+                .rx_from_side(
+                    &build_discovery_announce("GS_ONLY", 0, &[gs]).unwrap(),
+                    side_a,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("BEST_HOLDER", 0, &[gs, actuator]).unwrap(),
+                    side_b,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("UNRELATED", 0, &[radio]).unwrap(),
+                    side_c,
+                )
+                .unwrap();
+            seen_a.lock().unwrap().clear();
+            seen_b.lock().unwrap().clear();
+            seen_c.lock().unwrap().clear();
+
+            router
+                .tx_queue(Packet::from_f32_slice(reliable_ty, &[7.0], &[gs, actuator], 2).unwrap())
+                .unwrap();
+            router.process_tx_queue().unwrap();
+
+            assert_eq!(
+                count_packets_of_type(&seen_a.lock().unwrap(), reliable_ty),
+                0
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_b.lock().unwrap(), reliable_ty),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_c.lock().unwrap(), reliable_ty),
+                0
+            );
+        }
+
+        #[test]
+        fn reliable_tracking_ignores_local_endpoint_only_discovery_announcers() {
+            ensure_topology_test_schema();
+            let reliable_ty = ensure_reliable_overlap_test_schema();
+            let gs = DataEndpoint::named("GROUND_STATION");
+            let actuator = DataEndpoint::named("ACTUATOR_BOARD");
+
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(gs, |_pkt| Ok(()))])
+                    .with_sender("SRC"),
+                StepClock::new_box(0, 0),
+            );
+            let side = router.add_side_serialized_with_options(
+                "link",
+                |_bytes| Ok(()),
+                crate::router::RouterSideOptions {
+                    reliable_enabled: true,
+                    link_local_enabled: false,
+                    ..crate::router::RouterSideOptions::default()
+                },
+            );
+
+            router
+                .rx_from_side(
+                    &build_discovery_announce("GS_ONLY", 0, &[gs]).unwrap(),
+                    side,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("ACTUATOR_ONLY", 0, &[actuator]).unwrap(),
+                    side,
+                )
+                .unwrap();
+
+            let pkt = Packet::from_f32_slice(reliable_ty, &[3.0], &[gs, actuator], 10).unwrap();
+            let packet_id = pkt.packet_id();
+            router.tx(pkt).unwrap();
+
+            assert_eq!(
+                router.debug_end_to_end_pending_destination_count(packet_id),
+                Some(1),
+                "local-only endpoint announcers must not create phantom end-to-end ack expectations",
             );
         }
 
@@ -5947,8 +6500,14 @@ mod router_tests {
 
             let got_a = seen_a.lock().unwrap().clone();
             let got_b = seen_b.lock().unwrap().clone();
-            assert_eq!(count_packets_of_type(&got_a, DataType::named("GPS_DATA")), 1);
-            assert_eq!(count_packets_of_type(&got_b, DataType::named("GPS_DATA")), 0);
+            assert_eq!(
+                count_packets_of_type(&got_a, DataType::named("GPS_DATA")),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&got_b, DataType::named("GPS_DATA")),
+                0
+            );
         }
 
         #[test]
@@ -6640,7 +7199,7 @@ mod router_tests {
                 count_packets_of_type(&seen_b.lock().unwrap(), DataType::named("GPS_DATA"));
             let total_c =
                 count_packets_of_type(&seen_c.lock().unwrap(), DataType::named("GPS_DATA"));
-            assert_eq!(total_b + total_c, 4);
+            assert_eq!(total_b + total_c, 3);
 
             let _ = side_a;
         }
@@ -7960,7 +8519,8 @@ mod router_tests {
         }
 
         #[test]
-        fn reliable_packets_are_sent_to_all_discovered_candidate_sides() {
+        fn reliable_packets_use_discovery_selection_instead_of_flooding() {
+            ensure_topology_test_schema();
             let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_a_c = seen_a.clone();
@@ -7994,8 +8554,13 @@ mod router_tests {
             .unwrap();
             router.tx(msg).unwrap();
 
-            assert_eq!(seen_a.lock().unwrap().len(), 1);
-            assert_eq!(seen_b.lock().unwrap().len(), 1);
+            let seen_a_len = seen_a.lock().unwrap().len();
+            let seen_b_len = seen_b.lock().unwrap().len();
+            assert_eq!(
+                seen_a_len + seen_b_len,
+                1,
+                "reliable outbound traffic should follow one discovered path instead of flooding",
+            );
         }
 
         #[test]
@@ -8288,6 +8853,79 @@ mod router_tests {
                 .count();
             assert_eq!(ipc_count_net, 0);
             assert_eq!(ipc_count_ll, 1);
+        }
+
+        #[test]
+        fn runtime_registered_ipc_stays_off_network_sides() {
+            ensure_topology_test_schema();
+            let ep_name = "RUNTIME_IPC_EP_9901";
+            let ty_name = "RUNTIME_IPC_MSG_9901";
+            let _ = remove_data_type_by_name(ty_name);
+            let _ = remove_endpoint_by_name(ep_name);
+
+            let runtime_ipc_ep =
+                register_endpoint_with_description(ep_name, "runtime ipc endpoint", true)
+                    .expect("register runtime ipc endpoint");
+            let runtime_ipc_ty = register_data_type_with_description(
+                ty_name,
+                "runtime ipc type",
+                MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
+                &[runtime_ipc_ep],
+                ReliableMode::None,
+                1,
+            )
+            .expect("register runtime ipc type");
+
+            let seen_net: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_ll: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_net_c = seen_net.clone();
+            let seen_ll_c = seen_ll.clone();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            router.add_side_packet("NET", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_net_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            router.add_side_packet_with_options(
+                "IPC",
+                move |pkt: &Packet| -> TelemetryResult<()> {
+                    seen_ll_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+                crate::router::RouterSideOptions {
+                    reliable_enabled: false,
+                    link_local_enabled: true,
+                    ..crate::router::RouterSideOptions::default()
+                },
+            );
+
+            let pkt = Packet::new(
+                runtime_ipc_ty,
+                &[runtime_ipc_ep],
+                "RUNTIME_IPC_NODE",
+                17,
+                Arc::<[u8]>::from(b"runtime-ipc".as_slice()),
+            )
+            .unwrap();
+            router.tx(pkt).unwrap();
+
+            let ipc_count_net = seen_net
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|pkt| pkt.data_type() == runtime_ipc_ty)
+                .count();
+            let ipc_count_ll = seen_ll
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|pkt| pkt.data_type() == runtime_ipc_ty)
+                .count();
+            assert_eq!(ipc_count_net, 0);
+            assert_eq!(ipc_count_ll, 1);
+
+            assert!(remove_data_type_by_name(ty_name).unwrap());
+            assert!(remove_endpoint_by_name(ep_name).unwrap());
         }
 
         #[test]
@@ -8667,6 +9305,56 @@ mod router_tests {
                     .count(),
                 0
             );
+        }
+
+        #[test]
+        fn managed_variable_request_replays_latest_value_to_endpoint_handler() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+
+            let seen_client: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_client_c = seen_client.clone();
+
+            let source = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_sender("SOURCE"),
+                zero_clock(),
+            ));
+            source.enable_managed_variable(ty).unwrap();
+            source.log(ty, &[1.0_f32, 2.0, 3.0]).unwrap();
+
+            let client = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                    ep,
+                    move |pkt: &Packet| {
+                        seen_client_c.lock().unwrap().push(pkt.clone());
+                        Ok(())
+                    },
+                )])
+                .with_sender("CLIENT_RESTARTED"),
+                zero_clock(),
+            ));
+
+            client.enable_managed_variable(ty).unwrap();
+
+            let client_for_source = client.clone();
+            source.add_side_packet("to-client", move |pkt: &Packet| {
+                client_for_source.rx_from_side(pkt, 0)
+            });
+            let source_for_client = source.clone();
+            client.add_side_packet("to-source", move |pkt: &Packet| {
+                source_for_client.rx_from_side(pkt, 0)
+            });
+
+            client.request_managed_variable(ty).unwrap();
+            source.process_all_queues().unwrap();
+            client.process_all_queues().unwrap();
+
+            let seen = seen_client.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].data_type(), ty);
+            assert_eq!(seen[0].data_as_f32().unwrap(), vec![1.0, 2.0, 3.0]);
         }
 
         #[test]
@@ -9231,7 +9919,11 @@ mod router_tests {
         fn inline_wire_shape_keeps_old_payload_decodable_after_layout_change() {
             crate::tests::ensure_common_test_schema();
             let endpoint = DataEndpoint::named("RADIO");
-            let ty = DataType(crate::current_max_data_type_id().saturating_add(1));
+            let ty = (13..=crate::MAX_VALUE_DATA_TYPE)
+                .find_map(|id| {
+                    (!crate::config::data_type_exists(DataType(id))).then_some(DataType(id))
+                })
+                .expect("free runtime data type id");
             let ty_name = "SCHEMA_WIRE_TYPE_4090";
             let _ = remove_data_type_by_name(ty_name);
             register_data_type_id_with_description(

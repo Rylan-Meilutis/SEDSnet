@@ -198,6 +198,8 @@ impl DataType {
     pub const DISCOVERY_SCHEMA: Self = Self(10);
     pub const DISCOVERY_TOPOLOGY_REQUEST: Self = Self(11);
     pub const DISCOVERY_SCHEMA_REQUEST: Self = Self(12);
+    pub const MANAGED_VARIABLE_REQUEST: Self = Self(13);
+    pub const MANAGED_VARIABLE_VALUE: Self = Self(14);
 
     #[allow(non_upper_case_globals)]
     pub const TelemetryError: Self = Self::TELEMETRY_ERROR;
@@ -225,6 +227,10 @@ impl DataType {
     pub const DiscoveryTopologyRequest: Self = Self::DISCOVERY_TOPOLOGY_REQUEST;
     #[allow(non_upper_case_globals)]
     pub const DiscoverySchemaRequest: Self = Self::DISCOVERY_SCHEMA_REQUEST;
+    #[allow(non_upper_case_globals)]
+    pub const ManagedVariableRequest: Self = Self::MANAGED_VARIABLE_REQUEST;
+    #[allow(non_upper_case_globals)]
+    pub const ManagedVariableValue: Self = Self::MANAGED_VARIABLE_VALUE;
 
     #[inline]
     pub const fn as_u32(self) -> u32 {
@@ -267,6 +273,8 @@ impl core::fmt::Debug for DataType {
             Self::DiscoverySchema => "DiscoverySchema",
             Self::DiscoveryTopologyRequest => "DiscoveryTopologyRequest",
             Self::DiscoverySchemaRequest => "DiscoverySchemaRequest",
+            Self::ManagedVariableRequest => "ManagedVariableRequest",
+            Self::ManagedVariableValue => "ManagedVariableValue",
             _ => {
                 let meta = get_message_meta(*self);
                 if meta.name != "UNKNOWN_TYPE" {
@@ -529,6 +537,26 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 242,
+        })
+        .expect("built-in type");
+        reg.register_type_definition(DataTypeDefinition {
+            id: DataType::ManagedVariableRequest,
+            name: "MANAGED_VARIABLE_REQUEST",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            reliable: ReliableMode::Ordered,
+            priority: 243,
+        })
+        .expect("built-in type");
+        reg.register_type_definition(DataTypeDefinition {
+            id: DataType::ManagedVariableValue,
+            name: "MANAGED_VARIABLE_VALUE",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            reliable: ReliableMode::Ordered,
+            priority: 243,
         })
         .expect("built-in type");
         #[cfg(all(feature = "embedded", sedsprintf_has_telemetry_config_json))]
@@ -1825,6 +1853,24 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 242,
+        },
+        DataTypeDefinition {
+            id: DataType::ManagedVariableRequest,
+            name: "MANAGED_VARIABLE_REQUEST",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: &[DataEndpoint::Discovery],
+            reliable: ReliableMode::Ordered,
+            priority: 243,
+        },
+        DataTypeDefinition {
+            id: DataType::ManagedVariableValue,
+            name: "MANAGED_VARIABLE_VALUE",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: &[DataEndpoint::Discovery],
+            reliable: ReliableMode::Ordered,
+            priority: 243,
         },
     ];
     #[cfg(all(feature = "serde", sedsprintf_has_telemetry_config_json))]

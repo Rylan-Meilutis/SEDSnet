@@ -1,17 +1,17 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 use sedsprintf_rs::TelemetryResult;
 use sedsprintf_rs::config::{
-    data_type_definition_by_name, endpoint_definition_by_name, register_data_type_with_description,
-    register_endpoint_with_description, DataEndpoint, DataType,
+    DataEndpoint, DataType, data_type_definition_by_name, endpoint_definition_by_name,
+    register_data_type_with_description, register_endpoint_with_description,
 };
 use sedsprintf_rs::packet::Packet;
 use sedsprintf_rs::relay::Relay;
 use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
 use sedsprintf_rs::serialize::peek_frame_info;
+use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+use std::sync::Once;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::Once;
 
 fn zero_clock() -> Box<dyn Clock + Send + Sync> {
     Box::new(|| 0u64)
@@ -151,7 +151,10 @@ fn benchmark_router_system_paths(c: &mut Criterion) {
                 let frames_b = relay_frames_b.lock().unwrap().clone();
                 let frames_a = relay_frames_a.lock().unwrap().clone();
                 assert!(count_frames_of_type(&frames_b, DataType::named("GPS_DATA")) >= 1);
-                assert_eq!(count_frames_of_type(&frames_a, DataType::named("GPS_DATA")), 0);
+                assert_eq!(
+                    count_frames_of_type(&frames_a, DataType::named("GPS_DATA")),
+                    0
+                );
             },
             BatchSize::SmallInput,
         );

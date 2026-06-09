@@ -18,6 +18,7 @@ use crate::{impl_data_as_prim, impl_from_prim_slices, impl_ledecode_auto};
 use alloc::{string::String, string::ToString, sync::Arc, vec, vec::Vec};
 use core::any::TypeId;
 use core::fmt::{Formatter, Write};
+use core::sync::atomic::{AtomicU32, Ordering};
 // ============================================================================
 // Constants
 // ============================================================================
@@ -31,6 +32,19 @@ const EPOCH_MS_THRESHOLD: u64 = 1_000_000_000_000; // clearly not an uptime coun
 
 /// Default starting capacity for human-readable strings.
 const DEFAULT_STRING_CAPACITY: usize = 96;
+
+/// Process-local packet nonce generator used to keep same-timestamp packets
+/// distinct for recent-ID dedupe even when their logical payload matches.
+static PACKET_NONCE_COUNTER: AtomicU32 = AtomicU32::new(0xA5C3_1F27);
+
+#[inline]
+fn next_packet_nonce() -> u16 {
+    let mut x = PACKET_NONCE_COUNTER.fetch_add(0x9E37_79B9, Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    (x as u16) | 1
+}
 
 // ============================================================================
 // Packet
@@ -64,6 +78,11 @@ pub struct Packet {
     /// - If `>= EPOCH_MS_THRESHOLD`, treated as Unix epoch ms and formatted
     ///   as `YYYY-MM-DD HH:MM:SS.mmmZ`.
     timestamp: u64,
+
+    /// Small per-packet nonce carried on the wire and folded into packet ID
+    /// calculation so otherwise-identical packets emitted in the same
+    /// millisecond do not collapse in recent-ID dedupe.
+    nonce: u16,
 
     /// Raw payload bytes, stored via [`SmallPayload`] for small/large optimization.
     payload: StandardSmallPayload,
@@ -248,11 +267,13 @@ impl Packet {
     /// - `Err(TelemetryError)` when endpoints are empty or the payload is
     ///   incompatible with the effective schema element.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_wire_contract(
         ty: DataType,
         endpoints: &[DataEndpoint],
         sender: &str,
         timestamp: u64,
+        nonce: u16,
         payload: Arc<[u8]>,
         wire_shape: Option<MessageElement>,
         wire_target_senders: Arc<[u64]>,
@@ -270,6 +291,7 @@ impl Packet {
             sender: sender.into(),
             endpoints: Arc::<[DataEndpoint]>::from(endpoints),
             timestamp,
+            nonce,
             payload: StandardSmallPayload::new(&payload),
             wire_shape,
             wire_target_senders,
@@ -307,11 +329,35 @@ impl Packet {
         timestamp: u64,
         payload: Arc<[u8]>,
     ) -> TelemetryResult<Self> {
+        Self::new_with_nonce(
+            ty,
+            endpoints,
+            sender,
+            timestamp,
+            next_packet_nonce(),
+            payload,
+        )
+    }
+
+    /// Create a packet with an explicit nonce value.
+    ///
+    /// This is mainly useful when callers need stable byte-for-byte wire output
+    /// across repeated constructions, such as deterministic tests or
+    /// precomputed fixtures.
+    pub fn new_with_nonce(
+        ty: DataType,
+        endpoints: &[DataEndpoint],
+        sender: &str,
+        timestamp: u64,
+        nonce: u16,
+        payload: Arc<[u8]>,
+    ) -> TelemetryResult<Self> {
         Self::new_with_wire_contract(
             ty,
             endpoints,
             sender,
             timestamp,
+            nonce,
             payload,
             None,
             Arc::<[u64]>::from([]),
@@ -378,6 +424,7 @@ impl Packet {
 
         // Timestamp + data_size as bytes
         h = hash_bytes_u64(h, &self.timestamp.to_le_bytes());
+        h = hash_bytes_u64(h, &self.nonce.to_le_bytes());
         h = hash_bytes_u64(h, &self.data_size.to_le_bytes());
 
         // Payload bytes
@@ -468,6 +515,12 @@ impl Packet {
         self.timestamp
     }
 
+    /// Get the packet nonce.
+    #[inline]
+    pub fn nonce(&self) -> u16 {
+        self.nonce
+    }
+
     /// Get the payload size in bytes.
     #[inline]
     pub fn data_size(&self) -> usize {
@@ -497,6 +550,13 @@ impl Packet {
     #[inline]
     pub(crate) fn wire_target_senders(&self) -> &[u64] {
         &self.wire_target_senders
+    }
+
+    /// Override the packet nonce while keeping the rest of the packet intact.
+    #[inline]
+    pub fn with_nonce(mut self, nonce: u16) -> Self {
+        self.nonce = nonce;
+        self
     }
 
     /// Header-only string (no decoded data).

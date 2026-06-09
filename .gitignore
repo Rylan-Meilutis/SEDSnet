@@ -12,8 +12,6 @@ c-system-test/build/
 
 c-example-code/build/
 
-C-Headers/sedsprintf.h
-
 python-files/sedsprintf_rs/sedsprintf_rs.pyi
 
 *.so

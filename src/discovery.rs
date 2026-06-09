@@ -112,6 +112,8 @@ pub const fn is_discovery_type(ty: DataType) -> bool {
             | DataType::DiscoverySchema
             | DataType::DiscoveryTopologyRequest
             | DataType::DiscoverySchemaRequest
+            | DataType::ManagedVariableRequest
+            | DataType::ManagedVariableValue
     )
 }
 
@@ -119,7 +121,9 @@ pub const fn is_discovery_type(ty: DataType) -> bool {
 pub const fn is_discovery_request_type(ty: DataType) -> bool {
     matches!(
         ty,
-        DataType::DiscoveryTopologyRequest | DataType::DiscoverySchemaRequest
+        DataType::DiscoveryTopologyRequest
+            | DataType::DiscoverySchemaRequest
+            | DataType::ManagedVariableRequest
     )
 }
 
@@ -279,6 +283,36 @@ pub fn build_discovery_schema_request(sender: &str, timestamp_ms: u64) -> Teleme
         timestamp_ms,
         Vec::<u8>::new().into(),
     )
+}
+
+pub fn build_managed_variable_request(
+    sender: &str,
+    timestamp_ms: u64,
+    ty: DataType,
+) -> TelemetryResult<Packet> {
+    Packet::new(
+        DataType::ManagedVariableRequest,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        encode_slice_le(&[ty.as_u32()]),
+    )
+}
+
+pub fn decode_managed_variable_request(pkt: &Packet) -> TelemetryResult<DataType> {
+    if pkt.data_type() != DataType::ManagedVariableRequest {
+        return Err(TelemetryError::InvalidType);
+    }
+    let payload = pkt.payload();
+    if payload.len() != 4 {
+        return Err(TelemetryError::Deserialize(
+            "managed variable request width",
+        ));
+    }
+    let raw = u32::from_le_bytes(payload.try_into().expect("4-byte payload"));
+    try_enum_from_u32(raw).ok_or(TelemetryError::Deserialize(
+        "bad managed variable data type",
+    ))
 }
 
 /// Decodes a discovery time sync source packet into source identifiers.

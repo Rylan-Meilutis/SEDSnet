@@ -20,11 +20,11 @@ SedsResult on_radio_packet(const SedsPacketView *pkt, void *user);
 
 SedsResult init_telemetry_router(void);
 
-SedsResult log_telemetry_synchronous(SedsDataType data_type, const void *data,
+SedsResult log_telemetry_synchronous(SedsTypeRef data_type, const void *data,
                                      size_t element_count, size_t element_size);
-SedsResult log_telemetry_asynchronous(SedsDataType data_type, const void *data,
+SedsResult log_telemetry_asynchronous(SedsTypeRef data_type, const void *data,
                                       size_t element_count, size_t element_size);
-SedsResult log_telemetry_string_asynchronous(SedsDataType data_type, const char *str);
+SedsResult log_telemetry_string_asynchronous(SedsTypeRef data_type, const char *str);
 
 SedsResult dispatch_tx_queue(void);
 SedsResult process_rx_queue(void);

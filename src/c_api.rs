@@ -18,12 +18,12 @@ use crate::{
     TelemetryResult,
     config::{
         DataEndpoint, data_type_definition, data_type_definition_by_name, data_type_exists,
-        endpoint_definition, endpoint_definition_by_name, endpoint_exists, message_class_code,
-        message_class_from_code, message_data_type_code, message_data_type_from_code,
-        register_data_type_id, register_data_type_id_with_description, register_endpoint_id,
-        register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
-        reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
-        remove_endpoint_by_name,
+        endpoint_definition, endpoint_definition_by_name, endpoint_exists, known_endpoints,
+        message_class_code, message_class_from_code, message_data_type_code,
+        message_data_type_from_code, register_data_type_id, register_data_type_id_with_description,
+        register_endpoint_id, register_endpoint_id_with_description, register_schema_json_bytes,
+        reliable_code, reliable_from_code, remove_data_type, remove_data_type_by_name,
+        remove_endpoint, remove_endpoint_by_name,
     },
     do_vec_log_typed, get_needed_message_size, message_meta,
     packet::Packet,
@@ -32,9 +32,14 @@ use crate::{
     serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
 };
 use crate::{MessageDataType::NoData, get_data_type};
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
 use core::{ffi::c_char, ffi::c_void, mem::size_of, ptr, slice, str::from_utf8};
 
+#[cfg(feature = "crypto-shim")]
+use crate::crypto::{
+    CCryptoShim, clear_c_crypto_shim, open_with_registered_c_shim, register_c_crypto_shim,
+    seal_with_registered_c_shim,
+};
 use crate::relay::{Relay, RelaySideId, RelaySideOptions};
 // ============================================================================
 //  Constants / basic types shared with the C side
@@ -362,20 +367,51 @@ fn json_push_escaped(out: &mut String, s: &str) {
 
 #[cfg(feature = "discovery")]
 fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> String {
-    fn push_u32_array(out: &mut String, vals: &[u32]) {
+    fn push_endpoint_name(
+        out: &mut String,
+        names: &BTreeMap<DataEndpoint, &'static str>,
+        ep: DataEndpoint,
+    ) {
+        if let Some(name) = names.get(&ep) {
+            json_push_escaped(out, name);
+        } else {
+            json_push_escaped(out, &format!("endpoint_{}", ep.as_u32()));
+        }
+    }
+
+    fn push_endpoint_ids_array(out: &mut String, vals: &[DataEndpoint]) {
         out.push('[');
         for (idx, val) in vals.iter().enumerate() {
             if idx != 0 {
                 out.push(',');
             }
-            let _ = core::fmt::Write::write_fmt(out, format_args!("{val}"));
+            let _ = core::fmt::Write::write_fmt(out, format_args!("{}", val.as_u32()));
+        }
+        out.push(']');
+    }
+
+    fn push_endpoint_names_array(
+        out: &mut String,
+        names: &BTreeMap<DataEndpoint, &'static str>,
+        vals: &[DataEndpoint],
+    ) {
+        out.push('[');
+        for (idx, val) in vals.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            push_endpoint_name(out, names, *val);
         }
         out.push(']');
     }
 
     fn push_string_array(out: &mut String, vals: &[String]) {
+        push_str_array_iter(out, vals.iter().map(String::as_str));
+    }
+
+    fn push_str_array_iter<'a>(out: &mut String, vals: impl Iterator<Item = &'a str>) {
         out.push('[');
-        for (idx, val) in vals.iter().enumerate() {
+        for (idx, val) in vals.enumerate() {
             if idx != 0 {
                 out.push(',');
             }
@@ -384,19 +420,18 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         out.push(']');
     }
 
-    fn push_board(out: &mut String, board: &crate::discovery::TopologyBoardNode) {
+    fn push_board(
+        out: &mut String,
+        names: &BTreeMap<DataEndpoint, &'static str>,
+        board: &crate::discovery::TopologyBoardNode,
+    ) {
         out.push('{');
         out.push_str("\"sender_id\":");
         json_push_escaped(out, &board.sender_id);
         out.push_str(",\"reachable_endpoints\":");
-        push_u32_array(
-            out,
-            &board
-                .reachable_endpoints
-                .iter()
-                .map(|ep| ep.as_u32())
-                .collect::<Vec<u32>>(),
-        );
+        push_endpoint_names_array(out, names, &board.reachable_endpoints);
+        out.push_str(",\"reachable_endpoint_ids\":");
+        push_endpoint_ids_array(out, &board.reachable_endpoints);
         out.push_str(",\"reachable_timesync_sources\":");
         push_string_array(out, &board.reachable_timesync_sources);
         out.push_str(",\"connections\":");
@@ -404,17 +439,16 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         out.push('}');
     }
 
+    let endpoint_names = known_endpoints()
+        .into_iter()
+        .map(|def| (def.id, def.name))
+        .collect::<BTreeMap<_, _>>();
     let mut out = String::new();
     out.push('{');
     out.push_str("\"advertised_endpoints\":");
-    push_u32_array(
-        &mut out,
-        &snap
-            .advertised_endpoints
-            .iter()
-            .map(|ep| ep.as_u32())
-            .collect::<Vec<u32>>(),
-    );
+    push_endpoint_names_array(&mut out, &endpoint_names, &snap.advertised_endpoints);
+    out.push_str(",\"advertised_endpoint_ids\":");
+    push_endpoint_ids_array(&mut out, &snap.advertised_endpoints);
     out.push_str(",\"advertised_timesync_sources\":");
     push_string_array(&mut out, &snap.advertised_timesync_sources);
     out.push_str(",\"routers\":[");
@@ -422,7 +456,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         if idx != 0 {
             out.push(',');
         }
-        push_board(&mut out, board);
+        push_board(&mut out, &endpoint_names, board);
     }
     out.push(']');
     out.push_str(",\"routes\":[");
@@ -436,14 +470,9 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         out.push_str("\"side_name\":");
         json_push_escaped(&mut out, route.side_name);
         out.push_str(",\"reachable_endpoints\":");
-        push_u32_array(
-            &mut out,
-            &route
-                .reachable_endpoints
-                .iter()
-                .map(|ep| ep.as_u32())
-                .collect::<Vec<u32>>(),
-        );
+        push_endpoint_names_array(&mut out, &endpoint_names, &route.reachable_endpoints);
+        out.push_str(",\"reachable_endpoint_ids\":");
+        push_endpoint_ids_array(&mut out, &route.reachable_endpoints);
         out.push_str(",\"reachable_timesync_sources\":");
         push_string_array(&mut out, &route.reachable_timesync_sources);
         out.push_str(",\"announcers\":[");
@@ -455,14 +484,9 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
             out.push_str("\"sender_id\":");
             json_push_escaped(&mut out, &announcer.sender_id);
             out.push_str(",\"reachable_endpoints\":");
-            push_u32_array(
-                &mut out,
-                &announcer
-                    .reachable_endpoints
-                    .iter()
-                    .map(|ep| ep.as_u32())
-                    .collect::<Vec<u32>>(),
-            );
+            push_endpoint_names_array(&mut out, &endpoint_names, &announcer.reachable_endpoints);
+            out.push_str(",\"reachable_endpoint_ids\":");
+            push_endpoint_ids_array(&mut out, &announcer.reachable_endpoints);
             out.push_str(",\"reachable_timesync_sources\":");
             push_string_array(&mut out, &announcer.reachable_timesync_sources);
             out.push_str(",\"routers\":[");
@@ -470,7 +494,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
                 if board_idx != 0 {
                     out.push(',');
                 }
-                push_board(&mut out, board);
+                push_board(&mut out, &endpoint_names, board);
             }
             let _ = core::fmt::Write::write_fmt(
                 &mut out,
@@ -1192,6 +1216,96 @@ pub extern "C" fn seds_router_poll_discovery(r: *mut SedsRouter, out_did_queue: 
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_router_enable_managed_variable(r: *mut SedsRouter, ty: DataType) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.enable_managed_variable(ty))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_disable_managed_variable(r: *mut SedsRouter, ty: DataType) {
+    if r.is_null() {
+        return;
+    }
+    let router = unsafe { &(*r).inner };
+    router.disable_managed_variable(ty);
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_request_managed_variable(r: *mut SedsRouter, ty: DataType) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.request_managed_variable(ty))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_seed_managed_variable_serialized(
+    r: *mut SedsRouter,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if r.is_null() || bytes.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let data = unsafe { slice::from_raw_parts(bytes, len) };
+    match deserialize_packet(data).and_then(|pkt| {
+        pkt.validate()?;
+        let router = unsafe { &(*r).inner };
+        router.seed_managed_variable(pkt)
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(e) => status_from_err(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_cached_managed_variable_serialized_len(
+    r: *mut SedsRouter,
+    ty: DataType,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let Some(pkt) = router.cached_managed_variable(ty) else {
+        return 0;
+    };
+    i32::try_from(serialize_packet(&pkt).len()).unwrap_or(i32::MAX)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_cached_managed_variable_serialized(
+    r: *mut SedsRouter,
+    ty: DataType,
+    out: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if r.is_null() || out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let Some(pkt) = router.cached_managed_variable(ty) else {
+        return 0;
+    };
+    let bytes = serialize_packet(&pkt);
+    if out_len < bytes.len() {
+        return status_from_err(TelemetryError::SizeMismatch {
+            expected: bytes.len(),
+            got: out_len,
+        });
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+    }
+    i32::try_from(bytes.len()).unwrap_or(i32::MAX)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_router_periodic(r: *mut SedsRouter, timeout_ms: u32) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -1388,6 +1502,11 @@ pub extern "C" fn seds_router_set_local_network_datetime_nanos(
 //  FFI: Router side registration
 // ============================================================================
 
+enum SerializedSideMode {
+    Normal,
+    SmallPackets { max_frame_bytes: usize },
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_add_side_serialized(
     r: *mut SedsRouter,
@@ -1396,6 +1515,47 @@ pub extern "C" fn seds_router_add_side_serialized(
     tx: CTransmit,
     tx_user: *mut c_void,
     reliable_enabled: bool,
+) -> i32 {
+    seds_router_add_side_serialized_impl(
+        r,
+        name,
+        name_len,
+        tx,
+        tx_user,
+        reliable_enabled,
+        SerializedSideMode::Normal,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_add_side_serialized_small_packets(
+    r: *mut SedsRouter,
+    name: *const c_char,
+    name_len: usize,
+    tx: CTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    max_frame_bytes: usize,
+) -> i32 {
+    seds_router_add_side_serialized_impl(
+        r,
+        name,
+        name_len,
+        tx,
+        tx_user,
+        reliable_enabled,
+        SerializedSideMode::SmallPackets { max_frame_bytes },
+    )
+}
+
+fn seds_router_add_side_serialized_impl(
+    r: *mut SedsRouter,
+    name: *const c_char,
+    name_len: usize,
+    tx: CTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    mode: SerializedSideMode,
 ) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -1432,9 +1592,16 @@ pub extern "C" fn seds_router_add_side_serialized(
         return status_from_err(TelemetryError::BadArg);
     };
 
+    let (header_template_enabled, max_frame_bytes) = match mode {
+        SerializedSideMode::Normal => (false, 0),
+        SerializedSideMode::SmallPackets { max_frame_bytes } => (true, max_frame_bytes),
+    };
+
     let opts = RouterSideOptions {
         reliable_enabled,
         link_local_enabled: false,
+        header_template_enabled,
+        max_frame_bytes,
         ..RouterSideOptions::default()
     };
 
@@ -2088,13 +2255,14 @@ pub extern "C" fn seds_dtype_get_info(
         }
         return status_from_result_code(SedsResult::SedsOk);
     };
-    if def.endpoints.len() > endpoints_cap || (!def.endpoints.is_empty() && endpoints_out.is_null())
-    {
-        return status_from_err(TelemetryError::BadArg);
-    }
-    for (idx, ep) in def.endpoints.iter().enumerate() {
-        unsafe {
-            *endpoints_out.add(idx) = ep.as_u32();
+    if !endpoints_out.is_null() {
+        if def.endpoints.len() > endpoints_cap {
+            return status_from_err(TelemetryError::BadArg);
+        }
+        for (idx, ep) in def.endpoints.iter().enumerate() {
+            unsafe {
+                *endpoints_out.add(idx) = ep.as_u32();
+            }
         }
     }
     let (is_static, count, data_type, class) = match def.element {
@@ -2160,13 +2328,14 @@ pub extern "C" fn seds_dtype_get_info_by_name(
         }
         return status_from_result_code(SedsResult::SedsOk);
     };
-    if def.endpoints.len() > endpoints_cap || (!def.endpoints.is_empty() && endpoints_out.is_null())
-    {
-        return status_from_err(TelemetryError::BadArg);
-    }
-    for (idx, ep) in def.endpoints.iter().enumerate() {
-        unsafe {
-            *endpoints_out.add(idx) = ep.as_u32();
+    if !endpoints_out.is_null() {
+        if def.endpoints.len() > endpoints_cap {
+            return status_from_err(TelemetryError::BadArg);
+        }
+        for (idx, ep) in def.endpoints.iter().enumerate() {
+            unsafe {
+                *endpoints_out.add(idx) = ep.as_u32();
+            }
         }
     }
     let (is_static, count, data_type, class) = match def.element {
@@ -2433,6 +2602,39 @@ pub extern "C" fn seds_relay_add_side_serialized(
     tx_user: *mut c_void,
     reliable_enabled: bool,
 ) -> i32 {
+    seds_relay_add_side_serialized_impl(r, name, name_len, tx, tx_user, reliable_enabled, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_add_side_serialized_small_packets(
+    r: *mut SedsRelay,
+    name: *const c_char,
+    name_len: usize,
+    tx: CTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    max_frame_bytes: usize,
+) -> i32 {
+    seds_relay_add_side_serialized_impl(
+        r,
+        name,
+        name_len,
+        tx,
+        tx_user,
+        reliable_enabled,
+        max_frame_bytes,
+    )
+}
+
+fn seds_relay_add_side_serialized_impl(
+    r: *mut SedsRelay,
+    name: *const c_char,
+    name_len: usize,
+    tx: CTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    max_frame_bytes: usize,
+) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
     }
@@ -2471,6 +2673,7 @@ pub extern "C" fn seds_relay_add_side_serialized(
     let opts = RelaySideOptions {
         reliable_enabled,
         link_local_enabled: false,
+        max_frame_bytes,
         ..RelaySideOptions::default()
     };
     let side_id: RelaySideId = relay.add_side_serialized_with_options(side_name, tx_fn, opts);
@@ -4058,6 +4261,107 @@ pub extern "C" fn seds_owned_header_view(
     status_from_result_code(SedsResult::SedsOk)
 }
 
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_register_shim(
+    seal: Option<crate::crypto::CSealFn>,
+    open: Option<crate::crypto::COpenFn>,
+    user: *mut c_void,
+) -> i32 {
+    if seal.is_none() || open.is_none() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    register_c_crypto_shim(CCryptoShim { seal, open, user });
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_clear_shim() {
+    clear_c_crypto_shim();
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_seal(
+    key_id: u32,
+    nonce: *const u8,
+    nonce_len: usize,
+    aad: *const u8,
+    aad_len: usize,
+    plaintext: *const u8,
+    plaintext_len: usize,
+    ciphertext_out: *mut u8,
+    ciphertext_cap: usize,
+    ciphertext_len_out: *mut usize,
+    tag_out: *mut u8,
+    tag_cap: usize,
+    tag_len_out: *mut usize,
+) -> i32 {
+    if (nonce_len > 0 && nonce.is_null())
+        || (aad_len > 0 && aad.is_null())
+        || (plaintext_len > 0 && plaintext.is_null())
+        || ciphertext_out.is_null()
+        || ciphertext_len_out.is_null()
+        || tag_out.is_null()
+        || tag_len_out.is_null()
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let nonce = unsafe { slice::from_raw_parts(nonce, nonce_len) };
+    let aad = unsafe { slice::from_raw_parts(aad, aad_len) };
+    let plaintext = unsafe { slice::from_raw_parts(plaintext, plaintext_len) };
+    let ciphertext_out = unsafe { slice::from_raw_parts_mut(ciphertext_out, ciphertext_cap) };
+    let tag_out = unsafe { slice::from_raw_parts_mut(tag_out, tag_cap) };
+    match seal_with_registered_c_shim(key_id, nonce, aad, plaintext, ciphertext_out, tag_out) {
+        Ok((ciphertext_len, tag_len)) => unsafe {
+            *ciphertext_len_out = ciphertext_len;
+            *tag_len_out = tag_len;
+            status_from_result_code(SedsResult::SedsOk)
+        },
+        Err(e) => status_from_err(e),
+    }
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_open(
+    key_id: u32,
+    nonce: *const u8,
+    nonce_len: usize,
+    aad: *const u8,
+    aad_len: usize,
+    ciphertext: *const u8,
+    ciphertext_len: usize,
+    tag: *const u8,
+    tag_len: usize,
+    plaintext_out: *mut u8,
+    plaintext_cap: usize,
+    plaintext_len_out: *mut usize,
+) -> i32 {
+    if (nonce_len > 0 && nonce.is_null())
+        || (aad_len > 0 && aad.is_null())
+        || (ciphertext_len > 0 && ciphertext.is_null())
+        || (tag_len > 0 && tag.is_null())
+        || plaintext_out.is_null()
+        || plaintext_len_out.is_null()
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let nonce = unsafe { slice::from_raw_parts(nonce, nonce_len) };
+    let aad = unsafe { slice::from_raw_parts(aad, aad_len) };
+    let ciphertext = unsafe { slice::from_raw_parts(ciphertext, ciphertext_len) };
+    let tag = unsafe { slice::from_raw_parts(tag, tag_len) };
+    let plaintext_out = unsafe { slice::from_raw_parts_mut(plaintext_out, plaintext_cap) };
+    match open_with_registered_c_shim(key_id, nonce, aad, ciphertext, tag, plaintext_out) {
+        Ok(plaintext_len) => unsafe {
+            *plaintext_len_out = plaintext_len;
+            status_from_result_code(SedsResult::SedsOk)
+        },
+        Err(e) => status_from_err(e),
+    }
+}
+
 #[cfg(all(test, feature = "discovery"))]
 mod tests {
     use super::*;
@@ -4229,6 +4533,7 @@ mod tests {
 
     fn assert_topology_json_shape(doc: &Value, local_sender: &str) {
         assert!(doc.get("advertised_endpoints").unwrap().is_array());
+        assert!(doc.get("advertised_endpoint_ids").unwrap().is_array());
         assert!(doc.get("advertised_timesync_sources").unwrap().is_array());
         assert!(doc.get("routers").unwrap().is_array());
         assert!(doc.get("routes").unwrap().is_array());
@@ -4243,6 +4548,7 @@ mod tests {
             .unwrap();
         assert!(local.get("connections").unwrap().is_array());
         assert!(local.get("reachable_endpoints").unwrap().is_array());
+        assert!(local.get("reachable_endpoint_ids").unwrap().is_array());
         assert!(local.get("reachable_timesync_sources").unwrap().is_array());
 
         let route = doc
@@ -4254,7 +4560,35 @@ mod tests {
             .unwrap();
         assert!(route.get("side_id").unwrap().is_u64());
         assert!(route.get("side_name").unwrap().is_string());
+        assert!(route.get("reachable_endpoints").unwrap().is_array());
+        assert!(route.get("reachable_endpoint_ids").unwrap().is_array());
         assert!(route.get("announcers").unwrap().is_array());
+
+        let announcer = route
+            .get("announcers")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap();
+        assert!(
+            announcer
+                .get("reachable_endpoints")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(Value::is_string)
+        );
+        assert!(
+            announcer
+                .get("reachable_endpoint_ids")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(Value::is_u64)
+        );
     }
 
     #[cfg(feature = "discovery")]
@@ -4283,6 +4617,113 @@ mod tests {
 
         let router = seds_router_new(0, None, ptr::null_mut(), &desc, 1);
         assert!(router.is_null());
+    }
+
+    #[test]
+    fn c_abi_dtype_info_allows_metadata_only_lookup_for_endpoint_types() {
+        let ep_name = b"C_ABI_META_ONLY_EP";
+        let ty_name = b"C_ABI_META_ONLY_TYPE";
+        let ep = 224_u32;
+        let ty = 225_u32;
+
+        let _ = seds_dtype_remove_by_name(ty_name.as_ptr().cast(), ty_name.len());
+        let _ = seds_endpoint_remove_by_name(ep_name.as_ptr().cast(), ep_name.len());
+
+        assert_eq!(
+            seds_endpoint_register(ep, ep_name.as_ptr().cast(), ep_name.len(), false),
+            0
+        );
+        assert_eq!(
+            seds_dtype_register(
+                ty,
+                ty_name.as_ptr().cast(),
+                ty_name.len(),
+                true,
+                4,
+                2,
+                1,
+                0,
+                12,
+                &ep,
+                1,
+            ),
+            0
+        );
+
+        let mut info = SedsDataTypeInfo {
+            exists: false,
+            id: 0,
+            is_static: false,
+            element_count: 0,
+            message_data_type: 0,
+            message_class: 0,
+            reliable: 0,
+            priority: 0,
+            fixed_size: 0,
+            endpoints: ptr::null(),
+            num_endpoints: 0,
+            name: ptr::null(),
+            name_len: 0,
+            description: ptr::null(),
+            description_len: 0,
+        };
+        assert_eq!(
+            seds_dtype_get_info_by_name(
+                ty_name.as_ptr().cast(),
+                ty_name.len(),
+                ptr::null_mut(),
+                0,
+                &mut info,
+            ),
+            0
+        );
+        assert!(info.exists);
+        assert_eq!(info.id, ty);
+        assert_eq!(info.num_endpoints, 1);
+
+        let mut endpoints = [0_u32; 1];
+        assert_eq!(
+            seds_dtype_get_info_by_name(
+                ty_name.as_ptr().cast(),
+                ty_name.len(),
+                endpoints.as_mut_ptr(),
+                endpoints.len(),
+                &mut info,
+            ),
+            0
+        );
+        assert_eq!(endpoints[0], ep);
+
+        assert_eq!(seds_dtype_remove(ty), 0);
+        assert_eq!(seds_endpoint_remove(ep), 0);
+    }
+
+    #[test]
+    fn router_c_abi_managed_variable_cache_roundtrips_serialized_value() {
+        crate::tests::ensure_common_test_schema();
+        let ty = DataType::named("GPS_DATA");
+        let endpoints = [DataEndpoint::named("RADIO")];
+        let router = seds_router_new(0, None, ptr::null_mut(), ptr::null(), 0);
+        assert!(!router.is_null());
+
+        assert_eq!(seds_router_enable_managed_variable(router, ty), 0);
+        let pkt = Packet::from_f32_slice(ty, &[4.0, 5.0, 6.0], &endpoints, 42).unwrap();
+        let bytes = serialize_packet(&pkt);
+        assert_eq!(
+            seds_router_seed_managed_variable_serialized(router, bytes.as_ptr(), bytes.len()),
+            0
+        );
+        let need = seds_router_cached_managed_variable_serialized_len(router, ty);
+        assert!(need > 0);
+        let mut out = vec![0u8; need as usize];
+        let got =
+            seds_router_cached_managed_variable_serialized(router, ty, out.as_mut_ptr(), out.len());
+        assert_eq!(got, need);
+        let decoded = deserialize_packet(&out).unwrap();
+        assert_eq!(decoded.data_type(), ty);
+        assert_eq!(decoded.data_as_f32().unwrap(), vec![4.0, 5.0, 6.0]);
+
+        seds_router_free(router);
     }
 
     #[test]
@@ -4714,7 +5155,10 @@ mod tests {
             assert_eq!(ok_or_status((*router).inner.tx(pkt)), 0);
         }
         assert_eq!(hits_a.hits.load(Ordering::SeqCst), 0);
-        assert_eq!(hits_b.hits.load(Ordering::SeqCst) + hits_c.hits.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            hits_b.hits.load(Ordering::SeqCst) + hits_c.hits.load(Ordering::SeqCst),
+            3
+        );
 
         seds_router_free(router);
     }

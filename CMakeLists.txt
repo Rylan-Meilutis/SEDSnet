@@ -48,6 +48,15 @@ set(SEDSPRINTF_RS_SCHEMA_PATH "" CACHE STRING
 option(SEDSPRINTF_EMBEDDED_BUILD "Build sedsprintf_rs for embedded" OFF)
 option(SEDSPRINTF_RS_PREFER_DYNAMIC "Prefer dynamic linking for host builds when supported" ON)
 option(SEDSPRINTF_RS_FORCE_RELEASE "Build sedsprintf_rs in release profile even when the parent CMake build is Debug" OFF)
+option(SEDSPRINTF_RS_ENABLE_C_WRAPPER
+    "Build the optional native C wrapper target sedsprintf_rs::c_wrapper"
+    OFF)
+option(SEDSPRINTF_RS_ENABLE_CPP_WRAPPER
+    "Expose the optional header-only C++ convenience target sedsprintf_rs::cpp_wrapper"
+    OFF)
+option(SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM
+    "Enable feature-gated crypto shim APIs and define SEDS_ENABLE_CRYPTO_SHIM for C/C++ users"
+    OFF)
 
 # Auto-detect embedded if user hasn't forced it
 if (NOT SEDSPRINTF_EMBEDDED_BUILD)
@@ -107,6 +116,9 @@ set(RS_SHARED_LIB_REL "")
 
 set(RS_INCLUDE "${RUST_DIR}/C-Headers")
 set(RS_HEADER "${RS_INCLUDE}/sedsprintf.h")
+if (NOT EXISTS "${RS_HEADER}")
+    message(FATAL_ERROR "Static sedsprintf C header is missing: ${RS_HEADER}")
+endif ()
 
 # ============================================================
 # Build.py args (for logging only)
@@ -136,6 +148,9 @@ if (NOT SEDSPRINTF_RS_MAX_RECENT_RX_IDS STREQUAL "")
 endif ()
 if (NOT SEDSPRINTF_RS_SCHEMA_PATH STREQUAL "")
     set(RS_ARGS_STR "${RS_ARGS_STR} schema_path=${SEDSPRINTF_RS_SCHEMA_PATH}")
+endif ()
+if (SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM)
+    set(RS_ARGS_STR "${RS_ARGS_STR} crypto_shim")
 endif ()
 
 if (SEDSPRINTF_RS_FORCE_RELEASE)
@@ -182,6 +197,9 @@ endif ()
 if (NOT SEDSPRINTF_RS_SCHEMA_PATH STREQUAL "")
     list(APPEND RS_ARGS_BOOTSTRAP "schema_path=${SEDSPRINTF_RS_SCHEMA_PATH}")
 endif ()
+if (SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM)
+    list(APPEND RS_ARGS_BOOTSTRAP "crypto_shim")
+endif ()
 
 # New: forward arbitrary option_env config vars: SEDSPRINTF_RS_ENV_<KEY> => env:KEY=VALUE
 get_cmake_property(_all_cache_vars CACHE_VARIABLES)
@@ -198,28 +216,10 @@ foreach (_v ${_all_cache_vars})
     endif ()
 endforeach ()
 
-# Ensure include dir exists
-file(MAKE_DIRECTORY "${RS_INCLUDE}")
-
 # Keep Rust staticlib object deployment target aligned with C/C++ link target on macOS.
 set(_RS_ENV_CMD ${CMAKE_COMMAND} -E env)
 if (APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
     list(APPEND _RS_ENV_CMD "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
-endif ()
-
-# ============================================================
-# Bootstrap build if header missing
-# ============================================================
-if (NOT EXISTS "${RS_HEADER}")
-    message(STATUS "sedsprintf_rs: header not found (${RS_HEADER}); building once…")
-    execute_process(
-        COMMAND ${_RS_ENV_CMD} "${PYTHON_EXECUTABLE}" build.py ${RS_ARGS_BOOTSTRAP}
-        WORKING_DIRECTORY "${RUST_DIR}"
-        RESULT_VARIABLE _hdr_build_res
-    )
-    if (NOT _hdr_build_res EQUAL 0)
-        message(WARNING "Header bootstrap failed (exit ${_hdr_build_res}); will rely on full build step.")
-    endif ()
 endif ()
 
 # ============================================================
@@ -230,12 +230,16 @@ file(GLOB_RECURSE RS_SRC CONFIGURE_DEPENDS
     "${RUST_DIR}/build.rs"
     "${RUST_DIR}/Cargo.toml"
     "${RUST_DIR}/Cargo.lock"
+    "${RS_HEADER}"
+    "${RUST_DIR}/c-wrapper/*.c"
+    "${RUST_DIR}/c-wrapper/*.h"
+    "${RUST_DIR}/c-wrapper/*.hpp"
 )
 
 if (SEDSPRINTF_RS_FORCE_RELEASE)
-    set(RS_BUILD_OUTPUTS "${RS_LIB_REL}" "${RS_HEADER}")
+    set(RS_BUILD_OUTPUTS "${RS_LIB_REL}")
 else ()
-    set(RS_BUILD_OUTPUTS "${RS_LIB_DBG}" "${RS_LIB_REL}" "${RS_HEADER}")
+    set(RS_BUILD_OUTPUTS "${RS_LIB_DBG}" "${RS_LIB_REL}")
 endif ()
 
 # ============================================================
@@ -260,10 +264,14 @@ add_custom_target(sedsprintf_rs_build
 # ============================================================
 add_library(sedsprintf_rs ${RS_IMPORTED_KIND} IMPORTED GLOBAL)
 set_target_properties(sedsprintf_rs PROPERTIES
+    IMPORTED_LOCATION "${RS_LIB_DBG}"
     IMPORTED_LOCATION_DEBUG "${RS_LIB_DBG}"
     IMPORTED_LOCATION_RELEASE "${RS_LIB_REL}"
     INTERFACE_INCLUDE_DIRECTORIES "${RS_INCLUDE}"
 )
+if (SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM)
+    target_compile_definitions(sedsprintf_rs INTERFACE SEDS_ENABLE_CRYPTO_SHIM=1)
+endif ()
 
 add_dependencies(sedsprintf_rs sedsprintf_rs_build)
 
@@ -284,6 +292,34 @@ add_link_options(-Wl,--gc-sections -Wl,--icf=all)
 
 add_library(sedsprintf_rs::sedsprintf_rs ALIAS sedsprintf_rs)
 
+if (SEDSPRINTF_RS_ENABLE_C_WRAPPER)
+    add_library(sedsprintf_rs_c_wrapper STATIC
+        "${RUST_DIR}/c-wrapper/sedsprintf_c_wrapper.c"
+    )
+    target_include_directories(sedsprintf_rs_c_wrapper PUBLIC
+        "${RUST_DIR}/c-wrapper"
+    )
+    target_link_libraries(sedsprintf_rs_c_wrapper PUBLIC sedsprintf_rs)
+    if (SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM)
+        target_compile_definitions(sedsprintf_rs_c_wrapper PUBLIC SEDS_ENABLE_CRYPTO_SHIM=1)
+    endif ()
+    add_dependencies(sedsprintf_rs_c_wrapper sedsprintf_rs_build)
+    add_library(sedsprintf_rs::c_wrapper ALIAS sedsprintf_rs_c_wrapper)
+endif ()
+
+if (SEDSPRINTF_RS_ENABLE_CPP_WRAPPER)
+    add_library(sedsprintf_rs_cpp_wrapper INTERFACE)
+    target_include_directories(sedsprintf_rs_cpp_wrapper INTERFACE
+        "${RUST_DIR}/c-wrapper"
+    )
+    target_link_libraries(sedsprintf_rs_cpp_wrapper INTERFACE sedsprintf_rs)
+    if (SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM)
+        target_compile_definitions(sedsprintf_rs_cpp_wrapper INTERFACE SEDS_ENABLE_CRYPTO_SHIM=1)
+    endif ()
+    add_dependencies(sedsprintf_rs_cpp_wrapper sedsprintf_rs_build)
+    add_library(sedsprintf_rs::cpp_wrapper ALIAS sedsprintf_rs_cpp_wrapper)
+endif ()
+
 set(SEDSPRINTF_RS_LIB_DEBUG "${RS_LIB_DBG}" PARENT_SCOPE)
 set(SEDSPRINTF_RS_LIB_RELEASE "${RS_LIB_REL}" PARENT_SCOPE)
 set(SEDSPRINTF_RS_STATIC_LIB_DEBUG "${RS_STATIC_LIB_DBG}" PARENT_SCOPE)
@@ -291,6 +327,7 @@ set(SEDSPRINTF_RS_STATIC_LIB_RELEASE "${RS_STATIC_LIB_REL}" PARENT_SCOPE)
 set(SEDSPRINTF_RS_SHARED_LIB_DEBUG "${RS_SHARED_LIB_DBG}" PARENT_SCOPE)
 set(SEDSPRINTF_RS_SHARED_LIB_RELEASE "${RS_SHARED_LIB_REL}" PARENT_SCOPE)
 set(SEDSPRINTF_RS_INCLUDE_DIR "${RS_INCLUDE}" PARENT_SCOPE)
+set(SEDSPRINTF_RS_C_WRAPPER_INCLUDE_DIR "${RUST_DIR}/c-wrapper" PARENT_SCOPE)
 
 message(STATUS "sedsprintf_rs include dir: ${RS_INCLUDE}")
 message(STATUS "sedsprintf_rs debug lib:  ${RS_LIB_DBG}")
@@ -301,4 +338,7 @@ else ()
     set(_SEDSPRINTF_RS_LINK_MODE "static")
 endif ()
 message(STATUS "sedsprintf_rs link mode: ${_SEDSPRINTF_RS_LINK_MODE}")
+message(STATUS "sedsprintf_rs C wrapper target: ${SEDSPRINTF_RS_ENABLE_C_WRAPPER}")
+message(STATUS "sedsprintf_rs C++ wrapper target: ${SEDSPRINTF_RS_ENABLE_CPP_WRAPPER}")
+message(STATUS "sedsprintf_rs crypto shim: ${SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM}")
 message(STATUS "sedsprintf_rs build args: ${RS_ARGS_STR}")

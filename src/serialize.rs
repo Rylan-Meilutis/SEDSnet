@@ -74,6 +74,7 @@ pub const CRC32_BYTES: usize = 4;
 //   VARINT(ty: u32 as u64)           -- ULEB128
 //   VARINT(data_size: u64)           -- ULEB128   (LOGICAL payload size, uncompressed)
 //   VARINT(timestamp: u64)           -- ULEB128
+//   [VARINT(nonce: u16 as u64)]      -- ULEB128   (ONLY if bit3 set)
 //   VARINT(sender_len: u64)          -- ULEB128   (LOGICAL sender length, uncompressed)
 //   [VARINT(sender_wire_len: u64)]   -- ULEB128   (ONLY if sender compressed)
 //
@@ -92,6 +93,7 @@ pub const CRC32_BYTES: usize = 4;
 const FLAG_COMPRESSED_PAYLOAD: u8 = 0x01;
 const FLAG_COMPRESSED_SENDER: u8 = 0x02;
 const FLAG_WIRE_CONTRACT: u8 = 0x04;
+const FLAG_PACKET_NONCE: u8 = 0x08;
 const CONTRACT_FLAG_TARGETS: u8 = 0x01;
 const CONTRACT_FLAG_SHAPE: u8 = 0x02;
 const CONTRACT_FLAG_RELIABLE_HEADER: u8 = 0x04;
@@ -620,6 +622,9 @@ fn serialize_packet_inner_with_contract(
     if shape.is_some() || !target_senders.is_empty() {
         flags |= FLAG_WIRE_CONTRACT;
     }
+    if pkt.nonce() != 0 {
+        flags |= FLAG_PACKET_NONCE;
+    }
     out.push(flags);
 
     // NEP = number of UNIQUE endpoints (bits set in bitmap).
@@ -634,6 +639,9 @@ fn serialize_packet_inner_with_contract(
     write_uleb128(pkt.data_type().as_u32() as u64, &mut out);
     write_uleb128(pkt.data_size() as u64, &mut out);
     write_uleb128(pkt.timestamp(), &mut out);
+    if pkt.nonce() != 0 {
+        write_uleb128(pkt.nonce() as u64, &mut out);
+    }
 
     // Logical sender length (uncompressed).
     write_uleb128(sender_bytes.len() as u64, &mut out);
@@ -702,6 +710,12 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let ty_v = read_uleb128(&mut r)?;
     let dsz = read_uleb128(&mut r)? as usize; // logical (uncompressed) payload size
     let ts_v = read_uleb128(&mut r)?;
+    let nonce = if (flags & FLAG_PACKET_NONCE) != 0 {
+        u16::try_from(read_uleb128(&mut r)?)
+            .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+    } else {
+        0
+    };
     let slen = read_uleb128(&mut r)? as usize; // logical (uncompressed) sender length
 
     // If sender is compressed, next varint is its wire length; else wire_len == slen.
@@ -772,6 +786,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
         &eps,
         &sender_str,
         ts_v,
+        nonce,
         payload_arc,
         contract.shape,
         contract.target_senders,
@@ -815,6 +830,9 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     let ty_v = read_uleb128(&mut r)?;
     let _dsz = read_uleb128(&mut r)? as usize;
     let ts_v = read_uleb128(&mut r)?;
+    if (flags & FLAG_PACKET_NONCE) != 0 {
+        let _ = read_uleb128(&mut r)?;
+    }
     let slen = read_uleb128(&mut r)? as usize;
 
     let sender_wire_len = if sender_is_compressed {
@@ -887,6 +905,9 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     let ty_v = read_uleb128(&mut r)?;
     let _dsz = read_uleb128(&mut r)? as usize;
     let ts_v = read_uleb128(&mut r)?;
+    if (flags & FLAG_PACKET_NONCE) != 0 {
+        let _ = read_uleb128(&mut r)?;
+    }
     let slen = read_uleb128(&mut r)? as usize;
 
     let sender_wire_len = if sender_is_compressed {
@@ -989,6 +1010,9 @@ pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
     let ty_v = read_uleb128(&mut r)?;
     let _dsz = read_uleb128(&mut r)? as usize;
     let _ts_v = read_uleb128(&mut r)?;
+    if (flags & FLAG_PACKET_NONCE) != 0 {
+        let _ = read_uleb128(&mut r)?;
+    }
     let slen = read_uleb128(&mut r)? as usize;
 
     let sender_wire_len = if sender_is_compressed {
@@ -1083,6 +1107,11 @@ pub fn header_size_bytes(pkt: &Packet) -> usize {
         + uleb128_size(pkt.data_type().as_u32() as u64)
         + uleb128_size(pkt.data_size() as u64)
         + uleb128_size(pkt.timestamp())
+        + if pkt.nonce() != 0 {
+            uleb128_size(pkt.nonce() as u64)
+        } else {
+            0
+        }
         + uleb128_size(sender_bytes.len() as u64)
         + if sender_compressed {
             // extra varint for sender_wire_len when compressed
@@ -1141,6 +1170,12 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let ty_v = read_uleb128(&mut r)?;
     let dsz = read_uleb128(&mut r)? as usize; // logical payload size (uncompressed)
     let ts_v = read_uleb128(&mut r)?;
+    let nonce = if (flags & FLAG_PACKET_NONCE) != 0 {
+        u16::try_from(read_uleb128(&mut r)?)
+            .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+    } else {
+        0
+    };
     let slen = read_uleb128(&mut r)? as usize; // logical sender len (uncompressed)
 
     let sender_wire_len = if sender_is_compressed {
@@ -1228,6 +1263,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
 
     // Timestamp + data_size as bytes
     h = hash_bytes_u64(h, &ts_v.to_le_bytes());
+    h = hash_bytes_u64(h, &nonce.to_le_bytes());
     h = hash_bytes_u64(h, &(dsz as u64).to_le_bytes());
 
     // Payload bytes (logical payload)

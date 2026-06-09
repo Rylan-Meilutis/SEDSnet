@@ -1,21 +1,21 @@
 // tests/rust-system-test/single_threaded_test.rs
 #[cfg(test)]
 mod single_threaded_test {
-    use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
-    use sedsprintf_rs::TelemetryResult;
     use sedsprintf_rs::TelemetryError;
+    use sedsprintf_rs::TelemetryResult;
     use sedsprintf_rs::config::{
-        data_type_definition_by_name, endpoint_definition_by_name, register_data_type_with_description,
-        register_endpoint_with_description, DataEndpoint, DataType,
+        DataEndpoint, DataType, data_type_definition_by_name, endpoint_definition_by_name,
+        register_data_type_with_description, register_endpoint_with_description,
     };
     use sedsprintf_rs::packet::Packet;
     use sedsprintf_rs::relay::Relay;
     use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
+    use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
     use std::sync::Arc;
+    use std::sync::Once;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, TryRecvError};
-    use std::sync::Once;
 
     fn env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
@@ -147,9 +147,9 @@ mod single_threaded_test {
                                         .rx_serialized_queue(&frame)
                                         .expect("bus1: rx_serialized_queue retry failed");
                                 }
-                                other => panic!(
-                                    "bus1: rx_serialized_packet_to_queue failed: {other:?}"
-                                ),
+                                other => {
+                                    panic!("bus1: rx_serialized_packet_to_queue failed: {other:?}")
+                                }
                             }
                         }
                     }
@@ -188,9 +188,9 @@ mod single_threaded_test {
                                         .rx_serialized_queue(&frame)
                                         .expect("bus2: rx_serialized_queue retry failed");
                                 }
-                                other => panic!(
-                                    "bus2: rx_serialized_packet_to_queue failed: {other:?}"
-                                ),
+                                other => {
+                                    panic!("bus2: rx_serialized_packet_to_queue failed: {other:?}")
+                                }
                             }
                         }
                     }

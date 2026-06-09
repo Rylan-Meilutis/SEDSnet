@@ -110,8 +110,11 @@ With `discovery` enabled:
 `export_topology()` is available on both `Router` and `Relay`.
 
 - it returns a Python `dict`
-- the top-level `routers` key lists each discovered router, the endpoints/source IDs it owns, and
-  its connections
+- the top-level `routers` key lists each discovered router, the endpoint names/source IDs it owns,
+  and its connected router sender IDs
+- graph-facing endpoint fields such as `reachable_endpoints` and `advertised_endpoints` contain
+  schema-advertised names; companion fields such as `reachable_endpoint_ids` and
+  `advertised_endpoint_ids` preserve the numeric IDs
 - each route entry also includes `announcers` so you can see which upstream router advertised each
   piece of topology
 

@@ -282,7 +282,10 @@ With discovery enabled, `export_topology()` returns the router's current learned
 
 - `topology.routers` contains the top-level discovered router graph
 - each router entry includes the sender ID, owned endpoints, owned time-sync source IDs, and
-  connected routers
+  connected router sender IDs
+- exported JSON/Python dictionaries use `reachable_endpoints` and `advertised_endpoints` for
+  schema-advertised names, with `reachable_endpoint_ids` and `advertised_endpoint_ids` available
+  when code needs stable numeric validation
 - each side route also includes `announcers`, so you can see which upstream router advertised the
   exported topology
 

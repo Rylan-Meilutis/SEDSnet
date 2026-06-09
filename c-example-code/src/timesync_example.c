@@ -1,4 +1,4 @@
-#include "sedsprintf.h"
+#include "sedsprintf_c_wrapper.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -33,9 +33,29 @@ static SedsResult on_packet(const SedsPacketView * pkt, void * user)
 
 int main(void)
 {
+    SedsEndpointRef radio_endpoint;
+    SedsEndpointRef sd_card_endpoint;
+    SedsTypeRef gps_data;
+    SedsTypeRef imu_data;
+    SedsTypeRef battery_status;
+    SedsTypeRef message_data;
+    SedsTypeRef heartbeat;
+
+    if (seds_endpoint_ref_by_name(SEDS_NAME_LITERAL("RADIO"), &radio_endpoint) != SEDS_OK ||
+        seds_endpoint_ref_by_name(SEDS_NAME_LITERAL("SD_CARD"), &sd_card_endpoint) != SEDS_OK ||
+        seds_type_ref_by_name(SEDS_NAME_LITERAL("GPS_DATA"), &gps_data) != SEDS_OK ||
+        seds_type_ref_by_name(SEDS_NAME_LITERAL("IMU_DATA"), &imu_data) != SEDS_OK ||
+        seds_type_ref_by_name(SEDS_NAME_LITERAL("BATTERY_STATUS"), &battery_status) != SEDS_OK ||
+        seds_type_ref_by_name(SEDS_NAME_LITERAL("MESSAGE_DATA"), &message_data) != SEDS_OK ||
+        seds_type_ref_by_name(SEDS_NAME_LITERAL("HEARTBEAT"), &heartbeat) != SEDS_OK)
+    {
+        fprintf(stderr, "runtime schema is missing an example endpoint or data type\n");
+        return 1;
+    }
+
     const SedsLocalEndpointDesc locals[] = {
-        {.endpoint = SEDS_EP_RADIO, .packet_handler = on_packet, .user = NULL},
-        {.endpoint = SEDS_EP_SD_CARD, .packet_handler = on_packet, .user = NULL},
+        {.endpoint = radio_endpoint.id, .packet_handler = on_packet, .user = NULL},
+        {.endpoint = sd_card_endpoint.id, .packet_handler = on_packet, .user = NULL},
     };
 
     SedsRouter * r = seds_router_new(Seds_RM_Sink, host_now_ms, NULL, locals, 2);
@@ -51,11 +71,11 @@ int main(void)
     const float gps[3] = {37.7749f, -122.4194f, 30.0f};
     const float imu[6] = {0.1f, 0.2f, 0.3f, 1.1f, 1.2f, 1.3f};
     const float batt[2] = {12.5f, 1.8f};
-    seds_router_log(r, SEDS_DT_GPS_DATA, gps, 3);
-    seds_router_log(r, SEDS_DT_IMU_DATA, imu, 6);
-    seds_router_log(r, SEDS_DT_BATTERY_STATUS, batt, 2);
-    seds_router_log_cstr(r, SEDS_DT_MESSAGE_DATA, "hello from C timesync example");
-    seds_router_log_cstr(r, SEDS_DT_HEARTBEAT, "");
+    seds_router_log(r, gps_data.id, gps, sizeof(gps));
+    seds_router_log(r, imu_data.id, imu, sizeof(imu));
+    seds_router_log(r, battery_status.id, batt, sizeof(batt));
+    seds_router_log_cstr(r, message_data.id, "hello from C timesync example");
+    seds_router_log_cstr(r, heartbeat.id, "");
 
     seds_router_periodic(r, 0);
 

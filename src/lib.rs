@@ -165,6 +165,8 @@ mod embedded_alloc {
 
 mod c_api;
 pub mod config;
+#[cfg(feature = "crypto-shim")]
+pub mod crypto;
 pub mod diagnostics;
 #[cfg(feature = "discovery")]
 pub mod discovery;
