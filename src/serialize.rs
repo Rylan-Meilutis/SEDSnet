@@ -94,9 +94,15 @@ const FLAG_COMPRESSED_PAYLOAD: u8 = 0x01;
 const FLAG_COMPRESSED_SENDER: u8 = 0x02;
 const FLAG_WIRE_CONTRACT: u8 = 0x04;
 const FLAG_PACKET_NONCE: u8 = 0x08;
+#[cfg(feature = "crypto-shim")]
+const FLAG_E2E_ENCRYPTED_PAYLOAD: u8 = 0x10;
 const CONTRACT_FLAG_TARGETS: u8 = 0x01;
 const CONTRACT_FLAG_SHAPE: u8 = 0x02;
 const CONTRACT_FLAG_RELIABLE_HEADER: u8 = 0x04;
+#[cfg(feature = "crypto-shim")]
+const E2E_NONCE_LEN: usize = 12;
+#[cfg(feature = "crypto-shim")]
+const E2E_TAG_CAP: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WireContract {
@@ -355,6 +361,90 @@ fn verify_crc32(buf: &[u8]) -> Result<&[u8], TelemetryError> {
     Ok(data)
 }
 
+#[cfg(feature = "crypto-shim")]
+#[inline]
+fn e2e_nonce_for_packet(pkt: &Packet) -> [u8; E2E_NONCE_LEN] {
+    let mut nonce = [0u8; E2E_NONCE_LEN];
+    nonce[..4].copy_from_slice(&pkt.data_type().as_u32().to_le_bytes());
+    nonce[4..10].copy_from_slice(&(pkt.timestamp() & 0x0000_FFFF_FFFF_FFFF).to_le_bytes()[..6]);
+    nonce[10..].copy_from_slice(&pkt.nonce().to_le_bytes());
+    nonce
+}
+
+#[cfg(feature = "crypto-shim")]
+fn write_encrypted_payload(
+    pkt: &Packet,
+    key_id: u32,
+    plaintext_wire_payload: &[u8],
+    out: &mut Vec<u8>,
+) -> TelemetryResult<()> {
+    let aad_end = out.len();
+    let nonce = e2e_nonce_for_packet(pkt);
+    let mut ciphertext = vec![0u8; plaintext_wire_payload.len()];
+    let mut tag = [0u8; E2E_TAG_CAP];
+    let (ciphertext_len, tag_len) = crate::crypto::seal_with_registered_c_shim(
+        key_id,
+        &nonce,
+        &out[..aad_end],
+        plaintext_wire_payload,
+        &mut ciphertext,
+        &mut tag,
+    )?;
+    if ciphertext_len > ciphertext.len() || tag_len > tag.len() {
+        return Err(TelemetryError::SizeMismatchError);
+    }
+    write_uleb128(u64::from(key_id), out);
+    write_uleb128(plaintext_wire_payload.len() as u64, out);
+    write_uleb128(nonce.len() as u64, out);
+    out.extend_from_slice(&nonce);
+    write_uleb128(tag_len as u64, out);
+    out.extend_from_slice(&tag[..tag_len]);
+    out.extend_from_slice(&ciphertext[..ciphertext_len]);
+    Ok(())
+}
+
+#[cfg(feature = "crypto-shim")]
+fn read_encrypted_payload(
+    r: &mut ByteReader,
+    aad: &[u8],
+    plaintext_len: usize,
+) -> TelemetryResult<Vec<u8>> {
+    let key_id = u32::try_from(read_uleb128(r)?)
+        .map_err(|_| TelemetryError::Deserialize("e2e key id too large"))?;
+    let wire_payload_len = usize::try_from(read_uleb128(r)?)
+        .map_err(|_| TelemetryError::Deserialize("e2e payload length"))?;
+    if wire_payload_len > plaintext_len {
+        return Err(TelemetryError::Deserialize("bad e2e payload length"));
+    }
+    let nonce_len = usize::try_from(read_uleb128(r)?)
+        .map_err(|_| TelemetryError::Deserialize("e2e nonce length"))?;
+    if nonce_len == 0 || nonce_len > 64 {
+        return Err(TelemetryError::Deserialize("bad e2e nonce length"));
+    }
+    let nonce = r.read_bytes(nonce_len)?;
+    let tag_len = usize::try_from(read_uleb128(r)?)
+        .map_err(|_| TelemetryError::Deserialize("e2e tag length"))?;
+    if tag_len == 0 || tag_len > E2E_TAG_CAP {
+        return Err(TelemetryError::Deserialize("bad e2e tag length"));
+    }
+    let tag = r.read_bytes(tag_len)?;
+    let ciphertext_len = r.remaining();
+    let ciphertext = r.read_bytes(ciphertext_len)?;
+    let mut plaintext = vec![0u8; wire_payload_len];
+    let opened_len = crate::crypto::open_with_registered_c_shim(
+        key_id,
+        nonce,
+        aad,
+        ciphertext,
+        tag,
+        &mut plaintext,
+    )?;
+    if opened_len != wire_payload_len {
+        return Err(TelemetryError::SizeMismatchError);
+    }
+    Ok(plaintext)
+}
+
 #[inline]
 fn write_reliable_header(h: ReliableHeader, out: &mut Vec<u8>) {
     out.push(h.flags);
@@ -533,7 +623,14 @@ pub fn serialize_reliable_ack(
 }
 
 fn serialize_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]> {
-    serialize_packet_inner_with_contract(pkt, reliable, pkt.wire_shape(), pkt.wire_target_senders())
+    serialize_packet_inner_with_contract(
+        pkt,
+        reliable,
+        pkt.wire_shape(),
+        pkt.wire_target_senders(),
+        None,
+    )
+    .expect("plaintext packet serialization failed")
 }
 
 /// Serialize `pkt` while explicitly controlling the wire-contract metadata.
@@ -561,12 +658,24 @@ pub(crate) fn serialize_packet_with_wire_contract(
     shape: Option<MessageElement>,
     target_senders: &[u64],
 ) -> TelemetryResult<Arc<[u8]>> {
-    Ok(serialize_packet_inner_with_contract(
-        pkt,
-        reliable,
-        shape,
-        target_senders,
-    ))
+    serialize_packet_inner_with_contract(pkt, reliable, shape, target_senders, None)
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "crypto-shim"), allow(dead_code))]
+pub(crate) struct E2eSealConfig {
+    pub key_id: u32,
+}
+
+#[cfg(feature = "crypto-shim")]
+pub(crate) fn serialize_packet_with_wire_contract_e2e(
+    pkt: &Packet,
+    reliable: Option<ReliableHeader>,
+    shape: Option<MessageElement>,
+    target_senders: &[u64],
+    e2e: E2eSealConfig,
+) -> TelemetryResult<Arc<[u8]>> {
+    serialize_packet_inner_with_contract(pkt, reliable, shape, target_senders, Some(e2e))
 }
 
 fn serialize_packet_inner_with_contract(
@@ -574,7 +683,8 @@ fn serialize_packet_inner_with_contract(
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
     target_senders: &[u64],
-) -> Arc<[u8]> {
+    #[cfg_attr(not(feature = "crypto-shim"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
+) -> TelemetryResult<Arc<[u8]>> {
     // Endpoint selection always remains a fixed-width bitmap for compactness.
     // The optional wire contract then carries only the extra metadata required
     // to survive schema/topology churn.
@@ -625,6 +735,10 @@ fn serialize_packet_inner_with_contract(
     if pkt.nonce() != 0 {
         flags |= FLAG_PACKET_NONCE;
     }
+    #[cfg(feature = "crypto-shim")]
+    if e2e.is_some() {
+        flags |= FLAG_E2E_ENCRYPTED_PAYLOAD;
+    }
     out.push(flags);
 
     // NEP = number of UNIQUE endpoints (bits set in bitmap).
@@ -663,10 +777,19 @@ fn serialize_packet_inner_with_contract(
     if let Some(hdr) = reliable {
         write_reliable_header(hdr, &mut out);
     }
-    out.extend_from_slice(&payload_wire);
+    #[cfg(feature = "crypto-shim")]
+    if let Some(e2e) = e2e {
+        write_encrypted_payload(pkt, e2e.key_id, &payload_wire, &mut out)?;
+    } else {
+        out.extend_from_slice(&payload_wire);
+    }
+    #[cfg(not(feature = "crypto-shim"))]
+    {
+        out.extend_from_slice(&payload_wire);
+    }
     append_crc32(&mut out);
 
-    Arc::<[u8]>::from(out)
+    Ok(Arc::<[u8]>::from(out))
 }
 
 // ===========================================================================
@@ -704,6 +827,12 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let flags = r.read_bytes(1)?[0];
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
     let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
+    #[cfg(feature = "crypto-shim")]
+    let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
+    #[cfg(not(feature = "crypto-shim"))]
+    if (flags & 0x10) != 0 {
+        return Err(TelemetryError::Deserialize("e2e crypto unsupported"));
+    }
 
     let nep = r.read_bytes(1)?[0] as usize;
 
@@ -767,14 +896,38 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     }
 
     // ----- Payload handling -----
-    let payload_arc: Arc<[u8]> = if !payload_is_compressed {
-        let payload_slice = r.read_bytes(dsz)?;
-        Arc::<[u8]>::from(payload_slice)
-    } else {
-        let comp_len = r.remaining();
-        let comp_bytes = r.read_bytes(comp_len)?;
-        let decompressed = payload_compression::decompress(comp_bytes, dsz)?;
-        Arc::<[u8]>::from(decompressed)
+    let payload_arc: Arc<[u8]> = {
+        #[cfg(feature = "crypto-shim")]
+        let payload_wire_owned;
+        #[cfg(feature = "crypto-shim")]
+        let payload_wire: &[u8] = if payload_is_encrypted {
+            let aad_end = r.off;
+            payload_wire_owned = read_encrypted_payload(&mut r, &data[..aad_end], dsz)?;
+            &payload_wire_owned
+        } else if !payload_is_compressed {
+            r.read_bytes(dsz)?
+        } else {
+            let comp_len = r.remaining();
+            r.read_bytes(comp_len)?
+        };
+
+        #[cfg(not(feature = "crypto-shim"))]
+        let payload_wire: &[u8] = if !payload_is_compressed {
+            r.read_bytes(dsz)?
+        } else {
+            let comp_len = r.remaining();
+            r.read_bytes(comp_len)?
+        };
+
+        if payload_is_compressed {
+            let decompressed = payload_compression::decompress(payload_wire, dsz)?;
+            Arc::<[u8]>::from(decompressed)
+        } else {
+            if payload_wire.len() != dsz {
+                return Err(TelemetryError::Deserialize("payload length mismatch"));
+            }
+            Arc::<[u8]>::from(payload_wire)
+        }
     };
 
     // `Packet` preserves logical payload data plus wire-contract metadata, but
@@ -1164,6 +1317,12 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let flags = r.read_bytes(1)?[0];
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
     let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
+    #[cfg(feature = "crypto-shim")]
+    let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
+    #[cfg(not(feature = "crypto-shim"))]
+    if (flags & 0x10) != 0 {
+        return Err(TelemetryError::Deserialize("e2e crypto unsupported"));
+    }
 
     let _nep = r.read_bytes(1)?[0] as usize;
 
@@ -1219,22 +1378,49 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
         }
     }
 
-    // ---- payload bytes (must hash *decompressed* payload if compressed) ----
-    let payload_decompressed: Vec<u8>;
-    let payload_bytes: &[u8] = if !payload_is_compressed {
+    // ---- payload bytes (must hash *logical* payload bytes) ----
+    #[cfg(feature = "crypto-shim")]
+    let payload_wire_owned;
+    #[cfg(feature = "crypto-shim")]
+    let payload_wire: &[u8] = if payload_is_encrypted {
+        let aad_end = r.off;
+        payload_wire_owned =
+            read_encrypted_payload(&mut r, data.get(..aad_end).unwrap_or(&[]), dsz)?;
+        &payload_wire_owned
+    } else if !payload_is_compressed {
         if r.remaining() < dsz {
             return Err(TelemetryError::Deserialize("short buffer"));
         }
         r.read_bytes(dsz)?
     } else {
-        // Compressed payload consumes the rest of the buffer in the format.
         let comp_len = r.remaining();
         if comp_len < 1 {
             return Err(TelemetryError::Deserialize("short buffer"));
         }
-        let comp = r.read_bytes(comp_len)?;
-        payload_decompressed = payload_compression::decompress(comp, dsz)?;
+        r.read_bytes(comp_len)?
+    };
+    #[cfg(not(feature = "crypto-shim"))]
+    let payload_wire: &[u8] = if !payload_is_compressed {
+        if r.remaining() < dsz {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        r.read_bytes(dsz)?
+    } else {
+        let comp_len = r.remaining();
+        if comp_len < 1 {
+            return Err(TelemetryError::Deserialize("short buffer"));
+        }
+        r.read_bytes(comp_len)?
+    };
+    let payload_decompressed;
+    let payload_bytes: &[u8] = if payload_is_compressed {
+        payload_decompressed = payload_compression::decompress(payload_wire, dsz)?;
         &payload_decompressed
+    } else {
+        if payload_wire.len() != dsz {
+            return Err(TelemetryError::Deserialize("payload length mismatch"));
+        }
+        payload_wire
     };
 
     // ---- hash exactly like Packet::packet_id() ----

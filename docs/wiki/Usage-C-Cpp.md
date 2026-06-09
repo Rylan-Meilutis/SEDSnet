@@ -360,6 +360,25 @@ type, the router refreshes its cache. C firmware can seed the cache from a seria
 `seds_router_seed_managed_variable_serialized(...)`; Rust firmware can use
 `Router::seed_managed_variable(...)`.
 
+If the managed variable carries sensitive state, mark its data type as requiring E2E encryption and
+create the router with an E2E mode:
+
+```C
+seds_dtype_set_e2e_encryption_policy((uint32_t)flight_state_ty.id, SEDS_E2E_REQUIRE_ON);
+
+SedsWrapperRouterConfig cfg = seds_wrapper_router_default_config();
+cfg.sender = SEDS_NAME_LITERAL("FLIGHT_COMPUTER");
+cfg.e2e_mode = SEDS_ROUTER_E2E_REQUIRED_ONLY;
+cfg.e2e_key_id = 7U;
+(void)seds_global_router_init(&cfg);
+```
+
+Routers created without crypto support reject sends/subscriptions for data types marked
+`SEDS_E2E_REQUIRE_ON`. `SEDS_ROUTER_E2E_PREFERRED` encrypts both preferred and required data types,
+while `SEDS_ROUTER_E2E_FORCE_ALL` encrypts all non-control user data. When
+`SEDS_ENABLE_CRYPTO_SHIM` is defined, the convenience wrapper default is
+`SEDS_ROUTER_E2E_PREFERRED`; builds without it default to `SEDS_ROUTER_E2E_DISABLED`.
+
 ## Optional C++ Wrapper
 
 Enable `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` and include `sedsprintf_cpp_wrapper.hpp` when C++ code
@@ -372,6 +391,7 @@ void publish_state(SedsRouter *router, uint8_t state)
 {
     SedsTypeRef ty{};
     if (seds::type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), ty) == SEDS_OK) {
+        (void)seds::set_e2e_encryption_policy(ty, SEDS_E2E_REQUIRE_ON);
         (void)seds::router_log(router, ty, &state, 1);
     }
 }
@@ -388,23 +408,32 @@ For C firmware, register board-specific crypto callbacks:
 ```C
 #if defined(SEDS_ENABLE_CRYPTO_SHIM)
 static SedsResult seal_cb(
+    uint32_t key_id,
+    const uint8_t *nonce, size_t nonce_len,
     const uint8_t *aad, size_t aad_len,
     const uint8_t *plain, size_t plain_len,
-    uint8_t *out, size_t out_cap, size_t *out_len,
+    uint8_t *cipher_out, size_t cipher_cap, size_t *cipher_len_out,
+    uint8_t *tag_out, size_t tag_cap, size_t *tag_len_out,
     void *user)
 {
     (void)user;
-    return board_crypto_seal(aad, aad_len, plain, plain_len, out, out_cap, out_len);
+    return board_crypto_seal(key_id, nonce, nonce_len, aad, aad_len, plain, plain_len,
+                             cipher_out, cipher_cap, cipher_len_out,
+                             tag_out, tag_cap, tag_len_out);
 }
 
 static SedsResult open_cb(
+    uint32_t key_id,
+    const uint8_t *nonce, size_t nonce_len,
     const uint8_t *aad, size_t aad_len,
     const uint8_t *cipher, size_t cipher_len,
-    uint8_t *out, size_t out_cap, size_t *out_len,
+    const uint8_t *tag, size_t tag_len,
+    uint8_t *plain_out, size_t plain_cap, size_t *plain_len_out,
     void *user)
 {
     (void)user;
-    return board_crypto_open(aad, aad_len, cipher, cipher_len, out, out_cap, out_len);
+    return board_crypto_open(key_id, nonce, nonce_len, aad, aad_len, cipher, cipher_len,
+                             tag, tag_len, plain_out, plain_cap, plain_len_out);
 }
 
 void crypto_init(void)
@@ -423,15 +452,38 @@ struct BoardCrypto;
 
 #[cfg(feature = "crypto-shim")]
 impl sedsprintf_rs::crypto::CryptoShim for BoardCrypto {
-    fn seal(&self, aad: &[u8], plaintext: &[u8], out: &mut [u8]) -> Result<usize, sedsprintf_rs::SedsError> {
-        board_crypto_seal(aad, plaintext, out)
+    fn seal(
+        &self,
+        key_id: u32,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        ciphertext_out: &mut [u8],
+        tag_out: &mut [u8],
+    ) -> sedsprintf_rs::TelemetryResult<(usize, usize)> {
+        board_crypto_seal(key_id, nonce, aad, plaintext, ciphertext_out, tag_out)
     }
 
-    fn open(&self, aad: &[u8], ciphertext: &[u8], out: &mut [u8]) -> Result<usize, sedsprintf_rs::SedsError> {
-        board_crypto_open(aad, ciphertext, out)
+    fn open(
+        &self,
+        key_id: u32,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &[u8],
+        tag: &[u8],
+        plaintext_out: &mut [u8],
+    ) -> sedsprintf_rs::TelemetryResult<usize> {
+        board_crypto_open(key_id, nonce, aad, ciphertext, tag, plaintext_out)
     }
 }
 ```
+
+The library intentionally keeps key establishment in the board/application layer. A typical secure
+deployment runs a quantum-resistant asynchronous key exchange when discovery learns a peer, derives
+hardware-accelerated symmetric traffic keys, and selects them through `key_id`. For multi-drop
+traffic where three boards advertise the same endpoint, use a shared endpoint/group traffic key so
+all intended boards can open the same payload; the authenticated header and tag prevent a receiver
+from modifying that frame for another board without detection.
 
 The first `seds_router_new(...)` mode argument is retained for ABI compatibility with older
 headers. Current routers use runtime side route controls instead of sink/relay construction modes,

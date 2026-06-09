@@ -14,3 +14,4 @@ Additional example files in this folder:
 - `typed_routing_example.rs`: route one packet type through two dedicated sides without load balancing.
 - `relay_example.rs`: basic relay side wiring.
 - `multinode_sim_example.rs`: multi-node simulation.
+- `managed_variables_e2e_example.rs`: managed-variable resync plus E2E router/type policy.

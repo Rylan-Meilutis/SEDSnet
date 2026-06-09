@@ -40,9 +40,10 @@ use crate::{
     RouteSelectionMode, TelemetryError, TelemetryResult,
     config::{
         DataEndpoint, DataType, data_type_definition, data_type_definition_by_name,
-        data_type_exists, endpoint_definition, endpoint_definition_by_name, endpoint_exists,
-        known_endpoints, message_class_code, message_class_from_code, message_data_type_code,
-        message_data_type_from_code, register_data_type_id_with_description,
+        data_type_exists, e2e_encryption_policy_from_code, endpoint_definition,
+        endpoint_definition_by_name, endpoint_exists, known_endpoints, message_class_code,
+        message_class_from_code, message_data_type_code, message_data_type_from_code,
+        register_data_type_id_with_description_and_e2e_encryption,
         register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
         reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
         remove_endpoint_by_name,
@@ -50,7 +51,10 @@ use crate::{
     get_message_name, get_needed_message_size, message_meta,
     packet::Packet,
     relay::{Relay, RelaySideOptions},
-    router::{Clock, EndpointHandler, LeBytes, Router, RouterConfig, RouterSideOptions},
+    router::{
+        Clock, EndpointHandler, LeBytes, Router, RouterConfig, RouterE2eEncryptionMode,
+        RouterSideOptions,
+    },
     serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
     try_enum_from_i32, try_enum_from_u32,
 };
@@ -103,15 +107,35 @@ fn endpoint_from_u32(x: u32) -> TelemetryResult<DataEndpoint> {
     DataEndpoint::try_from_u32(x).ok_or(TelemetryError::Deserialize("bad endpoint"))
 }
 
-fn build_router_config(handlers: Vec<EndpointHandler>, timesync_enabled: bool) -> RouterConfig {
-    let cfg = RouterConfig::new(handlers);
+fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
+    match code {
+        0 => Some(RouterE2eEncryptionMode::Disabled),
+        1 => Some(RouterE2eEncryptionMode::RequiredOnly),
+        2 => Some(RouterE2eEncryptionMode::Preferred),
+        3 => Some(RouterE2eEncryptionMode::ForceAll),
+        255 => Some(RouterConfig::default_e2e_encryption_mode()),
+        _ => None,
+    }
+}
+
+fn build_router_config(
+    handlers: Vec<EndpointHandler>,
+    timesync_enabled: bool,
+    e2e_mode: u8,
+    e2e_key_id: u32,
+) -> PyResult<RouterConfig> {
+    let e2e_mode =
+        router_e2e_mode_from_code(e2e_mode).ok_or_else(|| PyValueError::new_err("bad e2e_mode"))?;
+    let cfg = RouterConfig::new(handlers)
+        .with_e2e_encryption(e2e_mode)
+        .with_e2e_key_id(e2e_key_id);
     #[cfg(feature = "timesync")]
     let cfg = if timesync_enabled {
         cfg.with_timesync(TimeSyncConfig::default())
     } else {
         cfg
     };
-    cfg
+    Ok(cfg)
 }
 
 fn build_router_with_optional_clock(
@@ -774,17 +798,24 @@ impl PyRouter {
 
     /// Create or retrieve a per-process singleton Router.
     #[staticmethod]
-    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled = true))]
+    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled = true, e2e_mode = 255, e2e_key_id = 0))]
     fn new_singleton(
         py: Python<'_>,
         now_ms: Option<Py<PyAny>>,
         handlers: Option<&Bound<'_, PyAny>>,
         timesync_enabled: bool,
+        e2e_mode: u8,
+        e2e_key_id: u32,
     ) -> PyResult<Self> {
         if let Some(existing) = GLOBAL_ROUTER_SINGLETON.get() {
-            if now_ms.is_some() || handlers.is_some() || !timesync_enabled {
+            if now_ms.is_some()
+                || handlers.is_some()
+                || !timesync_enabled
+                || e2e_mode != 255
+                || e2e_key_id != 0
+            {
                 return Err(PyRuntimeError::new_err(
-                    "Router singleton already exists; cannot modify now_ms/handlers/timesync_enabled",
+                    "Router singleton already exists; cannot modify constructor options",
                 ));
             }
 
@@ -800,7 +831,7 @@ impl PyRouter {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let (handlers_vec, keep_pkt, keep_ser) = build_endpoint_handlers(py, handlers)?;
-        let cfg = build_router_config(handlers_vec, timesync_enabled);
+        let cfg = build_router_config(handlers_vec, timesync_enabled, e2e_mode, e2e_key_id)?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
         let arc = SArc::new(Mutex::new(router));
 
@@ -818,17 +849,19 @@ impl PyRouter {
 
     /// Create a new router.
     #[new]
-    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled=true))]
+    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled=true, e2e_mode=255, e2e_key_id=0))]
     fn new(
         py: Python<'_>,
         now_ms: Option<Py<PyAny>>,
         handlers: Option<&Bound<'_, PyAny>>,
         timesync_enabled: bool,
+        e2e_mode: u8,
+        e2e_key_id: u32,
     ) -> PyResult<Self> {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let (handlers_vec, keep_pkt, keep_ser) = build_endpoint_handlers(py, handlers)?;
-        let cfg = build_router_config(handlers_vec, timesync_enabled);
+        let cfg = build_router_config(handlers_vec, timesync_enabled, e2e_mode, e2e_key_id)?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
 
         Ok(Self {
@@ -2201,7 +2234,7 @@ pub fn register_endpoint_py(
 }
 
 #[pyfunction(name = "register_data_type")]
-#[pyo3(signature = (ty, name, is_static, element_count, message_data_type, message_class, endpoints, reliable=0, priority=0, description="")
+#[pyo3(signature = (ty, name, is_static, element_count, message_data_type, message_class, endpoints, reliable=0, priority=0, description="", e2e_encryption=0)
 )]
 #[allow(clippy::too_many_arguments)]
 pub fn register_data_type_py(
@@ -2215,6 +2248,7 @@ pub fn register_data_type_py(
     reliable: u8,
     priority: u8,
     description: &str,
+    e2e_encryption: u8,
 ) -> PyResult<u32> {
     let data_type = message_data_type_from_code(message_data_type)
         .ok_or_else(|| PyValueError::new_err("bad message_data_type"))?;
@@ -2222,13 +2256,15 @@ pub fn register_data_type_py(
         .ok_or_else(|| PyValueError::new_err("bad message_class"))?;
     let reliable =
         reliable_from_code(reliable).ok_or_else(|| PyValueError::new_err("bad reliable"))?;
+    let e2e_encryption = e2e_encryption_policy_from_code(e2e_encryption)
+        .ok_or_else(|| PyValueError::new_err("bad e2e_encryption"))?;
     let element = if is_static {
         MessageElement::Static(element_count, data_type, class)
     } else {
         MessageElement::Dynamic(data_type, class)
     };
     let eps = endpoints.into_iter().map(DataEndpoint).collect::<Vec<_>>();
-    register_data_type_id_with_description(
+    register_data_type_id_with_description_and_e2e_encryption(
         DataType(ty),
         name,
         description,
@@ -2236,6 +2272,7 @@ pub fn register_data_type_py(
         &eps,
         reliable,
         priority,
+        e2e_encryption,
     )
     .map(|dt| dt.as_u32())
     .map_err(py_err_from)
@@ -2275,6 +2312,10 @@ pub fn data_type_info_py(py: Python<'_>, ty: u32) -> PyResult<Py<PyAny>> {
         out.set_item("message_class", message_class_code(class))?;
         out.set_item("reliable", reliable_code(def.reliable))?;
         out.set_item("priority", def.priority)?;
+        out.set_item(
+            "e2e_encryption",
+            crate::config::e2e_encryption_policy_code(def.e2e_encryption),
+        )?;
         out.set_item("fixed_size", get_needed_message_size(def.id))?;
         out.set_item(
             "endpoints",
@@ -2324,6 +2365,10 @@ pub fn data_type_info_by_name_py(py: Python<'_>, name: &str) -> PyResult<Py<PyAn
         out.set_item("message_class", message_class_code(class))?;
         out.set_item("reliable", reliable_code(def.reliable))?;
         out.set_item("priority", def.priority)?;
+        out.set_item(
+            "e2e_encryption",
+            crate::config::e2e_encryption_policy_code(def.e2e_encryption),
+        )?;
         out.set_item("fixed_size", get_needed_message_size(def.id))?;
         out.set_item(
             "endpoints",

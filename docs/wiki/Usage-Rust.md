@@ -89,6 +89,64 @@ Registering an endpoint handler for a missing endpoint auto-creates that endpoin
 and broadcasts the new schema through discovery. Registering a data type or endpoint with the same
 name/ID and a different shape returns an error.
 
+## Managed Variables and E2E Payloads
+
+Managed variables are latest-value caches for user data types. A router that enables a managed
+variable remembers the newest local or received packet for that type. A restarted board can call
+`request_managed_variable(...)` and peers replay the original value packet, so normal endpoint
+handlers run immediately with the cached global state.
+
+Data types can also advertise an E2E encryption preference:
+
+```rust
+use sedsprintf_rs::config::register_data_type_id_with_description_and_e2e_encryption;
+use sedsprintf_rs::router::{Router, RouterConfig, RouterE2eEncryptionMode};
+use sedsprintf_rs::{
+    DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement,
+    ReliableMode,
+};
+
+let flight_state = register_data_type_id_with_description_and_e2e_encryption(
+    DataType(3100),
+    "FLIGHT_STATE",
+    "network-managed flight state",
+    MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+    &[DataEndpoint::named("RADIO")],
+    ReliableMode::None,
+    90,
+    E2eEncryptionPolicy::RequireOn,
+)?;
+
+let router = Router::new(
+    RouterConfig::default()
+        .with_e2e_encryption(RouterE2eEncryptionMode::RequiredOnly)
+        .with_e2e_key_id(7),
+);
+router.enable_managed_variable(flight_state)?;
+router.request_managed_variable(flight_state)?;
+```
+
+Router modes are:
+
+- `Disabled`: never encrypt; reject data types marked `RequireOn`
+- `RequiredOnly`: encrypt only required data types
+- `Preferred`: encrypt required and preferred data types
+- `ForceAll`: encrypt every non-control user data type
+
+`RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically when the
+crate is built with `crypto-shim`; builds without `crypto-shim` default to `Disabled`.
+
+The `crypto-shim` feature does not ship a cipher. It provides the `crypto::CryptoShim` trait and C
+callback bridge so firmware can use a hardware accelerator, secure element, or application-owned
+AEAD implementation. Serialized side traffic carries visible routing metadata and an encrypted
+payload; the visible header is authenticated as AAD so header tampering fails during open.
+
+For board-to-board deployments, run your board-owned quantum-resistant asynchronous key exchange
+when discovery learns a peer, derive a low-cost symmetric traffic key, and pass that key through the
+shim by `key_id`. Multi-drop endpoint traffic can use a shared group traffic key when every holder of
+that endpoint must decode the same message; AEAD authentication still prevents a receiver from
+modifying the frame for downstream boards without detection.
+
 ## Sides and routing
 
 Routers and relays use named sides such as `UART`, `CAN`, or `RADIO`.

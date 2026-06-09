@@ -18,16 +18,19 @@ use crate::{
     TelemetryResult,
     config::{
         DataEndpoint, data_type_definition, data_type_definition_by_name, data_type_exists,
-        endpoint_definition, endpoint_definition_by_name, endpoint_exists, known_endpoints,
-        message_class_code, message_class_from_code, message_data_type_code,
-        message_data_type_from_code, register_data_type_id, register_data_type_id_with_description,
-        register_endpoint_id, register_endpoint_id_with_description, register_schema_json_bytes,
-        reliable_code, reliable_from_code, remove_data_type, remove_data_type_by_name,
-        remove_endpoint, remove_endpoint_by_name,
+        e2e_encryption_policy_code, e2e_encryption_policy_from_code, endpoint_definition,
+        endpoint_definition_by_name, endpoint_exists, known_endpoints, message_class_code,
+        message_class_from_code, message_data_type_code, message_data_type_from_code,
+        register_data_type_id_with_description_and_e2e_encryption, register_endpoint_id,
+        register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
+        reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
+        remove_endpoint_by_name, set_data_type_e2e_encryption_policy,
     },
     do_vec_log_typed, get_needed_message_size, message_meta,
     packet::Packet,
-    router::{Clock, LeBytes, RouterSideOptions, endpoint_is_router_internal},
+    router::{
+        Clock, LeBytes, RouterE2eEncryptionMode, RouterSideOptions, endpoint_is_router_internal,
+    },
     router::{EndpointHandler, Router, RouterConfig},
     serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
 };
@@ -245,6 +248,7 @@ pub struct SedsDataTypeInfo {
     message_class: u8,
     reliable: u8,
     priority: u8,
+    e2e_encryption: u8,
     fixed_size: usize,
     endpoints: *const u32,
     num_endpoints: usize,
@@ -951,6 +955,54 @@ pub extern "C" fn seds_router_new(
     handlers: *const SedsLocalEndpointDesc,
     n_handlers: usize,
 ) -> *mut SedsRouter {
+    seds_router_new_impl(
+        mode,
+        now_ms_cb,
+        user,
+        handlers,
+        n_handlers,
+        RouterConfig::default_e2e_encryption_mode(),
+        0,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_new_ex(
+    mode: u8,
+    now_ms_cb: CNowMs,
+    user: *mut c_void,
+    handlers: *const SedsLocalEndpointDesc,
+    n_handlers: usize,
+    e2e_mode: u8,
+    e2e_key_id: u32,
+) -> *mut SedsRouter {
+    let Some(e2e_mode) = router_e2e_mode_from_code(e2e_mode) else {
+        return ptr::null_mut();
+    };
+    seds_router_new_impl(
+        mode, now_ms_cb, user, handlers, n_handlers, e2e_mode, e2e_key_id,
+    )
+}
+
+fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
+    match code {
+        0 => Some(RouterE2eEncryptionMode::Disabled),
+        1 => Some(RouterE2eEncryptionMode::RequiredOnly),
+        2 => Some(RouterE2eEncryptionMode::Preferred),
+        3 => Some(RouterE2eEncryptionMode::ForceAll),
+        _ => None,
+    }
+}
+
+fn seds_router_new_impl(
+    mode: u8,
+    now_ms_cb: CNowMs,
+    user: *mut c_void,
+    handlers: *const SedsLocalEndpointDesc,
+    n_handlers: usize,
+    e2e_mode: RouterE2eEncryptionMode,
+    e2e_key_id: u32,
+) -> *mut SedsRouter {
     // Build handler vector
     let mut v: Vec<EndpointHandler> = Vec::new();
     if n_handlers > 0 && !handlers.is_null() {
@@ -1032,7 +1084,9 @@ pub extern "C" fn seds_router_new(
     }
 
     let cfg = {
-        let cfg = RouterConfig::new(v);
+        let cfg = RouterConfig::new(v)
+            .with_e2e_encryption(e2e_mode)
+            .with_e2e_key_id(e2e_key_id);
         #[cfg(feature = "timesync")]
         let cfg = cfg.with_timesync(TimeSyncConfig::default());
         cfg
@@ -2017,35 +2071,20 @@ pub extern "C" fn seds_dtype_register(
     endpoints: *const u32,
     num_endpoints: usize,
 ) -> i32 {
-    if name.is_null() || (num_endpoints > 0 && endpoints.is_null()) {
-        return status_from_err(TelemetryError::BadArg);
-    }
-    let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
-    let Ok(name) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("data type name"));
-    };
-    let Some(data_type) = message_data_type_from_code(message_data_type) else {
-        return status_from_err(TelemetryError::BadArg);
-    };
-    let Some(class) = message_class_from_code(message_class) else {
-        return status_from_err(TelemetryError::BadArg);
-    };
-    let Some(reliable) = reliable_from_code(reliable) else {
-        return status_from_err(TelemetryError::BadArg);
-    };
-    let element = if is_static {
-        MessageElement::Static(element_count, data_type, class)
-    } else {
-        MessageElement::Dynamic(data_type, class)
-    };
-    let endpoint_ids = if num_endpoints == 0 {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(endpoints, num_endpoints) }
-    };
-    let eps: Vec<DataEndpoint> = endpoint_ids.iter().copied().map(DataEndpoint).collect();
-    ok_or_status(
-        register_data_type_id(DataType(ty), name, element, &eps, reliable, priority).map(|_| ()),
+    seds_dtype_register_ex(
+        ty,
+        name,
+        name_len,
+        ptr::null(),
+        0,
+        is_static,
+        element_count,
+        message_data_type,
+        message_class,
+        reliable,
+        priority,
+        endpoints,
+        num_endpoints,
     )
 }
 
@@ -2095,6 +2134,9 @@ pub extern "C" fn seds_dtype_register_ex(
     let Some(reliable) = reliable_from_code(reliable) else {
         return status_from_err(TelemetryError::BadArg);
     };
+    let Some(e2e_encryption) = e2e_encryption_policy_from_code(0) else {
+        return status_from_err(TelemetryError::BadArg);
+    };
     let element = if is_static {
         MessageElement::Static(element_count, data_type, class)
     } else {
@@ -2107,7 +2149,7 @@ pub extern "C" fn seds_dtype_register_ex(
     };
     let eps: Vec<DataEndpoint> = endpoint_ids.iter().copied().map(DataEndpoint).collect();
     ok_or_status(
-        register_data_type_id_with_description(
+        register_data_type_id_with_description_and_e2e_encryption(
             DataType(ty),
             name,
             description,
@@ -2115,9 +2157,18 @@ pub extern "C" fn seds_dtype_register_ex(
             &eps,
             reliable,
             priority,
+            e2e_encryption,
         )
         .map(|_| ()),
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_dtype_set_e2e_encryption_policy(ty: u32, policy: u8) -> i32 {
+    let Some(policy) = e2e_encryption_policy_from_code(policy) else {
+        return status_from_err(TelemetryError::BadArg);
+    };
+    ok_or_status(set_data_type_e2e_encryption_policy(DataType(ty), policy))
 }
 
 #[unsafe(no_mangle)]
@@ -2244,6 +2295,7 @@ pub extern "C" fn seds_dtype_get_info(
                 message_class: 0,
                 reliable: 0,
                 priority: 0,
+                e2e_encryption: 0,
                 fixed_size: 0,
                 endpoints: ptr::null(),
                 num_endpoints: 0,
@@ -2279,6 +2331,7 @@ pub extern "C" fn seds_dtype_get_info(
             message_class: message_class_code(class),
             reliable: reliable_code(def.reliable),
             priority: def.priority,
+            e2e_encryption: e2e_encryption_policy_code(def.e2e_encryption),
             fixed_size: fixed_payload_size_if_static(def.id).unwrap_or(0),
             endpoints: endpoints_out,
             num_endpoints: def.endpoints.len(),
@@ -2317,6 +2370,7 @@ pub extern "C" fn seds_dtype_get_info_by_name(
                 message_class: 0,
                 reliable: 0,
                 priority: 0,
+                e2e_encryption: 0,
                 fixed_size: 0,
                 endpoints: ptr::null(),
                 num_endpoints: 0,
@@ -2352,6 +2406,7 @@ pub extern "C" fn seds_dtype_get_info_by_name(
             message_class: message_class_code(class),
             reliable: reliable_code(def.reliable),
             priority: def.priority,
+            e2e_encryption: e2e_encryption_policy_code(def.e2e_encryption),
             fixed_size: fixed_payload_size_if_static(def.id).unwrap_or(0),
             endpoints: endpoints_out,
             num_endpoints: def.endpoints.len(),
@@ -4659,6 +4714,7 @@ mod tests {
             message_class: 0,
             reliable: 0,
             priority: 0,
+            e2e_encryption: 0,
             fixed_size: 0,
             endpoints: ptr::null(),
             num_endpoints: 0,

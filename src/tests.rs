@@ -5182,20 +5182,21 @@ mod router_tests {
         use crate::config::{
             MAX_HANDLER_RETRIES, RELIABLE_MAX_END_TO_END_ACK_CACHE,
             RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_RETURN_ROUTES,
+            register_data_type_id_with_description_and_e2e_encryption,
             register_data_type_with_description, register_endpoint_with_description,
-            remove_data_type_by_name, remove_endpoint_by_name,
+            remove_data_type, remove_data_type_by_name, remove_endpoint_by_name,
         };
         use crate::discovery::{
             DISCOVERY_FAST_INTERVAL_MS, DISCOVERY_ROUTE_TTL_MS, TopologyBoardNode,
             build_discovery_announce, build_discovery_timesync_sources, build_discovery_topology,
         };
         use crate::relay::Relay;
-        use crate::router::{Clock, EndpointHandler, RouterConfig};
+        use crate::router::{Clock, EndpointHandler, RouterConfig, RouterE2eEncryptionMode};
         use crate::tests::count_packets_of_type;
         use crate::tests::timeout_tests::StepClock;
         use crate::{
-            DataEndpoint, DataType, MessageClass, MessageDataType, MessageElement, ReliableMode,
-            RouteSelectionMode, TelemetryError, TelemetryResult,
+            DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType,
+            MessageElement, ReliableMode, RouteSelectionMode, TelemetryError, TelemetryResult,
         };
         use crate::{packet::Packet, router::Router, serialize};
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -5203,6 +5204,12 @@ mod router_tests {
 
         fn zero_clock() -> Box<dyn Clock + Send + Sync> {
             StepClock::new_box(0, 0)
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        fn crypto_test_guard() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            LOCK.lock().unwrap()
         }
 
         fn ensure_topology_test_schema() {
@@ -9358,6 +9365,331 @@ mod router_tests {
         }
 
         #[test]
+        fn required_e2e_type_rejects_tx_without_crypto_support() {
+            #[cfg(feature = "crypto-shim")]
+            let _crypto_guard = crypto_test_guard();
+            crate::tests::ensure_common_test_schema();
+            #[cfg(feature = "crypto-shim")]
+            crate::crypto::clear_c_crypto_shim();
+            let ep = DataEndpoint::named("RADIO");
+            let ty = DataType(3_901);
+            let _ = remove_data_type(ty);
+            register_data_type_id_with_description_and_e2e_encryption(
+                ty,
+                "E2E_REQUIRED_TEST",
+                "",
+                MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+                &[ep],
+                ReliableMode::None,
+                10,
+                E2eEncryptionPolicy::RequireOn,
+            )
+            .unwrap();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            assert_eq!(router.log(ty, &[7_u8]), Err(TelemetryError::BadArg));
+
+            let _ = remove_data_type(ty);
+        }
+
+        #[test]
+        fn forced_e2e_router_rejects_plain_user_data_without_crypto_support() {
+            #[cfg(feature = "crypto-shim")]
+            let _crypto_guard = crypto_test_guard();
+            crate::tests::ensure_common_test_schema();
+            #[cfg(feature = "crypto-shim")]
+            crate::crypto::clear_c_crypto_shim();
+            let ty = DataType::named("GPS_DATA");
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_e2e_encryption(RouterE2eEncryptionMode::ForceAll),
+                zero_clock(),
+            );
+            assert_eq!(
+                router.log(ty, &[1.0_f32, 2.0, 3.0]),
+                Err(TelemetryError::BadArg)
+            );
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        unsafe extern "C" fn test_crypto_seal(
+            key_id: u32,
+            _nonce: *const u8,
+            _nonce_len: usize,
+            aad: *const u8,
+            aad_len: usize,
+            plaintext: *const u8,
+            plaintext_len: usize,
+            ciphertext_out: *mut u8,
+            ciphertext_cap: usize,
+            ciphertext_len_out: *mut usize,
+            tag_out: *mut u8,
+            tag_cap: usize,
+            tag_len_out: *mut usize,
+            _user: *mut core::ffi::c_void,
+        ) -> i32 {
+            if ciphertext_cap < plaintext_len || tag_cap < 4 {
+                return -1;
+            }
+            let plain = unsafe { core::slice::from_raw_parts(plaintext, plaintext_len) };
+            let out = unsafe { core::slice::from_raw_parts_mut(ciphertext_out, ciphertext_cap) };
+            for (idx, byte) in plain.iter().copied().enumerate() {
+                out[idx] = byte ^ key_id as u8 ^ 0xA5;
+            }
+            let aad = unsafe { core::slice::from_raw_parts(aad, aad_len) };
+            let mut tag = [0u8; 4];
+            for (idx, byte) in aad.iter().copied().enumerate() {
+                tag[idx % 4] ^= byte;
+            }
+            for idx in 0..plaintext_len {
+                tag[idx % 4] ^= out[idx];
+            }
+            tag[0] ^= key_id as u8;
+            let tag_out = unsafe { core::slice::from_raw_parts_mut(tag_out, tag_cap) };
+            tag_out[..4].copy_from_slice(&tag);
+            unsafe {
+                *ciphertext_len_out = plaintext_len;
+                *tag_len_out = 4;
+            }
+            0
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        unsafe extern "C" fn test_crypto_open(
+            key_id: u32,
+            _nonce: *const u8,
+            _nonce_len: usize,
+            aad: *const u8,
+            aad_len: usize,
+            ciphertext: *const u8,
+            ciphertext_len: usize,
+            tag: *const u8,
+            tag_len: usize,
+            plaintext_out: *mut u8,
+            plaintext_cap: usize,
+            plaintext_len_out: *mut usize,
+            _user: *mut core::ffi::c_void,
+        ) -> i32 {
+            if plaintext_cap < ciphertext_len || tag_len != 4 {
+                return -1;
+            }
+            let aad = unsafe { core::slice::from_raw_parts(aad, aad_len) };
+            let mut expected = [0u8; 4];
+            for (idx, byte) in aad.iter().copied().enumerate() {
+                expected[idx % 4] ^= byte;
+            }
+            let cipher = unsafe { core::slice::from_raw_parts(ciphertext, ciphertext_len) };
+            for (idx, byte) in cipher.iter().copied().enumerate() {
+                expected[idx % 4] ^= byte;
+            }
+            expected[0] ^= key_id as u8;
+            let tag = unsafe { core::slice::from_raw_parts(tag, tag_len) };
+            if tag != expected {
+                return -1;
+            }
+            let out = unsafe { core::slice::from_raw_parts_mut(plaintext_out, plaintext_cap) };
+            for (idx, byte) in cipher.iter().copied().enumerate() {
+                out[idx] = byte ^ key_id as u8 ^ 0xA5;
+            }
+            unsafe {
+                *plaintext_len_out = ciphertext_len;
+            }
+            0
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        fn refresh_crc32(bytes: &mut [u8]) {
+            let data_len = bytes.len() - 4;
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&bytes[..data_len]);
+            let crc = hasher.finalize();
+            bytes[data_len..].copy_from_slice(&crc.to_le_bytes());
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        fn register_test_crypto_shim() {
+            crate::crypto::register_c_crypto_shim(crate::crypto::CCryptoShim {
+                seal: Some(test_crypto_seal),
+                open: Some(test_crypto_open),
+                user: core::ptr::null_mut(),
+            });
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        #[test]
+        fn preferred_e2e_type_seals_serialized_side_payload_and_roundtrips() {
+            let _crypto_guard = crypto_test_guard();
+            crate::tests::ensure_common_test_schema();
+            register_test_crypto_shim();
+            let ep = DataEndpoint::named("RADIO");
+            let ty = DataType(3_902);
+            let _ = remove_data_type(ty);
+            register_data_type_id_with_description_and_e2e_encryption(
+                ty,
+                "E2E_PREFERRED_TEST",
+                "",
+                MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+                &[ep],
+                ReliableMode::None,
+                10,
+                E2eEncryptionPolicy::PreferOn,
+            )
+            .unwrap();
+
+            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let captured_for_side = captured.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default()
+                    .with_e2e_encryption(RouterE2eEncryptionMode::Preferred)
+                    .with_e2e_key_id(0x5A),
+                zero_clock(),
+            );
+            router.add_side_serialized("crypto-link", move |bytes| {
+                *captured_for_side.lock().unwrap() = bytes.to_vec();
+                Ok(())
+            });
+
+            let payload = [1_u8, 2, 3, 4, 5, 6];
+            router.log(ty, &payload).unwrap();
+            let wire = captured.lock().unwrap().clone();
+            assert!(!wire.windows(payload.len()).any(|window| window == payload));
+            let decoded = serialize::deserialize_packet(&wire).unwrap();
+            assert_eq!(decoded.data_type(), ty);
+            assert_eq!(decoded.payload(), payload);
+
+            let _ = remove_data_type(ty);
+            crate::crypto::clear_c_crypto_shim();
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        #[test]
+        fn encrypted_payload_rejects_authenticated_header_tamper() {
+            let _crypto_guard = crypto_test_guard();
+            crate::tests::ensure_common_test_schema();
+            register_test_crypto_shim();
+            let ep = DataEndpoint::named("RADIO");
+            let ty = DataType(3_903);
+            let _ = remove_data_type(ty);
+            register_data_type_id_with_description_and_e2e_encryption(
+                ty,
+                "E2E_TAMPER_TEST",
+                "",
+                MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+                &[ep],
+                ReliableMode::None,
+                10,
+                E2eEncryptionPolicy::RequireOn,
+            )
+            .unwrap();
+
+            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let captured_for_side = captured.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default()
+                    .with_e2e_encryption(RouterE2eEncryptionMode::RequiredOnly)
+                    .with_e2e_key_id(0x33),
+                zero_clock(),
+            );
+            router.add_side_serialized("crypto-link", move |bytes| {
+                *captured_for_side.lock().unwrap() = bytes.to_vec();
+                Ok(())
+            });
+
+            router.log(ty, &[9_u8, 8, 7, 6]).unwrap();
+            let mut wire = captured.lock().unwrap().clone();
+            wire[1] ^= 0x01;
+            refresh_crc32(&mut wire);
+            assert!(serialize::deserialize_packet(&wire).is_err());
+
+            let _ = remove_data_type(ty);
+            crate::crypto::clear_c_crypto_shim();
+        }
+
+        #[cfg(feature = "crypto-shim")]
+        #[test]
+        fn preferred_e2e_fanout_reaches_three_boards_with_same_endpoint_and_rejects_mods() {
+            let _crypto_guard = crypto_test_guard();
+            crate::tests::ensure_common_test_schema();
+            register_test_crypto_shim();
+            let ep = DataEndpoint::named("RADIO");
+            let ty = DataType(3_904);
+            let _ = remove_data_type(ty);
+            register_data_type_id_with_description_and_e2e_encryption(
+                ty,
+                "E2E_THREE_BOARD_RADIO_TEST",
+                "",
+                MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+                &[ep],
+                ReliableMode::None,
+                10,
+                E2eEncryptionPolicy::PreferOn,
+            )
+            .unwrap();
+
+            let seen_a = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let seen_b = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let seen_c = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+
+            let mk_board = |name: &'static str, seen: Arc<Mutex<Vec<Vec<u8>>>>| {
+                Router::new_with_clock(
+                    RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, move |pkt| {
+                        seen.lock().unwrap().push(pkt.payload().to_vec());
+                        Ok(())
+                    })])
+                    .with_sender(name)
+                    .with_e2e_key_id(0x44),
+                    zero_clock(),
+                )
+            };
+
+            let board_a = Arc::new(mk_board("BOARD_A", seen_a.clone()));
+            let board_b = Arc::new(mk_board("BOARD_B", seen_b.clone()));
+            let board_c = Arc::new(mk_board("BOARD_C", seen_c.clone()));
+            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+            let source = Router::new_with_clock(
+                RouterConfig::default()
+                    .with_sender("SOURCE")
+                    .with_e2e_key_id(0x44),
+                zero_clock(),
+            );
+
+            let a = board_a.clone();
+            let b = board_b.clone();
+            let c = board_c.clone();
+            let captured_for_side = captured.clone();
+            source.add_side_serialized("shared-radio", move |bytes| {
+                *captured_for_side.lock().unwrap() = bytes.to_vec();
+                a.rx_serialized(bytes)?;
+                b.rx_serialized(bytes)?;
+                c.rx_serialized(bytes)?;
+                Ok(())
+            });
+
+            let payload = [42_u8, 9, 7, 1];
+            source.log(ty, &payload).unwrap();
+            assert_eq!(seen_a.lock().unwrap().as_slice(), &[payload.to_vec()]);
+            assert_eq!(seen_b.lock().unwrap().as_slice(), &[payload.to_vec()]);
+            assert_eq!(seen_c.lock().unwrap().as_slice(), &[payload.to_vec()]);
+
+            let wire = captured.lock().unwrap().clone();
+            assert!(!wire.windows(payload.len()).any(|window| window == payload));
+
+            let mut header_tampered = wire.clone();
+            header_tampered[1] ^= 0x01;
+            refresh_crc32(&mut header_tampered);
+            assert!(board_a.rx_serialized(&header_tampered).is_err());
+
+            let mut payload_tampered = wire;
+            let data_len = payload_tampered.len() - 4;
+            payload_tampered[data_len - 1] ^= 0x55;
+            refresh_crc32(&mut payload_tampered);
+            assert!(board_b.rx_serialized(&payload_tampered).is_err());
+
+            let _ = remove_data_type(ty);
+            crate::crypto::clear_c_crypto_shim();
+        }
+
+        #[test]
         fn immediate_cross_wired_router_reentry_falls_back_to_queue() {
             let Some(ipc_message) = datatype_by_name("IPC_MESSAGE") else {
                 return;
@@ -9495,8 +9827,8 @@ mod router_tests {
         use alloc::{boxed::Box, sync::Arc};
 
         use crate::{
-            DataEndpoint, DataType, MessageClass, MessageDataType, MessageElement, ReliableMode,
-            TelemetryError,
+            DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType,
+            MessageElement, ReliableMode, TelemetryError,
             config::{
                 DataTypeDefinition, EndpointDefinition, MAX_QUEUE_BUDGET, OwnedDataTypeDefinition,
                 OwnedEndpointDefinition, OwnedRuntimeSchemaSnapshot, RuntimeSchemaSnapshot,
@@ -9532,6 +9864,7 @@ mod router_tests {
                 endpoints: Box::leak(endpoints.to_vec().into_boxed_slice()),
                 reliable: ReliableMode::None,
                 priority: 17,
+                e2e_encryption: E2eEncryptionPolicy::PreferOn,
             };
             let snapshot = RuntimeSchemaSnapshot {
                 endpoints: vec![endpoint],
@@ -9539,6 +9872,10 @@ mod router_tests {
             };
             let pkt = build_discovery_schema_from_snapshot("REMOTE", 10, snapshot).unwrap();
             let decoded = decode_discovery_schema(&pkt).unwrap();
+            assert_eq!(
+                decoded.types[0].e2e_encryption,
+                E2eEncryptionPolicy::PreferOn
+            );
             let report = merge_owned_schema_snapshot(decoded);
             assert!(report.changed() || DataType::try_from_u32(3001).is_some());
             assert_eq!(message_meta(DataType(3001)).element, ty.element);
@@ -9560,6 +9897,7 @@ mod router_tests {
                 endpoints: vec![endpoint.id],
                 reliable: ReliableMode::None,
                 priority: 1,
+                e2e_encryption: E2eEncryptionPolicy::PreferOff,
             };
             let snapshot = OwnedRuntimeSchemaSnapshot {
                 endpoints: vec![endpoint],
@@ -9884,6 +10222,7 @@ mod router_tests {
                 endpoints,
                 reliable: ReliableMode::None,
                 priority: 1,
+                e2e_encryption: E2eEncryptionPolicy::PreferOff,
             };
             let b = DataTypeDefinition {
                 id: DataType(3002),
@@ -9893,6 +10232,7 @@ mod router_tests {
                 endpoints,
                 reliable: ReliableMode::None,
                 priority: 1,
+                e2e_encryption: E2eEncryptionPolicy::PreferOff,
             };
 
             let _ = merge_schema_snapshot(RuntimeSchemaSnapshot {

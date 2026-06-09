@@ -35,7 +35,7 @@ use crate::timesync::{
     decode_timesync_request, decode_timesync_response,
 };
 use crate::{
-    MessageElement, RouteSelectionMode, TelemetryError, TelemetryResult,
+    E2eEncryptionPolicy, MessageElement, RouteSelectionMode, TelemetryError, TelemetryResult,
     config::{
         DEVICE_IDENTIFIER, DataEndpoint, DataType, MAX_HANDLER_RETRIES,
         RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_PENDING, RELIABLE_MAX_RETRIES,
@@ -43,7 +43,7 @@ use crate::{
     },
     get_needed_message_size, impl_letype_num, is_reliable_type,
     lock::{ReentryGate, RouterMutex},
-    message_meta, message_priority,
+    message_e2e_encryption_policy, message_meta, message_priority,
     packet::Packet,
     reliable_mode, serialize,
 };
@@ -730,6 +730,19 @@ impl Clock for StdMonotonicClock {
     }
 }
 
+/// Router-level E2E encryption behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterE2eEncryptionMode {
+    /// Do not use E2E encryption. Data types marked `RequireOn` are rejected.
+    Disabled,
+    /// Use E2E encryption only for data types that require it.
+    RequiredOnly,
+    /// Use E2E encryption for required and preferred data types.
+    Preferred,
+    /// Require E2E encryption for every non-control data type.
+    ForceAll,
+}
+
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     /// Handlers for local endpoints.
@@ -738,11 +751,31 @@ pub struct RouterConfig {
     reliable_enabled: bool,
     /// Optional per-router sender override.
     sender: Option<Arc<str>>,
+    /// End-to-end encryption behavior for user data.
+    e2e_encryption: RouterE2eEncryptionMode,
+    /// Application-defined key id passed to the crypto shim.
+    #[cfg_attr(not(feature = "crypto-shim"), allow(dead_code))]
+    e2e_key_id: u32,
     #[cfg(feature = "timesync")]
     timesync: Option<TimeSyncConfig>,
 }
 
 impl RouterConfig {
+    /// Default router E2E mode for this build.
+    ///
+    /// Builds with the crypto shim prefer encrypted payloads automatically for data types that
+    /// request it. Builds without the shim stay disabled and reject `RequireOn` traffic.
+    pub fn default_e2e_encryption_mode() -> RouterE2eEncryptionMode {
+        #[cfg(feature = "crypto-shim")]
+        {
+            RouterE2eEncryptionMode::Preferred
+        }
+        #[cfg(not(feature = "crypto-shim"))]
+        {
+            RouterE2eEncryptionMode::Disabled
+        }
+    }
+
     /// Create a new router configuration with the specified local endpoint handlers.
     pub fn new<H>(handlers: H) -> Self
     where
@@ -759,6 +792,8 @@ impl RouterConfig {
             handlers,
             reliable_enabled: true,
             sender: None,
+            e2e_encryption: Self::default_e2e_encryption_mode(),
+            e2e_key_id: 0,
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -773,6 +808,18 @@ impl RouterConfig {
     /// Override the sender identifier for this router instance.
     pub fn with_sender<S: AsRef<str>>(mut self, sender: S) -> Self {
         self.sender = Some(Arc::from(sender.as_ref()));
+        self
+    }
+
+    /// Configure this router's end-to-end encryption policy.
+    pub fn with_e2e_encryption(mut self, mode: RouterE2eEncryptionMode) -> Self {
+        self.e2e_encryption = mode;
+        self
+    }
+
+    /// Configure the application-defined key id used for E2E encrypted payloads.
+    pub fn with_e2e_key_id(mut self, key_id: u32) -> Self {
+        self.e2e_key_id = key_id;
         self
     }
 
@@ -802,6 +849,17 @@ impl RouterConfig {
         self.sender.as_deref().unwrap_or(DEVICE_IDENTIFIER)
     }
 
+    #[inline]
+    fn e2e_encryption(&self) -> RouterE2eEncryptionMode {
+        self.e2e_encryption
+    }
+
+    #[cfg(feature = "crypto-shim")]
+    #[inline]
+    fn e2e_key_id(&self) -> u32 {
+        self.e2e_key_id
+    }
+
     #[cfg(feature = "timesync")]
     #[inline]
     fn timesync_config(&self) -> Option<TimeSyncConfig> {
@@ -815,6 +873,8 @@ impl Default for RouterConfig {
             handlers: Arc::from([]),
             reliable_enabled: true,
             sender: None,
+            e2e_encryption: Self::default_e2e_encryption_mode(),
+            e2e_key_id: 0,
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -2568,6 +2628,126 @@ impl Router {
         }
     }
 
+    fn item_data_type(data: &RouterItem) -> TelemetryResult<DataType> {
+        match data {
+            RouterItem::Packet(pkt) => Ok(pkt.data_type()),
+            RouterItem::Serialized(bytes) => Ok(serialize::peek_envelope(bytes.as_ref())?.ty),
+        }
+    }
+
+    fn e2e_crypto_supported(&self) -> bool {
+        #[cfg(feature = "crypto-shim")]
+        {
+            self.cfg.e2e_encryption() != RouterE2eEncryptionMode::Disabled
+                && crate::crypto::c_crypto_shim_registered()
+        }
+        #[cfg(not(feature = "crypto-shim"))]
+        {
+            false
+        }
+    }
+
+    fn should_require_e2e_for_type(&self, ty: DataType) -> bool {
+        if is_internal_control_type(ty) {
+            return false;
+        }
+        match self.cfg.e2e_encryption() {
+            RouterE2eEncryptionMode::Disabled => {
+                message_e2e_encryption_policy(ty) == E2eEncryptionPolicy::RequireOn
+            }
+            RouterE2eEncryptionMode::RequiredOnly => {
+                message_e2e_encryption_policy(ty) == E2eEncryptionPolicy::RequireOn
+            }
+            RouterE2eEncryptionMode::Preferred => matches!(
+                message_e2e_encryption_policy(ty),
+                E2eEncryptionPolicy::PreferOn | E2eEncryptionPolicy::RequireOn
+            ),
+            RouterE2eEncryptionMode::ForceAll => true,
+        }
+    }
+
+    fn ensure_e2e_policy_supported_for_type(&self, ty: DataType) -> TelemetryResult<()> {
+        if self.should_require_e2e_for_type(ty) && !self.e2e_crypto_supported() {
+            return Err(TelemetryError::BadArg);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "crypto-shim")]
+    fn e2e_seal_config_for_type(&self, ty: DataType) -> Option<serialize::E2eSealConfig> {
+        if self.should_require_e2e_for_type(ty) && self.e2e_crypto_supported() {
+            Some(serialize::E2eSealConfig {
+                key_id: self.cfg.e2e_key_id(),
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn serialize_packet_for_router(
+        &self,
+        pkt: &Packet,
+        reliable: Option<serialize::ReliableHeader>,
+    ) -> TelemetryResult<Arc<[u8]>> {
+        #[cfg(feature = "crypto-shim")]
+        if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
+            return serialize::serialize_packet_with_wire_contract_e2e(
+                pkt,
+                reliable,
+                pkt.wire_shape(),
+                pkt.wire_target_senders(),
+                e2e,
+            );
+        }
+        Ok(match reliable {
+            Some(hdr) => serialize::serialize_packet_with_reliable(pkt, hdr),
+            None => serialize::serialize_packet(pkt),
+        })
+    }
+
+    #[inline]
+    fn serialize_packet_for_contract(
+        &self,
+        pkt: &Packet,
+        reliable: Option<serialize::ReliableHeader>,
+        shape: Option<MessageElement>,
+        target_senders: &[u64],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        #[cfg(feature = "crypto-shim")]
+        if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
+            return serialize::serialize_packet_with_wire_contract_e2e(
+                pkt,
+                reliable,
+                shape,
+                target_senders,
+                e2e,
+            );
+        }
+        serialize::serialize_packet_with_wire_contract(pkt, reliable, shape, target_senders)
+    }
+
+    #[cfg(feature = "crypto-shim")]
+    #[inline]
+    fn prepare_serialized_for_remote(
+        &self,
+        bytes: Arc<[u8]>,
+        reliable_override: Option<Option<serialize::ReliableHeader>>,
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let frame = serialize::peek_frame_info(bytes.as_ref())?;
+        if frame.ack_only() || self.e2e_seal_config_for_type(frame.envelope.ty).is_none() {
+            return Ok(bytes);
+        }
+        let reliable = reliable_override.unwrap_or(frame.reliable);
+        let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+        self.serialize_packet_for_contract(
+            &pkt,
+            reliable,
+            frame.envelope.wire_shape,
+            &frame.envelope.target_senders,
+        )
+    }
+
     fn item_target_senders(&self, data: &RouterItem) -> TelemetryResult<Arc<[u64]>> {
         match data {
             RouterItem::Packet(pkt) => Ok(Arc::from(pkt.wire_target_senders())),
@@ -2629,7 +2809,7 @@ impl Router {
                 } else {
                     None
                 };
-                let bytes = serialize::serialize_packet_with_wire_contract(
+                let bytes = self.serialize_packet_for_contract(
                     &pkt,
                     reliable,
                     Some(message_meta(pkt.data_type()).element),
@@ -3679,41 +3859,98 @@ impl Router {
         };
 
         let bytes: Arc<[u8]> = match data {
-            RouterItem::Packet(pkt) => serialize::serialize_packet_with_reliable(
+            RouterItem::Packet(pkt) => self.serialize_packet_for_router(
                 &pkt,
-                serialize::ReliableHeader { flags, seq, ack: 0 },
-            ),
+                Some(serialize::ReliableHeader { flags, seq, ack: 0 }),
+            )?,
             RouterItem::Serialized(bytes) => {
-                let mut v = bytes.to_vec();
-                if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
-                    let Some(_side_tx_guard) = self.try_enter_side_tx() else {
-                        return Err(TelemetryError::Io("side tx busy"));
-                    };
-                    let started_ms = self.clock.now_ms();
-                    let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
-                    let mut attempts_total = 0usize;
-                    let mut sent_bytes = 0usize;
-                    for frame in frames {
-                        match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
-                            Ok((_, attempts)) => {
-                                attempts_total = attempts_total.saturating_add(attempts);
-                                sent_bytes = sent_bytes.saturating_add(frame.len());
-                            }
-                            Err((err, attempts)) => {
-                                self.note_side_tx_failure(
-                                    side,
-                                    ty,
-                                    attempts_total.saturating_add(attempts),
-                                );
-                                return Err(err);
+                #[cfg(feature = "crypto-shim")]
+                if self.e2e_seal_config_for_type(ty).is_some() {
+                    self.prepare_serialized_for_remote(
+                        bytes,
+                        Some(Some(serialize::ReliableHeader { flags, seq, ack: 0 })),
+                    )?
+                } else {
+                    let mut v = bytes.to_vec();
+                    if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                        let Some(_side_tx_guard) = self.try_enter_side_tx() else {
+                            return Err(TelemetryError::Io("side tx busy"));
+                        };
+                        let started_ms = self.clock.now_ms();
+                        let frames =
+                            self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                        let mut attempts_total = 0usize;
+                        let mut sent_bytes = 0usize;
+                        for frame in frames {
+                            match self
+                                .retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref()))
+                            {
+                                Ok((_, attempts)) => {
+                                    attempts_total = attempts_total.saturating_add(attempts);
+                                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                                }
+                                Err((err, attempts)) => {
+                                    self.note_side_tx_failure(
+                                        side,
+                                        ty,
+                                        attempts_total.saturating_add(attempts),
+                                    );
+                                    return Err(err);
+                                }
                             }
                         }
+                        self.record_side_tx_sample(
+                            side,
+                            sent_bytes,
+                            started_ms,
+                            self.clock.now_ms(),
+                        );
+                        self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                        return Ok(());
                     }
-                    self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
-                    self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
-                    return Ok(());
+                    Arc::from(v)
                 }
-                Arc::from(v)
+                #[cfg(not(feature = "crypto-shim"))]
+                {
+                    let mut v = bytes.to_vec();
+                    if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                        let Some(_side_tx_guard) = self.try_enter_side_tx() else {
+                            return Err(TelemetryError::Io("side tx busy"));
+                        };
+                        let started_ms = self.clock.now_ms();
+                        let frames =
+                            self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                        let mut attempts_total = 0usize;
+                        let mut sent_bytes = 0usize;
+                        for frame in frames {
+                            match self
+                                .retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref()))
+                            {
+                                Ok((_, attempts)) => {
+                                    attempts_total = attempts_total.saturating_add(attempts);
+                                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                                }
+                                Err((err, attempts)) => {
+                                    self.note_side_tx_failure(
+                                        side,
+                                        ty,
+                                        attempts_total.saturating_add(attempts),
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        self.record_side_tx_sample(
+                            side,
+                            sent_bytes,
+                            started_ms,
+                            self.clock.now_ms(),
+                        );
+                        self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                        return Ok(());
+                    }
+                    Arc::from(v)
+                }
             }
         };
 
@@ -4209,7 +4446,11 @@ impl Router {
         };
         let result = match (handler, data) {
             (RouterTxHandlerFn::Serialized(f), RouterItem::Serialized(bytes)) => {
-                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                #[cfg(feature = "crypto-shim")]
+                let send_bytes = self.prepare_serialized_for_remote(bytes.clone(), None)?;
+                #[cfg(not(feature = "crypto-shim"))]
+                let send_bytes = bytes.clone();
+                let frames = self.encode_side_transport_frames(side, opts, send_bytes)?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
@@ -4236,7 +4477,7 @@ impl Router {
                 self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(pkt))
             }
             (RouterTxHandlerFn::Serialized(f), RouterItem::Packet(pkt)) => {
-                let owned = serialize::serialize_packet(pkt);
+                let owned = self.serialize_packet_for_router(pkt, None)?;
                 let frames = self.encode_side_transport_frames(side, opts, owned)?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
@@ -7168,6 +7409,7 @@ impl Router {
                 if is_internal_control_type(pkt.data_type()) {
                     return Ok(());
                 }
+                self.ensure_e2e_policy_supported_for_type(pkt.data_type())?;
                 if !self.item_targets_local_sender(item)? {
                     return Ok(());
                 }
@@ -7229,6 +7471,7 @@ impl Router {
                 if is_internal_control_type(env.ty) {
                     return Ok(());
                 }
+                self.ensure_e2e_policy_supported_for_type(env.ty)?;
                 if !self.item_targets_local_sender(item)? {
                     return Ok(());
                 }
@@ -7302,6 +7545,7 @@ impl Router {
     ) -> TelemetryResult<()> {
         match item {
             RouterTxItem::Broadcast(data) => {
+                self.ensure_e2e_policy_supported_for_type(Self::item_data_type(&data)?)?;
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
@@ -7416,6 +7660,7 @@ impl Router {
                 }
             }
             RouterTxItem::ToSide { src, dst, data } => {
+                self.ensure_e2e_policy_supported_for_type(Self::item_data_type(&data)?)?;
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {

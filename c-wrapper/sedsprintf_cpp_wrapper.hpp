@@ -40,6 +40,22 @@ inline bool exists(SedsEndpointRef endpoint)
     return seds_endpoint_exists(static_cast<uint32_t>(endpoint.id));
 }
 
+inline SedsResult set_e2e_encryption_policy(SedsTypeRef ty, uint8_t policy)
+{
+    return seds_dtype_set_e2e_encryption_policy(static_cast<uint32_t>(ty.id), policy);
+}
+
+inline SedsRouter * router_new(SedsRouterMode mode,
+                               SedsNowMsFn now_ms,
+                               void * user,
+                               const SedsLocalEndpointDesc * handlers,
+                               size_t n_handlers,
+                               uint8_t e2e_mode,
+                               uint32_t e2e_key_id)
+{
+    return seds_router_new_ex(mode, now_ms, user, handlers, n_handlers, e2e_mode, e2e_key_id);
+}
+
 inline int32_t expected_size(SedsTypeRef ty)
 {
     return seds_dtype_expected_size(ty.id);

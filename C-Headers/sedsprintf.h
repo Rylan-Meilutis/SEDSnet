@@ -114,6 +114,14 @@ typedef struct SedsSideRef
 #define SEDS_SIDE_REF(id_) ((SedsSideRef){ (int32_t)(id_) })
 #define SEDS_SIDE_INVALID ((SedsSideRef){ -1 })
 
+#define SEDS_E2E_PREFER_OFF 0U
+#define SEDS_E2E_PREFER_ON 1U
+#define SEDS_E2E_REQUIRE_ON 2U
+#define SEDS_ROUTER_E2E_DISABLED 0U
+#define SEDS_ROUTER_E2E_REQUIRED_ONLY 1U
+#define SEDS_ROUTER_E2E_PREFERRED 2U
+#define SEDS_ROUTER_E2E_FORCE_ALL 3U
+
 static inline SedsName seds_name_cstr(const char * s)
 {
     return (SedsName){ s, s ? strlen(s) : 0U };
@@ -161,6 +169,7 @@ typedef struct SedsDataTypeInfo
     uint8_t message_class;
     uint8_t reliable;
     uint8_t priority;
+    uint8_t e2e_encryption;
     size_t fixed_size;
     const uint32_t * endpoints;
     size_t num_endpoints;
@@ -309,6 +318,23 @@ SedsRouter * seds_router_new(
                              const SedsLocalEndpointDesc * handlers,
                              size_t n_handlers
                              );
+
+/**
+ * @brief Create a router with explicit end-to-end encryption settings.
+ *
+ * `e2e_mode`: SEDS_ROUTER_E2E_DISABLED, SEDS_ROUTER_E2E_REQUIRED_ONLY,
+ * SEDS_ROUTER_E2E_PREFERRED, or SEDS_ROUTER_E2E_FORCE_ALL.
+ * `e2e_key_id` is application-defined and passed through to the registered crypto shim.
+ */
+SedsRouter * seds_router_new_ex(
+                                SedsRouterMode mode,
+                                SedsNowMsFn now_ms_cb,
+                                void * user,
+                                const SedsLocalEndpointDesc * handlers,
+                                size_t n_handlers,
+                                uint8_t e2e_mode,
+                                uint32_t e2e_key_id
+                                );
 
 /** @brief Destroy a router created by seds_router_new(). */
 void seds_router_free(SedsRouter * r);
@@ -724,6 +750,7 @@ SedsResult seds_dtype_register_ex(uint32_t ty,
                                   uint8_t priority,
                                   const uint32_t * endpoints,
                                   size_t num_endpoints);
+SedsResult seds_dtype_set_e2e_encryption_policy(uint32_t ty, uint8_t policy);
 SedsResult seds_schema_register_json_bytes(const uint8_t * json, size_t json_len);
 SedsResult seds_schema_register_json_file(const char * path, size_t path_len);
 SedsResult seds_endpoint_get_info(uint32_t endpoint, SedsEndpointInfo * out);

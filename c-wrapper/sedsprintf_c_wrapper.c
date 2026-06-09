@@ -15,6 +15,12 @@ SedsWrapperRouterConfig seds_wrapper_router_default_config(void)
     SedsWrapperRouterConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = Seds_RM_Relay;
+#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+    cfg.e2e_mode = SEDS_ROUTER_E2E_PREFERRED;
+#else
+    cfg.e2e_mode = SEDS_ROUTER_E2E_DISABLED;
+#endif
+    cfg.e2e_key_id = 0U;
     cfg.timesync_source_timeout_ms = 5000ULL;
     cfg.timesync_announce_interval_ms = 2000ULL;
     cfg.timesync_request_interval_ms = 2000ULL;
@@ -42,11 +48,13 @@ SedsResult seds_wrapper_router_init(SedsWrapperRouter * node,
     memset(node, 0, sizeof(*node));
     node->primary_side = SEDS_SIDE_INVALID;
     node->init_error = SEDS_OK;
-    node->router = seds_router_new(cfg->mode,
-                                   cfg->now_ms,
-                                   cfg->now_user,
-                                   cfg->handlers,
-                                   cfg->num_handlers);
+    node->router = seds_router_new_ex(cfg->mode,
+                                      cfg->now_ms,
+                                      cfg->now_user,
+                                      cfg->handlers,
+                                      cfg->num_handlers,
+                                      cfg->e2e_mode,
+                                      cfg->e2e_key_id);
     if (!node->router) {
         node->init_error = SEDS_ERR;
         return SEDS_ERR;

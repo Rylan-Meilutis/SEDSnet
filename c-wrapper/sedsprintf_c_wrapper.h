@@ -17,6 +17,8 @@ typedef struct SedsWrapperRouterConfig
     const SedsLocalEndpointDesc * handlers;
     size_t num_handlers;
     SedsName sender;
+    uint8_t e2e_mode;
+    uint32_t e2e_key_id;
 
     bool configure_timesync;
     uint32_t timesync_role;

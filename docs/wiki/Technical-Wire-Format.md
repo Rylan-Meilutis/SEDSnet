@@ -21,7 +21,8 @@ src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/
     bit1: sender compressed
     bit2: wire contract present
     bit3: packet nonce present
-    bit4..7: reserved
+    bit4: E2E encrypted payload wrapper present
+    bit5..7: reserved
 [NEP: u8]                         // number of set bits in the endpoint bitmap
 VARINT(ty: u32 as u64)            // ULEB128
 VARINT(data_size: u64)            // logical payload size after decompression
@@ -34,7 +35,7 @@ SENDER_BYTES                      // raw or compressed
 [VARINT(contract_len: u64)]       // only when bit2 is set
 [WIRE_CONTRACT_BYTES]
 [RELIABLE_HEADER]                 // present for reliable schema types or when contract says so
-PAYLOAD_BYTES                     // raw or compressed
+PAYLOAD_BYTES                     // raw/compressed, or E2E wrapper around those bytes
 [CRC32: u32 LE]                   // checksum of every prior byte in the frame
 ```
 
@@ -46,6 +47,27 @@ Top-level frame flags:
 - `0x02`: sender compressed
 - `0x04`: wire contract present
 - `0x08`: packet nonce present
+- `0x10`: payload bytes are wrapped by the feature-gated E2E crypto shim
+
+When `0x10` is set, routing metadata remains visible, but the payload region is:
+
+```text
+VARINT(key_id)
+VARINT(plaintext_wire_payload_len)
+VARINT(nonce_len)
+NONCE_BYTES
+VARINT(tag_len)
+TAG_BYTES
+CIPHERTEXT_BYTES
+```
+
+The authenticated data passed to the crypto shim is the serialized frame prefix through the optional
+reliable header, excluding the payload wrapper and CRC. Deserializers built without `crypto-shim`
+reject frames with `0x10` rather than exposing ciphertext as application data.
+
+For multi-board endpoints, a sender can use an application-managed endpoint/group traffic key so
+each intended board can decrypt the same payload. Any board that changes visible routing metadata or
+ciphertext invalidates the AEAD tag for the other boards.
 
 Reliable-header flags:
 

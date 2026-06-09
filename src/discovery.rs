@@ -5,11 +5,12 @@ use alloc::vec::Vec;
 
 use crate::router::encode_slice_le;
 use crate::{
-    DataEndpoint, DataType, MessageElement, TelemetryError, TelemetryResult,
+    DataEndpoint, DataType, E2eEncryptionPolicy, MessageElement, TelemetryError, TelemetryResult,
     config::{
         OwnedDataTypeDefinition, OwnedEndpointDefinition, OwnedRuntimeSchemaSnapshot,
-        RuntimeSchemaSnapshot, export_schema, message_class_code, message_class_from_code,
-        message_data_type_code, message_data_type_from_code, reliable_code, reliable_from_code,
+        RuntimeSchemaSnapshot, e2e_encryption_policy_code, e2e_encryption_policy_from_code,
+        export_schema, message_class_code, message_class_from_code, message_data_type_code,
+        message_data_type_from_code, reliable_code, reliable_from_code,
     },
     packet::Packet,
     try_enum_from_u32,
@@ -667,7 +668,7 @@ pub fn build_discovery_schema_from_snapshot(
     mut schema: RuntimeSchemaSnapshot,
 ) -> TelemetryResult<Packet> {
     let mut payload = Vec::new();
-    payload.extend_from_slice(&2u32.to_le_bytes());
+    payload.extend_from_slice(&3u32.to_le_bytes());
 
     schema.endpoints.sort_unstable_by_key(|def| def.id.as_u32());
     schema.types.sort_unstable_by_key(|def| def.id.as_u32());
@@ -701,6 +702,7 @@ pub fn build_discovery_schema_from_snapshot(
         }
         payload.push(reliable_code(ty.reliable));
         payload.push(ty.priority);
+        payload.push(e2e_encryption_policy_code(ty.e2e_encryption));
         payload.extend_from_slice(&(ty.endpoints.len() as u32).to_le_bytes());
         for ep in ty.endpoints {
             payload.extend_from_slice(&ep.as_u32().to_le_bytes());
@@ -730,7 +732,7 @@ pub fn decode_discovery_schema_payload(
 ) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     let mut cursor = 0usize;
     let version = read_u32(payload, &mut cursor, "discovery schema version")?;
-    if version != 1 && version != 2 {
+    if version != 1 && version != 2 && version != 3 {
         return Err(TelemetryError::Deserialize("discovery schema version"));
     }
 
@@ -793,6 +795,18 @@ pub fn decode_discovery_schema_payload(
             reliable_from_code(read_u8(payload, &mut cursor, "discovery schema reliable")?)
                 .ok_or(TelemetryError::Deserialize("discovery schema reliable"))?;
         let priority = read_u8(payload, &mut cursor, "discovery schema priority")?;
+        let e2e_encryption = if version >= 3 {
+            e2e_encryption_policy_from_code(read_u8(
+                payload,
+                &mut cursor,
+                "discovery schema e2e encryption",
+            )?)
+            .ok_or(TelemetryError::Deserialize(
+                "discovery schema e2e encryption",
+            ))?
+        } else {
+            E2eEncryptionPolicy::PreferOff
+        };
         let endpoint_count =
             read_u32(payload, &mut cursor, "discovery schema type endpoint count")? as usize;
         let mut type_endpoints = Vec::with_capacity(endpoint_count);
@@ -811,6 +825,7 @@ pub fn decode_discovery_schema_payload(
             endpoints: type_endpoints,
             reliable,
             priority,
+            e2e_encryption,
         });
     }
 

@@ -6,8 +6,8 @@
 //! endpoints/types as the network announces them.
 
 use crate::{
-    EndpointMeta, MessageClass, MessageDataType, MessageElement, MessageMeta, ReliableMode,
-    TelemetryError, TelemetryResult, parse_f64, parse_strings, parse_usize,
+    E2eEncryptionPolicy, EndpointMeta, MessageClass, MessageDataType, MessageElement, MessageMeta,
+    ReliableMode, TelemetryError, TelemetryResult, parse_f64, parse_strings, parse_usize,
 };
 #[cfg(feature = "std")]
 use alloc::string::ToString;
@@ -308,6 +308,7 @@ pub struct DataTypeDefinition {
     pub endpoints: &'static [DataEndpoint],
     pub reliable: ReliableMode,
     pub priority: u8,
+    pub e2e_encryption: E2eEncryptionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +334,7 @@ pub struct OwnedDataTypeDefinition {
     pub endpoints: Vec<DataEndpoint>,
     pub reliable: ReliableMode,
     pub priority: u8,
+    pub e2e_encryption: E2eEncryptionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +419,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
             reliable: ReliableMode::None,
             priority: 255,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -427,6 +430,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
             reliable: ReliableMode::None,
             priority: 250,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -437,6 +441,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
             reliable: ReliableMode::None,
             priority: 250,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -447,6 +452,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
             reliable: ReliableMode::None,
             priority: 250,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -457,6 +463,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
             reliable: ReliableMode::None,
             priority: 245,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -467,6 +474,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
             reliable: ReliableMode::None,
             priority: 245,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -477,6 +485,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
             reliable: ReliableMode::None,
             priority: 245,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -487,6 +496,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::None,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -497,6 +507,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::None,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -507,6 +518,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -517,6 +529,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 241,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -527,6 +540,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 242,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -537,6 +551,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 242,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -547,6 +562,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 243,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
@@ -557,6 +573,7 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 243,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
         #[cfg(all(feature = "embedded", sedsprintf_has_telemetry_config_json))]
@@ -606,6 +623,7 @@ impl Registry {
                 && existing.endpoints == def.endpoints
                 && existing.reliable == def.reliable
                 && existing.priority == def.priority
+                && existing.e2e_encryption == def.e2e_encryption
             {
                 return Ok(());
             }
@@ -629,6 +647,7 @@ impl Registry {
                 endpoints: def.endpoints,
                 reliable: def.reliable,
                 priority: def.priority,
+                e2e_encryption: def.e2e_encryption,
             },
         ));
         self.types.sort_unstable_by_key(|(id, _)| id.0);
@@ -730,6 +749,7 @@ impl Registry {
                     endpoints: def.endpoints,
                     reliable: def.reliable,
                     priority: def.priority,
+                    e2e_encryption: def.e2e_encryption,
                 },
             ));
             self.types.sort_unstable_by_key(|(id, _)| id.0);
@@ -745,6 +765,7 @@ impl Registry {
             endpoints: existing.1.endpoints,
             reliable: existing.1.reliable,
             priority: existing.1.priority,
+            e2e_encryption: existing.1.e2e_encryption,
         };
         if type_def_equivalent(&existing_def, &def) {
             return SchemaMergeDecision::Unchanged;
@@ -759,6 +780,7 @@ impl Registry {
                     endpoints: def.endpoints,
                     reliable: def.reliable,
                     priority: def.priority,
+                    e2e_encryption: def.e2e_encryption,
                 },
             );
             self.types.sort_unstable_by_key(|(id, _)| id.0);
@@ -936,6 +958,28 @@ pub fn register_data_type_with_description(
     reliable: ReliableMode,
     priority: u8,
 ) -> TelemetryResult<DataType> {
+    register_data_type_with_description_and_e2e_encryption(
+        name,
+        description,
+        element,
+        endpoints,
+        reliable,
+        priority,
+        E2eEncryptionPolicy::PreferOff,
+    )
+}
+
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+pub fn register_data_type_with_description_and_e2e_encryption(
+    name: &str,
+    description: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
+    e2e_encryption: E2eEncryptionPolicy,
+) -> TelemetryResult<DataType> {
     let mut reg = registry().lock().expect("schema registry poisoned");
     let id = DataType(reg.next_type_id);
     reg.register_type_definition(DataTypeDefinition {
@@ -946,6 +990,7 @@ pub fn register_data_type_with_description(
         endpoints: leak_endpoints(endpoints.to_vec()),
         reliable,
         priority,
+        e2e_encryption,
     })?;
     Ok(id)
 }
@@ -956,6 +1001,19 @@ pub fn register_data_type_definition(def: DataTypeDefinition) -> TelemetryResult
         .lock()
         .expect("schema registry poisoned")
         .register_type_definition(def)
+}
+
+#[cfg(feature = "std")]
+pub fn set_data_type_e2e_encryption_policy(
+    ty: DataType,
+    policy: E2eEncryptionPolicy,
+) -> TelemetryResult<()> {
+    let mut reg = registry().lock().expect("schema registry poisoned");
+    let Some((_, meta)) = reg.types.iter_mut().find(|(id, _)| *id == ty) else {
+        return Err(TelemetryError::InvalidType);
+    };
+    meta.e2e_encryption = policy;
+    Ok(())
 }
 
 #[cfg(feature = "std")]
@@ -980,6 +1038,30 @@ pub fn register_data_type_id_with_description(
     reliable: ReliableMode,
     priority: u8,
 ) -> TelemetryResult<DataType> {
+    register_data_type_id_with_description_and_e2e_encryption(
+        id,
+        name,
+        description,
+        element,
+        endpoints,
+        reliable,
+        priority,
+        E2eEncryptionPolicy::PreferOff,
+    )
+}
+
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+pub fn register_data_type_id_with_description_and_e2e_encryption(
+    id: DataType,
+    name: &str,
+    description: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
+    e2e_encryption: E2eEncryptionPolicy,
+) -> TelemetryResult<DataType> {
     registry()
         .lock()
         .expect("schema registry poisoned")
@@ -991,6 +1073,7 @@ pub fn register_data_type_id_with_description(
             endpoints: leak_endpoints(endpoints.to_vec()),
             reliable,
             priority,
+            e2e_encryption,
         })?;
     Ok(id)
 }
@@ -1050,6 +1133,7 @@ pub fn merge_owned_schema_snapshot_with_budget(
             endpoints: leak_endpoints(ty.endpoints),
             reliable: ty.reliable,
             priority: ty.priority,
+            e2e_encryption: ty.e2e_encryption,
         });
     }
 
@@ -1135,6 +1219,7 @@ pub fn export_schema() -> RuntimeSchemaSnapshot {
                 endpoints: meta.endpoints,
                 reliable: meta.reliable,
                 priority: meta.priority,
+                e2e_encryption: meta.e2e_encryption,
             })
             .collect(),
     }
@@ -1242,6 +1327,7 @@ pub fn get_message_meta(data_type: DataType) -> MessageMeta {
             endpoints: &[],
             reliable: ReliableMode::None,
             priority: 0,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
 }
 
@@ -1312,6 +1398,7 @@ fn type_fingerprint(def: DataTypeDefinition) -> u64 {
     h = hash_message_element(h, def.element);
     h = hash_u8(h, reliable_code(def.reliable));
     h = hash_u8(h, def.priority);
+    h = hash_u8(h, e2e_encryption_policy_code(def.e2e_encryption));
     for ep in def.endpoints {
         h = hash_u32(h, ep.0);
     }
@@ -1367,6 +1454,7 @@ pub fn data_type_definition(ty: DataType) -> Option<DataTypeDefinition> {
             endpoints: meta.endpoints,
             reliable: meta.reliable,
             priority: meta.priority,
+            e2e_encryption: meta.e2e_encryption,
         })
 }
 
@@ -1402,6 +1490,7 @@ pub fn data_type_definition_by_name(name: &str) -> Option<DataTypeDefinition> {
             endpoints: meta.endpoints,
             reliable: meta.reliable,
             priority: meta.priority,
+            e2e_encryption: meta.e2e_encryption,
         })
 }
 
@@ -1587,6 +1676,23 @@ pub(crate) fn reliable_from_code(code: u8) -> Option<ReliableMode> {
     }
 }
 
+pub(crate) fn e2e_encryption_policy_code(policy: E2eEncryptionPolicy) -> u8 {
+    match policy {
+        E2eEncryptionPolicy::PreferOff => 0,
+        E2eEncryptionPolicy::PreferOn => 1,
+        E2eEncryptionPolicy::RequireOn => 2,
+    }
+}
+
+pub(crate) fn e2e_encryption_policy_from_code(code: u8) -> Option<E2eEncryptionPolicy> {
+    match code {
+        0 => Some(E2eEncryptionPolicy::PreferOff),
+        1 => Some(E2eEncryptionPolicy::PreferOn),
+        2 => Some(E2eEncryptionPolicy::RequireOn),
+        _ => None,
+    }
+}
+
 #[cfg(not(feature = "std"))]
 pub fn register_endpoint(_name: &str, _link_local_only: bool) -> TelemetryResult<DataEndpoint> {
     Err(TelemetryError::BadArg)
@@ -1666,6 +1772,14 @@ pub fn register_data_type_definition(_def: DataTypeDefinition) -> TelemetryResul
 }
 
 #[cfg(not(feature = "std"))]
+pub fn set_data_type_e2e_encryption_policy(
+    _ty: DataType,
+    _policy: E2eEncryptionPolicy,
+) -> TelemetryResult<()> {
+    Err(TelemetryError::BadArg)
+}
+
+#[cfg(not(feature = "std"))]
 pub fn register_data_type_id(
     _id: DataType,
     _name: &str,
@@ -1686,6 +1800,21 @@ pub fn register_data_type_id_with_description(
     _endpoints: &[DataEndpoint],
     _reliable: ReliableMode,
     _priority: u8,
+) -> TelemetryResult<DataType> {
+    Err(TelemetryError::BadArg)
+}
+
+#[cfg(not(feature = "std"))]
+#[allow(clippy::too_many_arguments)]
+pub fn register_data_type_id_with_description_and_e2e_encryption(
+    _id: DataType,
+    _name: &str,
+    _description: &str,
+    _element: MessageElement,
+    _endpoints: &[DataEndpoint],
+    _reliable: ReliableMode,
+    _priority: u8,
+    _e2e_encryption: E2eEncryptionPolicy,
 ) -> TelemetryResult<DataType> {
     Err(TelemetryError::BadArg)
 }
@@ -1745,6 +1874,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 255,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::ReliableAck,
@@ -1754,6 +1884,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 250,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::ReliablePacketRequest,
@@ -1763,6 +1894,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 250,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::ReliablePartialAck,
@@ -1772,6 +1904,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 250,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::TimeSyncAnnounce,
@@ -1781,6 +1914,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TimeSync],
             reliable: ReliableMode::None,
             priority: 245,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::TimeSyncRequest,
@@ -1790,6 +1924,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TimeSync],
             reliable: ReliableMode::None,
             priority: 245,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::TimeSyncResponse,
@@ -1799,6 +1934,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::TimeSync],
             reliable: ReliableMode::None,
             priority: 245,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::DiscoveryAnnounce,
@@ -1808,6 +1944,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::DiscoveryTimeSyncSources,
@@ -1817,6 +1954,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::DiscoveryTopology,
@@ -1826,6 +1964,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::DiscoverySchema,
@@ -1835,6 +1974,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 241,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::DiscoveryTopologyRequest,
@@ -1844,6 +1984,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 242,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::DiscoverySchemaRequest,
@@ -1853,6 +1994,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 242,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::ManagedVariableRequest,
@@ -1862,6 +2004,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 243,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
         DataTypeDefinition {
             id: DataType::ManagedVariableValue,
@@ -1871,6 +2014,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 243,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
     ];
     #[cfg(all(feature = "serde", sedsprintf_has_telemetry_config_json))]
@@ -2025,6 +2169,7 @@ pub fn get_message_meta(data_type: DataType) -> MessageMeta {
             endpoints: def.endpoints,
             reliable: def.reliable,
             priority: def.priority,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .unwrap_or(MessageMeta {
             name: "UNKNOWN_TYPE",
@@ -2033,6 +2178,7 @@ pub fn get_message_meta(data_type: DataType) -> MessageMeta {
             endpoints: &[],
             reliable: ReliableMode::None,
             priority: 0,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
 }
 
@@ -2122,6 +2268,17 @@ struct JsonType {
     reliable_mode: Option<String>,
     #[serde(default)]
     priority: Option<u8>,
+    #[serde(default)]
+    e2e_encryption: Option<String>,
+}
+
+fn parse_e2e_encryption_policy(raw: Option<&str>) -> TelemetryResult<E2eEncryptionPolicy> {
+    match raw.unwrap_or("PreferOff") {
+        "PreferOff" | "prefer_off" | "off" | "false" => Ok(E2eEncryptionPolicy::PreferOff),
+        "PreferOn" | "prefer_on" | "preferred" | "true" => Ok(E2eEncryptionPolicy::PreferOn),
+        "RequireOn" | "require_on" | "required" => Ok(E2eEncryptionPolicy::RequireOn),
+        _ => Err(TelemetryError::BadArg),
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -2217,6 +2374,7 @@ fn json_config_to_snapshot(
             endpoints: leak_endpoints(endpoints_for_type),
             reliable,
             priority: ty.priority.unwrap_or(0),
+            e2e_encryption: parse_e2e_encryption_policy(ty.e2e_encryption.as_deref())?,
         });
     }
     Ok(RuntimeSchemaSnapshot { endpoints, types })

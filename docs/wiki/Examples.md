@@ -13,6 +13,10 @@ c-example-code/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/m
 c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/timesync_example.c))
 -
 c-example-code/src/load_balancing_example.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/load_balancing_example.c))
+-
+c-example-code/src/managed_variables_e2e_example.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/managed_variables_e2e_example.c))
+-
+c-example-code/src/managed_variables_e2e_example.cpp ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/managed_variables_e2e_example.cpp))
 
 What it demonstrates:
 
@@ -20,6 +24,7 @@ What it demonstrates:
 - Creating and sending packets.
 - Receiving and dispatching to handlers.
 - Time sync announce/request/response and offset math.
+- Managed-variable latest-value resync, bounded serialized sides, and E2E policy configuration.
 
 Suggested first steps:
 
@@ -40,6 +45,8 @@ python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/s
 python-example/load_balancing_example.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-example/load_balancing_example.py))
 -
 python-example/typed_routing_example.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-example/typed_routing_example.py))
+-
+python-example/managed_variables_e2e_example.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-example/managed_variables_e2e_example.py))
 
 What it demonstrates:
 
@@ -48,6 +55,7 @@ What it demonstrates:
 - Looking up runtime schema names and using the returned IDs.
 - Type-specific routing to two dedicated command links without weighted or failover path selection.
 - Time sync announce/request/response and offset math.
+- Managed-variable latest-value resync and E2E router/type policy settings.
 
 Suggested first steps:
 
@@ -76,6 +84,8 @@ rust-example-code/multinode_sim_example.rs ([source](https://github.com/Rylan-Me
 rust-example-code/load_balancing_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/load_balancing_example.rs))
 -
 rust-example-code/typed_routing_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/typed_routing_example.rs))
+-
+rust-example-code/managed_variables_e2e_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/managed_variables_e2e_example.rs))
 
 The typed-routing example shows one practical pattern: ordinary telemetry stays on its normal
 link, while a command-like packet type is manually fanned out to two dedicated sides that both
