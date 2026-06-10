@@ -1,12 +1,12 @@
 [package]
-name = "sedsnet"
+name = "SEDSnet"
 version = "4.0.0"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
 description = "A memory safe, no_std-capable telemetry networking stack with routing, discovery, reliability, and Rust/C/Python bindings."
 license = "GPL-2"
-repository = "github.com/rylan-meilutis/sedsnet"
+repository = "github.com/rylan-meilutis/SEDSnet"
 keywords = ["telemetry", "networking", "no_std", "embedded", "pyo3"]
 categories = ["embedded", "no-std"]
 readme = "README.md"
