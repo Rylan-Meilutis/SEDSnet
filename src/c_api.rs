@@ -476,6 +476,19 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         push_board(&mut out, &endpoint_names, board);
     }
     out.push(']');
+    out.push_str(",\"links\":[");
+    for (idx, link) in snap.links.iter().enumerate() {
+        if idx != 0 {
+            out.push(',');
+        }
+        out.push('{');
+        out.push_str("\"source\":");
+        json_push_escaped(&mut out, &link.source);
+        out.push_str(",\"target\":");
+        json_push_escaped(&mut out, &link.target);
+        out.push('}');
+    }
+    out.push(']');
     out.push_str(",\"routes\":[");
     for (route_idx, route) in snap.routes.iter().enumerate() {
         if route_idx != 0 {
@@ -536,6 +549,110 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         format_args!(
             "],\"current_announce_interval_ms\":{},\"next_announce_ms\":{}",
             snap.current_announce_interval_ms, snap.next_announce_ms
+        ),
+    );
+    out.push('}');
+    out
+}
+
+#[cfg(feature = "discovery")]
+fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) -> String {
+    fn push_optional_u64(out: &mut String, val: Option<u64>) {
+        match val {
+            Some(v) => {
+                let _ = core::fmt::Write::write_fmt(out, format_args!("{v}"));
+            }
+            None => out.push_str("null"),
+        }
+    }
+
+    fn push_usize_array(out: &mut String, vals: &[usize]) {
+        out.push('[');
+        for (idx, val) in vals.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = core::fmt::Write::write_fmt(out, format_args!("{val}"));
+        }
+        out.push(']');
+    }
+
+    fn push_string_array(out: &mut String, vals: &[String]) {
+        out.push('[');
+        for (idx, val) in vals.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            json_push_escaped(out, val);
+        }
+        out.push(']');
+    }
+
+    fn push_endpoint_ids_array(out: &mut String, vals: &[DataEndpoint]) {
+        out.push('[');
+        for (idx, val) in vals.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = core::fmt::Write::write_fmt(out, format_args!("{}", val.as_u32()));
+        }
+        out.push(']');
+    }
+
+    fn push_endpoint_names_array(
+        out: &mut String,
+        names: &BTreeMap<DataEndpoint, &'static str>,
+        vals: &[DataEndpoint],
+    ) {
+        out.push('[');
+        for (idx, val) in vals.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            match names.get(val) {
+                Some(name) => json_push_escaped(out, name),
+                None => json_push_escaped(out, &format!("endpoint_{}", val.as_u32())),
+            }
+        }
+        out.push(']');
+    }
+
+    let endpoint_names = known_endpoints()
+        .into_iter()
+        .map(|def| (def.id, def.name))
+        .collect::<BTreeMap<_, _>>();
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"sender_id\":");
+    json_push_escaped(&mut out, &stats.sender_id);
+    out.push_str(",\"connected\":");
+    out.push_str(if stats.connected { "true" } else { "false" });
+    out.push_str(",\"side_ids\":");
+    push_usize_array(&mut out, &stats.side_ids);
+    out.push_str(",\"side_names\":");
+    out.push('[');
+    for (idx, name) in stats.side_names.iter().enumerate() {
+        if idx != 0 {
+            out.push(',');
+        }
+        json_push_escaped(&mut out, name);
+    }
+    out.push(']');
+    out.push_str(",\"last_seen_ms\":");
+    push_optional_u64(&mut out, stats.last_seen_ms);
+    out.push_str(",\"age_ms\":");
+    push_optional_u64(&mut out, stats.age_ms);
+    out.push_str(",\"reachable_endpoints\":");
+    push_endpoint_names_array(&mut out, &endpoint_names, &stats.reachable_endpoints);
+    out.push_str(",\"reachable_endpoint_ids\":");
+    push_endpoint_ids_array(&mut out, &stats.reachable_endpoints);
+    out.push_str(",\"reachable_timesync_sources\":");
+    push_string_array(&mut out, &stats.reachable_timesync_sources);
+    let _ = core::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            ",\"packets_sent\":{},\"packets_received\":{},\"bytes_sent\":{},\"bytes_received\":{}",
+            stats.packets_sent, stats.packets_received, stats.bytes_sent, stats.bytes_received
         ),
     );
     out.push('}');
@@ -1138,6 +1255,12 @@ pub extern "C" fn seds_router_free(r: *mut SedsRouter) {
     if r.is_null() {
         return;
     }
+    #[cfg(feature = "discovery")]
+    {
+        let router = unsafe { &(*r).inner };
+        let _ = router.announce_leave();
+        let _ = router.process_tx_queue();
+    }
     unsafe {
         drop(Box::from_raw(r));
     }
@@ -1266,6 +1389,16 @@ pub extern "C" fn seds_router_announce_discovery(r: *mut SedsRouter) -> i32 {
 
 #[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_router_announce_leave(r: *mut SedsRouter) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.announce_leave())
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_router_poll_discovery(r: *mut SedsRouter, out_did_queue: *mut bool) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -1292,6 +1425,81 @@ pub extern "C" fn seds_router_enable_managed_variable(r: *mut SedsRouter, ty: Da
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_router_enable_network_variable(
+    r: *mut SedsRouter,
+    ty: DataType,
+    can_read: bool,
+    can_write: bool,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.enable_network_variable(
+        ty,
+        crate::router::NetworkVariablePermissions {
+            read: can_read,
+            write: can_write,
+        },
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_on_network_variable_update(
+    r: *mut SedsRouter,
+    ty: DataType,
+    cb: CEndpointHandler,
+    user: *mut c_void,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let Some(cb_fn) = cb else {
+        return status_from_err(TelemetryError::BadArg);
+    };
+    let user_addr = user as usize;
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.on_network_variable_update(ty, move |pkt: &Packet| {
+        let mut stack_eps: [u32; STACK_EPS] = [0; STACK_EPS];
+        let (endpoints_ptr, num_endpoints, _owned_vec): (*const u32, usize, Option<Vec<u32>>) =
+            if pkt.endpoints().len() <= STACK_EPS {
+                for (i, e) in pkt.endpoints().iter().enumerate() {
+                    stack_eps[i] = e.as_u32();
+                }
+                (stack_eps.as_ptr(), pkt.endpoints().len(), None)
+            } else {
+                let mut eps_u32 = Vec::with_capacity(pkt.endpoints().len());
+                for e in pkt.endpoints().iter() {
+                    eps_u32.push(e.as_u32());
+                }
+                let ptr = eps_u32.as_ptr();
+                let len = eps_u32.len();
+                (ptr, len, Some(eps_u32))
+            };
+
+        let sender_bytes = pkt.sender().as_bytes();
+        let view = SedsPacketView {
+            ty: pkt.data_type().as_u32(),
+            data_size: pkt.data_size(),
+            sender: sender_bytes.as_ptr() as *const c_char,
+            sender_len: sender_bytes.len(),
+            endpoints: endpoints_ptr,
+            num_endpoints,
+            timestamp: pkt.timestamp(),
+            payload: pkt.payload().as_ptr(),
+            payload_len: pkt.payload().len(),
+        };
+
+        let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+        if code == status_from_result_code(SedsResult::SedsOk) {
+            Ok(())
+        } else {
+            Err(TelemetryError::Io("network variable update handler error"))
+        }
+    }))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_router_disable_managed_variable(r: *mut SedsRouter, ty: DataType) {
     if r.is_null() {
         return;
@@ -1308,6 +1516,26 @@ pub extern "C" fn seds_router_request_managed_variable(r: *mut SedsRouter, ty: D
     }
     let router = unsafe { &(*r).inner };
     ok_or_status(router.request_managed_variable(ty))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_network_variable_serialized(
+    r: *mut SedsRouter,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if r.is_null() || bytes.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let data = unsafe { slice::from_raw_parts(bytes, len) };
+    match deserialize_packet(data).and_then(|pkt| {
+        pkt.validate()?;
+        let router = unsafe { &(*r).inner };
+        router.set_network_variable(pkt)
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(e) => status_from_err(e),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1345,6 +1573,31 @@ pub extern "C" fn seds_router_cached_managed_variable_serialized_len(
     i32::try_from(serialize_packet(&pkt).len()).unwrap_or(i32::MAX)
 }
 
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_network_variable_serialized_len(
+    r: *mut SedsRouter,
+    ty: DataType,
+    stale_after_ms: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    match router.get_network_variable(
+        ty,
+        if stale_after_ms == 0 {
+            None
+        } else {
+            Some(u64::from(stale_after_ms))
+        },
+    ) {
+        Ok(Some(pkt)) => i32::try_from(serialize_packet(&pkt).len()).unwrap_or(i32::MAX),
+        Ok(None) => 0,
+        Err(e) => status_from_err(e),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_cached_managed_variable_serialized(
     r: *mut SedsRouter,
@@ -1358,6 +1611,44 @@ pub extern "C" fn seds_router_cached_managed_variable_serialized(
     let router = unsafe { &(*r).inner };
     let Some(pkt) = router.cached_managed_variable(ty) else {
         return 0;
+    };
+    let bytes = serialize_packet(&pkt);
+    if out_len < bytes.len() {
+        return status_from_err(TelemetryError::SizeMismatch {
+            expected: bytes.len(),
+            got: out_len,
+        });
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+    }
+    i32::try_from(bytes.len()).unwrap_or(i32::MAX)
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_network_variable_serialized(
+    r: *mut SedsRouter,
+    ty: DataType,
+    stale_after_ms: u32,
+    out: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if r.is_null() || out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let pkt = match router.get_network_variable(
+        ty,
+        if stale_after_ms == 0 {
+            None
+        } else {
+            Some(u64::from(stale_after_ms))
+        },
+    ) {
+        Ok(Some(pkt)) => pkt,
+        Ok(None) => return 0,
+        Err(e) => return status_from_err(e),
     };
     let bytes = serialize_packet(&pkt);
     if out_len < bytes.len() {
@@ -2502,6 +2793,12 @@ pub extern "C" fn seds_relay_free(r: *mut SedsRelay) {
     if r.is_null() {
         return;
     }
+    #[cfg(feature = "discovery")]
+    {
+        let relay = unsafe { &(*r).inner };
+        let _ = relay.announce_leave();
+        let _ = relay.process_tx_queue();
+    }
     unsafe {
         drop(Box::from_raw(r));
     }
@@ -2538,6 +2835,16 @@ pub extern "C" fn seds_relay_announce_discovery(r: *mut SedsRelay) -> i32 {
     }
     let relay = unsafe { &(*r).inner };
     ok_or_status(relay.announce_discovery())
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_announce_leave(r: *mut SedsRelay) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let relay = unsafe { &(*r).inner };
+    ok_or_status(relay.announce_leave())
 }
 
 #[cfg(feature = "discovery")]
@@ -2586,6 +2893,63 @@ pub extern "C" fn seds_router_export_topology(
 
 #[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_router_export_client_stats_len(
+    r: *mut SedsRouter,
+    sender: *const c_char,
+    sender_len: usize,
+) -> i32 {
+    if r.is_null() || (sender_len > 0 && sender.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let sender_id = if sender_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let router = unsafe { &(*r).inner };
+    match router.client_stats(sender_id) {
+        Some(stats) => (client_stats_snapshot_to_json(&stats).len() + 1) as i32,
+        None => ("null".len() + 1) as i32,
+    }
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_export_client_stats(
+    r: *mut SedsRouter,
+    sender: *const c_char,
+    sender_len: usize,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> i32 {
+    if r.is_null() || (sender_len > 0 && sender.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let sender_id = if sender_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let router = unsafe { &(*r).inner };
+    match router.client_stats(sender_id) {
+        Some(stats) => {
+            let json = client_stats_snapshot_to_json(&stats);
+            unsafe { write_str_to_buf(&json, buf, buf_len) }
+        }
+        None => unsafe { write_str_to_buf("null", buf, buf_len) },
+    }
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_runtime_stats_len(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -2607,6 +2971,30 @@ pub extern "C" fn seds_router_export_runtime_stats(
     }
     let router = unsafe { &(*r).inner };
     let json = runtime_stats_snapshot_to_json(&router.export_runtime_stats());
+    unsafe { write_str_to_buf(&json, buf, buf_len) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_export_memory_layout_len(r: *mut SedsRouter) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let json = router.export_memory_layout_json();
+    (json.len() + 1) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_export_memory_layout(
+    r: *mut SedsRouter,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let json = router.export_memory_layout_json();
     unsafe { write_str_to_buf(&json, buf, buf_len) }
 }
 
@@ -2638,6 +3026,63 @@ pub extern "C" fn seds_relay_export_topology(
 
 #[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_export_client_stats_len(
+    r: *mut SedsRelay,
+    sender: *const c_char,
+    sender_len: usize,
+) -> i32 {
+    if r.is_null() || (sender_len > 0 && sender.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let sender_id = if sender_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let relay = unsafe { &(*r).inner };
+    match relay.client_stats(sender_id) {
+        Some(stats) => (client_stats_snapshot_to_json(&stats).len() + 1) as i32,
+        None => ("null".len() + 1) as i32,
+    }
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_export_client_stats(
+    r: *mut SedsRelay,
+    sender: *const c_char,
+    sender_len: usize,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> i32 {
+    if r.is_null() || (sender_len > 0 && sender.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let sender_id = if sender_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let relay = unsafe { &(*r).inner };
+    match relay.client_stats(sender_id) {
+        Some(stats) => {
+            let json = client_stats_snapshot_to_json(&stats);
+            unsafe { write_str_to_buf(&json, buf, buf_len) }
+        }
+        None => unsafe { write_str_to_buf("null", buf, buf_len) },
+    }
+}
+
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_runtime_stats_len(r: *mut SedsRelay) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -2659,6 +3104,30 @@ pub extern "C" fn seds_relay_export_runtime_stats(
     }
     let relay = unsafe { &(*r).inner };
     let json = runtime_stats_snapshot_to_json(&relay.export_runtime_stats());
+    unsafe { write_str_to_buf(&json, buf, buf_len) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_export_memory_layout_len(r: *mut SedsRelay) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let relay = unsafe { &(*r).inner };
+    let json = relay.export_memory_layout_json();
+    (json.len() + 1) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_export_memory_layout(
+    r: *mut SedsRelay,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let relay = unsafe { &(*r).inner };
+    let json = relay.export_memory_layout_json();
     unsafe { write_str_to_buf(&json, buf, buf_len) }
 }
 
@@ -4724,6 +5193,7 @@ mod tests {
         assert!(doc.get("advertised_endpoint_ids").unwrap().is_array());
         assert!(doc.get("advertised_timesync_sources").unwrap().is_array());
         assert!(doc.get("routers").unwrap().is_array());
+        assert!(doc.get("links").unwrap().is_array());
         assert!(doc.get("routes").unwrap().is_array());
 
         let local = doc

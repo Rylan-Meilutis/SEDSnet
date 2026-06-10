@@ -35,6 +35,12 @@ They cover:
 - packet construction, validation, serialization, and deserialization
 - queue behavior, timeout budgeting, and dedupe
 - runtime routing policy, typed routes, route selection modes, and discovery-informed forwarding
+- network-variable getter/setter permissions, tiered cache refresh, and update callbacks
+- topology graph export, control-endpoint filtering, leave-announcement pruning, client stats, and
+  memory-layout snapshots
+- fixed-size serialized side splitting/reassembly and side-local header-template compaction
+- E2E payload cryptography policies, software fallback crypto, multi-holder encrypted fanout, and
+  tamper rejection
 - router and relay reliable-delivery internals
 - C ABI behavior that can be exercised directly from Rust tests
 - time-sync internals when the `timesync` feature is enabled

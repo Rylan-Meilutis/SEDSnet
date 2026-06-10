@@ -732,6 +732,9 @@ pub enum TelemetryError {
     /// Generic invalid argument from caller.
     BadArg,
 
+    /// Operation is not permitted for the current router/device policy.
+    PermissionDenied,
+
     /// Serialization error.
     Serialize(&'static str),
 
@@ -768,6 +771,7 @@ impl TelemetryError {
             TelemetryError::MissingPayload => TelemetryErrorCode::MissingPayload,
             TelemetryError::HandlerError(_) => TelemetryErrorCode::HandlerError,
             TelemetryError::BadArg => TelemetryErrorCode::BadArg,
+            TelemetryError::PermissionDenied => TelemetryErrorCode::PermissionDenied,
             TelemetryError::Serialize(_) => TelemetryErrorCode::Serialize,
             TelemetryError::Deserialize(_) => TelemetryErrorCode::Deserialize,
             TelemetryError::Io(_) => TelemetryErrorCode::Io,
@@ -830,13 +834,14 @@ pub enum TelemetryErrorCode {
     MissingPayload = -8,
     HandlerError = -9,
     BadArg = -10,
-    Serialize = -11,
-    Deserialize = -12,
-    Io = -13,
-    InvalidUtf8 = -14,
-    TypeMismatch = -15,
-    InvalidLinkId = -16,
-    PacketTooLarge = -17,
+    PermissionDenied = -11,
+    Serialize = -12,
+    Deserialize = -13,
+    Io = -14,
+    InvalidUtf8 = -15,
+    TypeMismatch = -16,
+    InvalidLinkId = -17,
+    PacketTooLarge = -18,
 }
 
 // Generate ReprI32Enum helpers for TelemetryErrorCode
@@ -851,7 +856,7 @@ impl TelemetryErrorCode {
     pub const MAX: i32 = TelemetryErrorCode::InvalidType as i32;
 
     /// Minimum valid numeric error code value.
-    pub const MIN: i32 = TelemetryErrorCode::Io as i32;
+    pub const MIN: i32 = TelemetryErrorCode::PacketTooLarge as i32;
 
     /// Human-readable string for logging / debugging.
     /// # Returns
@@ -868,6 +873,7 @@ impl TelemetryErrorCode {
             TelemetryErrorCode::MissingPayload => "{Missing Payload}",
             TelemetryErrorCode::HandlerError => "{Handler Error}",
             TelemetryErrorCode::BadArg => "{Bad Arg}",
+            TelemetryErrorCode::PermissionDenied => "{Permission Denied}",
             TelemetryErrorCode::Serialize => "{Serialize Error}",
             TelemetryErrorCode::Deserialize => "{Deserialize Error}",
             TelemetryErrorCode::Io => "{IO Error}",

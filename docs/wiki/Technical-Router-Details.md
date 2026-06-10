@@ -62,9 +62,10 @@ If a side is already reliable (e.g., TCP), disable reliability on that side to a
 
 With the `discovery` feature enabled, the router has a built-in internal control path:
 
-- `DISCOVERY` endpoint and `DISCOVERY_ANNOUNCE` type are built in.
-- When `timesync` is also enabled, `DISCOVERY_TIMESYNC_SOURCES` is also built in.
-- `DISCOVERY_TOPOLOGY` is also built in and carries the transitive router graph.
+- `SEDSNET_DISCOVERY` endpoint and `SEDSNET_DISCOVERY_ANNOUNCE` type are built in.
+- When `timesync` is also enabled, `SEDSNET_DISCOVERY_TIMESYNC_SOURCES` is also built in.
+- `SEDSNET_DISCOVERY_TOPOLOGY` is also built in and carries the transitive router graph.
+- `SEDSNET_DISCOVERY_LEAVE` lets a planned shutdown prune topology immediately.
 - Discovery packets are handled internally, not through user endpoint handlers.
 - The router keeps soft-state reachability data per side:
   reachable endpoints, reachable time source sender IDs, per-announcer router graphs, and
@@ -116,9 +117,9 @@ With discovery enabled, forwarding also consults the learned side map:
 - Reliable packets are sent to all known candidate sides for their endpoints.
 - Non-reliable discovered traffic defaults to adaptive one-path load balancing derived from recent
   measured side transmit bandwidth.
-- For time sync traffic, exact discovered source IDs win over generic `TIME_SYNC` endpoint matches
+- For time sync traffic, exact discovered source IDs win over generic `SEDSNET_TIME_SYNC` endpoint matches
   when the router knows which source it currently wants to talk to.
-- Source-side `TIME_SYNC_RESPONSE` traffic is returned to the requesting ingress side rather than
+- Source-side `SEDSNET_TIME_SYNC_RESPONSE` traffic is returned to the requesting ingress side rather than
   broadcast.
 
 ## Transmit pipeline (log*, tx*)

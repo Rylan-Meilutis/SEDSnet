@@ -894,7 +894,7 @@ mod handler_failure_tests {
 
         // Verify exact payload text produced by handle_callback_error(Some(dest), e)
         let expected = format!(
-            "{{Type: TELEMETRY_ERROR, Data Size: {:?}, Sender: TEST_PLATFORM, Endpoints: [TELEMETRY_ERROR], Timestamp: 0 (0s 000ms), Error: (\"Handler for endpoint {:?} failed on device {:?}: {:?}\")}}",
+            "{{Type: SEDSNET_ERROR, Data Size: {:?}, Sender: TEST_PLATFORM, Endpoints: [SEDSNET_ERROR], Timestamp: 0 (0s 000ms), Error: (\"Handler for endpoint {:?} failed on device {:?}: {:?}\")}}",
             69,
             failing_ep,
             DEVICE_IDENTIFIER,
@@ -956,7 +956,7 @@ mod handler_failure_tests {
 
         // Exact text from handle_callback_error(None, e)
         let expected = format!(
-            "{{Type: TELEMETRY_ERROR, Data Size: {:?}, Sender: TEST_PLATFORM, Endpoints: [SD_CARD], Timestamp: 0 (0s 000ms), Error: (\"TX Handler failed on device {:?}: {:?}\")}}",
+            "{{Type: SEDSNET_ERROR, Data Size: {:?}, Sender: TEST_PLATFORM, Endpoints: [SD_CARD], Timestamp: 0 (0s 000ms), Error: (\"TX Handler failed on device {:?}: {:?}\")}}",
             55,
             DEVICE_IDENTIFIER,
             TelemetryError::Io("boom")
@@ -5191,7 +5191,10 @@ mod router_tests {
             build_discovery_announce, build_discovery_timesync_sources, build_discovery_topology,
         };
         use crate::relay::Relay;
-        use crate::router::{Clock, EndpointHandler, RouterConfig, RouterE2eEncryptionMode};
+        use crate::router::{
+            Clock, EndpointHandler, NetworkVariablePermissions, RouterConfig,
+            RouterE2eEncryptionMode,
+        };
         use crate::tests::count_packets_of_type;
         use crate::tests::timeout_tests::StepClock;
         use crate::{
@@ -6397,7 +6400,7 @@ mod router_tests {
             assert_eq!(topo.routes[0].side_name, "FILL");
             assert_eq!(
                 topo.routes[0].reachable_endpoints,
-                vec![DataEndpoint::named("RADIO"), DataEndpoint::TimeSync]
+                vec![DataEndpoint::named("RADIO")]
             );
             assert!(
                 topo.advertised_endpoints
@@ -6927,7 +6930,11 @@ mod router_tests {
             let topology = vec![
                 TopologyBoardNode {
                     sender_id: "REMOTE_A".to_string(),
-                    reachable_endpoints: vec![DataEndpoint::named("SD_CARD")],
+                    reachable_endpoints: vec![
+                        DataEndpoint::named("SD_CARD"),
+                        DataEndpoint::TimeSync,
+                        DataEndpoint::TelemetryError,
+                    ],
                     reachable_timesync_sources: Vec::new(),
                     connections: vec!["SENSOR_B".to_string()],
                 },
@@ -6958,11 +6965,55 @@ mod router_tests {
                     .any(|board| board.sender_id == "SENSOR_B"
                         && board.connections.contains(&"REMOTE_A".to_string()))
             );
+            assert!(
+                snap.links
+                    .iter()
+                    .any(|link| link.source == "REMOTE_A" && link.target == "SENSOR_B")
+            );
 
             assert!(
                 snap.advertised_endpoints
                     .contains(&DataEndpoint::named("RADIO")),
                 "transitive endpoint holders should contribute to exported reachability"
+            );
+            assert!(!snap.advertised_endpoints.contains(&DataEndpoint::TimeSync));
+            assert!(
+                !snap
+                    .advertised_endpoints
+                    .contains(&DataEndpoint::TelemetryError)
+            );
+        }
+
+        #[test]
+        fn discovery_leave_prunes_client_topology_and_stats_immediately() {
+            ensure_topology_test_schema();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side_a =
+                router.add_side_packet("A", |_pkt: &Packet| -> TelemetryResult<()> { Ok(()) });
+
+            let discovery_pkt =
+                build_discovery_announce("LEAVING_NODE", 0, &[DataEndpoint::named("RADIO")])
+                    .unwrap();
+            router.rx_from_side(&discovery_pkt, side_a).unwrap();
+            let stats = router.client_stats("LEAVING_NODE").unwrap();
+            assert!(stats.connected);
+            assert_eq!(stats.side_names, vec!["A"]);
+            assert_eq!(
+                stats.reachable_endpoints,
+                vec![DataEndpoint::named("RADIO")]
+            );
+
+            let leave = crate::discovery::build_discovery_leave("LEAVING_NODE", 1).unwrap();
+            router.rx_from_side(&leave, side_a).unwrap();
+
+            assert!(router.client_stats("LEAVING_NODE").is_none());
+            assert!(
+                !router
+                    .export_topology()
+                    .routers
+                    .iter()
+                    .any(|board| board.sender_id == "LEAVING_NODE")
             );
         }
 
@@ -8482,10 +8533,12 @@ mod router_tests {
             router.periodic(0).unwrap();
 
             let pkts = seen.lock().unwrap().clone();
-            assert!(
-                pkts.iter()
-                    .any(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
-            );
+            assert!(pkts.iter().any(|pkt| matches!(
+                pkt.data_type(),
+                DataType::DiscoveryAnnounce
+                    | DataType::DiscoveryTopology
+                    | DataType::DiscoveryTimeSyncSources
+            )));
             assert!(
                 pkts.iter()
                     .any(|pkt| pkt.data_type() == DataType::TimeSyncAnnounce)
@@ -8513,10 +8566,12 @@ mod router_tests {
             router.periodic_no_timesync(0).unwrap();
 
             let pkts = seen.lock().unwrap().clone();
-            assert!(
-                pkts.iter()
-                    .any(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
-            );
+            assert!(pkts.iter().any(|pkt| matches!(
+                pkt.data_type(),
+                DataType::DiscoveryAnnounce
+                    | DataType::DiscoveryTopology
+                    | DataType::DiscoveryTimeSyncSources
+            )));
             assert!(
                 pkts.iter()
                     .all(|pkt| pkt.data_type() != DataType::TimeSyncAnnounce)
@@ -9202,7 +9257,7 @@ mod router_tests {
 
         #[cfg(feature = "timesync")]
         #[test]
-        fn discovery_advertises_timesync_endpoint_when_enabled() {
+        fn discovery_keeps_timesync_endpoint_out_of_user_reachability_when_enabled() {
             let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_c = seen.clone();
 
@@ -9218,13 +9273,8 @@ mod router_tests {
             router.announce_discovery().unwrap();
             router.process_tx_queue().unwrap();
 
-            let pkts = seen.lock().unwrap().clone();
-            let announce = pkts
-                .iter()
-                .find(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
-                .unwrap();
-            let eps = crate::discovery::decode_discovery_announce(announce).unwrap();
-            assert!(eps.contains(&DataEndpoint::TimeSync));
+            let topo = router.export_topology();
+            assert!(!topo.advertised_endpoints.contains(&DataEndpoint::TimeSync));
         }
 
         #[cfg(all(feature = "timesync", feature = "discovery"))]
@@ -9249,8 +9299,12 @@ mod router_tests {
             });
 
             let discovery_pkt =
-                build_discovery_announce("REMOTE_A", 0, &[DataEndpoint::TimeSync]).unwrap();
+                crate::discovery::build_discovery_timesync_sources("REMOTE_A", 0, &["REMOTE_A"])
+                    .unwrap();
             router.rx_from_side(&discovery_pkt, side_a).unwrap();
+            let announce =
+                crate::timesync::build_timesync_announce_with_sender("REMOTE_A", 1, 1_000).unwrap();
+            router.rx_from_side(&announce, side_a).unwrap();
             seen_a.lock().unwrap().clear();
             seen_b.lock().unwrap().clear();
 
@@ -9436,6 +9490,160 @@ mod router_tests {
             assert_eq!(seen.len(), 1);
             assert_eq!(seen[0].data_type(), ty);
             assert_eq!(seen[0].data_as_f32().unwrap(), vec![1.0, 2.0, 3.0]);
+        }
+
+        #[test]
+        fn network_variable_getter_requests_missing_value_and_uses_cache() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+
+            let source = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_sender("NV_SOURCE"),
+                zero_clock(),
+            ));
+            let value = Packet::from_f32_slice(ty, &[9.0_f32, 8.0, 7.0], &[ep], 1).unwrap();
+            source.seed_managed_variable(value).unwrap();
+
+            let client = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_sender("NV_CLIENT"),
+                zero_clock(),
+            ));
+
+            let client_for_source = client.clone();
+            source.add_side_packet("to-client", move |pkt: &Packet| {
+                client_for_source.rx_from_side(pkt, 0)
+            });
+            let source_for_client = source.clone();
+            client.add_side_packet("to-source", move |pkt: &Packet| {
+                source_for_client.rx_from_side(pkt, 0)
+            });
+
+            assert!(client.get_network_variable(ty, None).unwrap().is_none());
+            source.process_all_queues().unwrap();
+            client.process_all_queues().unwrap();
+
+            let cached = client.get_network_variable(ty, None).unwrap().unwrap();
+            assert_eq!(cached.data_as_f32().unwrap(), vec![9.0, 8.0, 7.0]);
+        }
+
+        #[test]
+        fn network_variable_update_callback_runs_on_inbound_cache_change() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+
+            let source = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_sender("NV_SOURCE_CB"),
+                zero_clock(),
+            ));
+            let value = Packet::from_f32_slice(ty, &[4.0_f32, 5.0, 6.0], &[ep], 1).unwrap();
+            source.seed_managed_variable(value).unwrap();
+
+            let client = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_sender("NV_CLIENT_CB"),
+                zero_clock(),
+            ));
+            let callback_values = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+            let callback_values_c = callback_values.clone();
+            client
+                .on_network_variable_update(ty, move |pkt| {
+                    callback_values_c.lock().unwrap().push(pkt.data_as_f32()?);
+                    Ok(())
+                })
+                .unwrap();
+
+            let client_for_source = client.clone();
+            source.add_side_packet("to-client", move |pkt: &Packet| {
+                client_for_source.rx_from_side(pkt, 0)
+            });
+            let source_for_client = source.clone();
+            client.add_side_packet("to-source", move |pkt: &Packet| {
+                source_for_client.rx_from_side(pkt, 0)
+            });
+
+            assert!(client.get_network_variable(ty, None).unwrap().is_none());
+            source.process_all_queues().unwrap();
+            client.process_all_queues().unwrap();
+
+            assert_eq!(
+                *callback_values.lock().unwrap(),
+                vec![vec![4.0_f32, 5.0, 6.0]]
+            );
+            client.process_all_queues().unwrap();
+            assert_eq!(callback_values.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn network_variable_setter_caches_and_respects_permissions() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))]),
+                zero_clock(),
+            );
+            let pkt = Packet::from_f32_slice(ty, &[1.0_f32, 2.0, 3.0], &[ep], 1).unwrap();
+
+            router.set_network_variable(pkt.clone()).unwrap();
+            assert_eq!(
+                router
+                    .get_cached_network_variable(ty)
+                    .unwrap()
+                    .unwrap()
+                    .data_as_f32()
+                    .unwrap(),
+                vec![1.0, 2.0, 3.0]
+            );
+
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+            assert_eq!(
+                router.set_network_variable(pkt),
+                Err(TelemetryError::PermissionDenied)
+            );
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::WRITE_ONLY)
+                .unwrap();
+            assert_eq!(
+                router.get_cached_network_variable(ty),
+                Err(TelemetryError::PermissionDenied)
+            );
+        }
+
+        #[test]
+        fn router_and_relay_memory_layout_exports_queue_breakdown() {
+            crate::tests::ensure_common_test_schema();
+            let ep = DataEndpoint::named("RADIO");
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))]),
+                zero_clock(),
+            );
+            let router_json: serde_json::Value =
+                serde_json::from_str(&router.export_memory_layout_json()).unwrap();
+            assert_eq!(router_json["kind"], "router");
+            assert!(
+                router_json["shared_queue_bytes_allocated"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert!(router_json["rx_queue_bytes_used"].is_u64());
+            assert!(router_json["tx_queue_bytes_allocated"].as_u64().unwrap() > 0);
+            assert!(router_json["network_variable_cache_bytes_used"].is_u64());
+
+            let relay = Relay::new(zero_clock());
+            let relay_json: serde_json::Value =
+                serde_json::from_str(&relay.export_memory_layout_json()).unwrap();
+            assert_eq!(relay_json["kind"], "relay");
+            assert!(relay_json["shared_queue_bytes_allocated"].as_u64().unwrap() > 0);
+            assert!(relay_json["rx_queue_bytes_used"].is_u64());
+            assert!(relay_json["replay_queue_bytes_allocated"].as_u64().unwrap() > 0);
         }
 
         #[test]

@@ -76,11 +76,14 @@ Python exposes the same runtime registry as Rust and C:
 The `DataType` and `DataEndpoint` enums only contain built-in control IDs. Application schema IDs
 should be looked up by string name after registration or JSON seeding.
 
-## Managed Variables and E2E Policy
+## Network Variables and E2E Policy
 
-Managed variables cache the latest value packet for a data type. After a process restart, call
-`request_managed_variable(...)` so a peer replays the latest cached value through the normal
-endpoint handler path.
+Network variables cache the latest value packet for a data type. User code uses a setter and getter;
+the getter returns the cached value and internally requests a refresh when the value has never been
+seen or is stale. No separate endpoint registration is needed for the network-variable machinery.
+Caches are tiered: any router that has enabled or seen the variable can answer the refresh from its
+local cache, so reconnecting boards can resync from a nearby node instead of always reaching the
+original producer/master.
 
 ```python
 import sedsnet as seds
@@ -102,10 +105,17 @@ seds.register_data_type(
 )
 
 router = seds.Router(e2e_mode=1, e2e_key_id=7)  # RequiredOnly
-router.enable_managed_variable(FLIGHT_STATE)
-router.request_managed_variable(FLIGHT_STATE)
+router.enable_network_variable(FLIGHT_STATE, True, True)
+router.on_network_variable_update(FLIGHT_STATE, on_flight_state_update)
+router.set_network_variable(packet)
+cached = router.get_network_variable(FLIGHT_STATE, 1000)
 router.process_all_queues()
 ```
+
+If the router lacks read or write permission, getters/setters raise the normal SEDSnet Python
+exception for `PermissionDenied`. Peers answer denied refreshes with a telemetry error packet. The
+update callback runs only for inbound updates and refresh replies that change the local cache; local
+setters/seeds update the cache without firing that callback.
 
 E2E policy values are `0=PreferOff`, `1=PreferOn`, and `2=RequireOn`. Router E2E modes are
 `0=Disabled`, `1=RequiredOnly`, `2=Preferred`, and `3=ForceAll`. The constructor default
@@ -155,11 +165,23 @@ With `discovery` enabled:
 - it returns a Python `dict`
 - the top-level `routers` key lists each discovered router, the endpoint names/source IDs it owns,
   and its connected router sender IDs
+- the top-level `links` key lists deduplicated board-to-board graph edges as `{source, target}`
 - graph-facing endpoint fields such as `reachable_endpoints` and `advertised_endpoints` contain
   schema-advertised names; companion fields such as `reachable_endpoint_ids` and
   `advertised_endpoint_ids` preserve the numeric IDs
+- SEDSnet-owned control endpoints (`SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, `SEDSNET_ERROR`) are
+  not included in user endpoint reachability fields
 - each route entry also includes `announcers` so you can see which upstream router advertised each
   piece of topology
+
+`Router.client_stats("BOARD_ID")` and `Relay.client_stats("BOARD_ID")` return a dictionary for one
+discovered client or `None` if that sender is unknown. The dictionary includes connected state,
+side IDs/names, last-seen/age timing, named reachable endpoints, reachable time-sync sources, and
+packet/byte counters aggregated from the side(s) currently reaching that client.
+
+Call `announce_leave()` before a planned shutdown or disconnect so peers receive
+`SEDSNET_DISCOVERY_LEAVE` and remove that sender from topology immediately instead of waiting for
+the discovery TTL.
 
 Reliable delivery is enabled on a per-side basis with `reliable_enabled=True` for serialized
 sides. Packets already in flight also carry a compact internal wire contract so topology or
@@ -197,13 +219,18 @@ memory all count against it.
 Recent packet ID caches preallocate their final storage and reserve that byte cost immediately.
 Discovery topology eviction emits a warning in `std` builds.
 
+Use `export_memory_layout_json()` on a router or relay to profile queue pressure. The JSON includes
+shared allocated/used bytes plus per-area queue, reliable-buffer, schema, discovery, and
+network-variable-cache breakdowns.
+
 ## Time sync
 
-When built with `timesync`, `Router` keeps an internal network clock and handles `TIME_SYNC`
+When built with `timesync`, `Router` keeps an internal network clock and handles `SEDSNET_TIME_SYNC`
 traffic internally.
 
 Construct `Router(..., timesync_enabled=False)` if the extension was built with `timesync` but you
-do not want time sync for a particular instance. `TIME_SYNC` and `DISCOVERY` remain reserved
-internal endpoints; do not register handlers for them or try to emit those packets manually.
+do not want time sync for a particular instance. `SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, and
+`SEDSNET_ERROR` remain reserved internal endpoints; do not register handlers for them or try to emit
+those packets manually.
 
 See [Time-Sync](Time-Sync) for protocol details.

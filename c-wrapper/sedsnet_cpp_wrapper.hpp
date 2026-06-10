@@ -137,6 +137,19 @@ inline SedsResult enable_managed_variable(SedsRouter * r, SedsTypeRef ty)
     return seds_router_enable_managed_variable(r, ty.id);
 }
 
+inline SedsResult enable_network_variable(SedsRouter * r, SedsTypeRef ty, bool can_read, bool can_write)
+{
+    return seds_router_enable_network_variable(r, ty.id, can_read, can_write);
+}
+
+inline SedsResult on_network_variable_update(SedsRouter * r,
+                                             SedsTypeRef ty,
+                                             SedsEndpointHandlerFn cb,
+                                             void * user)
+{
+    return seds_router_on_network_variable_update(r, ty.id, cb, user);
+}
+
 inline void disable_managed_variable(SedsRouter * r, SedsTypeRef ty)
 {
     seds_router_disable_managed_variable(r, ty.id);
@@ -152,6 +165,11 @@ inline SedsResult seed_managed_variable_serialized(SedsRouter * r, const uint8_t
     return seds_router_seed_managed_variable_serialized(r, bytes, len);
 }
 
+inline SedsResult set_network_variable_serialized(SedsRouter * r, const uint8_t * bytes, size_t len)
+{
+    return seds_router_set_network_variable_serialized(r, bytes, len);
+}
+
 inline int32_t cached_managed_variable_serialized_len(SedsRouter * r, SedsTypeRef ty)
 {
     return seds_router_cached_managed_variable_serialized_len(r, ty.id);
@@ -160,6 +178,70 @@ inline int32_t cached_managed_variable_serialized_len(SedsRouter * r, SedsTypeRe
 inline int32_t cached_managed_variable_serialized(SedsRouter * r, SedsTypeRef ty, uint8_t * out, size_t out_len)
 {
     return seds_router_cached_managed_variable_serialized(r, ty.id, out, out_len);
+}
+
+inline int32_t get_network_variable_serialized_len(SedsRouter * r, SedsTypeRef ty, uint32_t stale_after_ms)
+{
+    return seds_router_get_network_variable_serialized_len(r, ty.id, stale_after_ms);
+}
+
+inline int32_t get_network_variable_serialized(SedsRouter * r,
+                                               SedsTypeRef ty,
+                                               uint32_t stale_after_ms,
+                                               uint8_t * out,
+                                               size_t out_len)
+{
+    return seds_router_get_network_variable_serialized(r, ty.id, stale_after_ms, out, out_len);
+}
+
+inline int32_t router_memory_layout_len(SedsRouter * r)
+{
+    return seds_router_export_memory_layout_len(r);
+}
+
+inline SedsResult router_memory_layout(SedsRouter * r, char * out, size_t out_len)
+{
+    return seds_router_export_memory_layout(r, out, out_len);
+}
+
+inline int32_t relay_memory_layout_len(SedsRelay * r)
+{
+    return seds_relay_export_memory_layout_len(r);
+}
+
+inline SedsResult relay_memory_layout(SedsRelay * r, char * out, size_t out_len)
+{
+    return seds_relay_export_memory_layout(r, out, out_len);
+}
+
+inline int32_t router_client_stats_len(SedsRouter * r, SedsName sender)
+{
+    return seds_router_export_client_stats_len(r, sender.ptr, sender.len);
+}
+
+inline SedsResult router_client_stats(SedsRouter * r, SedsName sender, char * out, size_t out_len)
+{
+    return seds_router_export_client_stats(r, sender.ptr, sender.len, out, out_len);
+}
+
+inline int32_t relay_client_stats_len(SedsRelay * r, SedsName sender)
+{
+    return seds_relay_export_client_stats_len(r, sender.ptr, sender.len);
+}
+
+inline SedsResult relay_client_stats(SedsRelay * r, SedsName sender, char * out, size_t out_len)
+{
+    return seds_relay_export_client_stats(r, sender.ptr, sender.len, out, out_len);
+}
+
+inline SedsResult router_announce_leave(SedsRouter * r)
+{
+    return seds_router_announce_leave(r);
+}
+
+inline SedsResult relay_announce_leave(SedsRelay * r)
+{
+    return seds_relay_announce_leave(r);
 }
 
 template<typename T>

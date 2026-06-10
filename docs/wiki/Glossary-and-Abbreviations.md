@@ -46,8 +46,11 @@ API docs.
 
 - **Discovery**: The internal control plane that advertises reachable endpoints, time sources,
   schema, and topology so routers and relays can route selectively.
-- **Managed variable**: A data type whose latest packet is cached by the network. A restarted board
-  can request the current value and receive it through the normal endpoint handler path.
+- **Network variable**: A data type whose latest packet is cached by routers/relays with local
+  read/write permissions. Getters read the local cache and request refresh when missing or stale;
+  setters publish a new value for the network.
+- **Managed variable**: Legacy wording for a network variable or latest-value cache. Current user
+  docs prefer **network variable**.
 - **Schema**: Runtime definitions for endpoints and data types. In v4, user schema is registered,
   seeded from JSON, or learned through discovery instead of generated at compile time.
 - **Topology**: The discovered graph of boards, sides, reachable endpoints, time sources, and

@@ -19,8 +19,8 @@ use crate::diagnostics::{
 };
 #[cfg(feature = "discovery")]
 use crate::discovery::{
-    self, DISCOVERY_ROUTE_TTL_MS, DiscoveryCadenceState, TopologyAnnouncerRoute, TopologyBoardNode,
-    TopologySideRoute, TopologySnapshot,
+    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DiscoveryCadenceState,
+    TopologyAnnouncerRoute, TopologyBoardNode, TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::hash_bytes_u64;
 use crate::queue::{BoundedDeque, ByteCost};
@@ -1010,7 +1010,9 @@ struct RouterInner {
     side_runtime_stats: BTreeMap<RouterSideId, SideRuntimeStatsInner>,
     side_transport: BTreeMap<RouterSideId, SideTransportState>,
     managed_variable_types: BTreeSet<u32>,
-    managed_variable_latest: BTreeMap<u32, Packet>,
+    managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
+    managed_variable_latest: BTreeMap<u32, ManagedVariableCacheEntry>,
+    network_variable_update_handlers: BTreeMap<u32, Vec<NetworkVariableUpdateHandler>>,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     recent_rx: BoundedDeque<u64>,
@@ -1026,6 +1028,51 @@ struct RouterInner {
     discovery_routes: BTreeMap<RouterSideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedVariableCacheEntry {
+    packet: Packet,
+    cached_at_ms: u64,
+}
+
+type NetworkVariableUpdateFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct NetworkVariableUpdateHandler {
+    handler: Arc<NetworkVariableUpdateFn>,
+}
+
+impl Debug for NetworkVariableUpdateHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("NetworkVariableUpdateHandler(<handler>)")
+    }
+}
+
+/// Local permission policy for a network-managed variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkVariablePermissions {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl NetworkVariablePermissions {
+    pub const NONE: Self = Self {
+        read: false,
+        write: false,
+    };
+    pub const READ_ONLY: Self = Self {
+        read: true,
+        write: false,
+    };
+    pub const WRITE_ONLY: Self = Self {
+        read: false,
+        write: true,
+    };
+    pub const READ_WRITE: Self = Self {
+        read: true,
+        write: true,
+    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1643,25 +1690,85 @@ impl Router {
         entry.note_local_handler_failure(ty, retries);
     }
 
-    fn remember_managed_variable_packet(&self, pkt: &Packet) {
-        let mut st = self.state.lock();
-        if st
-            .managed_variable_types
-            .contains(&pkt.data_type().as_u32())
-        {
-            st.managed_variable_latest
-                .insert(pkt.data_type().as_u32(), pkt.clone());
+    fn cache_managed_variable_packet(
+        &self,
+        pkt: &Packet,
+        notify_handlers: bool,
+    ) -> TelemetryResult<()> {
+        let handlers = {
+            let mut st = self.state.lock();
+            if !st
+                .managed_variable_types
+                .contains(&pkt.data_type().as_u32())
+            {
+                return Ok(());
+            }
+            let changed = st
+                .managed_variable_latest
+                .get(&pkt.data_type().as_u32())
+                .is_none_or(|entry| entry.packet != *pkt);
+            st.managed_variable_latest.insert(
+                pkt.data_type().as_u32(),
+                ManagedVariableCacheEntry {
+                    packet: pkt.clone(),
+                    cached_at_ms: self.clock.now_ms(),
+                },
+            );
+            if notify_handlers && changed {
+                st.network_variable_update_handlers
+                    .get(&pkt.data_type().as_u32())
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+        for handler in handlers {
+            (handler.handler)(pkt)?;
         }
+        Ok(())
+    }
+
+    fn remember_managed_variable_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
+        self.cache_managed_variable_packet(pkt, true)
     }
 
     fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
         let st = self.state.lock();
-        st.managed_variable_latest.get(&ty.as_u32()).cloned()
+        st.managed_variable_latest
+            .get(&ty.as_u32())
+            .map(|entry| entry.packet.clone())
+    }
+
+    fn managed_variable_latest_with_age(&self, ty: DataType) -> Option<(Packet, u64)> {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        st.managed_variable_latest.get(&ty.as_u32()).map(|entry| {
+            (
+                entry.packet.clone(),
+                now_ms.saturating_sub(entry.cached_at_ms),
+            )
+        })
     }
 
     fn is_managed_variable_type(&self, ty: DataType) -> bool {
         let st = self.state.lock();
         st.managed_variable_types.contains(&ty.as_u32())
+    }
+
+    fn managed_variable_permissions_locked(
+        st: &RouterInner,
+        ty: DataType,
+    ) -> NetworkVariablePermissions {
+        st.managed_variable_permissions
+            .get(&ty.as_u32())
+            .copied()
+            .unwrap_or(NetworkVariablePermissions::READ_WRITE)
+    }
+
+    fn can_read_managed_variable(&self, ty: DataType) -> bool {
+        let st = self.state.lock();
+        Self::managed_variable_permissions_locked(&st, ty).read
     }
 
     #[inline]
@@ -3476,6 +3583,26 @@ impl Router {
         }
         if pkt.data_type() == DataType::ManagedVariableRequest {
             let ty = discovery::decode_managed_variable_request(pkt)?;
+            if !self.can_read_managed_variable(ty) {
+                let payload = make_error_payload("managed variable permission denied");
+                let err = Packet::new(
+                    DataType::TelemetryError,
+                    message_meta(DataType::TelemetryError).endpoints,
+                    self.sender_arc().as_ref(),
+                    self.clock.now_ms(),
+                    payload,
+                )?;
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side,
+                        data: RouterItem::Packet(err),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+                return Ok(true);
+            }
             if let Some(value) = self.managed_variable_latest(ty) {
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
@@ -3506,6 +3633,30 @@ impl Router {
         }
         let mut st = self.state.lock();
         let now_ms = self.clock.now_ms();
+        if pkt.data_type() == DataType::DiscoveryLeave {
+            let leaving = pkt.sender();
+            let before = st.discovery_routes.clone();
+            for route in st.discovery_routes.values_mut() {
+                route.announcers.remove(leaving);
+                for sender_state in route.announcers.values_mut() {
+                    sender_state
+                        .topology_boards
+                        .retain(|board| board.sender_id != leaving);
+                    for board in sender_state.topology_boards.iter_mut() {
+                        board.connections.retain(|peer| peer != leaving);
+                    }
+                    Self::refresh_sender_topology_state(sender_state);
+                }
+                Self::recompute_discovery_side_state(route);
+            }
+            st.discovery_routes
+                .retain(|_, route| !route.announcers.is_empty());
+            if st.discovery_routes != before {
+                Self::note_discovery_topology_change_locked(&mut st, now_ms);
+                self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+            }
+            return Ok(true);
+        }
         let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
         let side_link_local_enabled = st
             .sides
@@ -5354,7 +5505,9 @@ impl Router {
                 side_runtime_stats: BTreeMap::new(),
                 side_transport: BTreeMap::new(),
                 managed_variable_types: BTreeSet::new(),
+                managed_variable_permissions: BTreeMap::new(),
                 managed_variable_latest: BTreeMap::new(),
+                network_variable_update_handlers: BTreeMap::new(),
                 received_queue: BoundedDeque::new(
                     MAX_QUEUE_BUDGET,
                     STARTING_QUEUE_SIZE,
@@ -5808,6 +5961,14 @@ impl Router {
         self.queue_discovery_announce()
     }
 
+    /// Broadcast that this router is leaving so peers can prune topology immediately.
+    #[cfg(feature = "discovery")]
+    pub fn announce_leave(&self) -> TelemetryResult<()> {
+        let sender = self.sender_arc();
+        let pkt = discovery::build_discovery_leave(sender.as_ref(), self.clock.now_ms())?;
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
     /// Queue a discovery advertisement if the adaptive cadence says one is due.
     #[cfg(feature = "discovery")]
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
@@ -5836,18 +5997,57 @@ impl Router {
     /// replay the original value packet, so user endpoint handlers see the same API shape as a
     /// normal update.
     pub fn enable_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
+        self.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+    }
+
+    /// Mark a data type as a network variable with local read/write permissions.
+    ///
+    /// Users do not register a separate endpoint for network variables. Values are cached by
+    /// data type and refreshed through SEDSnet's internal managed-variable control packets.
+    pub fn enable_network_variable(
+        &self,
+        ty: DataType,
+        permissions: NetworkVariablePermissions,
+    ) -> TelemetryResult<()> {
         if is_internal_control_type(ty) {
             return Err(TelemetryError::InvalidType);
         }
         let mut st = self.state.lock();
         st.managed_variable_types.insert(ty.as_u32());
+        st.managed_variable_permissions
+            .insert(ty.as_u32(), permissions);
+        Ok(())
+    }
+
+    /// Register a callback that runs when an inbound network update changes this variable cache.
+    ///
+    /// The callback is invoked after the router state lock is released, so it may call back into
+    /// the router. Local `set_network_variable` and `seed_managed_variable` calls update the cache
+    /// without invoking this network-update callback.
+    pub fn on_network_variable_update<F>(&self, ty: DataType, f: F) -> TelemetryResult<()>
+    where
+        F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        let mut st = self.state.lock();
+        st.managed_variable_types.insert(ty.as_u32());
+        st.network_variable_update_handlers
+            .entry(ty.as_u32())
+            .or_default()
+            .push(NetworkVariableUpdateHandler {
+                handler: Arc::new(f),
+            });
         Ok(())
     }
 
     pub fn disable_managed_variable(&self, ty: DataType) {
         let mut st = self.state.lock();
         st.managed_variable_types.remove(&ty.as_u32());
+        st.managed_variable_permissions.remove(&ty.as_u32());
         st.managed_variable_latest.remove(&ty.as_u32());
+        st.network_variable_update_handlers.remove(&ty.as_u32());
     }
 
     pub fn seed_managed_variable(&self, pkt: Packet) -> TelemetryResult<()> {
@@ -5855,21 +6055,93 @@ impl Router {
             return Err(TelemetryError::InvalidType);
         }
         pkt.validate()?;
-        let mut st = self.state.lock();
-        st.managed_variable_types.insert(pkt.data_type().as_u32());
-        st.managed_variable_latest
-            .insert(pkt.data_type().as_u32(), pkt);
-        Ok(())
+        {
+            let mut st = self.state.lock();
+            st.managed_variable_types.insert(pkt.data_type().as_u32());
+        }
+        self.cache_managed_variable_packet(&pkt, false)
     }
 
     pub fn cached_managed_variable(&self, ty: DataType) -> Option<Packet> {
         self.managed_variable_latest(ty)
     }
 
+    /// Set a network variable for the whole network, permission policy allowing.
+    ///
+    /// The packet is cached locally and sent as normal user data. Routers that have seen or enabled
+    /// this variable update their local cache internally; applications do not need to register a
+    /// managed-variable endpoint.
+    pub fn set_network_variable(&self, pkt: Packet) -> TelemetryResult<()> {
+        if is_internal_control_type(pkt.data_type()) {
+            return Err(TelemetryError::InvalidType);
+        }
+        pkt.validate()?;
+        let ty = pkt.data_type();
+        {
+            let mut st = self.state.lock();
+            st.managed_variable_types.insert(ty.as_u32());
+            let perms = Self::managed_variable_permissions_locked(&st, ty);
+            if !perms.write {
+                return Err(TelemetryError::PermissionDenied);
+            }
+        }
+        self.cache_managed_variable_packet(&pkt, false)?;
+        self.tx(pkt)
+    }
+
+    /// Read a cached network variable, requesting a refresh if missing or stale.
+    ///
+    /// Returns the cached value when present. If the value is missing, this queues an internal
+    /// managed-variable request and returns `Ok(None)`. If the value is stale, this queues a refresh
+    /// request and returns the stale cached value so callers can continue operating while the network
+    /// catches up.
+    #[cfg(feature = "discovery")]
+    pub fn get_network_variable(
+        &self,
+        ty: DataType,
+        stale_after_ms: Option<u64>,
+    ) -> TelemetryResult<Option<Packet>> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        {
+            let mut st = self.state.lock();
+            st.managed_variable_types.insert(ty.as_u32());
+            let perms = Self::managed_variable_permissions_locked(&st, ty);
+            if !perms.read {
+                return Err(TelemetryError::PermissionDenied);
+            }
+        }
+        let cached = self.managed_variable_latest_with_age(ty);
+        let needs_refresh = match (cached.as_ref(), stale_after_ms) {
+            (None, _) => true,
+            (Some((_pkt, age_ms)), Some(max_age_ms)) => *age_ms > max_age_ms,
+            (Some(_), None) => false,
+        };
+        if needs_refresh {
+            self.request_managed_variable(ty)?;
+        }
+        Ok(cached.map(|(pkt, _age_ms)| pkt))
+    }
+
+    /// Read a cached network variable without issuing a network refresh.
+    pub fn get_cached_network_variable(&self, ty: DataType) -> TelemetryResult<Option<Packet>> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        if !self.can_read_managed_variable(ty) {
+            return Err(TelemetryError::PermissionDenied);
+        }
+        Ok(self.managed_variable_latest(ty))
+    }
+
     #[cfg(feature = "discovery")]
     pub fn request_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
         if is_internal_control_type(ty) {
             return Err(TelemetryError::InvalidType);
+        }
+        if !self.can_read_managed_variable(ty) {
+            return Err(TelemetryError::PermissionDenied);
         }
         let sender = self.sender_arc();
         let pkt =
@@ -5901,7 +6173,12 @@ impl Router {
                     .iter()
                     .map(|(sender_id, sender_state)| TopologyAnnouncerRoute {
                         sender_id: sender_id.clone(),
-                        reachable_endpoints: sender_state.reachable.clone(),
+                        reachable_endpoints: sender_state
+                            .reachable
+                            .iter()
+                            .copied()
+                            .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                            .collect(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
                         routers: sender_state.topology_boards.clone(),
                         last_seen_ms: sender_state.last_seen_ms,
@@ -5911,7 +6188,12 @@ impl Router {
                 Some(TopologySideRoute {
                     side_id,
                     side_name: side.name,
-                    reachable_endpoints: route.reachable.clone(),
+                    reachable_endpoints: route
+                        .reachable
+                        .iter()
+                        .copied()
+                        .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                        .collect(),
                     reachable_timesync_sources: route.reachable_timesync_sources.clone(),
                     announcers,
                     last_seen_ms: route.last_seen_ms,
@@ -5924,14 +6206,84 @@ impl Router {
             self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true);
         let advertised_timesync_sources =
             self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+        let links = discovery::topology_links_from_boards(&routers);
         TopologySnapshot {
             advertised_endpoints,
             advertised_timesync_sources,
             routers,
+            links,
             routes,
             current_announce_interval_ms: st.discovery_cadence.current_interval_ms,
             next_announce_ms: st.discovery_cadence.next_announce_ms,
         }
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn client_stats(&self, sender_id: &str) -> Option<ClientStatsSnapshot> {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        let mut side_ids = Vec::new();
+        let mut side_names = Vec::new();
+        let mut last_seen_ms = None::<u64>;
+        let mut reachable_endpoints = Vec::new();
+        let mut reachable_timesync_sources = Vec::new();
+        let mut packets_sent = 0u64;
+        let mut packets_received = 0u64;
+        let mut bytes_sent = 0u64;
+        let mut bytes_received = 0u64;
+
+        for (side_id, route) in &st.discovery_routes {
+            let Some(sender_state) = route.announcers.get(sender_id) else {
+                continue;
+            };
+            side_ids.push(*side_id);
+            if let Some(side_name) = st
+                .sides
+                .get(*side_id)
+                .and_then(|side| side.as_ref())
+                .map(|side| side.name)
+            {
+                side_names.push(side_name);
+            }
+            last_seen_ms = Some(last_seen_ms.unwrap_or(0).max(sender_state.last_seen_ms));
+            reachable_endpoints.extend(sender_state.reachable.iter().copied());
+            reachable_timesync_sources
+                .extend(sender_state.reachable_timesync_sources.iter().cloned());
+            if let Some(stats) = st.side_runtime_stats.get(side_id) {
+                packets_sent = packets_sent.saturating_add(stats.tx_packets);
+                packets_received = packets_received.saturating_add(stats.rx_packets);
+                bytes_sent = bytes_sent.saturating_add(stats.tx_bytes);
+                bytes_received = bytes_received.saturating_add(stats.rx_bytes);
+            }
+        }
+
+        if side_ids.is_empty() {
+            return None;
+        }
+        reachable_endpoints.retain(|ep| !discovery::is_router_control_endpoint(*ep));
+        reachable_endpoints.sort_unstable();
+        reachable_endpoints.dedup();
+        reachable_timesync_sources.sort_unstable();
+        reachable_timesync_sources.dedup();
+        side_ids.sort_unstable();
+        side_ids.dedup();
+        side_names.sort_unstable();
+        side_names.dedup();
+        let age_ms = last_seen_ms.map(|seen| now_ms.saturating_sub(seen));
+        Some(ClientStatsSnapshot {
+            sender_id: sender_id.to_string(),
+            connected: age_ms.is_some_and(|age| age <= DISCOVERY_ROUTE_TTL_MS),
+            side_ids,
+            side_names,
+            last_seen_ms,
+            age_ms,
+            reachable_endpoints,
+            reachable_timesync_sources,
+            packets_sent,
+            packets_received,
+            bytes_sent,
+            bytes_received,
+        })
     }
 
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
@@ -6126,6 +6478,63 @@ impl Router {
             total_handler_failures: st.total_handler_failures,
             total_handler_retries: st.total_handler_retries,
         }
+    }
+
+    /// Export current router memory usage/layout as JSON for profiling.
+    pub fn export_memory_layout_json(&self) -> String {
+        let isr_rx = self.isr_rx_queue.snapshot().unwrap_or((0, 0));
+        let st = self.state.lock();
+        #[cfg(feature = "discovery")]
+        let discovery_bytes = st.discovery_bytes_used();
+        #[cfg(not(feature = "discovery"))]
+        let discovery_bytes = 0usize;
+        let schema_bytes = crate::config::schema_bytes_used();
+        let network_variable_cache_bytes = st
+            .managed_variable_latest
+            .values()
+            .map(|entry| entry.packet.byte_cost())
+            .sum::<usize>();
+        let mut out = String::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"kind\":\"router\",\
+                 \"shared_queue_bytes_used\":{},\"shared_queue_bytes_allocated\":{},\
+                 \"rx_queue_bytes_used\":{},\"rx_queue_bytes_allocated\":{},\"rx_queue_len\":{},\
+                 \"isr_rx_queue_bytes_used\":{},\"isr_rx_queue_bytes_allocated\":{},\"isr_rx_queue_len\":{},\
+                 \"tx_queue_bytes_used\":{},\"tx_queue_bytes_allocated\":{},\"tx_queue_len\":{},\
+                 \"recent_rx_bytes_used\":{},\"recent_rx_bytes_allocated\":{},\"recent_rx_len\":{},\
+                 \"reliable_rx_buffer_bytes_used\":{},\"reliable_rx_buffer_bytes_allocated\":{},\"reliable_rx_buffer_len\":{},\
+                 \"discovery_bytes_used\":{},\"discovery_bytes_allocated\":{},\
+                 \"schema_bytes_used\":{},\"schema_bytes_allocated\":{},\
+                 \"network_variable_cache_bytes_used\":{},\"network_variable_cache_bytes_allocated\":{},\"network_variable_cache_len\":{}}}",
+                st.shared_queue_bytes_used(),
+                MAX_QUEUE_BUDGET,
+                st.received_queue.bytes_used(),
+                st.received_queue.max_bytes(),
+                st.received_queue.len(),
+                isr_rx.1,
+                MAX_QUEUE_BUDGET,
+                isr_rx.0,
+                st.transmit_queue.bytes_used(),
+                st.transmit_queue.max_bytes(),
+                st.transmit_queue.len(),
+                st.recent_rx.bytes_used(),
+                st.recent_rx.max_bytes(),
+                st.recent_rx.len(),
+                st.reliable_rx_buffered_bytes(),
+                MAX_QUEUE_BUDGET,
+                st.reliable_rx_buffer_len(),
+                discovery_bytes,
+                MAX_QUEUE_BUDGET,
+                schema_bytes,
+                MAX_QUEUE_BUDGET,
+                network_variable_cache_bytes,
+                MAX_QUEUE_BUDGET,
+                st.managed_variable_latest.len(),
+            ),
+        );
+        out
     }
 
     #[cfg(test)]
@@ -6953,7 +7362,7 @@ impl Router {
         match &item.data {
             RouterItem::Packet(pkt) => {
                 if !is_internal_control_type(pkt.data_type()) {
-                    self.remember_managed_variable_packet(pkt);
+                    self.remember_managed_variable_packet(pkt)?;
                 }
             }
             RouterItem::Serialized(bytes) => {
@@ -6963,7 +7372,7 @@ impl Router {
                 {
                     let pkt = serialize::deserialize_packet(bytes.as_ref())?;
                     pkt.validate()?;
-                    self.remember_managed_variable_packet(&pkt);
+                    self.remember_managed_variable_packet(&pkt)?;
                 }
             }
         }
@@ -7585,7 +7994,7 @@ impl Router {
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
-                    self.remember_managed_variable_packet(pkt);
+                    self.remember_managed_variable_packet(pkt)?;
                 }
                 #[cfg(feature = "discovery")]
                 let is_discovery = matches!(&data, RouterItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()))
@@ -7700,7 +8109,7 @@ impl Router {
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
-                    self.remember_managed_variable_packet(pkt);
+                    self.remember_managed_variable_packet(pkt)?;
                 }
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {

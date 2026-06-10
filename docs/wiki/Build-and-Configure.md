@@ -71,8 +71,8 @@ Compression notes:
 - For cross-target embedded builds, enabling `compression` requires a usable target C toolchain
   (for `zstd-sys`, e.g. `arm-none-eabi-gcc` or `CC_<target>` override).
 
-When `timesync` is enabled, the build adds the `TIME_SYNC` endpoint and
-`TIME_SYNC_*` packet types directly in code (like `TelemetryError`), plus the router-managed
+When `timesync` is enabled, the build adds the `SEDSNET_TIME_SYNC` endpoint and
+`SEDSNET_TIME_SYNC_*` packet types directly in code (like `SEDSNET_ERROR`), plus the router-managed
 internal network clock and FFI accessors for current network time. See [Time-Sync](Time-Sync)
 for roles, packet fields, internal clock behavior, and master-side setter APIs.
 

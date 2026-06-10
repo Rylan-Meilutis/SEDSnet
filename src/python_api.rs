@@ -52,8 +52,8 @@ use crate::{
     packet::Packet,
     relay::{Relay, RelaySideOptions},
     router::{
-        Clock, EndpointHandler, LeBytes, Router, RouterConfig, RouterE2eEncryptionMode,
-        RouterSideOptions,
+        Clock, EndpointHandler, LeBytes, NetworkVariablePermissions, Router, RouterConfig,
+        RouterE2eEncryptionMode, RouterSideOptions,
     },
     serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
     try_enum_from_i32, try_enum_from_u32,
@@ -387,6 +387,15 @@ fn topology_snapshot_to_pydict(
     }
     out.set_item("routers", routers)?;
 
+    let links = PyList::empty(py);
+    for link in snap.links {
+        let item = PyDict::new(py);
+        item.set_item("source", link.source)?;
+        item.set_item("target", link.target)?;
+        links.append(item)?;
+    }
+    out.set_item("links", links)?;
+
     let routes = PyList::empty(py);
     for route in snap.routes {
         let route_dict = PyDict::new(py);
@@ -455,6 +464,54 @@ fn topology_snapshot_to_pydict(
         snap.current_announce_interval_ms,
     )?;
     out.set_item("next_announce_ms", snap.next_announce_ms)?;
+    Ok(out.unbind())
+}
+
+#[cfg(feature = "discovery")]
+fn client_stats_snapshot_to_pydict(
+    py: Python<'_>,
+    stats: crate::discovery::ClientStatsSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let endpoint_name_map = known_endpoints()
+        .into_iter()
+        .map(|def| (def.id, def.name))
+        .collect::<BTreeMap<_, _>>();
+    let out = PyDict::new(py);
+    out.set_item("sender_id", stats.sender_id)?;
+    out.set_item("connected", stats.connected)?;
+    out.set_item("side_ids", stats.side_ids)?;
+    out.set_item("side_names", stats.side_names)?;
+    out.set_item("last_seen_ms", stats.last_seen_ms)?;
+    out.set_item("age_ms", stats.age_ms)?;
+    out.set_item(
+        "reachable_endpoints",
+        stats
+            .reachable_endpoints
+            .iter()
+            .map(|ep| {
+                endpoint_name_map
+                    .get(ep)
+                    .map(|name| (*name).to_string())
+                    .unwrap_or_else(|| format!("endpoint_{}", ep.as_u32()))
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "reachable_endpoint_ids",
+        stats
+            .reachable_endpoints
+            .iter()
+            .map(|ep| ep.as_u32())
+            .collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "reachable_timesync_sources",
+        stats.reachable_timesync_sources,
+    )?;
+    out.set_item("packets_sent", stats.packets_sent)?;
+    out.set_item("packets_received", stats.packets_received)?;
+    out.set_item("bytes_sent", stats.bytes_sent)?;
+    out.set_item("bytes_received", stats.bytes_received)?;
     Ok(out.unbind())
 }
 
@@ -788,6 +845,7 @@ pub struct PyRouter {
     _pkt_cbs: Vec<Py<PyAny>>,
     _ser_cbs: Vec<Py<PyAny>>,
     _side_cbs: Vec<Option<Py<PyAny>>>,
+    _netvar_cbs: Vec<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -824,6 +882,7 @@ impl PyRouter {
                 _pkt_cbs: Vec::new(),
                 _ser_cbs: Vec::new(),
                 _side_cbs: Vec::new(),
+                _netvar_cbs: Vec::new(),
             });
         }
 
@@ -844,6 +903,7 @@ impl PyRouter {
             _pkt_cbs: keep_pkt,
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
+            _netvar_cbs: Vec::new(),
         })
     }
 
@@ -869,6 +929,7 @@ impl PyRouter {
             _pkt_cbs: keep_pkt,
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
+            _netvar_cbs: Vec::new(),
         })
     }
 
@@ -1464,6 +1525,15 @@ impl PyRouter {
     }
 
     #[cfg(feature = "discovery")]
+    fn announce_leave(&self) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.announce_leave().map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
         let rtr = self
             .inner
@@ -1482,12 +1552,124 @@ impl PyRouter {
     }
 
     #[cfg(feature = "discovery")]
+    fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.client_stats(sender_id)
+            .map(|stats| client_stats_snapshot_to_pydict(py, stats))
+            .transpose()
+    }
+
+    #[cfg(feature = "discovery")]
     fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let rtr = self
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
         runtime_stats_snapshot_to_pydict(py, rtr.export_runtime_stats())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn enable_network_variable(&self, ty: u32, can_read: bool, can_write: bool) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.enable_network_variable(
+            DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+            NetworkVariablePermissions {
+                read: can_read,
+                write: can_write,
+            },
+        )
+        .map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn on_network_variable_update(
+        &mut self,
+        py: Python<'_>,
+        ty: u32,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        let cb_keep = callback.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.on_network_variable_update(
+            DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+            move |pkt: &Packet| {
+                Python::attach(|py| {
+                    let arg = Py::new(py, PyPacket { inner: pkt.clone() })
+                        .map_err(|_| TelemetryError::Io("network variable update callback"))?;
+                    match cb_for_closure.call1(py, (arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("network variable update callback"))
+                        }
+                    }
+                })
+            },
+        )
+        .map_err(py_err_from)?;
+        self._netvar_cbs.push(cb_keep);
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn set_network_variable(&self, pkt: &PyPacket) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.set_network_variable(pkt.inner.clone())
+            .map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn get_network_variable(
+        &self,
+        ty: u32,
+        stale_after_ms: Option<u64>,
+    ) -> PyResult<Option<PyPacket>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr
+            .get_network_variable(
+                DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+                stale_after_ms,
+            )
+            .map_err(py_err_from)?
+            .map(|inner| PyPacket { inner }))
+    }
+
+    #[cfg(feature = "discovery")]
+    fn cached_network_variable(&self, ty: u32) -> PyResult<Option<PyPacket>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr
+            .get_cached_network_variable(
+                DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+            )
+            .map_err(py_err_from)?
+            .map(|inner| PyPacket { inner }))
+    }
+
+    fn export_memory_layout_json(&self) -> PyResult<String> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr.export_memory_layout_json())
     }
 
     #[cfg(feature = "timesync")]
@@ -2126,6 +2308,11 @@ impl PyRelay {
     }
 
     #[cfg(feature = "discovery")]
+    fn announce_leave(&self) -> PyResult<()> {
+        self.inner.announce_leave().map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
         self.inner.poll_discovery().map_err(py_err_from)
     }
@@ -2136,8 +2323,20 @@ impl PyRelay {
     }
 
     #[cfg(feature = "discovery")]
+    fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
+        self.inner
+            .client_stats(sender_id)
+            .map(|stats| client_stats_snapshot_to_pydict(py, stats))
+            .transpose()
+    }
+
+    #[cfg(feature = "discovery")]
     fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         runtime_stats_snapshot_to_pydict(py, self.inner.export_runtime_stats())
+    }
+
+    fn export_memory_layout_json(&self) -> String {
+        self.inner.export_memory_layout_json()
     }
 }
 

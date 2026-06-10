@@ -58,9 +58,9 @@ SEDSnet also supports python bindings via pyo3. to use you need maturin installe
 With the optional `discovery` feature, routers and relays can exchange built-in discovery packets, learn which
 endpoints are reachable through which sides, adapt the announce rate as the topology changes, and export a live topology
 snapshot for inspection. When `timesync` is also enabled, discovery can advertise concrete time source sender IDs so
-`TIME_SYNC` requests prefer exact source paths instead of generic endpoint flooding. Once discovery topology exists,
+`SEDSNET_TIME_SYNC` requests prefer exact source paths instead of generic endpoint flooding. Once discovery topology exists,
 unknown user-data routes are not blindly flooded across low-bandwidth links; discovery/control traffic still propagates,
-and explicit route policy can intentionally select a side. `DISCOVERY` and `TIME_SYNC` are reserved internal router
+and explicit route policy can intentionally select a side. `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` are reserved internal router
 endpoints: applications can use the discovery and time-sync APIs, but must not register local endpoint handlers for
 those endpoints or try to override their built-in handling.
 
@@ -86,10 +86,11 @@ decode contract. New packets immediately use the latest endpoint bitmap/schema v
 route only to their original intended holders and remain decodable against the shape they were serialized with. The
 contract is encoded compactly with bitmap-oriented metadata and sender hashes so header growth stays small.
 
-The size of the header in a serialized packet is around 20 bytes (the size will change based on the total number of
-endpoints in your system and the length of the sender string), plus a 4-byte CRC32 trailer. As a rough example, a packet
-containing three floats is on the order of mid-30s bytes total. This small size makes it ideal for use in low bandwidth
-environments.
+Serialized packets use compact varint fields, endpoint bitmaps, sender IDs/hashes, and optional per-side header
+templates, so the header is no longer best described as a fixed ~20-byte cost. The first packet for a route may carry
+the full sender/schema context, while later packets on small-packet transports can replace repeated header fields with a
+compact template ID. That keeps the header-to-payload ratio reasonable for small payloads such as three floats or a few
+`u8` values, which matters on low-bandwidth links.
 
 ---
 
@@ -105,7 +106,7 @@ environments.
   `DataType::named("GPS_DATA")` instead of raw numeric IDs.
 - C and Python expose matching schema register/info/info-by-name/remove APIs.
 - Managed network variables let restarted boards request the latest cached state through normal
-  endpoint handlers.
+  endpoint handlers, and update callbacks can run when an inbound network update changes the cache.
 - End-to-end payload cryptography is enabled by default and can be preferred or required per data type;
   routers choose whether to encrypt required, preferred, or all user data.
 - Crypto providers can be supplied as C callbacks, Rust providers, or registered software fallback
@@ -115,6 +116,11 @@ environments.
   radios, while link-probe samples seed adaptive routing for asymmetric or time-sliced links.
 - Discovery-aware forwarding avoids blind unknown-route user-data flooding once topology exists,
   protecting low-bandwidth sides unless explicit route policy selects them.
+- Routers and relays export topology as a board graph with named endpoint fields, side names,
+  deduplicated `links`, and filtered SEDSnet control endpoints. They also expose memory-layout and
+  per-client stats snapshots for profiling and diagnostics.
+- Routers and relays announce `SEDSNET_DISCOVERY_LEAVE` during explicit leave/shutdown so peers can
+  prune topology immediately instead of waiting for expiry.
 - Optional JSON config is applied at runtime through env/path/bytes APIs. The repo does not carry a
   default user schema. Embedded users that want compiled-in seed bytes must provide their own local
   `telemetry_config.json` before building.
@@ -140,7 +146,7 @@ environments.
 
 ## Version 3.11.1 highlights
 
-- Discovery now propagates a full router graph with `DISCOVERY_TOPOLOGY`, so routers and relays
+- Discovery now propagates a full router graph with `SEDSNET_DISCOVERY_TOPOLOGY`, so routers and relays
   keep track of which sender IDs own which endpoints and how remote routers connect to each other.
 - `export_topology()` now includes router-level topology plus per-side announcer detail instead of
   only aggregated reachable endpoint lists.
@@ -180,7 +186,7 @@ environments.
 
 ## Version 3.9.1 highlights
 
-- Reserved the built-in `DISCOVERY` and `TIME_SYNC` endpoints for router-owned control traffic.
+- Reserved the built-in `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` endpoints for router-owned control traffic.
 - User handlers can no longer shadow internal discovery or time-sync behavior through Rust or C
   configuration APIs.
 - Queue timeout handling was tightened so TX/RX work shares nonzero budgets more predictably.
@@ -231,7 +237,7 @@ Rules that matter in practice:
 - Do not call router, relay, or packet-to-string APIs from an ISR. Queue the bytes and hand them to a task or worker.
 - If you wrap router calls with a lock, that lock must be recursive-safe because side TX callbacks can trigger deferred
   queue work in the same logical call chain.
-- `DISCOVERY` and `TIME_SYNC` are reserved internal endpoints. Do not register local handlers for them and do not emit
+- `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` are reserved internal endpoints. Do not register local handlers for them and do not emit
   those packets manually from application code. Use the time-sync and discovery APIs instead.
 - When the `timesync` feature is enabled, `periodic(...)` is the expected maintenance entry point. Only use
   `poll_timesync(...)` / `poll_discovery(...)` directly when you intentionally need manual phase control.
@@ -512,22 +518,28 @@ For board-local IPC/software-bus endpoints, seed a second JSON file with
 applied at runtime and treated as link-local when loaded through the IPC path.
 
 Built-in internal endpoint/type names for telemetry errors, reliable control, discovery, and time
-sync are reserved. Do not register user handlers for `DISCOVERY` or `TIME_SYNC`.
+sync are reserved. Do not register user handlers for `SEDSNET_DISCOVERY` or `SEDSNET_TIME_SYNC`.
 
-### Managed variables and E2E payloads
+### Network variables and E2E payloads
 
-Managed variables are latest-value caches keyed by data type. After registering or seeding schema,
-enable a type on the router and request it when a board boots or reconnects:
+Network variables are latest-value caches keyed by data type. After registering or seeding schema,
+enable a type on the router and use the getter/setter pair:
 
 ```rust
 let flight_state = DataType::named("FLIGHT_STATE");
-router.enable_managed_variable(flight_state)?;
-router.request_managed_variable(flight_state)?;
+router.enable_network_variable(flight_state, NetworkVariablePermissions::READ_WRITE)?;
+router.set_network_variable(pkt)?;
+let cached = router.get_network_variable(flight_state, Some(1_000))?;
 ```
 
-If a peer has cached that type, the current packet is replayed through the normal endpoint handler.
-This keeps the application API the same whether the value arrived from a live publisher or from a
-network resync request.
+The setter commits the value to the network when permissions allow. The getter reads the cached copy
+and internally requests the value if the cache has never seen it or is stale; user code does not
+register a separate endpoint for network variables. Caches are tiered: any router that has enabled
+or seen the variable can answer the refresh from its local cache, so reconnecting boards can resync
+from a nearby node instead of always reaching the original producer/master. If a peer has the value,
+the current packet is replayed through the normal endpoint handler so resync still looks like an
+ordinary update. Register `on_network_variable_update(...)` when code needs a callback whenever an
+inbound network update changes a variable cache.
 
 Data types can also choose an E2E payload cryptography policy:
 
@@ -542,6 +554,22 @@ registered software fallback key. The provider path is intended for OS crypto, h
 secure elements, and Rust-only embedded projects. Compact managed credential helpers are available
 for deployments where a master/root node issues short-lived board credentials instead of users
 managing certificate files.
+
+Routers and relays can export JSON memory-layout snapshots to profile queue pressure at runtime,
+including shared allocation, per-queue used/allocated bytes, reliable buffers, schema/discovery
+state, and network-variable cache bytes.
+
+Topology exports describe the board graph directly: `routers` contains each discovered board and
+its connected peers, while `links` contains deduplicated `{source, target}` edges for visual graph
+rendering. SEDSnet-owned control endpoints such as `SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, and
+`SEDSNET_ERROR` are filtered out of user endpoint reachability fields.
+
+Routers and relays can also export per-client stats by sender ID. The snapshot reports whether the
+client is still connected, which sides currently reach it, last-seen/age timing, named reachable
+endpoints, and packet/byte counters aggregated from the side(s) used to reach that client.
+Explicit `announce_leave(...)` calls, and best-effort C `free` paths, send a
+`SEDSNET_DISCOVERY_LEAVE` control packet so peers can remove a departing sender from topology right
+away.
 
 Note: The editor uses Tkinter. On some Linux distros you may need to install it
 (e.g. `sudo apt install python3-tk`).

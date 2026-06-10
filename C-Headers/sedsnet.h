@@ -45,16 +45,18 @@ typedef enum SedsDataType {
   SEDS_DT_MANAGED_VARIABLE_REQUEST = 13,
   /* Reserved managed variable value control type. Values replay as their original data type. */
   SEDS_DT_MANAGED_VARIABLE_VALUE = 14,
+  /* SEDSnet discovery leave announcement. */
+  SEDS_DT_DISCOVERY_LEAVE = 15,
   /* Built-in TelemetryError */
   SEDS_DT_TELEMETRY_ERROR = 0,
 } SedsDataType;
 
 typedef enum SedsDataEndpoint {
-  /* Time sync routing endpoint (always forwarded). */
+  /* SEDSnet time sync routing endpoint (internal, always forwarded). */
   SEDS_EP_TIME_SYNC = 200,
-  /* Discovery control endpoint for internal route advertisements. */
+  /* SEDSnet discovery control endpoint for internal route advertisements. */
   SEDS_EP_DISCOVERY = 201,
-  /* Built-in TelemetryError endpoint */
+  /* SEDSnet error endpoint for internal error packets. */
   SEDS_EP_TELEMETRY_ERROR = 202,
 } SedsDataEndpoint;
 
@@ -70,13 +72,14 @@ typedef enum SedsResult {
   SEDS_MISSING_PAYLOAD = -8,
   SEDS_HANDLER_ERROR = -9,
   SEDS_BAD_ARG = -10,
-  SEDS_SERIALIZE = -11,
-  SEDS_DESERIALIZE = -12,
-  SEDS_IO = -13,
-  SEDS_INVALID_UTF8 = -14,
-  SEDS_TYPE_MISMATCH = -15,
-  SEDS_INVALID_LINK_ID = -16,
-  SEDS_PACKET_TOO_LARGE = -17,
+  SEDS_PERMISSION_DENIED = -11,
+  SEDS_SERIALIZE = -12,
+  SEDS_DESERIALIZE = -13,
+  SEDS_IO = -14,
+  SEDS_INVALID_UTF8 = -15,
+  SEDS_TYPE_MISMATCH = -16,
+  SEDS_INVALID_LINK_ID = -17,
+  SEDS_PACKET_TOO_LARGE = -18,
 } SedsResult;
 
 /* ======================================================================== */
@@ -391,6 +394,7 @@ SedsResult seds_router_poll_timesync(SedsRouter * r, bool * out_did_queue);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_announce_discovery(SedsRouter * r);
+SedsResult seds_router_announce_leave(SedsRouter * r);
 
 /**
  * @brief Poll the router's internal discovery runtime and queue any due discovery traffic.
@@ -412,6 +416,33 @@ SedsResult seds_router_poll_discovery(SedsRouter * r, bool * out_did_queue);
 SedsResult seds_router_enable_managed_variable(SedsRouter * r, SedsDataType ty);
 
 /**
+ * @brief Enable a network variable with local read/write permissions.
+ *
+ * Network variables use internal SEDSnet control packets. Users do not register a separate
+ * endpoint for network-variable synchronization.
+ */
+SedsResult seds_router_enable_network_variable(
+    SedsRouter * r,
+    SedsDataType ty,
+    bool can_read,
+    bool can_write
+);
+
+/**
+ * @brief Register a callback for inbound network-variable cache changes.
+ *
+ * Local setters/seeds update the cache without invoking this callback. Inbound updates and refresh
+ * replies invoke it only when the cached packet changes. The callback uses SedsPacketView, matching
+ * normal packet endpoint handlers, and may call back into the router.
+ */
+SedsResult seds_router_on_network_variable_update(
+    SedsRouter * r,
+    SedsDataType ty,
+    SedsEndpointHandlerFn cb,
+    void * user
+);
+
+/**
  * @brief Disable and clear latest-value caching for a user data type.
  */
 void seds_router_disable_managed_variable(SedsRouter * r, SedsDataType ty);
@@ -423,6 +454,17 @@ void seds_router_disable_managed_variable(SedsRouter * r, SedsDataType ty);
  * an update had just occurred. Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_request_managed_variable(SedsRouter * r, SedsDataType ty);
+
+/**
+ * @brief Set a network variable for the whole network from a serialized packet.
+ *
+ * Returns SEDS_PERMISSION_DENIED if the local router policy does not allow writes.
+ */
+SedsResult seds_router_set_network_variable_serialized(
+    SedsRouter * r,
+    const uint8_t * bytes,
+    size_t len
+);
 
 /**
  * @brief Seed a managed variable cache entry from an already serialized packet.
@@ -439,6 +481,17 @@ SedsResult seds_router_seed_managed_variable_serialized(
 int32_t seds_router_cached_managed_variable_serialized_len(SedsRouter * r, SedsDataType ty);
 
 /**
+ * @brief Return serialized cached network-variable size, requesting refresh if missing/stale.
+ *
+ * `stale_after_ms == 0` disables stale-age checks. Returns 0 if no value is currently cached.
+ */
+int32_t seds_router_get_network_variable_serialized_len(
+    SedsRouter * r,
+    SedsDataType ty,
+    uint32_t stale_after_ms
+);
+
+/**
  * @brief Copy the cached managed-variable packet as serialized bytes.
  *
  * Returns the copied byte count, 0 when no value is cached, or a negative SedsResult error.
@@ -446,6 +499,19 @@ int32_t seds_router_cached_managed_variable_serialized_len(SedsRouter * r, SedsD
 int32_t seds_router_cached_managed_variable_serialized(
     SedsRouter * r,
     SedsDataType ty,
+    uint8_t * out,
+    size_t out_len
+);
+
+/**
+ * @brief Copy cached network-variable bytes, requesting refresh if missing/stale.
+ *
+ * Returns copied byte count, 0 when no value is cached yet, or a negative SedsResult.
+ */
+int32_t seds_router_get_network_variable_serialized(
+    SedsRouter * r,
+    SedsDataType ty,
+    uint32_t stale_after_ms,
     uint8_t * out,
     size_t out_len
 );
@@ -467,6 +533,34 @@ int32_t seds_router_export_topology_len(SedsRouter * r);
 SedsResult seds_router_export_topology(SedsRouter * r, char * buf, size_t buf_len);
 
 /**
+ * @brief Return the required buffer length for a discovered client stats JSON export.
+ *
+ * The returned size includes the trailing NUL byte. Unknown senders export as JSON `null`.
+ * Packet and byte counters are aggregated from the side(s) currently reaching that client.
+ * Requires a build with the `discovery` feature.
+ */
+int32_t seds_router_export_client_stats_len(
+    SedsRouter * r,
+    const char * sender,
+    size_t sender_len
+);
+
+/**
+ * @brief Export stats for one discovered client as JSON.
+ *
+ * Use `seds_router_export_client_stats_len()` to size the destination buffer.
+ * Unknown senders export as JSON `null`.
+ * Requires a build with the `discovery` feature.
+ */
+SedsResult seds_router_export_client_stats(
+    SedsRouter * r,
+    const char * sender,
+    size_t sender_len,
+    char * buf,
+    size_t buf_len
+);
+
+/**
  * @brief Return the required buffer length for the router runtime stats JSON export.
  *
  * The returned size includes the trailing NUL byte.
@@ -483,6 +577,17 @@ int32_t seds_router_export_runtime_stats_len(SedsRouter * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_export_runtime_stats(SedsRouter * r, char * buf, size_t buf_len);
+
+/** @brief Return required buffer length for router memory-layout JSON. */
+int32_t seds_router_export_memory_layout_len(SedsRouter * r);
+
+/**
+ * @brief Export router memory-layout JSON.
+ *
+ * Includes shared budget, total used bytes, and per-section used/allocated bytes for RX, TX,
+ * reliable buffers, discovery, schema, and network-variable cache state.
+ */
+SedsResult seds_router_export_memory_layout(SedsRouter * r, char * buf, size_t buf_len);
 
 /**
  * @brief Run one router maintenance cycle.
@@ -1013,6 +1118,7 @@ SedsResult seds_relay_set_sender_id(SedsRelay * r, const char * sender, size_t s
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_announce_discovery(SedsRelay * r);
+SedsResult seds_relay_announce_leave(SedsRelay * r);
 
 /**
  * @brief Poll the relay's internal discovery runtime and queue any due discovery traffic.
@@ -1041,6 +1147,34 @@ int32_t seds_relay_export_topology_len(SedsRelay * r);
 SedsResult seds_relay_export_topology(SedsRelay * r, char * buf, size_t buf_len);
 
 /**
+ * @brief Return the required buffer length for a discovered client stats JSON export.
+ *
+ * The returned size includes the trailing NUL byte. Unknown senders export as JSON `null`.
+ * Packet and byte counters are aggregated from the side(s) currently reaching that client.
+ * Requires a build with the `discovery` feature.
+ */
+int32_t seds_relay_export_client_stats_len(
+    SedsRelay * r,
+    const char * sender,
+    size_t sender_len
+);
+
+/**
+ * @brief Export stats for one discovered client as JSON.
+ *
+ * Use `seds_relay_export_client_stats_len()` to size the destination buffer.
+ * Unknown senders export as JSON `null`.
+ * Requires a build with the `discovery` feature.
+ */
+SedsResult seds_relay_export_client_stats(
+    SedsRelay * r,
+    const char * sender,
+    size_t sender_len,
+    char * buf,
+    size_t buf_len
+);
+
+/**
  * @brief Return the required buffer length for the relay runtime stats JSON export.
  *
  * The returned size includes the trailing NUL byte.
@@ -1057,6 +1191,17 @@ int32_t seds_relay_export_runtime_stats_len(SedsRelay * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_export_runtime_stats(SedsRelay * r, char * buf, size_t buf_len);
+
+/** @brief Return required buffer length for relay memory-layout JSON. */
+int32_t seds_relay_export_memory_layout_len(SedsRelay * r);
+
+/**
+ * @brief Export relay memory-layout JSON.
+ *
+ * Includes shared budget, total used bytes, and per-section used/allocated bytes for RX, TX,
+ * replay, reliable buffers, discovery, and schema state.
+ */
+SedsResult seds_relay_export_memory_layout(SedsRelay * r, char * buf, size_t buf_len);
 
 /**
  * @brief Run one relay maintenance cycle.

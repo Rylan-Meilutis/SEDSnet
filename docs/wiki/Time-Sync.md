@@ -8,7 +8,7 @@ This page explains the built-in time sync support that ships with the `timesync`
 - Python builds in this repo enable it by default (
   pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/pyproject.toml))).
 
-When enabled, the build adds the `TIME_SYNC` endpoint (broadcast mode `Always`) plus built-in
+When enabled, the build adds the `SEDSNET_TIME_SYNC` endpoint (broadcast mode `Always`) plus built-in
 time sync packet types in code.
 
 The current model is router-owned:
@@ -18,7 +18,7 @@ The current model is router-owned:
   provide a custom clock).
 - The monotonic clock drives scheduling, request timestamps, holdover, and slew; it is not treated
   as UTC.
-- `TIME_SYNC` traffic is consumed internally by the router. It does not dispatch to normal local
+- `SEDSNET_TIME_SYNC` traffic is consumed internally by the router. It does not dispatch to normal local
   endpoint handlers.
 - Packet timestamps prefer the internal network clock when one is available.
 - The internal clock can merge partial sources, for example date from one source and time-of-day
@@ -36,8 +36,8 @@ All payload fields are `u64` values in little-endian order. Timestamps are in mi
 - `TimeSyncResponse`: `[seq, t1_ms, t2_ms, t3_ms]`
 
 With the `discovery` feature enabled, discovery also adds a built-in
-`DISCOVERY_TIMESYNC_SOURCES` control packet that advertises concrete time source sender IDs.
-The richer `DISCOVERY_TOPOLOGY` packet then attributes those source IDs to specific remote routers
+`SEDSNET_DISCOVERY_TIMESYNC_SOURCES` control packet that advertises concrete time source sender IDs.
+The richer `SEDSNET_DISCOVERY_TOPOLOGY` packet then attributes those source IDs to specific remote routers
 and carries their inter-router connections.
 
 `t4_ms` is captured locally when the response is received; it is not part of the packet payload.
@@ -52,8 +52,8 @@ The router handles the built-in time sync packet types internally:
   source.
 - `TimeSyncResponse` updates the leader's remote sample and steers the local network clock using
   the local monotonic receive time.
-- When discovery is enabled, outbound `TIME_SYNC` traffic prefers exact discovered source paths
-  over generic `TIME_SYNC` endpoint reachability.
+- When discovery is enabled, outbound `SEDSNET_TIME_SYNC` traffic prefers exact discovered source paths
+  over generic `SEDSNET_TIME_SYNC` endpoint reachability.
 - Internally generated `TimeSyncResponse` packets are returned to the requesting ingress side
   instead of being broadcast to every side.
 
@@ -99,13 +99,13 @@ When a complete date+time base exists, the router advances it forward using the 
 
 With both `timesync` and `discovery` enabled:
 
-- discovery advertisements include `TIME_SYNC` endpoint reachability
+- discovery advertisements include `SEDSNET_TIME_SYNC` endpoint reachability
 - routers and relays also advertise reachable time source sender IDs
 - `export_topology()` includes both reachable endpoints and reachable time source IDs per side,
   plus a top-level `routers` graph showing which router owns each source ID and how routers are
   connected
 - a consumer can route requests toward the exact side that leads to its selected source instead of
-  sending requests to every side that merely exposes `TIME_SYNC`
+  sending requests to every side that merely exposes `SEDSNET_TIME_SYNC`
 
 If no exact source route is known yet, routing still falls back to ordinary endpoint-based
 discovery or flooding.

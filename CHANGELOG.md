@@ -20,9 +20,11 @@
   Type shape conflicts remain rejected by direct registration.
 - Schema registry memory is now part of the same shared router/relay queue budget used for RX/TX
   queues, reliable state, recent packet IDs, discovery topology, and other queue-backed state.
-- Added managed-variable latest-value caching. Routers can mark a data type as network-managed,
-  cache the latest packet for that type, seed the cache from serialized traffic, and request a
-  replay so restarted boards can resynchronize through the normal endpoint handler path.
+- Added network-variable latest-value caching. Routers can mark a data type as network-managed with
+  local read/write permissions, set the value for the network, read the cached value, and
+  internally request a refresh when the cache is missing or stale. Refreshes can be answered by any
+  nearby router that has enabled or seen the variable, and applications can register update
+  callbacks for inbound cache changes.
 - Added end-to-end payload encryption policy hooks under the `cryptography` feature:
     - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn`.
     - Routers can run in `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll` mode.
@@ -44,6 +46,16 @@
 - Tightened discovery-aware forwarding for low-bandwidth links. Once topology exists, unknown
   user-data routes are not blindly flooded; discovery/control traffic still propagates and explicit
   route policy can still intentionally select a side.
+- Topology exports now include a deduplicated `links` graph, named endpoint fields, side names, and
+  filtered SEDSnet control endpoints so graphing tools see user-facing network structure instead of
+  router-only internals.
+- Added explicit leave announcements. Routers and relays can queue `SEDSNET_DISCOVERY_LEAVE` so
+  peers prune topology and client stats immediately during planned shutdown or disconnect.
+- Added per-client stats snapshots for routers and relays. Rust exposes typed snapshots, Python
+  returns dictionaries, and C/C++ expose JSON exports keyed by sender ID. Packet and byte counters
+  are aggregated from the side(s) currently reaching the client.
+- Added memory-layout JSON exports for routers and relays, including shared allocation/used bytes,
+  queue breakdowns, reliable buffers, schema/discovery state, and network-variable cache usage.
 - Static JSON config is now runtime seeding only. `SEDSNET_STATIC_SCHEMA_PATH` and
   `SEDSNET_STATIC_IPC_SCHEMA_PATH` can seed the registry at startup, and explicit path/bytes
   APIs are available for Rust/C/Python. Default `build.py` builds do not include application JSON.
@@ -57,9 +69,12 @@
 - The checked-in C header is now static for the runtime-schema ABI. Optional reusable C and C++
   convenience wrappers can be selected from upstream CMake without forcing wrapper code into
   projects that only want the raw ABI.
-- C API coverage now includes router/relay global helper wrappers, managed variables, cryptography provider
-  registration, software fallback keys, managed credentials, runtime sender IDs, fixed-size
-  serialized sides, link-probe samples, and topology/runtime-stat exports.
+- Built-in runtime endpoint/type names now use the `SEDSNET_*` prefix for router-owned control
+  traffic such as `SEDSNET_DISCOVERY`, `SEDSNET_TIME_SYNC`, and `SEDSNET_ERROR`.
+- C API coverage now includes router/relay global helper wrappers, network variables, update
+  callbacks, cryptography provider registration, software fallback keys, managed credentials,
+  runtime sender IDs, fixed-size serialized sides, link-probe samples, leave announcements, memory
+  layout, client stats, and topology/runtime-stat exports.
 - `./build.py test` now auto-detects `cargo-nextest` for non-doctest Rust suites when installed,
   falls back to `cargo test` when it is not, and keeps doctests covered with Cargo's built-in test
   runner.
@@ -70,7 +85,8 @@
   `DataEndpoint::named("RADIO")` and `DataType::named("GPS_DATA")` instead of raw legacy IDs.
 - Added regression coverage for schema sync, deterministic conflict resolution, budget accounting,
   runtime string lookups, description metadata, handler construction from endpoint definitions,
-  runtime schema removal, managed-variable replay, crypto credentials/providers, topology exports,
+  runtime schema removal, network-variable getter/setter/cache/callback behavior, crypto
+  credentials/providers, topology graph exports, leave pruning, client stats, memory layout,
   fixed-size side splitting, link probing, and nextest-aware test execution.
 
 ## 3.12.0

@@ -89,18 +89,23 @@ Registering an endpoint handler for a missing endpoint auto-creates that endpoin
 and broadcasts the new schema through discovery. Registering a data type or endpoint with the same
 name/ID and a different shape returns an error.
 
-## Managed Variables and E2E Payloads
+## Network Variables and E2E Payloads
 
-Managed variables are latest-value caches for user data types. A router that enables a managed
-variable remembers the newest local or received packet for that type. A restarted board can call
-`request_managed_variable(...)` and peers replay the original value packet, so normal endpoint
-handlers run immediately with the cached global state.
+Network variables are latest-value caches for user data types. A router that enables a network
+variable remembers the newest local or received packet for that type. User code uses a setter and
+getter rather than registering a special endpoint: the setter commits the value to the network when
+permissions allow, and the getter returns the cached value while internally requesting a refresh if
+the value has never been seen or is stale. Caches are tiered: any router that has enabled or seen the
+variable can answer the refresh from its local cache, so reconnecting boards can resync from a nearby
+node instead of always reaching the original producer/master.
 
 Data types can also advertise an E2E cryptography preference:
 
 ```rust
 use sedsnet::config::register_data_type_id_with_description_and_e2e_encryption;
-use sedsnet::router::{Router, RouterConfig, RouterE2eEncryptionMode};
+use sedsnet::router::{
+    NetworkVariablePermissions, Router, RouterConfig, RouterE2eEncryptionMode,
+};
 use sedsnet::{
     DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement,
     ReliableMode,
@@ -122,9 +127,20 @@ let router = Router::new(
         .with_e2e_encryption(RouterE2eEncryptionMode::RequiredOnly)
         .with_e2e_key_id(7),
 );
-router.enable_managed_variable(flight_state)?;
-router.request_managed_variable(flight_state)?;
+router.enable_network_variable(flight_state, NetworkVariablePermissions::READ_WRITE)?;
+router.on_network_variable_update(flight_state, |pkt| {
+    let state = pkt.data_as_u8()?;
+    Ok(())
+})?;
+router.set_network_variable(pkt)?;
+let cached = router.get_network_variable(flight_state, Some(1_000))?;
 ```
+
+When a refresh request finds a peer with the value, the original value packet is replayed through
+normal endpoint handlers. If the local router lacks read or write permission, the getter/setter
+returns `TelemetryError::PermissionDenied` and peers answer refresh requests with a permission
+error packet. `on_network_variable_update(...)` runs only for inbound updates and refresh replies
+that change the local cache; local setters/seeds update the cache without firing that callback.
 
 Router modes are:
 
@@ -176,8 +192,8 @@ modifying the frame for downstream boards without detection.
 Fragmented links should encrypt the original message before splitting it. Fragments then carry a
 message id, fragment index/count, source epoch, and route metadata; the receiver reassembles and
 opens the original authenticated payload. On reconnect, routers should discard incomplete fragments
-from older master epochs, refresh time/topology, and request managed-variable deltas from the last
-known `{master_epoch, revision}`. If the master epoch changed, resync from the current snapshot.
+from older master epochs, refresh time/topology, and use network-variable getters to refresh any
+state that is missing or stale. If the master epoch changed, resync from the current snapshot.
 
 Discovery-enabled routers do not flood unknown user-data routes by fallback. They forward user data
 only when discovery or explicit route policy identifies a path; discovery/control traffic still
@@ -335,8 +351,9 @@ Meaning of the variants:
 
 If an immediate router receive/transmit API is called from inside a side TX callback, the router
 now defers that work onto its queue instead of recursively re-entering forwarding on the same
-stack. Internal `DISCOVERY` and `TIME_SYNC` traffic stays router-owned; applications should use the
-public discovery/time-sync APIs instead of constructing those packets directly.
+stack. Internal `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` traffic stays router-owned;
+applications should use the public discovery/time-sync APIs instead of constructing those packets
+directly.
 
 Use side-aware ingress only when you need to override the ingress side explicitly:
 
@@ -374,6 +391,10 @@ topology. Recent packet ID caches preallocate their final storage and reserve th
 immediately. If the remaining budget is exhausted, older queued state is evicted; discovery
 topology eviction emits a warning in `std` builds.
 
+Use `router.export_memory_layout_json()` or `relay.export_memory_layout_json()` when profiling a
+running node. The JSON reports shared allocated/used bytes plus per-area used/allocated bytes for
+RX, ISR RX, TX, replay queues, reliable buffers, discovery, schema, and the network-variable cache.
+
 ## Topology export
 
 With discovery enabled, `export_topology()` returns the router's current learned view.
@@ -381,11 +402,25 @@ With discovery enabled, `export_topology()` returns the router's current learned
 - `topology.routers` contains the top-level discovered router graph
 - each router entry includes the sender ID, owned endpoints, owned time-sync source IDs, and
   connected router sender IDs
+- `topology.links` is a deduplicated board-to-board edge list (`source`, `target`) for direct graph
+  rendering
 - exported JSON/Python dictionaries use `reachable_endpoints` and `advertised_endpoints` for
   schema-advertised names, with `reachable_endpoint_ids` and `advertised_endpoint_ids` available
   when code needs stable numeric validation
+- SEDSnet-owned control endpoints (`SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, `SEDSNET_ERROR`) are
+  filtered out of user endpoint reachability fields
 - each side route also includes `announcers`, so you can see which upstream router advertised the
   exported topology
+
+Use `router.client_stats("BOARD_ID")` or `relay.client_stats("BOARD_ID")` to inspect one
+discovered client. The snapshot includes connected/disconnected state, side IDs and side names,
+last-seen/age timing, named reachable endpoints, reachable time-sync sources, and packet/byte
+counters aggregated from the side(s) currently reaching that client.
+
+Use `router.announce_leave()` or `relay.announce_leave()` before a planned shutdown or disconnect.
+That queues a `SEDSNET_DISCOVERY_LEAVE` control packet so peers can prune topology immediately
+instead of waiting for the discovery TTL. The C ABI also attempts this on router/relay free, but an
+explicit leave is preferred when shutdown order matters.
 
 ## Reserved internal endpoints
 
@@ -399,7 +434,7 @@ Those endpoints are owned by the router’s built-in control traffic.
 ## Time sync
 
 When the `timesync` feature is enabled, the router maintains an internal network clock and handles
-`TIME_SYNC` traffic internally.
+`SEDSNET_TIME_SYNC` traffic internally.
 
 For ordinary loops, prefer `periodic(timeout_ms)` so time sync, discovery, and queue draining run
 together.

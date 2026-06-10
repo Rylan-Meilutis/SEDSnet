@@ -165,9 +165,9 @@ impl DataEndpoint {
 impl core::fmt::Debug for DataEndpoint {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let name = match *self {
-            Self::TelemetryError => "TelemetryError",
-            Self::TimeSync => "TimeSync",
-            Self::Discovery => "Discovery",
+            Self::TelemetryError => "SEDSNET_ERROR",
+            Self::TimeSync => "SEDSNET_TIME_SYNC",
+            Self::Discovery => "SEDSNET_DISCOVERY",
             _ => {
                 let meta = get_endpoint_meta(*self);
                 if meta.name != "UNKNOWN_ENDPOINT" {
@@ -200,6 +200,7 @@ impl DataType {
     pub const DISCOVERY_SCHEMA_REQUEST: Self = Self(12);
     pub const MANAGED_VARIABLE_REQUEST: Self = Self(13);
     pub const MANAGED_VARIABLE_VALUE: Self = Self(14);
+    pub const DISCOVERY_LEAVE: Self = Self(15);
 
     #[allow(non_upper_case_globals)]
     pub const TelemetryError: Self = Self::TELEMETRY_ERROR;
@@ -231,6 +232,8 @@ impl DataType {
     pub const ManagedVariableRequest: Self = Self::MANAGED_VARIABLE_REQUEST;
     #[allow(non_upper_case_globals)]
     pub const ManagedVariableValue: Self = Self::MANAGED_VARIABLE_VALUE;
+    #[allow(non_upper_case_globals)]
+    pub const DiscoveryLeave: Self = Self::DISCOVERY_LEAVE;
 
     #[inline]
     pub const fn as_u32(self) -> u32 {
@@ -260,21 +263,22 @@ impl DataType {
 impl core::fmt::Debug for DataType {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let name = match *self {
-            Self::TelemetryError => "TelemetryError",
+            Self::TelemetryError => "SEDSNET_ERROR",
             Self::ReliableAck => "ReliableAck",
             Self::ReliablePacketRequest => "ReliablePacketRequest",
             Self::ReliablePartialAck => "ReliablePartialAck",
-            Self::TimeSyncAnnounce => "TimeSyncAnnounce",
-            Self::TimeSyncRequest => "TimeSyncRequest",
-            Self::TimeSyncResponse => "TimeSyncResponse",
-            Self::DiscoveryAnnounce => "DiscoveryAnnounce",
-            Self::DiscoveryTimeSyncSources => "DiscoveryTimeSyncSources",
-            Self::DiscoveryTopology => "DiscoveryTopology",
-            Self::DiscoverySchema => "DiscoverySchema",
-            Self::DiscoveryTopologyRequest => "DiscoveryTopologyRequest",
-            Self::DiscoverySchemaRequest => "DiscoverySchemaRequest",
-            Self::ManagedVariableRequest => "ManagedVariableRequest",
-            Self::ManagedVariableValue => "ManagedVariableValue",
+            Self::TimeSyncAnnounce => "SedsnetTimeSyncAnnounce",
+            Self::TimeSyncRequest => "SedsnetTimeSyncRequest",
+            Self::TimeSyncResponse => "SedsnetTimeSyncResponse",
+            Self::DiscoveryAnnounce => "SedsnetDiscoveryAnnounce",
+            Self::DiscoveryTimeSyncSources => "SedsnetDiscoveryTimeSyncSources",
+            Self::DiscoveryTopology => "SedsnetDiscoveryTopology",
+            Self::DiscoverySchema => "SedsnetDiscoverySchema",
+            Self::DiscoveryTopologyRequest => "SedsnetDiscoveryTopologyRequest",
+            Self::DiscoverySchemaRequest => "SedsnetDiscoverySchemaRequest",
+            Self::ManagedVariableRequest => "SedsnetManagedVariableRequest",
+            Self::ManagedVariableValue => "SedsnetManagedVariableValue",
+            Self::DiscoveryLeave => "SedsnetDiscoveryLeave",
             _ => {
                 let meta = get_message_meta(*self);
                 if meta.name != "UNKNOWN_TYPE" {
@@ -391,21 +395,21 @@ impl Registry {
         };
         reg.register_endpoint_definition(EndpointDefinition {
             id: DataEndpoint::TelemetryError,
-            name: "TELEMETRY_ERROR",
+            name: "SEDSNET_ERROR",
             description: "",
             link_local_only: false,
         })
         .expect("built-in endpoint");
         reg.register_endpoint_definition(EndpointDefinition {
             id: DataEndpoint::TimeSync,
-            name: "TIME_SYNC",
+            name: "SEDSNET_TIME_SYNC",
             description: "",
             link_local_only: false,
         })
         .expect("built-in endpoint");
         reg.register_endpoint_definition(EndpointDefinition {
             id: DataEndpoint::Discovery,
-            name: "DISCOVERY",
+            name: "SEDSNET_DISCOVERY",
             description: "",
             link_local_only: false,
         })
@@ -413,7 +417,7 @@ impl Registry {
 
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::TelemetryError,
-            name: "TELEMETRY_ERROR",
+            name: "SEDSNET_ERROR",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
@@ -424,7 +428,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::ReliableAck,
-            name: "RELIABLE_ACK",
+            name: "SEDSNET_RELIABLE_ACK",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
@@ -435,7 +439,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::ReliablePacketRequest,
-            name: "RELIABLE_PACKET_REQUEST",
+            name: "SEDSNET_RELIABLE_PACKET_REQUEST",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
@@ -446,7 +450,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::ReliablePartialAck,
-            name: "RELIABLE_PARTIAL_ACK",
+            name: "SEDSNET_RELIABLE_PARTIAL_ACK",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
@@ -457,7 +461,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::TimeSyncAnnounce,
-            name: "TIME_SYNC_ANNOUNCE",
+            name: "SEDSNET_TIME_SYNC_ANNOUNCE",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
@@ -468,7 +472,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::TimeSyncRequest,
-            name: "TIME_SYNC_REQUEST",
+            name: "SEDSNET_TIME_SYNC_REQUEST",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
@@ -479,7 +483,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::TimeSyncResponse,
-            name: "TIME_SYNC_RESPONSE",
+            name: "SEDSNET_TIME_SYNC_RESPONSE",
             description: "",
             element: MessageElement::Static(4, MessageDataType::UInt64, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
@@ -490,7 +494,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::DiscoveryAnnounce,
-            name: "DISCOVERY_ANNOUNCE",
+            name: "SEDSNET_DISCOVERY_ANNOUNCE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt32, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -501,7 +505,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::DiscoveryTimeSyncSources,
-            name: "DISCOVERY_TIMESYNC_SOURCES",
+            name: "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -512,7 +516,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::DiscoveryTopology,
-            name: "DISCOVERY_TOPOLOGY",
+            name: "SEDSNET_DISCOVERY_TOPOLOGY",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -523,7 +527,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::DiscoverySchema,
-            name: "DISCOVERY_SCHEMA",
+            name: "SEDSNET_DISCOVERY_SCHEMA",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -534,7 +538,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::DiscoveryTopologyRequest,
-            name: "DISCOVERY_TOPOLOGY_REQUEST",
+            name: "SEDSNET_DISCOVERY_TOPOLOGY_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -545,7 +549,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::DiscoverySchemaRequest,
-            name: "DISCOVERY_SCHEMA_REQUEST",
+            name: "SEDSNET_DISCOVERY_SCHEMA_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -556,7 +560,7 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::ManagedVariableRequest,
-            name: "MANAGED_VARIABLE_REQUEST",
+            name: "SEDSNET_MANAGED_VARIABLE_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
@@ -567,12 +571,23 @@ impl Registry {
         .expect("built-in type");
         reg.register_type_definition(DataTypeDefinition {
             id: DataType::ManagedVariableValue,
-            name: "MANAGED_VARIABLE_VALUE",
+            name: "SEDSNET_MANAGED_VARIABLE_VALUE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 243,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        })
+        .expect("built-in type");
+        reg.register_type_definition(DataTypeDefinition {
+            id: DataType::DiscoveryLeave,
+            name: "SEDSNET_DISCOVERY_LEAVE",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            reliable: ReliableMode::Ordered,
+            priority: 244,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
@@ -1519,6 +1534,9 @@ fn is_internal_data_type(ty: DataType) -> bool {
             | DataType::DiscoverySchema
             | DataType::DiscoveryTopologyRequest
             | DataType::DiscoverySchemaRequest
+            | DataType::ManagedVariableRequest
+            | DataType::ManagedVariableValue
+            | DataType::DiscoveryLeave
     )
 }
 
@@ -1836,19 +1854,19 @@ pub fn known_endpoints() -> Vec<EndpointDefinition> {
     let mut endpoints = vec![
         EndpointDefinition {
             id: DataEndpoint::TelemetryError,
-            name: "TELEMETRY_ERROR",
+            name: "SEDSNET_ERROR",
             description: "",
             link_local_only: false,
         },
         EndpointDefinition {
             id: DataEndpoint::TimeSync,
-            name: "TIME_SYNC",
+            name: "SEDSNET_TIME_SYNC",
             description: "",
             link_local_only: false,
         },
         EndpointDefinition {
             id: DataEndpoint::Discovery,
-            name: "DISCOVERY",
+            name: "SEDSNET_DISCOVERY",
             description: "",
             link_local_only: false,
         },
@@ -1876,7 +1894,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
     let mut types = vec![
         DataTypeDefinition {
             id: DataType::TelemetryError,
-            name: "TELEMETRY_ERROR",
+            name: "SEDSNET_ERROR",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
             endpoints: &[DataEndpoint::TelemetryError],
@@ -1886,7 +1904,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::ReliableAck,
-            name: "RELIABLE_ACK",
+            name: "SEDSNET_RELIABLE_ACK",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
             endpoints: &[DataEndpoint::TelemetryError],
@@ -1896,7 +1914,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::ReliablePacketRequest,
-            name: "RELIABLE_PACKET_REQUEST",
+            name: "SEDSNET_RELIABLE_PACKET_REQUEST",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
             endpoints: &[DataEndpoint::TelemetryError],
@@ -1906,7 +1924,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::ReliablePartialAck,
-            name: "RELIABLE_PARTIAL_ACK",
+            name: "SEDSNET_RELIABLE_PARTIAL_ACK",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
             endpoints: &[DataEndpoint::TelemetryError],
@@ -1916,7 +1934,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::TimeSyncAnnounce,
-            name: "TIME_SYNC_ANNOUNCE",
+            name: "SEDSNET_TIME_SYNC_ANNOUNCE",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
             endpoints: &[DataEndpoint::TimeSync],
@@ -1926,7 +1944,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::TimeSyncRequest,
-            name: "TIME_SYNC_REQUEST",
+            name: "SEDSNET_TIME_SYNC_REQUEST",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
             endpoints: &[DataEndpoint::TimeSync],
@@ -1936,7 +1954,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::TimeSyncResponse,
-            name: "TIME_SYNC_RESPONSE",
+            name: "SEDSNET_TIME_SYNC_RESPONSE",
             description: "",
             element: MessageElement::Static(4, MessageDataType::UInt64, MessageClass::Data),
             endpoints: &[DataEndpoint::TimeSync],
@@ -1946,7 +1964,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::DiscoveryAnnounce,
-            name: "DISCOVERY_ANNOUNCE",
+            name: "SEDSNET_DISCOVERY_ANNOUNCE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt32, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -1956,7 +1974,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::DiscoveryTimeSyncSources,
-            name: "DISCOVERY_TIMESYNC_SOURCES",
+            name: "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -1966,7 +1984,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::DiscoveryTopology,
-            name: "DISCOVERY_TOPOLOGY",
+            name: "SEDSNET_DISCOVERY_TOPOLOGY",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -1976,7 +1994,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::DiscoverySchema,
-            name: "DISCOVERY_SCHEMA",
+            name: "SEDSNET_DISCOVERY_SCHEMA",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -1986,7 +2004,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::DiscoveryTopologyRequest,
-            name: "DISCOVERY_TOPOLOGY_REQUEST",
+            name: "SEDSNET_DISCOVERY_TOPOLOGY_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -1996,7 +2014,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::DiscoverySchemaRequest,
-            name: "DISCOVERY_SCHEMA_REQUEST",
+            name: "SEDSNET_DISCOVERY_SCHEMA_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -2006,7 +2024,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::ManagedVariableRequest,
-            name: "MANAGED_VARIABLE_REQUEST",
+            name: "SEDSNET_MANAGED_VARIABLE_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
@@ -2016,12 +2034,22 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
         },
         DataTypeDefinition {
             id: DataType::ManagedVariableValue,
-            name: "MANAGED_VARIABLE_VALUE",
+            name: "SEDSNET_MANAGED_VARIABLE_VALUE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 243,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        },
+        DataTypeDefinition {
+            id: DataType::DiscoveryLeave,
+            name: "SEDSNET_DISCOVERY_LEAVE",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: &[DataEndpoint::Discovery],
+            reliable: ReliableMode::Ordered,
+            priority: 244,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
     ];

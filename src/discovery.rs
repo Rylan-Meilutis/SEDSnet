@@ -66,6 +66,12 @@ pub struct TopologyBoardNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyLink {
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyAnnouncerRoute {
     pub sender_id: String,
     pub reachable_endpoints: Vec<DataEndpoint>,
@@ -91,9 +97,34 @@ pub struct TopologySnapshot {
     pub advertised_endpoints: Vec<DataEndpoint>,
     pub advertised_timesync_sources: Vec<String>,
     pub routers: Vec<TopologyBoardNode>,
+    pub links: Vec<TopologyLink>,
     pub routes: Vec<TopologySideRoute>,
     pub current_announce_interval_ms: u64,
     pub next_announce_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientStatsSnapshot {
+    pub sender_id: String,
+    pub connected: bool,
+    pub side_ids: Vec<usize>,
+    pub side_names: Vec<&'static str>,
+    pub last_seen_ms: Option<u64>,
+    pub age_ms: Option<u64>,
+    pub reachable_endpoints: Vec<DataEndpoint>,
+    pub reachable_timesync_sources: Vec<String>,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+#[inline]
+pub const fn is_router_control_endpoint(ep: DataEndpoint) -> bool {
+    matches!(
+        ep,
+        DataEndpoint::TelemetryError | DataEndpoint::TimeSync | DataEndpoint::Discovery
+    )
 }
 
 /// Returns `true` when the endpoint is reserved for discovery control traffic.
@@ -115,6 +146,7 @@ pub const fn is_discovery_type(ty: DataType) -> bool {
             | DataType::DiscoverySchemaRequest
             | DataType::ManagedVariableRequest
             | DataType::ManagedVariableValue
+            | DataType::DiscoveryLeave
     )
 }
 
@@ -125,6 +157,7 @@ pub const fn is_discovery_request_type(ty: DataType) -> bool {
         DataType::DiscoveryTopologyRequest
             | DataType::DiscoverySchemaRequest
             | DataType::ManagedVariableRequest
+            | DataType::DiscoveryLeave
     )
 }
 
@@ -136,6 +169,9 @@ fn sort_dedup_strings(items: &mut Vec<String>) {
 /// Normalizes a topology-board list in place so it can be compared, exported, or encoded.
 pub fn normalize_topology_boards(boards: &mut Vec<TopologyBoardNode>) {
     for board in boards.iter_mut() {
+        board
+            .reachable_endpoints
+            .retain(|ep| !is_router_control_endpoint(*ep));
         board.reachable_endpoints.sort_unstable();
         board.reachable_endpoints.dedup();
         sort_dedup_strings(&mut board.reachable_timesync_sources);
@@ -144,6 +180,26 @@ pub fn normalize_topology_boards(boards: &mut Vec<TopologyBoardNode>) {
     }
     boards.sort_unstable_by(|a, b| a.sender_id.cmp(&b.sender_id));
     boards.dedup_by(|a, b| a.sender_id == b.sender_id);
+}
+
+pub fn topology_links_from_boards(boards: &[TopologyBoardNode]) -> Vec<TopologyLink> {
+    let mut links = Vec::new();
+    for board in boards {
+        for peer in &board.connections {
+            if peer == &board.sender_id {
+                continue;
+            }
+            let (source, target) = if board.sender_id <= *peer {
+                (board.sender_id.clone(), peer.clone())
+            } else {
+                (peer.clone(), board.sender_id.clone())
+            };
+            links.push(TopologyLink { source, target });
+        }
+    }
+    links.sort_unstable_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    links.dedup_by(|a, b| a.source == b.source && a.target == b.target);
+    links
 }
 
 /// Merges board topology views keyed by sender ID.
@@ -185,6 +241,7 @@ pub fn summarize_topology_boards(boards: &[TopologyBoardNode]) -> (Vec<DataEndpo
     }
     reachable_endpoints.sort_unstable();
     reachable_endpoints.dedup();
+    reachable_endpoints.retain(|ep| !is_router_control_endpoint(*ep));
     sort_dedup_strings(&mut reachable_timesync_sources);
     (reachable_endpoints, reachable_timesync_sources)
 }
@@ -279,6 +336,16 @@ pub fn build_discovery_topology_request(
 pub fn build_discovery_schema_request(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
     Packet::new(
         DataType::DiscoverySchemaRequest,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        Vec::<u8>::new().into(),
+    )
+}
+
+pub fn build_discovery_leave(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
+    Packet::new(
+        DataType::DiscoveryLeave,
         &[DataEndpoint::Discovery],
         sender,
         timestamp_ms,

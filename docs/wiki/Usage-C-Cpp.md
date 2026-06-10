@@ -337,28 +337,34 @@ void telemetry_publish_flight_state(uint8_t state)
 The helper layer is optional. The lower-level ABI remains available for firmware that needs direct
 control over every router and relay call.
 
-## Managed Variables
+## Network Variables
 
-Routers can cache the latest packet for selected user data types and answer network resync requests
-with that original value packet. Endpoint handlers receive the replayed value exactly like a normal
-update, which lets a restarted board request global state such as `FLIGHT_STATE` immediately after
-joining.
+Routers can cache the latest packet for selected user data types and expose it through a setter and
+getter. The setter commits the value to the network when permissions allow. The getter reads the
+cached value and internally requests a refresh when the value has never been seen or is stale; user
+code does not register a separate endpoint for network variables. Caches are tiered: any router that
+has enabled or seen the variable can answer the refresh from its local cache, so reconnecting boards
+can resync from a nearby node instead of always reaching the original producer/master.
 
 ```C
 SedsTypeRef flight_state_ty;
 seds_type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), &flight_state_ty);
 
-seds_global_router_enable_managed_variable(flight_state_ty);
+seds_global_router_enable_network_variable(flight_state_ty, true, true);
+seds_global_router_on_network_variable_update(flight_state_ty, on_flight_state_update, NULL);
 
-/* After restart or link recovery, ask peers to replay the latest value. */
-seds_global_router_request_managed_variable(flight_state_ty);
+/* If stale or missing, this queues an internal refresh and returns 0 until a value arrives. */
+int32_t need = seds_global_router_get_network_variable_serialized_len(flight_state_ty, 1000U);
 seds_global_router_process(0);
 ```
 
-Producers should also enable the same managed variable type. When they publish or receive that data
-type, the router refreshes its cache. C firmware can seed the cache from a serialized packet with
-`seds_router_seed_managed_variable_serialized(...)`; Rust firmware can use
-`Router::seed_managed_variable(...)`.
+Producers should also enable the same variable type. C firmware can set the network variable from a
+serialized packet with `seds_global_router_set_network_variable_serialized(...)`, or seed only the
+local cache with `seds_router_seed_managed_variable_serialized(...)`. If the local router lacks read
+or write permission, getters/setters return `SEDS_PERMISSION_DENIED`; peers answer denied refreshes
+with a telemetry error packet. `seds_router_on_network_variable_update(...)` runs only for inbound
+updates and refresh replies that change the local cache; local setters/seeds update the cache without
+firing that callback.
 
 If the managed variable carries sensitive state, mark its data type as requiring E2E cryptography and
 create the router with an E2E mode:
@@ -575,7 +581,28 @@ RX work, TX work, recent packet IDs, reliable buffers/replay state, and discover
 from it. Recent packet ID caches preallocate their final storage and reserve that byte cost
 immediately. Discovery topology eviction emits a warning in `std` builds.
 
-With `timesync` enabled, the router owns an internal network clock and handles `TIME_SYNC`
+`seds_router_export_memory_layout(...)` and `seds_relay_export_memory_layout(...)` return JSON with
+shared allocated/used bytes and per-area queue, reliable-buffer, schema, discovery, and
+network-variable-cache breakdowns.
+
+Topology JSON exports include both `routers[].connections` and a top-level `links` array with
+deduplicated `{source, target}` board-to-board edges for graph rendering. SEDSnet-owned control
+endpoints (`SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, `SEDSNET_ERROR`) are filtered out of user
+endpoint reachability fields.
+
+Use `seds_router_export_client_stats_len(...)` / `seds_router_export_client_stats(...)` or the
+matching relay functions to export one discovered client's stats as JSON. The convenience wrapper
+also exposes `seds_global_router_export_client_stats*` and `seds_global_relay_export_client_stats*`.
+Unknown senders export as JSON `null`. Known snapshots include connected state, side IDs/names,
+last-seen/age timing, named reachable endpoints, reachable time-sync sources, and packet/byte
+counters aggregated from the side(s) currently reaching that client.
+
+Call `seds_router_announce_leave(...)` or `seds_relay_announce_leave(...)` before a planned
+disconnect so peers receive `SEDSNET_DISCOVERY_LEAVE` and prune topology immediately. The raw C free
+functions attempt a best-effort leave and queue flush, but explicit leave is preferred when shutdown
+order matters.
+
+With `timesync` enabled, the router owns an internal network clock and handles `SEDSNET_TIME_SYNC`
 packets internally. Use `seds_router_get_network_time_ms` / `seds_router_get_network_time` to
 read the current synthesized network time. Source/master nodes can seed that clock directly with
 the `seds_router_set_local_network_*` functions for date-only, time-only, millisecond, or

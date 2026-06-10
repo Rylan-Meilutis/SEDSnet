@@ -35,11 +35,13 @@
     - Runtime JSON accepts both `description` and legacy `doc`.
     - Schema registry memory counts against the same shared router/relay queue budget as RX/TX
       queues, reliable state, dedupe caches, and discovery topology.
-- Managed variables:
-    - Routers can cache the latest value packet for selected data types.
-    - A restarted board can call the managed-variable request API and receive the cached value
-      through the normal endpoint handler path instead of waiting for the next publisher update.
-    - The cache can also be seeded from already serialized traffic.
+- Network variables:
+    - Routers can cache the latest value packet for selected data types with local read/write
+      permissions.
+    - Applications use a setter and getter; stale or missing getters queue an internal refresh
+      request without requiring a user endpoint.
+    - Refreshes can be answered by any nearby router that has enabled or seen the variable, and
+      update callbacks run when inbound updates change the local cache.
 - E2E payload security:
     - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn` cryptography policy.
     - Routers can run with cryptography `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll`.
@@ -60,12 +62,21 @@
       selection.
     - Runtime sender IDs and serialized header templates reduce repeated header overhead after
       initial contact.
+- Topology and diagnostics:
+    - Topology exports now include named endpoint fields, side names, filtered SEDSnet control
+      endpoints, and a top-level `links` list for graph rendering.
+    - Routers and relays can announce `SEDSNET_DISCOVERY_LEAVE` during planned shutdown so peers
+      prune topology and client stats immediately.
+    - Routers and relays expose memory-layout snapshots and per-client stats. Client packet/byte
+      counters are aggregated from the side(s) currently reaching that sender.
 - C/C++ and wrapper integration:
     - The checked-in C header is static for the runtime-schema ABI.
     - Optional C and C++ convenience wrappers can be selected from CMake without requiring users of
       the raw ABI to include wrapper files.
     - Global router/relay wrapper helpers cover the common embedded case where application code
       should not carry router handles everywhere.
+    - C/Python/C++ surfaces include network-variable update callbacks, leave announcements,
+      memory-layout exports, and per-client stats exports.
 - Test and release tooling:
     - `./build.py test` auto-detects `cargo-nextest` when installed, falls back to Cargo's built-in
       test runner when it is not, and keeps doctests covered.
@@ -74,8 +85,9 @@
 - Tests and examples:
     - Rust tests and benches now use readable string-backed lookups instead of raw legacy IDs.
     - Added regression coverage for schema sync, conflict resolution, budget accounting, string
-      lookup, metadata, removal, managed variables, crypto credentials/providers, topology exports,
-      link probing, fixed-size splitting, and nextest-aware test execution.
+      lookup, metadata, removal, network variables, crypto credentials/providers, topology graph
+      exports, leave pruning, client stats, memory layout, link probing, fixed-size splitting, and
+      nextest-aware test execution.
 
 ## Version 3.12.0 highlights
 

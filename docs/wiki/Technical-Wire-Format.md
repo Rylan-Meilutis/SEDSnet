@@ -204,6 +204,25 @@ exceed the configured maximum. The receiver reassembles those chunks into the or
 side-transport frame and then resumes normal packet processing. This keeps CAN/I2C-style frame
 limits transparent to endpoint handlers and packet-oriented APIs.
 
+## Header Minimization
+
+The current implementation reduces repeated overhead with ULEB metadata, fixed endpoint bitmaps,
+sender IDs/hashes, side-local header templates, and fixed-size side splitting. The first packet on
+a side remains self-describing enough to establish context; follow-up packets on constrained links
+can replace repeated type/endpoint/sender/contract fields with a compact template ID.
+
+Further compatible reductions should use negotiated per-side context rather than removing fields
+globally:
+
+- stream/context profiles that omit sender, endpoints, type, and timestamp when unchanged
+- single-endpoint route contracts that omit the endpoint bitmap on links where the route fixes it
+- small-payload opcodes for common static shapes such as three `f32` values or one `u8` state
+- delta or omitted timestamps for traffic where link time or network-variable versioning is enough
+- grouped ACK/reliability metadata and optional aggregation of several tiny values into one
+  authenticated frame on very low-bandwidth links
+- E2E overhead amortization by sealing multiple tiny payloads under one AEAD tag when latency
+  policy allows it
+
 ## Varints
 
 All integer metadata fields use unsigned LEB128.

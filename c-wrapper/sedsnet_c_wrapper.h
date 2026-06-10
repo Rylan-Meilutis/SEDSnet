@@ -128,10 +128,22 @@ SedsResult seds_wrapper_router_process(SedsWrapperRouter * node, uint32_t timeou
 SedsResult seds_wrapper_router_periodic(SedsWrapperRouter * node, uint32_t timeout_ms);
 SedsResult seds_wrapper_router_poll_timesync(SedsWrapperRouter * node, bool * out_did_queue);
 SedsResult seds_wrapper_router_announce_discovery(SedsWrapperRouter * node);
+SedsResult seds_wrapper_router_announce_leave(SedsWrapperRouter * node);
 SedsResult seds_wrapper_router_poll_discovery(SedsWrapperRouter * node, bool * out_did_queue);
 SedsResult seds_wrapper_router_enable_managed_variable(SedsWrapperRouter * node, SedsTypeRef ty);
+SedsResult seds_wrapper_router_enable_network_variable(SedsWrapperRouter * node,
+                                                       SedsTypeRef ty,
+                                                       bool can_read,
+                                                       bool can_write);
+SedsResult seds_wrapper_router_on_network_variable_update(SedsWrapperRouter * node,
+                                                          SedsTypeRef ty,
+                                                          SedsEndpointHandlerFn cb,
+                                                          void * user);
 void seds_wrapper_router_disable_managed_variable(SedsWrapperRouter * node, SedsTypeRef ty);
 SedsResult seds_wrapper_router_request_managed_variable(SedsWrapperRouter * node, SedsTypeRef ty);
+SedsResult seds_wrapper_router_set_network_variable_serialized(SedsWrapperRouter * node,
+                                                               const uint8_t * bytes,
+                                                               size_t len);
 SedsResult seds_wrapper_router_seed_managed_variable_serialized(SedsWrapperRouter * node,
                                                                 const uint8_t * bytes,
                                                                 size_t len);
@@ -141,26 +153,50 @@ int32_t seds_wrapper_router_cached_managed_variable_serialized(SedsWrapperRouter
                                                                SedsTypeRef ty,
                                                                uint8_t * out,
                                                                size_t out_len);
+int32_t seds_wrapper_router_get_network_variable_serialized_len(SedsWrapperRouter * node,
+                                                                SedsTypeRef ty,
+                                                                uint32_t stale_after_ms);
+int32_t seds_wrapper_router_get_network_variable_serialized(SedsWrapperRouter * node,
+                                                            SedsTypeRef ty,
+                                                            uint32_t stale_after_ms,
+                                                            uint8_t * out,
+                                                            size_t out_len);
 SedsResult seds_global_router_process(uint32_t timeout_ms);
 SedsResult seds_global_router_periodic(uint32_t timeout_ms);
 SedsResult seds_global_router_periodic_no_timesync(uint32_t timeout_ms);
 SedsResult seds_global_router_poll_timesync(bool * out_did_queue);
 SedsResult seds_global_router_announce_discovery(void);
+SedsResult seds_global_router_announce_leave(void);
 SedsResult seds_global_router_poll_discovery(bool * out_did_queue);
 SedsResult seds_global_router_enable_managed_variable(SedsTypeRef ty);
+SedsResult seds_global_router_enable_network_variable(SedsTypeRef ty, bool can_read, bool can_write);
+SedsResult seds_global_router_on_network_variable_update(SedsTypeRef ty,
+                                                         SedsEndpointHandlerFn cb,
+                                                         void * user);
 void seds_global_router_disable_managed_variable(SedsTypeRef ty);
 SedsResult seds_global_router_request_managed_variable(SedsTypeRef ty);
+SedsResult seds_global_router_set_network_variable_serialized(const uint8_t * bytes, size_t len);
 SedsResult seds_global_router_seed_managed_variable_serialized(const uint8_t * bytes, size_t len);
 int32_t seds_global_router_cached_managed_variable_serialized_len(SedsTypeRef ty);
 int32_t seds_global_router_cached_managed_variable_serialized(SedsTypeRef ty,
                                                               uint8_t * out,
                                                               size_t out_len);
+int32_t seds_global_router_get_network_variable_serialized_len(SedsTypeRef ty,
+                                                               uint32_t stale_after_ms);
+int32_t seds_global_router_get_network_variable_serialized(SedsTypeRef ty,
+                                                           uint32_t stale_after_ms,
+                                                           uint8_t * out,
+                                                           size_t out_len);
 SedsResult seds_global_router_get_network_time_ms(uint64_t * out_ms);
 SedsResult seds_global_router_get_network_time(SedsNetworkTime * out);
 int32_t seds_global_router_export_topology_len(void);
 SedsResult seds_global_router_export_topology(char * buf, size_t buf_len);
+int32_t seds_global_router_export_client_stats_len(SedsName sender);
+SedsResult seds_global_router_export_client_stats(SedsName sender, char * buf, size_t buf_len);
 int32_t seds_global_router_export_runtime_stats_len(void);
 SedsResult seds_global_router_export_runtime_stats(char * buf, size_t buf_len);
+int32_t seds_global_router_export_memory_layout_len(void);
+SedsResult seds_global_router_export_memory_layout(char * buf, size_t buf_len);
 
 SedsResult seds_wrapper_router_log_typed(SedsWrapperRouter * node,
                                          SedsTypeRef ty,
@@ -243,15 +279,21 @@ SedsResult seds_global_relay_rx_packet_from_side(SedsSideRef side,
 SedsResult seds_wrapper_relay_process(SedsWrapperRelay * node, uint32_t timeout_ms);
 SedsResult seds_wrapper_relay_periodic(SedsWrapperRelay * node, uint32_t timeout_ms);
 SedsResult seds_wrapper_relay_announce_discovery(SedsWrapperRelay * node);
+SedsResult seds_wrapper_relay_announce_leave(SedsWrapperRelay * node);
 SedsResult seds_wrapper_relay_poll_discovery(SedsWrapperRelay * node, bool * out_did_queue);
 SedsResult seds_global_relay_process(uint32_t timeout_ms);
 SedsResult seds_global_relay_periodic(uint32_t timeout_ms);
 SedsResult seds_global_relay_announce_discovery(void);
+SedsResult seds_global_relay_announce_leave(void);
 SedsResult seds_global_relay_poll_discovery(bool * out_did_queue);
 int32_t seds_global_relay_export_topology_len(void);
 SedsResult seds_global_relay_export_topology(char * buf, size_t buf_len);
+int32_t seds_global_relay_export_client_stats_len(SedsName sender);
+SedsResult seds_global_relay_export_client_stats(SedsName sender, char * buf, size_t buf_len);
 int32_t seds_global_relay_export_runtime_stats_len(void);
 SedsResult seds_global_relay_export_runtime_stats(char * buf, size_t buf_len);
+int32_t seds_global_relay_export_memory_layout_len(void);
+SedsResult seds_global_relay_export_memory_layout(char * buf, size_t buf_len);
 
 SedsResult seds_global_relay_remove_side(SedsSideRef side);
 SedsResult seds_global_relay_set_side_ingress_enabled(SedsSideRef side, bool enabled);

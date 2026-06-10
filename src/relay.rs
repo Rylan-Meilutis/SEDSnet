@@ -10,8 +10,8 @@ use crate::diagnostics::{
 };
 #[cfg(feature = "discovery")]
 use crate::discovery::{
-    self, DISCOVERY_ROUTE_TTL_MS, DiscoveryCadenceState, TopologyAnnouncerRoute, TopologyBoardNode,
-    TopologySideRoute, TopologySnapshot,
+    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DiscoveryCadenceState,
+    TopologyAnnouncerRoute, TopologyBoardNode, TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::{Packet, hash_bytes_u64};
 use crate::queue::{BoundedDeque, ByteCost};
@@ -2437,6 +2437,31 @@ impl Relay {
             return Ok(());
         }
         let mut st = self.state.lock();
+        if pkt.data_type() == crate::DataType::DiscoveryLeave {
+            let leaving = pkt.sender();
+            let before = st.discovery_routes.clone();
+            for route in st.discovery_routes.values_mut() {
+                route.announcers.remove(leaving);
+                for sender_state in route.announcers.values_mut() {
+                    sender_state
+                        .topology_boards
+                        .retain(|board| board.sender_id != leaving);
+                    for board in sender_state.topology_boards.iter_mut() {
+                        board.connections.retain(|peer| peer != leaving);
+                    }
+                    Self::refresh_sender_topology_state(sender_state);
+                }
+                Self::recompute_discovery_side_state(route);
+            }
+            st.discovery_routes
+                .retain(|_, route| !route.announcers.is_empty());
+            if st.discovery_routes != before {
+                Self::note_discovery_topology_change_locked(&mut st, now_ms);
+            }
+            let _ = Self::prune_discovery_routes_locked(&mut st, now_ms);
+            self.reconcile_end_to_end_acked_destinations_locked(&mut st);
+            return Ok(());
+        }
         let mut route = st.discovery_routes.get(&src).cloned().unwrap_or_default();
         let side_link_local_enabled = st
             .sides
@@ -2989,6 +3014,29 @@ impl Relay {
         self.queue_discovery_announce()
     }
 
+    /// Broadcast that this relay is leaving so peers can prune topology immediately.
+    pub fn announce_leave(&self) -> TelemetryResult<()> {
+        let pkt = discovery::build_discovery_leave("relay", self.clock.now_ms())?;
+        let mut st = self.state.lock();
+        let dsts: Vec<usize> = st
+            .sides
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, side)| side.as_ref().map(|_| idx))
+            .collect();
+        for dst in dsts {
+            let data = RelayItem::Packet(Arc::new(pkt.clone()));
+            let priority = Self::relay_item_priority(&data)?;
+            st.push_tx(RelayTxItem {
+                src: None,
+                dst,
+                data,
+                priority,
+            })?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "discovery")]
     /// Polls discovery state and queues an announce if the cadence says one is due.
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
@@ -3014,7 +3062,12 @@ impl Relay {
                     .iter()
                     .map(|(sender_id, sender_state)| TopologyAnnouncerRoute {
                         sender_id: sender_id.clone(),
-                        reachable_endpoints: sender_state.reachable.clone(),
+                        reachable_endpoints: sender_state
+                            .reachable
+                            .iter()
+                            .copied()
+                            .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                            .collect(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
                         routers: sender_state.topology_boards.clone(),
                         last_seen_ms: sender_state.last_seen_ms,
@@ -3024,7 +3077,12 @@ impl Relay {
                 Some(TopologySideRoute {
                     side_id,
                     side_name: side.name,
-                    reachable_endpoints: route.reachable.clone(),
+                    reachable_endpoints: route
+                        .reachable
+                        .iter()
+                        .copied()
+                        .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                        .collect(),
                     reachable_timesync_sources: route.reachable_timesync_sources.clone(),
                     announcers,
                     last_seen_ms: route.last_seen_ms,
@@ -3037,14 +3095,84 @@ impl Relay {
             self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true);
         let advertised_timesync_sources =
             self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+        let links = discovery::topology_links_from_boards(&routers);
         TopologySnapshot {
             advertised_endpoints,
             advertised_timesync_sources,
             routers,
+            links,
             routes,
             current_announce_interval_ms: st.discovery_cadence.current_interval_ms,
             next_announce_ms: st.discovery_cadence.next_announce_ms,
         }
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn client_stats(&self, sender_id: &str) -> Option<ClientStatsSnapshot> {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        let mut side_ids = Vec::new();
+        let mut side_names = Vec::new();
+        let mut last_seen_ms = None::<u64>;
+        let mut reachable_endpoints = Vec::new();
+        let mut reachable_timesync_sources = Vec::new();
+        let mut packets_sent = 0u64;
+        let mut packets_received = 0u64;
+        let mut bytes_sent = 0u64;
+        let mut bytes_received = 0u64;
+
+        for (side_id, route) in &st.discovery_routes {
+            let Some(sender_state) = route.announcers.get(sender_id) else {
+                continue;
+            };
+            side_ids.push(*side_id);
+            if let Some(side_name) = st
+                .sides
+                .get(*side_id)
+                .and_then(|side| side.as_ref())
+                .map(|side| side.name)
+            {
+                side_names.push(side_name);
+            }
+            last_seen_ms = Some(last_seen_ms.unwrap_or(0).max(sender_state.last_seen_ms));
+            reachable_endpoints.extend(sender_state.reachable.iter().copied());
+            reachable_timesync_sources
+                .extend(sender_state.reachable_timesync_sources.iter().cloned());
+            if let Some(stats) = st.side_runtime_stats.get(side_id) {
+                packets_sent = packets_sent.saturating_add(stats.tx_packets);
+                packets_received = packets_received.saturating_add(stats.rx_packets);
+                bytes_sent = bytes_sent.saturating_add(stats.tx_bytes);
+                bytes_received = bytes_received.saturating_add(stats.rx_bytes);
+            }
+        }
+
+        if side_ids.is_empty() {
+            return None;
+        }
+        reachable_endpoints.retain(|ep| !discovery::is_router_control_endpoint(*ep));
+        reachable_endpoints.sort_unstable();
+        reachable_endpoints.dedup();
+        reachable_timesync_sources.sort_unstable();
+        reachable_timesync_sources.dedup();
+        side_ids.sort_unstable();
+        side_ids.dedup();
+        side_names.sort_unstable();
+        side_names.dedup();
+        let age_ms = last_seen_ms.map(|seen| now_ms.saturating_sub(seen));
+        Some(ClientStatsSnapshot {
+            sender_id: sender_id.to_string(),
+            connected: age_ms.is_some_and(|age| age <= DISCOVERY_ROUTE_TTL_MS),
+            side_ids,
+            side_names,
+            last_seen_ms,
+            age_ms,
+            reachable_endpoints,
+            reachable_timesync_sources,
+            packets_sent,
+            packets_received,
+            bytes_sent,
+            bytes_received,
+        })
     }
 
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
@@ -3234,6 +3362,53 @@ impl Relay {
             total_handler_failures: st.total_handler_failures,
             total_handler_retries: st.total_handler_retries,
         }
+    }
+
+    /// Export current relay memory usage/layout as JSON for profiling.
+    pub fn export_memory_layout_json(&self) -> String {
+        let st = self.state.lock();
+        #[cfg(feature = "discovery")]
+        let discovery_bytes = st.discovery_bytes_used();
+        #[cfg(not(feature = "discovery"))]
+        let discovery_bytes = 0usize;
+        let schema_bytes = crate::config::schema_bytes_used();
+        let mut out = String::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"kind\":\"relay\",\
+                 \"shared_queue_bytes_used\":{},\"shared_queue_bytes_allocated\":{},\
+                 \"rx_queue_bytes_used\":{},\"rx_queue_bytes_allocated\":{},\"rx_queue_len\":{},\
+                 \"tx_queue_bytes_used\":{},\"tx_queue_bytes_allocated\":{},\"tx_queue_len\":{},\
+                 \"replay_queue_bytes_used\":{},\"replay_queue_bytes_allocated\":{},\"replay_queue_len\":{},\
+                 \"recent_rx_bytes_used\":{},\"recent_rx_bytes_allocated\":{},\"recent_rx_len\":{},\
+                 \"reliable_rx_buffer_bytes_used\":{},\"reliable_rx_buffer_bytes_allocated\":{},\"reliable_rx_buffer_len\":{},\
+                 \"discovery_bytes_used\":{},\"discovery_bytes_allocated\":{},\
+                 \"schema_bytes_used\":{},\"schema_bytes_allocated\":{}}}",
+                st.shared_queue_bytes_used(),
+                MAX_QUEUE_BUDGET,
+                st.rx_queue.bytes_used(),
+                st.rx_queue.max_bytes(),
+                st.rx_queue.len(),
+                st.tx_queue.bytes_used(),
+                st.tx_queue.max_bytes(),
+                st.tx_queue.len(),
+                st.replay_queue.bytes_used(),
+                st.replay_queue.max_bytes(),
+                st.replay_queue.len(),
+                st.recent_rx.bytes_used(),
+                st.recent_rx.max_bytes(),
+                st.recent_rx.len(),
+                st.reliable_rx_buffered_bytes(),
+                MAX_QUEUE_BUDGET,
+                st.reliable_rx_buffer_len(),
+                discovery_bytes,
+                MAX_QUEUE_BUDGET,
+                schema_bytes,
+                MAX_QUEUE_BUDGET,
+            ),
+        );
+        out
     }
 
     #[cfg(test)]
