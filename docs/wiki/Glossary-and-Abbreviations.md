@@ -9,8 +9,8 @@ API docs.
   `C-Headers/sedsnet.h`.
 - **AAD**: Additional Authenticated Data. Header bytes that are not encrypted but are authenticated
   by the E2E payload wrapper so tampering is detected before handlers see the payload.
-- **AEAD**: Authenticated Encryption with Associated Data. The style of encryption expected from
-  crypto shims: encrypt the payload and authenticate both payload and selected visible header bytes.
+- **AEAD**: Authenticated Cryptography with Associated Data. The style of cryptography expected from
+  cryptography providers: encrypt the payload and authenticate both payload and selected visible header bytes.
 - **CRC**: Cyclic Redundancy Check. Serialized frames include a CRC32 trailer to reject corrupted
   bytes before dispatch.
 - **E2E**: End-to-end. In this project it can mean either end-to-end reliable delivery confirmation
@@ -18,7 +18,7 @@ API docs.
 - **Frame**: A serialized packet byte sequence ready to send over a side.
 - **Packet**: The logical telemetry message before or after serialization. It has a sender, time,
   data type, endpoints, and payload.
-- **Payload**: The application data bytes inside a packet. With `crypto-shim`, these bytes can be
+- **Payload**: The application data bytes inside a packet. With `cryptography`, these bytes can be
   wrapped by the E2E encrypted payload format.
 - **ULEB**: Unsigned Little Endian Base 128. A compact variable-length integer encoding used in
   parts of the wire format.
@@ -59,10 +59,10 @@ API docs.
   managed credential helper stores subject, key id, epoch, validity window, and permission bits.
 - **HMAC**: Hash-based Message Authentication Code. Used by the software fallback and managed
   credential helper for authentication.
-- **Key ID**: An application-defined number used by routers and crypto shims to select the
+- **Key ID**: An application-defined number used by routers and cryptography providers to select the
   symmetric key or provider context for a packet.
 - **MITM**: Man in the middle. An active attacker that can intercept and modify key exchange or
-  traffic. E2E encryption resists MITM only when the key source is authenticated, for example by a
+  traffic. E2E cryptography resists MITM only when the key source is authenticated, for example by a
   provisioned root key, PSK, or master-issued credential.
 - **PSK**: Pre-shared key. A key provisioned before deployment and used to authenticate peers,
   derive traffic keys, or verify a master/root authority.

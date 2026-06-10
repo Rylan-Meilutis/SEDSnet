@@ -730,16 +730,16 @@ impl Clock for StdMonotonicClock {
     }
 }
 
-/// Router-level E2E encryption behavior.
+/// Router-level E2E cryptography behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouterE2eEncryptionMode {
-    /// Do not use E2E encryption. Data types marked `RequireOn` are rejected.
+    /// Do not use E2E cryptography. Data types marked `RequireOn` are rejected.
     Disabled,
-    /// Use E2E encryption only for data types that require it.
+    /// Use E2E cryptography only for data types that require it.
     RequiredOnly,
-    /// Use E2E encryption for required and preferred data types.
+    /// Use E2E cryptography for required and preferred data types.
     Preferred,
-    /// Require E2E encryption for every non-control data type.
+    /// Require E2E cryptography for every non-control data type.
     ForceAll,
 }
 
@@ -751,10 +751,10 @@ pub struct RouterConfig {
     reliable_enabled: bool,
     /// Optional per-router sender override.
     sender: Option<Arc<str>>,
-    /// End-to-end encryption behavior for user data.
+    /// End-to-end cryptography behavior for user data.
     e2e_encryption: RouterE2eEncryptionMode,
-    /// Application-defined key id passed to the crypto shim.
-    #[cfg_attr(not(feature = "crypto-shim"), allow(dead_code))]
+    /// Application-defined key id passed to the cryptography provider.
+    #[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
     e2e_key_id: u32,
     #[cfg(feature = "timesync")]
     timesync: Option<TimeSyncConfig>,
@@ -763,14 +763,14 @@ pub struct RouterConfig {
 impl RouterConfig {
     /// Default router E2E mode for this build.
     ///
-    /// Builds with the crypto shim prefer encrypted payloads automatically for data types that
-    /// request it. Builds without the shim stay disabled and reject `RequireOn` traffic.
+    /// Builds with cryptography prefer encrypted payloads automatically for data types that request
+    /// it. Minimal builds without cryptography stay disabled and reject `RequireOn` traffic.
     pub fn default_e2e_encryption_mode() -> RouterE2eEncryptionMode {
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         {
             RouterE2eEncryptionMode::Preferred
         }
-        #[cfg(not(feature = "crypto-shim"))]
+        #[cfg(not(feature = "cryptography"))]
         {
             RouterE2eEncryptionMode::Disabled
         }
@@ -811,7 +811,7 @@ impl RouterConfig {
         self
     }
 
-    /// Configure this router's end-to-end encryption policy.
+    /// Configure this router's end-to-end cryptography policy.
     pub fn with_e2e_encryption(mut self, mode: RouterE2eEncryptionMode) -> Self {
         self.e2e_encryption = mode;
         self
@@ -854,7 +854,7 @@ impl RouterConfig {
         self.e2e_encryption
     }
 
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     #[inline]
     fn e2e_key_id(&self) -> u32 {
         self.e2e_key_id
@@ -2655,12 +2655,12 @@ impl Router {
     }
 
     fn e2e_crypto_supported(&self) -> bool {
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         {
             self.cfg.e2e_encryption() != RouterE2eEncryptionMode::Disabled
                 && crate::crypto::registered_crypto_available()
         }
-        #[cfg(not(feature = "crypto-shim"))]
+        #[cfg(not(feature = "cryptography"))]
         {
             false
         }
@@ -2692,7 +2692,7 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     fn e2e_seal_config_for_type(&self, ty: DataType) -> Option<serialize::E2eSealConfig> {
         if self.should_require_e2e_for_type(ty) && self.e2e_crypto_supported() {
             Some(serialize::E2eSealConfig {
@@ -2709,7 +2709,7 @@ impl Router {
         pkt: &Packet,
         reliable: Option<serialize::ReliableHeader>,
     ) -> TelemetryResult<Arc<[u8]>> {
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
             return serialize::serialize_packet_with_wire_contract_e2e(
                 pkt,
@@ -2733,7 +2733,7 @@ impl Router {
         shape: Option<MessageElement>,
         target_senders: &[u64],
     ) -> TelemetryResult<Arc<[u8]>> {
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
             return serialize::serialize_packet_with_wire_contract_e2e(
                 pkt,
@@ -2746,7 +2746,7 @@ impl Router {
         serialize::serialize_packet_with_wire_contract(pkt, reliable, shape, target_senders)
     }
 
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     #[inline]
     fn prepare_serialized_for_remote(
         &self,
@@ -3900,7 +3900,7 @@ impl Router {
                 Some(serialize::ReliableHeader { flags, seq, ack: 0 }),
             )?,
             RouterItem::Serialized(bytes) => {
-                #[cfg(feature = "crypto-shim")]
+                #[cfg(feature = "cryptography")]
                 if self.e2e_seal_config_for_type(ty).is_some() {
                     self.prepare_serialized_for_remote(
                         bytes,
@@ -3946,7 +3946,7 @@ impl Router {
                     }
                     Arc::from(v)
                 }
-                #[cfg(not(feature = "crypto-shim"))]
+                #[cfg(not(feature = "cryptography"))]
                 {
                     let mut v = bytes.to_vec();
                     if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
@@ -4482,9 +4482,9 @@ impl Router {
         };
         let result = match (handler, data) {
             (RouterTxHandlerFn::Serialized(f), RouterItem::Serialized(bytes)) => {
-                #[cfg(feature = "crypto-shim")]
+                #[cfg(feature = "cryptography")]
                 let send_bytes = self.prepare_serialized_for_remote(bytes.clone(), None)?;
-                #[cfg(not(feature = "crypto-shim"))]
+                #[cfg(not(feature = "cryptography"))]
                 let send_bytes = bytes.clone();
                 let frames = self.encode_side_transport_frames(side, opts, send_bytes)?;
                 let mut attempts_total = 0usize;

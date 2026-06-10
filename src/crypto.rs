@@ -1,6 +1,6 @@
-//! Feature-gated cryptography shim interfaces.
+//! Feature-gated cryptography provider interfaces.
 //!
-//! Registered C/Rust shims are preferred so std builds can use OS crypto APIs
+//! Registered C/Rust providers are preferred so std builds can use OS crypto APIs
 //! and embedded builds can use hardware accelerators or secure elements. A
 //! small software fallback is also available when a key is registered.
 
@@ -13,11 +13,11 @@ pub const MANAGED_CREDENTIAL_LEN: usize = 80;
 const MANAGED_CREDENTIAL_BODY_LEN: usize = 48;
 const MANAGED_CREDENTIAL_MAGIC: &[u8; 8] = b"SEDSCR1\0";
 
-/// Rust-side AEAD-like payload crypto shim.
+/// Rust-side AEAD-like payload cryptography provider.
 ///
 /// `key_id` is application-defined. `nonce` and `aad` are passed through by the
-/// caller; the shim is responsible for enforcing the algorithm's expected sizes.
-pub trait CryptoShim: Sync {
+/// caller; the provider is responsible for enforcing the algorithm's expected sizes.
+pub trait CryptographyProvider: Sync {
     fn seal(
         &self,
         key_id: u32,
@@ -39,9 +39,9 @@ pub trait CryptoShim: Sync {
     ) -> TelemetryResult<usize>;
 }
 
-/// Use a Rust shim directly without any C ABI involvement.
-pub fn seal_with<S: CryptoShim + ?Sized>(
-    shim: &S,
+/// Use a Rust provider directly without any C ABI involvement.
+pub fn seal_with<S: CryptographyProvider + ?Sized>(
+    provider: &S,
     key_id: u32,
     nonce: &[u8],
     aad: &[u8],
@@ -49,12 +49,12 @@ pub fn seal_with<S: CryptoShim + ?Sized>(
     ciphertext_out: &mut [u8],
     tag_out: &mut [u8],
 ) -> TelemetryResult<(usize, usize)> {
-    shim.seal(key_id, nonce, aad, plaintext, ciphertext_out, tag_out)
+    provider.seal(key_id, nonce, aad, plaintext, ciphertext_out, tag_out)
 }
 
-/// Use a Rust shim directly without any C ABI involvement.
-pub fn open_with<S: CryptoShim + ?Sized>(
-    shim: &S,
+/// Use a Rust provider directly without any C ABI involvement.
+pub fn open_with<S: CryptographyProvider + ?Sized>(
+    provider: &S,
     key_id: u32,
     nonce: &[u8],
     aad: &[u8],
@@ -62,7 +62,7 @@ pub fn open_with<S: CryptoShim + ?Sized>(
     tag: &[u8],
     plaintext_out: &mut [u8],
 ) -> TelemetryResult<usize> {
-    shim.open(key_id, nonce, aad, ciphertext, tag, plaintext_out)
+    provider.open(key_id, nonce, aad, ciphertext, tag, plaintext_out)
 }
 
 pub type CSealFn = unsafe extern "C" fn(
@@ -99,19 +99,19 @@ pub type COpenFn = unsafe extern "C" fn(
 ) -> i32;
 
 #[derive(Clone, Copy)]
-pub struct CCryptoShim {
+pub struct CCryptographyProvider {
     pub seal: Option<CSealFn>,
     pub open: Option<COpenFn>,
     pub user: *mut core::ffi::c_void,
 }
 
-static mut C_SHIM: CCryptoShim = CCryptoShim {
+static mut C_SHIM: CCryptographyProvider = CCryptographyProvider {
     seal: None,
     open: None,
     user: core::ptr::null_mut(),
 };
 
-static mut RUST_SHIM: Option<&'static dyn CryptoShim> = None;
+static mut RUST_SHIM: Option<&'static dyn CryptographyProvider> = None;
 
 #[derive(Clone, Copy)]
 struct SoftwareKey {
@@ -166,52 +166,52 @@ impl SoftwareKeyring {
 
 static mut SOFTWARE_KEYS: SoftwareKeyring = SoftwareKeyring::new();
 
-/// Register a C callback shim. This should be called during board startup
+/// Register a C callback provider. This should be called during board startup
 /// before concurrent router/relay work begins.
-pub fn register_c_crypto_shim(shim: CCryptoShim) {
+pub fn register_c_cryptography_provider(provider: CCryptographyProvider) {
     unsafe {
-        core::ptr::addr_of_mut!(C_SHIM).write(shim);
+        core::ptr::addr_of_mut!(C_SHIM).write(provider);
     }
 }
 
-pub fn clear_c_crypto_shim() {
-    register_c_crypto_shim(CCryptoShim {
+pub fn clear_c_cryptography_provider() {
+    register_c_cryptography_provider(CCryptographyProvider {
         seal: None,
         open: None,
         user: core::ptr::null_mut(),
     });
 }
 
-pub fn c_crypto_shim_registered() -> bool {
-    let shim = unsafe { core::ptr::addr_of!(C_SHIM).read() };
-    shim.seal.is_some() && shim.open.is_some()
+pub fn c_cryptography_provider_registered() -> bool {
+    let provider = unsafe { core::ptr::addr_of!(C_SHIM).read() };
+    provider.seal.is_some() && provider.open.is_some()
 }
 
-/// Register a Rust crypto shim for process-wide router/relay E2E traffic.
+/// Register a Rust cryptography provider for process-wide router/relay E2E traffic.
 ///
-/// Registered shims are preferred over the software fallback. In std builds the
-/// shim can wrap OS crypto APIs; in embedded builds it can wrap hardware crypto
+/// Registered providers are preferred over the software fallback. In std builds the
+/// provider can wrap OS crypto APIs; in embedded builds it can wrap hardware crypto
 /// or a secure element. Call during startup before concurrent router work.
-pub fn register_rust_crypto_shim(shim: &'static dyn CryptoShim) {
+pub fn register_rust_cryptography_provider(provider: &'static dyn CryptographyProvider) {
     unsafe {
-        core::ptr::addr_of_mut!(RUST_SHIM).write(Some(shim));
+        core::ptr::addr_of_mut!(RUST_SHIM).write(Some(provider));
     }
 }
 
-pub fn clear_rust_crypto_shim() {
+pub fn clear_rust_cryptography_provider() {
     unsafe {
         core::ptr::addr_of_mut!(RUST_SHIM).write(None);
     }
 }
 
-pub fn rust_crypto_shim_registered() -> bool {
+pub fn rust_cryptography_provider_registered() -> bool {
     unsafe { core::ptr::addr_of!(RUST_SHIM).read().is_some() }
 }
 
 /// Register a software fallback key for `key_id`.
 ///
 /// The fallback uses HMAC-SHA256 to derive a stream and authenticate the
-/// ciphertext. Prefer OS/hardware shims when they are available; this path keeps
+/// ciphertext. Prefer OS/hardware providers when they are available; this path keeps
 /// encrypted traffic functional when no accelerator or OS provider is present.
 pub fn register_software_key(key_id: u32, key: &[u8]) -> TelemetryResult<()> {
     let mut keyring = unsafe { core::ptr::addr_of!(SOFTWARE_KEYS).read() };
@@ -233,7 +233,9 @@ pub fn software_crypto_available() -> bool {
 }
 
 pub fn registered_crypto_available() -> bool {
-    c_crypto_shim_registered() || rust_crypto_shim_registered() || software_crypto_available()
+    c_cryptography_provider_registered()
+        || rust_cryptography_provider_registered()
+        || software_crypto_available()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +303,7 @@ pub fn verify_managed_credential(
     Ok(credential)
 }
 
-pub fn seal_with_registered_c_shim(
+pub fn seal_with_registered_c_provider(
     key_id: u32,
     nonce: &[u8],
     aad: &[u8],
@@ -309,8 +311,8 @@ pub fn seal_with_registered_c_shim(
     ciphertext_out: &mut [u8],
     tag_out: &mut [u8],
 ) -> TelemetryResult<(usize, usize)> {
-    let shim = unsafe { core::ptr::addr_of!(C_SHIM).read() };
-    let Some(seal) = shim.seal else {
+    let provider = unsafe { core::ptr::addr_of!(C_SHIM).read() };
+    let Some(seal) = provider.seal else {
         return Err(TelemetryError::BadArg);
     };
     let mut ciphertext_len = 0usize;
@@ -330,7 +332,7 @@ pub fn seal_with_registered_c_shim(
             tag_out.as_mut_ptr(),
             tag_out.len(),
             &mut tag_len,
-            shim.user,
+            provider.user,
         )
     };
     if status != 0 {
@@ -342,7 +344,7 @@ pub fn seal_with_registered_c_shim(
     Ok((ciphertext_len, tag_len))
 }
 
-pub fn open_with_registered_c_shim(
+pub fn open_with_registered_c_provider(
     key_id: u32,
     nonce: &[u8],
     aad: &[u8],
@@ -350,8 +352,8 @@ pub fn open_with_registered_c_shim(
     tag: &[u8],
     plaintext_out: &mut [u8],
 ) -> TelemetryResult<usize> {
-    let shim = unsafe { core::ptr::addr_of!(C_SHIM).read() };
-    let Some(open) = shim.open else {
+    let provider = unsafe { core::ptr::addr_of!(C_SHIM).read() };
+    let Some(open) = provider.open else {
         return Err(TelemetryError::BadArg);
     };
     let mut plaintext_len = 0usize;
@@ -369,7 +371,7 @@ pub fn open_with_registered_c_shim(
             plaintext_out.as_mut_ptr(),
             plaintext_out.len(),
             &mut plaintext_len,
-            shim.user,
+            provider.user,
         )
     };
     if status != 0 {
@@ -389,11 +391,26 @@ pub fn seal_with_registered_crypto(
     ciphertext_out: &mut [u8],
     tag_out: &mut [u8],
 ) -> TelemetryResult<(usize, usize)> {
-    if c_crypto_shim_registered() {
-        return seal_with_registered_c_shim(key_id, nonce, aad, plaintext, ciphertext_out, tag_out);
+    if c_cryptography_provider_registered() {
+        return seal_with_registered_c_provider(
+            key_id,
+            nonce,
+            aad,
+            plaintext,
+            ciphertext_out,
+            tag_out,
+        );
     }
-    if let Some(shim) = unsafe { core::ptr::addr_of!(RUST_SHIM).read() } {
-        return seal_with(shim, key_id, nonce, aad, plaintext, ciphertext_out, tag_out);
+    if let Some(provider) = unsafe { core::ptr::addr_of!(RUST_SHIM).read() } {
+        return seal_with(
+            provider,
+            key_id,
+            nonce,
+            aad,
+            plaintext,
+            ciphertext_out,
+            tag_out,
+        );
     }
     seal_with_software_key(key_id, nonce, aad, plaintext, ciphertext_out, tag_out)
 }
@@ -406,11 +423,11 @@ pub fn open_with_registered_crypto(
     tag: &[u8],
     plaintext_out: &mut [u8],
 ) -> TelemetryResult<usize> {
-    if c_crypto_shim_registered() {
-        return open_with_registered_c_shim(key_id, nonce, aad, ciphertext, tag, plaintext_out);
+    if c_cryptography_provider_registered() {
+        return open_with_registered_c_provider(key_id, nonce, aad, ciphertext, tag, plaintext_out);
     }
-    if let Some(shim) = unsafe { core::ptr::addr_of!(RUST_SHIM).read() } {
-        return open_with(shim, key_id, nonce, aad, ciphertext, tag, plaintext_out);
+    if let Some(provider) = unsafe { core::ptr::addr_of!(RUST_SHIM).read() } {
+        return open_with(provider, key_id, nonce, aad, ciphertext, tag, plaintext_out);
     }
     open_with_software_key(key_id, nonce, aad, ciphertext, tag, plaintext_out)
 }
@@ -727,7 +744,7 @@ mod tests {
 
     struct XorShim;
 
-    impl CryptoShim for XorShim {
+    impl CryptographyProvider for XorShim {
         fn seal(
             &self,
             key_id: u32,
@@ -767,13 +784,13 @@ mod tests {
     }
 
     #[test]
-    fn rust_crypto_shim_roundtrips_without_c_callbacks() {
-        let shim = XorShim;
+    fn rust_encryption_roundtrips_without_c_callbacks() {
+        let provider = XorShim;
         let plaintext = [1_u8, 2, 3, 4];
         let mut ciphertext = [0_u8; 8];
         let mut tag = [0_u8; 8];
         let (ciphertext_len, tag_len) = seal_with(
-            &shim,
+            &provider,
             9,
             &[0; 12],
             b"aad",
@@ -786,7 +803,7 @@ mod tests {
         assert_eq!(tag_len, 4);
         let mut opened = [0_u8; 8];
         let opened_len = open_with(
-            &shim,
+            &provider,
             9,
             &[0; 12],
             b"aad",

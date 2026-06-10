@@ -5206,12 +5206,12 @@ mod router_tests {
             StepClock::new_box(0, 0)
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         fn crypto_test_guard() -> std::sync::MutexGuard<'static, ()> {
             static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let guard = LOCK.lock().unwrap();
-            crate::crypto::clear_c_crypto_shim();
-            crate::crypto::clear_rust_crypto_shim();
+            crate::crypto::clear_c_cryptography_provider();
+            crate::crypto::clear_rust_cryptography_provider();
             crate::crypto::clear_software_keys();
             guard
         }
@@ -9440,7 +9440,7 @@ mod router_tests {
 
         #[test]
         fn required_e2e_type_rejects_tx_without_crypto_support() {
-            #[cfg(feature = "crypto-shim")]
+            #[cfg(feature = "cryptography")]
             let _crypto_guard = crypto_test_guard();
             crate::tests::ensure_common_test_schema();
             let ep = DataEndpoint::named("RADIO");
@@ -9466,7 +9466,7 @@ mod router_tests {
 
         #[test]
         fn forced_e2e_router_rejects_plain_user_data_without_crypto_support() {
-            #[cfg(feature = "crypto-shim")]
+            #[cfg(feature = "cryptography")]
             let _crypto_guard = crypto_test_guard();
             crate::tests::ensure_common_test_schema();
             let ty = DataType::named("GPS_DATA");
@@ -9480,7 +9480,7 @@ mod router_tests {
             );
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         unsafe extern "C" fn test_crypto_seal(
             key_id: u32,
             _nonce: *const u8,
@@ -9523,7 +9523,7 @@ mod router_tests {
             0
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         unsafe extern "C" fn test_crypto_open(
             key_id: u32,
             _nonce: *const u8,
@@ -9566,7 +9566,7 @@ mod router_tests {
             0
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         fn refresh_crc32(bytes: &mut [u8]) {
             let data_len = bytes.len() - 4;
             let mut hasher = crc32fast::Hasher::new();
@@ -9575,21 +9575,21 @@ mod router_tests {
             bytes[data_len..].copy_from_slice(&crc.to_le_bytes());
         }
 
-        #[cfg(feature = "crypto-shim")]
-        fn register_test_crypto_shim() {
-            crate::crypto::register_c_crypto_shim(crate::crypto::CCryptoShim {
+        #[cfg(feature = "cryptography")]
+        fn register_test_encryption() {
+            crate::crypto::register_c_cryptography_provider(crate::crypto::CCryptographyProvider {
                 seal: Some(test_crypto_seal),
                 open: Some(test_crypto_open),
                 user: core::ptr::null_mut(),
             });
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         #[test]
         fn preferred_e2e_type_seals_serialized_side_payload_and_roundtrips() {
             let _crypto_guard = crypto_test_guard();
             crate::tests::ensure_common_test_schema();
-            register_test_crypto_shim();
+            register_test_encryption();
             let ep = DataEndpoint::named("RADIO");
             let ty = DataType(3_902);
             let _ = remove_data_type(ty);
@@ -9627,10 +9627,10 @@ mod router_tests {
             assert_eq!(decoded.payload(), payload);
 
             let _ = remove_data_type(ty);
-            crate::crypto::clear_c_crypto_shim();
+            crate::crypto::clear_c_cryptography_provider();
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         #[test]
         fn software_crypto_fallback_seals_payload_when_no_shim_is_registered() {
             let _crypto_guard = crypto_test_guard();
@@ -9682,12 +9682,12 @@ mod router_tests {
             let _ = remove_data_type(ty);
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         #[test]
         fn encrypted_payload_rejects_authenticated_header_tamper() {
             let _crypto_guard = crypto_test_guard();
             crate::tests::ensure_common_test_schema();
-            register_test_crypto_shim();
+            register_test_encryption();
             let ep = DataEndpoint::named("RADIO");
             let ty = DataType(3_903);
             let _ = remove_data_type(ty);
@@ -9723,15 +9723,15 @@ mod router_tests {
             assert!(serialize::deserialize_packet(&wire).is_err());
 
             let _ = remove_data_type(ty);
-            crate::crypto::clear_c_crypto_shim();
+            crate::crypto::clear_c_cryptography_provider();
         }
 
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         #[test]
         fn preferred_e2e_fanout_reaches_three_boards_with_same_endpoint_and_rejects_mods() {
             let _crypto_guard = crypto_test_guard();
             crate::tests::ensure_common_test_schema();
-            register_test_crypto_shim();
+            register_test_encryption();
             let ep = DataEndpoint::named("RADIO");
             let ty = DataType(3_904);
             let _ = remove_data_type(ty);
@@ -9808,7 +9808,7 @@ mod router_tests {
             assert!(board_b.rx_serialized(&payload_tampered).is_err());
 
             let _ = remove_data_type(ty);
-            crate::crypto::clear_c_crypto_shim();
+            crate::crypto::clear_c_cryptography_provider();
         }
 
         #[test]

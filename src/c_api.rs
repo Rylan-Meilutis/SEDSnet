@@ -38,12 +38,12 @@ use crate::{MessageDataType::NoData, get_data_type};
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
 use core::{ffi::c_char, ffi::c_void, mem::size_of, ptr, slice, str::from_utf8};
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 use crate::crypto::{
-    CCryptoShim, MANAGED_CREDENTIAL_LEN, ManagedCredential, clear_c_crypto_shim,
-    clear_software_keys, issue_managed_credential, open_with_registered_crypto,
-    register_c_crypto_shim, register_software_key, seal_with_registered_crypto,
-    verify_managed_credential,
+    CCryptographyProvider, MANAGED_CREDENTIAL_LEN, ManagedCredential,
+    clear_c_cryptography_provider, clear_software_keys, issue_managed_credential,
+    open_with_registered_crypto, register_c_cryptography_provider, register_software_key,
+    seal_with_registered_crypto, verify_managed_credential,
 };
 use crate::relay::{Relay, RelaySideId, RelaySideOptions};
 // ============================================================================
@@ -260,7 +260,7 @@ pub struct SedsDataTypeInfo {
     description_len: usize,
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[repr(C)]
 pub struct SedsManagedCredentialInfo {
     subject_id: u64,
@@ -4357,9 +4357,9 @@ pub extern "C" fn seds_owned_header_view(
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_crypto_register_shim(
+pub extern "C" fn seds_crypto_register_provider(
     seal: Option<crate::crypto::CSealFn>,
     open: Option<crate::crypto::COpenFn>,
     user: *mut c_void,
@@ -4367,17 +4367,17 @@ pub extern "C" fn seds_crypto_register_shim(
     if seal.is_none() || open.is_none() {
         return status_from_err(TelemetryError::BadArg);
     }
-    register_c_crypto_shim(CCryptoShim { seal, open, user });
+    register_c_cryptography_provider(CCryptographyProvider { seal, open, user });
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_crypto_clear_shim() {
-    clear_c_crypto_shim();
+pub extern "C" fn seds_crypto_clear_provider() {
+    clear_c_cryptography_provider();
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_register_software_key(
     key_id: u32,
@@ -4391,13 +4391,13 @@ pub extern "C" fn seds_crypto_register_software_key(
     ok_or_status(register_software_key(key_id, key))
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_clear_software_keys() {
     clear_software_keys();
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_issue_managed_credential(
     root_key: *const u8,
@@ -4434,7 +4434,7 @@ pub extern "C" fn seds_crypto_issue_managed_credential(
     }
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_verify_managed_credential(
     root_key: *const u8,
@@ -4469,7 +4469,7 @@ pub extern "C" fn seds_crypto_verify_managed_credential(
     }
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_seal(
     key_id: u32,
@@ -4511,7 +4511,7 @@ pub extern "C" fn seds_crypto_seal(
     }
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_open(
     key_id: u32,

@@ -47,7 +47,7 @@ Top-level frame flags:
 - `0x02`: sender compressed
 - `0x04`: wire contract present
 - `0x08`: packet nonce present
-- `0x10`: payload bytes are wrapped by the feature-gated E2E crypto shim
+- `0x10`: payload bytes are wrapped by the feature-gated E2E cryptography provider
 
 When `0x10` is set, routing metadata remains visible, but the payload region is:
 
@@ -61,8 +61,8 @@ TAG_BYTES
 CIPHERTEXT_BYTES
 ```
 
-The authenticated data passed to the crypto shim is the serialized frame prefix through the optional
-reliable header, excluding the payload wrapper and CRC. Deserializers built without `crypto-shim`
+The authenticated data passed to the cryptography provider is the serialized frame prefix through the optional
+reliable header, excluding the payload wrapper and CRC. Deserializers built without `cryptography`
 reject frames with `0x10` rather than exposing ciphertext as application data.
 
 For multi-board endpoints, a sender can use an application-managed endpoint/group traffic key so

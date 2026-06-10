@@ -1,6 +1,6 @@
-# SEDSNet Documentation
+# SEDSnet Documentation
 
-SEDSNet is a Rust telemetry transport and logging library with a shared schema, compact wire format, routing, and
+SEDSnet is a Rust telemetry transport and logging library with a shared schema, compact wire format, routing, and
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 

@@ -35,7 +35,7 @@ Definitions carry:
 - string name
 - human-readable description
 - endpoint link-local flag
-- data type shape, allowed endpoints, reliability mode, queue priority, and E2E encryption policy
+- data type shape, allowed endpoints, reliability mode, queue priority, and E2E cryptography policy
 
 Lookup/export APIs include:
 

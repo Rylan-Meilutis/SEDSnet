@@ -109,12 +109,12 @@ router.process_all_queues()
 
 E2E policy values are `0=PreferOff`, `1=PreferOn`, and `2=RequireOn`. Router E2E modes are
 `0=Disabled`, `1=RequiredOnly`, `2=Preferred`, and `3=ForceAll`. The constructor default
-`e2e_mode=255` means "build default": `Preferred` when the extension is built with `crypto-shim`,
-otherwise `Disabled`. Builds without crypto support reject `RequireOn` traffic instead of silently
-downgrading it.
+`e2e_mode=255` means "build default": `Preferred` for normal Python builds because `cryptography`
+is part of the `python` feature. Custom extensions built without cryptography default to `Disabled`
+and reject `RequireOn` traffic instead of silently downgrading it.
 
 Key exchange is board/application owned. Run your quantum-resistant asynchronous exchange when
-discovery learns a peer, derive symmetric traffic keys, and have the crypto shim select those keys by
+discovery learns a peer, derive symmetric traffic keys, and have the cryptography provider select those keys by
 `e2e_key_id`. For three boards advertising the same endpoint, use an endpoint/group traffic key so
 all intended boards can open the same message; authenticated payloads reject header or ciphertext
 changes before handlers see data.

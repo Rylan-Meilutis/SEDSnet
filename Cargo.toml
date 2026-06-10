@@ -4,7 +4,7 @@ version = "4.0.0"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
-description = "A memory safe, no_std-capable telemetry networking stack with routing, discovery, reliability, and Rust/C/Python bindings."
+description = "A memory safe, no_std-capable networking stack with routing, discovery, reliability, and Rust/C/Python bindings."
 license = "GPL-2"
 repository = "github.com/rylan-meilutis/SEDSnet"
 keywords = ["telemetry", "networking", "no_std", "embedded", "pyo3"]
@@ -12,17 +12,18 @@ categories = ["embedded", "no-std"]
 readme = "README.md"
 
 [lib]
+name = "sedsnet"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["std", "compression", "timesync", "discovery"]
+default = ["std", "compression", "timesync", "discovery", "cryptography"]
 std = ["serde", "serde/std", "serde_json", "serde_json/std"]
-embedded = ["compression", "timesync", "discovery", "serde", "serde_json", "serde_json/alloc"]
-python = ["std", "pyo3/extension-module", "compression", "timesync", "discovery"]
+embedded = ["compression", "timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
+python = ["std", "pyo3/extension-module", "compression", "timesync", "discovery", "cryptography"]
 compression = ["zstd-safe"]
 timesync = []
 discovery = []
-crypto-shim = []
+cryptography = []
 
 [package.metadata.maturin]
 bindings = "pyo3"

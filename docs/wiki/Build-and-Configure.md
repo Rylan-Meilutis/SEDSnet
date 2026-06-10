@@ -41,7 +41,7 @@ Useful options:
 - `static_schema_path=<path>` sets `SEDSNET_STATIC_SCHEMA_PATH` for runtime registry seeding.
 - `static_ipc_schema_path=<path>` sets `SEDSNET_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
 - `max_stack_payload=<n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
-- `crypto_shim` enables the feature-gated crypto shim APIs.
+- `cryptography` is enabled by default and provides the cryptography provider APIs.
 - `env:KEY=VALUE` passes any compile-time env var used by
   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 - `target=<triple>` sets the Rust target triple for embedded builds.
@@ -56,7 +56,7 @@ Cargo.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/Cargo.t
 - `python`: enables pyo3 bindings.
 - `compression` (default): enables payload compression (implemented with `zstd-safe`).
 - `timesync`: enables time sync helpers and built-in time sync packet types.
-- `crypto-shim`: enables Rust crypto shim helpers plus optional C callback registration APIs.
+- `cryptography` (default): enables Rust cryptography provider helpers plus optional C callback registration APIs.
 
 Examples:
 
@@ -223,7 +223,7 @@ Common CMake variables:
 - `SEDSNET_MAX_STACK_PAYLOAD`
 - `SEDSNET_ENABLE_C_WRAPPER` (ON/OFF, builds `sedsnet::c_wrapper`)
 - `SEDSNET_ENABLE_CPP_WRAPPER` (ON/OFF, exposes `sedsnet::cpp_wrapper`)
-- `SEDSNET_ENABLE_CRYPTO_SHIM` (ON/OFF, enables `crypto-shim` and defines `SEDS_ENABLE_CRYPTO_SHIM`)
+- `SEDSNET_ENABLE_CRYPTOGRAPHY` (ON/OFF, enables `cryptography` and defines `SEDS_ENABLE_CRYPTOGRAPHY`)
 - `SEDSNET_ENV_<KEY>` for any config env var
 
 After `add_subdirectory`, link the target:

@@ -96,7 +96,7 @@ variable remembers the newest local or received packet for that type. A restarte
 `request_managed_variable(...)` and peers replay the original value packet, so normal endpoint
 handlers run immediately with the cached global state.
 
-Data types can also advertise an E2E encryption preference:
+Data types can also advertise an E2E cryptography preference:
 
 ```rust
 use sedsnet::config::register_data_type_id_with_description_and_e2e_encryption;
@@ -133,21 +133,22 @@ Router modes are:
 - `Preferred`: encrypt required and preferred data types
 - `ForceAll`: encrypt every non-control user data type
 
-`RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically when the
-crate is built with `crypto-shim`; builds without `crypto-shim` default to `Disabled`.
+`RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically with the
+default `cryptography` feature; minimal builds that explicitly omit `cryptography` default to
+`Disabled`.
 
-The `crypto-shim` feature uses this provider order:
+The `cryptography` feature uses this provider order:
 
-- registered C shim, for C firmware, OS crypto, secure elements, or hardware accelerators
-- registered Rust shim, for Rust-only firmware or std applications wrapping OS crypto
+- registered C provider, for C firmware, OS crypto, secure elements, or hardware accelerators
+- registered Rust provider, for Rust-only firmware or std applications wrapping OS crypto
 - built-in software fallback, only after the application registers a key for the packet `key_id`
 
 Serialized side traffic carries visible routing metadata and an encrypted payload; the visible
 header is authenticated as AAD so header tampering fails during open. The built-in fallback uses the
-provisioned key for authenticated encryption, but it does not create identity by itself.
+provisioned key for authenticated cryptography, but it does not create identity by itself.
 
 ```rust
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 sedsnet::crypto::register_software_key(
     7,
     b"32-byte minimum deployment secret....",
@@ -161,14 +162,14 @@ credentials, and peer/session keys are accepted only when the key exchange trans
 to that root. Without that authenticated root, an active attacker can substitute keys before the
 AEAD layer ever sees a packet.
 
-The `crypto-shim` feature includes a compact 80-byte managed credential helper for this
+The `cryptography` feature includes a compact 80-byte managed credential helper for this
 master-root model. The master issues a `ManagedCredential` containing subject id, key id, epoch,
 validity window, and permission bits; peers verify it against the provisioned root key before
 accepting issued session/group keys.
 
 For board-to-board deployments, run your board-owned quantum-resistant asynchronous key exchange
 when discovery learns a peer, derive a low-cost symmetric traffic key, and pass that key through the
-shim by `key_id`. Multi-drop endpoint traffic can use a shared group traffic key when every holder of
+provider by `key_id`. Multi-drop endpoint traffic can use a shared group traffic key when every holder of
 that endpoint must decode the same message; AEAD authentication still prevents a receiver from
 modifying the frame for downstream boards without detection.
 

@@ -1,7 +1,8 @@
-# SEDSNet
+# SEDSnet
 
-A Rust telemetry networking stack with compact packets, runtime schema, discovery, routing,
-reliability, managed state sync, optional E2E payload encryption, and C/Python bindings.
+A Rust networking stack with compact packets, runtime schema, discovery, routing,
+reliability, managed state sync, optional E2E payload cryptography, and C/Python bindings build for use in distributed 
+embedded and non embedded systems.
 
 ---
 
@@ -25,7 +26,7 @@ archived and is no longer being maintained.
 With the Rust version being the sole implementation, we have continued to improve it and add new features like python
 bindings, packet compression, and a bitmap for endpoints to further reduce packet size.
 This library is now being used in multiple projects including embedded code on the rocket and on the rust based ground
-station. SEDSNet is now capable of acting as a new network, passing telemetry data to endpoints across hardware
+station. SEDSnet is now capable of acting as a new network, passing telemetry data to endpoints across hardware
 and software networks (uart, can ethernet, etc.) and across differing platforms and protocols (tcp, udp, etc.).
 
 ---
@@ -45,14 +46,14 @@ The core functions are as follows:
 - A function to handle local data endpoints (e.g. logging to console, writing to file, sending over radio, etc.)
   (Note: each local endpoint needs its own function)
 
-SEDSNet also provides helpers to convert the telemetry data into strings for logging purposes.
+SEDSnet also provides helpers to convert the telemetry data into strings for logging purposes.
 The library also handles the serialization and deserialization of the telemetry data.
 
-SEDSNet is platform-agnostic and can be used on any platform that supports Rust. The library is primarily designed
+SEDSnet is platform-agnostic and can be used on any platform that supports Rust. The library is primarily designed
 to be used in embedded systems and used by a C program, but can also be used in desktop applications and other rust
 codebases.
 
-SEDSNet also supports python bindings via pyo3. to use you need maturin installed to build the python package.
+SEDSnet also supports python bindings via pyo3. to use you need maturin installed to build the python package.
 
 With the optional `discovery` feature, routers and relays can exchange built-in discovery packets, learn which
 endpoints are reachable through which sides, adapt the announce rate as the topology changes, and export a live topology
@@ -77,8 +78,8 @@ can still retransmit it later.
 
 Routers can also cache selected data types as managed network variables. A board that restarts can request the current
 cached value and receive it through the normal endpoint handler path instead of waiting for the next publisher update.
-For sensitive state or commands, the optional `crypto-shim` feature lets data types prefer or require end-to-end payload
-encryption while the application supplies a C shim, Rust shim, OS/hardware crypto wrapper, or registered software key.
+For sensitive state or commands, the default `cryptography` feature lets data types prefer or require end-to-end payload
+cryptography while the application supplies a C provider, Rust provider, OS/hardware crypto wrapper, or registered software key.
 
 When topology or schema changes are propagating, packets already on the wire now carry a compact frozen delivery and
 decode contract. New packets immediately use the latest endpoint bitmap/schema view, while in-flight packets continue to
@@ -105,9 +106,9 @@ environments.
 - C and Python expose matching schema register/info/info-by-name/remove APIs.
 - Managed network variables let restarted boards request the latest cached state through normal
   endpoint handlers.
-- End-to-end payload encryption can be preferred or required per data type when the crate is built
-  with `crypto-shim`; routers choose whether to encrypt required, preferred, or all user data.
-- Crypto providers can be supplied as C callbacks, Rust shims, or registered software fallback
+- End-to-end payload cryptography is enabled by default and can be preferred or required per data type;
+  routers choose whether to encrypt required, preferred, or all user data.
+- Crypto providers can be supplied as C callbacks, Rust providers, or registered software fallback
   keys, and compact managed credentials support master-root deployments without user-managed cert
   files.
 - Fixed-size serialized sides transparently split/reassemble packets for CAN, I2C, and fixed-frame
@@ -217,7 +218,7 @@ Building with python bindings can be done with the build script on posix systems
 
 When building in an embedded environment the library will compile to a static library that can be linked to your C code.
 this library takes up about 100kb of flash and does require heap allocation to be available through either freertos, or
-by creating shims that expose pvPortMalloc and vPortFree.
+by creating providers that expose pvPortMalloc and vPortFree.
 
 
 ## Embedded hooks
@@ -346,7 +347,7 @@ set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
-set(SEDSNET_ENABLE_CRYPTO_SHIM ON CACHE BOOL "" FORCE)
+set(SEDSNET_ENABLE_CRYPTOGRAPHY ON CACHE BOOL "" FORCE)
 
 # optional wrapper targets; leave both OFF to use only the raw static ABI header
 set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
@@ -528,16 +529,16 @@ If a peer has cached that type, the current packet is replayed through the norma
 This keeps the application API the same whether the value arrived from a live publisher or from a
 network resync request.
 
-Data types can also choose an E2E payload encryption policy:
+Data types can also choose an E2E payload cryptography policy:
 
-- `PreferOff`: plaintext unless the router forces encryption
+- `PreferOff`: plaintext unless the router forces cryptography
 - `PreferOn`: encrypt when router crypto support is available
-- `RequireOn`: reject send/subscribe paths unless encryption support is available
+- `RequireOn`: reject send/subscribe paths unless cryptography support is available
 
-Router E2E modes are `Disabled`, `RequiredOnly`, `Preferred`, and `ForceAll`. When the
-`crypto-shim` feature is enabled, the default is `Preferred`; without it, the default is
-`Disabled`. Crypto providers are tried in this order: registered C shim, registered Rust shim, then
-registered software fallback key. The shim path is intended for OS crypto, hardware accelerators,
+Router E2E modes are `Disabled`, `RequiredOnly`, `Preferred`, and `ForceAll`. With the default
+`cryptography` feature, the default is `Preferred`; minimal builds that explicitly omit it default
+to `Disabled`. Crypto providers are tried in this order: registered C provider, registered Rust provider, then
+registered software fallback key. The provider path is intended for OS crypto, hardware accelerators,
 secure elements, and Rust-only embedded projects. Compact managed credential helpers are available
 for deployments where a master/root node issues short-lived board credentials instead of users
 managing certificate files.

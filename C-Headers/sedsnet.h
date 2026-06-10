@@ -320,11 +320,11 @@ SedsRouter * seds_router_new(
                              );
 
 /**
- * @brief Create a router with explicit end-to-end encryption settings.
+ * @brief Create a router with explicit end-to-end cryptography settings.
  *
  * `e2e_mode`: SEDS_ROUTER_E2E_DISABLED, SEDS_ROUTER_E2E_REQUIRED_ONLY,
  * SEDS_ROUTER_E2E_PREFERRED, or SEDS_ROUTER_E2E_FORCE_ALL.
- * `e2e_key_id` is application-defined and passed through to the registered crypto shim.
+ * `e2e_key_id` is application-defined and passed through to the registered cryptography provider.
  */
 SedsRouter * seds_router_new_ex(
                                 SedsRouterMode mode,
@@ -1255,7 +1255,7 @@ SedsResult seds_relay_process_tx_queue_with_timeout(SedsRelay * r, uint32_t time
  */
 SedsResult seds_relay_process_all_queues_with_timeout(SedsRelay * r, uint32_t timeout_ms);
 
-#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 typedef SedsResult (* SedsCryptoSealFn)(
     uint32_t key_id,
     const uint8_t * nonce,
@@ -1296,8 +1296,8 @@ typedef struct SedsManagedCredentialInfo {
     uint32_t permissions;
 } SedsManagedCredentialInfo;
 
-SedsResult seds_crypto_register_shim(SedsCryptoSealFn seal, SedsCryptoOpenFn open, void * user);
-void seds_crypto_clear_shim(void);
+SedsResult seds_crypto_register_provider(SedsCryptoSealFn seal, SedsCryptoOpenFn open, void * user);
+void seds_crypto_clear_provider(void);
 SedsResult seds_crypto_register_software_key(uint32_t key_id,
                                              const uint8_t * key,
                                              size_t key_len);

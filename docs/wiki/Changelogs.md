@@ -41,11 +41,11 @@
       through the normal endpoint handler path instead of waiting for the next publisher update.
     - The cache can also be seeded from already serialized traffic.
 - E2E payload security:
-    - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn` encryption policy.
-    - Routers can run with encryption `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll`.
-    - Builds without `crypto-shim` reject required encrypted traffic instead of silently falling
+    - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn` cryptography policy.
+    - Routers can run with cryptography `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll`.
+    - Builds without `cryptography` reject required encrypted traffic instead of silently falling
       back to plaintext.
-    - The `crypto-shim` provider chain supports C callbacks, Rust shims, and a registered software
+    - The `cryptography` provider chain supports C callbacks, Rust providers, and a registered software
       fallback key so host builds can wrap OS crypto and embedded builds can wrap hardware crypto or
       secure elements.
     - Compact managed credential helpers support master-root deployments without requiring users to
@@ -74,7 +74,7 @@
 - Tests and examples:
     - Rust tests and benches now use readable string-backed lookups instead of raw legacy IDs.
     - Added regression coverage for schema sync, conflict resolution, budget accounting, string
-      lookup, metadata, removal, managed variables, crypto credentials/shims, topology exports,
+      lookup, metadata, removal, managed variables, crypto credentials/providers, topology exports,
       link probing, fixed-size splitting, and nextest-aware test execution.
 
 ## Version 3.12.0 highlights

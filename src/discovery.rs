@@ -799,10 +799,10 @@ pub fn decode_discovery_schema_payload(
             e2e_encryption_policy_from_code(read_u8(
                 payload,
                 &mut cursor,
-                "discovery schema e2e encryption",
+                "discovery schema e2e cryptography",
             )?)
             .ok_or(TelemetryError::Deserialize(
-                "discovery schema e2e encryption",
+                "discovery schema e2e cryptography",
             ))?
         } else {
             E2eEncryptionPolicy::PreferOff

@@ -33,7 +33,7 @@ Options (can be combined where it makes sense):
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
-  crypto_shim             Enable crypto shim APIs (Rust trait helpers + optional C callbacks).
+  cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
   maturin-build           Run `maturin build` with the .pyi .gitignore hack.
   maturin-develop         Run `maturin develop` with the .pyi .gitignore hack.
   maturin-install         Build wheel and install it with `uv pip install`.
@@ -847,7 +847,7 @@ def main(argv: list[str]) -> None:
     build_embedded = False
     build_python = False
     build_timesync = False
-    build_crypto_shim = False
+    build_cryptography = False
     build_wheel = False
     develop_wheel = False
     release_build = False
@@ -885,9 +885,9 @@ def main(argv: list[str]) -> None:
             print("Building with time sync helpers.")
             build_timesync = True
 
-        elif arg == "crypto_shim":
-            print("Building with crypto shim APIs.")
-            build_crypto_shim = True
+        elif arg == "cryptography":
+            print("Building with cryptography provider APIs.")
+            build_cryptography = True
 
         elif arg == "maturin-build":
             print("Building Python wheel.")
@@ -983,8 +983,8 @@ def main(argv: list[str]) -> None:
         feature_parts = []
         if build_timesync:
             feature_parts.append("timesync")
-        if build_crypto_shim:
-            feature_parts.append("crypto-shim")
+        if build_cryptography:
+            feature_parts.append("cryptography")
         run_clippy_checks(
             env=env,
             repo_root=repo_root,
@@ -1000,8 +1000,8 @@ def main(argv: list[str]) -> None:
     if tests:
         _banner("TEST MODE")
         feature_parts = ["timesync"]
-        if build_crypto_shim:
-            feature_parts.append("crypto-shim")
+        if build_cryptography:
+            feature_parts.append("cryptography")
         feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
         embedded_target = target or "thumbv7em-none-eabihf"
         can_check_embedded = has_embedded_c_toolchain(embedded_target, env)
@@ -1119,8 +1119,8 @@ def main(argv: list[str]) -> None:
     feature_parts = []
     if build_timesync:
         feature_parts.append("timesync")
-    if build_crypto_shim:
-        feature_parts.append("crypto-shim")
+    if build_cryptography:
+        feature_parts.append("cryptography")
     feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
     build_shared = not build_embedded and not build_python
 

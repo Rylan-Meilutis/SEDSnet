@@ -165,7 +165,7 @@ mod embedded_alloc {
 
 mod c_api;
 pub mod config;
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 pub mod crypto;
 pub mod diagnostics;
 #[cfg(feature = "discovery")]
@@ -465,14 +465,14 @@ pub enum ReliableMode {
     Unordered,
 }
 
-/// End-to-end encryption preference for a data type.
+/// End-to-end cryptography preference for a data type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum E2eEncryptionPolicy {
-    /// Send unencrypted unless a router-level policy forces encryption.
+    /// Send unencrypted unless a router-level policy forces cryptography.
     PreferOff,
-    /// Encrypt when the local router supports E2E encryption, but allow plaintext fallback.
+    /// Encrypt when the local router supports E2E cryptography, but allow plaintext fallback.
     PreferOn,
-    /// Require E2E encryption support before sending or locally consuming this type.
+    /// Require E2E cryptography support before sending or locally consuming this type.
     RequireOn,
 }
 
@@ -490,7 +490,7 @@ pub struct MessageMeta {
     reliable: ReliableMode,
     /// Queue priority for this type. Higher values are serviced first.
     priority: u8,
-    /// End-to-end encryption policy for this type.
+    /// End-to-end cryptography policy for this type.
     e2e_encryption: E2eEncryptionPolicy,
 }
 
@@ -533,7 +533,7 @@ pub fn message_priority(ty: DataType) -> u8 {
     get_message_meta(ty).priority
 }
 
-/// Return the end-to-end encryption policy for a data type.
+/// Return the end-to-end cryptography policy for a data type.
 #[inline]
 pub fn message_e2e_encryption_policy(ty: DataType) -> E2eEncryptionPolicy {
     get_message_meta(ty).e2e_encryption

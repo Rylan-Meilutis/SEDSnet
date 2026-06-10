@@ -23,12 +23,12 @@
 - Added managed-variable latest-value caching. Routers can mark a data type as network-managed,
   cache the latest packet for that type, seed the cache from serialized traffic, and request a
   replay so restarted boards can resynchronize through the normal endpoint handler path.
-- Added end-to-end payload encryption policy hooks under the `crypto-shim` feature:
+- Added end-to-end payload encryption policy hooks under the `cryptography` feature:
     - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn`.
     - Routers can run in `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll` mode.
     - Builds without crypto support reject required encrypted traffic instead of silently
       downgrading it.
-- Added process-wide crypto provider support. The provider order is C shim, Rust shim, then a
+- Added process-wide crypto provider support. The provider order is C provider, Rust provider, then a
   software fallback key, so std applications can wrap OS crypto APIs and embedded applications can
   use secure elements or hardware accelerators without changing the router API.
 - Added compact 80-byte managed credential helpers for master-root deployments. A master/root key
@@ -57,7 +57,7 @@
 - The checked-in C header is now static for the runtime-schema ABI. Optional reusable C and C++
   convenience wrappers can be selected from upstream CMake without forcing wrapper code into
   projects that only want the raw ABI.
-- C API coverage now includes router/relay global helper wrappers, managed variables, crypto shim
+- C API coverage now includes router/relay global helper wrappers, managed variables, cryptography provider
   registration, software fallback keys, managed credentials, runtime sender IDs, fixed-size
   serialized sides, link-probe samples, and topology/runtime-stat exports.
 - `./build.py test` now auto-detects `cargo-nextest` for non-doctest Rust suites when installed,
@@ -70,7 +70,7 @@
   `DataEndpoint::named("RADIO")` and `DataType::named("GPS_DATA")` instead of raw legacy IDs.
 - Added regression coverage for schema sync, deterministic conflict resolution, budget accounting,
   runtime string lookups, description metadata, handler construction from endpoint definitions,
-  runtime schema removal, managed-variable replay, crypto credentials/shims, topology exports,
+  runtime schema removal, managed-variable replay, crypto credentials/providers, topology exports,
   fixed-size side splitting, link probing, and nextest-aware test execution.
 
 ## 3.12.0

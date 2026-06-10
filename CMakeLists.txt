@@ -54,9 +54,9 @@ option(SEDSNET_ENABLE_C_WRAPPER
 option(SEDSNET_ENABLE_CPP_WRAPPER
     "Expose the optional header-only C++ convenience target sedsnet::cpp_wrapper"
     OFF)
-option(SEDSNET_ENABLE_CRYPTO_SHIM
-    "Enable feature-gated crypto shim APIs and define SEDS_ENABLE_CRYPTO_SHIM for C/C++ users"
-    OFF)
+option(SEDSNET_ENABLE_CRYPTOGRAPHY
+    "Enable cryptography provider APIs and define SEDS_ENABLE_CRYPTOGRAPHY for C/C++ users"
+    ON)
 
 # Auto-detect embedded if user hasn't forced it
 if (NOT SEDSNET_EMBEDDED_BUILD)
@@ -149,8 +149,8 @@ endif ()
 if (NOT SEDSNET_SCHEMA_PATH STREQUAL "")
     set(RS_ARGS_STR "${RS_ARGS_STR} schema_path=${SEDSNET_SCHEMA_PATH}")
 endif ()
-if (SEDSNET_ENABLE_CRYPTO_SHIM)
-    set(RS_ARGS_STR "${RS_ARGS_STR} crypto_shim")
+if (SEDSNET_ENABLE_CRYPTOGRAPHY)
+    set(RS_ARGS_STR "${RS_ARGS_STR} cryptography")
 endif ()
 
 if (SEDSNET_FORCE_RELEASE)
@@ -197,8 +197,8 @@ endif ()
 if (NOT SEDSNET_SCHEMA_PATH STREQUAL "")
     list(APPEND RS_ARGS_BOOTSTRAP "schema_path=${SEDSNET_SCHEMA_PATH}")
 endif ()
-if (SEDSNET_ENABLE_CRYPTO_SHIM)
-    list(APPEND RS_ARGS_BOOTSTRAP "crypto_shim")
+if (SEDSNET_ENABLE_CRYPTOGRAPHY)
+    list(APPEND RS_ARGS_BOOTSTRAP "cryptography")
 endif ()
 
 # New: forward arbitrary option_env config vars: SEDSNET_ENV_<KEY> => env:KEY=VALUE
@@ -269,8 +269,8 @@ set_target_properties(sedsnet PROPERTIES
     IMPORTED_LOCATION_RELEASE "${RS_LIB_REL}"
     INTERFACE_INCLUDE_DIRECTORIES "${RS_INCLUDE}"
 )
-if (SEDSNET_ENABLE_CRYPTO_SHIM)
-    target_compile_definitions(sedsnet INTERFACE SEDS_ENABLE_CRYPTO_SHIM=1)
+if (SEDSNET_ENABLE_CRYPTOGRAPHY)
+    target_compile_definitions(sedsnet INTERFACE SEDS_ENABLE_CRYPTOGRAPHY=1)
 endif ()
 
 add_dependencies(sedsnet sedsnet_build)
@@ -300,8 +300,8 @@ if (SEDSNET_ENABLE_C_WRAPPER)
         "${RUST_DIR}/c-wrapper"
     )
     target_link_libraries(sedsnet_c_wrapper PUBLIC sedsnet)
-    if (SEDSNET_ENABLE_CRYPTO_SHIM)
-        target_compile_definitions(sedsnet_c_wrapper PUBLIC SEDS_ENABLE_CRYPTO_SHIM=1)
+    if (SEDSNET_ENABLE_CRYPTOGRAPHY)
+        target_compile_definitions(sedsnet_c_wrapper PUBLIC SEDS_ENABLE_CRYPTOGRAPHY=1)
     endif ()
     add_dependencies(sedsnet_c_wrapper sedsnet_build)
     add_library(sedsnet::c_wrapper ALIAS sedsnet_c_wrapper)
@@ -313,8 +313,8 @@ if (SEDSNET_ENABLE_CPP_WRAPPER)
         "${RUST_DIR}/c-wrapper"
     )
     target_link_libraries(sedsnet_cpp_wrapper INTERFACE sedsnet)
-    if (SEDSNET_ENABLE_CRYPTO_SHIM)
-        target_compile_definitions(sedsnet_cpp_wrapper INTERFACE SEDS_ENABLE_CRYPTO_SHIM=1)
+    if (SEDSNET_ENABLE_CRYPTOGRAPHY)
+        target_compile_definitions(sedsnet_cpp_wrapper INTERFACE SEDS_ENABLE_CRYPTOGRAPHY=1)
     endif ()
     add_dependencies(sedsnet_cpp_wrapper sedsnet_build)
     add_library(sedsnet::cpp_wrapper ALIAS sedsnet_cpp_wrapper)
@@ -340,5 +340,5 @@ endif ()
 message(STATUS "sedsnet link mode: ${_SEDSNET_LINK_MODE}")
 message(STATUS "sedsnet C wrapper target: ${SEDSNET_ENABLE_C_WRAPPER}")
 message(STATUS "sedsnet C++ wrapper target: ${SEDSNET_ENABLE_CPP_WRAPPER}")
-message(STATUS "sedsnet crypto shim: ${SEDSNET_ENABLE_CRYPTO_SHIM}")
+message(STATUS "sedsnet cryptography provider: ${SEDSNET_ENABLE_CRYPTOGRAPHY}")
 message(STATUS "sedsnet build args: ${RS_ARGS_STR}")

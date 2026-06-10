@@ -94,14 +94,14 @@ const FLAG_COMPRESSED_PAYLOAD: u8 = 0x01;
 const FLAG_COMPRESSED_SENDER: u8 = 0x02;
 const FLAG_WIRE_CONTRACT: u8 = 0x04;
 const FLAG_PACKET_NONCE: u8 = 0x08;
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 const FLAG_E2E_ENCRYPTED_PAYLOAD: u8 = 0x10;
 const CONTRACT_FLAG_TARGETS: u8 = 0x01;
 const CONTRACT_FLAG_SHAPE: u8 = 0x02;
 const CONTRACT_FLAG_RELIABLE_HEADER: u8 = 0x04;
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 const E2E_NONCE_LEN: usize = 12;
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 const E2E_TAG_CAP: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,7 +361,7 @@ fn verify_crc32(buf: &[u8]) -> Result<&[u8], TelemetryError> {
     Ok(data)
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 #[inline]
 fn e2e_nonce_for_packet(pkt: &Packet) -> [u8; E2E_NONCE_LEN] {
     let mut nonce = [0u8; E2E_NONCE_LEN];
@@ -371,7 +371,7 @@ fn e2e_nonce_for_packet(pkt: &Packet) -> [u8; E2E_NONCE_LEN] {
     nonce
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 fn write_encrypted_payload(
     pkt: &Packet,
     key_id: u32,
@@ -403,7 +403,7 @@ fn write_encrypted_payload(
     Ok(())
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 fn read_encrypted_payload(
     r: &mut ByteReader,
     aad: &[u8],
@@ -662,12 +662,12 @@ pub(crate) fn serialize_packet_with_wire_contract(
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(feature = "crypto-shim"), allow(dead_code))]
+#[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
 pub(crate) struct E2eSealConfig {
     pub key_id: u32,
 }
 
-#[cfg(feature = "crypto-shim")]
+#[cfg(feature = "cryptography")]
 pub(crate) fn serialize_packet_with_wire_contract_e2e(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
@@ -683,7 +683,7 @@ fn serialize_packet_inner_with_contract(
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
     target_senders: &[u64],
-    #[cfg_attr(not(feature = "crypto-shim"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
+    #[cfg_attr(not(feature = "cryptography"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
 ) -> TelemetryResult<Arc<[u8]>> {
     // Endpoint selection always remains a fixed-width bitmap for compactness.
     // The optional wire contract then carries only the extra metadata required
@@ -735,7 +735,7 @@ fn serialize_packet_inner_with_contract(
     if pkt.nonce() != 0 {
         flags |= FLAG_PACKET_NONCE;
     }
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     if e2e.is_some() {
         flags |= FLAG_E2E_ENCRYPTED_PAYLOAD;
     }
@@ -777,13 +777,13 @@ fn serialize_packet_inner_with_contract(
     if let Some(hdr) = reliable {
         write_reliable_header(hdr, &mut out);
     }
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     if let Some(e2e) = e2e {
         write_encrypted_payload(pkt, e2e.key_id, &payload_wire, &mut out)?;
     } else {
         out.extend_from_slice(&payload_wire);
     }
-    #[cfg(not(feature = "crypto-shim"))]
+    #[cfg(not(feature = "cryptography"))]
     {
         out.extend_from_slice(&payload_wire);
     }
@@ -827,9 +827,9 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let flags = r.read_bytes(1)?[0];
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
     let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
-    #[cfg(not(feature = "crypto-shim"))]
+    #[cfg(not(feature = "cryptography"))]
     if (flags & 0x10) != 0 {
         return Err(TelemetryError::Deserialize("e2e crypto unsupported"));
     }
@@ -897,9 +897,9 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 
     // ----- Payload handling -----
     let payload_arc: Arc<[u8]> = {
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         let payload_wire_owned;
-        #[cfg(feature = "crypto-shim")]
+        #[cfg(feature = "cryptography")]
         let payload_wire: &[u8] = if payload_is_encrypted {
             let aad_end = r.off;
             payload_wire_owned = read_encrypted_payload(&mut r, &data[..aad_end], dsz)?;
@@ -911,7 +911,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
             r.read_bytes(comp_len)?
         };
 
-        #[cfg(not(feature = "crypto-shim"))]
+        #[cfg(not(feature = "cryptography"))]
         let payload_wire: &[u8] = if !payload_is_compressed {
             r.read_bytes(dsz)?
         } else {
@@ -1317,9 +1317,9 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let flags = r.read_bytes(1)?[0];
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
     let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
-    #[cfg(not(feature = "crypto-shim"))]
+    #[cfg(not(feature = "cryptography"))]
     if (flags & 0x10) != 0 {
         return Err(TelemetryError::Deserialize("e2e crypto unsupported"));
     }
@@ -1379,9 +1379,9 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     }
 
     // ---- payload bytes (must hash *logical* payload bytes) ----
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     let payload_wire_owned;
-    #[cfg(feature = "crypto-shim")]
+    #[cfg(feature = "cryptography")]
     let payload_wire: &[u8] = if payload_is_encrypted {
         let aad_end = r.off;
         payload_wire_owned =
@@ -1399,7 +1399,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
         }
         r.read_bytes(comp_len)?
     };
-    #[cfg(not(feature = "crypto-shim"))]
+    #[cfg(not(feature = "cryptography"))]
     let payload_wire: &[u8] = if !payload_is_compressed {
         if r.remaining() < dsz {
             return Err(TelemetryError::Deserialize("short buffer"));

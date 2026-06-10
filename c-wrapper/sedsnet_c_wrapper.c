@@ -15,7 +15,7 @@ SedsWrapperRouterConfig seds_wrapper_router_default_config(void)
     SedsWrapperRouterConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = Seds_RM_Relay;
-#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
     cfg.e2e_mode = SEDS_ROUTER_E2E_PREFERRED;
 #else
     cfg.e2e_mode = SEDS_ROUTER_E2E_DISABLED;

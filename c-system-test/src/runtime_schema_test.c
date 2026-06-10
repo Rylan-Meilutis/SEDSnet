@@ -38,7 +38,7 @@ static SedsResult capture_tx(const uint8_t *bytes, size_t len, void *user)
     return SEDS_OK;
 }
 
-#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 static SedsResult test_crypto_seal(uint32_t key_id,
                                    const uint8_t * nonce,
                                    size_t nonce_len,
@@ -383,8 +383,8 @@ int main(void)
     assert(seds_dtype_remove(chunk_ty_ref.id) == SEDS_OK);
     assert(seds_endpoint_remove(chunk_ep_ref.id) == SEDS_OK);
 
-#if defined(SEDS_ENABLE_CRYPTO_SHIM)
-    assert(seds_crypto_register_shim(test_crypto_seal, test_crypto_open, NULL) == SEDS_OK);
+#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
+    assert(seds_crypto_register_provider(test_crypto_seal, test_crypto_open, NULL) == SEDS_OK);
     const uint8_t crypto_nonce[12] = {0};
     const uint8_t crypto_aad[3] = {1U, 2U, 3U};
     const uint8_t plaintext[5] = {10U, 11U, 12U, 13U, 14U};
@@ -425,7 +425,7 @@ int main(void)
            == SEDS_OK);
     assert(opened_len == sizeof(plaintext));
     assert(memcmp(opened, plaintext, sizeof(plaintext)) == 0);
-    seds_crypto_clear_shim();
+    seds_crypto_clear_provider();
 #endif
 
     SedsRelay *relay = seds_relay_new(NULL, NULL);
