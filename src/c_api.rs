@@ -40,8 +40,10 @@ use core::{ffi::c_char, ffi::c_void, mem::size_of, ptr, slice, str::from_utf8};
 
 #[cfg(feature = "crypto-shim")]
 use crate::crypto::{
-    CCryptoShim, clear_c_crypto_shim, open_with_registered_c_shim, register_c_crypto_shim,
-    seal_with_registered_c_shim,
+    CCryptoShim, MANAGED_CREDENTIAL_LEN, ManagedCredential, clear_c_crypto_shim,
+    clear_software_keys, issue_managed_credential, open_with_registered_crypto,
+    register_c_crypto_shim, register_software_key, seal_with_registered_crypto,
+    verify_managed_credential,
 };
 use crate::relay::{Relay, RelaySideId, RelaySideOptions};
 // ============================================================================
@@ -256,6 +258,17 @@ pub struct SedsDataTypeInfo {
     name_len: usize,
     description: *const c_char,
     description_len: usize,
+}
+
+#[cfg(feature = "crypto-shim")]
+#[repr(C)]
+pub struct SedsManagedCredentialInfo {
+    subject_id: u64,
+    key_id: u32,
+    epoch: u64,
+    not_before_ms: u64,
+    not_after_ms: u64,
+    permissions: u32,
 }
 
 /// Transmit callback signature used from C (legacy).
@@ -1783,6 +1796,20 @@ pub extern "C" fn seds_router_set_side_egress_enabled(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_router_note_side_link_probe_sample(
+    r: *mut SedsRouter,
+    side_id: i32,
+    bytes: usize,
+    duration_ms: u64,
+) -> i32 {
+    if r.is_null() || side_id < 0 {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.note_side_link_probe_sample(side_id as usize, bytes, duration_ms))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_router_set_route(
     r: *mut SedsRouter,
     src_side_id: i32,
@@ -2850,6 +2877,20 @@ pub extern "C" fn seds_relay_set_side_egress_enabled(
     }
     let relay = unsafe { &(*r).inner };
     ok_or_status(relay.set_side_egress_enabled(side_id as usize, enabled))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_note_side_link_probe_sample(
+    r: *mut SedsRelay,
+    side_id: i32,
+    bytes: usize,
+    duration_ms: u64,
+) -> i32 {
+    if r.is_null() || side_id < 0 {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let relay = unsafe { &(*r).inner };
+    ok_or_status(relay.note_side_link_probe_sample(side_id as usize, bytes, duration_ms))
 }
 
 #[unsafe(no_mangle)]
@@ -4338,6 +4379,98 @@ pub extern "C" fn seds_crypto_clear_shim() {
 
 #[cfg(feature = "crypto-shim")]
 #[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_register_software_key(
+    key_id: u32,
+    key: *const u8,
+    key_len: usize,
+) -> i32 {
+    if key_len == 0 || key.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let key = unsafe { slice::from_raw_parts(key, key_len) };
+    ok_or_status(register_software_key(key_id, key))
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_clear_software_keys() {
+    clear_software_keys();
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_issue_managed_credential(
+    root_key: *const u8,
+    root_key_len: usize,
+    subject_id: u64,
+    key_id: u32,
+    epoch: u64,
+    not_before_ms: u64,
+    not_after_ms: u64,
+    permissions: u32,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if (root_key_len > 0 && root_key.is_null()) || out.is_null() || out_len.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let root_key = unsafe { slice::from_raw_parts(root_key, root_key_len) };
+    let out = unsafe { slice::from_raw_parts_mut(out, out_cap) };
+    let credential = ManagedCredential {
+        subject_id,
+        key_id,
+        epoch,
+        not_before_ms,
+        not_after_ms,
+        permissions,
+    };
+    match issue_managed_credential(root_key, credential, out) {
+        Ok(len) => unsafe {
+            *out_len = len;
+            status_from_result_code(SedsResult::SedsOk)
+        },
+        Err(e) => status_from_err(e),
+    }
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_crypto_verify_managed_credential(
+    root_key: *const u8,
+    root_key_len: usize,
+    credential: *const u8,
+    credential_len: usize,
+    now_ms: u64,
+    out_info: *mut SedsManagedCredentialInfo,
+) -> i32 {
+    if (root_key_len > 0 && root_key.is_null())
+        || credential.is_null()
+        || credential_len != MANAGED_CREDENTIAL_LEN
+        || out_info.is_null()
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let root_key = unsafe { slice::from_raw_parts(root_key, root_key_len) };
+    let credential = unsafe { slice::from_raw_parts(credential, credential_len) };
+    match verify_managed_credential(root_key, credential, now_ms) {
+        Ok(info) => unsafe {
+            *out_info = SedsManagedCredentialInfo {
+                subject_id: info.subject_id,
+                key_id: info.key_id,
+                epoch: info.epoch,
+                not_before_ms: info.not_before_ms,
+                not_after_ms: info.not_after_ms,
+                permissions: info.permissions,
+            };
+            status_from_result_code(SedsResult::SedsOk)
+        },
+        Err(e) => status_from_err(e),
+    }
+}
+
+#[cfg(feature = "crypto-shim")]
+#[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_seal(
     key_id: u32,
     nonce: *const u8,
@@ -4368,7 +4501,7 @@ pub extern "C" fn seds_crypto_seal(
     let plaintext = unsafe { slice::from_raw_parts(plaintext, plaintext_len) };
     let ciphertext_out = unsafe { slice::from_raw_parts_mut(ciphertext_out, ciphertext_cap) };
     let tag_out = unsafe { slice::from_raw_parts_mut(tag_out, tag_cap) };
-    match seal_with_registered_c_shim(key_id, nonce, aad, plaintext, ciphertext_out, tag_out) {
+    match seal_with_registered_crypto(key_id, nonce, aad, plaintext, ciphertext_out, tag_out) {
         Ok((ciphertext_len, tag_len)) => unsafe {
             *ciphertext_len_out = ciphertext_len;
             *tag_len_out = tag_len;
@@ -4408,7 +4541,7 @@ pub extern "C" fn seds_crypto_open(
     let ciphertext = unsafe { slice::from_raw_parts(ciphertext, ciphertext_len) };
     let tag = unsafe { slice::from_raw_parts(tag, tag_len) };
     let plaintext_out = unsafe { slice::from_raw_parts_mut(plaintext_out, plaintext_cap) };
-    match open_with_registered_c_shim(key_id, nonce, aad, ciphertext, tag, plaintext_out) {
+    match open_with_registered_crypto(key_id, nonce, aad, ciphertext, tag, plaintext_out) {
         Ok(plaintext_len) => unsafe {
             *plaintext_len_out = plaintext_len;
             status_from_result_code(SedsResult::SedsOk)

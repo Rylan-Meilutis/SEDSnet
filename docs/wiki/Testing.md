@@ -15,8 +15,10 @@ That runs:
 
 - strict `cargo clippy -D warnings` checks for the default host build, the `python` feature build,
   and the embedded-feature build when the matching cross toolchain exists
-- `cargo test --features timesync`
-- a short Criterion benchmark smoke pass
+- `cargo nextest run --features timesync` when cargo-nextest is installed, otherwise
+  `cargo test --features timesync`
+- `cargo test --doc --features timesync` when nextest is used
+- a stable Criterion smoke pass for benchmark target validation
 - `cargo build --features python`
 - embedded build validation when the target toolchain is available
 
@@ -72,13 +74,16 @@ This is the compatibility net for the generated C interface, not just the Rust c
 
 ### Benchmark smoke tests
 
-`./build.py test` also runs short Criterion benchmark smoke passes for:
+`./build.py test` also runs stable Criterion benchmark smoke passes for:
 
 - `benches/packet_paths.rs`
 - `benches/router_system_paths.rs`
 
 These are not pass/fail performance gates today. They are there to catch obvious pathological
-regressions in hot paths while still keeping the test command practical for local use.
+regressions in hot paths while still keeping the test command practical for local use. The smoke
+runner saves into a dedicated `sedsprintf_smoke` baseline, disables plots, uses a longer measurement
+window than the old fast smoke path, and applies a wider noise threshold so normal host variance
+does not show up as alternating regression/improvement noise against the default benchmark baseline.
 
 ## Reliability coverage
 
@@ -132,6 +137,15 @@ cargo test --lib
 cargo test --test reliable_drop_test
 cargo test --test rust-system-test
 ```
+
+If installed, nextest is the preferred fast runner for non-doctest suites:
+
+```bash
+cargo nextest run --features timesync
+```
+
+`./build.py test` auto-detects nextest. Set `SEDSPRINTF_RS_TEST_RUNNER=cargo` to force Cargo's
+built-in runner, or `SEDSPRINTF_RS_TEST_RUNNER=nextest` to require nextest.
 
 Broader validation:
 

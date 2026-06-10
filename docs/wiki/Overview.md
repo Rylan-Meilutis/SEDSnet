@@ -45,8 +45,9 @@ Think of the router as a message bus with two kinds of consumers:
 A packet can go to both: local handlers run, and then the router may forward the packet to remote links depending on
 configuration and endpoint rules.
 
-If discovery is enabled, forwarding can become side-aware: known routes are used first, and unknown routes fall back to
-the usual flood behavior.
+If discovery is enabled, forwarding becomes side-aware: known routes are used first, and unknown
+user-data routes are not flooded by fallback. Discovery/control traffic still propagates so the
+network can learn paths.
 
 If reliable ordered delivery is enabled, later packets that arrive after a missing sequence are
 buffered and partially acknowledged. The missing packet is requested, and the buffered run is
@@ -67,7 +68,8 @@ released immediately when the gap is filled.
 4) It calls any local handlers for the targeted endpoints.
 5) If configured to relay, it forwards the packet to other links.
 
-With discovery enabled, step 5 becomes "forward to known matching sides when possible, otherwise flood."
+With discovery enabled, step 5 becomes "forward to known matching sides when possible; otherwise
+hold user data off the link until discovery or explicit route policy identifies a path."
 
 ## Typical deployment shapes
 

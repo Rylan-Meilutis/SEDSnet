@@ -136,16 +136,54 @@ Router modes are:
 `RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically when the
 crate is built with `crypto-shim`; builds without `crypto-shim` default to `Disabled`.
 
-The `crypto-shim` feature does not ship a cipher. It provides the `crypto::CryptoShim` trait and C
-callback bridge so firmware can use a hardware accelerator, secure element, or application-owned
-AEAD implementation. Serialized side traffic carries visible routing metadata and an encrypted
-payload; the visible header is authenticated as AAD so header tampering fails during open.
+The `crypto-shim` feature uses this provider order:
+
+- registered C shim, for C firmware, OS crypto, secure elements, or hardware accelerators
+- registered Rust shim, for Rust-only firmware or std applications wrapping OS crypto
+- built-in software fallback, only after the application registers a key for the packet `key_id`
+
+Serialized side traffic carries visible routing metadata and an encrypted payload; the visible
+header is authenticated as AAD so header tampering fails during open. The built-in fallback uses the
+provisioned key for authenticated encryption, but it does not create identity by itself.
+
+```rust
+#[cfg(feature = "crypto-shim")]
+sedsprintf_rs::crypto::register_software_key(
+    7,
+    b"32-byte minimum deployment secret....",
+)?;
+```
+
+For MITM resistance, boards must authenticate the key source. Common deployments use either
+factory-provisioned PSKs or a network master that acts as the root authority. In the master-root
+model, boards ship with the master public key or a join PSK, the master signs short-lived board
+credentials, and peer/session keys are accepted only when the key exchange transcript validates back
+to that root. Without that authenticated root, an active attacker can substitute keys before the
+AEAD layer ever sees a packet.
+
+The `crypto-shim` feature includes a compact 80-byte managed credential helper for this
+master-root model. The master issues a `ManagedCredential` containing subject id, key id, epoch,
+validity window, and permission bits; peers verify it against the provisioned root key before
+accepting issued session/group keys.
 
 For board-to-board deployments, run your board-owned quantum-resistant asynchronous key exchange
 when discovery learns a peer, derive a low-cost symmetric traffic key, and pass that key through the
 shim by `key_id`. Multi-drop endpoint traffic can use a shared group traffic key when every holder of
 that endpoint must decode the same message; AEAD authentication still prevents a receiver from
 modifying the frame for downstream boards without detection.
+
+Fragmented links should encrypt the original message before splitting it. Fragments then carry a
+message id, fragment index/count, source epoch, and route metadata; the receiver reassembles and
+opens the original authenticated payload. On reconnect, routers should discard incomplete fragments
+from older master epochs, refresh time/topology, and request managed-variable deltas from the last
+known `{master_epoch, revision}`. If the master epoch changed, resync from the current snapshot.
+
+Discovery-enabled routers do not flood unknown user-data routes by fallback. They forward user data
+only when discovery or explicit route policy identifies a path; discovery/control traffic still
+propagates so the network can recover after partitions. For time-sliced radios, have the TX callback
+return `TelemetryError::Io("side tx busy")` while the radio is in an RX window. Queued work will be
+retried later, and measured bring-up/slot throughput can be fed into
+`note_side_link_probe_sample(side, bytes, duration_ms)` to seed adaptive path selection.
 
 ## Sides and routing
 
@@ -185,8 +223,9 @@ router.set_side_egress_enabled(side_c, false)?; // ingress only
 With the `discovery` feature enabled, routers and relays learn which endpoints are reachable
 through which sides.
 
-- known paths are preferred over flooding
-- unknown paths still fall back to flood/bootstrap behavior
+- known paths are used directly
+- unknown user-data paths are not flooded by fallback; discovery/control traffic still bootstraps
+  route learning
 - link-local-only endpoints stay on sides marked `link_local_enabled`
 - local plus source-side route rules still gate what discovery is allowed to use
 - discovery also carries a transitive router graph, so exported topology keeps sender ownership and

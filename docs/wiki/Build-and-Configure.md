@@ -30,8 +30,10 @@ Useful options:
 
 - `check` runs `cargo clippy -D warnings` for the default, python, and embedded builds.
 - `test` runs the same clippy checks, then:
-    - `cargo test --features timesync`
-    - a short Criterion smoke pass for `packet_paths` and `router_system_paths`
+    - `cargo nextest run --features timesync` when cargo-nextest is installed, otherwise
+      `cargo test --features timesync`
+    - `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
+    - a stable Criterion smoke pass for `packet_paths` and `router_system_paths`
     - `cargo build --features python`
     - `cargo build --no-default-features --target <embedded-target> --features embedded` when a matching cross C
       toolchain is available
@@ -83,10 +85,12 @@ pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/ma
 It covers four layers:
 
 - Static analysis: strict `cargo clippy -D warnings` for default, `python`, and embedded variants.
-- Rust unit and integration tests: `cargo test --features timesync`, including `src/tests.rs`, Rust system tests in
-  `tests/rust-system-test/`, and the Rust harness that configures and runs the C system tests in
-  `tests/c-system-test/c_system_test.rs`.
-- Benchmark smoke: short Criterion runs for `benches/packet_paths.rs` and `benches/router_system_paths.rs`.
+- Rust unit and integration tests: `cargo nextest run --features timesync` when available, otherwise
+  `cargo test --features timesync`, including `src/tests.rs`, Rust system tests in `tests/rust-system-test/`,
+  and the Rust harness that configures and runs the C system tests in `tests/c-system-test/c_system_test.rs`.
+- Benchmark smoke: run Criterion benchmarks into a dedicated `sedsprintf_smoke` baseline, with plot generation
+  disabled, longer timing than the old fast path, and a wider smoke-test noise threshold so validation exercises
+  benchmark code without treating normal workstation variance as a regression.
 - Build validation: host `python` feature build and embedded-feature build when an embedded cross C toolchain is
   present.
 

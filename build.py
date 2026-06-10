@@ -52,6 +52,8 @@ New (compile-time env vars):
                           cross C toolchain when embedded checks need it.
   env:SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO=0         Disable automatic size-oriented CFLAGS/defines
                           injection for embedded C dependencies.
+  env:SEDSPRINTF_RS_TEST_RUNNER=auto|nextest|cargo Select Rust test runner for `build.py test`.
+                          `auto` uses cargo-nextest when installed and falls back to cargo test.
 
 Special:
   -h, --help, help        Show this help message and exit.
@@ -205,7 +207,7 @@ def output_hint_for_cmd(
     if not cmd:
         return None
 
-    if cmd[:2] == ["cargo", "test"]:
+    if cmd[:2] == ["cargo", "test"] or cmd[:3] == ["cargo", "nextest", "run"]:
         # cargo test builds test artifacts (and deps) under target/...
         return f"Build artifacts: {repo_root / 'target'}"
 
@@ -270,6 +272,50 @@ def cargo_lib_build_cmd(
         crate_types.append("cdylib")
     cmd.extend(["--crate-type", ",".join(crate_types)])
     return cmd
+
+
+def cargo_nextest_available(env: dict[str, str]) -> bool:
+    try:
+        subprocess.run(
+            ["cargo", "nextest", "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            env=env,
+        )
+        return True
+    except (FileNotFoundError, PermissionError, OSError, subprocess.CalledProcessError):
+        return False
+
+
+def test_runner_cmds(*, env: dict[str, str], features: list[str]) -> tuple[str, list[list[str]]]:
+    feature_arg = ",".join(features)
+    runner = env.get("SEDSPRINTF_RS_TEST_RUNNER", "auto").strip().lower()
+    if runner not in ("auto", "nextest", "cargo"):
+        raise SystemExit(
+            "SEDSPRINTF_RS_TEST_RUNNER must be one of: auto, nextest, cargo "
+            f"(got {runner!r})"
+        )
+
+    has_nextest = cargo_nextest_available(env)
+    if runner == "nextest" and not has_nextest:
+        raise SystemExit(
+            "SEDSPRINTF_RS_TEST_RUNNER=nextest was requested, but `cargo nextest` is not installed. "
+            "Install it with `cargo install cargo-nextest --locked` or use SEDSPRINTF_RS_TEST_RUNNER=cargo."
+        )
+
+    if runner == "nextest" or (runner == "auto" and has_nextest):
+        return (
+            "cargo nextest",
+            [
+                ["cargo", "nextest", "run", "--features", feature_arg],
+                ["cargo", "test", "--doc", "--features", feature_arg],
+            ],
+        )
+
+    if runner == "auto":
+        print("info: cargo-nextest not found; falling back to `cargo test`.")
+    return "cargo test", [["cargo", "test", "--features", feature_arg]]
 
 
 def run_cmd(
@@ -672,12 +718,17 @@ def cargo_bench_smoke_cmd() -> list[str]:
     ]
     cmd.extend([
         "--",
+        "--save-baseline",
+        "sedsprintf_smoke",
+        "--noplot",
         "--sample-size",
-        "10",
+        "30",
         "--warm-up-time",
-        "0.1",
+        "1",
         "--measurement-time",
-        "0.1",
+        "2",
+        "--noise-threshold",
+        "0.15",
     ])
     return cmd
 
@@ -975,13 +1026,16 @@ def main(argv: list[str]) -> None:
         )
         _success("Clippy checks passed.")
 
-        run_cmd(
-            ["cargo", "test", "--features", ",".join(feature_parts)],
-            env=env,
-            repo_root=repo_root,
-            title=f"4/{total_steps} cargo test",
-            release_build=release_build,
-        )
+        runner_name, test_cmds = test_runner_cmds(env=env, features=feature_parts)
+        for idx, cmd in enumerate(test_cmds):
+            title_suffix = runner_name if idx == 0 else "cargo test (doctests)"
+            run_cmd(
+                cmd,
+                env=env,
+                repo_root=repo_root,
+                title=f"4/{total_steps} {title_suffix}",
+                release_build=release_build,
+            )
         _success("Tests passed.")
 
         run_cmd(

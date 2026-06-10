@@ -382,7 +382,7 @@ fn write_encrypted_payload(
     let nonce = e2e_nonce_for_packet(pkt);
     let mut ciphertext = vec![0u8; plaintext_wire_payload.len()];
     let mut tag = [0u8; E2E_TAG_CAP];
-    let (ciphertext_len, tag_len) = crate::crypto::seal_with_registered_c_shim(
+    let (ciphertext_len, tag_len) = crate::crypto::seal_with_registered_crypto(
         key_id,
         &nonce,
         &out[..aad_end],
@@ -431,7 +431,7 @@ fn read_encrypted_payload(
     let ciphertext_len = r.remaining();
     let ciphertext = r.read_bytes(ciphertext_len)?;
     let mut plaintext = vec![0u8; wire_payload_len];
-    let opened_len = crate::crypto::open_with_registered_c_shim(
+    let opened_len = crate::crypto::open_with_registered_crypto(
         key_id,
         nonce,
         aad,

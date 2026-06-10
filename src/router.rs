@@ -1960,6 +1960,25 @@ impl Router {
             .observe(bytes, sample_bps, ended_ms);
     }
 
+    /// Seed adaptive route selection with a transport-measured link probe.
+    ///
+    /// Call this after a side-specific bring-up probe, or whenever the transport already knows the
+    /// duration for a frame. The router does not emit synthetic probe frames by itself.
+    pub fn note_side_link_probe_sample(
+        &self,
+        side: RouterSideId,
+        bytes: usize,
+        duration_ms: u64,
+    ) -> TelemetryResult<()> {
+        {
+            let st = self.state.lock();
+            let _ = Self::side_ref(&st, side).map_err(|_| TelemetryError::BadArg)?;
+        }
+        let ended_ms = self.clock.now_ms();
+        self.record_side_tx_sample(side, bytes, ended_ms.saturating_sub(duration_ms), ended_ms);
+        Ok(())
+    }
+
     fn router_item_wire_len(data: &RouterItem) -> TelemetryResult<usize> {
         match data {
             RouterItem::Packet(pkt) => Ok(serialize::serialize_packet(pkt).len()),
@@ -2639,7 +2658,7 @@ impl Router {
         #[cfg(feature = "crypto-shim")]
         {
             self.cfg.e2e_encryption() != RouterE2eEncryptionMode::Disabled
-                && crate::crypto::c_crypto_shim_registered()
+                && crate::crypto::registered_crypto_available()
         }
         #[cfg(not(feature = "crypto-shim"))]
         {
@@ -2854,6 +2873,18 @@ impl Router {
         }
     }
 
+    #[cfg(feature = "discovery")]
+    fn has_explicit_route_policy_locked(
+        st: &RouterInner,
+        src: Option<RouterSideId>,
+        ty: DataType,
+    ) -> bool {
+        st.route_overrides
+            .keys()
+            .any(|(route_src, _)| *route_src == src)
+            || Self::has_typed_route_overrides_locked(st, src, ty)
+    }
+
     fn remote_side_plan(
         &self,
         data: &RouterItem,
@@ -2932,13 +2963,18 @@ impl Router {
             } else if prefer_best_overlap {
                 Ok(RemoteSidePlan::Target(Vec::new()))
             } else {
-                let fallback =
-                    self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
-                Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
-                    fallback
+                if Self::has_explicit_route_policy_locked(&st, exclude, ty) {
+                    let sides =
+                        self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
+                    Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
+                        &mut st,
+                        exclude,
+                        sides,
+                        RouteSelectionOrigin::Flood,
+                    )))
                 } else {
-                    Vec::new()
-                }))
+                    Ok(RemoteSidePlan::Target(Vec::new()))
+                }
             }
         }
         #[cfg(not(feature = "discovery"))]

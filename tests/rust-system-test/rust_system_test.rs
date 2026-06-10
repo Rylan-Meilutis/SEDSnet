@@ -370,6 +370,12 @@ mod threaded_system_tests {
                 let _ = relay_bus2_tx.send((usize::MAX, bytes.to_vec()));
                 Ok(())
             });
+        relay
+            .set_route(Some(bus1_side_id), bus2_side_id, true)
+            .unwrap();
+        relay
+            .set_route(Some(bus2_side_id), bus1_side_id, true)
+            .unwrap();
 
         // ------------- 2) Build nodes -------------
         let stop_flag = Arc::new(AtomicBool::new(false));

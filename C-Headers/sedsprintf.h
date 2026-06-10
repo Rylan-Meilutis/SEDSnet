@@ -672,6 +672,12 @@ SedsResult seds_router_set_side_ingress_enabled(SedsRouter * r, int32_t side_id,
 /** @brief Enable or disable packet egress toward a router side. */
 SedsResult seds_router_set_side_egress_enabled(SedsRouter * r, int32_t side_id, bool enabled);
 
+/** @brief Seed adaptive router link stats from a transport-measured probe/sample. */
+SedsResult seds_router_note_side_link_probe_sample(SedsRouter * r,
+                                                   int32_t side_id,
+                                                   size_t bytes,
+                                                   uint64_t duration_ms);
+
 /**
  * @brief Override whether traffic from @p src_side_id may be routed to @p dst_side_id.
  *
@@ -1134,6 +1140,11 @@ SedsResult seds_relay_remove_side(SedsRelay * r, int32_t side_id);
 SedsResult seds_relay_set_side_ingress_enabled(SedsRelay * r, int32_t side_id, bool enabled);
 /** @brief Enable or disable packet egress toward a relay side. */
 SedsResult seds_relay_set_side_egress_enabled(SedsRelay * r, int32_t side_id, bool enabled);
+/** @brief Seed adaptive relay link stats from a transport-measured probe/sample. */
+SedsResult seds_relay_note_side_link_probe_sample(SedsRelay * r,
+                                                  int32_t side_id,
+                                                  size_t bytes,
+                                                  uint64_t duration_ms);
 /** @brief Allow or block routing from @p src_side_id toward @p dst_side_id (-1 => locally-originated relay TX). */
 SedsResult seds_relay_set_route(SedsRelay * r, int32_t src_side_id, int32_t dst_side_id, bool enabled);
 /** @brief Clear a route override so the relay falls back to its default routing behavior. */
@@ -1276,8 +1287,38 @@ typedef SedsResult (* SedsCryptoOpenFn)(
     size_t * plaintext_len_out,
     void * user);
 
+typedef struct SedsManagedCredentialInfo {
+    uint64_t subject_id;
+    uint32_t key_id;
+    uint64_t epoch;
+    uint64_t not_before_ms;
+    uint64_t not_after_ms;
+    uint32_t permissions;
+} SedsManagedCredentialInfo;
+
 SedsResult seds_crypto_register_shim(SedsCryptoSealFn seal, SedsCryptoOpenFn open, void * user);
 void seds_crypto_clear_shim(void);
+SedsResult seds_crypto_register_software_key(uint32_t key_id,
+                                             const uint8_t * key,
+                                             size_t key_len);
+void seds_crypto_clear_software_keys(void);
+SedsResult seds_crypto_issue_managed_credential(const uint8_t * root_key,
+                                                size_t root_key_len,
+                                                uint64_t subject_id,
+                                                uint32_t key_id,
+                                                uint64_t epoch,
+                                                uint64_t not_before_ms,
+                                                uint64_t not_after_ms,
+                                                uint32_t permissions,
+                                                uint8_t * out,
+                                                size_t out_cap,
+                                                size_t * out_len);
+SedsResult seds_crypto_verify_managed_credential(const uint8_t * root_key,
+                                                 size_t root_key_len,
+                                                 const uint8_t * credential,
+                                                 size_t credential_len,
+                                                 uint64_t now_ms,
+                                                 SedsManagedCredentialInfo * out_info);
 SedsResult seds_crypto_seal(uint32_t key_id,
                             const uint8_t * nonce,
                             size_t nonce_len,

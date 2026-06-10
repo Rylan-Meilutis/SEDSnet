@@ -104,7 +104,10 @@ With discovery enabled, forwarding also consults the learned side map:
 
 - If candidate sides are known for one or more packet endpoints, the router forwards only to those sides.
 - If the packet carries frozen destination sender hashes from its wire contract, local delivery and remote forwarding are further narrowed to only those intended holders.
-- If no side is known yet, the router falls back to flooding.
+- Once discovery topology exists, user data with no matching known side is not forwarded by
+  fallback. Discovery/control traffic still propagates so routes can be learned, and explicit route
+  policy can still intentionally select a side. Before any discovery topology has been learned,
+  legacy single-side fallback remains available for simple non-discovery deployments.
 - Link-local-only endpoints are only forwarded to sides marked `link_local_enabled: true`.
 - If typed route overrides exist for `(source side or local TX, packet type)`, only those enabled
   destination sides remain eligible before path selection and discovery matching are applied.
@@ -128,6 +131,8 @@ With discovery enabled, forwarding also consults the learned side map:
 - `poll_discovery()` queues one only when the adaptive cadence says it is due.
 - `export_topology()` snapshots the current learned route map and announce cadence, including
   discovered time source IDs, the top-level `routers` graph, and per-side announcer detail.
+- `note_side_link_probe_sample()` seeds adaptive path selection from a transport-measured bring-up
+  or runtime probe without emitting synthetic library probe frames.
 
 ## Queue variants and processing
 
@@ -216,3 +221,9 @@ When discovery reports multiple eligible paths for the same endpoint set:
 Failover health is driven by the existing discovery reachability TTL plus explicit side removal or
 ingress/egress disable state. When a preferred path expires or is removed, routing automatically
 uses the next eligible path.
+
+For time-sliced radios, return `TelemetryError::Io("side tx busy")` from the side TX callback while
+the radio is in an RX window or otherwise unable to accept a frame. The router/relay keeps the work
+queued and retries during later queue processing. If the radio driver measures a bring-up probe or
+slot throughput, feed that sample into `note_side_link_probe_sample()` so adaptive routing learns
+that the radio has less headroom than Ethernet or other high-rate links.

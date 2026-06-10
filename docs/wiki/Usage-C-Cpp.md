@@ -443,8 +443,28 @@ void crypto_init(void)
 #endif
 ```
 
-For embedded Rust-only projects, implement `sedsprintf_rs::crypto::CryptoShim` directly and call
-`seal_with` / `open_with`. This avoids exporting a C ABI when the whole firmware is Rust:
+Registered callbacks are preferred over the built-in fallback, so std applications can wrap OS
+crypto APIs and embedded applications can wrap hardware accelerators or secure elements. If no
+callback is available, register a software fallback key for the `key_id` used by the router:
+
+```C
+#if defined(SEDS_ENABLE_CRYPTO_SHIM)
+static const uint8_t fallback_key[32] = {
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+};
+
+void crypto_fallback_init(void)
+{
+    (void)seds_crypto_register_software_key(7, fallback_key, sizeof(fallback_key));
+}
+#endif
+```
+
+For embedded Rust-only projects, implement `sedsprintf_rs::crypto::CryptoShim` directly and register
+it globally. This avoids exporting a C ABI when the whole firmware is Rust:
 
 ```rust
 #[cfg(feature = "crypto-shim")]
@@ -476,14 +496,27 @@ impl sedsprintf_rs::crypto::CryptoShim for BoardCrypto {
         board_crypto_open(key_id, nonce, aad, ciphertext, tag, plaintext_out)
     }
 }
+
+#[cfg(feature = "crypto-shim")]
+static BOARD_CRYPTO: BoardCrypto = BoardCrypto;
+
+#[cfg(feature = "crypto-shim")]
+fn crypto_init() {
+    sedsprintf_rs::crypto::register_rust_crypto_shim(&BOARD_CRYPTO);
+}
 ```
 
-The library intentionally keeps key establishment in the board/application layer. A typical secure
+The crypto layer authenticates packet bytes only after a trusted key exists. A typical secure
 deployment runs a quantum-resistant asynchronous key exchange when discovery learns a peer, derives
-hardware-accelerated symmetric traffic keys, and selects them through `key_id`. For multi-drop
-traffic where three boards advertise the same endpoint, use a shared endpoint/group traffic key so
-all intended boards can open the same payload; the authenticated header and tag prevent a receiver
-from modifying that frame for another board without detection.
+hardware-accelerated symmetric traffic keys, and selects them through `key_id`. To avoid user-managed
+certificates, deploy a master-root model: boards are provisioned with the master public key or a join
+PSK, the master issues signed short-lived board credentials, and peers accept session keys only when
+the exchange transcript validates to that root. Without that root or a PSK, a man-in-the-middle can
+substitute keys before packet authentication begins.
+
+For multi-drop traffic where three boards advertise the same endpoint, use a shared endpoint/group
+traffic key so all intended boards can open the same payload; the authenticated header and tag
+prevent a receiver from modifying that frame for another board without detection.
 
 The first `seds_router_new(...)` mode argument is retained for ABI compatibility with older
 headers. Current routers use runtime side route controls instead of sink/relay construction modes,
@@ -618,6 +651,7 @@ Runtime side policy and routing controls are also available:
 - `seds_router_remove_side`
 - `seds_router_set_side_ingress_enabled`
 - `seds_router_set_side_egress_enabled`
+- `seds_router_note_side_link_probe_sample`
 - `seds_router_set_route`
 - `seds_router_clear_route`
 - `seds_router_set_typed_route`
@@ -628,6 +662,7 @@ Runtime side policy and routing controls are also available:
 - `seds_relay_remove_side`
 - `seds_relay_set_side_ingress_enabled`
 - `seds_relay_set_side_egress_enabled`
+- `seds_relay_note_side_link_probe_sample`
 - `seds_relay_set_route`
 - `seds_relay_clear_route`
 - `seds_relay_set_typed_route`
@@ -646,6 +681,18 @@ Typed route rules act as per-`DataType` allowlists for a given source side. If a
 exist for `(src_side, ty)`, only the enabled destination sides for that type remain eligible.
 That allows dedicated command, abort, or other special-purpose links while keeping ordinary
 traffic on the default routing policy.
+
+With discovery enabled, unknown user-data routes are not flooded by fallback. Discovery/control
+traffic still propagates so paths can be learned; user data uses discovered paths or explicit route
+policy. This keeps low-bandwidth sides such as LoRa from being saturated just because they are the
+only currently eligible side.
+
+For time-sliced radios, return the side TX error code for `TelemetryError::Io("side tx busy")` while
+the radio is in an RX window or otherwise cannot accept another frame. The router/relay leaves the
+work queued and retries during later queue processing. If the driver measures link speed during
+bring-up or per-slot operation, call `seds_router_note_side_link_probe_sample(...)` or
+`seds_relay_note_side_link_probe_sample(...)` so adaptive path selection learns that radio has less
+headroom than Ethernet.
 
 `SedsRouteSelectionMode` controls multi-path behavior:
 
