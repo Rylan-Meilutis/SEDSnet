@@ -1,6 +1,6 @@
-# Sedsprintf_rs Documentation
+# SEDSNet Documentation
 
-Sedsprintf_rs is a Rust telemetry transport and logging library with a shared schema, compact wire format, routing, and
+SEDSNet is a Rust telemetry transport and logging library with a shared schema, compact wire format, routing, and
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 
@@ -13,6 +13,7 @@ These pages are written for readers who want a clear mental model before digging
 - [Overview](Overview)
 - [Concepts](Concepts)
 - [Examples](Examples)
+- [Glossary-and-Abbreviations](Glossary-and-Abbreviations)
 - [Changelogs](Changelogs)
 
 ## How-to guides (practical steps)
@@ -43,40 +44,42 @@ Detailed pages that describe internals, data structures, and formats.
 
 -
 
-src/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/src)):
+src/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/src)):
 core Rust library (schema, packet types, serialization, router/relay).
 
 -
 
-sedsprintf_macros/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/sedsprintf_macros)):
+sedsnet_macros/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/sedsnet_macros)):
 support macros for Rust integrations.
 
 -
 
-telemetry_config.json ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/telemetry_config.json)):
-optional runtime schema seed (endpoints + data types).
+application-owned schema JSON:
+optional runtime schema seed supplied through `SEDSNET_STATIC_SCHEMA_PATH`,
+`SEDSNET_STATIC_IPC_SCHEMA_PATH`, or explicit registration APIs. The crate does not ship a
+default user schema.
 
 -
 
-build.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.rs)):
+build.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.rs)):
 tracks build metadata and optional embedded schema bytes; user schemas are not compiled into normal
 crate builds.
 
 -
 
-C-Headers/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/C-Headers)):
-C ABI header (`sedsprintf.h`).
+C-Headers/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/C-Headers)):
+C ABI header (`sedsnet.h`).
 
 -
 
-python-files/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/python-files)):
+python-files/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-files)):
 Python package assets and type hints.
 
 -
 
-c-example-code/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/c-example-code))
+c-example-code/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code))
 and
-python-example/ ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/python-example)):
+python-example/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-example)):
 runnable examples.
 
 ## Data flow at a glance

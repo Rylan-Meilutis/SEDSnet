@@ -1,65 +1,65 @@
 # C/C++ Usage
 
 The C API is exposed via
-C-Headers/sedsprintf.h ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/C-Headers/sedsprintf.h))
+C-Headers/sedsnet.h ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/C-Headers/sedsnet.h))
 and a static library built by Cargo.
 
-`C-Headers/sedsprintf.h` is a static checked-in ABI header. Runtime data types and endpoints are
+`C-Headers/sedsnet.h` is a static checked-in ABI header. Runtime data types and endpoints are
 registered at runtime, so the header no longer needs to be generated for each schema. Build-time
-payload storage settings such as `SEDSPRINTF_RS_MAX_STACK_PAYLOAD` / `MAX_STACK_PAYLOAD` are still
+payload storage settings such as `SEDSNET_MAX_STACK_PAYLOAD` / `MAX_STACK_PAYLOAD` are still
 preserved and forwarded into the Rust build.
 
 ## CMake integration (recommended)
 
 ```cmake
 # Example: building for an embedded target
-set(SEDSPRINTF_RS_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
-set(SEDSPRINTF_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
 
 # Optional: force the Rust crate into the release profile even when the parent
 # CMake build is Debug.
-# set(SEDSPRINTF_RS_FORCE_RELEASE ON CACHE BOOL "" FORCE)
+# set(SEDSNET_FORCE_RELEASE ON CACHE BOOL "" FORCE)
 
 # set the sender name
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 
 # optional compile-time env overrides
-set(SEDSPRINTF_RS_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
 # Optional wrappers and feature-gated crypto shim support.
 # Leave wrappers OFF when you only want the raw ABI header/library.
-set(SEDSPRINTF_RS_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
-# set(SEDSPRINTF_RS_ENABLE_CPP_WRAPPER ON CACHE BOOL "" FORCE)
-# set(SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM ON CACHE BOOL "" FORCE)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+# set(SEDSNET_ENABLE_CPP_WRAPPER ON CACHE BOOL "" FORCE)
+# set(SEDSNET_ENABLE_CRYPTO_SHIM ON CACHE BOOL "" FORCE)
 
-add_subdirectory(${CMAKE_SOURCE_DIR}/sedsprintf_rs sedsprintf_rs_build)
+add_subdirectory(${CMAKE_SOURCE_DIR}/sedsnet sedsnet_build)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::sedsprintf_rs)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
 
-# If SEDSPRINTF_RS_ENABLE_C_WRAPPER is ON and you want the reusable C wrapper:
-# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::c_wrapper)
-# If SEDSPRINTF_RS_ENABLE_CPP_WRAPPER is ON and you want the C++ header wrapper:
-# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::cpp_wrapper)
+# If SEDSNET_ENABLE_C_WRAPPER is ON and you want the reusable C wrapper:
+# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::c_wrapper)
+# If SEDSNET_ENABLE_CPP_WRAPPER is ON and you want the C++ header wrapper:
+# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::cpp_wrapper)
 ```
 
 Important CMake variables:
 
-- `SEDSPRINTF_EMBEDDED_BUILD` (ON/OFF)
-- `SEDSPRINTF_RS_FORCE_RELEASE` (ON/OFF)
-- `SEDSPRINTF_RS_ENABLE_C_WRAPPER` (ON/OFF)
-- `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` (ON/OFF)
-- `SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM` (ON/OFF)
-- `SEDSPRINTF_RS_TARGET` (Rust target triple)
-- `SEDSPRINTF_RS_DEVICE_IDENTIFIER`
-- `SEDSPRINTF_RS_MAX_STACK_PAYLOAD`
-- `SEDSPRINTF_RS_MAX_QUEUE_BUDGET`
-- `SEDSPRINTF_RS_MAX_RECENT_RX_IDS`
-- `SEDSPRINTF_RS_ENV_<KEY>` for any config env var
+- `SEDSNET_EMBEDDED_BUILD` (ON/OFF)
+- `SEDSNET_FORCE_RELEASE` (ON/OFF)
+- `SEDSNET_ENABLE_C_WRAPPER` (ON/OFF)
+- `SEDSNET_ENABLE_CPP_WRAPPER` (ON/OFF)
+- `SEDSNET_ENABLE_CRYPTO_SHIM` (ON/OFF)
+- `SEDSNET_TARGET` (Rust target triple)
+- `SEDSNET_DEVICE_IDENTIFIER`
+- `SEDSNET_MAX_STACK_PAYLOAD`
+- `SEDSNET_MAX_QUEUE_BUDGET`
+- `SEDSNET_MAX_RECENT_RX_IDS`
+- `SEDSNET_ENV_<KEY>` for any config env var
 
-`SEDSPRINTF_RS_FORCE_RELEASE` is useful when your top-level CMake build remains `Debug` but you
-still want `sedsprintf_rs` built with Cargo's release profile. If it is left `OFF`, the wrapper
+`SEDSNET_FORCE_RELEASE` is useful when your top-level CMake build remains `Debug` but you
+still want `sedsnet` built with Cargo's release profile. If it is left `OFF`, the wrapper
 follows the parent CMake configuration for single-config generators.
 
 ## Manual build (no CMake)
@@ -76,17 +76,17 @@ The static library will be under `target/release/` (or under `target/<triple>/re
 
 There are three intentionally separate C/C++ surfaces:
 
-- `C-Headers/sedsprintf.h`: the raw ABI header. It is always available and does not expose
+- `C-Headers/sedsnet.h`: the raw ABI header. It is always available and does not expose
   convenience macros or wrapper-owned globals.
-- `c-wrapper/sedsprintf_c_wrapper.h`: optional C convenience API. Enable
-  `SEDSPRINTF_RS_ENABLE_C_WRAPPER` and link `sedsprintf_rs::c_wrapper`.
-- `c-wrapper/sedsprintf_cpp_wrapper.hpp`: optional header-only C++ convenience API. Enable
-  `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` and link `sedsprintf_rs::cpp_wrapper`.
+- `c-wrapper/sedsnet_c_wrapper.h`: optional C convenience API. Enable
+  `SEDSNET_ENABLE_C_WRAPPER` and link `sedsnet::c_wrapper`.
+- `c-wrapper/sedsnet_cpp_wrapper.hpp`: optional header-only C++ convenience API. Enable
+  `SEDSNET_ENABLE_CPP_WRAPPER` and link `sedsnet::cpp_wrapper`.
 
 ## Optional Native C Wrapper
 
-When `SEDSPRINTF_RS_ENABLE_C_WRAPPER` is `ON`, CMake also builds
-`sedsprintf_rs::c_wrapper`, which provides `sedsprintf_c_wrapper.h`.
+When `SEDSNET_ENABLE_C_WRAPPER` is `ON`, CMake also builds
+`sedsnet::c_wrapper`, which provides `sedsnet_c_wrapper.h`.
 
 The wrapper has two styles:
 
@@ -98,7 +98,7 @@ The wrapper has two styles:
 Minimal global-router usage:
 
 ```C
-#include "sedsprintf_c_wrapper.h"
+#include "sedsnet_c_wrapper.h"
 
 static SedsResult tx_can(const uint8_t *bytes, size_t len, void *user)
 {
@@ -155,7 +155,7 @@ drop down to a raw ABI function that is not wrapped yet.
 ## Minimal C example
 
 ```C
-#include "sedsprintf.h"
+#include "sedsnet.h"
 #include <string.h>
 
 static uint64_t now_ms(void *user) { (void)user; return 0; }
@@ -255,14 +255,14 @@ The optional `c-wrapper/` sources provide the reusable router-node wrapper patte
 gateway, RF, actuator, power, valve, DAQ, and flight-computer firmware. Enable it with:
 
 ```cmake
-set(SEDSPRINTF_RS_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::c_wrapper)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::c_wrapper)
 ```
 
 Then include:
 
 ```C
-#include "sedsprintf_c_wrapper.h"
+#include "sedsnet_c_wrapper.h"
 ```
 
 The shared helper surface includes:
@@ -381,11 +381,11 @@ while `SEDS_ROUTER_E2E_FORCE_ALL` encrypts all non-control user data. When
 
 ## Optional C++ Wrapper
 
-Enable `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` and include `sedsprintf_cpp_wrapper.hpp` when C++ code
+Enable `SEDSNET_ENABLE_CPP_WRAPPER` and include `sedsnet_cpp_wrapper.hpp` when C++ code
 wants typed helpers without the C macro layer:
 
 ```cpp
-#include "sedsprintf_cpp_wrapper.hpp"
+#include "sedsnet_cpp_wrapper.hpp"
 
 void publish_state(SedsRouter *router, uint8_t state)
 {
@@ -400,7 +400,7 @@ void publish_state(SedsRouter *router, uint8_t state)
 ## Optional Crypto Shim
 
 Enable the crypto shim APIs with Cargo feature `crypto-shim`, build.py option `crypto_shim`, or
-CMake option `SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM`. C/C++ builds receive the
+CMake option `SEDSNET_ENABLE_CRYPTO_SHIM`. C/C++ builds receive the
 `SEDS_ENABLE_CRYPTO_SHIM` define automatically when the CMake option is enabled.
 
 For C firmware, register board-specific crypto callbacks:
@@ -463,7 +463,7 @@ void crypto_fallback_init(void)
 #endif
 ```
 
-For embedded Rust-only projects, implement `sedsprintf_rs::crypto::CryptoShim` directly and register
+For embedded Rust-only projects, implement `sedsnet::crypto::CryptoShim` directly and register
 it globally. This avoids exporting a C ABI when the whole firmware is Rust:
 
 ```rust
@@ -471,7 +471,7 @@ it globally. This avoids exporting a C ABI when the whole firmware is Rust:
 struct BoardCrypto;
 
 #[cfg(feature = "crypto-shim")]
-impl sedsprintf_rs::crypto::CryptoShim for BoardCrypto {
+impl sedsnet::crypto::CryptoShim for BoardCrypto {
     fn seal(
         &self,
         key_id: u32,
@@ -480,7 +480,7 @@ impl sedsprintf_rs::crypto::CryptoShim for BoardCrypto {
         plaintext: &[u8],
         ciphertext_out: &mut [u8],
         tag_out: &mut [u8],
-    ) -> sedsprintf_rs::TelemetryResult<(usize, usize)> {
+    ) -> sedsnet::TelemetryResult<(usize, usize)> {
         board_crypto_seal(key_id, nonce, aad, plaintext, ciphertext_out, tag_out)
     }
 
@@ -492,7 +492,7 @@ impl sedsprintf_rs::crypto::CryptoShim for BoardCrypto {
         ciphertext: &[u8],
         tag: &[u8],
         plaintext_out: &mut [u8],
-    ) -> sedsprintf_rs::TelemetryResult<usize> {
+    ) -> sedsnet::TelemetryResult<usize> {
         board_crypto_open(key_id, nonce, aad, ciphertext, tag, plaintext_out)
     }
 }
@@ -502,7 +502,7 @@ static BOARD_CRYPTO: BoardCrypto = BoardCrypto;
 
 #[cfg(feature = "crypto-shim")]
 fn crypto_init() {
-    sedsprintf_rs::crypto::register_rust_crypto_shim(&BOARD_CRYPTO);
+    sedsnet::crypto::register_rust_crypto_shim(&BOARD_CRYPTO);
 }
 ```
 
@@ -530,9 +530,9 @@ Reserved internal endpoints:
   and `seds_router_new(...)` rejects them.
 
 See c-example-code/
-([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/tree/main/c-example-code))
+([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code))
 for a more complete example. Time sync is demonstrated in c-example-code/src/timesync_example.c
-([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/timesync_example.c)).
+([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c)).
 See [Time-Sync](Time-Sync) for the time sync packet flow and roles.
 
 ## Side reliability

@@ -478,9 +478,9 @@ fn caller_manifest_dir() -> Result<std::path::PathBuf, String> {
 
 fn resolve_schema_path(path_rel: &str) -> Result<std::path::PathBuf, String> {
     let root = caller_manifest_dir()?;
-    if let Ok(override_path) = std::env::var("SEDSPRINTF_RS_SCHEMA_PATH") {
+    if let Ok(override_path) = std::env::var("SEDSNET_SCHEMA_PATH") {
         if override_path.trim().is_empty() {
-            return Err("SEDSPRINTF_RS_SCHEMA_PATH is set but empty".to_string());
+            return Err("SEDSNET_SCHEMA_PATH is set but empty".to_string());
         }
         let p = std::path::PathBuf::from(override_path);
         if p.is_absolute() {
@@ -493,11 +493,11 @@ fn resolve_schema_path(path_rel: &str) -> Result<std::path::PathBuf, String> {
 
 fn resolve_optional_ipc_schema_path() -> Result<Option<std::path::PathBuf>, String> {
     let root = caller_manifest_dir()?;
-    let Ok(override_path) = std::env::var("SEDSPRINTF_RS_IPC_SCHEMA_PATH") else {
+    let Ok(override_path) = std::env::var("SEDSNET_IPC_SCHEMA_PATH") else {
         return Ok(None);
     };
     if override_path.trim().is_empty() {
-        return Err("SEDSPRINTF_RS_IPC_SCHEMA_PATH is set but empty".to_string());
+        return Err("SEDSNET_IPC_SCHEMA_PATH is set but empty".to_string());
     }
     let path = std::path::PathBuf::from(override_path);
     Ok(Some(if path.is_absolute() {
@@ -514,7 +514,7 @@ fn load_schema(path_rel: &str) -> Result<TelemetryConfig, String> {
     let bytes = std::fs::read(&path).map_err(|e| {
         format!(
             "failed to read telemetry schema at {}: {e}\n\
-             note: path is resolved as CARGO_MANIFEST_DIR ({}) + {:?} (override with SEDSPRINTF_RS_SCHEMA_PATH)",
+             note: path is resolved as CARGO_MANIFEST_DIR ({}) + {:?} (override with SEDSNET_SCHEMA_PATH)",
             path.display(),
             root.display(),
             path_rel
@@ -554,7 +554,7 @@ fn load_merged_schema(path_rel: &str) -> Result<TelemetryConfig, String> {
     let bytes = std::fs::read(&overlay_path).map_err(|e| {
         format!(
             "failed to read IPC overlay schema at {}: {e}\n\
-             note: set SEDSPRINTF_RS_IPC_SCHEMA_PATH to a JSON file containing only board-local link-local endpoints/types",
+             note: set SEDSNET_IPC_SCHEMA_PATH to a JSON file containing only board-local link-local endpoints/types",
             overlay_path.display()
         )
     })?;

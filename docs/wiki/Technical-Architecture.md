@@ -16,49 +16,49 @@ look the way they do. It assumes no prior knowledge of the codebase.
 
 -
 
-src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/config.rs)):
+src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)):
 compile-time configuration values plus the runtime schema registry for `DataType` and `DataEndpoint` metadata.
 
 -
 
-src/lib.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/lib.rs)):
+src/lib.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/lib.rs)):
 schema metadata (`MessageMeta`, `MessageElement`, `MessageDataType`, `MessageClass`).
 
 -
 
-src/packet.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/packet.rs)):
+src/packet.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/packet.rs)):
 `Packet` validation, formatting, packet IDs, and migration-safe wire-contract state.
 
 -
 
-src/small_payload.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/small_payload.rs)):
+src/small_payload.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/small_payload.rs)):
 inline-optimized payload storage (`SmallPayload`).
 
 -
 
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/serialize.rs)):
+src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/serialize.rs)):
 compact wire format, ULEB128 helpers, envelope peek, packet IDs from wire.
 
 -
 
-src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/router.rs)):
+src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/router.rs)):
 router core, queues, endpoint handlers, side-based routing.
 
 -
 
-src/relay.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/relay.rs)):
+src/relay.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/relay.rs)):
 schema-agnostic fanout relay between sides.
 
 -
 
-src/queue.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/queue.rs)):
+src/queue.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/queue.rs)):
 bounded deque used by router and relay.
 
 -
 
-src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/c_api.rs))
+src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/c_api.rs))
 and
-src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/python_api.rs)):
+src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/python_api.rs)):
 FFI bindings (C ABI and pyo3).
 
 ## Runtime schema and metadata pipeline
@@ -132,7 +132,7 @@ Why this matters:
 ## Serialization and wire format
 
 The compact v2 wire format is implemented in
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/serialize.rs)).
+src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/serialize.rs)).
 A packet is encoded as a compact v2 frame with a fixed-width endpoint bitmap, optional wire contract, optional reliable header, payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
 
 Design choices:

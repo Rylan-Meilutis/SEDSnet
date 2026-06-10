@@ -11,13 +11,13 @@ import telemetry_config_editor as editor
 class TelemetryConfigEditorPathTests(unittest.TestCase):
     def test_find_ipc_schema_json_returns_none_when_env_unset(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SEDSPRINTF_RS_IPC_SCHEMA_PATH", None)
+            os.environ.pop("SEDSNET_IPC_SCHEMA_PATH", None)
             self.assertIsNone(editor.find_ipc_schema_json())
 
     def test_find_ipc_schema_json_resolves_relative_env_path(self) -> None:
         with mock.patch.dict(
                 os.environ,
-                {"SEDSPRINTF_RS_IPC_SCHEMA_PATH": "tmp/ipc_overlay.json"},
+                {"SEDSNET_IPC_SCHEMA_PATH": "tmp/ipc_overlay.json"},
                 clear=False,
         ):
             path = editor.find_ipc_schema_json()
@@ -29,7 +29,7 @@ class TelemetryConfigEditorPathTests(unittest.TestCase):
         absolute = Path("/tmp/test_ipc_overlay.json").resolve()
         with mock.patch.dict(
                 os.environ,
-                {"SEDSPRINTF_RS_IPC_SCHEMA_PATH": str(absolute)},
+                {"SEDSNET_IPC_SCHEMA_PATH": str(absolute)},
                 clear=False,
         ):
             self.assertEqual(editor.find_ipc_schema_json(), absolute)

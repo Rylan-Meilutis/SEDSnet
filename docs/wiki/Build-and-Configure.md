@@ -6,7 +6,7 @@ Python.
 ## Build tooling (build.py)
 
 The repo includes
-build.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.py)),
+build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)),
 a wrapper around Cargo and Maturin that:
 
 - Sets compile-time environment variables (e.g., `DEVICE_IDENTIFIER`).
@@ -38,18 +38,18 @@ Useful options:
     - `cargo build --no-default-features --target <embedded-target> --features embedded` when a matching cross C
       toolchain is available
 - `device_id=<id>` sets `DEVICE_IDENTIFIER` for the build.
-- `static_schema_path=<path>` sets `SEDSPRINTF_RS_STATIC_SCHEMA_PATH` for runtime registry seeding.
-- `static_ipc_schema_path=<path>` sets `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
+- `static_schema_path=<path>` sets `SEDSNET_STATIC_SCHEMA_PATH` for runtime registry seeding.
+- `static_ipc_schema_path=<path>` sets `SEDSNET_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
 - `max_stack_payload=<n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
 - `crypto_shim` enables the feature-gated crypto shim APIs.
 - `env:KEY=VALUE` passes any compile-time env var used by
-  src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/config.rs)).
+  src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 - `target=<triple>` sets the Rust target triple for embedded builds.
 
 ## Cargo features
 
 From
-Cargo.toml ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/Cargo.toml)):
+Cargo.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/Cargo.toml)):
 
 - `std` (default): host build with std.
 - `embedded`: enables embedded defaults, `timesync`, and no_std-friendly behavior.
@@ -77,7 +77,7 @@ internal network clock and FFI accessors for current network time. See [Time-Syn
 for roles, packet fields, internal clock behavior, and master-side setter APIs.
 
 Python builds via `maturin` in this repo enable `timesync` by default (see
-pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/pyproject.toml))).
+pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/pyproject.toml))).
 
 ## Test coverage and what runs
 
@@ -88,13 +88,13 @@ It covers four layers:
 - Rust unit and integration tests: `cargo nextest run --features timesync` when available, otherwise
   `cargo test --features timesync`, including `src/tests.rs`, Rust system tests in `tests/rust-system-test/`,
   and the Rust harness that configures and runs the C system tests in `tests/c-system-test/c_system_test.rs`.
-- Benchmark smoke: run Criterion benchmarks into a dedicated `sedsprintf_smoke` baseline, with plot generation
+- Benchmark smoke: run Criterion benchmarks into a dedicated `sedsnet_smoke` baseline, with plot generation
   disabled, longer timing than the old fast path, and a wider smoke-test noise threshold so validation exercises
   benchmark code without treating normal workstation variance as a regression.
 - Build validation: host `python` feature build and embedded-feature build when an embedded cross C toolchain is
   present.
 
-The C system tests exercise the generated C ABI, multi-endpoint routing, relay forwarding, discovery, and time-sync
+The C system tests exercise the static C ABI, multi-endpoint routing, relay forwarding, discovery, and time-sync
 behavior through compiled executables in `c-system-test/`. The main multi-node C test now waits for every asserted
 endpoint count before shutdown so it does not fail early when one simulated board drains slightly slower than another.
 
@@ -135,10 +135,10 @@ DEVICE_IDENTIFIER = "GROUND_STATION_26"
 CMake:
 
 ```
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 ```
 
-build.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.py)):
+build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)):
 
 ```
 ./build.py release device_id=GROUND_STATION
@@ -147,9 +147,9 @@ build.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/bui
 ## Compile-time configuration
 
 Configuration values are read via `option_env!` in
-src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/config.rs)).
+src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 You can set them via `.cargo/config.toml`,
-`build.py env:KEY=VALUE`, or CMake `SEDSPRINTF_RS_ENV_<KEY>` variables.
+`build.py env:KEY=VALUE`, or CMake `SEDSNET_ENV_<KEY>` variables.
 
 Supported keys (defaults shown):
 
@@ -173,7 +173,7 @@ amount from the same budget.
 
 `MAX_QUEUE_SIZE` is still accepted as a legacy environment alias, but new builds should use
 `MAX_QUEUE_BUDGET`, `build.py max_queue_budget=<n>`, or CMake
-`SEDSPRINTF_RS_MAX_QUEUE_BUDGET`.
+`SEDSNET_MAX_QUEUE_BUDGET`.
 
 ## Runtime telemetry schema
 
@@ -197,38 +197,39 @@ Applications add user endpoints and data types at runtime:
 
 Runtime JSON seeding options:
 
-- `SEDSPRINTF_RS_STATIC_SCHEMA_PATH=/path/to/telemetry_config.json`
-- `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH=/path/to/ipc_config.json`
+- `SEDSNET_STATIC_SCHEMA_PATH=/path/to/telemetry_config.json`
+- `SEDSNET_STATIC_IPC_SCHEMA_PATH=/path/to/ipc_config.json`
 - Rust `register_schema_json_path(...)` / `register_schema_json_bytes(...)`
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-Embedded builds include `telemetry_config.json` bytes only when that file exists, then parse those
-bytes at runtime. The default crate build does not require or include application JSON.
+Embedded builds include `telemetry_config.json` bytes only when an application provides that file
+locally before building, then parse those bytes at runtime. The default crate build does not require
+or include application JSON.
 
 ## CMake integration
 
-CMakeLists.txt ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/CMakeLists.txt))
+CMakeLists.txt ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/CMakeLists.txt))
 invokes
-build.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.py))
+build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py))
 and exposes variables for embedded builds.
 
 Common CMake variables:
 
-- `SEDSPRINTF_EMBEDDED_BUILD` (ON/OFF)
-- `SEDSPRINTF_RS_FORCE_RELEASE` (ON/OFF, forces Cargo release profile even under a Debug parent build)
-- `SEDSPRINTF_RS_TARGET` (Rust target triple)
-- `SEDSPRINTF_RS_DEVICE_IDENTIFIER`
-- `SEDSPRINTF_RS_MAX_STACK_PAYLOAD`
-- `SEDSPRINTF_RS_ENABLE_C_WRAPPER` (ON/OFF, builds `sedsprintf_rs::c_wrapper`)
-- `SEDSPRINTF_RS_ENABLE_CPP_WRAPPER` (ON/OFF, exposes `sedsprintf_rs::cpp_wrapper`)
-- `SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM` (ON/OFF, enables `crypto-shim` and defines `SEDS_ENABLE_CRYPTO_SHIM`)
-- `SEDSPRINTF_RS_ENV_<KEY>` for any config env var
+- `SEDSNET_EMBEDDED_BUILD` (ON/OFF)
+- `SEDSNET_FORCE_RELEASE` (ON/OFF, forces Cargo release profile even under a Debug parent build)
+- `SEDSNET_TARGET` (Rust target triple)
+- `SEDSNET_DEVICE_IDENTIFIER`
+- `SEDSNET_MAX_STACK_PAYLOAD`
+- `SEDSNET_ENABLE_C_WRAPPER` (ON/OFF, builds `sedsnet::c_wrapper`)
+- `SEDSNET_ENABLE_CPP_WRAPPER` (ON/OFF, exposes `sedsnet::cpp_wrapper`)
+- `SEDSNET_ENABLE_CRYPTO_SHIM` (ON/OFF, enables `crypto-shim` and defines `SEDS_ENABLE_CRYPTO_SHIM`)
+- `SEDSNET_ENV_<KEY>` for any config env var
 
 After `add_subdirectory`, link the target:
 
 ```
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::sedsprintf_rs)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
 ```
 
 ## Python builds
@@ -245,7 +246,7 @@ If you use `maturin develop` directly, ensure you are in the correct virtualenv.
 
 ## Build.rs behavior (advanced)
 
-build.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.rs))
+build.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.rs))
 is intentionally minimal in v4. It tracks build environment keys and whether optional embedded
 JSON bytes are available. It does not generate user schema constants.
 

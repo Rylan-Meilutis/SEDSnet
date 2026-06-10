@@ -1,6 +1,6 @@
-# sedsprintf_rs.pyi
+# sedsnet.pyi
 # =============================
-# Auto-generated Python type stubs for sedsprintf_rs. DO NOT EDIT AS CHANGES WILL BE OVERWRITTEN.
+# Auto-generated Python type stubs for sedsnet. DO NOT EDIT AS CHANGES WILL BE OVERWRITTEN.
 # =============================
 from __future__ import annotations
 

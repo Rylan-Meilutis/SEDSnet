@@ -1,5 +1,5 @@
-use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
-use sedsprintf_rs::{DataEndpoint, DataType, RouteSelectionMode, TelemetryResult};
+use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
+use sedsnet::{DataEndpoint, DataType, RouteSelectionMode, TelemetryResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct StepClock(AtomicU64);

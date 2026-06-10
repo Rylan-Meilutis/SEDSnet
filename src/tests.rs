@@ -10183,7 +10183,7 @@ mod router_tests {
                 ]
             }"#;
             let path = std::env::temp_dir().join(format!(
-                "sedsprintf_runtime_schema_{}_{}.json",
+                "sedsnet_runtime_schema_{}_{}.json",
                 std::process::id(),
                 9002
             ));

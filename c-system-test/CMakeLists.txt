@@ -50,24 +50,24 @@ target_include_directories(c_system_runtime_schema_test PRIVATE
 )
 
 # 3) Bring in the Rust crate (parent dir) with an explicit build dir
-get_filename_component(SEDSPRINTF_RS_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." REALPATH)
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "SYSTEM_TEST" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
-set(SEDSPRINTF_RS_ENABLE_CRYPTO_SHIM ON CACHE BOOL "" FORCE)
+get_filename_component(SEDSNET_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." REALPATH)
+set(SEDSNET_DEVICE_IDENTIFIER "SYSTEM_TEST" CACHE STRING "" FORCE)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+set(SEDSNET_ENABLE_CRYPTO_SHIM ON CACHE BOOL "" FORCE)
 add_subdirectory(
-        "${SEDSPRINTF_RS_ROOT}"
-        "${CMAKE_CURRENT_BINARY_DIR}/sedsprintf_rs-build"
+        "${SEDSNET_ROOT}"
+        "${CMAKE_CURRENT_BINARY_DIR}/sedsnet-build"
         EXCLUDE_FROM_ALL
 )
 
 # 4) Link + add the crate's public headers
-target_link_libraries(c_system_test PRIVATE sedsprintf_rs::c_wrapper)
-target_include_directories(c_system_test PRIVATE "${SEDSPRINTF_RS_INCLUDE_DIR}")
-target_link_libraries(c_system_timesync_test PRIVATE sedsprintf_rs::c_wrapper)
-target_include_directories(c_system_timesync_test PRIVATE "${SEDSPRINTF_RS_INCLUDE_DIR}")
-target_link_libraries(c_system_board_topology_timesync_test PRIVATE sedsprintf_rs::c_wrapper)
-target_include_directories(c_system_board_topology_timesync_test PRIVATE "${SEDSPRINTF_RS_INCLUDE_DIR}")
-target_link_libraries(c_system_multi_endpoint_topology_test PRIVATE sedsprintf_rs)
-target_include_directories(c_system_multi_endpoint_topology_test PRIVATE "${SEDSPRINTF_RS_INCLUDE_DIR}")
-target_link_libraries(c_system_runtime_schema_test PRIVATE sedsprintf_rs::c_wrapper)
-target_include_directories(c_system_runtime_schema_test PRIVATE "${SEDSPRINTF_RS_INCLUDE_DIR}")
+target_link_libraries(c_system_test PRIVATE sedsnet::c_wrapper)
+target_include_directories(c_system_test PRIVATE "${SEDSNET_INCLUDE_DIR}")
+target_link_libraries(c_system_timesync_test PRIVATE sedsnet::c_wrapper)
+target_include_directories(c_system_timesync_test PRIVATE "${SEDSNET_INCLUDE_DIR}")
+target_link_libraries(c_system_board_topology_timesync_test PRIVATE sedsnet::c_wrapper)
+target_include_directories(c_system_board_topology_timesync_test PRIVATE "${SEDSNET_INCLUDE_DIR}")
+target_link_libraries(c_system_multi_endpoint_topology_test PRIVATE sedsnet)
+target_include_directories(c_system_multi_endpoint_topology_test PRIVATE "${SEDSNET_INCLUDE_DIR}")
+target_link_libraries(c_system_runtime_schema_test PRIVATE sedsnet::c_wrapper)
+target_include_directories(c_system_runtime_schema_test PRIVATE "${SEDSNET_INCLUDE_DIR}")

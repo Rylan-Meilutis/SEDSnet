@@ -1,8 +1,8 @@
 #[cfg(feature = "compression")]
 mod compression_memory_pool_test {
-    use sedsprintf_rs::config::{DataEndpoint, DataType};
-    use sedsprintf_rs::packet::Packet;
-    use sedsprintf_rs::serialize;
+    use sedsnet::config::{DataEndpoint, DataType};
+    use sedsnet::packet::Packet;
+    use sedsnet::serialize;
 
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::mem::{align_of, size_of};

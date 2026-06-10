@@ -1,6 +1,6 @@
-use sedsprintf_rs::relay::Relay;
-use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
-use sedsprintf_rs::{DataEndpoint, DataType, Packet, TelemetryResult};
+use sedsnet::relay::Relay;
+use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
+use sedsnet::{DataEndpoint, DataType, Packet, TelemetryResult};
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -59,7 +59,7 @@ These tests validate behavior closer to how the crate is actually embedded into 
 
 ### C system tests
 
-The C system test harness lives in `tests/c-system-test/` and executes the generated C ABI through
+The C system test harness lives in `tests/c-system-test/` and executes the static C ABI through
 compiled test binaries.
 
 It covers:
@@ -70,7 +70,7 @@ It covers:
 - multi-node forwarding through the exported ABI
 - discovery and time-sync behavior from the C caller’s point of view
 
-This is the compatibility net for the generated C interface, not just the Rust core.
+This is the compatibility net for the C interface, not just the Rust core.
 
 ### Benchmark smoke tests
 
@@ -81,7 +81,7 @@ This is the compatibility net for the generated C interface, not just the Rust c
 
 These are not pass/fail performance gates today. They are there to catch obvious pathological
 regressions in hot paths while still keeping the test command practical for local use. The smoke
-runner saves into a dedicated `sedsprintf_smoke` baseline, disables plots, uses a longer measurement
+runner saves into a dedicated `sedsnet_smoke` baseline, disables plots, uses a longer measurement
 window than the old fast smoke path, and applies a wider noise threshold so normal host variance
 does not show up as alternating regression/improvement noise against the default benchmark baseline.
 
@@ -144,8 +144,8 @@ If installed, nextest is the preferred fast runner for non-doctest suites:
 cargo nextest run --features timesync
 ```
 
-`./build.py test` auto-detects nextest. Set `SEDSPRINTF_RS_TEST_RUNNER=cargo` to force Cargo's
-built-in runner, or `SEDSPRINTF_RS_TEST_RUNNER=nextest` to require nextest.
+`./build.py test` auto-detects nextest. Set `SEDSNET_TEST_RUNNER=cargo` to force Cargo's
+built-in runner, or `SEDSNET_TEST_RUNNER=nextest` to require nextest.
 
 Broader validation:
 

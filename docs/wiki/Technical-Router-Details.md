@@ -1,7 +1,7 @@
 # Router Details (Technical)
 
 This page dives into the Router internals in
-src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/router.rs))
+src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/router.rs))
 and how routing decisions are made.
 
 ## Router configuration
@@ -69,7 +69,9 @@ With the `discovery` feature enabled, the router has a built-in internal control
 - The router keeps soft-state reachability data per side:
   reachable endpoints, reachable time source sender IDs, per-announcer router graphs, and
   last-seen timestamps.
-- Unknown or expired routes fall back to ordinary flood behavior.
+- Once discovery topology exists, unknown user-data routes are not blindly flooded. Discovery and
+  other control traffic still propagate so routes can be learned after startup, partition, or
+  reconnect.
 
 Discovery advertisements are adaptive:
 

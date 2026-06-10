@@ -1,4 +1,4 @@
-import sedsprintf_rs as seds
+import sedsnet as seds
 
 
 RADIO = 101

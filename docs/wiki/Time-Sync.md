@@ -6,7 +6,7 @@ This page explains the built-in time sync support that ships with the `timesync`
 
 - Enable the `timesync` Cargo feature.
 - Python builds in this repo enable it by default (
-  pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/pyproject.toml))).
+  pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/pyproject.toml))).
 
 When enabled, the build adds the `TIME_SYNC` endpoint (broadcast mode `Always`) plus built-in
 time sync packet types in code.
@@ -180,7 +180,7 @@ stale.
 
 ## API entry points
 
-Rust helpers live in `sedsprintf_rs::timesync`:
+Rust helpers live in `sedsnet::timesync`:
 
 - `TimeSyncConfig`, `TimeSyncRole`, `TimeSyncTracker`
 - `send_timesync_announce`, `send_timesync_request`, `send_timesync_response`
@@ -192,12 +192,12 @@ Example implementations:
 
 -
 
-rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/timesync_example.rs))
+rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs))
 -
-c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/timesync_example.c))
+c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c))
 -
-python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-example/timesync_example.py))
+python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py))
 -
-rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rtos-example-code/freertos_timesync.c))
+rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c))
 -
-rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rtos-example-code/threadx_timesync.c))
+rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c))

@@ -1,13 +1,13 @@
-#ifndef SEDSPRINTF_C_H
-#define SEDSPRINTF_C_H
+#ifndef SEDSNET_C_H
+#define SEDSNET_C_H
 /* ============================================================================
-    Static raw C/C++ ABI header for sedsprintf_rs.
+    Static raw C/C++ ABI header for sedsnet.
 
     Runtime data types and endpoints are registered at runtime; this header only
     carries built-in IDs and ABI shapes. Optional convenience APIs live in
-    c-wrapper/sedsprintf_c_wrapper.h and c-wrapper/sedsprintf_cpp_wrapper.hpp.
+    c-wrapper/sedsnet_c_wrapper.h and c-wrapper/sedsnet_cpp_wrapper.hpp.
     Rust-side payload stack sizing is still controlled at build time with
-    MAX_STACK_PAYLOAD / SEDSPRINTF_RS_MAX_STACK_PAYLOAD.
+    MAX_STACK_PAYLOAD / SEDSNET_MAX_STACK_PAYLOAD.
    ============================================================================ */
 #include <stdint.h>
 #include <stddef.h>
@@ -1350,4 +1350,4 @@ SedsResult seds_crypto_open(uint32_t key_id,
 } /* extern "C" */
 #endif
 
-#endif /* SEDSPRINTF_C_H */
+#endif /* SEDSNET_C_H */

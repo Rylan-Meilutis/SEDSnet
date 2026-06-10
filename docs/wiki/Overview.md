@@ -5,7 +5,7 @@ implementation details and focuses on how you think about the system.
 
 ## What problem this solves
 
-Sedsprintf_rs gives you a **shared telemetry schema**, a **compact wire format**, and a **router** that can deliver
+SEDSNet gives you a **shared telemetry schema**, a **compact wire format**, and a **router** that can deliver
 messages locally and/or forward them across links. It is designed to run on embedded devices and host machines with the
 **same schema** and compatible packets.
 
@@ -18,6 +18,9 @@ Key outcomes:
 - CRC32 integrity checks on all serialized frames (corrupt frames are dropped; reliable modes request retransmit via
   internal reliable control packets).
 - Optional adaptive discovery that learns which endpoints are reachable on which sides and exports a live topology view.
+- Managed-variable latest-value caches so restarted boards can request current network state through
+  the normal endpoint handler path.
+- Optional E2E encrypted payloads through C/Rust crypto shims or a registered software fallback key.
 - Bounded queue memory: RX, TX, reliable buffers, preallocated dedupe caches, and discovery
   topology share one dynamic `MAX_QUEUE_BUDGET` per router or relay.
 
@@ -26,14 +29,17 @@ through their handlers; side-aware RX functions are only needed when you explici
 
 ## The core concepts (in plain language)
 
-- **Schema**: A shared list of endpoints (where data goes) and types (what data looks like). It lives in
-  telemetry_config.json ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/telemetry_config.json)).
+- **Schema**: A shared list of endpoints (where data goes) and types (what data looks like). In v4,
+  application schema is runtime state supplied by registration APIs, application-owned JSON, or
+  discovery sync; the crate does not ship a default user schema.
 - **Telemetry packet**: One message, with a type, destination endpoints, sender ID, timestamp, and payload bytes.
 - **Router**: The switchboard. It receives packets, calls local handlers, and optionally forwards packets to other
   nodes.
 - **Relay**: A simpler fan‑out component that forwards packets between sides without knowing the schema.
 - **Discovery**: An optional internal control plane that advertises reachable endpoints, adapts its announce rate to
   topology changes, and helps routers/relays forward more selectively.
+- **Managed variable**: A data type whose latest value is cached by the network and can be replayed
+  on request after a board restart or reconnect.
 
 ## A simple mental model
 
@@ -93,6 +99,7 @@ log(GPS_DATA)  ->  serialize -> bytes -> send -> bytes -> rx_serialized()
 ## What to read next
 
 - If you want the concepts explained without code: [Concepts](Concepts)
+- If you want abbreviations and terms defined: [Glossary-and-Abbreviations](Glossary-and-Abbreviations)
 - If you want integration steps: [Build-and-Configure](Build-and-Configure)
 - If you want routing internals: [Technical-Router-Details](Technical-Router-Details)
 - If you need time sync details: [Time-Sync](Time-Sync)

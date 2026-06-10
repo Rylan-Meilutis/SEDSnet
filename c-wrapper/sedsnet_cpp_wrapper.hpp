@@ -1,7 +1,7 @@
-#ifndef SEDSPRINTF_CPP_WRAPPER_HPP
-#define SEDSPRINTF_CPP_WRAPPER_HPP
+#ifndef SEDSNET_CPP_WRAPPER_HPP
+#define SEDSNET_CPP_WRAPPER_HPP
 
-#include "sedsprintf.h"
+#include "sedsnet.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>

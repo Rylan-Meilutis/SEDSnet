@@ -12,7 +12,7 @@ from pathlib import Path
 
 # The line pattern in .gitignore we want to temporarily comment out.
 # This is treated as a literal and turned into a whole-line regex.
-PYI_IGNORE_LINE = "python-files/sedsprintf_rs/sedsprintf_rs.pyi"
+PYI_IGNORE_LINE = "python-files/sedsnet/sedsnet.pyi"
 PYI_IGNORE_REGEX = re.compile(rf"^{re.escape(PYI_IGNORE_LINE)}$")
 
 
@@ -28,7 +28,7 @@ def print_help(error: str | None = None) -> None:
 Options (can be combined where it makes sense):
   release                 Build in release mode.
   check                   Run `cargo clippy` for default, python, and embedded feature variants with `-D warnings`.
-  test                    Run `cargo test`, a short Criterion benchmark smoke pass, and also validate python + 
+  test                    Run Rust tests, a stable Criterion benchmark smoke pass, and validate python +
   embedded build if cross C toolchain exists.
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
@@ -39,8 +39,8 @@ Options (can be combined where it makes sense):
   maturin-install         Build wheel and install it with `uv pip install`.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
-  static_schema_path=<path>      Set SEDSPRINTF_RS_STATIC_SCHEMA_PATH for runtime registry seeding.
-  static_ipc_schema_path=<path>  Set SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH for runtime IPC overlay seeding.
+  static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
+  static_ipc_schema_path=<path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for runtime IPC overlay seeding.
   max_queue_budget=<n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
   max_recent_rx_ids=<n>   Set MAX_RECENT_RX_IDS for the preallocated recent-ID cache.
 
@@ -48,11 +48,11 @@ New (compile-time env vars):
   max_stack_payload=<n>   Set MAX_STACK_PAYLOAD for define_stack_payload!(env="MAX_STACK_PAYLOAD", ...).
   env:KEY=VALUE           Set arbitrary environment variable(s) for the build (repeatable).
                           Example: env:MAX_QUEUE_BUDGET=65536 env:QUEUE_GROW_STEP=2.0
-  env:SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD="..."  Optional command used to auto-install
+  env:SEDSNET_INSTALL_C_TOOLCHAIN_CMD="..."  Optional command used to auto-install
                           cross C toolchain when embedded checks need it.
-  env:SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO=0         Disable automatic size-oriented CFLAGS/defines
+  env:SEDSNET_EMBEDDED_CFLAGS_AUTO=0         Disable automatic size-oriented CFLAGS/defines
                           injection for embedded C dependencies.
-  env:SEDSPRINTF_RS_TEST_RUNNER=auto|nextest|cargo Select Rust test runner for `build.py test`.
+  env:SEDSNET_TEST_RUNNER=auto|nextest|cargo Select Rust test runner for `build.py test`.
                           `auto` uses cargo-nextest when installed and falls back to cargo test.
 
 Special:
@@ -127,17 +127,17 @@ def _fmt_bytes(n: int) -> str:
 
 def shared_lib_name() -> str:
     if sys.platform == "darwin":
-        return "libsedsprintf_rs.dylib"
+        return "libsedsnet.dylib"
     if os.name == "nt":
-        return "sedsprintf_rs.dll"
-    return "libsedsprintf_rs.so"
+        return "sedsnet.dll"
+    return "libsedsnet.so"
 
 
 def print_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> None:
     out_dir = repo_root / "target" / target / profile if target else repo_root / "target" / profile
-    staticlib = out_dir / "libsedsprintf_rs.a"
+    staticlib = out_dir / "libsedsnet.a"
     sharedlib = out_dir / shared_lib_name()
-    rlib = out_dir / "libsedsprintf_rs.rlib"
+    rlib = out_dir / "libsedsnet.rlib"
 
     printed = False
     for p, label in ((staticlib, "staticlib"), (sharedlib, "sharedlib"), (rlib, "rlib")):
@@ -151,9 +151,9 @@ def print_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> None:
 
 def collect_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> dict[str, int]:
     out_dir = repo_root / "target" / target / profile if target else repo_root / "target" / profile
-    staticlib = out_dir / "libsedsprintf_rs.a"
+    staticlib = out_dir / "libsedsnet.a"
     sharedlib = out_dir / shared_lib_name()
-    rlib = out_dir / "libsedsprintf_rs.rlib"
+    rlib = out_dir / "libsedsnet.rlib"
     out: dict[str, int] = {}
     if staticlib.exists():
         out["staticlib"] = staticlib.stat().st_size
@@ -290,18 +290,18 @@ def cargo_nextest_available(env: dict[str, str]) -> bool:
 
 def test_runner_cmds(*, env: dict[str, str], features: list[str]) -> tuple[str, list[list[str]]]:
     feature_arg = ",".join(features)
-    runner = env.get("SEDSPRINTF_RS_TEST_RUNNER", "auto").strip().lower()
+    runner = env.get("SEDSNET_TEST_RUNNER", "auto").strip().lower()
     if runner not in ("auto", "nextest", "cargo"):
         raise SystemExit(
-            "SEDSPRINTF_RS_TEST_RUNNER must be one of: auto, nextest, cargo "
+            "SEDSNET_TEST_RUNNER must be one of: auto, nextest, cargo "
             f"(got {runner!r})"
         )
 
     has_nextest = cargo_nextest_available(env)
     if runner == "nextest" and not has_nextest:
         raise SystemExit(
-            "SEDSPRINTF_RS_TEST_RUNNER=nextest was requested, but `cargo nextest` is not installed. "
-            "Install it with `cargo install cargo-nextest --locked` or use SEDSPRINTF_RS_TEST_RUNNER=cargo."
+            "SEDSNET_TEST_RUNNER=nextest was requested, but `cargo nextest` is not installed. "
+            "Install it with `cargo install cargo-nextest --locked` or use SEDSNET_TEST_RUNNER=cargo."
         )
 
     if runner == "nextest" or (runner == "auto" and has_nextest):
@@ -496,7 +496,7 @@ def try_install_embedded_c_toolchain(target: str, env: dict[str, str]) -> bool:
         return True
 
     # Allow caller/CI to provide an explicit install command.
-    override = env.get("SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD", "").strip()
+    override = env.get("SEDSNET_INSTALL_C_TOOLCHAIN_CMD", "").strip()
     if override:
         cmd = shlex.split(override)
         if not cmd:
@@ -557,8 +557,8 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
     if not target:
         return
 
-    if env.get("SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO", "1") in ("0", "false", "False"):
-        print("info: embedded CFLAGS auto-tuning disabled by SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO.")
+    if env.get("SEDSNET_EMBEDDED_CFLAGS_AUTO", "1") in ("0", "false", "False"):
+        print("info: embedded CFLAGS auto-tuning disabled by SEDSNET_EMBEDDED_CFLAGS_AUTO.")
         return
 
     defaults = [
@@ -587,7 +587,7 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
 
     print(
         "info: applied embedded CFLAGS defaults for size (override with env:CFLAGS... "
-        "or disable via env:SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO=0)."
+        "or disable via env:SEDSNET_EMBEDDED_CFLAGS_AUTO=0)."
     )
 
 
@@ -682,7 +682,7 @@ def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root:
     )
 
     wheels_dir = repo_root / "target" / "wheels"
-    wheels = sorted(wheels_dir.glob("sedsprintf_rs-*.whl"))
+    wheels = sorted(wheels_dir.glob("sedsnet-*.whl"))
     if not wheels:
         raise SystemExit(f"No wheels found in {wheels_dir}")
     wheel = wheels[-1]
@@ -719,7 +719,7 @@ def cargo_bench_smoke_cmd() -> list[str]:
     cmd.extend([
         "--",
         "--save-baseline",
-        "sedsprintf_smoke",
+        "sedsnet_smoke",
         "--noplot",
         "--sample-size",
         "30",
@@ -769,7 +769,7 @@ def run_clippy_checks(
         expected = ", ".join(preferred_cross_compilers(embedded_target)) or "CC_<target>/TARGET_CC"
         print(
             "info: embedded cross C toolchain missing; attempting auto-install "
-            "(set SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD to override)."
+            "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
         )
         can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
 
@@ -913,13 +913,13 @@ def main(argv: list[str]) -> None:
             schema_path = arg.split("=", 1)[1]
             if not schema_path:
                 print_help("static_schema_path requires a value")
-            env_overrides["SEDSPRINTF_RS_STATIC_SCHEMA_PATH"] = schema_path
+            env_overrides["SEDSNET_STATIC_SCHEMA_PATH"] = schema_path
 
         elif arg.startswith("static_ipc_schema_path=") or arg.startswith("ipc_schema_path="):
             ipc_schema_path = arg.split("=", 1)[1]
             if not ipc_schema_path:
                 print_help("static_ipc_schema_path requires a value")
-            env_overrides["SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH"] = ipc_schema_path
+            env_overrides["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = ipc_schema_path
 
         elif arg.startswith("max_stack_payload="):
             v = arg.split("=", 1)[1].strip()
@@ -962,16 +962,16 @@ def main(argv: list[str]) -> None:
     env = os.environ.copy()
     if device_id:
         env["DEVICE_IDENTIFIER"] = device_id
-    if (tests and "SEDSPRINTF_RS_STATIC_SCHEMA_PATH" not in env_overrides and "SEDSPRINTF_RS_STATIC_SCHEMA_PATH" not
+    if (tests and "SEDSNET_STATIC_SCHEMA_PATH" not in env_overrides and "SEDSNET_STATIC_SCHEMA_PATH" not
             in env):
-        env_overrides["SEDSPRINTF_RS_STATIC_SCHEMA_PATH"] = str(
+        env_overrides["SEDSNET_STATIC_SCHEMA_PATH"] = str(
             (repo_root / "telemetry_config.test.json").resolve()
         )
-    if (tests and "SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH" not in env_overrides and
-            "SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH" not in env):
+    if (tests and "SEDSNET_STATIC_IPC_SCHEMA_PATH" not in env_overrides and
+            "SEDSNET_STATIC_IPC_SCHEMA_PATH" not in env):
         test_ipc_schema = (repo_root / "telemetry_config.ipc.test.json").resolve()
         if test_ipc_schema.exists():
-            env_overrides["SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH"] = str(test_ipc_schema)
+            env_overrides["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = str(test_ipc_schema)
     _apply_env_overrides(env, env_overrides)
 
     if release_build:
@@ -1009,7 +1009,7 @@ def main(argv: list[str]) -> None:
             expected = ", ".join(preferred_cross_compilers(embedded_target)) or "CC_<target>/TARGET_CC"
             print(
                 "info: embedded cross C toolchain missing; attempting auto-install "
-                "(set SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD to override)."
+                "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
         total_steps = 7 if can_check_embedded else 6
@@ -1133,7 +1133,7 @@ def main(argv: list[str]) -> None:
             expected = ", ".join(preferred_cross_compilers(target)) or "CC_<target>/TARGET_CC"
             print(
                 "info: embedded cross C toolchain missing; attempting auto-install "
-                "(set SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD to override)."
+                "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             if not try_install_embedded_c_toolchain(target, env):
                 print(

@@ -1,5 +1,5 @@
-#include "sedsprintf.h"
-#include "sedsprintf_c_wrapper.h"
+#include "sedsnet.h"
+#include "sedsnet_c_wrapper.h"
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>

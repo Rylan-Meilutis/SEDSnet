@@ -1,12 +1,12 @@
 #[cfg(test)]
 mod mega_library_system_tests {
-    use sedsprintf_rs::TelemetryResult;
-    use sedsprintf_rs::config::{DataEndpoint, DataType};
-    use sedsprintf_rs::packet::Packet;
-    use sedsprintf_rs::relay::Relay;
-    use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
+    use sedsnet::TelemetryResult;
+    use sedsnet::config::{DataEndpoint, DataType};
+    use sedsnet::packet::Packet;
+    use sedsnet::relay::Relay;
+    use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
 
-    use sedsprintf_rs::serialize::serialize_packet;
+    use sedsnet::serialize::serialize_packet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;

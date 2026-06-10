@@ -1,5 +1,5 @@
-use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
-use sedsprintf_rs::{DataEndpoint, DataType, TelemetryResult};
+use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
+use sedsnet::{DataEndpoint, DataType, TelemetryResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]

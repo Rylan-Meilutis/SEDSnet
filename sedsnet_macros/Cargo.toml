@@ -1,5 +1,5 @@
 [package]
-name = "sedsprintf_macros"
+name = "sedsnet_macros"
 version = "2.0.0"
 edition = "2024"
 

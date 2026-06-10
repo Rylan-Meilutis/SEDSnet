@@ -1,7 +1,7 @@
 # Wire Format (Technical)
 
 This page documents the compact v2 wire format implemented in
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/serialize.rs)).
+src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/serialize.rs)).
 
 ## Goals
 

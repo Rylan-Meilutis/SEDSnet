@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 #include "telemetry_sim.h"
-#include "sedsprintf.h"
+#include "sedsnet.h"
 
 #define num_endpoint_hits 40
 #define min_expected_endpoint_hits (num_endpoint_hits / 2)

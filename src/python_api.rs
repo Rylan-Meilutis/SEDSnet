@@ -24,7 +24,7 @@
 //! - Dynamic enums
 //!   - `DataType`, `DataEndpoint`, `ElemKind`
 //!
-//! The Python module name is `sedsprintf_rs`.
+//! The Python module name is `sedsnet`.
 
 use alloc::{boxed::Box, string::String, sync::Arc as AArc, vec::Vec};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -2430,8 +2430,8 @@ pub fn register_schema_json_file_py(path: &str) -> PyResult<()> {
 // ============================================================================
 
 #[pymodule]
-/// Initializes the `sedsprintf_rs` Python extension module.
-pub fn sedsprintf_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Initializes the `sedsnet` Python extension module.
+pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRouter>()?;
     m.add_class::<PyPacket>()?;
     m.add_class::<PyRelay>()?;

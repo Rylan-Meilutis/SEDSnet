@@ -4,8 +4,8 @@
 
 - v4.0.0 does not generate application endpoint/type constants at compile time.
 - Register endpoints and data types at startup, seed them from JSON, or wait for discovery sync.
-- For runtime JSON seeding, use `SEDSPRINTF_RS_STATIC_SCHEMA_PATH`,
-  `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH`, or the explicit JSON file/bytes API for your language.
+- For runtime JSON seeding, use `SEDSNET_STATIC_SCHEMA_PATH`,
+  `SEDSNET_STATIC_IPC_SCHEMA_PATH`, or the explicit JSON file/bytes API for your language.
 - Use name lookup helpers such as `DataEndpoint::try_named(...)`,
   `seds_endpoint_get_info_by_name(...)`, or `endpoint_info_by_name(...)` before logging.
 
@@ -90,7 +90,7 @@ If C system tests print warnings like "object file ... built for newer 'macOS' v
 ## Python import fails
 
 - Ensure you built the extension: `./build.py python` or `maturin develop`. (
-  build.py: [source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.py))
+  build.py: [source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py))
 - Verify you are using the same Python interpreter/venv used for the build.
 - If runtime schema names are missing, seed/register the schema in that process; rebuilding is only
   needed after Python API changes.

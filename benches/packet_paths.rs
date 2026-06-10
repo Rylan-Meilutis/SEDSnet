@@ -1,7 +1,7 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use sedsprintf_rs::config::{DataEndpoint, DataType};
-use sedsprintf_rs::packet::Packet;
-use sedsprintf_rs::serialize::{deserialize_packet, peek_frame_info, serialize_packet};
+use sedsnet::config::{DataEndpoint, DataType};
+use sedsnet::packet::Packet;
+use sedsnet::serialize::{deserialize_packet, peek_frame_info, serialize_packet};
 use std::hint::black_box;
 
 const GPS_VALUES: &[f32] = &[37.7749_f32, -122.4194_f32, 30.0_f32];

@@ -698,7 +698,7 @@ impl RelayInner {
     #[inline]
     fn queue_budget_warning(msg: &str) {
         #[cfg(feature = "std")]
-        eprintln!("sedsprintf_rs queue budget warning: {msg}");
+        eprintln!("sedsnet queue budget warning: {msg}");
         let _ = msg;
     }
 

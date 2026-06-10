@@ -20,19 +20,58 @@
   Type shape conflicts remain rejected by direct registration.
 - Schema registry memory is now part of the same shared router/relay queue budget used for RX/TX
   queues, reliable state, recent packet IDs, discovery topology, and other queue-backed state.
-- Static JSON config is now runtime seeding only. `SEDSPRINTF_RS_STATIC_SCHEMA_PATH` and
-  `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH` can seed the registry at startup, and explicit path/bytes
+- Added managed-variable latest-value caching. Routers can mark a data type as network-managed,
+  cache the latest packet for that type, seed the cache from serialized traffic, and request a
+  replay so restarted boards can resynchronize through the normal endpoint handler path.
+- Added end-to-end payload encryption policy hooks under the `crypto-shim` feature:
+    - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn`.
+    - Routers can run in `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll` mode.
+    - Builds without crypto support reject required encrypted traffic instead of silently
+      downgrading it.
+- Added process-wide crypto provider support. The provider order is C shim, Rust shim, then a
+  software fallback key, so std applications can wrap OS crypto APIs and embedded applications can
+  use secure elements or hardware accelerators without changing the router API.
+- Added compact 80-byte managed credential helpers for master-root deployments. A master/root key
+  can issue short-lived board credentials containing subject, key, epoch, validity window, and
+  permission bits; peers verify them before accepting issued session or group keys.
+- Added runtime sender ID update APIs and reduced follow-up serialized header overhead by caching
+  sender/header templates on serialized sides.
+- Added fixed-size serialized side splitting/reassembly for transports such as CAN, I2C, and
+  fixed-frame radio links. Router and relay sides can cap outbound serialized chunks without
+  changing the user packet/logging API.
+- Added link-probe sample APIs for routers and relays so transport bring-up or driver-measured
+  throughput can seed adaptive path selection.
+- Tightened discovery-aware forwarding for low-bandwidth links. Once topology exists, unknown
+  user-data routes are not blindly flooded; discovery/control traffic still propagates and explicit
+  route policy can still intentionally select a side.
+- Static JSON config is now runtime seeding only. `SEDSNET_STATIC_SCHEMA_PATH` and
+  `SEDSNET_STATIC_IPC_SCHEMA_PATH` can seed the registry at startup, and explicit path/bytes
   APIs are available for Rust/C/Python. Default `build.py` builds do not include application JSON.
-- Embedded builds include `telemetry_config.json` bytes only when that file exists, then decode
-  those bytes through the normal runtime JSON parser. Builds remain publishable without a required
-  local JSON file.
+- Embedded builds include `telemetry_config.json` bytes only when an application provides that file
+  locally before building, then decode those bytes through the normal runtime JSON parser. Builds
+  remain publishable without a required local JSON file, and the repo no longer carries a default
+  user schema. Downstream applications can still add and package their own schema files
+  intentionally.
 - Runtime removal APIs can remove user endpoints or data types by ID or name. Built-in internal
   discovery, time-sync, telemetry-error, and reliable-control entries remain protected.
+- The checked-in C header is now static for the runtime-schema ABI. Optional reusable C and C++
+  convenience wrappers can be selected from upstream CMake without forcing wrapper code into
+  projects that only want the raw ABI.
+- C API coverage now includes router/relay global helper wrappers, managed variables, crypto shim
+  registration, software fallback keys, managed credentials, runtime sender IDs, fixed-size
+  serialized sides, link-probe samples, and topology/runtime-stat exports.
+- `./build.py test` now auto-detects `cargo-nextest` for non-doctest Rust suites when installed,
+  falls back to `cargo test` when it is not, and keeps doctests covered with Cargo's built-in test
+  runner.
+- Benchmark smoke validation still executes Criterion benchmarks, but now uses a dedicated
+  `sedsnet_smoke` baseline, longer timing windows, disabled plots, and a wider smoke-test noise
+  threshold so normal host variance does not print alternating regression/improvement noise.
 - Updated Rust tests and benches to use readable runtime names such as
   `DataEndpoint::named("RADIO")` and `DataType::named("GPS_DATA")` instead of raw legacy IDs.
 - Added regression coverage for schema sync, deterministic conflict resolution, budget accounting,
-  runtime string lookups, description metadata, handler construction from endpoint definitions, and
-  runtime schema removal.
+  runtime string lookups, description metadata, handler construction from endpoint definitions,
+  runtime schema removal, managed-variable replay, crypto credentials/shims, topology exports,
+  fixed-size side splitting, link probing, and nextest-aware test execution.
 
 ## 3.12.0
 
@@ -229,6 +268,6 @@
   folded that clippy coverage into `./build.py test`.
 - Fixed the static C ABI header so the checked-in header includes the current logging entry points, including
   `seds_router_log_typed`, `seds_router_log_queue_typed`, `seds_router_log_bytes`, and `seds_router_log_f32`.
-- Moved `C-Headers/sedsprintf.h` to a static runtime-schema ABI header so user data types and endpoints are resolved
+- Moved `C-Headers/sedsnet.h` to a static runtime-schema ABI header so user data types and endpoints are resolved
   by runtime registration instead of generated schema constants.
 - Updated Python stub generation and example telemetry code to match the current public ABI and discovery helpers.

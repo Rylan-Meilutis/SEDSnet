@@ -2,7 +2,7 @@
 import sys
 import time
 
-import sedsprintf_rs as seds
+import sedsnet as seds
 
 DT = seds.DataType
 

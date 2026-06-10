@@ -1,10 +1,10 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use sedsprintf_rs::RouteSelectionMode;
-use sedsprintf_rs::TelemetryResult;
-use sedsprintf_rs::config::{DataEndpoint, DataType};
-use sedsprintf_rs::packet::Packet;
-use sedsprintf_rs::relay::Relay;
-use sedsprintf_rs::router::{Clock, Router, RouterConfig};
+use sedsnet::RouteSelectionMode;
+use sedsnet::TelemetryResult;
+use sedsnet::config::{DataEndpoint, DataType};
+use sedsnet::packet::Packet;
+use sedsnet::relay::Relay;
+use sedsnet::router::{Clock, Router, RouterConfig};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,13 +43,13 @@ fn benchmark_route_selection_paths(c: &mut Criterion) {
             Ok(())
         })
     };
-    let discovery_a = sedsprintf_rs::discovery::build_discovery_announce(
+    let discovery_a = sedsnet::discovery::build_discovery_announce(
         "REMOTE_A",
         0,
         &[DataEndpoint::named("RADIO")],
     )
     .unwrap();
-    let discovery_b = sedsprintf_rs::discovery::build_discovery_announce(
+    let discovery_b = sedsnet::discovery::build_discovery_announce(
         "REMOTE_B",
         1,
         &[DataEndpoint::named("RADIO")],
@@ -92,13 +92,13 @@ fn benchmark_route_selection_paths(c: &mut Criterion) {
             Ok(())
         })
     };
-    let relay_discovery_a = sedsprintf_rs::discovery::build_discovery_announce(
+    let relay_discovery_a = sedsnet::discovery::build_discovery_announce(
         "REMOTE_A",
         0,
         &[DataEndpoint::named("RADIO")],
     )
     .unwrap();
-    let relay_discovery_b = sedsprintf_rs::discovery::build_discovery_announce(
+    let relay_discovery_b = sedsnet::discovery::build_discovery_announce(
         "REMOTE_B",
         1,
         &[DataEndpoint::named("RADIO")],
@@ -116,7 +116,7 @@ fn benchmark_route_selection_paths(c: &mut Criterion) {
     let relay_counter = AtomicU64::new(10_000);
     group.bench_function("relay_failover_forward", |b| {
         b.iter_batched(
-            || sedsprintf_rs::serialize::serialize_packet(&next_packet(&relay_counter)),
+            || sedsnet::serialize::serialize_packet(&next_packet(&relay_counter)),
             |frame| {
                 relay_out_a.lock().unwrap().clear();
                 relay_out_b.lock().unwrap().clear();

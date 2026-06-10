@@ -1,6 +1,6 @@
 // telemetry_sim_threadsafe.c
 #include "telemetry_sim.h"
-#include "sedsprintf_c_wrapper.h"
+#include "sedsnet_c_wrapper.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>

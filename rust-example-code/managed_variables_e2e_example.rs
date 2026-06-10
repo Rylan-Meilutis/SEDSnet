@@ -1,9 +1,9 @@
-use sedsprintf_rs::config::{
+use sedsnet::config::{
     register_data_type_id_with_description_and_e2e_encryption,
     register_endpoint_id_with_description,
 };
-use sedsprintf_rs::router::{Router, RouterConfig, RouterE2eEncryptionMode};
-use sedsprintf_rs::{
+use sedsnet::router::{Router, RouterConfig, RouterE2eEncryptionMode};
+use sedsnet::{
     DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement,
     ReliableMode, TelemetryResult,
 };

@@ -78,7 +78,7 @@ pub const STRING_PRECISION: usize = match option_env!("STRING_PRECISION") {
     None => 8,
 };
 
-sedsprintf_macros::define_stack_payload!(env = "MAX_STACK_PAYLOAD", default = 64);
+sedsnet_macros::define_stack_payload!(env = "MAX_STACK_PAYLOAD", default = 64);
 
 pub const MAX_HANDLER_RETRIES: usize = match option_env!("MAX_HANDLER_RETRIES") {
     Some(val) => parse_usize(val),
@@ -576,14 +576,14 @@ impl Registry {
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
-        #[cfg(all(feature = "embedded", sedsprintf_has_telemetry_config_json))]
+        #[cfg(all(feature = "embedded", sedsnet_has_telemetry_config_json))]
         if let Ok(snapshot) = bundled_schema_snapshot() {
             let _ = register_schema_snapshot_into(&mut reg, snapshot);
         }
-        if let Some(cfg) = read_runtime_json_config("SEDSPRINTF_RS_STATIC_SCHEMA_PATH", &[]) {
+        if let Some(cfg) = read_runtime_json_config("SEDSNET_STATIC_SCHEMA_PATH", &[]) {
             let _ = register_json_config_into(&mut reg, cfg, false);
         }
-        if let Some(cfg) = read_runtime_json_config("SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH", &[]) {
+        if let Some(cfg) = read_runtime_json_config("SEDSNET_STATIC_IPC_SCHEMA_PATH", &[]) {
             let _ = register_json_config_into(&mut reg, cfg, true);
         }
         reg
@@ -837,7 +837,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
 #[cfg(all(
     feature = "serde",
     feature = "embedded",
-    sedsprintf_has_telemetry_config_json
+    sedsnet_has_telemetry_config_json
 ))]
 fn bundled_schema_snapshot() -> TelemetryResult<RuntimeSchemaSnapshot> {
     schema_snapshot_from_json_bytes(include_bytes!("../telemetry_config.json"))
@@ -1829,6 +1829,10 @@ pub fn export_schema() -> RuntimeSchemaSnapshot {
 
 #[cfg(not(feature = "std"))]
 pub fn known_endpoints() -> Vec<EndpointDefinition> {
+    #[cfg_attr(
+        not(all(feature = "serde", sedsnet_has_telemetry_config_json)),
+        allow(unused_mut)
+    )]
     let mut endpoints = vec![
         EndpointDefinition {
             id: DataEndpoint::TelemetryError,
@@ -1849,7 +1853,7 @@ pub fn known_endpoints() -> Vec<EndpointDefinition> {
             link_local_only: false,
         },
     ];
-    #[cfg(all(feature = "serde", sedsprintf_has_telemetry_config_json))]
+    #[cfg(all(feature = "serde", sedsnet_has_telemetry_config_json))]
     if let Ok(snapshot) = bundled_schema_snapshot() {
         for endpoint in snapshot.endpoints {
             if !endpoints
@@ -1865,6 +1869,10 @@ pub fn known_endpoints() -> Vec<EndpointDefinition> {
 
 #[cfg(not(feature = "std"))]
 pub fn known_data_types() -> Vec<DataTypeDefinition> {
+    #[cfg_attr(
+        not(all(feature = "serde", sedsnet_has_telemetry_config_json)),
+        allow(unused_mut)
+    )]
     let mut types = vec![
         DataTypeDefinition {
             id: DataType::TelemetryError,
@@ -2017,7 +2025,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
     ];
-    #[cfg(all(feature = "serde", sedsprintf_has_telemetry_config_json))]
+    #[cfg(all(feature = "serde", sedsnet_has_telemetry_config_json))]
     if let Ok(snapshot) = bundled_schema_snapshot() {
         for ty in snapshot.types {
             if !types

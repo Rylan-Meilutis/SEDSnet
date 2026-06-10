@@ -1,7 +1,7 @@
 # Packet Details (Technical)
 
 This page documents `Packet` in
-src/packet.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/packet.rs))
+src/packet.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/packet.rs))
 and how payload validation works.
 
 ## Structure

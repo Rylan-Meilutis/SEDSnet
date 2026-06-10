@@ -1,4 +1,4 @@
-#include "sedsprintf_c_wrapper.h"
+#include "sedsnet_c_wrapper.h"
 
 static SedsResult radio_tx(const uint8_t * bytes, size_t len, void * user)
 {

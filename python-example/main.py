@@ -5,7 +5,7 @@ import sys
 import time
 from queue import Empty
 
-import sedsprintf_rs as seds
+import sedsnet as seds
 
 DT = seds.DataType
 

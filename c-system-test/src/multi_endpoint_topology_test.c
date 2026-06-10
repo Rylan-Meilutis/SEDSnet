@@ -5,7 +5,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "sedsprintf.h"
+#include "sedsnet.h"
 
 enum {
     TEST_EP_SD_CARD = 100,

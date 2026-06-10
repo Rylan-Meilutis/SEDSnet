@@ -19,10 +19,12 @@
     - C and Python expose matching register/info/info-by-name/remove APIs.
 - JSON seeding:
     - Static JSON is optional runtime input, not compile-time codegen.
-    - Host builds can seed via `SEDSPRINTF_RS_STATIC_SCHEMA_PATH`,
-      `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH`, explicit path APIs, or explicit bytes APIs.
-    - Embedded builds include `telemetry_config.json` bytes only if the file exists, then decode
-      them through the same runtime parser.
+    - Host builds can seed via `SEDSNET_STATIC_SCHEMA_PATH`,
+      `SEDSNET_STATIC_IPC_SCHEMA_PATH`, explicit path APIs, or explicit bytes APIs.
+    - Embedded builds include `telemetry_config.json` bytes only when an application provides that
+      file locally before building, then decode them through the same runtime parser.
+    - The repo no longer carries a default user schema, but downstream applications can still add
+      and package their own schema files intentionally.
 - Network schema sync:
     - Discovery advertises the current endpoint/type schema.
     - Nodes merge compatible schemas and resolve ID/name conflicts deterministically.
@@ -33,10 +35,47 @@
     - Runtime JSON accepts both `description` and legacy `doc`.
     - Schema registry memory counts against the same shared router/relay queue budget as RX/TX
       queues, reliable state, dedupe caches, and discovery topology.
+- Managed variables:
+    - Routers can cache the latest value packet for selected data types.
+    - A restarted board can call the managed-variable request API and receive the cached value
+      through the normal endpoint handler path instead of waiting for the next publisher update.
+    - The cache can also be seeded from already serialized traffic.
+- E2E payload security:
+    - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn` encryption policy.
+    - Routers can run with encryption `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll`.
+    - Builds without `crypto-shim` reject required encrypted traffic instead of silently falling
+      back to plaintext.
+    - The `crypto-shim` provider chain supports C callbacks, Rust shims, and a registered software
+      fallback key so host builds can wrap OS crypto and embedded builds can wrap hardware crypto or
+      secure elements.
+    - Compact managed credential helpers support master-root deployments without requiring users to
+      manage full certificate files.
+- Low-bandwidth routing and link behavior:
+    - Once topology exists, unknown user-data routes are no longer blindly flooded across every
+      eligible side; discovery/control traffic still propagates and explicit route policy can still
+      select a side.
+    - Fixed-size serialized sides can split and reassemble messages for CAN, I2C, and fixed-frame
+      radio transports without changing the user API.
+    - Link-probe sample APIs let measured bring-up or driver throughput seed adaptive route
+      selection.
+    - Runtime sender IDs and serialized header templates reduce repeated header overhead after
+      initial contact.
+- C/C++ and wrapper integration:
+    - The checked-in C header is static for the runtime-schema ABI.
+    - Optional C and C++ convenience wrappers can be selected from CMake without requiring users of
+      the raw ABI to include wrapper files.
+    - Global router/relay wrapper helpers cover the common embedded case where application code
+      should not carry router handles everywhere.
+- Test and release tooling:
+    - `./build.py test` auto-detects `cargo-nextest` when installed, falls back to Cargo's built-in
+      test runner when it is not, and keeps doctests covered.
+    - Criterion benchmark smoke runs still execute, but use a dedicated `sedsnet_smoke`
+      baseline, longer timing, disabled plots, and a wider smoke noise threshold.
 - Tests and examples:
     - Rust tests and benches now use readable string-backed lookups instead of raw legacy IDs.
     - Added regression coverage for schema sync, conflict resolution, budget accounting, string
-      lookup, metadata, and removal.
+      lookup, metadata, removal, managed variables, crypto credentials/shims, topology exports,
+      link probing, fixed-size splitting, and nextest-aware test execution.
 
 ## Version 3.12.0 highlights
 
@@ -143,7 +182,7 @@
     - Updated Rust and C/C++ usage docs to state that discovery and time sync are router-owned
       internals rather than user-registerable endpoints.
 - Full
-  changelog: [v3.9.0...v3.9.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.9.0...v3.9.1)
+  changelog: [v3.9.0...v3.9.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.9.0...v3.9.1)
 
 ## Version 3.9.0 highlights
 
@@ -165,7 +204,7 @@
     - Updated Rust, Python, C/C++, and technical router documentation to describe typed-route
       behavior and precedence.
 - Full
-  changelog: [v3.8.0...v3.9.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.8.0...v3.9.0)
+  changelog: [v3.8.0...v3.9.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.8.0...v3.9.0)
 
 ## Version 3.8.0 highlights
 
@@ -183,7 +222,7 @@
     - Added router and relay tests for weighted split and failover behavior, plus C ABI coverage
       for weighted local routing.
 - Full
-  changelog: [v3.7.0...v3.8.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.7.0...v3.8.0)
+  changelog: [v3.7.0...v3.8.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.7.0...v3.8.0)
 
 ## Version 3.7.0 highlights
 
@@ -206,7 +245,7 @@
     - Added tests for asymmetric router and relay paths, ingress-disabled sides, and C ABI
       local-route overrides.
 - Full
-  changelog: [v3.6.0...v3.7.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.6.0...v3.7.0)
+  changelog: [v3.6.0...v3.7.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.6.0...v3.7.0)
 
 ## Version 3.6.0 highlights
 
@@ -226,7 +265,7 @@
     - Added C ABI coverage for removing a router side and verifying discovery only transmits on
       the remaining side.
 - Full
-  changelog: [v3.5.2...v3.6.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.5.2...v3.6.0)
+  changelog: [v3.5.2...v3.6.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.5.2...v3.6.0)
 
 ## Version 3.5.2 highlights
 
@@ -238,7 +277,7 @@
     - Added Rust system-test coverage for the disconnect/reconnect failover path where a
       replacement source must be requested and accepted after timeout-driven re-election.
 - Full
-  changelog: [v3.5.1...v3.5.2](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.5.1...v3.5.2)
+  changelog: [v3.5.1...v3.5.2](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.5.1...v3.5.2)
 
 ## Version 3.5.1 highlights
 
@@ -254,7 +293,7 @@
     - Kept the lower-level `poll_timesync()` and `poll_discovery()` APIs documented for advanced
       callers that want explicit control over maintenance phases.
 - Full
-  changelog: [v3.5.0...v3.5.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.5.0...v3.5.1)
+  changelog: [v3.5.0...v3.5.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.5.0...v3.5.1)
 
 ## Version 3.4.2 highlights
 
@@ -279,7 +318,7 @@
     - Wiki source links now default to GitHub in-repo, while the wiki sync script rewrites them to
       the target GitLab repo path when publishing to GitLab.
 - Full
-  changelog: [v3.4.1...v3.4.2](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.4.1...v3.4.2)
+  changelog: [v3.4.1...v3.4.2](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.4.1...v3.4.2)
 
 ## Version 3.4.1 highlights
 
@@ -299,7 +338,7 @@
     - Fixed an internal request-serving deadlock by avoiding timesync mutex re-entry while
       sampling source-side timestamps.
     - Full
-      changelog: [v3.4.0...v3.4.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.4.0...v3.4.1)
+      changelog: [v3.4.0...v3.4.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.4.0...v3.4.1)
 
 ## Version 3.4.0 highlights
 
@@ -332,7 +371,7 @@
     - Expanded time-sync documentation to cover the internal network clock, merged partial
       sources, current network time accessors, and master-side setter APIs.
 - Full
-  changelog: [v3.3.0...v3.4.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.3.0...v3.4.0)
+  changelog: [v3.3.0...v3.4.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.3.0...v3.4.0)
 
 ## Version 3.3.0 highlights
 
@@ -351,7 +390,7 @@
     - Discovery advertisements are filtered per-side so IPC endpoints are not exposed on non-link-local links.
     - Routers and relays now enforce link-local routing boundaries even when discovery data is overly broad.
 - Split schema support for per-board IPC:
-    - Added `SEDSPRINTF_RS_IPC_SCHEMA_PATH` for board-local IPC overlays that merge with the shared base schema.
+    - Added `SEDSNET_IPC_SCHEMA_PATH` for board-local IPC overlays that merge with the shared base schema.
     - IPC overlay endpoints are treated as link-local automatically; base-schema endpoints are treated as non-link-local
       automatically.
     - Added proc-macro/build-script tests for overlay merging, collision rejection, and link-local normalization.
@@ -361,7 +400,7 @@
       CMake or `.cargo/config.toml`.
     - Link-local scope is now derived from which file is being edited rather than being a user-editable checkbox.
 - Full
-  changelog: [v3.2.3...v3.3.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.2.3...v3.3.0)
+  changelog: [v3.2.3...v3.3.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.2.3...v3.3.0)
 
 ## Version 3.2.3 highlights
 
@@ -380,7 +419,7 @@
     - macOS C system-test builds now align deployment target settings with Rust staticlib builds to avoid linker
       mismatch warnings.
 - Full
-  changelog: [v3.2.2...v3.2.3](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.2.2...v3.2.3)
+  changelog: [v3.2.2...v3.2.3](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.2.2...v3.2.3)
 
 ## Version 3.2.2 highlights
 
@@ -389,14 +428,14 @@
 - Formatting cleanup across scripts and docs for more consistent output.
 - Additional wiki documentation updates and wording cleanup.
 - Full
-  changelog: [v3.2.1...v3.2.2](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.2.1...v3.2.2)
+  changelog: [v3.2.1...v3.2.2](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.2.1...v3.2.2)
 
 ## Version 3.2.1 highlights
 
 - Wiki overhaul: broad documentation refresh, structure cleanup, and improved navigation/discoverability.
 - GUI updates to the telemetry config editor.
 - Full
-  changelog: [v3.2.0...v3.2.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.2.0...v3.2.1)
+  changelog: [v3.2.0...v3.2.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.2.0...v3.2.1)
 
 ## Version 3.2.0 highlights
 
@@ -407,22 +446,22 @@
 - RTOS time sync example code for FreeRTOS and ThreadX.
 - Updated wiki docs to surface new examples and feature behavior.
 - Full
-  changelog: [v3.1.0...v3.2.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.1.0...v3.2.0)
+  changelog: [v3.1.0...v3.2.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.1.0...v3.2.0)
 
 What's included:
 
 - Feature: `timesync` adds `TIME_SYNC` endpoint and `TIME_SYNC_ANNOUNCE/REQUEST/RESPONSE` types (built-in like
   `TelemetryError`).
 - Examples:
-  rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/timesync_example.rs)),
-  rust-example-code/relay_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/relay_example.rs)),
-  rust-example-code/reliable_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/reliable_example.rs)),
-  rust-example-code/queue_timeout_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/queue_timeout_example.rs)),
-  rust-example-code/multinode_sim_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/multinode_sim_example.rs)),
-  c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/timesync_example.c)),
-  python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-example/timesync_example.py)),
-  rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rtos-example-code/freertos_timesync.c)),
-  rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rtos-example-code/threadx_timesync.c)).
+  rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs)),
+  rust-example-code/relay_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/relay_example.rs)),
+  rust-example-code/reliable_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/reliable_example.rs)),
+  rust-example-code/queue_timeout_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/queue_timeout_example.rs)),
+  rust-example-code/multinode_sim_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/multinode_sim_example.rs)),
+  c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c)),
+  python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py)),
+  rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c)),
+  rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c)).
 - C system test and examples demonstrate Time Sync announce/request/response flows.
 - Python example handles Time Sync without re-entering the router from handlers.
 
@@ -431,7 +470,7 @@ What's included:
 - CRC support for packets to ensure validity; in reliable mode, CRC failures trigger retransmits.
 - Fixes to the config editor GUI.
 - Full
-  changelog: [v3.0.0...v3.1.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v3.0.0...v3.1.0)
+  changelog: [v3.0.0...v3.1.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v3.0.0...v3.1.0)
 
 ## Version 3.0.0 highlights
 
@@ -440,92 +479,92 @@ What's included:
 - TCP-like reliability is now available for schema types marked `reliable` / `reliable_mode`, with ACKs, retransmits,
   and optional ordering. Enable per side and disable when the transport is already reliable.
 - Full
-  changelog: [v2.4.0...v3.0.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.4.0...v3.0.0)
+  changelog: [v2.4.0...v3.0.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.4.0...v3.0.0)
 
 ## Version 2.4.0 highlights
 
 - Moved config to environment + JSON schema used at compile time.
 - Added a simple GUI tool for building the config.
 - Full
-  changelog: [v2.3.2...v2.4.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.3.2...v2.4.0)
+  changelog: [v2.3.2...v2.4.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.3.2...v2.4.0)
 
 ## Version 2.3.2 highlights
 
 - Added a new unsafe API for creating link IDs.
 - Fixed existing bugs.
 - Full
-  changelog: [v2.3.1...v2.3.2](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.3.1...v2.3.2)
+  changelog: [v2.3.1...v2.3.2](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.3.1...v2.3.2)
 
 ## Version 2.3.1 highlights
 
 - Simplified config format is now live and in production.
 - Full
-  changelog: [v2.2.3...v2.3.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.2.3...v2.3.0)
+  changelog: [v2.2.3...v2.3.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.2.3...v2.3.0)
 
 ## Version 2.2.3 highlights
 
 - Build script fixes and more repo details.
 - Final fix for bounded ring buffers used in routers and relays.
 - Full
-  changelog: [v2.2.1...v2.2.3](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.2.1...v2.2.3)
+  changelog: [v2.2.1...v2.2.3](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.2.1...v2.2.3)
 
 ## Version 2.2.1 highlights
 
 - Link-aware router for relay mode, reducing reliance on dedupe to prevent loops.
 - Full
-  changelog: [v2.2.0...v2.2.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.2.0...v2.2.1)
+  changelog: [v2.2.0...v2.2.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.2.0...v2.2.1)
 
 ## Version 2.1.0 highlights
 
 - Improved relay handling with side-aware routing and transmit callbacks.
 - Added a new full system test.
 - Full
-  changelog: [v2.0.0...v2.1.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.0.0...v2.1.0)
+  changelog: [v2.0.0...v2.1.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.0.0...v2.1.0)
 
 ## Version 2.0.0 highlights
 
 - Added `RouterMode` (Relay vs Sink) behavior.
 - Fixed a bug where packet hashes were not saved, causing double processing.
 - Full
-  changelog: [v1.5.2...v2.0.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.5.2...v2.0.0)
+  changelog: [v1.5.2...v2.0.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.5.2...v2.0.0)
 
 ## Version 1.5.2 highlights
 
 - Added max queue size controls plus ring buffer behavior to prevent unbounded growth and heap overruns.
 - Full
-  changelog: [v1.5.1...v1.5.2](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.5.1...v1.5.2)
+  changelog: [v1.5.1...v1.5.2](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.5.1...v1.5.2)
 
 ## Version 1.5.1 highlights
 
 - Reduced memory usage for stack-stored packet payloads and overall memory footprint.
 - Full
-  changelog: [v1.5.0...v1.5.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.5.0...v1.5.1)
+  changelog: [v1.5.0...v1.5.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.5.0...v1.5.1)
 
 ## Version 1.5.0 highlights
 
 - Added payload and sender string compression with configurable thresholds.
 - Full
-  changelog: [v1.4.0...v1.5.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.4.0...v1.5.0)
+  changelog: [v1.4.0...v1.5.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.4.0...v1.5.0)
 
 ## Version 1.4.0 highlights
 
 - Added packet dedupe prevention.
 - Improved README and added scripts for submodule usage and compile-time sender string setting.
 - Full
-  changelog: [v1.2.0...v1.4.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.2.0...v1.4.0)
+  changelog: [v1.2.0...v1.4.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.2.0...v1.4.0)
 
 ## Version 1.2.0 highlights
 
 - Added relay support for transporting packets across protocols (e.g., CAN to UART).
 - Full
-  changelog: [v1.1.1...v1.2.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.1.1...v1.2.0)
+  changelog: [v1.1.1...v1.2.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.1.1...v1.2.0)
 
 ## Version 1.1.1 highlights
 
 - Fixed broadcast behavior when all consumers have handlers or endpoints.
 - Added support for packets containing no data.
 - Full
-  changelog: [v1.1.0...v1.1.1](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v1.1.0...v1.1.1)
+  changelog: [v1.1.0...v1.1.1](https://github.com/Rylan-Meilutis/sedsnet/compare/v1.1.0...v1.1.1)
 
 ## Version 1.0.6 highlights
 

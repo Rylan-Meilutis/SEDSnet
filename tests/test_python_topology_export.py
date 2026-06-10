@@ -12,7 +12,7 @@ if str(PYTHON_FILES) not in sys.path:
     sys.path.insert(0, str(PYTHON_FILES))
 
 try:
-    import sedsprintf_rs as seds
+    import sedsnet as seds
 except Exception as exc:  # pragma: no cover - environment dependent
     seds = None
     IMPORT_ERROR = exc
@@ -22,7 +22,7 @@ else:
 
 @unittest.skipIf(
     seds is None or not hasattr(seds, "endpoint_exists") or not hasattr(seds, "make_packet"),
-    f"sedsprintf_rs binding unavailable: {IMPORT_ERROR}",
+    f"sedsnet binding unavailable: {IMPORT_ERROR}",
 )
 class PythonTopologyExportTests(unittest.TestCase):
     @classmethod

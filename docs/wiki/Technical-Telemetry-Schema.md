@@ -35,7 +35,7 @@ Definitions carry:
 - string name
 - human-readable description
 - endpoint link-local flag
-- data type shape, allowed endpoints, reliability mode, and priority
+- data type shape, allowed endpoints, reliability mode, queue priority, and E2E encryption policy
 
 Lookup/export APIs include:
 
@@ -70,11 +70,14 @@ register_data_type_id_with_description(
 )?;
 ```
 
+Use `register_data_type_id_with_description_and_e2e_encryption(...)` when a type should prefer or
+require E2E encrypted payloads.
+
 Direct registration rejects conflicts:
 
 - same endpoint ID/name with different endpoint metadata
-- same data type ID/name with a different shape, endpoint set, reliability mode,
-  or priority
+- same data type ID/name with a different shape, endpoint set, reliability mode, priority, or E2E
+  policy
 - data types referencing endpoints that do not exist
 
 Endpoint handler registration also creates missing endpoints in `std` builds:
@@ -104,15 +107,15 @@ JSON is optional runtime input. It is not used to generate user schema constants
 
 Host/std builds can seed from:
 
-- `SEDSPRINTF_RS_STATIC_SCHEMA_PATH`
-- `SEDSPRINTF_RS_STATIC_IPC_SCHEMA_PATH`
+- `SEDSNET_STATIC_SCHEMA_PATH`
+- `SEDSNET_STATIC_IPC_SCHEMA_PATH`
 - Rust `register_schema_json_path(...)` / `register_schema_json_bytes(...)`
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-Embedded builds include `telemetry_config.json` bytes only if that file exists
-at build time, then decode those bytes through the same runtime parser. The
-crate remains buildable/publishable without an application JSON file.
+Embedded builds include `telemetry_config.json` bytes only if an application provides that file
+locally before building, then decode those bytes through the same runtime parser. The crate remains
+buildable/publishable without an application JSON file.
 
 JSON shape:
 

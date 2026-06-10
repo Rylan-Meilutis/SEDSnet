@@ -4,10 +4,10 @@ This page describes how the Rust core is exposed to C/C++ and Python.
 
 ## C/C++ binding
 
-src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/c_api.rs))
+src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/c_api.rs))
 defines the C ABI surface.
 
-C-Headers/sedsprintf.h ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/C-Headers/sedsprintf.h))
+C-Headers/sedsnet.h ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/C-Headers/sedsnet.h))
 declares the ABI structs and functions. It is not generated from an application schema.
 
 - Built-in control IDs are exposed as constants.
@@ -35,10 +35,10 @@ Embedded builds provide allocator and error hooks so the core can run without st
 
 ## Python binding
 
-src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/python_api.rs))
+src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/python_api.rs))
 defines the pyo3 module.
 
-python-files/sedsprintf_rs/sedsprintf_rs.pyi ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-files/sedsprintf_rs/sedsprintf_rs.pyi))
+python-files/sedsnet/sedsnet.pyi ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-files/sedsnet/sedsnet.pyi))
 contains type hints for the stable Python API surface.
 
 - The Python package exposes built-in control IDs, router/packet helpers, and runtime schema APIs.

@@ -1,10 +1,10 @@
 #[cfg(feature = "timesync")]
 mod timesync_system_test {
-    use sedsprintf_rs::config::{DEVICE_IDENTIFIER, DataEndpoint, DataType};
-    use sedsprintf_rs::packet::Packet;
-    use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
-    use sedsprintf_rs::serialize;
-    use sedsprintf_rs::timesync::{
+    use sedsnet::config::{DEVICE_IDENTIFIER, DataEndpoint, DataType};
+    use sedsnet::packet::Packet;
+    use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
+    use sedsnet::serialize;
+    use sedsnet::timesync::{
         PartialNetworkTime, TimeSyncConfig, TimeSyncRole, TimeSyncTracker,
         build_timesync_announce_with_sender, build_timesync_request, build_timesync_response,
         compute_offset_delay,
@@ -120,7 +120,7 @@ mod timesync_system_test {
 
         assert!(matches!(
             tracker.refresh(6_050),
-            sedsprintf_rs::timesync::TimeSyncUpdate::SourceChanged
+            sedsnet::timesync::TimeSyncUpdate::SourceChanged
         ));
         assert_eq!(tracker.current_source().unwrap().sender, "SRC_B");
         assert!(!tracker.should_announce(6_050, true));
@@ -144,7 +144,7 @@ mod timesync_system_test {
         assert!(!tracker.should_announce(5_000, true));
         assert_eq!(
             tracker.leader(5_000, true),
-            Some(sedsprintf_rs::timesync::TimeSyncLeader::Remote(
+            Some(sedsnet::timesync::TimeSyncLeader::Remote(
                 tracker.current_source().unwrap().clone()
             ))
         );

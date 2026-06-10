@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sedsprintf_rs as seds
+import sedsnet as seds
 
 DT = seds.DataType
 

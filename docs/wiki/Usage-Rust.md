@@ -5,23 +5,23 @@ This is the primary API and the source of truth for the Rust-facing behavior.
 ## Add as a dependency
 
 ```toml
-sedsprintf_rs = { path = "path/to/sedsprintf_rs" }
+sedsnet = { path = "path/to/sedsnet" }
 ```
 
 Or from git:
 
 ```toml
-sedsprintf_rs = { git = "https://github.com/Rylan-Meilutis/sedsprintf_rs.git", branch = "main" }
+sedsnet = { git = "https://github.com/Rylan-Meilutis/sedsnet.git", branch = "main" }
 ```
 
 ## Minimal router example
 
 ```rust
-use sedsprintf_rs::config::{
+use sedsnet::config::{
     register_data_type_id_with_description, register_endpoint_id_with_description,
 };
-use sedsprintf_rs::router::{EndpointHandler, Router, RouterConfig};
-use sedsprintf_rs::{
+use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+use sedsnet::{
     DataEndpoint, DataType, MessageClass, MessageDataType, MessageElement, ReliableMode,
     TelemetryResult,
 };
@@ -99,9 +99,9 @@ handlers run immediately with the cached global state.
 Data types can also advertise an E2E encryption preference:
 
 ```rust
-use sedsprintf_rs::config::register_data_type_id_with_description_and_e2e_encryption;
-use sedsprintf_rs::router::{Router, RouterConfig, RouterE2eEncryptionMode};
-use sedsprintf_rs::{
+use sedsnet::config::register_data_type_id_with_description_and_e2e_encryption;
+use sedsnet::router::{Router, RouterConfig, RouterE2eEncryptionMode};
+use sedsnet::{
     DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement,
     ReliableMode,
 };
@@ -148,7 +148,7 @@ provisioned key for authenticated encryption, but it does not create identity by
 
 ```rust
 #[cfg(feature = "crypto-shim")]
-sedsprintf_rs::crypto::register_software_key(
+sedsnet::crypto::register_software_key(
     7,
     b"32-byte minimum deployment secret....",
 )?;
@@ -204,7 +204,7 @@ There is no `RouterMode` anymore.
 Example:
 
 ```rust
-use sedsprintf_rs::router::Router;
+use sedsnet::router::Router;
 
 let router = Router::new(RouterConfig::default());
 let side_a = router.add_side_serialized("A", tx_a);
@@ -254,7 +254,7 @@ That side option is per hop, not global. It controls what happens between the ro
 that side's TX callback.
 
 ```rust
-use sedsprintf_rs::router::{Router, RouterConfig, RouterSideOptions};
+use sedsnet::router::{Router, RouterConfig, RouterSideOptions};
 
 let router = Router::new(RouterConfig::default());
 router.add_side_serialized_with_options(

@@ -1,5 +1,5 @@
-use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
-use sedsprintf_rs::{DataEndpoint, DataType, TelemetryResult};
+use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
+use sedsnet::{DataEndpoint, DataType, TelemetryResult};
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

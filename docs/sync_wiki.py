@@ -254,7 +254,7 @@ def main():
     )
     parser.add_argument(
         "--workdir",
-        default="/tmp/sedsprintf_wiki_sync",
+        default="/tmp/sedsnet_wiki_sync",
         help="Directory for cloning wiki repos",
     )
     parser.add_argument(

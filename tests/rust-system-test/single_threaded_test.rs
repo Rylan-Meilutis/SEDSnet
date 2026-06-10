@@ -1,16 +1,16 @@
 // tests/rust-system-test/single_threaded_test.rs
 #[cfg(test)]
 mod single_threaded_test {
-    use sedsprintf_rs::TelemetryError;
-    use sedsprintf_rs::TelemetryResult;
-    use sedsprintf_rs::config::{
+    use sedsnet::TelemetryError;
+    use sedsnet::TelemetryResult;
+    use sedsnet::config::{
         DataEndpoint, DataType, data_type_definition_by_name, endpoint_definition_by_name,
         register_data_type_with_description, register_endpoint_with_description,
     };
-    use sedsprintf_rs::packet::Packet;
-    use sedsprintf_rs::relay::Relay;
-    use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
-    use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+    use sedsnet::packet::Packet;
+    use sedsnet::relay::Relay;
+    use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
+    use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
     use std::sync::Arc;
     use std::sync::Once;
@@ -312,8 +312,8 @@ mod single_threaded_test {
         //   C: BATTERY + MESSAGE
         // → 5 packets / iteration, all with [SD_CARD, Radio] endpoints.
         //
-        let repeats = env_usize("SEDSPRINTF_SINGLE_THREADED_REPEATS", 1);
-        let iters = env_usize("SEDSPRINTF_SINGLE_THREADED_ITERS", 10);
+        let repeats = env_usize("SEDSNET_SINGLE_THREADED_REPEATS", 1);
+        let iters = env_usize("SEDSNET_SINGLE_THREADED_ITERS", 10);
         const PACKETS_PER_ITER: usize = 5;
 
         let mut gps_buf = [0.0_f32; 8];

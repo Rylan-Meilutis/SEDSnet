@@ -1,17 +1,17 @@
 #[cfg(test)]
 mod reliable_drop_tests {
-    use sedsprintf_rs::TelemetryResult;
-    use sedsprintf_rs::config::{
+    use sedsnet::TelemetryResult;
+    use sedsnet::config::{
         DataEndpoint, DataType, RELIABLE_RETRANSMIT_MS, data_type_definition_by_name,
         endpoint_definition_by_name, register_data_type_with_description,
         register_endpoint_with_description,
     };
-    use sedsprintf_rs::discovery::build_discovery_announce;
-    use sedsprintf_rs::packet::Packet;
-    use sedsprintf_rs::relay::{Relay, RelaySideOptions};
-    use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
-    use sedsprintf_rs::serialize;
-    use sedsprintf_rs::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+    use sedsnet::discovery::build_discovery_announce;
+    use sedsnet::packet::Packet;
+    use sedsnet::relay::{Relay, RelaySideOptions};
+    use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
+    use sedsnet::serialize;
+    use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
     use std::collections::{BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};

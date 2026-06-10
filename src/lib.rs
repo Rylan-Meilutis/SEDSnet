@@ -28,7 +28,7 @@
 //! Version 4.0.0 highlights:
 //! - Telemetry endpoints and data types are runtime IDs with process-local registry metadata.
 //! - The build no longer reads `telemetry_config.json` or generates schema-specific Rust enums.
-//! - A JSON schema can still seed the runtime registry with `SEDSPRINTF_RS_STATIC_SCHEMA_PATH`.
+//! - A JSON schema can still seed the runtime registry with `SEDSNET_STATIC_SCHEMA_PATH`.
 //! - Nodes can export known endpoints/types and register new ones over time.
 
 extern crate alloc;

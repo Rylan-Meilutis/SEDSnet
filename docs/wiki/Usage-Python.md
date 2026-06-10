@@ -1,6 +1,6 @@
 # Python Usage
 
-Python bindings are built with `pyo3` and `maturin`. The module name is `sedsprintf_rs`.
+Python bindings are built with `pyo3` and `maturin`. The module name is `sedsnet`.
 
 ## Build and install
 
@@ -19,7 +19,7 @@ maturin develop
 ## Minimal example
 
 ```python
-import sedsprintf_rs as seds
+import sedsnet as seds
 
 
 def tx(bytes_buf):
@@ -83,7 +83,7 @@ Managed variables cache the latest value packet for a data type. After a process
 endpoint handler path.
 
 ```python
-import sedsprintf_rs as seds
+import sedsnet as seds
 
 RADIO = 101
 FLIGHT_STATE = 3100

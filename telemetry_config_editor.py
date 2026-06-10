@@ -87,7 +87,7 @@ def find_project_root(start: Path) -> Path:
 
 def find_schema_json_from_config_rs(config_rs: Path, crate_root: Path) -> Optional[Path]:
     script_root = Path(__file__).resolve().parent
-    raw = os.environ.get("SEDSPRINTF_RS_SCHEMA_PATH", "").strip()
+    raw = os.environ.get("SEDSNET_SCHEMA_PATH", "").strip()
     if raw:
         p = Path(raw)
         return (p if p.is_absolute() else (script_root / p)).resolve()
@@ -111,7 +111,7 @@ def find_schema_json_from_config_rs(config_rs: Path, crate_root: Path) -> Option
 
 def find_ipc_schema_json() -> Optional[Path]:
     script_root = Path(__file__).resolve().parent
-    raw = os.environ.get("SEDSPRINTF_RS_IPC_SCHEMA_PATH", "").strip()
+    raw = os.environ.get("SEDSNET_IPC_SCHEMA_PATH", "").strip()
     if not raw:
         return None
     p = Path(raw)
@@ -246,7 +246,7 @@ class TelemetryConfigEditor(tk.Tk):
             ipc_json_path: Optional[Path],
     ):
         super().__init__()
-        self.title("Telemetry Config Editor (sedsprintf_rs)")
+        self.title("Telemetry Config Editor (sedsnet)")
         self.geometry("1200x760")
 
         self.crate_root = crate_root
@@ -1016,7 +1016,7 @@ class TelemetryConfigEditor(tk.Tk):
         self.json_paths[SCHEMA_SCOPE_IPC] = found
         self.ipc_json_path_var.set(self._json_path_display(SCHEMA_SCOPE_IPC))
         if found is None:
-            self._set_status("SEDSPRINTF_RS_IPC_SCHEMA_PATH is not set")
+            self._set_status("SEDSNET_IPC_SCHEMA_PATH is not set")
             return
         if found.exists():
             self.load_from_path(SCHEMA_SCOPE_IPC, found)

@@ -3,9 +3,9 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "sedsprintf_rs"
-version = "3.12.0"
-description = "Rust telemetry and serialization library"
+name = "sedsnet"
+version = "4.0.0"
+description = "Rust telemetry networking stack with routing, discovery, reliability, and C/Python bindings"
 authors = [{ name = "Rylan Meilutis", email = "rylan.meilutis@gmail.com" }]
 readme = "README.md"
 license = "GPL-2"
@@ -17,5 +17,5 @@ bindings = "pyo3"
 features = ["python", "timesync"]
 python-source = "python-files"
 include = [
-    "python-files/sedsprintf_rs/sedsprintf_rs.pyi",
+    "python-files/sedsnet/sedsnet.pyi",
 ]

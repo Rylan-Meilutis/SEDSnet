@@ -3,7 +3,7 @@
 
 #include "app_threadx.h"
 #include "can_bus.h"
-#include "sedsprintf.h"
+#include "sedsnet.h"
 #include "stm32g4xx_hal.h"
 
 #include <stdarg.h>

@@ -1,6 +1,6 @@
-use sedsprintf_rs::router::{EndpointHandler, Router, RouterConfig};
-use sedsprintf_rs::timesync::{TimeSyncConfig, TimeSyncRole};
-use sedsprintf_rs::{DataEndpoint, DataType, Packet, TelemetryResult};
+use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
+use sedsnet::{DataEndpoint, DataType, Packet, TelemetryResult};
 
 fn main() -> TelemetryResult<()> {
     // Build with `--features timesync`. The router owns TIME_SYNC internally.

@@ -1,7 +1,7 @@
-#ifndef SEDSPRINTF_C_WRAPPER_H
-#define SEDSPRINTF_C_WRAPPER_H
+#ifndef SEDSNET_C_WRAPPER_H
+#define SEDSNET_C_WRAPPER_H
 
-#include "sedsprintf.h"
+#include "sedsnet.h"
 #include <stddef.h>
 #include <stdint.h>
 
