@@ -1,6 +1,10 @@
 #[cfg(feature = "timesync")]
 mod timesync_system_test {
-    use sedsnet::config::{DEVICE_IDENTIFIER, DataEndpoint, DataType};
+    use sedsnet::config::{
+        DEVICE_IDENTIFIER, DataEndpoint, DataType, data_type_definition_by_name,
+        endpoint_definition_by_name, register_data_type_with_description,
+        register_endpoint_with_description,
+    };
     use sedsnet::packet::Packet;
     use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
     use sedsnet::serialize;
@@ -9,9 +13,10 @@ mod timesync_system_test {
         build_timesync_announce_with_sender, build_timesync_request, build_timesync_response,
         compute_offset_delay,
     };
+    use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
     use std::thread;
 
     struct StepClock {
@@ -35,6 +40,31 @@ mod timesync_system_test {
 
     fn shared_clock(now: Arc<AtomicU64>) -> Box<dyn Clock + Send + Sync> {
         Box::new(move || now.load(Ordering::SeqCst))
+    }
+
+    fn ensure_compression_test_schema() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            if endpoint_definition_by_name("SD_CARD").is_none() {
+                register_endpoint_with_description(
+                    "SD_CARD",
+                    "On-board storage endpoint used by system compression tests.",
+                    false,
+                )
+                .expect("register SD_CARD");
+            }
+            if data_type_definition_by_name("MESSAGE_DATA").is_none() {
+                register_data_type_with_description(
+                    "MESSAGE_DATA",
+                    "Dynamic bytes used by system compression tests.",
+                    MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
+                    &[DataEndpoint::named("SD_CARD")],
+                    ReliableMode::None,
+                    50,
+                )
+                .expect("register MESSAGE_DATA");
+            }
+        });
     }
 
     #[test]
@@ -388,6 +418,8 @@ mod timesync_system_test {
     #[cfg(feature = "compression")]
     #[test]
     fn compression_mixed_workload_threaded_system_stability() {
+        ensure_compression_test_schema();
+
         let worker_count = 4usize;
         let iters_per_worker = 600usize;
 
