@@ -46,6 +46,10 @@
 - Tightened discovery-aware forwarding for low-bandwidth links. Once topology exists, unknown
   user-data routes are not blindly flooded; discovery/control traffic still propagates and explicit
   route policy can still intentionally select a side.
+- Added dynamic control-plane throttling for measured slow links. Routers and relays use recent
+  link-probe or driver timing samples to send minimal discovery reachability pings across slow
+  sides between infrequent full schema/topology/time-source refreshes, and router-managed time sync
+  throttles only the measured slow egress while fast sides keep the configured normal cadence.
 - Topology exports now include a deduplicated `links` graph, named endpoint fields, side names, and
   filtered SEDSnet control endpoints so graphing tools see user-facing network structure instead of
   router-only internals.
@@ -87,7 +91,8 @@
   runtime string lookups, description metadata, handler construction from endpoint definitions,
   runtime schema removal, network-variable getter/setter/cache/callback behavior, crypto
   credentials/providers, topology graph exports, leave pruning, client stats, memory layout,
-  fixed-size side splitting, link probing, and nextest-aware test execution.
+  fixed-size side splitting, link probing, slow-link discovery/time-sync throttling, and
+  nextest-aware test execution.
 
 ## 3.12.0
 

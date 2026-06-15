@@ -19,6 +19,10 @@ use crate::{
 pub const DISCOVERY_ROUTE_TTL_MS: u64 = 30_000;
 pub const DISCOVERY_FAST_INTERVAL_MS: u64 = 250;
 pub const DISCOVERY_SLOW_INTERVAL_MS: u64 = 5_000;
+pub const DISCOVERY_SLOW_LINK_CAPACITY_BPS: u64 = 512;
+pub const DISCOVERY_SLOW_LINK_PING_INTERVAL_MS: u64 = 15_000;
+pub const DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS: u64 = 120_000;
+pub const TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryCadenceState {

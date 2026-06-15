@@ -64,6 +64,13 @@ and explicit route policy can intentionally select a side. `SEDSNET_DISCOVERY` a
 endpoints: applications can use the discovery and time-sync APIs, but must not register local endpoint handlers for
 those endpoints or try to override their built-in handling.
 
+Discovery and time-sync maintenance also throttle themselves across measured slow links. Link-probe
+or driver timing samples mark constrained sides, after which routers and relays send mostly minimal
+reachability pings across those sides and reserve full schema/topology/time-source refreshes for a
+much slower cadence. Router-managed time sync keeps its normal cadence on fast sides while each
+measured slow side independently receives sparse time-sync traffic, keeping asymmetric or
+time-sliced radio links available for user payloads.
+
 Queue memory is bounded by the compile-time `MAX_QUEUE_BUDGET`. Router and relay internals share that budget
 dynamically across RX work, TX work, reliable replay/out-of-order buffers, recent packet ID tracking, and learned
 discovery topology state. The recent packet ID cache preallocates its final storage because it is expected to fill
@@ -116,6 +123,8 @@ compact template ID. That keeps the header-to-payload ratio reasonable for small
   radios, while link-probe samples seed adaptive routing for asymmetric or time-sliced links.
 - Discovery-aware forwarding avoids blind unknown-route user-data flooding once topology exists,
   protecting low-bandwidth sides unless explicit route policy selects them.
+- Discovery and time-sync control traffic is dynamically throttled per measured slow link, using
+  minimal reachability pings between infrequent full topology/schema refreshes.
 - Routers and relays export topology as a board graph with named endpoint fields, side names,
   deduplicated `links`, and filtered SEDSnet control endpoints. They also expose memory-layout and
   per-client stats snapshots for profiling and diagnostics.

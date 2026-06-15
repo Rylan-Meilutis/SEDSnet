@@ -5187,8 +5187,9 @@ mod router_tests {
             remove_data_type, remove_data_type_by_name, remove_endpoint_by_name,
         };
         use crate::discovery::{
-            DISCOVERY_FAST_INTERVAL_MS, DISCOVERY_ROUTE_TTL_MS, TopologyBoardNode,
-            build_discovery_announce, build_discovery_timesync_sources, build_discovery_topology,
+            DISCOVERY_FAST_INTERVAL_MS, DISCOVERY_ROUTE_TTL_MS,
+            DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, TopologyBoardNode, build_discovery_announce,
+            build_discovery_timesync_sources, build_discovery_topology,
         };
         use crate::relay::Relay;
         use crate::router::{
@@ -7525,6 +7526,189 @@ mod router_tests {
             assert!(
                 fast_stats.adaptive.estimated_capacity_bps
                     > slow_stats.adaptive.estimated_capacity_bps
+            );
+        }
+
+        #[test]
+        fn slow_links_get_minimal_discovery_pings_between_full_refreshes() {
+            ensure_topology_test_schema();
+
+            let now_ms = Arc::new(AtomicU64::new(5_000));
+            let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c = seen.clone();
+
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                    DataEndpoint::named("RADIO"),
+                    |_pkt| Ok(()),
+                )]),
+                Box::new(SharedClock {
+                    now_ms: now_ms.clone(),
+                }),
+            );
+            let side = router.add_side_packet("LORA", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            router
+                .note_side_link_probe_sample(side, 250, 5_000)
+                .unwrap();
+            router.announce_discovery().unwrap();
+            router.process_tx_queue().unwrap();
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|pkt| pkt.data_type() == DataType::DiscoverySchema)
+            );
+
+            seen.lock().unwrap().clear();
+            now_ms.store(10_000, Ordering::SeqCst);
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "slow side should wait for the lightweight ping cadence"
+            );
+
+            now_ms.store(
+                5_000 + DISCOVERY_SLOW_LINK_PING_INTERVAL_MS,
+                Ordering::SeqCst,
+            );
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+
+            let pkts = seen.lock().unwrap().clone();
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0].data_type(), DataType::DiscoveryAnnounce);
+            assert!(
+                crate::discovery::decode_discovery_announce(&pkts[0])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn relay_slow_links_get_minimal_discovery_pings_between_full_refreshes() {
+            let now_ms = Arc::new(AtomicU64::new(5_000));
+            let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c = seen.clone();
+
+            let relay = Relay::new(Box::new(SharedClock {
+                now_ms: now_ms.clone(),
+            }));
+            let side = relay.add_side_packet("LORA", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            relay.note_side_link_probe_sample(side, 250, 5_000).unwrap();
+            relay.announce_discovery().unwrap();
+            relay.process_tx_queue().unwrap();
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|pkt| pkt.data_type() == DataType::DiscoverySchema)
+            );
+
+            seen.lock().unwrap().clear();
+            now_ms.store(
+                5_000 + DISCOVERY_SLOW_LINK_PING_INTERVAL_MS,
+                Ordering::SeqCst,
+            );
+            assert!(relay.poll_discovery().unwrap());
+            relay.process_tx_queue().unwrap();
+
+            let pkts = seen.lock().unwrap().clone();
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0].data_type(), DataType::DiscoveryAnnounce);
+            assert!(
+                crate::discovery::decode_discovery_announce(&pkts[0])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[cfg(all(feature = "timesync", feature = "discovery"))]
+        #[test]
+        fn timesync_announces_throttle_only_the_measured_slow_side() {
+            let now_ms = Arc::new(AtomicU64::new(5_000));
+            let seen_fast: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_slow: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_fast_c = seen_fast.clone();
+            let seen_slow_c = seen_slow.clone();
+
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_timesync(crate::timesync::TimeSyncConfig {
+                    role: crate::timesync::TimeSyncRole::Source,
+                    announce_interval_ms: 1_000,
+                    ..Default::default()
+                }),
+                Box::new(SharedClock {
+                    now_ms: now_ms.clone(),
+                }),
+            );
+            let fast =
+                router.add_side_packet("ETHERNET", move |pkt: &Packet| -> TelemetryResult<()> {
+                    seen_fast_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                });
+            let slow = router.add_side_packet("LORA", move |pkt: &Packet| -> TelemetryResult<()> {
+                seen_slow_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            let local_sender = router.sender().to_string();
+            let local_sources = [local_sender.as_str()];
+
+            router
+                .set_source_route_mode(None, RouteSelectionMode::Fanout)
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_timesync_sources("FAST_TS", 0, &local_sources).unwrap(),
+                    fast,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_timesync_sources("SLOW_TS", 1, &local_sources).unwrap(),
+                    slow,
+                )
+                .unwrap();
+            router.process_rx_queue().unwrap();
+            router.process_tx_queue().unwrap();
+            seen_fast.lock().unwrap().clear();
+            seen_slow.lock().unwrap().clear();
+            router
+                .note_side_link_probe_sample(slow, 250, 5_000)
+                .unwrap();
+
+            now_ms.store(6_000, Ordering::SeqCst);
+            assert!(router.poll_timesync().unwrap());
+            router.process_tx_queue().unwrap();
+            assert_eq!(
+                count_packets_of_type(&seen_fast.lock().unwrap(), DataType::TimeSyncAnnounce),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_slow.lock().unwrap(), DataType::TimeSyncAnnounce),
+                0
+            );
+
+            seen_fast.lock().unwrap().clear();
+            seen_slow.lock().unwrap().clear();
+            now_ms.store(7_000, Ordering::SeqCst);
+            assert!(router.poll_timesync().unwrap());
+            router.process_tx_queue().unwrap();
+            assert_eq!(
+                count_packets_of_type(&seen_fast.lock().unwrap(), DataType::TimeSyncAnnounce),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&seen_slow.lock().unwrap(), DataType::TimeSyncAnnounce),
+                0
             );
         }
 

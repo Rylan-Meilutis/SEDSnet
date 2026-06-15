@@ -81,6 +81,9 @@ Discovery is an optional built-in control plane, similar in spirit to time sync:
 - Routers and relays exchange internal `DISCOVERY_ANNOUNCE` packets.
 - They learn reachable endpoints per side and keep that information as soft state with expiry.
 - Discovery traffic is adaptive: it is sent more often when topology changes and less often when the network is stable.
+- Measured slow sides are throttled automatically. After a slow link-probe or driver timing sample,
+  routers and relays send mostly minimal reachability pings across that side and only send full
+  schema/topology/time-source refreshes on a much slower cadence.
 - Apps can export the current discovered topology for inspection.
 - Link-local-only endpoints stay on software-bus / IPC links and are not advertised onto normal network links.
 

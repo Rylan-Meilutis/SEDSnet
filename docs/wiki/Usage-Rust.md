@@ -200,7 +200,10 @@ only when discovery or explicit route policy identifies a path; discovery/contro
 propagates so the network can recover after partitions. For time-sliced radios, have the TX callback
 return `TelemetryError::Io("side tx busy")` while the radio is in an RX window. Queued work will be
 retried later, and measured bring-up/slot throughput can be fed into
-`note_side_link_probe_sample(side, bytes, duration_ms)` to seed adaptive path selection.
+`note_side_link_probe_sample(side, bytes, duration_ms)` to seed adaptive path selection and
+control-plane throttling. Once a side is measured as slow, discovery sends minimal reachability
+pings between infrequent full schema/topology/time-source refreshes, and router-managed time sync
+throttles only that measured slow side while fast sides keep the configured normal cadence.
 
 ## Sides and routing
 
@@ -243,6 +246,8 @@ through which sides.
 - known paths are used directly
 - unknown user-data paths are not flooded by fallback; discovery/control traffic still bootstraps
   route learning
+- measured slow links receive minimal discovery pings most of the time, with full refreshes spaced
+  out to preserve bandwidth
 - link-local-only endpoints stay on sides marked `link_local_enabled`
 - local plus source-side route rules still gate what discovery is allowed to use
 - discovery also carries a transitive router graph, so exported topology keeps sender ownership and

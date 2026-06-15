@@ -56,6 +56,9 @@
     - Once topology exists, unknown user-data routes are no longer blindly flooded across every
       eligible side; discovery/control traffic still propagates and explicit route policy can still
       select a side.
+    - Recent slow link-probe or driver timing samples throttle built-in discovery output across
+      constrained sides to minimal reachability pings between infrequent full refreshes. Time sync
+      is throttled per measured slow egress, while fast sides keep the configured normal cadence.
     - Fixed-size serialized sides can split and reassemble messages for CAN, I2C, and fixed-frame
       radio transports without changing the user API.
     - Link-probe sample APIs let measured bring-up or driver throughput seed adaptive route

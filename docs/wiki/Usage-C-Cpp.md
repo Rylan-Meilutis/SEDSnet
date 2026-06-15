@@ -719,7 +719,10 @@ the radio is in an RX window or otherwise cannot accept another frame. The route
 work queued and retries during later queue processing. If the driver measures link speed during
 bring-up or per-slot operation, call `seds_router_note_side_link_probe_sample(...)` or
 `seds_relay_note_side_link_probe_sample(...)` so adaptive path selection learns that radio has less
-headroom than Ethernet.
+headroom than Ethernet. Those same samples also throttle built-in control traffic: discovery sends
+minimal reachability pings across measured slow sides between infrequent full refreshes, and
+router-managed time sync throttles only the measured slow egress while fast sides keep the
+configured normal cadence.
 
 `SedsRouteSelectionMode` controls multi-path behavior:
 

@@ -10,8 +10,10 @@ use crate::diagnostics::{
 };
 #[cfg(feature = "discovery")]
 use crate::discovery::{
-    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DiscoveryCadenceState,
-    TopologyAnnouncerRoute, TopologyBoardNode, TopologySideRoute, TopologySnapshot,
+    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS,
+    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState,
+    TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
+    TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::{Packet, hash_bytes_u64};
 use crate::queue::{BoundedDeque, ByteCost};
@@ -42,6 +44,7 @@ const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
 const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
 const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
 const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
+const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + serialize::CRC32_BYTES;
 const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
 const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
@@ -285,10 +288,31 @@ struct AdaptiveRouteStats {
     estimated_bandwidth_bps: u64,
     peak_bandwidth_bps: u64,
     last_observed_ms: u64,
+    last_slow_observed_ms: u64,
     sample_count: u64,
     window_started_ms: u64,
     window_bytes: u64,
     peak_usage_bps: u64,
+}
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Default)]
+struct DiscoverySideThrottleState {
+    next_ping_ms: u64,
+    next_full_ms: u64,
+}
+
+#[cfg(all(feature = "discovery", feature = "timesync"))]
+#[derive(Debug, Clone, Default)]
+struct TimeSyncSideThrottleState {
+    next_allowed_ms: u64,
+}
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryAdvertiseLevel {
+    MinimalPing,
+    Full,
 }
 
 impl AdaptiveRouteStats {
@@ -309,6 +333,9 @@ impl AdaptiveRouteStats {
         };
         self.peak_bandwidth_bps = self.peak_bandwidth_bps.max(sample_bps);
         self.last_observed_ms = now_ms;
+        if sample_bps > 0 && sample_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS {
+            self.last_slow_observed_ms = now_ms;
+        }
         self.sample_count = self.sample_count.saturating_add(1);
         if self.window_started_ms == 0 || now_ms.saturating_sub(self.window_started_ms) > 1_000 {
             self.window_started_ms = now_ms;
@@ -468,6 +495,10 @@ struct RelayInner {
     discovery_routes: BTreeMap<RelaySideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
+    #[cfg(feature = "discovery")]
+    discovery_side_throttle: BTreeMap<RelaySideId, DiscoverySideThrottleState>,
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    timesync_side_throttle: BTreeMap<RelaySideId, TimeSyncSideThrottleState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -864,12 +895,21 @@ impl Relay {
         data: RelayItem,
     ) -> TelemetryResult<bool> {
         let allowed = {
-            let st = self.state.lock();
+            let mut st = self.state.lock();
             let ty = match &data {
                 RelayItem::Packet(pkt) => Some(pkt.data_type()),
                 RelayItem::Serialized(bytes) => Some(serialize::peek_envelope(bytes.as_ref())?.ty),
             };
-            self.route_allowed_locked(&st, src, ty, dst)
+            let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
+            #[cfg(all(feature = "discovery", feature = "timesync"))]
+            let timesync_allowed = ty
+                .map(|ty| {
+                    Self::timesync_allowed_for_side_locked(&mut st, dst, ty, self.clock.now_ms())
+                })
+                .unwrap_or(true);
+            #[cfg(not(all(feature = "discovery", feature = "timesync")))]
+            let timesync_allowed = true;
+            route_allowed && timesync_allowed
         };
         if !allowed {
             return Ok(false);
@@ -924,6 +964,10 @@ impl Relay {
                 discovery_routes: BTreeMap::new(),
                 #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
+                #[cfg(feature = "discovery")]
+                discovery_side_throttle: BTreeMap::new(),
+                #[cfg(all(feature = "discovery", feature = "timesync"))]
+                timesync_side_throttle: BTreeMap::new(),
             }),
             side_tx_gate: ReentryGate::new(),
             clock,
@@ -1786,6 +1830,15 @@ impl Relay {
                         .map(|route| route.side),
                 );
                 if let Some(side) = target_side {
+                    #[cfg(feature = "timesync")]
+                    if !Self::timesync_allowed_for_side_locked(
+                        &mut st,
+                        side,
+                        ty,
+                        self.clock.now_ms(),
+                    ) {
+                        return Ok(RemoteSidePlan::Target(Vec::new()));
+                    }
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
                 return Ok(RemoteSidePlan::Target(Vec::new()));
@@ -1797,12 +1850,21 @@ impl Relay {
                 RouteSelectionOrigin::Discovered
             };
             if st.discovery_routes.is_empty() {
-                let fallback = self.eligible_side_ids_locked(
+                let mut fallback = self.eligible_side_ids_locked(
                     &st,
                     Some(exclude),
                     Some(ty),
                     restrict_link_local,
                 );
+                #[cfg(feature = "timesync")]
+                {
+                    fallback = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        fallback,
+                    );
+                }
                 return Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
                     fallback
                 } else {
@@ -1853,6 +1915,15 @@ impl Relay {
             }
 
             if had_exact {
+                #[cfg(feature = "timesync")]
+                {
+                    exact_targets = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        exact_targets,
+                    );
+                }
                 let targets = self.filter_end_to_end_satisfied_sides_locked(
                     &st,
                     data,
@@ -1867,6 +1938,15 @@ impl Relay {
                     discovered_origin,
                 )))
             } else if had_known {
+                #[cfg(feature = "timesync")]
+                {
+                    generic_targets = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        generic_targets,
+                    );
+                }
                 let targets = self.filter_end_to_end_satisfied_sides_locked(
                     &st,
                     data,
@@ -1882,12 +1962,21 @@ impl Relay {
                 )))
             } else {
                 if Self::has_explicit_route_policy_locked(&st, Some(exclude), ty) {
-                    let sides = self.eligible_side_ids_locked(
+                    let mut sides = self.eligible_side_ids_locked(
                         &st,
                         Some(exclude),
                         Some(ty),
                         restrict_link_local,
                     );
+                    #[cfg(feature = "timesync")]
+                    {
+                        sides = Self::filter_timesync_sides_locked(
+                            &mut st,
+                            ty,
+                            self.clock.now_ms(),
+                            sides,
+                        );
+                    }
                     Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
                         &mut st,
                         Some(exclude),
@@ -2259,6 +2348,95 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
+    #[inline]
+    fn side_is_slow_control_link_locked(
+        st: &RelayInner,
+        side_id: RelaySideId,
+        now_ms: u64,
+    ) -> bool {
+        st.adaptive_route_stats.get(&side_id).is_some_and(|stats| {
+            let recent_slow = stats.last_slow_observed_ms > 0
+                && now_ms.saturating_sub(stats.last_slow_observed_ms)
+                    <= DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS;
+            stats.sample_count > 0
+                && ((stats.estimated_bandwidth_bps > 0
+                    && stats.estimated_bandwidth_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS)
+                    || recent_slow)
+        })
+    }
+
+    #[cfg(feature = "discovery")]
+    fn discovery_level_for_side_locked(
+        st: &mut RelayInner,
+        side_id: RelaySideId,
+        now_ms: u64,
+    ) -> Option<DiscoveryAdvertiseLevel> {
+        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
+            st.discovery_side_throttle.remove(&side_id);
+            return Some(DiscoveryAdvertiseLevel::Full);
+        }
+
+        let throttle = st.discovery_side_throttle.entry(side_id).or_default();
+        if now_ms >= throttle.next_full_ms {
+            throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
+            throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+            return Some(DiscoveryAdvertiseLevel::Full);
+        }
+        if now_ms >= throttle.next_ping_ms {
+            throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+            return Some(DiscoveryAdvertiseLevel::MinimalPing);
+        }
+        None
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[inline]
+    fn is_timesync_type(ty: crate::DataType) -> bool {
+        matches!(
+            ty,
+            crate::DataType::TimeSyncAnnounce
+                | crate::DataType::TimeSyncRequest
+                | crate::DataType::TimeSyncResponse
+        )
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn timesync_allowed_for_side_locked(
+        st: &mut RelayInner,
+        side_id: RelaySideId,
+        ty: crate::DataType,
+        now_ms: u64,
+    ) -> bool {
+        if !Self::is_timesync_type(ty) {
+            return true;
+        }
+        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
+            st.timesync_side_throttle.remove(&side_id);
+            return true;
+        }
+
+        let throttle = st.timesync_side_throttle.entry(side_id).or_default();
+        if now_ms >= throttle.next_allowed_ms {
+            throttle.next_allowed_ms = now_ms.saturating_add(TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn filter_timesync_sides_locked(
+        st: &mut RelayInner,
+        ty: crate::DataType,
+        now_ms: u64,
+        sides: Vec<RelaySideId>,
+    ) -> Vec<RelaySideId> {
+        sides
+            .into_iter()
+            .filter(|side| Self::timesync_allowed_for_side_locked(st, *side, ty, now_ms))
+            .collect()
+    }
+
+    #[cfg(feature = "discovery")]
     fn queue_discovery_announce(&self) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         let per_side = {
@@ -2272,48 +2450,64 @@ impl Relay {
                 return Ok(());
             }
             st.discovery_cadence.on_announce_sent(now_ms);
-            st.sides
+            let side_entries = st
+                .sides
                 .iter()
                 .enumerate()
                 .filter_map(|(side_id, side)| {
-                    let side = side.as_ref()?;
-                    if !self.route_allowed_locked(
-                        &st,
-                        None,
-                        Some(crate::DataType::DiscoveryAnnounce),
-                        side_id,
-                    ) {
-                        return None;
-                    }
-                    let endpoints = self.advertised_discovery_endpoints_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    );
-                    let timesync_sources =
-                        self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
-                    let topology = self.advertised_discovery_topology_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    );
-                    Some((side_id, endpoints, timesync_sources, topology))
+                    side.as_ref()
+                        .map(|side| (side_id, side.opts.link_local_enabled))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let mut per_side = Vec::new();
+            for (side_id, link_local_enabled) in side_entries {
+                if !self.route_allowed_locked(
+                    &st,
+                    None,
+                    Some(crate::DataType::DiscoveryAnnounce),
+                    side_id,
+                ) {
+                    continue;
+                }
+                let Some(level) = Self::discovery_level_for_side_locked(&mut st, side_id, now_ms)
+                else {
+                    continue;
+                };
+                if level == DiscoveryAdvertiseLevel::MinimalPing {
+                    per_side.push((side_id, level, Vec::new(), Vec::new(), Vec::new()));
+                    continue;
+                }
+                let endpoints = self.advertised_discovery_endpoints_for_link_locked(
+                    &st,
+                    now_ms,
+                    link_local_enabled,
+                );
+                let timesync_sources =
+                    self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+                let topology = self.advertised_discovery_topology_for_link_locked(
+                    &st,
+                    now_ms,
+                    link_local_enabled,
+                );
+                per_side.push((side_id, level, endpoints, timesync_sources, topology));
+            }
+            per_side
         };
         let mut st = self.state.lock();
-        for (dst, endpoints, timesync_sources, topology) in per_side {
+        for (dst, level, endpoints, timesync_sources, topology) in per_side {
             let sender = self.sender_arc();
-            let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
-            let data = RelayItem::Packet(Arc::new(pkt));
-            let priority = Self::relay_item_priority(&data)?;
-            st.push_tx(RelayTxItem {
-                src: None,
-                dst,
-                data,
-                priority,
-            })?;
-            if !endpoints.is_empty() {
+            if level == DiscoveryAdvertiseLevel::Full {
+                let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
+                let data = RelayItem::Packet(Arc::new(pkt));
+                let priority = Self::relay_item_priority(&data)?;
+                st.push_tx(RelayTxItem {
+                    src: None,
+                    dst,
+                    data,
+                    priority,
+                })?;
+            }
+            if level == DiscoveryAdvertiseLevel::MinimalPing || !endpoints.is_empty() {
                 let pkt = discovery::build_discovery_announce(
                     sender.as_ref(),
                     now_ms,
@@ -2328,7 +2522,7 @@ impl Relay {
                     priority,
                 })?;
             }
-            if !timesync_sources.is_empty() {
+            if level == DiscoveryAdvertiseLevel::Full && !timesync_sources.is_empty() {
                 let pkt = discovery::build_discovery_timesync_sources(
                     sender.as_ref(),
                     now_ms,
@@ -2343,7 +2537,7 @@ impl Relay {
                     priority,
                 })?;
             }
-            if !topology.is_empty() {
+            if level == DiscoveryAdvertiseLevel::Full && !topology.is_empty() {
                 let pkt = discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?;
                 let data = RelayItem::Packet(Arc::new(pkt));
                 let priority = Self::relay_item_priority(&data)?;
@@ -2775,6 +2969,10 @@ impl Relay {
         st.source_route_modes.remove(&Some(side));
         st.route_selection_cursors.remove(&Some(side));
         st.adaptive_route_stats.remove(&side);
+        #[cfg(feature = "discovery")]
+        st.discovery_side_throttle.remove(&side);
+        #[cfg(all(feature = "discovery", feature = "timesync"))]
+        st.timesync_side_throttle.remove(&side);
         st.side_runtime_stats.remove(&side);
         st.reliable_return_routes
             .retain(|_, route| route.side != side);

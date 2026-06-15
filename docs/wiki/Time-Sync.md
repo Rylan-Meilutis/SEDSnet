@@ -130,6 +130,11 @@ feature enabled, use `periodic_no_timesync(timeout_ms)`.
 `poll_timesync()` remains available as a lower-level hook when you want to queue only due
 announce/request traffic and manage the surrounding queue processing yourself.
 
+When discovery has measured a side as slow through link-probe or driver timing samples,
+router-managed time sync throttles only that slow egress. Local high-speed segments keep the
+configured normal sync cadence while slow bridge links carry only occasional master-to-master timing
+traffic.
+
 If you want a producer to advertise real UTC, inject that absolute time through the local network
 time setters. The router's timing callback remains monotonic-only.
 
