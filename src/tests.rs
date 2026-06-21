@@ -3035,7 +3035,7 @@ mod relay_tests {
     use crate::discovery::build_discovery_announce;
     use crate::router::Clock;
 
-    use crate::relay::Relay;
+    use crate::relay::{Relay, RelaySideOptions};
     use crate::tests::timeout_tests::StepClock;
     use crate::tests::{count_serialized_frames_of_type, serialized_frame_type};
     use crate::{TelemetryError, TelemetryResult, packet::Packet, serialize};
@@ -3125,7 +3125,124 @@ mod relay_tests {
         assert!(max_seen.load(Ordering::SeqCst) <= max_frame_bytes);
     }
 
+    #[test]
+    fn relay_serialized_side_templates_can_omit_unchanged_timestamps() {
+        crate::tests::ensure_common_test_schema();
+        use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+        let frames = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let frames_c = frames.clone();
+        let relay = Relay::new(zero_clock());
+
+        let input_side = relay.add_side_packet("input", |_pkt| Ok(()));
+        let output_side = relay.add_side_serialized_with_options(
+            "compact-link",
+            move |bytes: &[u8]| {
+                frames_c.lock().unwrap().push(bytes.len());
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            RelaySideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 20,
+                ..RelaySideOptions::default()
+                    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+            },
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "compact-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 20,
+                ..RouterSideOptions::default()
+                    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+        advertise_side(
+            &relay,
+            output_side,
+            "DST_SIDE",
+            DataEndpoint::named("SD_CARD"),
+        );
+        relay.process_all_queues().unwrap();
+        frames.lock().unwrap().clear();
+        let delivered_before = delivered.load(Ordering::SeqCst);
+        let stats_before = relay.export_runtime_stats();
+        let side_before = stats_before
+            .sides
+            .iter()
+            .find(|side| side.side_name == "compact-link")
+            .expect("compact-link side stats before data")
+            .clone();
+
+        let pkt_a = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[1.0_f32, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10_000,
+        )
+        .unwrap()
+        .with_nonce(41);
+        let pkt_b = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[4.0_f32, 5.0, 6.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10_000,
+        )
+        .unwrap()
+        .with_nonce(42);
+
+        relay.rx_from_side(input_side, pkt_a).unwrap();
+        relay.rx_from_side(input_side, pkt_b).unwrap();
+        relay.process_all_queues().unwrap();
+
+        assert_eq!(
+            delivered
+                .load(Ordering::SeqCst)
+                .saturating_sub(delivered_before),
+            2
+        );
+        let lens = frames.lock().unwrap();
+        assert!(lens.len() >= 2);
+        drop(lens);
+
+        let stats = relay.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "compact-link")
+            .expect("compact-link side stats");
+        assert!(side.side_transport_full_frames > side_before.side_transport_full_frames);
+        assert!(side.side_transport_compact_frames > side_before.side_transport_compact_frames);
+        assert_eq!(
+            side.side_transport_compact_omitted_timestamp_frames
+                - side_before.side_transport_compact_omitted_timestamp_frames,
+            1
+        );
+    }
+
     fn wire_for_value(v: u64) -> Arc<[u8]> {
+        crate::tests::ensure_common_test_schema();
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
             &[v as f32, 0.0, 0.0],
@@ -3463,7 +3580,7 @@ mod dedupe_tests {
 
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// Simple clock that always returns 0.
     fn zero_clock() -> Box<dyn Clock + Send + Sync> {
@@ -3482,6 +3599,7 @@ mod dedupe_tests {
     }
 
     fn advertise_side(relay: &Relay, side: usize, sender: &str) {
+        crate::tests::ensure_common_test_schema();
         let pkt = build_discovery_announce(sender, 0, &[DataEndpoint::named("SD_CARD")]).unwrap();
         relay.rx_from_side(side, pkt).unwrap();
     }
@@ -3546,7 +3664,7 @@ mod dedupe_tests {
         );
 
         // Step clock that advances every time we look at it.
-        let clock = StepClock::new_box(0, 1_000);
+        let clock = StepClock::new_box(0, 1);
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), clock);
 
         let pkt = Packet::from_f32_slice(
@@ -3706,7 +3824,7 @@ mod dedupe_tests {
             DataType::named("GPS_DATA"),
             &[1.0_f32, 2.0, 3.0],
             &[DataEndpoint::named("SD_CARD")],
-            10,
+            10_000,
         )
         .unwrap()
         .with_nonce(11);
@@ -3714,7 +3832,7 @@ mod dedupe_tests {
             DataType::named("GPS_DATA"),
             &[4.0_f32, 5.0, 6.0],
             &[DataEndpoint::named("SD_CARD")],
-            11,
+            10_001,
         )
         .unwrap()
         .with_nonce(12);
@@ -3726,6 +3844,352 @@ mod dedupe_tests {
         assert_eq!(delivered.load(Ordering::SeqCst), 2);
         assert_eq!(lens.len(), 2);
         assert!(lens[1] < lens[0], "second frame should use compact header");
+
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "link")
+            .expect("link side stats");
+        assert!(side.header_template_enabled);
+        assert_eq!(side.side_transport_profile, "ipv6_like");
+        assert_eq!(side.side_transport_full_frames, 1);
+        assert_eq!(side.side_transport_compact_frames, 1);
+        assert_eq!(side.side_transport_compact_delta_frames, 1);
+        assert!(side.side_transport_bytes_saved > 0);
+        assert_eq!(
+            side.compact_header_target_bytes,
+            crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+        );
+        assert!(
+            side.side_transport_min_compact_overhead_bytes
+                .expect("compact overhead")
+                <= side.compact_header_target_bytes,
+            "simple compact follow-up frames should fit the configured overhead target"
+        );
+        assert_eq!(side.side_transport_compact_target_misses, 0);
+    }
+
+    #[test]
+    fn serialized_side_header_templates_can_omit_unchanged_timestamps() {
+        crate::tests::ensure_common_test_schema();
+        let delivered_payloads = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+        let delivered_payloads_c = delivered_payloads.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |pkt: &Packet| {
+                    let mut payload = Vec::with_capacity(pkt.payload().len() / 4);
+                    for chunk in pkt.payload().chunks_exact(4) {
+                        payload.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    }
+                    delivered_payloads_c.lock().unwrap().push(payload);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let frames = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let frames_c = frames.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_serialized_with_options(
+            "link",
+            move |bytes: &[u8]| {
+                frames_c.lock().unwrap().push(bytes.len());
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 20,
+                ..RouterSideOptions::default()
+                    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+            },
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 20,
+                ..RouterSideOptions::default()
+                    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        let pkt_a = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[1.0_f32, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10_000,
+        )
+        .unwrap()
+        .with_nonce(21);
+        let pkt_b = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[4.0_f32, 5.0, 6.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10_000,
+        )
+        .unwrap()
+        .with_nonce(22);
+
+        sender.tx(pkt_a).unwrap();
+        sender.tx(pkt_b).unwrap();
+
+        let lens = frames.lock().unwrap();
+        assert_eq!(lens.len(), 2);
+        assert!(lens[1] < lens[0], "second frame should use compact header");
+        drop(lens);
+
+        let delivered = delivered_payloads.lock().unwrap();
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(delivered[1], vec![4.0, 5.0, 6.0]);
+        drop(delivered);
+
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "link")
+            .expect("link side stats");
+        assert_eq!(side.side_transport_full_frames, 1);
+        assert_eq!(side.side_transport_compact_frames, 1);
+        assert_eq!(side.side_transport_compact_delta_frames, 0);
+        assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 1);
+        assert!(side.side_transport_bytes_saved > 0);
+        assert_eq!(side.side_transport_compact_target_misses, 0);
+    }
+
+    #[test]
+    fn serialized_side_timestamp_omission_policy_does_not_apply_to_other_types() {
+        crate::tests::ensure_common_test_schema();
+        let other_ty = DataType::try_named("POLICY_OTHER_DATA").unwrap_or_else(|| {
+            use crate::config::register_data_type_with_description;
+            use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+            register_data_type_with_description(
+                "POLICY_OTHER_DATA",
+                "test type that should not inherit GPS timestamp omission policy",
+                MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+                &[DataEndpoint::named("SD_CARD")],
+                ReliableMode::None,
+                1,
+            )
+            .expect("register POLICY_OTHER_DATA")
+        });
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_serialized_with_options(
+            "link",
+            move |bytes: &[u8]| {
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 20,
+                ..RouterSideOptions::default()
+                    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+            },
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 20,
+                ..RouterSideOptions::default()
+                    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        let pkt_a = Packet::from_f32_slice(
+            other_ty,
+            &[1.0_f32, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10_000,
+        )
+        .unwrap()
+        .with_nonce(31);
+        let pkt_b = Packet::from_f32_slice(
+            other_ty,
+            &[4.0_f32, 5.0, 6.0],
+            &[DataEndpoint::named("SD_CARD")],
+            10_000,
+        )
+        .unwrap()
+        .with_nonce(32);
+
+        sender.tx(pkt_a).unwrap();
+        sender.tx(pkt_b).unwrap();
+
+        assert_eq!(delivered.load(Ordering::SeqCst), 2);
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "link")
+            .expect("link side stats");
+        assert_eq!(side.side_transport_full_frames, 1);
+        assert_eq!(side.side_transport_compact_frames, 1);
+        assert_eq!(side.side_transport_compact_delta_frames, 1);
+        assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 0);
+    }
+
+    #[test]
+    fn serialized_side_template_dictionary_is_bounded() {
+        crate::tests::ensure_common_test_schema();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::default(),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_serialized_with_options(
+            "bounded-link",
+            move |bytes: &[u8]| {
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 1,
+                ..RouterSideOptions::default()
+            },
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "bounded-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 1,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        for (sender_id, ts, nonce) in [("SRC_A", 1, 1), ("SRC_B", 2, 2), ("SRC_A", 3, 3)] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(ts as f32).to_le_bytes());
+            payload.extend_from_slice(&0.0f32.to_le_bytes());
+            payload.extend_from_slice(&0.0f32.to_le_bytes());
+            let pkt = Packet::new(
+                DataType::named("GPS_DATA"),
+                &[DataEndpoint::named("SD_CARD")],
+                sender_id,
+                ts,
+                Arc::<[u8]>::from(payload),
+            )
+            .unwrap()
+            .with_nonce(nonce);
+            sender.tx(pkt).unwrap();
+        }
+
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "bounded-link")
+            .expect("bounded side stats");
+        assert_eq!(side.max_side_transport_templates, 1);
+        assert_eq!(side.side_transport_profile, "template");
+        assert_eq!(side.side_transport_tx_template_count, 1);
+        assert_eq!(side.side_transport_full_frames, 3);
+        assert_eq!(side.side_transport_compact_frames, 0);
+        assert!(side.side_transport_template_evictions >= 2);
+    }
+
+    #[test]
+    fn compact_header_target_misses_are_counted() {
+        crate::tests::ensure_common_test_schema();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::default(),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_serialized_with_options(
+            "tight-target",
+            move |bytes: &[u8]| {
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_serialized_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                compact_header_target_bytes: 1,
+                ..RouterSideOptions::default()
+            },
+        );
+        let rx_side = receiver.add_side_serialized_with_options(
+            "tight-target",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        for (value, nonce) in [(1.0, 11), (2.0, 12)] {
+            let pkt = Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[value, 0.0, 0.0],
+                &[DataEndpoint::named("SD_CARD")],
+                nonce as u64,
+            )
+            .unwrap()
+            .with_nonce(nonce);
+            sender.tx(pkt).unwrap();
+        }
+
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "tight-target")
+            .expect("tight target side stats");
+        assert_eq!(side.side_transport_compact_frames, 1);
+        assert_eq!(side.side_transport_compact_target_misses, 1);
     }
 
     #[test]
@@ -3871,8 +4335,10 @@ mod dedupe_tests {
     /// still be deduped (no time-based expiry).
     #[test]
     fn relay_dedup_persists_across_time_advance() {
-        // Step clock that advances each time now_ms() is called.
-        let clock = StepClock::new_box(0, 1_000);
+        let now_ms = Arc::new(AtomicU64::new(0));
+        let clock_now = now_ms.clone();
+        let clock: Box<dyn Clock + Send + Sync> =
+            Box::new(move || clock_now.load(Ordering::SeqCst));
         let relay = Relay::new(clock);
 
         let tx_count = Arc::new(AtomicUsize::new(0));
@@ -3897,6 +4363,8 @@ mod dedupe_tests {
         relay
             .process_all_queues_with_timeout(0)
             .expect("first drain failed");
+
+        now_ms.store(1_000, Ordering::SeqCst);
 
         relay
             .rx_serialized_from_side(id_src, frame.as_ref())
@@ -5188,13 +5656,17 @@ mod router_tests {
         };
         use crate::discovery::{
             DISCOVERY_FAST_INTERVAL_MS, DISCOVERY_ROUTE_TTL_MS,
-            DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, TopologyBoardNode, build_discovery_announce,
-            build_discovery_timesync_sources, build_discovery_topology,
+            DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, LINK_CAPABILITY_CHUNKING,
+            LINK_CAPABILITY_END_TO_END_RELIABILITY, LINK_CAPABILITY_HEADER_TEMPLATES,
+            LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS, LINK_CAPABILITY_RELIABILITY,
+            LINK_PROFILE_IPV4_LIKE, LinkCapabilities, TopologyBoardNode, build_discovery_announce,
+            build_discovery_link_capabilities, build_discovery_timesync_sources,
+            build_discovery_topology, decode_discovery_link_capabilities,
         };
         use crate::relay::Relay;
         use crate::router::{
             Clock, EndpointHandler, NetworkVariablePermissions, RouterConfig,
-            RouterE2eEncryptionMode,
+            RouterE2eEncryptionMode, RouterSideOptions,
         };
         use crate::tests::count_packets_of_type;
         use crate::tests::timeout_tests::StepClock;
@@ -5244,6 +5716,66 @@ mod router_tests {
                     .expect("register GPS_DATA");
                 }
             });
+        }
+
+        #[test]
+        fn discovery_link_capabilities_roundtrip() {
+            let caps = LinkCapabilities {
+                version: 1,
+                flags: LINK_CAPABILITY_HEADER_TEMPLATES
+                    | LINK_CAPABILITY_CHUNKING
+                    | LINK_CAPABILITY_RELIABILITY
+                    | LINK_CAPABILITY_END_TO_END_RELIABILITY
+                    | LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS,
+                profile: LINK_PROFILE_IPV4_LIKE,
+                max_frame_bytes: 64,
+                compact_header_target_bytes: 20,
+                max_side_transport_templates: 8,
+            };
+            let pkt = build_discovery_link_capabilities("NODE_A", 42, caps).unwrap();
+            assert_eq!(pkt.data_type(), DataType::DiscoveryLinkCapabilities);
+            let decoded = decode_discovery_link_capabilities(&pkt).unwrap();
+            assert_eq!(decoded, caps);
+        }
+
+        #[test]
+        fn router_discovery_advertises_side_link_capabilities() {
+            let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_cb = seen.clone();
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            router.add_side_packet_with_options(
+                "RADIO",
+                move |pkt| {
+                    seen_cb.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    max_frame_bytes: 64,
+                    max_side_transport_templates: 8,
+                    ..RouterSideOptions::default().with_ipv4_like_compact_header_target()
+                },
+            );
+
+            router.announce_discovery().unwrap();
+            router.process_tx_queue().unwrap();
+
+            let packets = seen.lock().unwrap();
+            let caps_pkt = packets
+                .iter()
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryLinkCapabilities)
+                .expect("missing link capabilities discovery packet");
+            let caps = decode_discovery_link_capabilities(caps_pkt).unwrap();
+            assert_eq!(caps.version, 1);
+            assert_eq!(caps.profile, LINK_PROFILE_IPV4_LIKE);
+            assert_eq!(caps.max_frame_bytes, 64);
+            assert_eq!(caps.compact_header_target_bytes, 20);
+            assert_eq!(caps.max_side_transport_templates, 8);
+            assert_ne!(caps.flags & LINK_CAPABILITY_HEADER_TEMPLATES, 0);
+            assert_ne!(caps.flags & LINK_CAPABILITY_CHUNKING, 0);
+            assert_ne!(caps.flags & LINK_CAPABILITY_RELIABILITY, 0);
+            assert_ne!(caps.flags & LINK_CAPABILITY_END_TO_END_RELIABILITY, 0);
+            assert_ne!(caps.flags & LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS, 0);
         }
 
         fn ensure_reliable_overlap_test_schema() -> DataType {

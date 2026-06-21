@@ -189,13 +189,25 @@ Kinds:
 - `0x01`: full serialized frame plus a side-local ULEB template id
 - `0x02`: compact frame using a previously learned side-local template id
 - `0x03`: ordered chunk of a full or compact side-transport frame
+- `0x04`: compact frame using a template id plus timestamp delta from the previous frame for that
+  template
+- `0x05`: compact frame using a template id and the unchanged previous timestamp for that template
 
 Router serialized sides support header-template reuse with
 `Router::add_side_serialized_small_packets(...)` or
 `RouterSideOptions::with_small_packet_transport(...)`. The first stable header shape is sent as a
 full `SDT` frame and assigns a compact side-local ULEB template id. Later packets with the same
 static header shape can use kind `0x02`, replacing repeated type/endpoint/sender/contract bytes with
-that template id plus the fields that still vary per packet.
+that template id plus the fields that still vary per packet. When the previous timestamp for that
+template is known and the nonnegative delta is smaller than the full timestamp varint, the sender
+uses kind `0x04` and carries the timestamp delta instead. When unchanged-timestamp omission is
+enabled and the timestamp is identical to the previous frame for that template, the sender uses kind
+`0x05` and omits the timestamp field entirely. Omission can be enabled side-wide, by the IPv4-like
+profile, or for selected data types on a mixed link.
+
+Python and C bindings expose the same profiles through `add_side_serialized_profile(...)` and
+`seds_*_add_side_serialized_profile(...)`. `ipv6_like` uses a 40-byte compact-header profiling
+target; `ipv4_like` uses a 20-byte target and enables unchanged-timestamp omission.
 
 Router and relay serialized sides both support bounded frame sizes. Relay small-packet sides use the
 same side-local template id compaction when `max_frame_bytes` is non-zero. When the side-transport
@@ -211,13 +223,65 @@ sender IDs/hashes, side-local header templates, and fixed-size side splitting. T
 a side remains self-describing enough to establish context; follow-up packets on constrained links
 can replace repeated type/endpoint/sender/contract fields with a compact template ID.
 
+The practical target is:
+
+- **canonical full frame**: self-describing, migration-safe, and suitable for recovery after peer
+  restart or lost side context
+- **compact side-transport follow-up frame**: IPv6-like overhead target by default, with an
+  IPv4-like target available for stable tiny telemetry streams
+
+Routers and relays expose this as a per-side compact-header target. `with_small_packet_transport`
+sets the default target to 40 bytes, and `with_ipv4_like_compact_header_target` sets a 20-byte
+profiling target. The target is not a hard parser rule; it is a deployment contract to validate
+against runtime stats while preserving canonical packet reconstruction before normal routing,
+dedupe, reliability, E2E ACK, and payload-decryption behavior.
+
+Each side also exports an effective side-transport profile:
+
+- `canonical`: no side-transport wrapping is needed
+- `template`: template reuse is enabled without an IPv4/IPv6-size target
+- `ipv6_like`: compact follow-up frames are profiled against a 40-byte target
+- `ipv4_like`: compact follow-up frames are profiled against a 20-byte target and omit unchanged
+  compact timestamps
+
+Runtime stats report:
+
+- whether header templates are enabled on each side
+- max fixed-frame size
+- compact-header target bytes
+- effective side-transport profile
+- maximum retained side-local templates
+- full, compact, timestamp-delta compact, unchanged-timestamp compact, and chunk side-transport
+  frame counts
+- raw canonical bytes, emitted side-transport bytes, and bytes saved
+- minimum and maximum compact follow-up overhead bytes
+- compact-header target misses
+- active TX/RX template counts and template evictions
+
+For small stable telemetry such as a single template carrying changing timestamp/nonce/payload,
+the compact follow-up path is expected to fit the IPv4-like 20-byte overhead target. Larger
+contracts, reliable sequence/ACK fields, E2E wrappers, chunking, or changing header shapes can push
+overhead toward the IPv6-like target or require a fresh full template frame.
+
+Side-local template dictionaries are bounded by `max_side_transport_templates`, which defaults to
+64 entries per side. When the dictionary is full, the sender or receiver evicts a deterministic
+entry and later refreshes that shape with a full template frame. This keeps compact-link state
+bounded and makes template memory visible through the same runtime stats used to tune queue,
+reliability, discovery, and cache budgets.
+
+Full discovery snapshots also send `SEDSNET_DISCOVERY_LINK_CAPABILITIES` on each side. Its payload
+is fixed-width: version `u8`, capability flags `u32`, profile code `u8`, max frame bytes `u32`,
+compact-header target bytes `u32`, and max side templates `u32`, all little-endian except the
+single-byte fields. The flags advertise header templates, chunking, hop reliability, crypto support,
+end-to-end reliability support, and unchanged compact timestamp omission. Profile codes are `0`
+canonical, `1` template, `2` IPv6-like, and `3` IPv4-like.
+
 Further compatible reductions should use negotiated per-side context rather than removing fields
 globally:
 
-- stream/context profiles that omit sender, endpoints, type, and timestamp when unchanged
+- stream/context profiles that omit sender, endpoints, and type when unchanged
 - single-endpoint route contracts that omit the endpoint bitmap on links where the route fixes it
 - small-payload opcodes for common static shapes such as three `f32` values or one `u8` state
-- delta or omitted timestamps for traffic where link time or network-variable versioning is enough
 - grouped ACK/reliability metadata and optional aggregation of several tiny values into one
   authenticated frame on very low-bandwidth links
 - E2E overhead amortization by sealing multiple tiny payloads under one AEAD tag when latency

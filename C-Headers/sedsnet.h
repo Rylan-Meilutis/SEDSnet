@@ -47,6 +47,8 @@ typedef enum SedsDataType {
   SEDS_DT_MANAGED_VARIABLE_VALUE = 14,
   /* SEDSnet discovery leave announcement. */
   SEDS_DT_DISCOVERY_LEAVE = 15,
+  /* Per-link compact transport capability advertisement. */
+  SEDS_DT_DISCOVERY_LINK_CAPABILITIES = 16,
   /* Built-in TelemetryError */
   SEDS_DT_TELEMETRY_ERROR = 0,
 } SedsDataType;
@@ -81,6 +83,22 @@ typedef enum SedsResult {
   SEDS_INVALID_LINK_ID = -17,
   SEDS_PACKET_TOO_LARGE = -18,
 } SedsResult;
+
+typedef enum SedsSideTransportProfile {
+  SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL = 0,
+  SEDS_SIDE_TRANSPORT_PROFILE_TEMPLATE = 1,
+  SEDS_SIDE_TRANSPORT_PROFILE_IPV6_LIKE = 2,
+  SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE = 3,
+} SedsSideTransportProfile;
+
+typedef enum SedsLinkCapabilityFlags {
+  SEDS_LINK_CAPABILITY_HEADER_TEMPLATES = 0x00000001U,
+  SEDS_LINK_CAPABILITY_CHUNKING = 0x00000002U,
+  SEDS_LINK_CAPABILITY_RELIABILITY = 0x00000004U,
+  SEDS_LINK_CAPABILITY_CRYPTO = 0x00000008U,
+  SEDS_LINK_CAPABILITY_END_TO_END_RELIABILITY = 0x00000010U,
+  SEDS_LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS = 0x00000020U,
+} SedsLinkCapabilityFlags;
 
 /* ======================================================================== */
 typedef uint64_t (* SedsNowMsFn)(void * user);
@@ -745,6 +763,32 @@ int32_t seds_router_add_side_serialized_small_packets(
 );
 
 /**
+ * @brief Add a serialized router side using a named compact wire profile.
+ *
+ * Profiles:
+ *  - SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL: canonical packet bytes, no side header templates.
+ *  - SEDS_SIDE_TRANSPORT_PROFILE_TEMPLATE: compact side header-template transport.
+ *  - SEDS_SIDE_TRANSPORT_PROFILE_IPV6_LIKE: template transport targeting a 40-byte compact header.
+ *  - SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE: template transport targeting a 20-byte compact header
+ *    and omitting unchanged compact timestamps.
+ *
+ * A compact_header_target_bytes value of 0 uses the profile default target.
+ * max_frame_bytes may be 0 for template-only transport without chunking.
+ */
+int32_t seds_router_add_side_serialized_profile(
+    SedsRouter * r,
+    const char * name,
+    size_t name_len,
+    SedsTransmitFn tx,
+    void * tx_user,
+    bool reliable_enabled,
+    SedsSideTransportProfile profile,
+    size_t max_frame_bytes,
+    size_t compact_header_target_bytes,
+    size_t max_side_transport_templates
+);
+
+/**
  * @brief Add a packet-view router side.
  *
  * @param r                 Router handle.
@@ -1251,6 +1295,26 @@ int32_t seds_relay_add_side_serialized_small_packets(SedsRelay * r,
                             void * tx_user,
                             bool reliable_enabled,
                             size_t max_frame_bytes);
+
+/**
+ * @brief Add a serialized relay side using a named compact wire profile.
+ *
+ * SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE targets a 20-byte compact header and omits unchanged
+ * compact timestamps.
+ *
+ * A compact_header_target_bytes value of 0 uses the profile default target.
+ * max_frame_bytes may be 0 for template-only transport without chunking.
+ */
+int32_t seds_relay_add_side_serialized_profile(SedsRelay * r,
+                            const char * name,
+                            size_t name_len,
+                            SedsTransmitFn tx,
+                            void * tx_user,
+                            bool reliable_enabled,
+                            SedsSideTransportProfile profile,
+                            size_t max_frame_bytes,
+                            size_t compact_header_target_bytes,
+                            size_t max_side_transport_templates);
 
 /**
  * @brief Add a new side/network to the relay whose TX callback receives packets.

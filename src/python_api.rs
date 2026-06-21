@@ -53,7 +53,7 @@ use crate::{
     relay::{Relay, RelaySideOptions},
     router::{
         Clock, EndpointHandler, LeBytes, NetworkVariablePermissions, Router, RouterConfig,
-        RouterE2eEncryptionMode, RouterSideOptions,
+        RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
     },
     serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
     try_enum_from_i32, try_enum_from_u32,
@@ -524,6 +524,98 @@ fn route_selection_mode_name(mode: RouteSelectionMode) -> &'static str {
     }
 }
 
+fn side_transport_profile_from_name(profile: &str) -> PyResult<SideTransportProfile> {
+    match profile {
+        "canonical" => Ok(SideTransportProfile::Canonical),
+        "template" => Ok(SideTransportProfile::Template),
+        "ipv6_like" => Ok(SideTransportProfile::Ipv6Like),
+        "ipv4_like" => Ok(SideTransportProfile::Ipv4Like),
+        _ => Err(PyValueError::new_err(
+            "profile must be canonical, template, ipv6_like, or ipv4_like",
+        )),
+    }
+}
+
+fn router_side_options_for_profile(
+    reliable_enabled: bool,
+    profile: SideTransportProfile,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> RouterSideOptions {
+    let mut opts = RouterSideOptions {
+        reliable_enabled,
+        max_frame_bytes,
+        max_side_transport_templates,
+        side_transport_profile: profile,
+        ..RouterSideOptions::default()
+    };
+    match profile {
+        SideTransportProfile::Canonical => {}
+        SideTransportProfile::Template => {
+            opts.header_template_enabled = true;
+        }
+        SideTransportProfile::Ipv6Like => {
+            opts.header_template_enabled = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+        SideTransportProfile::Ipv4Like => {
+            opts.header_template_enabled = true;
+            opts.omit_unchanged_compact_timestamps = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+    }
+    opts
+}
+
+fn relay_side_options_for_profile(
+    reliable_enabled: bool,
+    profile: SideTransportProfile,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> RelaySideOptions {
+    let mut opts = RelaySideOptions {
+        reliable_enabled,
+        max_frame_bytes,
+        max_side_transport_templates,
+        side_transport_profile: profile,
+        ..RelaySideOptions::default()
+    };
+    match profile {
+        SideTransportProfile::Canonical => {}
+        SideTransportProfile::Template => {
+            opts.header_template_enabled = true;
+        }
+        SideTransportProfile::Ipv6Like => {
+            opts.header_template_enabled = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::relay::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+        SideTransportProfile::Ipv4Like => {
+            opts.header_template_enabled = true;
+            opts.omit_unchanged_compact_timestamps = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::relay::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+    }
+    opts
+}
+
 #[cfg(feature = "discovery")]
 fn runtime_stats_snapshot_to_pydict(
     py: Python<'_>,
@@ -538,6 +630,13 @@ fn runtime_stats_snapshot_to_pydict(
         side_dict.set_item("side_name", side.side_name)?;
         side_dict.set_item("reliable_enabled", side.reliable_enabled)?;
         side_dict.set_item("link_local_enabled", side.link_local_enabled)?;
+        side_dict.set_item("header_template_enabled", side.header_template_enabled)?;
+        side_dict.set_item("max_frame_bytes", side.max_frame_bytes)?;
+        side_dict.set_item(
+            "compact_header_target_bytes",
+            side.compact_header_target_bytes,
+        )?;
+        side_dict.set_item("side_transport_profile", side.side_transport_profile)?;
         side_dict.set_item("ingress_enabled", side.ingress_enabled)?;
         side_dict.set_item("egress_enabled", side.egress_enabled)?;
         side_dict.set_item("tx_packets", side.tx_packets)?;
@@ -553,6 +652,60 @@ fn runtime_stats_snapshot_to_pydict(
         side_dict.set_item("tx_handler_failures", side.tx_handler_failures)?;
         side_dict.set_item("local_handler_failures", side.local_handler_failures)?;
         side_dict.set_item("total_handler_retries", side.total_handler_retries)?;
+        side_dict.set_item(
+            "side_transport_full_frames",
+            side.side_transport_full_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_frames",
+            side.side_transport_compact_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_delta_frames",
+            side.side_transport_compact_delta_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_omitted_timestamp_frames",
+            side.side_transport_compact_omitted_timestamp_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_chunk_frames",
+            side.side_transport_chunk_frames,
+        )?;
+        side_dict.set_item("side_transport_raw_bytes", side.side_transport_raw_bytes)?;
+        side_dict.set_item("side_transport_wire_bytes", side.side_transport_wire_bytes)?;
+        side_dict.set_item(
+            "side_transport_bytes_saved",
+            side.side_transport_bytes_saved,
+        )?;
+        side_dict.set_item(
+            "side_transport_min_compact_overhead_bytes",
+            side.side_transport_min_compact_overhead_bytes,
+        )?;
+        side_dict.set_item(
+            "side_transport_max_compact_overhead_bytes",
+            side.side_transport_max_compact_overhead_bytes,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_target_misses",
+            side.side_transport_compact_target_misses,
+        )?;
+        side_dict.set_item(
+            "side_transport_template_evictions",
+            side.side_transport_template_evictions,
+        )?;
+        side_dict.set_item(
+            "side_transport_tx_template_count",
+            side.side_transport_tx_template_count,
+        )?;
+        side_dict.set_item(
+            "side_transport_rx_template_count",
+            side.side_transport_rx_template_count,
+        )?;
+        side_dict.set_item(
+            "max_side_transport_templates",
+            side.max_side_transport_templates,
+        )?;
 
         let adaptive = PyDict::new(py);
         adaptive.set_item(
@@ -1001,6 +1154,57 @@ impl PyRouter {
         }
         self._side_cbs[id] = Some(cb_keep);
 
+        Ok(id as u32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, tx, reliable_enabled=false, profile="ipv6_like", max_frame_bytes=0, compact_header_target_bytes=0, max_side_transport_templates=64))]
+    fn add_side_serialized_profile(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        tx: Py<PyAny>,
+        reliable_enabled: bool,
+        profile: &str,
+        max_frame_bytes: usize,
+        compact_header_target_bytes: usize,
+        max_side_transport_templates: usize,
+    ) -> PyResult<u32> {
+        let cb_keep = tx.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        let profile = side_transport_profile_from_name(profile)?;
+        let opts = router_side_options_for_profile(
+            reliable_enabled,
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        );
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let id = rtr.add_side_serialized_with_options(
+            name_static,
+            move |bytes| {
+                Python::attach(|py| {
+                    let arg = PyBytes::new(py, bytes);
+                    match cb_for_closure.call1(py, (&arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("router side tx error"))
+                        }
+                    }
+                })
+            },
+            opts,
+        );
+        if self._side_cbs.len() <= id {
+            self._side_cbs.resize_with(id + 1, || None);
+        }
+        self._side_cbs[id] = Some(cb_keep);
         Ok(id as u32)
     }
 
@@ -2053,6 +2257,53 @@ impl PyRelay {
         }
         self._tx_cbs[id] = Some(cb_keep);
 
+        Ok(id as u32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, tx, reliable_enabled=false, profile="ipv6_like", max_frame_bytes=0, compact_header_target_bytes=0, max_side_transport_templates=64))]
+    fn add_side_serialized_profile(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        tx: Py<PyAny>,
+        reliable_enabled: bool,
+        profile: &str,
+        max_frame_bytes: usize,
+        compact_header_target_bytes: usize,
+        max_side_transport_templates: usize,
+    ) -> PyResult<u32> {
+        let cb_keep = tx.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        let profile = side_transport_profile_from_name(profile)?;
+        let opts = relay_side_options_for_profile(
+            reliable_enabled,
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        );
+        let id = self.inner.add_side_serialized_with_options(
+            name_static,
+            move |bytes| {
+                Python::attach(|py| {
+                    let arg = PyBytes::new(py, bytes);
+                    match cb_for_closure.call1(py, (&arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("relay tx error"))
+                        }
+                    }
+                })
+            },
+            opts,
+        );
+        if self._tx_cbs.len() <= id {
+            self._tx_cbs.resize_with(id + 1, || None);
+        }
+        self._tx_cbs[id] = Some(cb_keep);
         Ok(id as u32)
     }
 

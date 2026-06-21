@@ -29,7 +29,8 @@ use crate::{
     do_vec_log_typed, get_needed_message_size, message_meta,
     packet::Packet,
     router::{
-        Clock, LeBytes, RouterE2eEncryptionMode, RouterSideOptions, endpoint_is_router_internal,
+        Clock, LeBytes, RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
+        endpoint_is_router_internal,
     },
     router::{EndpointHandler, Router, RouterConfig},
     serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
@@ -57,6 +58,11 @@ const SEDS_EK_FLOAT: u32 = 2;
 
 /// Small stack buffer size for endpoint lists in callbacks.
 const STACK_EPS: usize = 16; // number of endpoints to store on stack for callback
+
+const SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL: u32 = 0;
+const SEDS_SIDE_TRANSPORT_PROFILE_TEMPLATE: u32 = 1;
+const SEDS_SIDE_TRANSPORT_PROFILE_IPV6_LIKE: u32 = 2;
+const SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE: u32 = 3;
 
 /// Generic "OK/ERR" status returned for simple FFI entry points.
 #[repr(i32)]
@@ -203,6 +209,97 @@ fn route_selection_mode_from_i32(x: i32) -> TelemetryResult<RouteSelectionMode> 
         2 => Ok(RouteSelectionMode::Failover),
         _ => Err(TelemetryError::BadArg),
     }
+}
+
+#[inline]
+fn side_transport_profile_from_code(code: u32) -> TelemetryResult<SideTransportProfile> {
+    match code {
+        SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL => Ok(SideTransportProfile::Canonical),
+        SEDS_SIDE_TRANSPORT_PROFILE_TEMPLATE => Ok(SideTransportProfile::Template),
+        SEDS_SIDE_TRANSPORT_PROFILE_IPV6_LIKE => Ok(SideTransportProfile::Ipv6Like),
+        SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE => Ok(SideTransportProfile::Ipv4Like),
+        _ => Err(TelemetryError::BadArg),
+    }
+}
+
+fn router_side_options_for_profile(
+    reliable_enabled: bool,
+    profile: SideTransportProfile,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> RouterSideOptions {
+    let mut opts = RouterSideOptions {
+        reliable_enabled,
+        max_frame_bytes,
+        max_side_transport_templates,
+        side_transport_profile: profile,
+        ..RouterSideOptions::default()
+    };
+    match profile {
+        SideTransportProfile::Canonical => {}
+        SideTransportProfile::Template => {
+            opts.header_template_enabled = true;
+        }
+        SideTransportProfile::Ipv6Like => {
+            opts.header_template_enabled = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+        SideTransportProfile::Ipv4Like => {
+            opts.header_template_enabled = true;
+            opts.omit_unchanged_compact_timestamps = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+    }
+    opts
+}
+
+fn relay_side_options_for_profile(
+    reliable_enabled: bool,
+    profile: SideTransportProfile,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> RelaySideOptions {
+    let mut opts = RelaySideOptions {
+        reliable_enabled,
+        max_frame_bytes,
+        max_side_transport_templates,
+        side_transport_profile: profile,
+        ..RelaySideOptions::default()
+    };
+    match profile {
+        SideTransportProfile::Canonical => {}
+        SideTransportProfile::Template => {
+            opts.header_template_enabled = true;
+        }
+        SideTransportProfile::Ipv6Like => {
+            opts.header_template_enabled = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::relay::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+        SideTransportProfile::Ipv4Like => {
+            opts.header_template_enabled = true;
+            opts.omit_unchanged_compact_timestamps = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::relay::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+    }
+    opts
 }
 
 // ============================================================================
@@ -717,6 +814,20 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
         push_bool(&mut out, side.reliable_enabled);
         out.push_str(",\"link_local_enabled\":");
         push_bool(&mut out, side.link_local_enabled);
+        out.push_str(",\"header_template_enabled\":");
+        push_bool(&mut out, side.header_template_enabled);
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                ",\"max_frame_bytes\":{},\"compact_header_target_bytes\":{},\
+                 \"max_side_transport_templates\":{}",
+                side.max_frame_bytes,
+                side.compact_header_target_bytes,
+                side.max_side_transport_templates
+            ),
+        );
+        out.push_str(",\"side_transport_profile\":");
+        json_push_escaped(&mut out, side.side_transport_profile);
         out.push_str(",\"ingress_enabled\":");
         push_bool(&mut out, side.ingress_enabled);
         out.push_str(",\"egress_enabled\":");
@@ -729,7 +840,19 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
                  \"relayed_rx_packets\":{},\"relayed_rx_bytes\":{},\
                  \"local_delivery_packets\":{},\"tx_retries\":{},\
                  \"tx_handler_failures\":{},\"local_handler_failures\":{},\
-                 \"total_handler_retries\":{}",
+                 \"total_handler_retries\":{},\
+                 \"side_transport_full_frames\":{},\
+                 \"side_transport_compact_frames\":{},\
+                 \"side_transport_compact_delta_frames\":{},\
+                 \"side_transport_compact_omitted_timestamp_frames\":{},\
+                 \"side_transport_chunk_frames\":{},\
+                 \"side_transport_raw_bytes\":{},\
+                 \"side_transport_wire_bytes\":{},\
+                 \"side_transport_bytes_saved\":{},\
+                 \"side_transport_compact_target_misses\":{},\
+                 \"side_transport_template_evictions\":{},\
+                 \"side_transport_tx_template_count\":{},\
+                 \"side_transport_rx_template_count\":{}",
                 side.tx_packets,
                 side.tx_bytes,
                 side.rx_packets,
@@ -742,9 +865,25 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
                 side.tx_retries,
                 side.tx_handler_failures,
                 side.local_handler_failures,
-                side.total_handler_retries
+                side.total_handler_retries,
+                side.side_transport_full_frames,
+                side.side_transport_compact_frames,
+                side.side_transport_compact_delta_frames,
+                side.side_transport_compact_omitted_timestamp_frames,
+                side.side_transport_chunk_frames,
+                side.side_transport_raw_bytes,
+                side.side_transport_wire_bytes,
+                side.side_transport_bytes_saved,
+                side.side_transport_compact_target_misses,
+                side.side_transport_template_evictions,
+                side.side_transport_tx_template_count,
+                side.side_transport_rx_template_count
             ),
         );
+        out.push_str(",\"side_transport_min_compact_overhead_bytes\":");
+        push_optional_usize(&mut out, side.side_transport_min_compact_overhead_bytes);
+        out.push_str(",\"side_transport_max_compact_overhead_bytes\":");
+        push_optional_usize(&mut out, side.side_transport_max_compact_overhead_bytes);
         out.push_str(",\"adaptive\":{");
         out.push_str("\"auto_balancing_enabled\":");
         push_bool(&mut out, side.adaptive.auto_balancing_enabled);
@@ -1862,7 +2001,15 @@ pub extern "C" fn seds_router_set_local_network_datetime_nanos(
 
 enum SerializedSideMode {
     Normal,
-    SmallPackets { max_frame_bytes: usize },
+    SmallPackets {
+        max_frame_bytes: usize,
+    },
+    Profile {
+        profile: SideTransportProfile,
+        max_frame_bytes: usize,
+        compact_header_target_bytes: usize,
+        max_side_transport_templates: usize,
+    },
 }
 
 #[unsafe(no_mangle)]
@@ -1903,6 +2050,39 @@ pub extern "C" fn seds_router_add_side_serialized_small_packets(
         tx_user,
         reliable_enabled,
         SerializedSideMode::SmallPackets { max_frame_bytes },
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_add_side_serialized_profile(
+    r: *mut SedsRouter,
+    name: *const c_char,
+    name_len: usize,
+    tx: CTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    profile: u32,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> i32 {
+    let profile = match side_transport_profile_from_code(profile) {
+        Ok(profile) => profile,
+        Err(err) => return status_from_err(err),
+    };
+    seds_router_add_side_serialized_impl(
+        r,
+        name,
+        name_len,
+        tx,
+        tx_user,
+        reliable_enabled,
+        SerializedSideMode::Profile {
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        },
     )
 }
 
@@ -1950,17 +2130,35 @@ fn seds_router_add_side_serialized_impl(
         return status_from_err(TelemetryError::BadArg);
     };
 
-    let (header_template_enabled, max_frame_bytes) = match mode {
-        SerializedSideMode::Normal => (false, 0),
-        SerializedSideMode::SmallPackets { max_frame_bytes } => (true, max_frame_bytes),
-    };
-
-    let opts = RouterSideOptions {
-        reliable_enabled,
-        link_local_enabled: false,
-        header_template_enabled,
-        max_frame_bytes,
-        ..RouterSideOptions::default()
+    let opts = match mode {
+        SerializedSideMode::Normal => RouterSideOptions {
+            reliable_enabled,
+            link_local_enabled: false,
+            ..RouterSideOptions::default()
+        },
+        SerializedSideMode::SmallPackets { max_frame_bytes } => RouterSideOptions {
+            reliable_enabled,
+            link_local_enabled: false,
+            header_template_enabled: true,
+            max_frame_bytes,
+            ..RouterSideOptions::default()
+        },
+        SerializedSideMode::Profile {
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        } => {
+            let mut opts = router_side_options_for_profile(
+                reliable_enabled,
+                profile,
+                max_frame_bytes,
+                compact_header_target_bytes,
+                max_side_transport_templates,
+            );
+            opts.link_local_enabled = false;
+            opts
+        }
     };
 
     let side_id = router.add_side_serialized_with_options(side_name, tx_fn, opts);
@@ -3153,7 +3351,15 @@ pub extern "C" fn seds_relay_add_side_serialized(
     tx_user: *mut c_void,
     reliable_enabled: bool,
 ) -> i32 {
-    seds_relay_add_side_serialized_impl(r, name, name_len, tx, tx_user, reliable_enabled, 0)
+    seds_relay_add_side_serialized_impl(
+        r,
+        name,
+        name_len,
+        tx,
+        tx_user,
+        reliable_enabled,
+        SerializedSideMode::Normal,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -3173,7 +3379,40 @@ pub extern "C" fn seds_relay_add_side_serialized_small_packets(
         tx,
         tx_user,
         reliable_enabled,
-        max_frame_bytes,
+        SerializedSideMode::SmallPackets { max_frame_bytes },
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_add_side_serialized_profile(
+    r: *mut SedsRelay,
+    name: *const c_char,
+    name_len: usize,
+    tx: CTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    profile: u32,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> i32 {
+    let profile = match side_transport_profile_from_code(profile) {
+        Ok(profile) => profile,
+        Err(err) => return status_from_err(err),
+    };
+    seds_relay_add_side_serialized_impl(
+        r,
+        name,
+        name_len,
+        tx,
+        tx_user,
+        reliable_enabled,
+        SerializedSideMode::Profile {
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        },
     )
 }
 
@@ -3184,7 +3423,7 @@ fn seds_relay_add_side_serialized_impl(
     tx: CTransmit,
     tx_user: *mut c_void,
     reliable_enabled: bool,
-    max_frame_bytes: usize,
+    mode: SerializedSideMode,
 ) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -3221,11 +3460,35 @@ fn seds_relay_add_side_serialized_impl(
         return status_from_err(TelemetryError::BadArg);
     };
 
-    let opts = RelaySideOptions {
-        reliable_enabled,
-        link_local_enabled: false,
-        max_frame_bytes,
-        ..RelaySideOptions::default()
+    let opts = match mode {
+        SerializedSideMode::Normal => RelaySideOptions {
+            reliable_enabled,
+            link_local_enabled: false,
+            ..RelaySideOptions::default()
+        },
+        SerializedSideMode::SmallPackets { max_frame_bytes } => RelaySideOptions {
+            reliable_enabled,
+            link_local_enabled: false,
+            header_template_enabled: max_frame_bytes != 0,
+            max_frame_bytes,
+            ..RelaySideOptions::default()
+        },
+        SerializedSideMode::Profile {
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        } => {
+            let mut opts = relay_side_options_for_profile(
+                reliable_enabled,
+                profile,
+                max_frame_bytes,
+                compact_header_target_bytes,
+                max_side_transport_templates,
+            );
+            opts.link_local_enabled = false;
+            opts
+        }
     };
     let side_id: RelaySideId = relay.add_side_serialized_with_options(side_name, tx_fn, opts);
     side_id as i32
@@ -5155,6 +5418,55 @@ mod tests {
         assert!(side.get("relayed_rx_packets").unwrap().is_u64());
         assert!(side.get("tx_retries").unwrap().is_u64());
         assert!(side.get("data_types").unwrap().is_array());
+        assert!(side.get("header_template_enabled").unwrap().is_boolean());
+        assert!(side.get("max_frame_bytes").unwrap().is_u64());
+        assert!(side.get("compact_header_target_bytes").unwrap().is_u64());
+        assert!(side.get("side_transport_profile").unwrap().is_string());
+        assert!(side.get("max_side_transport_templates").unwrap().is_u64());
+        assert!(side.get("side_transport_full_frames").unwrap().is_u64());
+        assert!(side.get("side_transport_compact_frames").unwrap().is_u64());
+        assert!(
+            side.get("side_transport_compact_delta_frames")
+                .unwrap()
+                .is_u64()
+        );
+        assert!(
+            side.get("side_transport_compact_omitted_timestamp_frames")
+                .unwrap()
+                .is_u64()
+        );
+        assert!(side.get("side_transport_chunk_frames").unwrap().is_u64());
+        assert!(side.get("side_transport_raw_bytes").unwrap().is_u64());
+        assert!(side.get("side_transport_wire_bytes").unwrap().is_u64());
+        assert!(side.get("side_transport_bytes_saved").unwrap().is_u64());
+        let min_compact_overhead = side
+            .get("side_transport_min_compact_overhead_bytes")
+            .unwrap();
+        assert!(min_compact_overhead.is_u64() || min_compact_overhead.is_null());
+        let max_compact_overhead = side
+            .get("side_transport_max_compact_overhead_bytes")
+            .unwrap();
+        assert!(max_compact_overhead.is_u64() || max_compact_overhead.is_null());
+        assert!(
+            side.get("side_transport_compact_target_misses")
+                .unwrap()
+                .is_u64()
+        );
+        assert!(
+            side.get("side_transport_template_evictions")
+                .unwrap()
+                .is_u64()
+        );
+        assert!(
+            side.get("side_transport_tx_template_count")
+                .unwrap()
+                .is_u64()
+        );
+        assert!(
+            side.get("side_transport_rx_template_count")
+                .unwrap()
+                .is_u64()
+        );
 
         let adaptive = side.get("adaptive").unwrap();
         assert!(adaptive.get("auto_balancing_enabled").unwrap().is_boolean());
@@ -5417,13 +5729,13 @@ mod tests {
 
         assert_eq!(seds_router_announce_discovery(router), 0);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
 
         now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
         assert_eq!(seds_router_poll_discovery(router, &mut did_queue), 0);
         assert!(did_queue);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 6);
+        assert_eq!(hits.load(Ordering::SeqCst), 8);
 
         seds_router_free(router);
     }
@@ -5633,7 +5945,7 @@ mod tests {
 
         assert_eq!(seds_router_announce_discovery(router), 0);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
 
         seds_router_free(router);
     }
@@ -5851,7 +6163,7 @@ mod tests {
         assert!(side_id >= 0);
 
         assert_eq!(seds_router_periodic_no_timesync(router, 0), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
 
         seds_router_free(router);
     }
@@ -5959,7 +6271,7 @@ mod tests {
         assert_eq!(seds_relay_periodic(relay, 0), 0);
         let hits_after_learning = hits.load(Ordering::SeqCst);
         assert_eq!(seds_relay_periodic(relay, 0), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), hits_after_learning + 6);
+        assert_eq!(hits.load(Ordering::SeqCst), hits_after_learning + 8);
 
         seds_relay_free(relay);
     }
@@ -6008,6 +6320,77 @@ mod tests {
     }
 
     #[test]
+    fn router_c_abi_serialized_profile_sets_compact_side_options() {
+        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        assert!(!router.is_null());
+
+        let side_name = b"PROFILE_UPLINK";
+        let side_id = seds_router_add_side_serialized_profile(
+            router,
+            side_name.as_ptr() as *const c_char,
+            side_name.len(),
+            Some(serialized_ok_cb),
+            ptr::null_mut(),
+            false,
+            SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE,
+            0,
+            0,
+            2,
+        );
+        assert!(side_id >= 0);
+        assert_eq!(
+            seds_router_add_side_serialized_profile(
+                router,
+                side_name.as_ptr() as *const c_char,
+                side_name.len(),
+                Some(serialized_ok_cb),
+                ptr::null_mut(),
+                false,
+                99,
+                0,
+                0,
+                2,
+            ),
+            status_from_err(TelemetryError::BadArg)
+        );
+
+        let runtime: Value = serde_json::from_str(&export_router_json(
+            router,
+            seds_router_export_runtime_stats_len,
+            seds_router_export_runtime_stats,
+        ))
+        .unwrap();
+        let side = runtime
+            .get("sides")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|side| side.get("side_name").and_then(Value::as_str) == Some("PROFILE_UPLINK"))
+            .unwrap();
+        assert_eq!(
+            side.get("side_transport_profile").and_then(Value::as_str),
+            Some("ipv4_like")
+        );
+        assert_eq!(
+            side.get("compact_header_target_bytes")
+                .and_then(Value::as_u64),
+            Some(crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES as u64)
+        );
+        assert_eq!(
+            side.get("max_side_transport_templates")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            side.get("header_template_enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        seds_router_free(router);
+    }
+
+    #[test]
     fn relay_c_abi_runtime_stats_json_has_expected_schema() {
         let relay = seds_relay_new(None, ptr::null_mut());
         assert!(!relay.is_null());
@@ -6047,6 +6430,77 @@ mod tests {
         ))
         .unwrap();
         assert_runtime_json_shape(&runtime, "UPLINK");
+
+        seds_relay_free(relay);
+    }
+
+    #[test]
+    fn relay_c_abi_serialized_profile_sets_compact_side_options() {
+        let relay = seds_relay_new(None, ptr::null_mut());
+        assert!(!relay.is_null());
+
+        let side_name = b"PROFILE_UPLINK";
+        let side_id = seds_relay_add_side_serialized_profile(
+            relay,
+            side_name.as_ptr() as *const c_char,
+            side_name.len(),
+            Some(serialized_ok_cb),
+            ptr::null_mut(),
+            false,
+            SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE,
+            0,
+            0,
+            3,
+        );
+        assert!(side_id >= 0);
+        assert_eq!(
+            seds_relay_add_side_serialized_profile(
+                relay,
+                side_name.as_ptr() as *const c_char,
+                side_name.len(),
+                Some(serialized_ok_cb),
+                ptr::null_mut(),
+                false,
+                99,
+                0,
+                0,
+                3,
+            ),
+            status_from_err(TelemetryError::BadArg)
+        );
+
+        let runtime: Value = serde_json::from_str(&export_relay_json(
+            relay,
+            seds_relay_export_runtime_stats_len,
+            seds_relay_export_runtime_stats,
+        ))
+        .unwrap();
+        let side = runtime
+            .get("sides")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|side| side.get("side_name").and_then(Value::as_str) == Some("PROFILE_UPLINK"))
+            .unwrap();
+        assert_eq!(
+            side.get("side_transport_profile").and_then(Value::as_str),
+            Some("ipv4_like")
+        );
+        assert_eq!(
+            side.get("compact_header_target_bytes")
+                .and_then(Value::as_u64),
+            Some(crate::relay::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES as u64)
+        );
+        assert_eq!(
+            side.get("max_side_transport_templates")
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            side.get("header_template_enabled").and_then(Value::as_bool),
+            Some(true)
+        );
 
         seds_relay_free(relay);
     }

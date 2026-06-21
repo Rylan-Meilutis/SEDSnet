@@ -201,6 +201,7 @@ impl DataType {
     pub const MANAGED_VARIABLE_REQUEST: Self = Self(13);
     pub const MANAGED_VARIABLE_VALUE: Self = Self(14);
     pub const DISCOVERY_LEAVE: Self = Self(15);
+    pub const DISCOVERY_LINK_CAPABILITIES: Self = Self(16);
 
     #[allow(non_upper_case_globals)]
     pub const TelemetryError: Self = Self::TELEMETRY_ERROR;
@@ -234,6 +235,8 @@ impl DataType {
     pub const ManagedVariableValue: Self = Self::MANAGED_VARIABLE_VALUE;
     #[allow(non_upper_case_globals)]
     pub const DiscoveryLeave: Self = Self::DISCOVERY_LEAVE;
+    #[allow(non_upper_case_globals)]
+    pub const DiscoveryLinkCapabilities: Self = Self::DISCOVERY_LINK_CAPABILITIES;
 
     #[inline]
     pub const fn as_u32(self) -> u32 {
@@ -279,6 +282,7 @@ impl core::fmt::Debug for DataType {
             Self::ManagedVariableRequest => "SedsnetManagedVariableRequest",
             Self::ManagedVariableValue => "SedsnetManagedVariableValue",
             Self::DiscoveryLeave => "SedsnetDiscoveryLeave",
+            Self::DiscoveryLinkCapabilities => "SedsnetDiscoveryLinkCapabilities",
             _ => {
                 let meta = get_message_meta(*self);
                 if meta.name != "UNKNOWN_TYPE" {
@@ -588,6 +592,17 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::Ordered,
             priority: 244,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        })
+        .expect("built-in type");
+        reg.register_type_definition(DataTypeDefinition {
+            id: DataType::DiscoveryLinkCapabilities,
+            name: "SEDSNET_DISCOVERY_LINK_CAPABILITIES",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            reliable: ReliableMode::None,
+            priority: 240,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
@@ -1537,6 +1552,7 @@ fn is_internal_data_type(ty: DataType) -> bool {
             | DataType::ManagedVariableRequest
             | DataType::ManagedVariableValue
             | DataType::DiscoveryLeave
+            | DataType::DiscoveryLinkCapabilities
     )
 }
 
@@ -2050,6 +2066,16 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 244,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        },
+        DataTypeDefinition {
+            id: DataType::DiscoveryLinkCapabilities,
+            name: "SEDSNET_DISCOVERY_LINK_CAPABILITIES",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: &[DataEndpoint::Discovery],
+            reliable: ReliableMode::None,
+            priority: 240,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
     ];

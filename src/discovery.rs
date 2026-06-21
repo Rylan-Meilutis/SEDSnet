@@ -123,6 +123,28 @@ pub struct ClientStatsSnapshot {
     pub bytes_received: u64,
 }
 
+pub const LINK_CAPABILITY_HEADER_TEMPLATES: u32 = 0x0000_0001;
+pub const LINK_CAPABILITY_CHUNKING: u32 = 0x0000_0002;
+pub const LINK_CAPABILITY_RELIABILITY: u32 = 0x0000_0004;
+pub const LINK_CAPABILITY_CRYPTO: u32 = 0x0000_0008;
+pub const LINK_CAPABILITY_END_TO_END_RELIABILITY: u32 = 0x0000_0010;
+pub const LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS: u32 = 0x0000_0020;
+
+pub const LINK_PROFILE_CANONICAL: u8 = 0;
+pub const LINK_PROFILE_TEMPLATE: u8 = 1;
+pub const LINK_PROFILE_IPV6_LIKE: u8 = 2;
+pub const LINK_PROFILE_IPV4_LIKE: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkCapabilities {
+    pub version: u8,
+    pub flags: u32,
+    pub profile: u8,
+    pub max_frame_bytes: u32,
+    pub compact_header_target_bytes: u32,
+    pub max_side_transport_templates: u32,
+}
+
 #[inline]
 pub const fn is_router_control_endpoint(ep: DataEndpoint) -> bool {
     matches!(
@@ -151,6 +173,7 @@ pub const fn is_discovery_type(ty: DataType) -> bool {
             | DataType::ManagedVariableRequest
             | DataType::ManagedVariableValue
             | DataType::DiscoveryLeave
+            | DataType::DiscoveryLinkCapabilities
     )
 }
 
@@ -355,6 +378,51 @@ pub fn build_discovery_leave(sender: &str, timestamp_ms: u64) -> TelemetryResult
         timestamp_ms,
         Vec::<u8>::new().into(),
     )
+}
+
+pub fn build_discovery_link_capabilities(
+    sender: &str,
+    timestamp_ms: u64,
+    capabilities: LinkCapabilities,
+) -> TelemetryResult<Packet> {
+    let mut payload = Vec::with_capacity(18);
+    payload.push(capabilities.version);
+    payload.extend_from_slice(&capabilities.flags.to_le_bytes());
+    payload.push(capabilities.profile);
+    payload.extend_from_slice(&capabilities.max_frame_bytes.to_le_bytes());
+    payload.extend_from_slice(&capabilities.compact_header_target_bytes.to_le_bytes());
+    payload.extend_from_slice(&capabilities.max_side_transport_templates.to_le_bytes());
+    Packet::new(
+        DataType::DiscoveryLinkCapabilities,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        payload.into(),
+    )
+}
+
+pub fn decode_discovery_link_capabilities(pkt: &Packet) -> TelemetryResult<LinkCapabilities> {
+    if pkt.data_type() != DataType::DiscoveryLinkCapabilities {
+        return Err(TelemetryError::InvalidType);
+    }
+    let payload = pkt.payload();
+    if payload.len() != 18 {
+        return Err(TelemetryError::Deserialize(
+            "discovery link capabilities width",
+        ));
+    }
+    Ok(LinkCapabilities {
+        version: payload[0],
+        flags: u32::from_le_bytes(payload[1..5].try_into().expect("4-byte flags")),
+        profile: payload[5],
+        max_frame_bytes: u32::from_le_bytes(payload[6..10].try_into().expect("4-byte max frame")),
+        compact_header_target_bytes: u32::from_le_bytes(
+            payload[10..14].try_into().expect("4-byte target"),
+        ),
+        max_side_transport_templates: u32::from_le_bytes(
+            payload[14..18].try_into().expect("4-byte templates"),
+        ),
+    })
 }
 
 pub fn build_managed_variable_request(

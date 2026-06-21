@@ -20,7 +20,7 @@ use crate::queue::{BoundedDeque, ByteCost};
 use crate::serialize;
 use crate::{is_reliable_type, message_meta, message_priority, reliable_mode};
 use crate::{
-    router::Clock,
+    router::{Clock, CompactTimestampOmissionPolicy, SideTransportProfile},
     {
         RouteSelectionMode, TelemetryError, TelemetryResult,
         lock::{ReentryGate, ReentryGuard, RouterMutex},
@@ -40,6 +40,8 @@ const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
 const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
 const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
 const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
+const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
+const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
 const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
 const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
 const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
@@ -48,6 +50,12 @@ const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + serialize::CRC32_BYTES;
 const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
 const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
+pub const IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES: usize =
+    crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES;
+pub const IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES: usize =
+    crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+pub const DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT: usize =
+    crate::router::DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT;
 /// Packet Handler function type
 type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
@@ -75,6 +83,8 @@ pub struct RelaySideOptions {
     pub ingress_enabled: bool,
     /// Allows the relay to transmit packets toward this side.
     pub egress_enabled: bool,
+    /// Enables side-local header-template reuse for serialized transport.
+    pub header_template_enabled: bool,
     /// Maximum number of bytes to emit per serialized TX callback.
     ///
     /// When non-zero and a serialized frame would exceed this size, the relay
@@ -82,6 +92,16 @@ pub struct RelaySideOptions {
     /// before normal relay processing. This is intended for fixed-size links
     /// such as CAN or I2C while keeping the user API packet-oriented.
     pub max_frame_bytes: usize,
+    /// Target total side-transport overhead for compact follow-up frames.
+    pub compact_header_target_bytes: usize,
+    /// Maximum side-local header templates retained for TX and RX dictionaries.
+    pub max_side_transport_templates: usize,
+    /// Omits the timestamp field from compact follow-up frames when it is unchanged.
+    pub omit_unchanged_compact_timestamps: bool,
+    /// Optional per-data-type timestamp omission policy for compact follow-up frames.
+    pub compact_timestamp_omission_types: CompactTimestampOmissionPolicy,
+    /// Declared compact-link profile for stats and future negotiation.
+    pub side_transport_profile: SideTransportProfile,
 }
 
 impl Default for RelaySideOptions {
@@ -91,7 +111,13 @@ impl Default for RelaySideOptions {
             link_local_enabled: false,
             ingress_enabled: true,
             egress_enabled: true,
+            header_template_enabled: false,
             max_frame_bytes: 0,
+            compact_header_target_bytes: 0,
+            max_side_transport_templates: DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT,
+            omit_unchanged_compact_timestamps: false,
+            compact_timestamp_omission_types: CompactTimestampOmissionPolicy::none(),
+            side_transport_profile: SideTransportProfile::Canonical,
         }
     }
 }
@@ -103,8 +129,97 @@ impl RelaySideOptions {
     /// than zero enable relay-managed chunking/reassembly on this side.
     #[inline]
     pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
+        self.header_template_enabled = true;
         self.max_frame_bytes = max_frame_bytes;
+        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.side_transport_profile = SideTransportProfile::Ipv6Like;
         self
+    }
+
+    #[inline]
+    pub fn with_ipv4_like_compact_header_target(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.compact_header_target_bytes = IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.omit_unchanged_compact_timestamps = true;
+        self.side_transport_profile = SideTransportProfile::Ipv4Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_ipv6_like_compact_header_target(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_template_transport(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.side_transport_profile = SideTransportProfile::Template;
+        self
+    }
+
+    #[inline]
+    pub fn with_omitted_unchanged_compact_timestamps(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.omit_unchanged_compact_timestamps = true;
+        self
+    }
+
+    #[inline]
+    pub fn with_omitted_unchanged_compact_timestamps_for_type(
+        mut self,
+        ty: crate::DataType,
+    ) -> Self {
+        self.header_template_enabled = true;
+        self.compact_timestamp_omission_types.insert(ty);
+        self
+    }
+
+    #[inline]
+    pub fn effective_transport_profile(self) -> SideTransportProfile {
+        if !self.header_template_enabled && self.max_frame_bytes == 0 {
+            SideTransportProfile::Canonical
+        } else if self.side_transport_profile == SideTransportProfile::Canonical {
+            SideTransportProfile::Template
+        } else {
+            self.side_transport_profile
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    #[inline]
+    pub fn link_capabilities(self) -> discovery::LinkCapabilities {
+        let mut flags = discovery::LINK_CAPABILITY_END_TO_END_RELIABILITY;
+        if self.header_template_enabled {
+            flags |= discovery::LINK_CAPABILITY_HEADER_TEMPLATES;
+        }
+        if self.max_frame_bytes != 0 {
+            flags |= discovery::LINK_CAPABILITY_CHUNKING;
+        }
+        if self.reliable_enabled {
+            flags |= discovery::LINK_CAPABILITY_RELIABILITY;
+        }
+        if self.omit_unchanged_compact_timestamps
+            || !self.compact_timestamp_omission_types.is_empty()
+        {
+            flags |= discovery::LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS;
+        }
+        #[cfg(feature = "cryptography")]
+        {
+            flags |= discovery::LINK_CAPABILITY_CRYPTO;
+        }
+        discovery::LinkCapabilities {
+            version: 1,
+            flags,
+            profile: self.effective_transport_profile().discovery_code(),
+            max_frame_bytes: self.max_frame_bytes.min(u32::MAX as usize) as u32,
+            compact_header_target_bytes: self.compact_header_target_bytes.min(u32::MAX as usize)
+                as u32,
+            max_side_transport_templates: self.max_side_transport_templates.min(u32::MAX as usize)
+                as u32,
+        }
     }
 }
 
@@ -257,11 +372,73 @@ struct SideChunkAssembly {
 struct SideTransportState {
     tx_template_ids: BTreeMap<u64, u32>,
     tx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    tx_last_timestamps: BTreeMap<u32, u64>,
     rx_templates: BTreeMap<u64, SideHeaderTemplate>,
     rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
+    rx_last_timestamps: BTreeMap<u32, u64>,
     rx_chunks: BTreeMap<u32, SideChunkAssembly>,
     next_chunk_id: u32,
     next_template_id: u32,
+}
+
+impl SideTransportState {
+    fn tx_template_count(&self) -> usize {
+        self.tx_template_ids.len()
+    }
+
+    fn rx_template_count(&self) -> usize {
+        self.rx_templates_by_id.len()
+    }
+
+    fn insert_tx_template(
+        &mut self,
+        template: SideHeaderTemplate,
+        template_id: u32,
+        max_templates: usize,
+    ) -> bool {
+        if max_templates == 0 {
+            return false;
+        }
+        let mut evicted = false;
+        if self.tx_template_ids.len() >= max_templates
+            && !self.tx_template_ids.contains_key(&template.hash)
+            && let Some(old_hash) = self.tx_template_ids.keys().next().copied()
+        {
+            if let Some(old_id) = self.tx_template_ids.remove(&old_hash) {
+                self.tx_last_timestamps.remove(&old_id);
+            }
+            self.tx_templates.remove(&old_hash);
+            evicted = true;
+        }
+        self.tx_template_ids.insert(template.hash, template_id);
+        self.tx_templates.insert(template.hash, template);
+        evicted
+    }
+
+    fn insert_rx_template(
+        &mut self,
+        template_id: u32,
+        template: SideHeaderTemplate,
+        max_templates: usize,
+    ) -> bool {
+        if max_templates == 0 {
+            return false;
+        }
+        let mut evicted = false;
+        if self.rx_templates_by_id.len() >= max_templates
+            && !self.rx_templates_by_id.contains_key(&template_id)
+            && let Some(old_id) = self.rx_templates_by_id.keys().next().copied()
+            && let Some(old_template) = self.rx_templates_by_id.remove(&old_id)
+        {
+            self.rx_templates.remove(&old_template.hash);
+            self.rx_last_timestamps.remove(&old_id);
+            evicted = true;
+        }
+        self.rx_templates_by_id
+            .insert(template_id, template.clone());
+        self.rx_templates.insert(template.hash, template);
+        evicted
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +452,7 @@ struct SideHeaderTemplate {
 
 type SideTemplateExtract<'a> = (
     SideHeaderTemplate,
+    crate::DataType,
     u8,
     u64,
     u64,
@@ -282,6 +460,13 @@ type SideTemplateExtract<'a> = (
     Option<(u32, u32)>,
     &'a [u8],
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SideCompactTimestampMode {
+    Absolute,
+    Delta,
+    Omitted,
+}
 
 #[derive(Debug, Clone, Default)]
 struct AdaptiveRouteStats {
@@ -416,6 +601,18 @@ struct SideRuntimeStatsInner {
     tx_retries: u64,
     tx_handler_failures: u64,
     total_handler_retries: u64,
+    side_transport_full_frames: u64,
+    side_transport_compact_frames: u64,
+    side_transport_compact_delta_frames: u64,
+    side_transport_compact_omitted_timestamp_frames: u64,
+    side_transport_chunk_frames: u64,
+    side_transport_raw_bytes: u64,
+    side_transport_wire_bytes: u64,
+    side_transport_bytes_saved: u64,
+    side_transport_min_compact_overhead_bytes: Option<usize>,
+    side_transport_max_compact_overhead_bytes: Option<usize>,
+    side_transport_compact_target_misses: u64,
+    side_transport_template_evictions: u64,
     data_types: BTreeMap<u32, TypeRuntimeStatsInner>,
 }
 
@@ -458,6 +655,70 @@ impl SideRuntimeStatsInner {
         let stats = self.type_stats_mut(ty);
         stats.handler_failures = stats.handler_failures.saturating_add(1);
         stats.tx_retries = stats.tx_retries.saturating_add(retries as u64);
+    }
+
+    fn note_side_transport_full(&mut self, raw_bytes: usize, wire_bytes: usize) {
+        self.side_transport_full_frames = self.side_transport_full_frames.saturating_add(1);
+        self.note_side_transport_bytes(raw_bytes, wire_bytes);
+    }
+
+    fn note_side_transport_compact(
+        &mut self,
+        raw_bytes: usize,
+        wire_bytes: usize,
+        compact_overhead_bytes: usize,
+        used_timestamp_delta: bool,
+        omitted_timestamp: bool,
+    ) {
+        self.side_transport_compact_frames = self.side_transport_compact_frames.saturating_add(1);
+        if used_timestamp_delta {
+            self.side_transport_compact_delta_frames =
+                self.side_transport_compact_delta_frames.saturating_add(1);
+        }
+        if omitted_timestamp {
+            self.side_transport_compact_omitted_timestamp_frames = self
+                .side_transport_compact_omitted_timestamp_frames
+                .saturating_add(1);
+        }
+        self.note_side_transport_bytes(raw_bytes, wire_bytes);
+        self.side_transport_min_compact_overhead_bytes = Some(
+            self.side_transport_min_compact_overhead_bytes
+                .map_or(compact_overhead_bytes, |v| v.min(compact_overhead_bytes)),
+        );
+        self.side_transport_max_compact_overhead_bytes = Some(
+            self.side_transport_max_compact_overhead_bytes
+                .map_or(compact_overhead_bytes, |v| v.max(compact_overhead_bytes)),
+        );
+    }
+
+    fn note_side_transport_chunks(&mut self, chunks: usize) {
+        self.side_transport_chunk_frames = self
+            .side_transport_chunk_frames
+            .saturating_add(chunks as u64);
+    }
+
+    fn note_side_transport_bytes(&mut self, raw_bytes: usize, wire_bytes: usize) {
+        self.side_transport_raw_bytes = self
+            .side_transport_raw_bytes
+            .saturating_add(raw_bytes as u64);
+        self.side_transport_wire_bytes = self
+            .side_transport_wire_bytes
+            .saturating_add(wire_bytes as u64);
+        if raw_bytes > wire_bytes {
+            self.side_transport_bytes_saved = self
+                .side_transport_bytes_saved
+                .saturating_add((raw_bytes - wire_bytes) as u64);
+        }
+    }
+
+    fn note_side_transport_compact_target_miss(&mut self) {
+        self.side_transport_compact_target_misses =
+            self.side_transport_compact_target_misses.saturating_add(1);
+    }
+
+    fn note_side_transport_template_eviction(&mut self) {
+        self.side_transport_template_evictions =
+            self.side_transport_template_evictions.saturating_add(1);
     }
 }
 
@@ -2456,11 +2717,11 @@ impl Relay {
                 .enumerate()
                 .filter_map(|(side_id, side)| {
                     side.as_ref()
-                        .map(|side| (side_id, side.opts.link_local_enabled))
+                        .map(|side| (side_id, side.opts.link_local_enabled, side.opts))
                 })
                 .collect::<Vec<_>>();
             let mut per_side = Vec::new();
-            for (side_id, link_local_enabled) in side_entries {
+            for (side_id, link_local_enabled, opts) in side_entries {
                 if !self.route_allowed_locked(
                     &st,
                     None,
@@ -2473,8 +2734,16 @@ impl Relay {
                 else {
                     continue;
                 };
+                let capabilities = opts.link_capabilities();
                 if level == DiscoveryAdvertiseLevel::MinimalPing {
-                    per_side.push((side_id, level, Vec::new(), Vec::new(), Vec::new()));
+                    per_side.push((
+                        side_id,
+                        level,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        capabilities,
+                    ));
                     continue;
                 }
                 let endpoints = self.advertised_discovery_endpoints_for_link_locked(
@@ -2489,15 +2758,37 @@ impl Relay {
                     now_ms,
                     link_local_enabled,
                 );
-                per_side.push((side_id, level, endpoints, timesync_sources, topology));
+                per_side.push((
+                    side_id,
+                    level,
+                    endpoints,
+                    timesync_sources,
+                    topology,
+                    capabilities,
+                ));
             }
             per_side
         };
         let mut st = self.state.lock();
-        for (dst, level, endpoints, timesync_sources, topology) in per_side {
+        for (dst, level, endpoints, timesync_sources, topology, capabilities) in per_side {
             let sender = self.sender_arc();
             if level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
+                let data = RelayItem::Packet(Arc::new(pkt));
+                let priority = Self::relay_item_priority(&data)?;
+                st.push_tx(RelayTxItem {
+                    src: None,
+                    dst,
+                    data,
+                    priority,
+                })?;
+            }
+            if level == DiscoveryAdvertiseLevel::Full {
+                let pkt = discovery::build_discovery_link_capabilities(
+                    sender.as_ref(),
+                    now_ms,
+                    capabilities,
+                )?;
                 let data = RelayItem::Packet(Arc::new(pkt));
                 let priority = Self::relay_item_priority(&data)?;
                 st.push_tx(RelayTxItem {
@@ -2628,6 +2919,10 @@ impl Relay {
                 st.fit_discovery_budget();
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
+            return Ok(());
+        }
+        if pkt.data_type() == crate::DataType::DiscoveryLinkCapabilities {
+            let _ = discovery::decode_discovery_link_capabilities(&pkt)?;
             return Ok(());
         }
         let mut st = self.state.lock();
@@ -3391,6 +3686,11 @@ impl Relay {
                 .cloned()
                 .unwrap_or_default()
                 .snapshot(now_ms, true);
+            let (tx_template_count, rx_template_count) = st
+                .side_transport
+                .get(&side_id)
+                .map(|state| (state.tx_template_count(), state.rx_template_count()))
+                .unwrap_or((0, 0));
             let mut data_types: Vec<RuntimeTypeStats> = stats
                 .data_types
                 .into_iter()
@@ -3414,6 +3714,10 @@ impl Relay {
                 side_name: side.name,
                 reliable_enabled: side.opts.reliable_enabled,
                 link_local_enabled: side.opts.link_local_enabled,
+                header_template_enabled: side.opts.header_template_enabled,
+                max_frame_bytes: side.opts.max_frame_bytes,
+                compact_header_target_bytes: side.opts.compact_header_target_bytes,
+                side_transport_profile: side.opts.effective_transport_profile().as_str(),
                 ingress_enabled: side.opts.ingress_enabled,
                 egress_enabled: side.opts.egress_enabled,
                 tx_packets: stats.tx_packets,
@@ -3429,6 +3733,24 @@ impl Relay {
                 tx_handler_failures: stats.tx_handler_failures,
                 local_handler_failures: 0,
                 total_handler_retries: stats.total_handler_retries,
+                side_transport_full_frames: stats.side_transport_full_frames,
+                side_transport_compact_frames: stats.side_transport_compact_frames,
+                side_transport_compact_delta_frames: stats.side_transport_compact_delta_frames,
+                side_transport_compact_omitted_timestamp_frames: stats
+                    .side_transport_compact_omitted_timestamp_frames,
+                side_transport_chunk_frames: stats.side_transport_chunk_frames,
+                side_transport_raw_bytes: stats.side_transport_raw_bytes,
+                side_transport_wire_bytes: stats.side_transport_wire_bytes,
+                side_transport_bytes_saved: stats.side_transport_bytes_saved,
+                side_transport_min_compact_overhead_bytes: stats
+                    .side_transport_min_compact_overhead_bytes,
+                side_transport_max_compact_overhead_bytes: stats
+                    .side_transport_max_compact_overhead_bytes,
+                side_transport_compact_target_misses: stats.side_transport_compact_target_misses,
+                side_transport_template_evictions: stats.side_transport_template_evictions,
+                side_transport_tx_template_count: tx_template_count,
+                side_transport_rx_template_count: rx_template_count,
+                max_side_transport_templates: side.opts.max_side_transport_templates,
                 adaptive,
                 data_types,
             });
@@ -4036,6 +4358,15 @@ impl Relay {
         }
     }
 
+    fn uleb128_len_local(mut value: u64) -> usize {
+        let mut len = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
     fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
         if bytes.len() < serialize::CRC32_BYTES + 4 {
             return Err(TelemetryError::Deserialize("short buffer"));
@@ -4048,7 +4379,13 @@ impl Relay {
             .ok_or(TelemetryError::Deserialize("short prelude"))?;
         off += 1;
         off += 1; // NEP
-        let _ty = Self::read_uleb128_local(data, &mut off)?;
+        let ty_u64 = Self::read_uleb128_local(data, &mut off)?;
+        let ty_u32 =
+            u32::try_from(ty_u64).map_err(|_| TelemetryError::Deserialize("bad data type"))?;
+        if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
+            return Err(TelemetryError::Deserialize("bad data type"));
+        }
+        let ty = crate::DataType(ty_u32);
         let data_size_off = off;
         let data_size = Self::read_uleb128_local(data, &mut off)?;
         let timestamp = Self::read_uleb128_local(data, &mut off)?;
@@ -4129,6 +4466,7 @@ impl Relay {
         };
         Ok((
             template,
+            ty,
             flags,
             data_size,
             timestamp,
@@ -4141,7 +4479,9 @@ impl Relay {
     fn reconstruct_side_compact_frame(
         template: &SideHeaderTemplate,
         body: &[u8],
-    ) -> TelemetryResult<Arc<[u8]>> {
+        timestamp_mode: SideCompactTimestampMode,
+        timestamp_base: Option<u64>,
+    ) -> TelemetryResult<(Arc<[u8]>, u64)> {
         if body.is_empty() {
             return Err(TelemetryError::Deserialize("short side compact frame"));
         }
@@ -4154,7 +4494,22 @@ impl Relay {
             return Err(TelemetryError::Deserialize("side compact flags mismatch"));
         }
         let data_size = Self::read_uleb128_local(body, &mut off)?;
-        let timestamp = Self::read_uleb128_local(body, &mut off)?;
+        let timestamp = match timestamp_mode {
+            SideCompactTimestampMode::Absolute => Self::read_uleb128_local(body, &mut off)?,
+            SideCompactTimestampMode::Delta => {
+                let timestamp_field = Self::read_uleb128_local(body, &mut off)?;
+                let base = timestamp_base.ok_or(TelemetryError::Deserialize(
+                    "missing side compact timestamp context",
+                ))?;
+                base.checked_add(timestamp_field)
+                    .ok_or(TelemetryError::Deserialize(
+                        "side compact timestamp delta overflow",
+                    ))?
+            }
+            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(
+                TelemetryError::Deserialize("missing side compact timestamp context"),
+            )?,
+        };
         let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
             Some(Self::read_uleb128_local(body, &mut off)?)
         } else {
@@ -4194,7 +4549,7 @@ impl Relay {
         raw.extend_from_slice(payload);
         let crc = Self::crc32_bytes(&raw);
         raw.extend_from_slice(&crc.to_le_bytes());
-        Ok(Arc::from(raw))
+        Ok((Arc::from(raw), timestamp))
     }
 
     fn split_side_transport_frame(
@@ -4240,33 +4595,73 @@ impl Relay {
         opts: RelaySideOptions,
         raw: Arc<[u8]>,
     ) -> TelemetryResult<Vec<Arc<[u8]>>> {
-        if opts.max_frame_bytes == 0 {
+        if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
             return Ok(vec![raw]);
         }
-        let (template, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+        let raw_len = raw.len();
+        let mut compact_payload_len = None;
+        let mut used_compact = false;
+        let mut used_timestamp_delta = false;
+        let mut omitted_timestamp = false;
+        let (template, ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
             Self::extract_side_header_template(raw.as_ref())?;
-        let (template_id, use_compact) = {
+        let (template_id, use_compact, previous_timestamp) = {
             let mut st = self.state.lock();
             let side_state = st
                 .side_transport
                 .get_mut(&side)
                 .ok_or(TelemetryError::BadArg)?;
             if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
-                (id, true)
+                let previous = side_state.tx_last_timestamps.get(&id).copied();
+                (id, true, previous)
             } else {
                 let next = side_state.next_template_id.wrapping_add(1).max(1);
                 side_state.next_template_id = next;
-                side_state.tx_template_ids.insert(template.hash, next);
-                side_state.tx_templates.insert(template.hash, template);
-                (next, false)
+                let evicted = side_state.insert_tx_template(
+                    template,
+                    next,
+                    opts.max_side_transport_templates,
+                );
+                if evicted {
+                    st.side_runtime_stats
+                        .entry(side)
+                        .or_default()
+                        .note_side_transport_template_eviction();
+                }
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.tx_last_timestamps.insert(next, timestamp);
+                }
+                (next, false, None)
             }
         };
         let wrapped = if use_compact {
+            used_compact = true;
+            compact_payload_len = Some(payload.len());
+            let timestamp_field = if let Some(previous) = previous_timestamp {
+                let delta = timestamp.saturating_sub(previous);
+                let omit_timestamp = opts.omit_unchanged_compact_timestamps
+                    || opts.compact_timestamp_omission_types.contains(ty);
+                if omit_timestamp && timestamp == previous {
+                    omitted_timestamp = true;
+                    None
+                } else if timestamp >= previous
+                    && Self::uleb128_len_local(delta) < Self::uleb128_len_local(timestamp)
+                {
+                    used_timestamp_delta = true;
+                    Some(delta)
+                } else {
+                    Some(timestamp)
+                }
+            } else {
+                Some(timestamp)
+            };
             let mut body = Vec::with_capacity(payload.len() + 32);
             body.push(flags);
             Self::write_uleb128_local(u64::from(template_id), &mut body);
             Self::write_uleb128_local(data_size, &mut body);
-            Self::write_uleb128_local(timestamp, &mut body);
+            if let Some(timestamp_field) = timestamp_field {
+                Self::write_uleb128_local(timestamp_field, &mut body);
+            }
             if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
                 Self::write_uleb128_local(u64::from(nonce), &mut body);
             }
@@ -4275,18 +4670,56 @@ impl Relay {
                 body.extend_from_slice(&ack.to_le_bytes());
             }
             body.extend_from_slice(payload);
-            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body)
+            {
+                let mut st = self.state.lock();
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.tx_last_timestamps.insert(template_id, timestamp);
+                }
+            }
+            let kind = if omitted_timestamp {
+                SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+            } else if used_timestamp_delta {
+                SIDE_TRANSPORT_KIND_COMPACT_DELTA
+            } else {
+                SIDE_TRANSPORT_KIND_COMPACT
+            };
+            Self::wrap_side_transport_frame(kind, &body)
         } else {
             let mut body = Vec::with_capacity(raw.len() + 4);
             Self::write_uleb128_local(u64::from(template_id), &mut body);
             body.extend_from_slice(raw.as_ref());
             Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
         };
-        if wrapped.len() > opts.max_frame_bytes {
+        let frames = if opts.max_frame_bytes != 0 && wrapped.len() > opts.max_frame_bytes {
             self.split_side_transport_frame(side, wrapped, opts.max_frame_bytes)
         } else {
             Ok(vec![wrapped])
+        }?;
+        let wire_len = frames.iter().map(|frame| frame.len()).sum::<usize>();
+        let mut st = self.state.lock();
+        let stats = st.side_runtime_stats.entry(side).or_default();
+        if used_compact {
+            let overhead = compact_payload_len
+                .map(|payload_len| wire_len.saturating_sub(payload_len))
+                .unwrap_or(wire_len);
+            stats.note_side_transport_compact(
+                raw_len,
+                wire_len,
+                overhead,
+                used_timestamp_delta,
+                omitted_timestamp,
+            );
+            if opts.compact_header_target_bytes != 0 && overhead > opts.compact_header_target_bytes
+            {
+                stats.note_side_transport_compact_target_miss();
+            }
+        } else {
+            stats.note_side_transport_full(raw_len, wire_len);
         }
+        if frames.len() > 1 {
+            stats.note_side_transport_chunks(frames.len());
+        }
+        Ok(frames)
     }
 
     fn decode_side_transport_frame(
@@ -4303,18 +4736,34 @@ impl Relay {
                 let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
                     .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
                 let raw = Arc::<[u8]>::from(&body[off..]);
-                if let Ok((template, ..)) = Self::extract_side_header_template(raw.as_ref()) {
+                if let Ok((template, _, _, _, timestamp, _, _, _)) =
+                    Self::extract_side_header_template(raw.as_ref())
+                {
                     let mut st = self.state.lock();
-                    if let Some(side_state) = st.side_transport.get_mut(&side) {
-                        side_state
-                            .rx_templates_by_id
-                            .insert(template_id, template.clone());
-                        side_state.rx_templates.insert(template.hash, template);
+                    let max_templates = st
+                        .sides
+                        .get(side)
+                        .and_then(|side| side.as_ref())
+                        .map(|side| side.opts.max_side_transport_templates)
+                        .unwrap_or(DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT);
+                    let evicted = st.side_transport.get_mut(&side).is_some_and(|side_state| {
+                        let evicted =
+                            side_state.insert_rx_template(template_id, template, max_templates);
+                        side_state.rx_last_timestamps.insert(template_id, timestamp);
+                        evicted
+                    });
+                    if evicted {
+                        st.side_runtime_stats
+                            .entry(side)
+                            .or_default()
+                            .note_side_transport_template_eviction();
                     }
                 }
                 Ok(Some(raw))
             }
-            SIDE_TRANSPORT_KIND_COMPACT => {
+            SIDE_TRANSPORT_KIND_COMPACT
+            | SIDE_TRANSPORT_KIND_COMPACT_DELTA
+            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
                 if body.is_empty() {
                     return Err(TelemetryError::Deserialize("short side compact frame"));
                 }
@@ -4324,15 +4773,43 @@ impl Relay {
                 let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
                 compact_body.push(body[0]);
                 compact_body.extend_from_slice(&body[off..]);
-                let template = {
+                let (template, timestamp_base) = {
                     let st = self.state.lock();
-                    st.side_transport
-                        .get(&side)
+                    let state = st.side_transport.get(&side);
+                    let template = state
                         .and_then(|state| state.rx_templates_by_id.get(&template_id))
-                        .cloned()
+                        .cloned();
+                    let timestamp_base = if matches!(
+                        kind,
+                        SIDE_TRANSPORT_KIND_COMPACT_DELTA
+                            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+                    ) {
+                        state
+                            .and_then(|state| state.rx_last_timestamps.get(&template_id))
+                            .copied()
+                    } else {
+                        None
+                    };
+                    (template, timestamp_base)
+                };
+                let template =
+                    template.ok_or(TelemetryError::Deserialize("unknown side compact template"))?;
+                let timestamp_mode = match kind {
+                    SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
+                    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
+                    _ => SideCompactTimestampMode::Absolute,
+                };
+                let (frame, timestamp) = Self::reconstruct_side_compact_frame(
+                    &template,
+                    &compact_body,
+                    timestamp_mode,
+                    timestamp_base,
+                )?;
+                let mut st = self.state.lock();
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.rx_last_timestamps.insert(template_id, timestamp);
                 }
-                .ok_or(TelemetryError::Deserialize("unknown side compact template"))?;
-                Self::reconstruct_side_compact_frame(&template, &compact_body).map(Some)
+                Ok(Some(frame))
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
                 if body.len() < 8 {

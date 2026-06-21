@@ -223,6 +223,25 @@ Use `export_memory_layout_json()` on a router or relay to profile queue pressure
 shared allocated/used bytes plus per-area queue, reliable-buffer, schema, discovery, and
 network-variable-cache breakdowns.
 
+Use `add_side_serialized_profile(...)` to select a compact side-wire profile from Python:
+
+```python
+router.add_side_serialized_profile(
+    "RADIO",
+    tx,
+    reliable_enabled=True,
+    profile="ipv4_like",
+    max_frame_bytes=0,
+    max_side_transport_templates=64,
+)
+```
+
+Profiles are `canonical`, `template`, `ipv6_like`, and `ipv4_like`. A
+`compact_header_target_bytes` value of `0` uses the IPv6-like 40-byte or IPv4-like 20-byte default
+target for the selected profile. The `ipv4_like` profile also omits unchanged compact timestamps.
+The same method is available on `Relay`. Per-data-type timestamp omission policy is currently a
+Rust-side option; Python callers use profile-wide timestamp omission through `ipv4_like`.
+
 ## Time sync
 
 When built with `timesync`, `Router` keeps an internal network clock and handles `SEDSNET_TIME_SYNC`

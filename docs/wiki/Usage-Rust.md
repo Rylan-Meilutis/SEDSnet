@@ -400,6 +400,27 @@ Use `router.export_memory_layout_json()` or `relay.export_memory_layout_json()` 
 running node. The JSON reports shared allocated/used bytes plus per-area used/allocated bytes for
 RX, ISR RX, TX, replay queues, reliable buffers, discovery, schema, and the network-variable cache.
 
+Use `router.export_runtime_stats()` / `relay.export_runtime_stats()` or the matching C/Python
+exports when profiling constrained links. Each side reports whether header-template compaction is
+enabled, its effective side-transport profile, fixed-frame size, the compact-header target,
+full/compact/chunk side-transport frame counts, emitted bytes, bytes saved versus canonical frames,
+timestamp-delta and unchanged-timestamp compact frame counts, and the observed compact follow-up
+overhead. Small-packet transport defaults to a 40-byte IPv6-like overhead target; call
+`with_ipv4_like_compact_header_target()` on the side options when a stable tiny telemetry stream
+should be held to a 20-byte IPv4-like target with unchanged compact timestamps omitted. Python
+exposes the same profile selection with `add_side_serialized_profile(..., profile="ipv4_like")`; C
+callers use `seds_router_add_side_serialized_profile(...)` or
+`seds_relay_add_side_serialized_profile(...)` with `SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE`.
+
+For mixed links, keep absolute/delta timestamps for most traffic and omit unchanged timestamps only
+for selected data types:
+
+```rust
+let opts = RouterSideOptions::default()
+    .with_ipv6_like_compact_header_target()
+    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"));
+```
+
 ## Topology export
 
 With discovery enabled, `export_topology()` returns the router's current learned view.
