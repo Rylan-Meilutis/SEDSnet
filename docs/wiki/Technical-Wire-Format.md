@@ -3,6 +3,40 @@
 This page documents the compact v2 wire format implemented in
 src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)).
 
+## Public API Names
+
+The wire-format module is named `wire_format`; the former generic encoding module path is not part
+of the API.
+
+Rust callers use:
+
+- `sedsnet::wire_format::pack_packet(...)`
+- `sedsnet::wire_format::unpack_packet(...)`
+- `sedsnet::wire_format::pack_packet_with_reliable(...)`
+- `sedsnet::wire_format::pack_reliable_ack(...)`
+- `sedsnet::wire_format::peek_envelope(...)`
+- `sedsnet::wire_format::peek_frame_info(...)`
+- `sedsnet::wire_format::packet_wire_size(...)`
+
+Python callers use:
+
+- `Packet.pack()`
+- `unpack_packet_py(...)`
+- `peek_header_py(...)`
+
+C/C++ callers use the packed-wire names:
+
+- `seds_pkt_pack_len(...)`
+- `seds_pkt_pack(...)`
+- `seds_pkt_unpack_owned(...)`
+- `seds_pkt_unpack_header_owned(...)`
+- `seds_pkt_validate_packed(...)`
+- packed side APIs such as `seds_router_add_side_packed(...)`,
+  `seds_router_rx_packed_packet_to_queue(...)`, and `seds_relay_rx_packed_from_side(...)`
+
+This naming is intentional: SEDSnet is packing a protocol-specific wire frame, not performing
+general-purpose object encoding.
+
 ## Goals
 
 - Compact prelude with a fixed 2-byte start.
@@ -177,7 +211,7 @@ traffic.
 
 Routers and relays can add a side-local wrapper around packed frames for constrained links. This
 wrapper is not part of the application `Packet`; it is consumed by `rx_packed_from_side(...)`
-before normal deserialization.
+before normal unpacking.
 
 ```text
 [magic: "SDT"]
