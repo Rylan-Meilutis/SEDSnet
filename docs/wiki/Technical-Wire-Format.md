@@ -34,20 +34,7 @@ C/C++ callers use the packed-wire names:
 - packed side APIs such as `seds_router_add_side_packed(...)`,
   `seds_router_rx_packed_packet_to_queue(...)`, and `seds_relay_rx_packed_from_side(...)`
 
-This naming is intentional: SEDSnet is packing a protocol-specific wire frame, not performing
-general-purpose object encoding.
-
-## Goals
-
-- Compact prelude with a fixed 2-byte start.
-- ULEB128 integers for small-on-the-wire metadata.
-- Endpoint bitmaps instead of repeated endpoint IDs.
-- Optional sender and payload compression.
-- CRC32 trailer for frame integrity.
-- Defer stable context such as sender names, route owners, endpoint names, schema metadata, and
-  link capabilities to discovery whenever it is safe to do so.
-- A compact in-flight wire contract so packets already on the wire remain routable and decodable
-  while topology and runtime-schema changes are still propagating.
+These functions pack and unpack SEDSnet protocol frames.
 
 ## Frame layout
 
@@ -102,7 +89,7 @@ reliable header, excluding the payload wrapper and CRC. Unpackers built without 
 reject frames with `0x10` rather than exposing ciphertext as application data.
 
 For multi-board endpoints, a sender can use an application-managed endpoint/group traffic key so
-each intended board can decrypt the same payload. Any board that changes visible routing metadata or
+each listed board can decrypt the same payload. Any board that changes visible routing metadata or
 ciphertext invalidates the AEAD tag for the other boards.
 
 Reliable-header flags:
@@ -112,7 +99,7 @@ Reliable-header flags:
 - `0x80`: unsequenced best-effort reliable wrapper
 
 ACK-only reliable control frames are emitted by the router or relay reliable layer. They are not
-valid application `Packet` values and are consumed before normal packet deserialization.
+valid application `Packet` values and are consumed before normal packet unpacking.
 
 ## Endpoint bitmap
 
@@ -125,12 +112,8 @@ schema.
 Packing is LSB-first within each byte. `NEP` is the popcount of the bitmap and is used as a sanity
 check during decode.
 
-Important implications:
-
-- The bitmap width is stable for a given build.
-- Removing or adding runtime schema entries does not change bitmap width.
-- New packets use the current endpoint IDs, but old packets still parse because the bitmap layout is
-  fixed and the contract can carry extra delivery/decode metadata when needed.
+The bitmap width is stable for a given build. Adding or removing runtime schema entries does not
+change the bitmap width.
 
 ## Wire contract
 
@@ -165,26 +148,13 @@ The shape is packed compactly:
 [static_count: ULEB128]           // only when bit 6 is set
 ```
 
-This lets a packet remain decodable after runtime schema changes such as:
-
-- the current type layout changing
-- the type being removed from the local runtime registry
-
-In those cases deserialization constructs the `Packet` against the inline wire shape instead of the
-current registry definition.
+When present, the inline shape is used to construct the `Packet` instead of the current registry
+definition.
 
 ### Frozen destination sender hashes
 
-The target list contains `u64` sender hashes for the destination holders the source intended when
-that packet was packed.
-
-Routers and relays use that list to:
-
-- keep in-flight packets pointed only at the intended holders
-- avoid delivering a packet to the wrong board while discovery/topology updates are still
-  converging
-- allow new packets to immediately use the latest topology while old packets continue with the
-  original delivery contract
+The target list contains `u64` sender hashes for destination holders. Routers and relays use this
+list as an explicit destination set for the packed frame.
 
 ## Reliable header
 
@@ -204,8 +174,7 @@ Reliable control traffic now primarily uses built-in internal packet types such 
 - `ReliablePartialAck`
 - `ReliablePacketRequest`
 
-Those are router/relay-owned control packets. Applications should not model them as user endpoint
-traffic.
+Those are router/relay-owned control packets, not user endpoint traffic.
 
 ## Side Transport Wrappers
 
@@ -249,32 +218,13 @@ Router and relay packed sides both support bounded frame sizes. Relay small-pack
 same side-local template id compaction when `max_frame_bytes` is non-zero. When the side-transport
 frame is too large, the sender emits kind `0x03` chunks whose individual callback payloads do not
 exceed the configured maximum. The receiver reassembles those chunks into the original
-side-transport frame and then resumes normal packet processing. This keeps CAN/I2C-style frame
-limits transparent to endpoint handlers and packet-oriented APIs.
+side-transport frame and then resumes normal packet processing.
 
-## Header Minimization
+## Compact Side Profiles
 
-The current implementation reduces repeated overhead with ULEB metadata, fixed endpoint bitmaps,
-sender IDs/hashes, side-local header templates, and fixed-size side splitting. The first packet on
-a side remains self-describing enough to establish context; follow-up packets on constrained links
-can replace repeated type/endpoint/sender/contract fields with a compact template ID.
-
-The practical target is:
-
-- **canonical full frame**: self-describing, migration-safe, and suitable for recovery after peer
-  restart or lost side context
-- **discovery-deferred steady-state frame**: carries only the critical per-packet fields that cannot
-  be inferred from current discovery state, such as type ID, endpoint bitmap or compact route
-  selector, timestamp/nonce when needed, reliability/crypto flags, payload length, payload bytes, and
-  integrity/authentication data
-- **compact side-transport follow-up frame**: IPv6-like overhead target by default, with an
-  IPv4-like target available for stable tiny telemetry streams
-
-Routers and relays expose this as a per-side compact-header target. `with_small_packet_transport`
-sets the default target to 40 bytes, and `with_ipv4_like_compact_header_target` sets a 20-byte
-profiling target. The target is not a hard parser rule; it is a deployment contract to validate
-against runtime stats while preserving canonical packet reconstruction before normal routing,
-dedupe, reliability, E2E ACK, and payload-decryption behavior.
+Routers and relays expose per-side compact-header profiles. `with_small_packet_transport` sets the
+compact-header profile to `ipv6_like`; `with_ipv4_like_compact_header_target` sets it to
+`ipv4_like`.
 
 Each side also exports an effective side-transport profile:
 
@@ -298,48 +248,40 @@ Runtime stats report:
 - compact-header target misses
 - active TX/RX template counts and template evictions
 
-For small stable telemetry such as a single template carrying changing timestamp/nonce/payload,
-the compact follow-up path is expected to fit the IPv4-like 20-byte overhead target. Larger
-contracts, reliable sequence/ACK fields, E2E wrappers, chunking, or changing header shapes can push
-overhead toward the IPv6-like target or require a fresh full template frame.
-
 Side-local template dictionaries are bounded by `max_side_transport_templates`, which defaults to
 64 entries per side. When the dictionary is full, the sender or receiver evicts a deterministic
-entry and later refreshes that shape with a full template frame. This keeps compact-link state
-bounded and makes template memory visible through the same runtime stats used to tune queue,
-reliability, discovery, and cache budgets.
+entry and later refreshes that shape with a full template frame.
 
-The intended next protocol-level header-reduction path is to add discovered router addresses as a
-canonical wire identity and treat the current sender string as a discovery hostname. In that model,
-discovery owns the address-to-sender-name mapping, endpoint/schema names, route capabilities, and
-stable link profile metadata. Steady-state packet headers should then carry a compact source address
-and only the per-packet fields that are safety-critical to route, dedupe, decrypt, verify, and unpack
-the payload. A peer that has lost discovery context can request or receive a full discovery/schema
-refresh, and a sender can fall back to the canonical full frame or side-template refresh when
-discovery state is stale.
+## Discovery Link Capabilities
 
-That needs a wire-versioned migration because sender strings are currently part of packet identity,
-discovery topology, reliable return-path learning, E2E ACK tracking, crypto authenticated header
-data, and the C/Python API surface. Until that protocol version exists, side-local templates are the
-supported way to replace repeated sender/type/endpoint header fields on constrained links.
+Full discovery snapshots also send `SEDSNET_DISCOVERY_LINK_CAPABILITIES` on each side.
 
-Full discovery snapshots also send `SEDSNET_DISCOVERY_LINK_CAPABILITIES` on each side. Its payload
-is fixed-width: version `u8`, capability flags `u32`, profile code `u8`, max frame bytes `u32`,
-compact-header target bytes `u32`, and max side templates `u32`, all little-endian except the
-single-byte fields. The flags advertise header templates, chunking, hop reliability, crypto support,
-end-to-end reliability support, and unchanged compact timestamp omission. Profile codes are `0`
-canonical, `1` template, `2` IPv6-like, and `3` IPv4-like.
+Payload:
 
-Further compatible reductions should use negotiated per-side context rather than removing fields
-globally:
+```text
+[version: u8]
+[capability_flags: u32 LE]
+[profile_code: u8]
+[max_frame_bytes: u32 LE]
+[compact_header_target_bytes: u32 LE]
+[max_side_templates: u32 LE]
+```
 
-- stream/context profiles that omit sender, endpoints, and type when unchanged
-- single-endpoint route contracts that omit the endpoint bitmap on links where the route fixes it
-- small-payload opcodes for common static shapes such as three `f32` values or one `u8` state
-- grouped ACK/reliability metadata and optional aggregation of several tiny values into one
-  authenticated frame on very low-bandwidth links
-- E2E overhead amortization by sealing multiple tiny payloads under one AEAD tag when latency
-  policy allows it
+Capability flags advertise:
+
+- header templates
+- chunking
+- hop reliability
+- crypto support
+- end-to-end reliability support
+- unchanged compact timestamp omission
+
+Profile codes:
+
+- `0`: canonical
+- `1`: template
+- `2`: IPv6-like
+- `3`: IPv4-like
 
 ## Varints
 
@@ -380,7 +322,8 @@ High-level decode order:
 7. Decode the payload bytes.
 8. Construct `Packet::new_with_wire_contract(...)`.
 
-The contract is what keeps decode and delivery stable across runtime topology/schema churn.
+The optional wire contract provides the inline shape and target sender hashes used during unpacking
+and routing.
 
 ## Envelope peek
 
@@ -395,8 +338,8 @@ The contract is what keeps decode and delivery stable across runtime topology/sc
 
 `peek_frame_info(...)` extends that with the reliable header when present.
 
-These helpers are what the router and relay use to make routing and reliable-layer decisions without
-fully decoding payload data.
+Routers and relays use these helpers for routing and reliable-layer decisions without fully decoding
+payload data.
 
 ## Packet ID from wire
 
@@ -410,10 +353,7 @@ It hashes:
 - logical payload size
 - payload bytes after decompression
 
-This makes dedupe stable across compressed and uncompressed links.
-
-The wire contract is intentionally not part of the packet ID. It preserves delivery/decode intent
-for in-flight packets without changing duplicate detection for the underlying telemetry payload.
+The wire contract is not part of the packet ID.
 
 ## CRC32 trailer
 
