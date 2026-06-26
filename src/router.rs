@@ -82,6 +82,7 @@ const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
 const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
 const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
 const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
+const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
 const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
 const SIDE_TIMESTAMP_POLICY_WORDS: usize = ((crate::MAX_VALUE_DATA_TYPE as usize) + 1).div_ceil(64);
@@ -4855,10 +4856,15 @@ impl Router {
         } else {
             sender_len
         };
-        if data.len() < off + SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len {
+        let endpoint_bitmap_bytes = if (flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT) != 0 {
+            SIDE_TRANSPORT_EP_BITMAP_BYTES
+        } else {
+            0
+        };
+        if data.len() < off + endpoint_bitmap_bytes + sender_wire_len {
             return Err(TelemetryError::Unpack("short buffer"));
         }
-        off += SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len;
+        off += endpoint_bitmap_bytes + sender_wire_len;
         if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
             let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
                 .map_err(|_| TelemetryError::Unpack("wire contract length"))?;

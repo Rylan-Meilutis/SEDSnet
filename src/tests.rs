@@ -2046,7 +2046,7 @@ mod tests_more {
     }
 
     // ---------------------------------------------------------------------------
-    // Serialization header math + ByteReader edge cases
+    // Wire-format header math + ByteReader edge cases
     // ---------------------------------------------------------------------------
 
     /// `packet_wire_size` must match the length of the packed output.
@@ -2059,6 +2059,51 @@ mod tests_more {
         let need = wire_format::packet_wire_size(&pkt);
         let out = wire_format::pack_packet(&pkt);
         assert_eq!(need, out.len());
+    }
+
+    #[test]
+    fn schema_default_endpoints_omit_wire_bitmap_but_custom_endpoints_keep_it() {
+        crate::tests::ensure_common_test_schema();
+        let ty = DataType::named("GPS_DATA");
+        let mut default_eps = crate::message_meta(ty).endpoints.to_vec();
+        default_eps.sort_unstable();
+        let subset_eps = &default_eps[..1];
+
+        let default_pkt = Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &default_eps, 9)
+            .unwrap()
+            .with_nonce(7);
+        let subset_pkt = Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], subset_eps, 9)
+            .unwrap()
+            .with_nonce(7);
+
+        let default_wire = wire_format::pack_packet(&default_pkt);
+        let subset_wire = wire_format::pack_packet(&subset_pkt);
+        let bitmap_bytes = ((crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1).div_ceil(8);
+
+        assert_eq!(
+            default_wire[0] & 0x20,
+            0,
+            "default endpoint set omits bitmap"
+        );
+        assert_ne!(
+            subset_wire[0] & 0x20,
+            0,
+            "custom endpoint set carries bitmap"
+        );
+        assert_eq!(subset_wire.len(), default_wire.len() + bitmap_bytes);
+
+        let default_round = wire_format::unpack_packet(&default_wire).unwrap();
+        let subset_round = wire_format::unpack_packet(&subset_wire).unwrap();
+        assert_eq!(default_round.endpoints(), default_eps.as_slice());
+        assert_eq!(subset_round.endpoints(), subset_eps);
+        assert_eq!(
+            wire_format::packet_id_from_wire(&default_wire).unwrap(),
+            default_pkt.packet_id()
+        );
+        assert_eq!(
+            wire_format::packet_id_from_wire(&subset_wire).unwrap(),
+            subset_pkt.packet_id()
+        );
     }
 
     // ---------------------------------------------------------------------------

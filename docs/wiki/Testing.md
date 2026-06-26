@@ -32,7 +32,7 @@ The unit tests live primarily in `src/tests.rs`.
 
 They cover:
 
-- packet construction, validation, serialization, and deserialization
+- packet construction, validation, packing, and unpacking
 - queue behavior, timeout budgeting, and dedupe
 - runtime routing policy, typed routes, route selection modes, and discovery-informed forwarding
 - network-variable getter/setter permissions, tiered cache refresh, and update callbacks

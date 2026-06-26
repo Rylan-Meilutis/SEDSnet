@@ -240,7 +240,7 @@ impl Packet {
 
     /// Create a packet while preserving wire-contract metadata from a decoded frame.
     ///
-    /// This constructor is used by deserialization paths that may carry a
+    /// This constructor is used by unpacking paths that may carry a
     /// migration-safe wire contract. The contract can supply:
     ///
     /// - `wire_shape`: an inline `MessageElement` that keeps payload decoding
@@ -533,9 +533,9 @@ impl Packet {
         &self.payload
     }
 
-    /// Return the optional inline wire shape preserved from deserialization.
+    /// Return the optional inline wire shape preserved from unpacking.
     ///
-    /// This is crate-visible because serialization and routing need to keep the
+    /// This is crate-visible because packing and routing need to keep the
     /// contract intact when a packet is forwarded again.
     #[inline]
     pub(crate) fn wire_shape(&self) -> Option<MessageElement> {

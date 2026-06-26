@@ -598,5 +598,5 @@ What's included:
 
 ## Version 1.0.0 highlights
 
-- First stable release with routing, serialization, and packet creation across C, Rust, and Python.
+- First stable release with routing, packet packing, and packet creation across C, Rust, and Python.
 - Marked API as stable.

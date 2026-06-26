@@ -4,7 +4,7 @@
 //! - Router lifecycle (create / free)
 //! - Logging (typed, bytes, strings)
 //! - RX / TX queue processing
-//! - Packet serialization / deserialization
+//! - Packet packing / unpacking
 //! - Fixed-size schema queries
 //! - Typed payload extraction
 //!
@@ -4894,7 +4894,7 @@ pub extern "C" fn seds_pkt_get_typed(
 }
 
 // ============================================================================
-//  Serialization / deserialization helpers
+//  Packet packing / unpacking helpers
 // ============================================================================
 
 #[unsafe(no_mangle)]

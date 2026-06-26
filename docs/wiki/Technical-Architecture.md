@@ -133,12 +133,13 @@ Why this matters:
 
 The compact v2 wire format is implemented in
 src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)).
-A packet is encoded as a compact v2 frame with a fixed-width endpoint bitmap, optional wire contract, optional reliable header, payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
+A packet is encoded as a compact v2 frame with schema-derived endpoints or an explicit endpoint bitmap, optional wire contract, optional reliable header, payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
 
 Design choices:
 
 - **ULEB128 varints** minimize size for small values.
-- **Endpoint bitmap** avoids repeated endpoint IDs; width is fixed from `MAX_VALUE_DATA_ENDPOINT`, not from the current runtime registry contents.
+- **Schema-derived endpoints** omit endpoint bytes when a packet uses the data type's default endpoint set.
+- **Endpoint bitmap** represents custom endpoint sets; width is fixed from `MAX_VALUE_DATA_ENDPOINT`, not from the current runtime registry contents.
 - **Wire contract** carries inline payload shape and frozen destination-holder sender hashes so in-flight packets stay decodable and correctly targeted across topology/schema churn.
 - **Sender/payload compression** is applied independently only when it reduces the wire size.
 - **CRC32 trailer** validates the entire frame before normal decode.

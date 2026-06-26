@@ -47,7 +47,7 @@ The core functions are as follows:
   (Note: each local endpoint needs its own function)
 
 SEDSnet also provides helpers to convert the telemetry data into strings for logging purposes.
-The library also handles the serialization and deserialization of the telemetry data.
+The library also handles packing telemetry packets to wire frames and unpacking received frames.
 
 SEDSnet is platform-agnostic and can be used on any platform that supports Rust. The library is primarily designed
 to be used in embedded systems and used by a C program, but can also be used in desktop applications and other rust
@@ -89,11 +89,11 @@ For sensitive state or commands, the default `cryptography` feature lets data ty
 cryptography while the application supplies a C provider, Rust provider, OS/hardware crypto wrapper, or registered software key.
 
 When topology or schema changes are propagating, packets already on the wire now carry a compact frozen delivery and
-decode contract. New packets immediately use the latest endpoint bitmap/schema view, while in-flight packets continue to
+decode contract. New packets immediately use the latest schema-default endpoint view, while in-flight packets continue to
 route only to their original intended holders and remain decodable against the shape they were packed with. The
 contract is encoded compactly with bitmap-oriented metadata and sender hashes so header growth stays small.
 
-Packed packets use compact varint fields, endpoint bitmaps, sender IDs/hashes, and optional per-side header
+Packed packets use compact varint fields, schema-derived endpoints, sender IDs/hashes, and optional per-side header
 templates, so the header is no longer best described as a fixed ~20-byte cost. The first packet for a route may carry
 the full sender/schema context, while later packets on small-packet transports can replace repeated header fields with a
 compact template ID. That keeps the header-to-payload ratio reasonable for small payloads such as three floats or a few
@@ -212,7 +212,7 @@ compact template ID. That keeps the header-to-payload ratio reasonable for small
 
 ## Version 1.0.0 highlights
 
-- First stable release with routing, serialization, and packet creation across Rust, C, and Python.
+- First stable release with routing, packet packing, and packet creation across Rust, C, and Python.
 - Marked the API as stable and established the base wire-format and packet model the later versions
   built on.
 
@@ -298,7 +298,7 @@ Examples:
 ## Performance benchmarking
 
 Criterion benchmarks are available through Cargo benches. The current benchmark targets exercise packet construction,
-serialization, header peeking, deserialization, and router/relay flows that mirror the Rust system-test path under the
+packing, header peeking, unpacking, and router/relay flows that mirror the Rust system-test path under the
 default host feature set.
 
 Run:

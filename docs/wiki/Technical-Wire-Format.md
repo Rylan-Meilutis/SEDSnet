@@ -45,15 +45,16 @@ These functions pack and unpack SEDSnet protocol frames.
     bit2: wire contract present
     bit3: packet nonce present
     bit4: E2E encrypted payload wrapper present
-    bit5..7: reserved
-[NEP: u8]                         // number of set bits in the endpoint bitmap
+    bit5: endpoint bitmap present
+    bit6..7: reserved
+[NEP: u8]                         // number of selected endpoints
 VARINT(ty: u32 as u64)            // ULEB128
 VARINT(data_size: u64)            // logical payload size after decompression
 VARINT(timestamp_ms: u64)
 [VARINT(nonce: u16 as u64)]       // only when bit3 is set
 VARINT(sender_len: u64)           // logical sender length after decompression
 [VARINT(sender_wire_len: u64)]    // only when sender is compressed
-ENDPOINT_BITMAP                   // fixed width, 1 bit per possible endpoint ID
+[ENDPOINT_BITMAP]                 // only when bit5 is set
 SENDER_BYTES                      // raw or compressed
 [VARINT(contract_len: u64)]       // only when bit2 is set
 [WIRE_CONTRACT_BYTES]
@@ -71,6 +72,7 @@ Top-level frame flags:
 - `0x04`: wire contract present
 - `0x08`: packet nonce present
 - `0x10`: payload bytes are wrapped by the feature-gated E2E cryptography provider
+- `0x20`: endpoint bitmap present
 
 When `0x10` is set, routing metadata remains visible, but the payload region is:
 
@@ -103,14 +105,22 @@ valid application `Packet` values and are consumed before normal packet unpackin
 
 ## Endpoint bitmap
 
-The endpoint bitmap is fixed-width for the build, not sized from the currently registered runtime
-schema.
+`NEP` is the number of selected endpoints for the frame.
+
+When flag `0x20` is clear, no endpoint bitmap bytes are present. The endpoint set is the default
+endpoint set from the local data type metadata for `ty`, expanded in ascending endpoint-ID order,
+and `NEP` must match that set size.
+
+When flag `0x20` is set, a fixed-width endpoint bitmap follows the sender length fields and appears
+before `SENDER_BYTES`. This form is used for custom endpoint sets, subsets, ACK-only reliable
+control frames, wire-contract frames, and frames whose endpoints cannot be inferred from the data
+type metadata.
 
 - `EP_BITMAP_BITS = MAX_VALUE_DATA_ENDPOINT + 1`
 - `EP_BITMAP_BYTES = ceil(EP_BITMAP_BITS / 8)`
 
-Packing is LSB-first within each byte. `NEP` is the popcount of the bitmap and is used as a sanity
-check during decode.
+Bitmap packing is LSB-first within each byte. `NEP` is the popcount of the bitmap and is used as a
+sanity check during decode.
 
 The bitmap width is stable for a given build. Adding or removing runtime schema entries does not
 change the bitmap width.
@@ -315,7 +325,8 @@ High-level decode order:
 
 1. Verify CRC32.
 2. Parse the fixed prelude and varints.
-3. Expand the fixed-width endpoint bitmap.
+3. Resolve endpoints from the fixed-width endpoint bitmap when flag `0x20` is set, otherwise from
+   the default endpoint list in local data type metadata.
 4. Decode sender bytes.
 5. Decode the optional wire contract.
 6. Decode the reliable header if current schema or contract says it is present.

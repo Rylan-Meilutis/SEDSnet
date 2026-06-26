@@ -16,7 +16,7 @@ API docs.
 - **E2E**: End-to-end. In this project it can mean either end-to-end reliable delivery confirmation
   or end-to-end encrypted payloads, depending on context.
 - **Frame**: A packed packet byte sequence ready to send over a side.
-- **Packet**: The logical telemetry message before or after serialization. It has a sender, time,
+- **Packet**: The logical telemetry message before packing or after unpacking. It has a sender, time,
   data type, endpoints, and payload.
 - **Payload**: The application data bytes inside a packet. With `cryptography`, these bytes can be
   wrapped by the E2E encrypted payload format.
