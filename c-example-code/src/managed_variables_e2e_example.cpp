@@ -37,7 +37,7 @@ void managed_variables_e2e_cpp_example()
                                            7U);
     (void)seds_router_set_sender_id(router, "FLIGHT_COMPUTER", 15U);
     (void)seds_router_enable_managed_variable(router, flight_state.id);
-    (void)seds_router_add_side_serialized_small_packets(
+    (void)seds_router_add_side_packed_small_packets(
         router, "RADIO", 5U, radio_tx, nullptr, false, 64U);
 
     const uint8_t state = 3U;

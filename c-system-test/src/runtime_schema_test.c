@@ -290,7 +290,7 @@ int main(void)
     cfg.sender = SEDS_NAME_LITERAL("C_RUNTIME_WRAPPER");
     cfg.announce_discovery = false;
     assert(seds_wrapper_router_init(&wrapper, &cfg) == SEDS_OK);
-    SedsSideRef side = seds_wrapper_router_add_serialized_small_side(
+    SedsSideRef side = seds_wrapper_router_add_packed_small_side(
         &wrapper,
         SEDS_NAME_LITERAL("SIDE_A"),
         capture_tx,
@@ -321,7 +321,7 @@ int main(void)
     global_router_cfg.sender = SEDS_NAME_LITERAL("C_RUNTIME_GLOBAL_ROUTER");
     global_router_cfg.announce_discovery = false;
     assert(seds_global_router_init(&global_router_cfg) == SEDS_OK);
-    SedsSideRef global_router_side = seds_global_router_add_serialized_small_side(
+    SedsSideRef global_router_side = seds_global_router_add_packed_small_side(
         SEDS_NAME_LITERAL("GLOBAL_ROUTER_SIDE"),
         capture_tx,
         &global_router_capture,
@@ -348,12 +348,12 @@ int main(void)
     relay_cfg.sender = SEDS_NAME_LITERAL("C_RUNTIME_GLOBAL_RELAY");
     relay_cfg.announce_discovery = false;
     assert(seds_global_relay_init(&relay_cfg) == SEDS_OK);
-    SedsSideRef relay_in = seds_global_relay_add_serialized_side(
+    SedsSideRef relay_in = seds_global_relay_add_packed_side(
         SEDS_NAME_LITERAL("RELAY_IN"),
         noop_tx,
         NULL,
         false);
-    SedsSideRef relay_out = seds_global_relay_add_serialized_small_side(
+    SedsSideRef relay_out = seds_global_relay_add_packed_small_side(
         SEDS_NAME_LITERAL("RELAY_OUT"),
         capture_tx,
         &global_relay_capture,
@@ -430,7 +430,7 @@ int main(void)
 
     SedsRelay *relay = seds_relay_new(NULL, NULL);
     assert(relay != NULL);
-    assert(seds_relay_add_side_serialized_small_packets(
+    assert(seds_relay_add_side_packed_small_packets(
                relay,
                "SIDE_A",
                strlen("SIDE_A"),

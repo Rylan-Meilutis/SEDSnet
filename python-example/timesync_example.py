@@ -30,7 +30,7 @@ def main() -> None:
         ],
         timesync_enabled=True,
     )
-    router.add_side_serialized("TX", _tx)
+    router.add_side_packed("TX", _tx)
     router.set_local_network_datetime_millis(2025, 1, 1, 12, 0, 0, 0)
 
     router.log_f32(int(DT.GPS_DATA), [37.7749, -122.4194, 30.0])

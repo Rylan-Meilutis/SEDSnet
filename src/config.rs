@@ -2274,7 +2274,7 @@ pub fn register_schema_json_str(json: &str) -> TelemetryResult<()> {
 #[cfg(feature = "std")]
 pub fn register_schema_json_bytes(json: &[u8]) -> TelemetryResult<()> {
     let cfg: JsonConfig =
-        serde_json::from_slice(json).map_err(|_| TelemetryError::Deserialize("schema json"))?;
+        serde_json::from_slice(json).map_err(|_| TelemetryError::Unpack("schema json"))?;
     register_json_config(cfg, false)
 }
 
@@ -2445,7 +2445,7 @@ fn json_config_to_snapshot(
 #[cfg(feature = "serde")]
 pub fn schema_snapshot_from_json_bytes(json: &[u8]) -> TelemetryResult<RuntimeSchemaSnapshot> {
     let cfg: JsonConfig =
-        serde_json::from_slice(json).map_err(|_| TelemetryError::Deserialize("schema json"))?;
+        serde_json::from_slice(json).map_err(|_| TelemetryError::Unpack("schema json"))?;
     json_config_to_snapshot(cfg, false, 100, 100)
 }
 

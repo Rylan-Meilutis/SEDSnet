@@ -16,7 +16,7 @@
 // ============================================================================
 
 /// The `ReprU32Enum` trait marks enums that are represented as `u32` in
-/// serialized / FFI form.
+/// packed / FFI form.
 ///
 /// Types implementing this trait are expected to be:
 /// - `#[repr(u32)]`
@@ -65,7 +65,7 @@ macro_rules! impl_repr_u32_enum {
 }
 
 /// The `ReprI32Enum` trait marks enums that are represented as `i32` in
-/// serialized / FFI form.
+/// packed / FFI form.
 ///
 /// Types implementing this trait are expected to be:
 /// - `#[repr(i32)]`

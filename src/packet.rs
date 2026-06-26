@@ -204,7 +204,7 @@ impl Packet {
     ///
     /// This helper is shared by normal packet construction and by
     /// `new_with_wire_contract(...)`. The latter matters because a packet that
-    /// was already serialized may need to keep using the element shape it was
+    /// was already packed may need to keep using the element shape it was
     /// written with even if the local runtime registry has since changed.
     ///
     /// # Parameters
@@ -245,7 +245,7 @@ impl Packet {
     ///
     /// - `wire_shape`: an inline `MessageElement` that keeps payload decoding
     ///   stable even if the local runtime schema changed after the packet was
-    ///   serialized.
+    ///   packed.
     /// - `wire_target_senders`: a frozen list of destination-holder sender
     ///   hashes that routers and relays use to keep in-flight forwarding bound
     ///   to the originally intended remote holders.
@@ -397,7 +397,7 @@ impl Packet {
 
     /// Compute a stable 64-bit identifier for this packet.
     ///
-    /// This is *not* serialized – it is derived locally from:
+    /// This is *not* packed – it is derived locally from:
     /// - sender
     /// - logical type (DataType)
     /// - endpoints
@@ -546,7 +546,7 @@ impl Packet {
     ///
     /// Routers and relays use this list to avoid delivering an in-flight packet
     /// to newly-learned holders that were not part of the original delivery
-    /// contract when the packet was serialized.
+    /// contract when the packet was packed.
     #[inline]
     pub(crate) fn wire_target_senders(&self) -> &[u64] {
         &self.wire_target_senders

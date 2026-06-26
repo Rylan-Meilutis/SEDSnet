@@ -7,7 +7,7 @@ use sedsnet::config::{
 use sedsnet::packet::Packet;
 use sedsnet::relay::Relay;
 use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
-use sedsnet::serialize::peek_frame_info;
+use sedsnet::wire_format::peek_frame_info;
 use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -98,7 +98,7 @@ fn benchmark_router_system_paths(c: &mut Criterion) {
     let source = {
         let tx_frames = tx_frames.clone();
         let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        router.add_side_serialized("bench_bus", move |bytes: &[u8]| -> TelemetryResult<()> {
+        router.add_side_packed("bench_bus", move |bytes: &[u8]| -> TelemetryResult<()> {
             tx_frames.lock().unwrap().push(bytes.to_vec());
             Ok(())
         });
@@ -112,7 +112,7 @@ fn benchmark_router_system_paths(c: &mut Criterion) {
             |pkt| {
                 source.tx(pkt).unwrap();
                 let frame = tx_frames.lock().unwrap().pop().unwrap();
-                sink.rx_serialized(&frame).unwrap();
+                sink.rx_packed(&frame).unwrap();
             },
             BatchSize::SmallInput,
         );
@@ -123,14 +123,14 @@ fn benchmark_router_system_paths(c: &mut Criterion) {
     let relay = Relay::new(zero_clock());
     let side_a = {
         let relay_frames_a = relay_frames_a.clone();
-        relay.add_side_serialized("bus_a", move |bytes: &[u8]| -> TelemetryResult<()> {
+        relay.add_side_packed("bus_a", move |bytes: &[u8]| -> TelemetryResult<()> {
             relay_frames_a.lock().unwrap().push(bytes.to_vec());
             Ok(())
         })
     };
     let _side_b = {
         let relay_frames_b = relay_frames_b.clone();
-        relay.add_side_serialized("bus_b", move |bytes: &[u8]| -> TelemetryResult<()> {
+        relay.add_side_packed("bus_b", move |bytes: &[u8]| -> TelemetryResult<()> {
             relay_frames_b.lock().unwrap().push(bytes.to_vec());
             Ok(())
         })
@@ -143,10 +143,10 @@ fn benchmark_router_system_paths(c: &mut Criterion) {
                 let pkt = next_gps_packet(&relay_counter);
                 relay_frames_a.lock().unwrap().clear();
                 relay_frames_b.lock().unwrap().clear();
-                sedsnet::serialize::serialize_packet(&pkt)
+                sedsnet::wire_format::pack_packet(&pkt)
             },
             |frame| {
-                relay.rx_serialized_from_side(side_a, &frame).unwrap();
+                relay.rx_packed_from_side(side_a, &frame).unwrap();
                 relay.process_all_queues().unwrap();
                 let frames_b = relay_frames_b.lock().unwrap().clone();
                 let frames_a = relay_frames_a.lock().unwrap().clone();

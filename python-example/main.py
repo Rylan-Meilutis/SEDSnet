@@ -22,8 +22,8 @@ def _on_packet(pkt: seds.Packet):
     print("[RX Packet]", pkt)
 
 
-def _on_serialized(data: bytes):
-    print(f"[RX Serialized] {len(data)} bytes")
+def _on_packed(data: bytes):
+    print(f"[RX Packed] {len(data)} bytes")
 
 
 def router_server(cmd_q: mp.Queue, pump_period_ms: int = 2, max_total_seconds: float = 10.0):
@@ -33,11 +33,11 @@ def router_server(cmd_q: mp.Queue, pump_period_ms: int = 2, max_total_seconds: f
         now_ms=_now_ms,
         handlers=[
             (sd_card, _on_packet, None),
-            (radio, None, _on_serialized),
+            (radio, None, _on_packed),
         ],
         timesync_enabled=True,
     )
-    router.add_side_serialized("TX", _tx, reliable_enabled=True)
+    router.add_side_packed("TX", _tx, reliable_enabled=True)
     router.set_local_network_datetime_millis(2025, 1, 1, 12, 0, 0, 0)
 
     start_time = time.time()

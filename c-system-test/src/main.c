@@ -261,7 +261,7 @@ int main(void)
     SedsRelay * relay = seds_relay_new(relay_now_ms, NULL);
     assert(relay && "Failed to create relay");
 
-    int32_t side_bus1 = seds_relay_add_side_serialized(
+    int32_t side_bus1 = seds_relay_add_side_packed(
         relay,
         "bus1",
         4, // strlen("bus1")
@@ -269,7 +269,7 @@ int main(void)
         &bus1,
         true
     );
-    int32_t side_bus2 = seds_relay_add_side_serialized(
+    int32_t side_bus2 = seds_relay_add_side_packed(
         relay,
         "bus2",
         4, // strlen("bus2")

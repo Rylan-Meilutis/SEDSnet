@@ -33,7 +33,7 @@ use crate::{
         endpoint_is_router_internal,
     },
     router::{EndpointHandler, Router, RouterConfig},
-    serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
+    wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
 };
 use crate::{MessageDataType::NoData, get_data_type};
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
@@ -374,16 +374,15 @@ type CTransmit = Option<extern "C" fn(bytes: *const u8, len: usize, user: *mut c
 /// Endpoint handler callback (packet view) (legacy).
 type CEndpointHandler = Option<extern "C" fn(pkt: *const SedsPacketView, user: *mut c_void) -> i32>;
 
-/// Endpoint handler callback (serialized bytes) (legacy).
-type CSerializedHandler =
-    Option<extern "C" fn(bytes: *const u8, len: usize, user: *mut c_void) -> i32>;
+/// Endpoint handler callback (packed bytes) (legacy).
+type CPackedHandler = Option<extern "C" fn(bytes: *const u8, len: usize, user: *mut c_void) -> i32>;
 
 /// C-facing endpoint descriptor (legacy, must match C header).
 #[repr(C)]
 pub struct SedsLocalEndpointDesc {
-    endpoint: u32,                          // DataEndpoint.as_u32()
-    packet_handler: CEndpointHandler,       // optional
-    serialized_handler: CSerializedHandler, // optional
+    endpoint: u32,                    // DataEndpoint.as_u32()
+    packet_handler: CEndpointHandler, // optional
+    packed_handler: CPackedHandler,   // optional
     user: *mut c_void,
 }
 
@@ -1335,17 +1334,16 @@ fn seds_router_new_impl(
                 v.push(eh);
             }
 
-            // If a SERIALIZED handler is provided, register it
-            if let Some(cb_fn) = desc.serialized_handler {
-                let eh =
-                    EndpointHandler::new_serialized_handler(endpoint, move |bytes: &[u8]| {
-                        let code = cb_fn(bytes.as_ptr(), bytes.len(), user_addr as *mut c_void);
-                        if code == status_from_result_code(SedsResult::SedsOk) {
-                            Ok(())
-                        } else {
-                            Err(TelemetryError::Io("handler error"))
-                        }
-                    });
+            // If a PACKED handler is provided, register it
+            if let Some(cb_fn) = desc.packed_handler {
+                let eh = EndpointHandler::new_packed_handler(endpoint, move |bytes: &[u8]| {
+                    let code = cb_fn(bytes.as_ptr(), bytes.len(), user_addr as *mut c_void);
+                    if code == status_from_result_code(SedsResult::SedsOk) {
+                        Ok(())
+                    } else {
+                        Err(TelemetryError::Io("handler error"))
+                    }
+                });
 
                 v.push(eh);
             }
@@ -1658,7 +1656,7 @@ pub extern "C" fn seds_router_request_managed_variable(r: *mut SedsRouter, ty: D
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_set_network_variable_serialized(
+pub extern "C" fn seds_router_set_network_variable_packed(
     r: *mut SedsRouter,
     bytes: *const u8,
     len: usize,
@@ -1667,7 +1665,7 @@ pub extern "C" fn seds_router_set_network_variable_serialized(
         return status_from_err(TelemetryError::BadArg);
     }
     let data = unsafe { slice::from_raw_parts(bytes, len) };
-    match deserialize_packet(data).and_then(|pkt| {
+    match unpack_packet(data).and_then(|pkt| {
         pkt.validate()?;
         let router = unsafe { &(*r).inner };
         router.set_network_variable(pkt)
@@ -1678,7 +1676,7 @@ pub extern "C" fn seds_router_set_network_variable_serialized(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_seed_managed_variable_serialized(
+pub extern "C" fn seds_router_seed_managed_variable_packed(
     r: *mut SedsRouter,
     bytes: *const u8,
     len: usize,
@@ -1687,7 +1685,7 @@ pub extern "C" fn seds_router_seed_managed_variable_serialized(
         return status_from_err(TelemetryError::BadArg);
     }
     let data = unsafe { slice::from_raw_parts(bytes, len) };
-    match deserialize_packet(data).and_then(|pkt| {
+    match unpack_packet(data).and_then(|pkt| {
         pkt.validate()?;
         let router = unsafe { &(*r).inner };
         router.seed_managed_variable(pkt)
@@ -1698,7 +1696,7 @@ pub extern "C" fn seds_router_seed_managed_variable_serialized(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_cached_managed_variable_serialized_len(
+pub extern "C" fn seds_router_cached_managed_variable_packed_len(
     r: *mut SedsRouter,
     ty: DataType,
 ) -> i32 {
@@ -1709,12 +1707,12 @@ pub extern "C" fn seds_router_cached_managed_variable_serialized_len(
     let Some(pkt) = router.cached_managed_variable(ty) else {
         return 0;
     };
-    i32::try_from(serialize_packet(&pkt).len()).unwrap_or(i32::MAX)
+    i32::try_from(pack_packet(&pkt).len()).unwrap_or(i32::MAX)
 }
 
 #[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_get_network_variable_serialized_len(
+pub extern "C" fn seds_router_get_network_variable_packed_len(
     r: *mut SedsRouter,
     ty: DataType,
     stale_after_ms: u32,
@@ -1731,14 +1729,14 @@ pub extern "C" fn seds_router_get_network_variable_serialized_len(
             Some(u64::from(stale_after_ms))
         },
     ) {
-        Ok(Some(pkt)) => i32::try_from(serialize_packet(&pkt).len()).unwrap_or(i32::MAX),
+        Ok(Some(pkt)) => i32::try_from(pack_packet(&pkt).len()).unwrap_or(i32::MAX),
         Ok(None) => 0,
         Err(e) => status_from_err(e),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_cached_managed_variable_serialized(
+pub extern "C" fn seds_router_cached_managed_variable_packed(
     r: *mut SedsRouter,
     ty: DataType,
     out: *mut u8,
@@ -1751,7 +1749,7 @@ pub extern "C" fn seds_router_cached_managed_variable_serialized(
     let Some(pkt) = router.cached_managed_variable(ty) else {
         return 0;
     };
-    let bytes = serialize_packet(&pkt);
+    let bytes = pack_packet(&pkt);
     if out_len < bytes.len() {
         return status_from_err(TelemetryError::SizeMismatch {
             expected: bytes.len(),
@@ -1766,7 +1764,7 @@ pub extern "C" fn seds_router_cached_managed_variable_serialized(
 
 #[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_get_network_variable_serialized(
+pub extern "C" fn seds_router_get_network_variable_packed(
     r: *mut SedsRouter,
     ty: DataType,
     stale_after_ms: u32,
@@ -1789,7 +1787,7 @@ pub extern "C" fn seds_router_get_network_variable_serialized(
         Ok(None) => return 0,
         Err(e) => return status_from_err(e),
     };
-    let bytes = serialize_packet(&pkt);
+    let bytes = pack_packet(&pkt);
     if out_len < bytes.len() {
         return status_from_err(TelemetryError::SizeMismatch {
             expected: bytes.len(),
@@ -1999,7 +1997,7 @@ pub extern "C" fn seds_router_set_local_network_datetime_nanos(
 //  FFI: Router side registration
 // ============================================================================
 
-enum SerializedSideMode {
+enum PackedSideMode {
     Normal,
     SmallPackets {
         max_frame_bytes: usize,
@@ -2013,7 +2011,7 @@ enum SerializedSideMode {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_add_side_serialized(
+pub extern "C" fn seds_router_add_side_packed(
     r: *mut SedsRouter,
     name: *const c_char,
     name_len: usize,
@@ -2021,19 +2019,19 @@ pub extern "C" fn seds_router_add_side_serialized(
     tx_user: *mut c_void,
     reliable_enabled: bool,
 ) -> i32 {
-    seds_router_add_side_serialized_impl(
+    seds_router_add_side_packed_impl(
         r,
         name,
         name_len,
         tx,
         tx_user,
         reliable_enabled,
-        SerializedSideMode::Normal,
+        PackedSideMode::Normal,
     )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_add_side_serialized_small_packets(
+pub extern "C" fn seds_router_add_side_packed_small_packets(
     r: *mut SedsRouter,
     name: *const c_char,
     name_len: usize,
@@ -2042,19 +2040,19 @@ pub extern "C" fn seds_router_add_side_serialized_small_packets(
     reliable_enabled: bool,
     max_frame_bytes: usize,
 ) -> i32 {
-    seds_router_add_side_serialized_impl(
+    seds_router_add_side_packed_impl(
         r,
         name,
         name_len,
         tx,
         tx_user,
         reliable_enabled,
-        SerializedSideMode::SmallPackets { max_frame_bytes },
+        PackedSideMode::SmallPackets { max_frame_bytes },
     )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_add_side_serialized_profile(
+pub extern "C" fn seds_router_add_side_packed_profile(
     r: *mut SedsRouter,
     name: *const c_char,
     name_len: usize,
@@ -2070,14 +2068,14 @@ pub extern "C" fn seds_router_add_side_serialized_profile(
         Ok(profile) => profile,
         Err(err) => return status_from_err(err),
     };
-    seds_router_add_side_serialized_impl(
+    seds_router_add_side_packed_impl(
         r,
         name,
         name_len,
         tx,
         tx_user,
         reliable_enabled,
-        SerializedSideMode::Profile {
+        PackedSideMode::Profile {
             profile,
             max_frame_bytes,
             compact_header_target_bytes,
@@ -2086,14 +2084,14 @@ pub extern "C" fn seds_router_add_side_serialized_profile(
     )
 }
 
-fn seds_router_add_side_serialized_impl(
+fn seds_router_add_side_packed_impl(
     r: *mut SedsRouter,
     name: *const c_char,
     name_len: usize,
     tx: CTransmit,
     tx_user: *mut c_void,
     reliable_enabled: bool,
-    mode: SerializedSideMode,
+    mode: PackedSideMode,
 ) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -2131,19 +2129,19 @@ fn seds_router_add_side_serialized_impl(
     };
 
     let opts = match mode {
-        SerializedSideMode::Normal => RouterSideOptions {
+        PackedSideMode::Normal => RouterSideOptions {
             reliable_enabled,
             link_local_enabled: false,
             ..RouterSideOptions::default()
         },
-        SerializedSideMode::SmallPackets { max_frame_bytes } => RouterSideOptions {
+        PackedSideMode::SmallPackets { max_frame_bytes } => RouterSideOptions {
             reliable_enabled,
             link_local_enabled: false,
             header_template_enabled: true,
             max_frame_bytes,
             ..RouterSideOptions::default()
         },
-        SerializedSideMode::Profile {
+        PackedSideMode::Profile {
             profile,
             max_frame_bytes,
             compact_header_target_bytes,
@@ -2161,7 +2159,7 @@ fn seds_router_add_side_serialized_impl(
         }
     };
 
-    let side_id = router.add_side_serialized_with_options(side_name, tx_fn, opts);
+    let side_id = router.add_side_packed_with_options(side_name, tx_fn, opts);
     side_id as i32
 }
 
@@ -2531,7 +2529,7 @@ pub extern "C" fn seds_endpoint_register(
     }
     let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("endpoint name"));
+        return status_from_err(TelemetryError::Unpack("endpoint name"));
     };
     ok_or_status(register_endpoint_id(DataEndpoint(endpoint), name, link_local_only).map(|_| ()))
 }
@@ -2550,7 +2548,7 @@ pub extern "C" fn seds_endpoint_register_ex(
     }
     let name_bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(name_bytes) else {
-        return status_from_err(TelemetryError::Deserialize("endpoint name"));
+        return status_from_err(TelemetryError::Unpack("endpoint name"));
     };
     let description = if description_len == 0 {
         ""
@@ -2558,7 +2556,7 @@ pub extern "C" fn seds_endpoint_register_ex(
         let bytes =
             unsafe { slice::from_raw_parts(c_char_ptr_as_u8(description), description_len) };
         let Ok(description) = from_utf8(bytes) else {
-            return status_from_err(TelemetryError::Deserialize("endpoint description"));
+            return status_from_err(TelemetryError::Unpack("endpoint description"));
         };
         description
     };
@@ -2629,7 +2627,7 @@ pub extern "C" fn seds_dtype_register_ex(
     }
     let name_bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(name_bytes) else {
-        return status_from_err(TelemetryError::Deserialize("data type name"));
+        return status_from_err(TelemetryError::Unpack("data type name"));
     };
     let description = if description_len == 0 {
         ""
@@ -2637,7 +2635,7 @@ pub extern "C" fn seds_dtype_register_ex(
         let bytes =
             unsafe { slice::from_raw_parts(c_char_ptr_as_u8(description), description_len) };
         let Ok(description) = from_utf8(bytes) else {
-            return status_from_err(TelemetryError::Deserialize("data type description"));
+            return status_from_err(TelemetryError::Unpack("data type description"));
         };
         description
     };
@@ -2703,7 +2701,7 @@ pub extern "C" fn seds_schema_register_json_file(path: *const c_char, path_len: 
     }
     let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(path), path_len) };
     let Ok(path) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("schema json path"));
+        return status_from_err(TelemetryError::Unpack("schema json path"));
     };
     #[cfg(feature = "std")]
     {
@@ -2760,7 +2758,7 @@ pub extern "C" fn seds_endpoint_get_info_by_name(
     }
     let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("endpoint name"));
+        return status_from_err(TelemetryError::Unpack("endpoint name"));
     };
     let Some(def) = endpoint_definition_by_name(name) else {
         unsafe {
@@ -2873,7 +2871,7 @@ pub extern "C" fn seds_dtype_get_info_by_name(
     }
     let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("data type name"));
+        return status_from_err(TelemetryError::Unpack("data type name"));
     };
     let Some(def) = data_type_definition_by_name(name) else {
         unsafe {
@@ -2947,7 +2945,7 @@ pub extern "C" fn seds_endpoint_remove_by_name(name: *const c_char, name_len: us
     }
     let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("endpoint name"));
+        return status_from_err(TelemetryError::Unpack("endpoint name"));
     };
     ok_or_status(remove_endpoint_by_name(name).map(|_| ()))
 }
@@ -2964,7 +2962,7 @@ pub extern "C" fn seds_dtype_remove_by_name(name: *const c_char, name_len: usize
     }
     let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
     let Ok(name) = from_utf8(bytes) else {
-        return status_from_err(TelemetryError::Deserialize("data type name"));
+        return status_from_err(TelemetryError::Unpack("data type name"));
     };
     ok_or_status(remove_data_type_by_name(name).map(|_| ()))
 }
@@ -3343,7 +3341,7 @@ pub extern "C" fn seds_relay_periodic(r: *mut SedsRelay, timeout_ms: u32) -> i32
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_relay_add_side_serialized(
+pub extern "C" fn seds_relay_add_side_packed(
     r: *mut SedsRelay,
     name: *const c_char,
     name_len: usize,
@@ -3351,19 +3349,19 @@ pub extern "C" fn seds_relay_add_side_serialized(
     tx_user: *mut c_void,
     reliable_enabled: bool,
 ) -> i32 {
-    seds_relay_add_side_serialized_impl(
+    seds_relay_add_side_packed_impl(
         r,
         name,
         name_len,
         tx,
         tx_user,
         reliable_enabled,
-        SerializedSideMode::Normal,
+        PackedSideMode::Normal,
     )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_relay_add_side_serialized_small_packets(
+pub extern "C" fn seds_relay_add_side_packed_small_packets(
     r: *mut SedsRelay,
     name: *const c_char,
     name_len: usize,
@@ -3372,19 +3370,19 @@ pub extern "C" fn seds_relay_add_side_serialized_small_packets(
     reliable_enabled: bool,
     max_frame_bytes: usize,
 ) -> i32 {
-    seds_relay_add_side_serialized_impl(
+    seds_relay_add_side_packed_impl(
         r,
         name,
         name_len,
         tx,
         tx_user,
         reliable_enabled,
-        SerializedSideMode::SmallPackets { max_frame_bytes },
+        PackedSideMode::SmallPackets { max_frame_bytes },
     )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_relay_add_side_serialized_profile(
+pub extern "C" fn seds_relay_add_side_packed_profile(
     r: *mut SedsRelay,
     name: *const c_char,
     name_len: usize,
@@ -3400,14 +3398,14 @@ pub extern "C" fn seds_relay_add_side_serialized_profile(
         Ok(profile) => profile,
         Err(err) => return status_from_err(err),
     };
-    seds_relay_add_side_serialized_impl(
+    seds_relay_add_side_packed_impl(
         r,
         name,
         name_len,
         tx,
         tx_user,
         reliable_enabled,
-        SerializedSideMode::Profile {
+        PackedSideMode::Profile {
             profile,
             max_frame_bytes,
             compact_header_target_bytes,
@@ -3416,14 +3414,14 @@ pub extern "C" fn seds_relay_add_side_serialized_profile(
     )
 }
 
-fn seds_relay_add_side_serialized_impl(
+fn seds_relay_add_side_packed_impl(
     r: *mut SedsRelay,
     name: *const c_char,
     name_len: usize,
     tx: CTransmit,
     tx_user: *mut c_void,
     reliable_enabled: bool,
-    mode: SerializedSideMode,
+    mode: PackedSideMode,
 ) -> i32 {
     if r.is_null() {
         return status_from_err(TelemetryError::BadArg);
@@ -3461,19 +3459,19 @@ fn seds_relay_add_side_serialized_impl(
     };
 
     let opts = match mode {
-        SerializedSideMode::Normal => RelaySideOptions {
+        PackedSideMode::Normal => RelaySideOptions {
             reliable_enabled,
             link_local_enabled: false,
             ..RelaySideOptions::default()
         },
-        SerializedSideMode::SmallPackets { max_frame_bytes } => RelaySideOptions {
+        PackedSideMode::SmallPackets { max_frame_bytes } => RelaySideOptions {
             reliable_enabled,
             link_local_enabled: false,
             header_template_enabled: max_frame_bytes != 0,
             max_frame_bytes,
             ..RelaySideOptions::default()
         },
-        SerializedSideMode::Profile {
+        PackedSideMode::Profile {
             profile,
             max_frame_bytes,
             compact_header_target_bytes,
@@ -3490,7 +3488,7 @@ fn seds_relay_add_side_serialized_impl(
             opts
         }
     };
-    let side_id: RelaySideId = relay.add_side_serialized_with_options(side_name, tx_fn, opts);
+    let side_id: RelaySideId = relay.add_side_packed_with_options(side_name, tx_fn, opts);
     side_id as i32
 }
 
@@ -3824,7 +3822,7 @@ pub extern "C" fn seds_relay_clear_route_priority(
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_relay_rx_serialized_from_side(
+pub extern "C" fn seds_relay_rx_packed_from_side(
     r: *mut SedsRelay,
     side_id: u32,
     bytes: *const u8,
@@ -3837,7 +3835,7 @@ pub extern "C" fn seds_relay_rx_serialized_from_side(
     let relay = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
 
-    ok_or_status(relay.rx_serialized_from_side(side_id as usize, slice))
+    ok_or_status(relay.rx_packed_from_side(side_id as usize, slice))
 }
 
 #[unsafe(no_mangle)]
@@ -4268,7 +4266,7 @@ pub extern "C" fn seds_router_log_queue_typed(
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_receive_serialized(
+pub extern "C" fn seds_router_receive_packed(
     r: *mut SedsRouter,
     bytes: *const u8,
     len: usize,
@@ -4278,7 +4276,7 @@ pub extern "C" fn seds_router_receive_serialized(
     }
     let router = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
-    ok_or_status(router.rx_serialized(slice))
+    ok_or_status(router.rx_packed(slice))
 }
 
 #[unsafe(no_mangle)]
@@ -4327,7 +4325,7 @@ pub extern "C" fn seds_router_transmit_message(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_transmit_serialized_message_queue(
+pub extern "C" fn seds_router_transmit_packed_message_queue(
     r: *mut SedsRouter,
     bytes: *const u8,
     len: usize,
@@ -4338,11 +4336,11 @@ pub extern "C" fn seds_router_transmit_serialized_message_queue(
     let router = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
     let data = Arc::from(slice);
-    ok_or_status(router.tx_serialized_queue(data))
+    ok_or_status(router.tx_packed_queue(data))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_transmit_serialized_message(
+pub extern "C" fn seds_router_transmit_packed_message(
     r: *mut SedsRouter,
     bytes: *const u8,
     len: usize,
@@ -4353,7 +4351,7 @@ pub extern "C" fn seds_router_transmit_serialized_message(
     let router = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
     let data = Arc::from(slice);
-    ok_or_status(router.tx_serialized(data))
+    ok_or_status(router.tx_packed(data))
 }
 
 #[unsafe(no_mangle)]
@@ -4375,7 +4373,7 @@ pub extern "C" fn seds_router_process_rx_queue(r: *mut SedsRouter) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_rx_serialized_packet_to_queue(
+pub extern "C" fn seds_router_rx_packed_packet_to_queue(
     r: *mut SedsRouter,
     bytes: *const u8,
     len: usize,
@@ -4385,7 +4383,7 @@ pub extern "C" fn seds_router_rx_serialized_packet_to_queue(
     }
     let router = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
-    ok_or_status(router.rx_serialized_queue(slice))
+    ok_or_status(router.rx_packed_queue(slice))
 }
 
 #[unsafe(no_mangle)]
@@ -4484,7 +4482,7 @@ pub extern "C" fn seds_router_process_all_queues_with_timeout(
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_receive_serialized_from_side(
+pub extern "C" fn seds_router_receive_packed_from_side(
     r: *mut SedsRouter,
     side_id: u32,
     bytes: *const u8,
@@ -4495,7 +4493,7 @@ pub extern "C" fn seds_router_receive_serialized_from_side(
     }
     let router = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
-    ok_or_status(router.rx_serialized_from_side(slice, side_id as usize))
+    ok_or_status(router.rx_packed_from_side(slice, side_id as usize))
 }
 
 #[unsafe(no_mangle)]
@@ -4516,7 +4514,7 @@ pub extern "C" fn seds_router_receive_from_side(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_router_rx_serialized_packet_to_queue_from_side(
+pub extern "C" fn seds_router_rx_packed_packet_to_queue_from_side(
     r: *mut SedsRouter,
     side_id: u32,
     bytes: *const u8,
@@ -4527,7 +4525,7 @@ pub extern "C" fn seds_router_rx_serialized_packet_to_queue_from_side(
     }
     let router = unsafe { &(*r).inner };
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
-    ok_or_status(router.rx_serialized_queue_from_side(slice, side_id as usize))
+    ok_or_status(router.rx_packed_queue_from_side(slice, side_id as usize))
 }
 
 #[unsafe(no_mangle)]
@@ -4900,7 +4898,7 @@ pub extern "C" fn seds_pkt_get_typed(
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_pkt_serialize_len(view: *const SedsPacketView) -> i32 {
+pub extern "C" fn seds_pkt_pack_len(view: *const SedsPacketView) -> i32 {
     if view.is_null() {
         return status_from_err(TelemetryError::BadArg);
     }
@@ -4916,11 +4914,7 @@ pub extern "C" fn seds_pkt_serialize_len(view: *const SedsPacketView) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_pkt_serialize(
-    view: *const SedsPacketView,
-    out: *mut u8,
-    out_len: usize,
-) -> i32 {
+pub extern "C" fn seds_pkt_pack(view: *const SedsPacketView, out: *mut u8, out_len: usize) -> i32 {
     if view.is_null() {
         return status_from_err(TelemetryError::BadArg);
     }
@@ -4933,7 +4927,7 @@ pub extern "C" fn seds_pkt_serialize(
         return status_from_err(e);
     }
 
-    let bytes = serialize_packet(&pkt);
+    let bytes = pack_packet(&pkt);
     let needed = bytes.len();
 
     if out.is_null() || out_len == 0 || out_len < needed {
@@ -4947,13 +4941,13 @@ pub extern "C" fn seds_pkt_serialize(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_pkt_deserialize_owned(bytes: *const u8, len: usize) -> *mut SedsOwnedPacket {
+pub extern "C" fn seds_pkt_unpack_owned(bytes: *const u8, len: usize) -> *mut SedsOwnedPacket {
     if len > 0 && bytes.is_null() {
         return ptr::null_mut();
     }
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
 
-    let tpkt = match deserialize_packet(slice) {
+    let tpkt = match unpack_packet(slice) {
         Ok(p) => p,
         Err(_) => return ptr::null_mut(),
     };
@@ -5011,22 +5005,22 @@ pub extern "C" fn seds_owned_pkt_view(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_pkt_validate_serialized(bytes: *const u8, len: usize) -> i32 {
+pub extern "C" fn seds_pkt_validate_packed(bytes: *const u8, len: usize) -> i32 {
     if len > 0 && bytes.is_null() {
         return status_from_err(TelemetryError::BadArg);
     }
     let slice = unsafe { slice::from_raw_parts(bytes, len) };
-    match deserialize_packet(slice) {
+    match unpack_packet(slice) {
         Ok(p) => match p.validate() {
             Ok(()) => status_from_result_code(SedsResult::SedsOk),
             Err(e) => status_from_err(e),
         },
-        Err(_) => status_from_err(TelemetryError::Deserialize("bad packet")),
+        Err(_) => status_from_err(TelemetryError::Unpack("bad packet")),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn seds_pkt_deserialize_header_owned(
+pub extern "C" fn seds_pkt_unpack_header_owned(
     bytes: *const u8,
     len: usize,
 ) -> *mut SedsOwnedHeader {
@@ -5328,23 +5322,23 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct SerializedTxState {
+    struct PackedTxState {
         attempts: AtomicUsize,
         delivered: Mutex<Vec<Vec<u8>>>,
     }
 
-    fn count_serialized_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> usize {
+    fn count_packed_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> usize {
         frames
             .iter()
             .filter(|bytes| peek_envelope(bytes.as_slice()).ok().map(|env| env.ty) == Some(ty))
             .count()
     }
 
-    extern "C" fn serialized_retry_once_cb(bytes: *const u8, len: usize, user: *mut c_void) -> i32 {
+    extern "C" fn packed_retry_once_cb(bytes: *const u8, len: usize, user: *mut c_void) -> i32 {
         if bytes.is_null() || user.is_null() {
             return status_from_result_code(SedsResult::SedsErr);
         }
-        let state = unsafe { &*(user as *const SerializedTxState) };
+        let state = unsafe { &*(user as *const PackedTxState) };
         let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
         if attempt == 0 {
             return status_from_result_code(SedsResult::SedsErr);
@@ -5354,7 +5348,7 @@ mod tests {
         status_from_result_code(SedsResult::SedsOk)
     }
 
-    extern "C" fn serialized_ok_cb(bytes: *const u8, _len: usize, _user: *mut c_void) -> i32 {
+    extern "C" fn packed_ok_cb(bytes: *const u8, _len: usize, _user: *mut c_void) -> i32 {
         if bytes.is_null() {
             return status_from_result_code(SedsResult::SedsErr);
         }
@@ -5567,7 +5561,7 @@ mod tests {
         let desc = SedsLocalEndpointDesc {
             endpoint: DataEndpoint::Discovery.as_u32(),
             packet_handler: Some(pkt_counter_cb),
-            serialized_handler: None,
+            packed_handler: None,
             user: ptr::null_mut(),
         };
 
@@ -5581,7 +5575,7 @@ mod tests {
         let desc = SedsLocalEndpointDesc {
             endpoint: DataEndpoint::TimeSync.as_u32(),
             packet_handler: Some(pkt_counter_cb),
-            serialized_handler: None,
+            packed_handler: None,
             user: ptr::null_mut(),
         };
 
@@ -5670,7 +5664,7 @@ mod tests {
     }
 
     #[test]
-    fn router_c_abi_managed_variable_cache_roundtrips_serialized_value() {
+    fn router_c_abi_managed_variable_cache_roundtrips_packed_value() {
         crate::tests::ensure_common_test_schema();
         let ty = DataType::named("GPS_DATA");
         let endpoints = [DataEndpoint::named("RADIO")];
@@ -5679,18 +5673,18 @@ mod tests {
 
         assert_eq!(seds_router_enable_managed_variable(router, ty), 0);
         let pkt = Packet::from_f32_slice(ty, &[4.0, 5.0, 6.0], &endpoints, 42).unwrap();
-        let bytes = serialize_packet(&pkt);
+        let bytes = pack_packet(&pkt);
         assert_eq!(
-            seds_router_seed_managed_variable_serialized(router, bytes.as_ptr(), bytes.len()),
+            seds_router_seed_managed_variable_packed(router, bytes.as_ptr(), bytes.len()),
             0
         );
-        let need = seds_router_cached_managed_variable_serialized_len(router, ty);
+        let need = seds_router_cached_managed_variable_packed_len(router, ty);
         assert!(need > 0);
         let mut out = vec![0u8; need as usize];
         let got =
-            seds_router_cached_managed_variable_serialized(router, ty, out.as_mut_ptr(), out.len());
+            seds_router_cached_managed_variable_packed(router, ty, out.as_mut_ptr(), out.len());
         assert_eq!(got, need);
-        let decoded = deserialize_packet(&out).unwrap();
+        let decoded = unpack_packet(&out).unwrap();
         assert_eq!(decoded.data_type(), ty);
         assert_eq!(decoded.data_as_f32().unwrap(), vec![4.0, 5.0, 6.0]);
 
@@ -5741,40 +5735,40 @@ mod tests {
     }
 
     #[test]
-    fn router_c_abi_queued_serialized_ingress_retries_side_tx_and_relays() {
+    fn router_c_abi_queued_packed_ingress_retries_side_tx_and_relays() {
         let side_name_a = b"can";
         let side_name_b = b"uart";
-        let tx_state = SerializedTxState::default();
+        let tx_state = PackedTxState::default();
 
         let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
 
-        let side_a = seds_router_add_side_serialized(
+        let side_a = seds_router_add_side_packed(
             router,
             side_name_a.as_ptr() as *const c_char,
             side_name_a.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             true,
         );
         assert!(side_a >= 0);
 
-        let side_b = seds_router_add_side_serialized(
+        let side_b = seds_router_add_side_packed(
             router,
             side_name_b.as_ptr() as *const c_char,
             side_name_b.len(),
-            Some(serialized_retry_once_cb),
-            (&tx_state as *const SerializedTxState).cast_mut().cast(),
+            Some(packed_retry_once_cb),
+            (&tx_state as *const PackedTxState).cast_mut().cast(),
             true,
         );
         assert!(side_b >= 0);
 
         let pkt = Packet::from_f32_slice(DataType(100), &[1.0, 2.0, 3.0], &[DataEndpoint(101)], 33)
             .unwrap();
-        let wire = serialize_packet(&pkt);
+        let wire = pack_packet(&pkt);
 
         assert_eq!(
-            seds_router_rx_serialized_packet_to_queue_from_side(
+            seds_router_rx_packed_packet_to_queue_from_side(
                 router,
                 side_a as u32,
                 wire.as_ptr(),
@@ -5786,10 +5780,7 @@ mod tests {
 
         assert!(tx_state.attempts.load(Ordering::SeqCst) >= 2);
         let delivered = tx_state.delivered.lock().unwrap().clone();
-        assert_eq!(
-            count_serialized_frames_of_type(&delivered, DataType(100)),
-            1
-        );
+        assert_eq!(count_packed_frames_of_type(&delivered, DataType(100)), 1);
         assert!(!delivered[0].is_empty());
 
         seds_router_free(router);
@@ -6282,11 +6273,11 @@ mod tests {
         assert!(!router.is_null());
 
         let side_name = b"UPLINK";
-        let side_id = seds_router_add_side_serialized(
+        let side_id = seds_router_add_side_packed(
             router,
             side_name.as_ptr() as *const c_char,
             side_name.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             false,
         );
@@ -6320,16 +6311,16 @@ mod tests {
     }
 
     #[test]
-    fn router_c_abi_serialized_profile_sets_compact_side_options() {
+    fn router_c_abi_packed_profile_sets_compact_side_options() {
         let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
 
         let side_name = b"PROFILE_UPLINK";
-        let side_id = seds_router_add_side_serialized_profile(
+        let side_id = seds_router_add_side_packed_profile(
             router,
             side_name.as_ptr() as *const c_char,
             side_name.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             false,
             SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE,
@@ -6339,11 +6330,11 @@ mod tests {
         );
         assert!(side_id >= 0);
         assert_eq!(
-            seds_router_add_side_serialized_profile(
+            seds_router_add_side_packed_profile(
                 router,
                 side_name.as_ptr() as *const c_char,
                 side_name.len(),
-                Some(serialized_ok_cb),
+                Some(packed_ok_cb),
                 ptr::null_mut(),
                 false,
                 99,
@@ -6396,11 +6387,11 @@ mod tests {
         assert!(!relay.is_null());
 
         let side_name = b"UPLINK";
-        let side_id = seds_relay_add_side_serialized(
+        let side_id = seds_relay_add_side_packed(
             relay,
             side_name.as_ptr() as *const c_char,
             side_name.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             false,
         );
@@ -6435,16 +6426,16 @@ mod tests {
     }
 
     #[test]
-    fn relay_c_abi_serialized_profile_sets_compact_side_options() {
+    fn relay_c_abi_packed_profile_sets_compact_side_options() {
         let relay = seds_relay_new(None, ptr::null_mut());
         assert!(!relay.is_null());
 
         let side_name = b"PROFILE_UPLINK";
-        let side_id = seds_relay_add_side_serialized_profile(
+        let side_id = seds_relay_add_side_packed_profile(
             relay,
             side_name.as_ptr() as *const c_char,
             side_name.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             false,
             SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE,
@@ -6454,11 +6445,11 @@ mod tests {
         );
         assert!(side_id >= 0);
         assert_eq!(
-            seds_relay_add_side_serialized_profile(
+            seds_relay_add_side_packed_profile(
                 relay,
                 side_name.as_ptr() as *const c_char,
                 side_name.len(),
-                Some(serialized_ok_cb),
+                Some(packed_ok_cb),
                 ptr::null_mut(),
                 false,
                 99,
@@ -6510,11 +6501,11 @@ mod tests {
         let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
         let side_name = b"UPLINK";
-        let side_id = seds_router_add_side_serialized(
+        let side_id = seds_router_add_side_packed(
             router,
             side_name.as_ptr() as *const c_char,
             side_name.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             false,
         );
@@ -6546,11 +6537,11 @@ mod tests {
 
         let relay = seds_relay_new(None, ptr::null_mut());
         assert!(!relay.is_null());
-        let relay_side_id = seds_relay_add_side_serialized(
+        let relay_side_id = seds_relay_add_side_packed(
             relay,
             side_name.as_ptr() as *const c_char,
             side_name.len(),
-            Some(serialized_ok_cb),
+            Some(packed_ok_cb),
             ptr::null_mut(),
             false,
         );

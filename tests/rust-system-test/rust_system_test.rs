@@ -154,10 +154,7 @@ mod threaded_system_tests {
         let discovery_a =
             build_discovery_announce("REMOTE_A", 0, &[DataEndpoint::named("RADIO")]).unwrap();
         router
-            .rx_serialized_queue_from_side(
-                &sedsnet::serialize::serialize_packet(&discovery_a),
-                side_a,
-            )
+            .rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&discovery_a), side_a)
             .unwrap();
         router.process_all_queues().unwrap();
         now_ms.store(DISCOVERY_ROUTE_TTL_MS / 2, Ordering::SeqCst);
@@ -168,10 +165,7 @@ mod threaded_system_tests {
         )
         .unwrap();
         router
-            .rx_serialized_queue_from_side(
-                &sedsnet::serialize::serialize_packet(&discovery_b),
-                side_b,
-            )
+            .rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&discovery_b), side_b)
             .unwrap();
         router.process_all_queues().unwrap();
         seen_a.lock().unwrap().clear();
@@ -259,7 +253,7 @@ mod threaded_system_tests {
         let discovery_a =
             build_discovery_announce("REMOTE_A", 0, &[DataEndpoint::named("RADIO")]).unwrap();
         relay
-            .rx_serialized_from_side(side_a, &sedsnet::serialize::serialize_packet(&discovery_a))
+            .rx_packed_from_side(side_a, &sedsnet::wire_format::pack_packet(&discovery_a))
             .unwrap();
         relay.process_all_queues().unwrap();
         now_ms.store(DISCOVERY_ROUTE_TTL_MS / 2, Ordering::SeqCst);
@@ -270,7 +264,7 @@ mod threaded_system_tests {
         )
         .unwrap();
         relay
-            .rx_serialized_from_side(side_b, &sedsnet::serialize::serialize_packet(&discovery_b))
+            .rx_packed_from_side(side_b, &sedsnet::wire_format::pack_packet(&discovery_b))
             .unwrap();
         relay.process_all_queues().unwrap();
         seen_a.lock().unwrap().clear();
@@ -351,7 +345,7 @@ mod threaded_system_tests {
         // Frames sent out of relay on "bus1" side get injected into bus1_rx
         let relay_bus1_tx = bus1_tx.clone();
         let bus1_side_id =
-            relay.add_side_serialized("bus1", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus1", move |bytes: &[u8]| -> TelemetryResult<()> {
                 // from = usize::MAX so we don't accidentally "skip" any node
                 let _ = relay_bus1_tx.send((usize::MAX, bytes.to_vec()));
                 Ok(())
@@ -360,7 +354,7 @@ mod threaded_system_tests {
         // Frames sent out of relay on "bus2" side get injected into bus2_rx
         let relay_bus2_tx = bus2_tx.clone();
         let bus2_side_id =
-            relay.add_side_serialized("bus2", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus2", move |bytes: &[u8]| -> TelemetryResult<()> {
                 let _ = relay_bus2_tx.send((usize::MAX, bytes.to_vec()));
                 Ok(())
             });
@@ -422,7 +416,7 @@ mod threaded_system_tests {
             } else {
                 Router::new_with_clock(RouterConfig::new(handlers), clock)
             };
-            router.add_side_serialized("bus", tx);
+            router.add_side_packed("bus", tx);
 
             nodes.push(SimNode {
                 router: Arc::new(router),
@@ -448,14 +442,14 @@ mod threaded_system_tests {
                             if *idx != from {
                                 bus1_nodes_arc[*idx]
                                     .router
-                                    .rx_serialized_queue(&frame)
-                                    .expect("bus1: rx_serialized_packet_to_queue failed");
+                                    .rx_packed_queue(&frame)
+                                    .expect("bus1: rx_packed_packet_to_queue failed");
                             }
                         }
 
                         // Feed into relay from bus1 side
                         bus1_relay
-                            .rx_serialized_from_side(bus1_side_id, &frame)
+                            .rx_packed_from_side(bus1_side_id, &frame)
                             .expect("bus1 -> relay failed");
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -471,12 +465,12 @@ mod threaded_system_tests {
                     if *idx != from {
                         bus1_nodes_arc[*idx]
                             .router
-                            .rx_serialized_queue(&frame)
-                            .expect("bus1: rx_serialized_packet_to_queue failed (drain)");
+                            .rx_packed_queue(&frame)
+                            .expect("bus1: rx_packed_packet_to_queue failed (drain)");
                     }
                 }
                 bus1_relay
-                    .rx_serialized_from_side(bus1_side_id, &frame)
+                    .rx_packed_from_side(bus1_side_id, &frame)
                     .expect("bus1 -> relay failed (drain)");
             }
         });
@@ -494,14 +488,14 @@ mod threaded_system_tests {
                             if *idx != from {
                                 bus2_nodes_arc[*idx]
                                     .router
-                                    .rx_serialized_queue(&frame)
-                                    .expect("bus2: rx_serialized_packet_to_queue failed");
+                                    .rx_packed_queue(&frame)
+                                    .expect("bus2: rx_packed_packet_to_queue failed");
                             }
                         }
 
                         // Feed into relay from bus2 side
                         bus2_relay
-                            .rx_serialized_from_side(bus2_side_id, &frame)
+                            .rx_packed_from_side(bus2_side_id, &frame)
                             .expect("bus2 -> relay failed");
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -515,12 +509,12 @@ mod threaded_system_tests {
                     if *idx != from {
                         bus2_nodes_arc[*idx]
                             .router
-                            .rx_serialized_queue(&frame)
-                            .expect("bus2: rx_serialized_packet_to_queue failed (drain)");
+                            .rx_packed_queue(&frame)
+                            .expect("bus2: rx_packed_packet_to_queue failed (drain)");
                     }
                 }
                 bus2_relay
-                    .rx_serialized_from_side(bus2_side_id, &frame)
+                    .rx_packed_from_side(bus2_side_id, &frame)
                     .expect("bus2 -> relay failed (drain)");
             }
         });

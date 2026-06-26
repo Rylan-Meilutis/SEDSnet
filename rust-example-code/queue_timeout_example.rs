@@ -24,7 +24,7 @@ fn main() -> TelemetryResult<()> {
         )]),
         Box::new(StepClock::default()),
     );
-    router.add_side_serialized("TX", |_bytes| Ok(()));
+    router.add_side_packed("TX", |_bytes| Ok(()));
 
     for i in 0..5 {
         router.log_f32(DataType::named("GPS_DATA"), &[i as f32, 0.0, 0.0])?;

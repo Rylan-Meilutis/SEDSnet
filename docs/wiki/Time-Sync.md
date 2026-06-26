@@ -179,7 +179,7 @@ Python APIs:
 - `router.set_local_network_datetime_nanos(...)`
 
 These setters are safe to call from multiple threads because the internal clock update is
-serialized by the router. For complete date+time values, the implementation re-samples the
+packed by the router. For complete date+time values, the implementation re-samples the
 monotonic clock at commit so short context switches during the call do not leave the stored time
 stale.
 

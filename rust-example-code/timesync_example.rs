@@ -21,7 +21,7 @@ fn main() -> TelemetryResult<()> {
             ..TimeSyncConfig::default()
         }),
     );
-    router.add_side_serialized("TX", |_bytes| Ok(()));
+    router.add_side_packed("TX", |_bytes| Ok(()));
     router.set_local_network_datetime_millis(2025, 1, 1, 12, 0, 0, 0);
 
     router.log_f32(DataType::named("GPS_DATA"), &[37.7749, -122.4194, 30.0])?;

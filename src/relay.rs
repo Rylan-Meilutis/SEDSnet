@@ -17,7 +17,7 @@ use crate::discovery::{
 };
 use crate::packet::{Packet, hash_bytes_u64};
 use crate::queue::{BoundedDeque, ByteCost};
-use crate::serialize;
+use crate::wire_format;
 use crate::{is_reliable_type, message_meta, message_priority, reliable_mode};
 use crate::{
     router::{Clock, CompactTimestampOmissionPolicy, SideTransportProfile},
@@ -47,7 +47,7 @@ const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
 const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
 const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
 const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
-const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + serialize::CRC32_BYTES;
+const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
 const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
 const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
 pub const IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES: usize =
@@ -59,13 +59,13 @@ pub const DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT: usize =
 /// Packet Handler function type
 type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
-/// Serialized Handler function type
-type SerializedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
+/// Packed Handler function type
+type PackedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
 
-/// TX handler for a relay side: either serialized or packet-based.
+/// TX handler for a relay side: either packed or packet-based.
 #[derive(Clone)]
 pub enum RelayTxHandlerFn {
-    Serialized(Arc<SerializedHandlerFn>),
+    Packed(Arc<PackedHandlerFn>),
     Packet(Arc<PacketHandlerFn>),
 }
 
@@ -73,9 +73,9 @@ pub enum RelayTxHandlerFn {
 pub struct RelaySideOptions {
     /// Enables the relay's per-link reliable transport layer on this side.
     ///
-    /// When `true` and the side uses a serialized TX handler, reliable schema traffic on this hop
+    /// When `true` and the side uses a packed TX handler, reliable schema traffic on this hop
     /// gains relay-managed sequence numbers, ACKs, packet requests, and retransmits.
-    /// Packet-output sides still receive decoded packets rather than serialized reliable framing.
+    /// Packet-output sides still receive decoded packets rather than packed reliable framing.
     pub reliable_enabled: bool,
     /// Marks the side as eligible for link-local-only endpoints and discovery routes.
     pub link_local_enabled: bool,
@@ -83,11 +83,11 @@ pub struct RelaySideOptions {
     pub ingress_enabled: bool,
     /// Allows the relay to transmit packets toward this side.
     pub egress_enabled: bool,
-    /// Enables side-local header-template reuse for serialized transport.
+    /// Enables side-local header-template reuse for packed transport.
     pub header_template_enabled: bool,
-    /// Maximum number of bytes to emit per serialized TX callback.
+    /// Maximum number of bytes to emit per packed TX callback.
     ///
-    /// When non-zero and a serialized frame would exceed this size, the relay
+    /// When non-zero and a packed frame would exceed this size, the relay
     /// splits it into ordered side-transport chunks and reassembles them on RX
     /// before normal relay processing. This is intended for fixed-size links
     /// such as CAN or I2C while keeping the user API packet-oriented.
@@ -123,9 +123,9 @@ impl Default for RelaySideOptions {
 }
 
 impl RelaySideOptions {
-    /// Convenience preset for bounded serialized-side transport.
+    /// Convenience preset for bounded packed-side transport.
     ///
-    /// `max_frame_bytes == 0` leaves serialized frames unbounded. Values greater
+    /// `max_frame_bytes == 0` leaves packed frames unbounded. Values greater
     /// than zero enable relay-managed chunking/reassembly on this side.
     #[inline]
     pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
@@ -233,7 +233,7 @@ pub struct RelaySide {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayItem {
-    Serialized(Arc<[u8]>),
+    Packed(Arc<[u8]>),
     Packet(Arc<Packet>),
 }
 
@@ -248,7 +248,7 @@ struct RelayRxItem {
 impl ByteCost for RelayRxItem {
     fn byte_cost(&self) -> usize {
         match &self.data {
-            RelayItem::Serialized(bytes) => bytes.len(),
+            RelayItem::Packed(bytes) => bytes.len(),
             RelayItem::Packet(pkt) => pkt.byte_cost(),
         }
     }
@@ -273,7 +273,7 @@ struct RelayReplayItem {
 impl ByteCost for RelayTxItem {
     fn byte_cost(&self) -> usize {
         match &self.data {
-            RelayItem::Serialized(bytes) => bytes.len(),
+            RelayItem::Packed(bytes) => bytes.len(),
             RelayItem::Packet(pkt) => pkt.byte_cost(),
         }
     }
@@ -1062,7 +1062,7 @@ impl RelayInner {
 }
 
 /// Relay that fans out packets from one side to all others.
-/// - Supports both serialized bytes and full Packet.
+/// - Supports both packed bytes and full Packet.
 /// - Has RX & TX queues, like Router.
 /// - Uses a Clock for the *_with_timeout APIs, same style as Router.
 pub struct Relay {
@@ -1083,7 +1083,7 @@ impl Relay {
     fn relay_item_priority(data: &RelayItem) -> TelemetryResult<u8> {
         let ty = match data {
             RelayItem::Packet(pkt) => pkt.data_type(),
-            RelayItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RelayItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         Ok(message_priority(ty))
     }
@@ -1100,7 +1100,7 @@ impl Relay {
         }) else {
             return Ok(false);
         };
-        let frame = serialize::peek_frame_info(item.bytes.as_ref())?;
+        let frame = wire_format::peek_frame_info(item.bytes.as_ref())?;
         let ty = frame.envelope.ty;
         let Some(hdr) = frame.reliable else {
             return Ok(false);
@@ -1159,7 +1159,7 @@ impl Relay {
             let mut st = self.state.lock();
             let ty = match &data {
                 RelayItem::Packet(pkt) => Some(pkt.data_type()),
-                RelayItem::Serialized(bytes) => Some(serialize::peek_envelope(bytes.as_ref())?.ty),
+                RelayItem::Packed(bytes) => Some(wire_format::peek_envelope(bytes.as_ref())?.ty),
             };
             let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
             #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -1175,7 +1175,7 @@ impl Relay {
         if !allowed {
             return Ok(false);
         }
-        if opts.reliable_enabled && matches!(handler, RelayTxHandlerFn::Serialized(_)) {
+        if opts.reliable_enabled && matches!(handler, RelayTxHandlerFn::Packed(_)) {
             self.send_reliable_to_side(dst, data)?;
             Ok(true)
         } else if let Some(adjusted) = self.adjust_reliable_for_side(opts, data)? {
@@ -1525,15 +1525,15 @@ impl Relay {
 
     fn relay_item_wire_len(data: &RelayItem) -> TelemetryResult<usize> {
         match data {
-            RelayItem::Packet(pkt) => Ok(serialize::serialize_packet(pkt).len()),
-            RelayItem::Serialized(bytes) => Ok(bytes.len()),
+            RelayItem::Packet(pkt) => Ok(wire_format::pack_packet(pkt).len()),
+            RelayItem::Packed(bytes) => Ok(bytes.len()),
         }
     }
 
     #[inline]
     fn decode_end_to_end_reliable_ack(payload: &[u8]) -> TelemetryResult<u64> {
         if payload.len() != 8 {
-            return Err(TelemetryError::Deserialize("bad reliable e2e ack payload"));
+            return Err(TelemetryError::Unpack("bad reliable e2e ack payload"));
         }
         Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
     }
@@ -1562,7 +1562,7 @@ impl Relay {
 
     /// Extract the logical packet ID targeted by an end-to-end reliable ACK item.
     ///
-    /// Relay queues can hold either decoded packets or serialized frames. This
+    /// Relay queues can hold either decoded packets or packed frames. This
     /// helper normalizes both forms so relay ACK-routing logic can treat them
     /// uniformly.
     ///
@@ -1578,14 +1578,14 @@ impl Relay {
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
-            RelayItem::Serialized(bytes) => {
-                if serialize::peek_frame_info(bytes.as_ref())
+            RelayItem::Packed(bytes) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| frame.ack_only())
                 {
                     return Ok(None);
                 }
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 if pkt.data_type() != crate::DataType::ReliableAck
                     || !Self::is_end_to_end_ack_sender(pkt.sender())
                 {
@@ -1832,11 +1832,11 @@ impl Relay {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        let ty = serialize::peek_envelope(bytes.as_ref())
+        let ty = wire_format::peek_envelope(bytes.as_ref())
             .map(|env| env.ty)
             .unwrap_or(crate::DataType::ReliableAck);
         let result = match handler {
-            RelayTxHandlerFn::Serialized(f) => {
+            RelayTxHandlerFn::Packed(f) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
@@ -1848,13 +1848,13 @@ impl Relay {
                 return Ok(());
             }
             RelayTxHandlerFn::Packet(f) => {
-                if serialize::peek_frame_info(bytes.as_ref())
+                if wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| frame.ack_only())
                 {
                     return Ok(());
                 }
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 f(&pkt)
             }
         };
@@ -1877,7 +1877,7 @@ impl Relay {
             (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
         };
 
-        let RelayTxHandlerFn::Serialized(f) = &handler else {
+        let RelayTxHandlerFn::Packed(f) = &handler else {
             return self.call_tx_handler(side, &handler, &data);
         };
 
@@ -1892,8 +1892,8 @@ impl Relay {
 
         let ty = match &data {
             RelayItem::Packet(pkt) => pkt.data_type(),
-            RelayItem::Serialized(bytes) => {
-                let Ok(frame) = serialize::peek_frame_info(bytes.as_ref()) else {
+            RelayItem::Packed(bytes) => {
+                let Ok(frame) = wire_format::peek_frame_info(bytes.as_ref()) else {
                     return self.call_tx_handler(side, &handler, &data);
                 };
                 frame.envelope.ty
@@ -1919,20 +1919,20 @@ impl Relay {
             let next = tx_state.next_seq.wrapping_add(1);
             tx_state.next_seq = if next == 0 { 1 } else { next };
             let flags = match reliable_mode(ty) {
-                crate::ReliableMode::Unordered => serialize::RELIABLE_FLAG_UNORDERED,
+                crate::ReliableMode::Unordered => wire_format::RELIABLE_FLAG_UNORDERED,
                 _ => 0,
             };
             (seq, flags)
         };
 
         let bytes: Arc<[u8]> = match data {
-            RelayItem::Packet(pkt) => serialize::serialize_packet_with_reliable(
+            RelayItem::Packet(pkt) => wire_format::pack_packet_with_reliable(
                 &pkt,
-                serialize::ReliableHeader { flags, seq, ack: 0 },
+                wire_format::ReliableHeader { flags, seq, ack: 0 },
             ),
-            RelayItem::Serialized(bytes) => {
+            RelayItem::Packed(bytes) => {
                 let mut v = bytes.to_vec();
-                if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                if !wire_format::rewrite_reliable_header(&mut v, flags, seq, 0)? {
                     let Some(_side_tx_guard) = self.try_enter_side_tx() else {
                         return Err(TelemetryError::Io("side tx busy"));
                     };
@@ -1994,8 +1994,8 @@ impl Relay {
                 eps.dedup();
                 Ok((eps, pkt.data_type()))
             }
-            RelayItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 let mut eps: Vec<crate::DataEndpoint> = env.endpoints.iter().copied().collect();
                 eps.sort_unstable();
                 eps.dedup();
@@ -2011,8 +2011,8 @@ impl Relay {
     fn item_target_senders(&self, data: &RelayItem) -> TelemetryResult<Arc<[u64]>> {
         match data {
             RelayItem::Packet(pkt) => Ok(Arc::from(pkt.wire_target_senders())),
-            RelayItem::Serialized(bytes) => {
-                Ok(serialize::peek_envelope(bytes.as_ref())?.target_senders)
+            RelayItem::Packed(bytes) => {
+                Ok(wire_format::peek_envelope(bytes.as_ref())?.target_senders)
             }
         }
     }
@@ -2301,9 +2301,9 @@ impl Relay {
         }
         let packet_id = match data {
             RelayItem::Packet(pkt) => pkt.packet_id(),
-            RelayItem::Serialized(bytes) => match serialize::packet_id_from_wire(bytes.as_ref()) {
+            RelayItem::Packed(bytes) => match wire_format::packet_id_from_wire(bytes.as_ref()) {
                 Ok(packet_id) => packet_id,
-                Err(TelemetryError::Deserialize("reliable control frame")) => return Ok(sides),
+                Err(TelemetryError::Unpack("reliable control frame")) => return Ok(sides),
                 Err(err) => return Err(err),
             },
         };
@@ -2593,14 +2593,14 @@ impl Relay {
 
         let sender = match data {
             RelayItem::Packet(pkt) => pkt.sender().to_owned(),
-            RelayItem::Serialized(bytes) => {
-                if serialize::peek_frame_info(bytes.as_ref())
+            RelayItem::Packed(bytes) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| frame.ack_only())
                 {
                     return Ok(None);
                 }
-                serialize::deserialize_packet(bytes.as_ref())?
+                wire_format::unpack_packet(bytes.as_ref())?
                     .sender()
                     .to_owned()
             }
@@ -2890,18 +2890,18 @@ impl Relay {
                 }
                 pkt.as_ref().clone()
             }
-            RelayItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 if !discovery::is_discovery_type(env.ty) {
                     return Ok(());
                 }
-                if serialize::peek_frame_info(bytes.as_ref())
+                if wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| frame.ack_only())
                 {
                     return Ok(());
                 }
-                serialize::deserialize_packet(bytes.as_ref())?
+                wire_format::unpack_packet(bytes.as_ref())?
             }
         };
 
@@ -3075,23 +3075,23 @@ impl Relay {
 
     /// Compute a de-dupe hash for a QueueItem.
     /// Uses packet ID for Packet items, and attempts to extract packet ID from
-    /// serialized bytes. If extraction fails, hashes raw bytes as a fallback.
+    /// packed bytes. If extraction fails, hashes raw bytes as a fallback.
     fn get_hash(item: &RelayRxItem) -> u64 {
         match &item.data {
             RelayItem::Packet(pkt) => pkt.packet_id(),
-            RelayItem::Serialized(bytes) => {
-                let reliable_seq = serialize::peek_frame_info(bytes.as_ref())
+            RelayItem::Packed(bytes) => {
+                let reliable_seq = wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .and_then(|frame| frame.reliable)
                     .and_then(|hdr| {
-                        if (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) != 0 {
+                        if (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) != 0 {
                             None
                         } else {
                             Some(hdr.seq)
                         }
                     });
 
-                match serialize::packet_id_from_wire(bytes.as_ref()) {
+                match wire_format::packet_id_from_wire(bytes.as_ref()) {
                     Ok(id) => {
                         if let Some(seq) = reliable_seq {
                             hash_bytes_u64(id, &seq.to_le_bytes())
@@ -3146,21 +3146,21 @@ impl Relay {
             .any(|side| self.side_has_multiple_announcers_locked(&st, side, now_ms)))
     }
 
-    /// Register a side whose TX callback consumes serialized packet bytes.
+    /// Register a side whose TX callback consumes packed packet bytes.
     ///
-    /// Returns the side id later used for ingress APIs such as `rx_serialized_from_side`.
+    /// Returns the side id later used for ingress APIs such as `rx_packed_from_side`.
     /// The default options disable the relay's per-link reliable framing on this side.
-    pub fn add_side_serialized<F>(&self, name: &'static str, tx: F) -> RelaySideId
+    pub fn add_side_packed<F>(&self, name: &'static str, tx: F) -> RelaySideId
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        self.add_side_serialized_with_options(name, tx, RelaySideOptions::default())
+        self.add_side_packed_with_options(name, tx, RelaySideOptions::default())
     }
 
-    /// Register a serialized side with bounded-frame transport enabled.
+    /// Register a packed side with bounded-frame transport enabled.
     ///
     /// `max_frame_bytes == 0` leaves frames unbounded.
-    pub fn add_side_serialized_small_packets<F>(
+    pub fn add_side_packed_small_packets<F>(
         &self,
         name: &'static str,
         tx: F,
@@ -3169,19 +3169,19 @@ impl Relay {
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        self.add_side_serialized_with_options(
+        self.add_side_packed_with_options(
             name,
             tx,
             RelaySideOptions::default().with_small_packet_transport(max_frame_bytes),
         )
     }
 
-    /// Register a serialized-output side with explicit side options.
+    /// Register a packed-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` enables relay-managed per-hop ACK/retransmit behavior on this side.
     /// `opts.link_local_enabled` gates link-local-only forwarding and discovery use of this side.
     /// `ingress_enabled` and `egress_enabled` set the initial directional policy.
-    pub fn add_side_serialized_with_options<F>(
+    pub fn add_side_packed_with_options<F>(
         &self,
         name: &'static str,
         tx: F,
@@ -3194,7 +3194,7 @@ impl Relay {
         let id = st.sides.len();
         st.sides.push(Some(RelaySide {
             name,
-            tx_handler: RelayTxHandlerFn::Serialized(Arc::new(tx)),
+            tx_handler: RelayTxHandlerFn::Packed(Arc::new(tx)),
             opts,
         }));
         st.side_runtime_stats
@@ -3207,8 +3207,8 @@ impl Relay {
 
     /// Register a side whose TX callback receives decoded [`Packet`] values.
     ///
-    /// Packet-output sides do not preserve the relay's serialized reliable hop framing, so use a
-    /// serialized side when this hop should participate in relay-managed per-link reliability.
+    /// Packet-output sides do not preserve the relay's packed reliable hop framing, so use a
+    /// packed side when this hop should participate in relay-managed per-link reliability.
     pub fn add_side_packet<F>(&self, name: &'static str, tx: F) -> RelaySideId
     where
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
@@ -3951,18 +3951,18 @@ impl Relay {
         st.reliable_return_routes.len()
     }
 
-    /// Enqueue serialized bytes that originated from `src` into the relay RX queue.
+    /// Enqueue packed bytes that originated from `src` into the relay RX queue.
     ///
     /// Note: `Arc::from(bytes)` allocates and copies `len` bytes into a new `Arc<[u8]>`.
     /// This is still “fast enough” for many cases, but it is not allocation-free / ISR-safe.
-    pub fn rx_serialized_from_side(&self, src: RelaySideId, bytes: &[u8]) -> TelemetryResult<()> {
+    pub fn rx_packed_from_side(&self, src: RelaySideId, bytes: &[u8]) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(src)?;
         let Some(bytes) = self.decode_side_transport_frame(src, bytes)? else {
             return Ok(());
         };
         let mut st = self.state.lock();
 
-        let data = RelayItem::Serialized(bytes);
+        let data = RelayItem::Packed(bytes);
         let priority = Self::relay_item_priority(&data)?;
         st.push_rx(RelayRxItem {
             src,
@@ -4014,11 +4014,11 @@ impl Relay {
         self.ensure_side_ingress_enabled(item.src)?;
         match &item.data {
             RelayItem::Packet(pkt) => {
-                let bytes = serialize::serialize_packet(pkt).len();
+                let bytes = wire_format::pack_packet(pkt).len();
                 self.note_side_rx(item.src, pkt.data_type(), bytes);
             }
-            RelayItem::Serialized(bytes) => {
-                if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
+            RelayItem::Packed(bytes) => {
+                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
                     self.note_side_rx(item.src, env.ty, bytes.len());
                 }
             }
@@ -4029,25 +4029,25 @@ impl Relay {
                     self.note_reliable_return_route(item.src, pkt.packet_id());
                 }
             }
-            RelayItem::Serialized(bytes) => {
-                if let Ok(env) = serialize::peek_envelope(bytes.as_ref())
+            RelayItem::Packed(bytes) => {
+                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
                     && is_reliable_type(env.ty)
                     && !is_internal_control_type(env.ty)
-                    && let Ok(packet_id) = serialize::packet_id_from_wire(bytes.as_ref())
+                    && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
                 {
                     self.note_reliable_return_route(item.src, packet_id);
                 }
             }
         }
         let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
-        if let RelayItem::Serialized(bytes) = &item.data {
-            let (_opts, handler_is_serialized, hop_reliable_enabled) = {
+        if let RelayItem::Packed(bytes) = &item.data {
+            let (_opts, handler_is_packed, hop_reliable_enabled) = {
                 let st = self.state.lock();
                 let side_ref = Self::side_ref(&st, item.src)?;
                 let opts = side_ref.opts;
                 (
                     opts,
-                    matches!(side_ref.tx_handler, RelayTxHandlerFn::Serialized(_)),
+                    matches!(side_ref.tx_handler, RelayTxHandlerFn::Packed(_)),
                     opts.reliable_enabled
                         && !self.side_has_multiple_announcers_locked(
                             &st,
@@ -4057,20 +4057,20 @@ impl Relay {
                 )
             };
 
-            let frame = match serialize::peek_frame_info(bytes.as_ref()) {
+            let frame = match wire_format::peek_frame_info(bytes.as_ref()) {
                 Ok(frame) => frame,
                 Err(e) => {
-                    if matches!(e, TelemetryError::Deserialize(msg) if msg == "crc32 mismatch")
+                    if matches!(e, TelemetryError::Unpack(msg) if msg == "crc32 mismatch")
                         && hop_reliable_enabled
-                        && handler_is_serialized
-                        && let Ok(frame) = serialize::peek_frame_info_unchecked(bytes.as_ref())
+                        && handler_is_packed
+                        && let Ok(frame) = wire_format::peek_frame_info_unchecked(bytes.as_ref())
                     {
                         if is_reliable_type(frame.envelope.ty)
                             && let Some(hdr) = frame.reliable
                         {
-                            let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
+                            let unordered = (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
                             let unsequenced =
-                                (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                                (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                             if !unsequenced {
                                 let requested = if unordered {
@@ -4098,7 +4098,7 @@ impl Relay {
             };
 
             if hop_reliable_enabled
-                && handler_is_serialized
+                && handler_is_packed
                 && is_reliable_type(frame.envelope.ty)
                 && let Some(hdr) = frame.reliable
             {
@@ -4106,8 +4106,8 @@ impl Relay {
                     self.handle_reliable_ack(item.src, frame.envelope.ty, hdr.ack);
                     return Ok(());
                 }
-                let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
-                let unsequenced = (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                let unordered = (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
+                let unsequenced = (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                 if !unsequenced {
                     if unordered {
@@ -4186,8 +4186,8 @@ impl Relay {
         for release_bytes in released_buffered {
             let release_item = RelayRxItem {
                 src: item.src,
-                priority: Self::relay_item_priority(&RelayItem::Serialized(release_bytes.clone()))?,
-                data: RelayItem::Serialized(release_bytes),
+                priority: Self::relay_item_priority(&RelayItem::Packed(release_bytes.clone()))?,
+                data: RelayItem::Packed(release_bytes),
             };
             if self.is_duplicate_pkt(&release_item)?
                 && !self.should_forward_duplicate_reliable_item(&release_item)?
@@ -4226,9 +4226,7 @@ impl Relay {
                     } else {
                         let vals = pkt.data_as_u32()?;
                         if vals.len() != 2 {
-                            return Err(TelemetryError::Deserialize(
-                                "bad reliable control payload",
-                            ));
+                            return Err(TelemetryError::Unpack("bad reliable control payload"));
                         }
                         let ty = crate::DataType::try_from_u32(vals[0])
                             .ok_or(TelemetryError::InvalidType)?;
@@ -4249,15 +4247,15 @@ impl Relay {
                     }
                 }
             }
-            RelayItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 if matches!(
                     env.ty,
                     crate::DataType::ReliableAck
                         | crate::DataType::ReliablePacketRequest
                         | crate::DataType::ReliablePartialAck
                 ) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     return self.dispatch_relay_rx_item(&RelayRxItem {
                         src: item.src,
                         data: RelayItem::Packet(Arc::new(pkt)),
@@ -4295,7 +4293,7 @@ impl Relay {
 
     fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
         let mut out = Vec::with_capacity(
-            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + serialize::CRC32_BYTES,
+            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES,
         );
         out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
         out.push(kind);
@@ -4306,13 +4304,13 @@ impl Relay {
     }
 
     fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
-        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + serialize::CRC32_BYTES {
+        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES {
             return Ok(None);
         }
         if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
             return Ok(None);
         }
-        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
         let expected = u32::from_le_bytes([
             bytes[data_len],
             bytes[data_len + 1],
@@ -4321,7 +4319,7 @@ impl Relay {
         ]);
         let data = &bytes[..data_len];
         if Self::crc32_bytes(data) != expected {
-            return Err(TelemetryError::Deserialize("side transport crc32 mismatch"));
+            return Err(TelemetryError::Unpack("side transport crc32 mismatch"));
         }
         let kind = data[SIDE_TRANSPORT_MAGIC.len()];
         Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
@@ -4331,9 +4329,7 @@ impl Relay {
         let mut result = 0u64;
         let mut shift = 0u32;
         for _ in 0..10 {
-            let byte = *buf
-                .get(*off)
-                .ok_or(TelemetryError::Deserialize("short read"))?;
+            let byte = *buf.get(*off).ok_or(TelemetryError::Unpack("short read"))?;
             *off += 1;
             result |= u64::from(byte & 0x7F) << shift;
             if (byte & 0x80) == 0 {
@@ -4341,7 +4337,7 @@ impl Relay {
             }
             shift += 7;
         }
-        Err(TelemetryError::Deserialize("uleb128 too long"))
+        Err(TelemetryError::Unpack("uleb128 too long"))
     }
 
     fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
@@ -4368,22 +4364,21 @@ impl Relay {
     }
 
     fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
-        if bytes.len() < serialize::CRC32_BYTES + 4 {
-            return Err(TelemetryError::Deserialize("short buffer"));
+        if bytes.len() < wire_format::CRC32_BYTES + 4 {
+            return Err(TelemetryError::Unpack("short buffer"));
         }
-        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
         let data = &bytes[..data_len];
         let mut off = 0usize;
         let flags = *data
             .get(off)
-            .ok_or(TelemetryError::Deserialize("short prelude"))?;
+            .ok_or(TelemetryError::Unpack("short prelude"))?;
         off += 1;
         off += 1; // NEP
         let ty_u64 = Self::read_uleb128_local(data, &mut off)?;
-        let ty_u32 =
-            u32::try_from(ty_u64).map_err(|_| TelemetryError::Deserialize("bad data type"))?;
+        let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
         if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
-            return Err(TelemetryError::Deserialize("bad data type"));
+            return Err(TelemetryError::Unpack("bad data type"));
         }
         let ty = crate::DataType(ty_u32);
         let data_size_off = off;
@@ -4391,35 +4386,35 @@ impl Relay {
         let timestamp = Self::read_uleb128_local(data, &mut off)?;
         let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
             u16::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+                .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
         } else {
             0
         };
         let between_start = off;
         let sender_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-            .map_err(|_| TelemetryError::Deserialize("sender length too large"))?;
+            .map_err(|_| TelemetryError::Unpack("sender length too large"))?;
         let sender_wire_len = if (flags & SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED) != 0 {
             usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Deserialize("sender wire length too large"))?
+                .map_err(|_| TelemetryError::Unpack("sender wire length too large"))?
         } else {
             sender_len
         };
         if data.len() < off + SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         off += SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len;
         if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
             let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Deserialize("wire contract length"))?;
+                .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
             if data.len() < off + contract_len {
-                return Err(TelemetryError::Deserialize("short buffer"));
+                return Err(TelemetryError::Unpack("short buffer"));
             }
             off += contract_len;
         }
-        let reliable_off = serialize::reliable_header_offset(bytes)?;
+        let reliable_off = wire_format::reliable_header_offset(bytes)?;
         let (reliable_flags, reliable_seq_ack, payload_off) = if let Some(rel_off) = reliable_off {
-            if data.len() < rel_off + serialize::RELIABLE_HEADER_BYTES {
-                return Err(TelemetryError::Deserialize("short buffer"));
+            if data.len() < rel_off + wire_format::RELIABLE_HEADER_BYTES {
+                return Err(TelemetryError::Unpack("short buffer"));
             }
             let rel_flags = data[rel_off];
             let seq = u32::from_le_bytes([
@@ -4437,13 +4432,13 @@ impl Relay {
             (
                 Some(rel_flags),
                 Some((seq, ack)),
-                rel_off + serialize::RELIABLE_HEADER_BYTES,
+                rel_off + wire_format::RELIABLE_HEADER_BYTES,
             )
         } else {
             (None, None, off)
         };
         if payload_off > data.len() {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         let payload = &data[payload_off..];
         let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
@@ -4483,7 +4478,7 @@ impl Relay {
         timestamp_base: Option<u64>,
     ) -> TelemetryResult<(Arc<[u8]>, u64)> {
         if body.is_empty() {
-            return Err(TelemetryError::Deserialize("short side compact frame"));
+            return Err(TelemetryError::Unpack("short side compact frame"));
         }
         let mut off = 0usize;
         let flags = body[off];
@@ -4491,24 +4486,24 @@ impl Relay {
         if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
             != template.base_flags
         {
-            return Err(TelemetryError::Deserialize("side compact flags mismatch"));
+            return Err(TelemetryError::Unpack("side compact flags mismatch"));
         }
         let data_size = Self::read_uleb128_local(body, &mut off)?;
         let timestamp = match timestamp_mode {
             SideCompactTimestampMode::Absolute => Self::read_uleb128_local(body, &mut off)?,
             SideCompactTimestampMode::Delta => {
                 let timestamp_field = Self::read_uleb128_local(body, &mut off)?;
-                let base = timestamp_base.ok_or(TelemetryError::Deserialize(
+                let base = timestamp_base.ok_or(TelemetryError::Unpack(
                     "missing side compact timestamp context",
                 ))?;
                 base.checked_add(timestamp_field)
-                    .ok_or(TelemetryError::Deserialize(
+                    .ok_or(TelemetryError::Unpack(
                         "side compact timestamp delta overflow",
                     ))?
             }
-            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(
-                TelemetryError::Deserialize("missing side compact timestamp context"),
-            )?,
+            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(TelemetryError::Unpack(
+                "missing side compact timestamp context",
+            ))?,
         };
         let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
             Some(Self::read_uleb128_local(body, &mut off)?)
@@ -4517,7 +4512,7 @@ impl Relay {
         };
         let reliable_seq_ack = if template.reliable_flags.is_some() {
             if body.len() < off + 8 {
-                return Err(TelemetryError::Deserialize("short side compact reliable"));
+                return Err(TelemetryError::Unpack("short side compact reliable"));
             }
             let seq = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
             let ack =
@@ -4541,8 +4536,8 @@ impl Relay {
         raw.extend_from_slice(&template.between);
         if let Some(rel_flags) = template.reliable_flags {
             raw.push(rel_flags);
-            let (seq, ack) = reliable_seq_ack
-                .ok_or(TelemetryError::Deserialize("missing side compact reliable"))?;
+            let (seq, ack) =
+                reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
             raw.extend_from_slice(&seq.to_le_bytes());
             raw.extend_from_slice(&ack.to_le_bytes());
         }
@@ -4734,7 +4729,7 @@ impl Relay {
             SIDE_TRANSPORT_KIND_FULL => {
                 let mut off = 0usize;
                 let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
                 let raw = Arc::<[u8]>::from(&body[off..]);
                 if let Ok((template, _, _, _, timestamp, _, _, _)) =
                     Self::extract_side_header_template(raw.as_ref())
@@ -4765,11 +4760,11 @@ impl Relay {
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
             | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
                 if body.is_empty() {
-                    return Err(TelemetryError::Deserialize("short side compact frame"));
+                    return Err(TelemetryError::Unpack("short side compact frame"));
                 }
                 let mut off = 1usize;
                 let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
                 let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
                 compact_body.push(body[0]);
                 compact_body.extend_from_slice(&body[off..]);
@@ -4793,7 +4788,7 @@ impl Relay {
                     (template, timestamp_base)
                 };
                 let template =
-                    template.ok_or(TelemetryError::Deserialize("unknown side compact template"))?;
+                    template.ok_or(TelemetryError::Unpack("unknown side compact template"))?;
                 let timestamp_mode = match kind {
                     SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
                     SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
@@ -4813,7 +4808,7 @@ impl Relay {
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
                 if body.len() < 8 {
-                    return Err(TelemetryError::Deserialize("short side chunk frame"));
+                    return Err(TelemetryError::Unpack("short side chunk frame"));
                 }
                 let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let index = u16::from_le_bytes([body[4], body[5]]);
@@ -4830,20 +4825,20 @@ impl Relay {
                         entry.total = total;
                     } else if entry.total != total {
                         side_state.rx_chunks.remove(&transfer_id);
-                        return Err(TelemetryError::Deserialize("side chunk total mismatch"));
+                        return Err(TelemetryError::Unpack("side chunk total mismatch"));
                     }
                     entry.received.entry(index).or_insert(payload);
                     if entry.received.len() == usize::from(total) {
                         let entry = side_state
                             .rx_chunks
                             .remove(&transfer_id)
-                            .ok_or(TelemetryError::Deserialize("side chunk missing"))?;
+                            .ok_or(TelemetryError::Unpack("side chunk missing"))?;
                         let mut out = Vec::new();
                         for idx in 0..entry.total {
                             let chunk = entry
                                 .received
                                 .get(&idx)
-                                .ok_or(TelemetryError::Deserialize("side chunk gap"))?;
+                                .ok_or(TelemetryError::Unpack("side chunk gap"))?;
                             out.extend_from_slice(chunk);
                         }
                         Some(Arc::<[u8]>::from(out))
@@ -4856,15 +4851,15 @@ impl Relay {
                     None => Ok(None),
                 }
             }
-            _ => Err(TelemetryError::Deserialize("unknown side transport frame")),
+            _ => Err(TelemetryError::Unpack("unknown side transport frame")),
         }
     }
 
     /// Helper: call a TX handler with the best representation we have.
     /// - Packet handler + Packet item: direct.
-    /// - Serialized handler + Serialized item: direct.
-    /// - Packet handler + Serialized item: deserialize for this call.
-    /// - Serialized handler + Packet item: serialize for this call.
+    /// - Packed handler + Packed item: direct.
+    /// - Packet handler + Packed item: unpack for this call.
+    /// - Packed handler + Packet item: pack for this call.
     fn call_tx_handler(
         &self,
         side: RelaySideId,
@@ -4881,11 +4876,11 @@ impl Relay {
         let started_ms = self.clock.now_ms();
         let ty = match data {
             RelayItem::Packet(pkt) => pkt.data_type(),
-            RelayItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RelayItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         let result = match (handler, data) {
             // Fast paths
-            (RelayTxHandlerFn::Serialized(f), RelayItem::Serialized(bytes)) => {
+            (RelayTxHandlerFn::Packed(f), RelayItem::Packed(bytes)) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
@@ -4899,8 +4894,8 @@ impl Relay {
             (RelayTxHandlerFn::Packet(f), RelayItem::Packet(pkt)) => f(pkt),
 
             // Conversion paths
-            (RelayTxHandlerFn::Serialized(f), RelayItem::Packet(pkt)) => {
-                let owned = serialize::serialize_packet(pkt);
+            (RelayTxHandlerFn::Packed(f), RelayItem::Packet(pkt)) => {
+                let owned = wire_format::pack_packet(pkt);
                 let frames = self.encode_side_transport_frames(side, opts, owned)?;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
@@ -4911,14 +4906,14 @@ impl Relay {
                 self.note_side_tx_success(side, ty, sent_bytes, 1);
                 return Ok(());
             }
-            (RelayTxHandlerFn::Packet(f), RelayItem::Serialized(bytes)) => {
-                if serialize::peek_frame_info(bytes.as_ref())
+            (RelayTxHandlerFn::Packet(f), RelayItem::Packed(bytes)) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| frame.ack_only())
                 {
                     return Ok(());
                 }
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 f(&pkt)
             }
         };
@@ -4943,29 +4938,29 @@ impl Relay {
         }
 
         match data {
-            RelayItem::Serialized(bytes) => {
-                let frame = match serialize::peek_frame_info(bytes.as_ref()) {
+            RelayItem::Packed(bytes) => {
+                let frame = match wire_format::peek_frame_info(bytes.as_ref()) {
                     Ok(frame) => frame,
-                    Err(_) => return Ok(Some(RelayItem::Serialized(bytes))),
+                    Err(_) => return Ok(Some(RelayItem::Packed(bytes))),
                 };
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
-                    if (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) != 0 {
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) != 0 {
                         return Ok(None);
                     }
-                    if (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) == 0 {
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) == 0 {
                         let mut v = bytes.to_vec();
-                        let _ = serialize::rewrite_reliable_header(
+                        let _ = wire_format::rewrite_reliable_header(
                             &mut v,
-                            serialize::RELIABLE_FLAG_UNSEQUENCED,
+                            wire_format::RELIABLE_FLAG_UNSEQUENCED,
                             hdr.seq,
                             0,
                         )?;
-                        return Ok(Some(RelayItem::Serialized(Arc::from(v))));
+                        return Ok(Some(RelayItem::Packed(Arc::from(v))));
                     }
                 }
-                Ok(Some(RelayItem::Serialized(bytes)))
+                Ok(Some(RelayItem::Packed(bytes)))
             }
             RelayItem::Packet(pkt) => {
                 if matches!(

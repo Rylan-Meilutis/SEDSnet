@@ -28,7 +28,7 @@ packet came from a migration-safe wire contract.
 - otherwise the current runtime `message_meta(ty).element`
 
 That distinction matters when runtime schema changes while packets are still in flight. Old packets
-can continue to validate and decode against the inline wire shape they were serialized with.
+can continue to validate and decode against the inline wire shape they were packed with.
 
 ## Validation rules
 
@@ -81,7 +81,7 @@ migration metadata.
 
 ### `wire_shape`
 
-`wire_shape` is an inline `MessageElement` copied from the serialized frame when the wire contract
+`wire_shape` is an inline `MessageElement` copied from the packed frame when the wire contract
 carried one.
 
 Effects:

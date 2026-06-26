@@ -38,7 +38,7 @@ They cover:
 - network-variable getter/setter permissions, tiered cache refresh, and update callbacks
 - topology graph export, control-endpoint filtering, leave-announcement pruning, client stats, and
   memory-layout snapshots
-- fixed-size serialized side splitting/reassembly and side-local header-template compaction
+- fixed-size packed side splitting/reassembly and side-local header-template compaction
 - E2E payload cryptography policies, software fallback crypto, multi-holder encrypted fanout, and
   tamper rejection
 - router and relay reliable-delivery internals
@@ -53,12 +53,16 @@ The Rust system tests live under `tests/rust-system-test/`.
 
 They exercise multi-node flows that are awkward to validate in a single unit test, including:
 
-- router-to-router serialized links
+- router-to-router packed links
 - router-to-relay-to-router forwarding
 - discovery convergence and multi-hop routing
 - reliable delivery under dropped frames and retransmit recovery
 - end-to-end reliable acknowledgement routing without flooding unrelated sides
 - time-sync election, failover, and multi-node clock behavior
+- time-sync convergence across constrained scheduler models such as RFBOARD26-style TDMA slots,
+  high-latency FIFO radios, bursty shared serial links, and CAN-FD tick scheduling, with assertions
+  that each modeled board converges to an accurate clock and that slow links are not monopolized by
+  time-sync traffic
 - compression and memory-pool behavior
 
 These tests validate behavior closer to how the crate is actually embedded into larger systems.
@@ -152,6 +156,29 @@ cargo nextest run --features timesync
 
 `./build.py test` auto-detects nextest. Set `SEDSNET_TEST_RUNNER=cargo` to force Cargo's
 built-in runner, or `SEDSNET_TEST_RUNNER=nextest` to require nextest.
+
+Ignored long-form soak:
+
+```bash
+cargo test --test reliable_drop_test comprehensive_multinode_churn_soak_exercises_stack_features -- --ignored --nocapture
+```
+
+This deterministic multi-node soak is intentionally ignored by default because the normal settings
+simulate several virtual minutes of unreliable network behavior. It exercises gateway and RF relay
+paths, links with different bandwidth budgets, random disconnect/reconnect windows, planned side
+disable/enable windows, temporary side add/remove operations, discovery and topology export,
+source and typed route policies, reliable recovery, network-variable cache propagation, large
+dynamic payload forwarding, side-transport compaction/chunking, time-sync configuration, runtime
+stats, memory-layout export, and E2E crypto when the `cryptography` feature is enabled.
+
+The soak can be shortened for local iteration:
+
+```bash
+SEDSNET_SOAK_TICKS=160 SEDSNET_SOAK_TICK_MS=250 cargo test --test reliable_drop_test comprehensive_multinode_churn_soak_exercises_stack_features -- --ignored --nocapture
+```
+
+`SEDSNET_SOAK_TICKS` controls how many virtual ticks run before the recovery drain, and
+`SEDSNET_SOAK_TICK_MS` controls the virtual milliseconds advanced per tick.
 
 Broader validation:
 

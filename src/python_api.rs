@@ -5,19 +5,19 @@
 //! - `Packet`
 //!   - Immutable view of a `Packet`
 //!   - Header fields + payload access
-//!   - Serialization to bytes
+//!   - Packing to wire bytes
 //!
 //! - `Router`
 //!   - Logging (bytes, f32, generic typed)
 //!   - RX/TX queue processing (with optional timeouts)
-//!   - Python callbacks for TX, packet handlers, and serialized handlers
+//!   - Python callbacks for TX, packet handlers, and packed handlers
 //!   - New link-aware APIs (`*_from`, RX queueing variants)
 //!
 //! - `Relay`
 //!   - unchanged (fans out between sides)
 //!
 //! - Top-level helpers
-//!   - `deserialize_packet_py(data)` → `Packet`
+//!   - `unpack_packet_py(data)` → `Packet`
 //!   - `peek_header_py(data)` → dict with header fields
 //!   - `make_packet(...)` → `Packet`
 //!
@@ -55,8 +55,8 @@ use crate::{
         Clock, EndpointHandler, LeBytes, NetworkVariablePermissions, Router, RouterConfig,
         RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
     },
-    serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
     try_enum_from_i32, try_enum_from_u32,
+    wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
 };
 
 static GLOBAL_ROUTER_SINGLETON: OnceLock<SArc<Mutex<Router>>> = OnceLock::new();
@@ -104,7 +104,7 @@ fn dtype_from_u32(x: u32) -> TelemetryResult<DataType> {
 
 /// Convert Python-side `int` → `DataEndpoint`, with range/validity checks.
 fn endpoint_from_u32(x: u32) -> TelemetryResult<DataEndpoint> {
-    DataEndpoint::try_from_u32(x).ok_or(TelemetryError::Deserialize("bad endpoint"))
+    DataEndpoint::try_from_u32(x).ok_or(TelemetryError::Unpack("bad endpoint"))
 }
 
 fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
@@ -210,14 +210,14 @@ fn build_endpoint_handlers(
                 let cb_for_closure = cb.clone_ref(py);
                 keep_ser.push(cb);
 
-                let eh = EndpointHandler::new_serialized_handler(endpoint, move |bytes| {
+                let eh = EndpointHandler::new_packed_handler(endpoint, move |bytes| {
                     Python::attach(|py| {
                         let arg = PyBytes::new(py, bytes).into_any();
                         match cb_for_closure.call1(py, (arg,)) {
                             Ok(_cb) => Ok(()),
                             Err(err) => {
                                 err.restore(py);
-                                Err(TelemetryError::Io("serialized handler error"))
+                                Err(TelemetryError::Io("packed handler error"))
                             }
                         }
                     })
@@ -867,7 +867,7 @@ fn runtime_stats_snapshot_to_pydict(
 /// Python-visible wrapper around `Packet`.
 ///
 /// Constructed indirectly via:
-/// - `deserialize_packet_py`
+/// - `unpack_packet_py`
 /// - `make_packet`
 /// - callbacks (router handlers)
 #[pyclass(name = "Packet")]
@@ -945,14 +945,14 @@ impl PyPacket {
         self.inner.to_string()
     }
 
-    /// Wire size in bytes when serialized.
+    /// Wire size in bytes when packed.
     fn wire_size(&self) -> usize {
         packet_wire_size(&self.inner)
     }
 
-    /// Serialize to wire format bytes.
-    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = serialize_packet(&self.inner);
+    /// Pack to wire format bytes.
+    fn pack<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = pack_packet(&self.inner);
         Ok(PyBytes::new(py, &bytes))
     }
 }
@@ -990,7 +990,7 @@ impl Clock for PyClock {
 ///
 /// The underlying `Router` is protected by a `Mutex` for host-side
 /// concurrency. Python callbacks for TX, packet handlers, and
-/// serialized handlers are kept alive in this object.
+/// packed handlers are kept alive in this object.
 #[pyclass(name = "Router")]
 pub struct PyRouter {
     // Host-side concurrency: protect the Router with a Mutex and share via Arc.
@@ -1109,7 +1109,7 @@ impl PyRouter {
     // ------------------------------------------------------------------------
 
     #[pyo3(signature = (name, tx, reliable_enabled=false))]
-    fn add_side_serialized(
+    fn add_side_packed(
         &mut self,
         py: Python<'_>,
         name: &str,
@@ -1132,7 +1132,7 @@ impl PyRouter {
             ..RouterSideOptions::default()
         };
 
-        let id = rtr.add_side_serialized_with_options(
+        let id = rtr.add_side_packed_with_options(
             name_static,
             move |bytes| {
                 Python::attach(|py| {
@@ -1159,7 +1159,7 @@ impl PyRouter {
 
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (name, tx, reliable_enabled=false, profile="ipv6_like", max_frame_bytes=0, compact_header_target_bytes=0, max_side_transport_templates=64))]
-    fn add_side_serialized_profile(
+    fn add_side_packed_profile(
         &mut self,
         py: Python<'_>,
         name: &str,
@@ -1185,7 +1185,7 @@ impl PyRouter {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        let id = rtr.add_side_serialized_with_options(
+        let id = rtr.add_side_packed_with_options(
             name_static,
             move |bytes| {
                 Python::attach(|py| {
@@ -1453,7 +1453,19 @@ impl PyRouter {
         rtr.tx_queue(pkt_ref.inner.clone()).map_err(py_err_from)
     }
 
-    fn transmit_serialized_message(
+    fn transmit_packed_message(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes: &[u8] = data.extract()?;
+        let arc: AArc<[u8]> = AArc::from(bytes);
+
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+
+        rtr.tx_packed(arc).map_err(py_err_from)
+    }
+
+    fn transmit_packed_message_queue(
         &self,
         _py: Python<'_>,
         data: &Bound<'_, PyAny>,
@@ -1466,32 +1478,16 @@ impl PyRouter {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
 
-        rtr.tx_serialized(arc).map_err(py_err_from)
+        rtr.tx_packed_queue(arc).map_err(py_err_from)
     }
 
-    fn transmit_serialized_message_queue(
-        &self,
-        _py: Python<'_>,
-        data: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let bytes: &[u8] = data.extract()?;
-        let arc: AArc<[u8]> = AArc::from(bytes);
-
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-
-        rtr.tx_serialized_queue(arc).map_err(py_err_from)
-    }
-
-    fn receive_serialized(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn receive_packed(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
         let rtr = self
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized(bytes).map_err(py_err_from)
+        rtr.rx_packed(bytes).map_err(py_err_from)
     }
 
     fn receive_packet(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1507,7 +1503,7 @@ impl PyRouter {
     //  Side-aware RX (explicit ingress side)
     // ------------------------------------------------------------------------
 
-    fn receive_serialized_from_side(
+    fn receive_packed_from_side(
         &self,
         _py: Python<'_>,
         side_id: u32,
@@ -1518,17 +1514,17 @@ impl PyRouter {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized_from_side(bytes, side_id as usize)
+        rtr.rx_packed_from_side(bytes, side_id as usize)
             .map_err(py_err_from)
     }
 
-    fn receive_serialized_queue(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn receive_packed_queue(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
         let rtr = self
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized_queue(bytes).map_err(py_err_from)
+        rtr.rx_packed_queue(bytes).map_err(py_err_from)
     }
 
     fn receive_packet_queue(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1540,7 +1536,7 @@ impl PyRouter {
         rtr.rx_queue(pkt_ref.inner.clone()).map_err(py_err_from)
     }
 
-    fn receive_serialized_queue_from_side(
+    fn receive_packed_queue_from_side(
         &self,
         _py: Python<'_>,
         side_id: u32,
@@ -1551,7 +1547,7 @@ impl PyRouter {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized_queue_from_side(bytes, side_id as usize)
+        rtr.rx_packed_queue_from_side(bytes, side_id as usize)
             .map_err(py_err_from)
     }
 
@@ -2177,7 +2173,7 @@ impl PyRouter {
 /// Python-visible relay wrapper.
 ///
 /// The Relay:
-///   - fans out serialized packets from one side to all others
+///   - fans out packed packets from one side to all others
 ///   - has RX/TX queues and time-budgeted processing
 ///   - uses the same Clock abstraction as Router.
 #[pyclass(name = "Relay")]
@@ -2217,7 +2213,7 @@ impl PyRelay {
     }
 
     #[pyo3(signature = (name, tx, reliable_enabled=false))]
-    fn add_side_serialized(
+    fn add_side_packed(
         &mut self,
         py: Python<'_>,
         name: &str,
@@ -2235,7 +2231,7 @@ impl PyRelay {
             ..RelaySideOptions::default()
         };
 
-        let id = self.inner.add_side_serialized_with_options(
+        let id = self.inner.add_side_packed_with_options(
             name_static,
             move |bytes| {
                 Python::attach(|py| {
@@ -2262,7 +2258,7 @@ impl PyRelay {
 
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (name, tx, reliable_enabled=false, profile="ipv6_like", max_frame_bytes=0, compact_header_target_bytes=0, max_side_transport_templates=64))]
-    fn add_side_serialized_profile(
+    fn add_side_packed_profile(
         &mut self,
         py: Python<'_>,
         name: &str,
@@ -2284,7 +2280,7 @@ impl PyRelay {
             compact_header_target_bytes,
             max_side_transport_templates,
         );
-        let id = self.inner.add_side_serialized_with_options(
+        let id = self.inner.add_side_packed_with_options(
             name_static,
             move |bytes| {
                 Python::attach(|py| {
@@ -2483,7 +2479,7 @@ impl PyRelay {
             .map_err(py_err_from)
     }
 
-    fn rx_serialized_from_side(
+    fn rx_packed_from_side(
         &self,
         _py: Python<'_>,
         side_id: u32,
@@ -2491,7 +2487,7 @@ impl PyRelay {
     ) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
         self.inner
-            .rx_serialized_from_side(side_id as usize, bytes)
+            .rx_packed_from_side(side_id as usize, bytes)
             .map_err(py_err_from)
     }
 
@@ -2596,10 +2592,10 @@ impl PyRelay {
 // ============================================================================
 
 #[pyfunction]
-/// Deserializes wire bytes into a `PyPacket` instance.
-pub fn deserialize_packet_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+/// Unpacks wire bytes into a `PyPacket` instance.
+pub fn unpack_packet_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let bytes: &[u8] = data.extract()?;
-    let pkt = deserialize_packet(bytes).map_err(py_err_from)?;
+    let pkt = unpack_packet(bytes).map_err(py_err_from)?;
     if let Err(e) = pkt.validate() {
         return Err(py_err_from(e));
     }
@@ -2886,7 +2882,7 @@ pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPacket>()?;
     m.add_class::<PyRelay>()?;
 
-    m.add_function(wrap_pyfunction!(deserialize_packet_py, m)?)?;
+    m.add_function(wrap_pyfunction!(unpack_packet_py, m)?)?;
     m.add_function(wrap_pyfunction!(peek_header_py, m)?)?;
     m.add_function(wrap_pyfunction!(make_packet, m)?)?;
     m.add_function(wrap_pyfunction!(endpoint_exists_py, m)?)?;

@@ -36,10 +36,10 @@
 - Added compact 80-byte managed credential helpers for master-root deployments. A master/root key
   can issue short-lived board credentials containing subject, key, epoch, validity window, and
   permission bits; peers verify them before accepting issued session or group keys.
-- Added runtime sender ID update APIs and reduced follow-up serialized header overhead by caching
-  sender/header templates on serialized sides.
-- Added fixed-size serialized side splitting/reassembly for transports such as CAN, I2C, and
-  fixed-frame radio links. Router and relay sides can cap outbound serialized chunks without
+- Added runtime sender ID update APIs and reduced follow-up packed header overhead by caching
+  sender/header templates on packed sides.
+- Added fixed-size packed side splitting/reassembly for transports such as CAN, I2C, and
+  fixed-frame radio links. Router and relay sides can cap outbound packed chunks without
   changing the user packet/logging API.
 - Added link-probe sample APIs for routers and relays so transport bring-up or driver-measured
   throughput can seed adaptive path selection.
@@ -77,7 +77,7 @@
   traffic such as `SEDSNET_DISCOVERY`, `SEDSNET_TIME_SYNC`, and `SEDSNET_ERROR`.
 - C API coverage now includes router/relay global helper wrappers, network variables, update
   callbacks, cryptography provider registration, software fallback keys, managed credentials,
-  runtime sender IDs, fixed-size serialized sides, link-probe samples, leave announcements, memory
+  runtime sender IDs, fixed-size packed sides, link-probe samples, leave announcements, memory
   layout, client stats, and topology/runtime-stat exports.
 - `./build.py test` now auto-detects `cargo-nextest` for non-doctest Rust suites when installed,
   falls back to `cargo test` when it is not, and keeps doctests covered with Cargo's built-in test

@@ -69,12 +69,12 @@ int32_t seds_global_router_init_error(void);
 SedsResult seds_global_router_init(const SedsWrapperRouterConfig * cfg);
 void seds_global_router_free(void);
 
-SedsSideRef seds_wrapper_router_add_serialized_side(SedsWrapperRouter * node,
+SedsSideRef seds_wrapper_router_add_packed_side(SedsWrapperRouter * node,
                                                     SedsName name,
                                                     SedsTransmitFn tx,
                                                     void * tx_user,
                                                     bool reliable_enabled);
-SedsSideRef seds_wrapper_router_add_serialized_small_side(SedsWrapperRouter * node,
+SedsSideRef seds_wrapper_router_add_packed_small_side(SedsWrapperRouter * node,
                                                           SedsName name,
                                                           SedsTransmitFn tx,
                                                           void * tx_user,
@@ -85,11 +85,11 @@ SedsSideRef seds_wrapper_router_add_packet_side(SedsWrapperRouter * node,
                                                 SedsEndpointHandlerFn tx,
                                                 void * tx_user,
                                                 bool reliable_enabled);
-SedsSideRef seds_global_router_add_serialized_side(SedsName name,
+SedsSideRef seds_global_router_add_packed_side(SedsName name,
                                                    SedsTransmitFn tx,
                                                    void * tx_user,
                                                    bool reliable_enabled);
-SedsSideRef seds_global_router_add_serialized_small_side(SedsName name,
+SedsSideRef seds_global_router_add_packed_small_side(SedsName name,
                                                          SedsTransmitFn tx,
                                                          void * tx_user,
                                                          bool reliable_enabled,
@@ -112,15 +112,15 @@ SedsResult seds_global_router_clear_route_weight(SedsSideRef src_side, SedsSideR
 SedsResult seds_global_router_set_route_priority(SedsSideRef src_side, SedsSideRef dst_side, uint32_t priority);
 SedsResult seds_global_router_clear_route_priority(SedsSideRef src_side, SedsSideRef dst_side);
 
-SedsResult seds_wrapper_router_rx_serialized(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_rx_packed(SedsWrapperRouter * node,
                                              const uint8_t * bytes,
                                              size_t len);
-SedsResult seds_wrapper_router_rx_serialized_from_side(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_rx_packed_from_side(SedsWrapperRouter * node,
                                                        SedsSideRef side,
                                                        const uint8_t * bytes,
                                                        size_t len);
-SedsResult seds_global_router_rx_serialized(const uint8_t * bytes, size_t len);
-SedsResult seds_global_router_rx_serialized_from_side(SedsSideRef side,
+SedsResult seds_global_router_rx_packed(const uint8_t * bytes, size_t len);
+SedsResult seds_global_router_rx_packed_from_side(SedsSideRef side,
                                                       const uint8_t * bytes,
                                                       size_t len);
 
@@ -141,22 +141,22 @@ SedsResult seds_wrapper_router_on_network_variable_update(SedsWrapperRouter * no
                                                           void * user);
 void seds_wrapper_router_disable_managed_variable(SedsWrapperRouter * node, SedsTypeRef ty);
 SedsResult seds_wrapper_router_request_managed_variable(SedsWrapperRouter * node, SedsTypeRef ty);
-SedsResult seds_wrapper_router_set_network_variable_serialized(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_set_network_variable_packed(SedsWrapperRouter * node,
                                                                const uint8_t * bytes,
                                                                size_t len);
-SedsResult seds_wrapper_router_seed_managed_variable_serialized(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_seed_managed_variable_packed(SedsWrapperRouter * node,
                                                                 const uint8_t * bytes,
                                                                 size_t len);
-int32_t seds_wrapper_router_cached_managed_variable_serialized_len(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_cached_managed_variable_packed_len(SedsWrapperRouter * node,
                                                                    SedsTypeRef ty);
-int32_t seds_wrapper_router_cached_managed_variable_serialized(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_cached_managed_variable_packed(SedsWrapperRouter * node,
                                                                SedsTypeRef ty,
                                                                uint8_t * out,
                                                                size_t out_len);
-int32_t seds_wrapper_router_get_network_variable_serialized_len(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_get_network_variable_packed_len(SedsWrapperRouter * node,
                                                                 SedsTypeRef ty,
                                                                 uint32_t stale_after_ms);
-int32_t seds_wrapper_router_get_network_variable_serialized(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_get_network_variable_packed(SedsWrapperRouter * node,
                                                             SedsTypeRef ty,
                                                             uint32_t stale_after_ms,
                                                             uint8_t * out,
@@ -175,15 +175,15 @@ SedsResult seds_global_router_on_network_variable_update(SedsTypeRef ty,
                                                          void * user);
 void seds_global_router_disable_managed_variable(SedsTypeRef ty);
 SedsResult seds_global_router_request_managed_variable(SedsTypeRef ty);
-SedsResult seds_global_router_set_network_variable_serialized(const uint8_t * bytes, size_t len);
-SedsResult seds_global_router_seed_managed_variable_serialized(const uint8_t * bytes, size_t len);
-int32_t seds_global_router_cached_managed_variable_serialized_len(SedsTypeRef ty);
-int32_t seds_global_router_cached_managed_variable_serialized(SedsTypeRef ty,
+SedsResult seds_global_router_set_network_variable_packed(const uint8_t * bytes, size_t len);
+SedsResult seds_global_router_seed_managed_variable_packed(const uint8_t * bytes, size_t len);
+int32_t seds_global_router_cached_managed_variable_packed_len(SedsTypeRef ty);
+int32_t seds_global_router_cached_managed_variable_packed(SedsTypeRef ty,
                                                               uint8_t * out,
                                                               size_t out_len);
-int32_t seds_global_router_get_network_variable_serialized_len(SedsTypeRef ty,
+int32_t seds_global_router_get_network_variable_packed_len(SedsTypeRef ty,
                                                                uint32_t stale_after_ms);
-int32_t seds_global_router_get_network_variable_serialized(SedsTypeRef ty,
+int32_t seds_global_router_get_network_variable_packed(SedsTypeRef ty,
                                                            uint32_t stale_after_ms,
                                                            uint8_t * out,
                                                            size_t out_len);
@@ -233,12 +233,12 @@ int32_t seds_global_relay_init_error(void);
 SedsResult seds_global_relay_init(const SedsWrapperRelayConfig * cfg);
 void seds_global_relay_free(void);
 
-SedsSideRef seds_wrapper_relay_add_serialized_side(SedsWrapperRelay * node,
+SedsSideRef seds_wrapper_relay_add_packed_side(SedsWrapperRelay * node,
                                                    SedsName name,
                                                    SedsTransmitFn tx,
                                                    void * tx_user,
                                                    bool reliable_enabled);
-SedsSideRef seds_wrapper_relay_add_serialized_small_side(SedsWrapperRelay * node,
+SedsSideRef seds_wrapper_relay_add_packed_small_side(SedsWrapperRelay * node,
                                                          SedsName name,
                                                          SedsTransmitFn tx,
                                                          void * tx_user,
@@ -249,11 +249,11 @@ SedsSideRef seds_wrapper_relay_add_packet_side(SedsWrapperRelay * node,
                                                SedsEndpointHandlerFn tx,
                                                void * tx_user,
                                                bool reliable_enabled);
-SedsSideRef seds_global_relay_add_serialized_side(SedsName name,
+SedsSideRef seds_global_relay_add_packed_side(SedsName name,
                                                   SedsTransmitFn tx,
                                                   void * tx_user,
                                                   bool reliable_enabled);
-SedsSideRef seds_global_relay_add_serialized_small_side(SedsName name,
+SedsSideRef seds_global_relay_add_packed_small_side(SedsName name,
                                                         SedsTransmitFn tx,
                                                         void * tx_user,
                                                         bool reliable_enabled,
@@ -263,14 +263,14 @@ SedsSideRef seds_global_relay_add_packet_side(SedsName name,
                                               void * tx_user,
                                               bool reliable_enabled);
 
-SedsResult seds_wrapper_relay_rx_serialized_from_side(SedsWrapperRelay * node,
+SedsResult seds_wrapper_relay_rx_packed_from_side(SedsWrapperRelay * node,
                                                       SedsSideRef side,
                                                       const uint8_t * bytes,
                                                       size_t len);
 SedsResult seds_wrapper_relay_rx_packet_from_side(SedsWrapperRelay * node,
                                                   SedsSideRef side,
                                                   const SedsPacketView * view);
-SedsResult seds_global_relay_rx_serialized_from_side(SedsSideRef side,
+SedsResult seds_global_relay_rx_packed_from_side(SedsSideRef side,
                                                      const uint8_t * bytes,
                                                      size_t len);
 SedsResult seds_global_relay_rx_packet_from_side(SedsSideRef side,

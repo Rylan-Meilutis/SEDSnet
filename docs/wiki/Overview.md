@@ -15,7 +15,7 @@ Key outcomes:
 - Small, predictable packets that are easy to send over low‑bandwidth links.
 - A central Router API that handles validation, dedupe, and dispatch.
 - Optional TCP‑like reliability (ACKs, retransmits, ordered/unordered delivery) for types marked reliable in the schema.
-- CRC32 integrity checks on all serialized frames (corrupt frames are dropped; reliable modes request retransmit via
+- CRC32 integrity checks on all packed frames (corrupt frames are dropped; reliable modes request retransmit via
   internal reliable control packets).
 - Optional adaptive discovery that learns which endpoints are reachable on which sides and exports a live topology view.
 - Managed-variable latest-value caches so restarted boards can request current network state through
@@ -63,7 +63,7 @@ released immediately when the gap is filled.
 
 1) Your code calls a log/tx API with a type and payload.
 2) The router validates the payload against the schema.
-3) The packet is serialized into a compact byte format.
+3) The packet is packed into a compact byte format.
 4) The bytes are handed to a transport callback for sending.
 
 ## What happens when you receive telemetry
@@ -90,7 +90,7 @@ hold user data off the link until discovery or explicit route policy identifies 
 ```
 Device A                 Link (UART)                 Device B
 --------                 -----------                 --------
-log(GPS_DATA)  ->  serialize -> bytes -> send -> bytes -> rx_serialized()
+log(GPS_DATA)  ->  pack -> bytes -> send -> bytes -> rx_packed()
   |                              |                        |
   +-- local handler              |                        +-- local handler
                                  +-- remote forward

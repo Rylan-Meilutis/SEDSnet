@@ -103,7 +103,7 @@ void managed_variables_e2e_example(void)
     cfg.e2e_key_id = 7U;
     (void)seds_global_router_init(&cfg);
 
-    radio_side = seds_global_router_add_serialized_small_side(
+    radio_side = seds_global_router_add_packed_small_side(
         SEDS_NAME_LITERAL("RADIO"),
         radio_tx,
         NULL,

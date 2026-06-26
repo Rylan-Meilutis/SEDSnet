@@ -63,7 +63,7 @@ int main(void)
     assert(node_init(&c1, &can_bus, "Consumer1", 0, 0, 0) == SEDS_OK);
     assert(node_init(&c2, &can_bus, "Consumer2", 0, 0, 0) == SEDS_OK);
 
-    int32_t gm_radio_side = seds_router_add_side_serialized(gm.r, "RADIO", 5, radio_side_tx, &gm, true);
+    int32_t gm_radio_side = seds_router_add_side_packed(gm.r, "RADIO", 5, radio_side_tx, &gm, true);
     assert(gm_radio_side >= 0);
 
     SimNode *nodes[] = {&gm, &c1, &c2};

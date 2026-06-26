@@ -34,7 +34,7 @@ void rx_asynchronous(const uint8_t *bytes, size_t len) {
   if (!g_router.r && init_telemetry_router() != SEDS_OK) {
     return;
   }
-  (void)seds_router_rx_serialized_packet_to_queue(g_router.r, bytes, len);
+  (void)seds_router_rx_packed_packet_to_queue(g_router.r, bytes, len);
 }
 
 SedsResult on_radio_packet(const SedsPacketView *pkt, void *user) {
@@ -159,7 +159,7 @@ SedsResult init_telemetry_router(void) {
     return SEDS_ERR;
   }
 
-  if (seds_router_add_side_serialized(r, "TX", 2, tx_send, NULL, true) < 0) {
+  if (seds_router_add_side_packed(r, "TX", 2, tx_send, NULL, true) < 0) {
     printf("Error: failed to add router side\n");
     seds_router_free(r);
     return SEDS_ERR;

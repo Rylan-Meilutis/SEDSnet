@@ -1,8 +1,8 @@
-//! Serialization and deserialization of telemetry packets.
+//! Wire-format packing and unpacking of telemetry packets.
 //!
 //! This module defines the compact v2 wire format used to send and receive
 //! [`Packet`]s, along with:
-//! - [`serialize_packet`] / [`deserialize_packet`] for full packets.
+//! - [`pack_packet`] / [`unpack_packet`] for full packets.
 //! - [`peek_envelope`] for header-only inspection without touching the payload.
 //! - Size helpers like [`header_size_bytes`] and [`packet_wire_size`].
 //!
@@ -20,7 +20,7 @@ use crate::packet::hash_bytes_u64;
 use alloc::{borrow::ToOwned, string::String, sync::Arc, vec, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
 
-/// Lightweight header-only view of a serialized [`Packet`].
+/// Lightweight header-only view of a packed [`Packet`].
 ///
 /// Produced by [`peek_envelope`] without allocating or copying the payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,7 +144,7 @@ fn read_uleb128(r: &mut ByteReader) -> Result<u64, TelemetryError> {
         }
         shift += 7;
     }
-    Err(TelemetryError::Deserialize("uleb128 too long"))
+    Err(TelemetryError::Unpack("uleb128 too long"))
 }
 
 /// Compute the encoded length (in bytes) of a ULEB128-encoded `u64`.
@@ -188,7 +188,7 @@ impl<'a> ByteReader<'a> {
     /// Read exactly `n` bytes, advancing the internal offset.
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], TelemetryError> {
         if self.remaining() < n {
-            return Err(TelemetryError::Deserialize("short read"));
+            return Err(TelemetryError::Unpack("short read"));
         }
         let s = &self.buf[self.off..self.off + n];
         self.off += n;
@@ -218,8 +218,7 @@ fn encode_wire_shape(shape: MessageElement) -> Result<Vec<u8>, TelemetryError> {
     }
     out.push(packed);
     if let MessageElement::Static(count, _, _) = shape {
-        let count =
-            u64::try_from(count).map_err(|_| TelemetryError::Serialize("wire shape count"))?;
+        let count = u64::try_from(count).map_err(|_| TelemetryError::Pack("wire shape count"))?;
         write_uleb128(count, &mut out);
     }
     Ok(out)
@@ -229,12 +228,12 @@ fn encode_wire_shape(shape: MessageElement) -> Result<Vec<u8>, TelemetryError> {
 fn decode_wire_shape(r: &mut ByteReader) -> Result<MessageElement, TelemetryError> {
     let packed = r.read_bytes(1)?[0];
     let dt = crate::config::message_data_type_from_code(packed & 0x0F)
-        .ok_or(TelemetryError::Deserialize("wire shape type"))?;
+        .ok_or(TelemetryError::Unpack("wire shape type"))?;
     let class = crate::config::message_class_from_code((packed >> 4) & 0x03)
-        .ok_or(TelemetryError::Deserialize("wire shape class"))?;
+        .ok_or(TelemetryError::Unpack("wire shape class"))?;
     if (packed & (1 << 6)) != 0 {
         let count = usize::try_from(read_uleb128(r)?)
-            .map_err(|_| TelemetryError::Deserialize("wire shape count"))?;
+            .map_err(|_| TelemetryError::Unpack("wire shape count"))?;
         Ok(MessageElement::Static(count, dt, class))
     } else {
         Ok(MessageElement::Dynamic(dt, class))
@@ -287,7 +286,7 @@ fn decode_wire_contract(
         });
     }
     let contract_len = usize::try_from(read_uleb128(r)?)
-        .map_err(|_| TelemetryError::Deserialize("wire contract length"))?;
+        .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
     let contract_bytes = r.read_bytes(contract_len)?;
     let mut cr = ByteReader::new(contract_bytes);
     // Parsing through a bounded sub-reader lets us reject trailing garbage in
@@ -301,7 +300,7 @@ fn decode_wire_contract(
     };
     let target_senders: Arc<[u64]> = if (flags & CONTRACT_FLAG_TARGETS) != 0 {
         let count = usize::try_from(read_uleb128(&mut cr)?)
-            .map_err(|_| TelemetryError::Deserialize("wire contract target count"))?;
+            .map_err(|_| TelemetryError::Unpack("wire contract target count"))?;
         let mut targets = Vec::with_capacity(count);
         for _ in 0..count {
             let bytes = cr.read_bytes(8)?;
@@ -314,7 +313,7 @@ fn decode_wire_contract(
         Arc::<[u64]>::from([])
     };
     if cr.remaining() != 0 {
-        return Err(TelemetryError::Deserialize("wire contract trailing bytes"));
+        return Err(TelemetryError::Unpack("wire contract trailing bytes"));
     }
     Ok(WireContract {
         shape,
@@ -339,7 +338,7 @@ fn append_crc32(out: &mut Vec<u8>) {
 #[inline]
 fn split_crc32(buf: &[u8]) -> Result<(&[u8], u32), TelemetryError> {
     if buf.len() < CRC32_BYTES {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
     let data_len = buf.len() - CRC32_BYTES;
     let crc = u32::from_le_bytes([
@@ -356,7 +355,7 @@ fn verify_crc32(buf: &[u8]) -> Result<&[u8], TelemetryError> {
     let (data, expected) = split_crc32(buf)?;
     let actual = crc32_bytes(data);
     if actual != expected {
-        return Err(TelemetryError::Deserialize("crc32 mismatch"));
+        return Err(TelemetryError::Unpack("crc32 mismatch"));
     }
     Ok(data)
 }
@@ -410,22 +409,22 @@ fn read_encrypted_payload(
     plaintext_len: usize,
 ) -> TelemetryResult<Vec<u8>> {
     let key_id = u32::try_from(read_uleb128(r)?)
-        .map_err(|_| TelemetryError::Deserialize("e2e key id too large"))?;
+        .map_err(|_| TelemetryError::Unpack("e2e key id too large"))?;
     let wire_payload_len = usize::try_from(read_uleb128(r)?)
-        .map_err(|_| TelemetryError::Deserialize("e2e payload length"))?;
+        .map_err(|_| TelemetryError::Unpack("e2e payload length"))?;
     if wire_payload_len > plaintext_len {
-        return Err(TelemetryError::Deserialize("bad e2e payload length"));
+        return Err(TelemetryError::Unpack("bad e2e payload length"));
     }
     let nonce_len = usize::try_from(read_uleb128(r)?)
-        .map_err(|_| TelemetryError::Deserialize("e2e nonce length"))?;
+        .map_err(|_| TelemetryError::Unpack("e2e nonce length"))?;
     if nonce_len == 0 || nonce_len > 64 {
-        return Err(TelemetryError::Deserialize("bad e2e nonce length"));
+        return Err(TelemetryError::Unpack("bad e2e nonce length"));
     }
     let nonce = r.read_bytes(nonce_len)?;
-    let tag_len = usize::try_from(read_uleb128(r)?)
-        .map_err(|_| TelemetryError::Deserialize("e2e tag length"))?;
+    let tag_len =
+        usize::try_from(read_uleb128(r)?).map_err(|_| TelemetryError::Unpack("e2e tag length"))?;
     if tag_len == 0 || tag_len > E2E_TAG_CAP {
-        return Err(TelemetryError::Deserialize("bad e2e tag length"));
+        return Err(TelemetryError::Unpack("bad e2e tag length"));
     }
     let tag = r.read_bytes(tag_len)?;
     let ciphertext_len = r.remaining();
@@ -468,11 +467,11 @@ fn decode_sender_name(
     if sender_is_compressed {
         let decompressed = payload_compression::decompress(sender_wire_bytes, sender_len)?;
         Ok(core::str::from_utf8(&decompressed)
-            .map_err(|_| TelemetryError::Deserialize("sender not UTF-8 after decompress"))?
+            .map_err(|_| TelemetryError::Unpack("sender not UTF-8 after decompress"))?
             .to_owned())
     } else {
         Ok(core::str::from_utf8(sender_wire_bytes)
-            .map_err(|_| TelemetryError::Deserialize("sender not UTF-8"))?
+            .map_err(|_| TelemetryError::Unpack("sender not UTF-8"))?
             .to_owned())
     }
 }
@@ -515,7 +514,7 @@ fn expand_endpoint_bitmap(
     bm: &[u8],
 ) -> Result<([DataEndpoint; EP_BITMAP_BITS], usize), TelemetryError> {
     if bm.len() != EP_BITMAP_BYTES {
-        return Err(TelemetryError::Deserialize("bad endpoint bitmap size"));
+        return Err(TelemetryError::Unpack("bad endpoint bitmap size"));
     }
 
     // Pick *any* valid endpoint as filler/dummy for the array.
@@ -531,7 +530,7 @@ fn expand_endpoint_bitmap(
         if (bm[byte] >> bit) & 1 != 0 {
             let v = idx as u32;
             let ep = DataEndpoint::try_from_u32(v)
-                .ok_or(TelemetryError::Deserialize("bad endpoint bit set"))?;
+                .ok_or(TelemetryError::Unpack("bad endpoint bit set"))?;
             arr[len] = ep;
             len += 1;
         }
@@ -541,48 +540,43 @@ fn expand_endpoint_bitmap(
 }
 
 // ===========================================================================
-// Serialization
+// Packing
 // ===========================================================================
 
-/// Serialize a [`Packet`] into the compact v2 wire format.
+/// Pack a [`Packet`] into the compact v2 wire format.
 ///
-/// The returned `Arc<[u8]>` owns the encoded bytes and can be shared cheaply.
+/// The returned `Arc<[u8]>` owns the packed bytes and can be shared cheaply.
 /// # Arguments
-/// - `pkt`: Telemetry packet to serialize.
+/// - `pkt`: Telemetry packet to pack.
 ///
 /// # Returns
-/// - `Arc<[u8]>`: Serialized packet in compact v2 wire format.
-pub fn serialize_packet(pkt: &Packet) -> Arc<[u8]> {
+/// - `Arc<[u8]>`: Packed packet in compact v2 wire format.
+pub fn pack_packet(pkt: &Packet) -> Arc<[u8]> {
     if is_reliable_type(pkt.data_type()) {
         // Default to an unsequenced reliable header to keep the wire format consistent.
-        // Use `serialize_packet_reliable` for ordered/retransmitted delivery.
+        // Use `pack_packet_with_reliable` for ordered/retransmitted delivery.
         let hdr = ReliableHeader {
             flags: RELIABLE_FLAG_UNSEQUENCED,
             seq: 0,
             ack: 0,
         };
-        return serialize_packet_with_reliable(pkt, hdr);
+        return pack_packet_with_reliable(pkt, hdr);
     }
-    serialize_packet_inner(pkt, None)
+    pack_packet_inner(pkt, None)
 }
 
-/// Serialize a [`Packet`] with an explicit reliable header.
+/// Pack a [`Packet`] with an explicit reliable header.
 ///
 /// This should be used for data types configured as `reliable` in the schema.
-pub fn serialize_packet_with_reliable(pkt: &Packet, header: ReliableHeader) -> Arc<[u8]> {
-    serialize_packet_inner(pkt, Some(header))
+pub fn pack_packet_with_reliable(pkt: &Packet, header: ReliableHeader) -> Arc<[u8]> {
+    pack_packet_inner(pkt, Some(header))
 }
 
-/// Serialize a reliable ACK-only control frame for the given data type.
+/// Pack a reliable ACK-only control frame for the given data type.
 ///
 /// The resulting bytes are not a valid `Packet` and should be handled
 /// by the router's reliable layer.
-pub fn serialize_reliable_ack(
-    sender: &str,
-    ty: DataType,
-    timestamp_ms: u64,
-    ack: u32,
-) -> Arc<[u8]> {
+pub fn pack_reliable_ack(sender: &str, ty: DataType, timestamp_ms: u64, ack: u32) -> Arc<[u8]> {
     let bm = [0u8; EP_BITMAP_BYTES];
 
     let sender_bytes = sender.as_bytes();
@@ -622,43 +616,43 @@ pub fn serialize_reliable_ack(
     Arc::<[u8]>::from(out)
 }
 
-fn serialize_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]> {
-    serialize_packet_inner_with_contract(
+fn pack_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]> {
+    pack_packet_inner_with_contract(
         pkt,
         reliable,
         pkt.wire_shape(),
         pkt.wire_target_senders(),
         None,
     )
-    .expect("plaintext packet serialization failed")
+    .expect("plaintext packet packing failed")
 }
 
-/// Serialize `pkt` while explicitly controlling the wire-contract metadata.
+/// Pack `pkt` while explicitly controlling the wire-contract metadata.
 ///
 /// Router and relay forwarding paths use this helper when they need to attach
 /// or preserve a migration-safe contract instead of simply serializing the
 /// packet against the current runtime schema/topology view.
 ///
 /// # Parameters
-/// - `pkt`: Logical packet to serialize.
+/// - `pkt`: Logical packet to pack.
 /// - `reliable`: Optional hop-level reliable header to append after the
 ///   contract.
 /// - `shape`: Optional inline payload shape to encode into the contract so
-///   downstream deserializers can validate/decode the payload against the
+///   downstream unpackers can validate/decode the payload against the
 ///   original shape.
 /// - `target_senders`: Frozen destination-holder sender hashes that keep
 ///   in-flight routing bound to the intended holders.
 ///
 /// # Returns
-/// - `Ok(Arc<[u8]>)` containing the serialized frame bytes.
+/// - `Ok(Arc<[u8]>)` containing the packed frame bytes.
 /// - `Err(TelemetryError)` if contract encoding fails.
-pub(crate) fn serialize_packet_with_wire_contract(
+pub(crate) fn pack_packet_with_wire_contract(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
     target_senders: &[u64],
 ) -> TelemetryResult<Arc<[u8]>> {
-    serialize_packet_inner_with_contract(pkt, reliable, shape, target_senders, None)
+    pack_packet_inner_with_contract(pkt, reliable, shape, target_senders, None)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -668,17 +662,17 @@ pub(crate) struct E2eSealConfig {
 }
 
 #[cfg(feature = "cryptography")]
-pub(crate) fn serialize_packet_with_wire_contract_e2e(
+pub(crate) fn pack_packet_with_wire_contract_e2e(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
     target_senders: &[u64],
     e2e: E2eSealConfig,
 ) -> TelemetryResult<Arc<[u8]>> {
-    serialize_packet_inner_with_contract(pkt, reliable, shape, target_senders, Some(e2e))
+    pack_packet_inner_with_contract(pkt, reliable, shape, target_senders, Some(e2e))
 }
 
-fn serialize_packet_inner_with_contract(
+fn pack_packet_inner_with_contract(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
@@ -793,34 +787,34 @@ fn serialize_packet_inner_with_contract(
 }
 
 // ===========================================================================
-// Deserialization (full packet)
+// Unpacking (full packet)
 // ===========================================================================
 
-/// Deserialize a full [`Packet`] from a serialized v2 wire frame.
+/// Unpack a full [`Packet`] from a packed v2 wire frame.
 ///
 /// This validates the frame CRC, expands the endpoint bitmap, decodes the
 /// optional migration-safe wire contract, parses the optional reliable header,
 /// and reconstructs the logical `Packet`. When the frame carries an inline wire
 /// shape, the returned packet preserves that shape so payload validation and
 /// formatting remain stable even if the local runtime schema has changed since
-/// the packet was originally serialized.
+/// the packet was originally packed.
 ///
 /// # Parameters
-/// - `buf`: Complete serialized frame bytes, including the CRC32 trailer.
+/// - `buf`: Complete packed frame bytes, including the CRC32 trailer.
 ///
 /// # Returns
 /// - `Ok(Packet)` when the frame is well-formed and contains a payload-bearing
 ///   telemetry packet.
 ///
 /// # Errors
-/// - [`TelemetryError::Deserialize`] if the frame is malformed, truncated, or
+/// - [`TelemetryError::Unpack`] if the frame is malformed, truncated, or
 ///   fails CRC validation.
 /// - [`TelemetryError::InvalidType`] if the type ID is not valid and the frame
 ///   does not carry enough inline shape information to keep decoding it.
-pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
+pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let data = verify_crc32(buf)?;
     if data.is_empty() {
-        return Err(TelemetryError::Deserialize("short prelude"));
+        return Err(TelemetryError::Unpack("short prelude"));
     }
     let mut r = ByteReader::new(data);
 
@@ -831,7 +825,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
     #[cfg(not(feature = "cryptography"))]
     if (flags & 0x10) != 0 {
-        return Err(TelemetryError::Deserialize("e2e crypto unsupported"));
+        return Err(TelemetryError::Unpack("e2e crypto unsupported"));
     }
 
     let nep = r.read_bytes(1)?[0] as usize;
@@ -841,7 +835,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let ts_v = read_uleb128(&mut r)?;
     let nonce = if (flags & FLAG_PACKET_NONCE) != 0 {
         u16::try_from(read_uleb128(&mut r)?)
-            .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+            .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
     } else {
         0
     };
@@ -858,18 +852,18 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     // For compressed payload: bitmap + sender_wire + [contract] + [reliable] + at least 1 byte.
     if !payload_is_compressed {
         if r.remaining() < EP_BITMAP_BYTES + sender_wire_len + dsz {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
     } else {
         if r.remaining() < EP_BITMAP_BYTES + sender_wire_len + 1 {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
     }
 
     let bm = r.read_bytes(EP_BITMAP_BYTES)?;
     let (ep_buf, ep_len) = expand_endpoint_bitmap(bm)?;
     if ep_len != nep {
-        return Err(TelemetryError::Deserialize("endpoint count mismatch"));
+        return Err(TelemetryError::Unpack("endpoint count mismatch"));
     }
     let eps: Arc<[DataEndpoint]> = Arc::from(&ep_buf[..ep_len]);
 
@@ -880,7 +874,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 
     // ----- Reliable header (optional) -----
     let mut reliable_hdr: Option<ReliableHeader> = None;
-    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Deserialize("type too large"))?;
+    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Unpack("type too large"))?;
     if ty_u32 > MAX_VALUE_DATA_TYPE {
         return Err(TelemetryError::InvalidType);
     }
@@ -890,7 +884,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     if is_reliable_type(ty) || contract.has_reliable_header {
         let hdr = read_reliable_header(&mut r)?;
         if (hdr.flags & RELIABLE_FLAG_ACK_ONLY) != 0 {
-            return Err(TelemetryError::Deserialize("reliable control frame"));
+            return Err(TelemetryError::Unpack("reliable control frame"));
         }
         reliable_hdr = Some(hdr);
     }
@@ -924,7 +918,7 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
             Arc::<[u8]>::from(decompressed)
         } else {
             if payload_wire.len() != dsz {
-                return Err(TelemetryError::Deserialize("payload length mismatch"));
+                return Err(TelemetryError::Unpack("payload length mismatch"));
             }
             Arc::<[u8]>::from(payload_wire)
         }
@@ -950,26 +944,26 @@ pub fn deserialize_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 // Peek / envelope-only decode
 // ===========================================================================
 
-/// Decode only the routing-relevant envelope of a serialized packet.
+/// Decode only the routing-relevant envelope of a packed packet.
 ///
 /// This reads enough of the frame to expose type, endpoints, sender, timestamp,
 /// and any migration-safe contract metadata without touching payload bytes.
 /// That makes it the fast path for routing and other header-only inspection.
 ///
 /// # Parameters
-/// - `buf`: Complete serialized frame bytes, including the CRC32 trailer.
+/// - `buf`: Complete packed frame bytes, including the CRC32 trailer.
 ///
 /// # Returns
 /// - `Ok(TelemetryEnvelope)` containing the logical packet envelope plus any
 ///   inline wire-shape and target-sender metadata.
 ///
 /// # Errors
-/// - [`TelemetryError::Deserialize`] if the frame is malformed or fails CRC.
+/// - [`TelemetryError::Unpack`] if the frame is malformed or fails CRC.
 /// - [`TelemetryError::InvalidType`] if the type ID cannot be resolved.
 pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     let data = verify_crc32(buf)?;
     if data.is_empty() {
-        return Err(TelemetryError::Deserialize("short prelude"));
+        return Err(TelemetryError::Unpack("short prelude"));
     }
     let mut r = ByteReader::new(data);
 
@@ -995,13 +989,13 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     };
 
     if r.remaining() < EP_BITMAP_BYTES + sender_wire_len {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
 
     let bm = r.read_bytes(EP_BITMAP_BYTES)?;
     let (ep_buf, ep_len) = expand_endpoint_bitmap(bm)?;
     if ep_len != nep {
-        return Err(TelemetryError::Deserialize("endpoint count mismatch"));
+        return Err(TelemetryError::Unpack("endpoint count mismatch"));
     }
     let eps: Arc<[DataEndpoint]> = Arc::from(&ep_buf[..ep_len]);
 
@@ -1009,7 +1003,7 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     let sender_str = decode_sender_name(sender_wire_bytes, sender_is_compressed, slen)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
 
-    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Deserialize("type too large"))?;
+    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Unpack("type too large"))?;
     if ty_u32 > MAX_VALUE_DATA_TYPE {
         return Err(TelemetryError::InvalidType);
     }
@@ -1045,7 +1039,7 @@ impl TelemetryFrameInfo {
 
 fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     if buf.is_empty() {
-        return Err(TelemetryError::Deserialize("short prelude"));
+        return Err(TelemetryError::Unpack("short prelude"));
     }
     let mut r = ByteReader::new(buf);
 
@@ -1070,13 +1064,13 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     };
 
     if r.remaining() < EP_BITMAP_BYTES + sender_wire_len {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
 
     let bm = r.read_bytes(EP_BITMAP_BYTES)?;
     let (ep_buf, ep_len) = expand_endpoint_bitmap(bm)?;
     if ep_len != nep {
-        return Err(TelemetryError::Deserialize("endpoint count mismatch"));
+        return Err(TelemetryError::Unpack("endpoint count mismatch"));
     }
     let eps: Arc<[DataEndpoint]> = Arc::from(&ep_buf[..ep_len]);
 
@@ -1084,7 +1078,7 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     let sender_str = decode_sender_name(sender_wire_bytes, sender_is_compressed, slen)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
 
-    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Deserialize("type too large"))?;
+    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Unpack("type too large"))?;
     if ty_u32 > MAX_VALUE_DATA_TYPE {
         return Err(TelemetryError::InvalidType);
     }
@@ -1094,7 +1088,7 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
 
     let reliable = if is_reliable_type(ty) || contract.has_reliable_header {
         if r.remaining() < RELIABLE_HEADER_BYTES {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         Some(read_reliable_header(&mut r)?)
     } else {
@@ -1117,7 +1111,7 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
 /// Peek the envelope plus reliable header (if present) without decoding payload bytes.
 ///
 /// This is the primary router/relay fast path for reliable-layer decisions on
-/// serialized traffic. It still validates the frame CRC before exposing any
+/// packed traffic. It still validates the frame CRC before exposing any
 /// information.
 pub fn peek_frame_info(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     let data = verify_crc32(buf)?;
@@ -1134,7 +1128,7 @@ pub fn peek_frame_info_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryFrameIn
     peek_frame_info_inner(data)
 }
 
-/// Locate the reliable-header byte offset within a serialized frame.
+/// Locate the reliable-header byte offset within a packed frame.
 ///
 /// The offset is computed after walking the sender bytes and optional wire
 /// contract. This matters because the contract can explicitly state that a
@@ -1142,7 +1136,7 @@ pub fn peek_frame_info_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryFrameIn
 /// marks the type as reliable.
 ///
 /// # Parameters
-/// - `buf`: Serialized frame bytes, including the CRC32 trailer.
+/// - `buf`: Packed frame bytes, including the CRC32 trailer.
 ///
 /// # Returns
 /// - `Ok(Some(offset))` when a reliable header is present.
@@ -1150,7 +1144,7 @@ pub fn peek_frame_info_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryFrameIn
 /// - `Err(TelemetryError)` when the frame is malformed.
 pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
     if buf.len() < CRC32_BYTES + 1 {
-        return Err(TelemetryError::Deserialize("short prelude"));
+        return Err(TelemetryError::Unpack("short prelude"));
     }
     let data_len = buf.len().saturating_sub(CRC32_BYTES);
     let mut r = ByteReader::new(&buf[..data_len]);
@@ -1175,13 +1169,13 @@ pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
     };
 
     if r.remaining() < EP_BITMAP_BYTES + sender_wire_len {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
 
     r.read_bytes(EP_BITMAP_BYTES)?;
     r.read_bytes(sender_wire_len)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
-    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Deserialize("type too large"))?;
+    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Unpack("type too large"))?;
     if ty_u32 > MAX_VALUE_DATA_TYPE {
         return Err(TelemetryError::InvalidType);
     }
@@ -1201,7 +1195,7 @@ pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
 /// only needs to change sequence/ACK state in an already-built frame.
 ///
 /// # Parameters
-/// - `buf`: Mutable serialized frame bytes.
+/// - `buf`: Mutable packed frame bytes.
 /// - `flags`: Replacement reliable-header flags byte.
 /// - `seq`: Replacement sequence number.
 /// - `ack`: Replacement cumulative ACK value.
@@ -1221,13 +1215,13 @@ pub fn rewrite_reliable_header(
     };
     let data_len = buf.len().saturating_sub(CRC32_BYTES);
     if data_len.saturating_sub(off) < RELIABLE_HEADER_BYTES {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
     buf[off] = flags;
     buf[off + 1..off + 5].copy_from_slice(&seq.to_le_bytes());
     buf[off + 5..off + 9].copy_from_slice(&ack.to_le_bytes());
     if buf.len() < CRC32_BYTES {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
     let crc = crc32_bytes(&buf[..data_len]);
     buf[data_len..data_len + CRC32_BYTES].copy_from_slice(&crc.to_le_bytes());
@@ -1248,7 +1242,7 @@ pub fn rewrite_reliable_header(
 /// - `pkt`: Packet to size.
 ///
 /// # Returns
-/// - Byte count of the serialized metadata prefix.
+/// - Byte count of the packed metadata prefix.
 pub fn header_size_bytes(pkt: &Packet) -> usize {
     let prelude = 2; // FLAGS (u8) + NEP (u8)
 
@@ -1274,10 +1268,10 @@ pub fn header_size_bytes(pkt: &Packet) -> usize {
         }
 }
 
-/// Compute the full serialized wire size for `pkt`.
+/// Compute the full packed wire size for `pkt`.
 ///
 /// This applies the same sender/payload compression heuristics as normal
-/// serialization, then sums the metadata prefix, endpoint bitmap, optional
+/// packing, then sums the metadata prefix, endpoint bitmap, optional
 /// reliable header, payload bytes, and CRC32 trailer.
 ///
 /// # Parameters
@@ -1305,11 +1299,11 @@ pub fn packet_wire_size(pkt: &Packet) -> usize {
 }
 
 #[inline]
-/// Computes the same packet ID as [`Packet::packet_id`] directly from a serialized wire frame.
+/// Computes the same packet ID as [`Packet::packet_id`] directly from a packed wire frame.
 pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let data = verify_crc32(buf)?;
     if data.len() < 2 {
-        return Err(TelemetryError::Deserialize("short prelude"));
+        return Err(TelemetryError::Unpack("short prelude"));
     }
 
     let mut r = ByteReader::new(data);
@@ -1321,7 +1315,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
     #[cfg(not(feature = "cryptography"))]
     if (flags & 0x10) != 0 {
-        return Err(TelemetryError::Deserialize("e2e crypto unsupported"));
+        return Err(TelemetryError::Unpack("e2e crypto unsupported"));
     }
 
     let _nep = r.read_bytes(1)?[0] as usize;
@@ -1331,7 +1325,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let ts_v = read_uleb128(&mut r)?;
     let nonce = if (flags & FLAG_PACKET_NONCE) != 0 {
         u16::try_from(read_uleb128(&mut r)?)
-            .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+            .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
     } else {
         0
     };
@@ -1344,7 +1338,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     };
 
     if r.remaining() < EP_BITMAP_BYTES + sender_wire_len {
-        return Err(TelemetryError::Deserialize("short buffer"));
+        return Err(TelemetryError::Unpack("short buffer"));
     }
 
     // ---- endpoints (hash in ASC discriminant order, which matches expand loop) ----
@@ -1362,7 +1356,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     let _contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
 
     // Convert ty discriminant -> DataType (needed for ty.as_str()).
-    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Deserialize("type too large"))?;
+    let ty_u32 = u32::try_from(ty_v).map_err(|_| TelemetryError::Unpack("type too large"))?;
     if ty_u32 > MAX_VALUE_DATA_TYPE {
         return Err(TelemetryError::InvalidType);
     }
@@ -1374,7 +1368,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     if is_reliable_type(ty) || _contract.has_reliable_header {
         let hdr = read_reliable_header(&mut r)?;
         if (hdr.flags & RELIABLE_FLAG_ACK_ONLY) != 0 {
-            return Err(TelemetryError::Deserialize("reliable control frame"));
+            return Err(TelemetryError::Unpack("reliable control frame"));
         }
     }
 
@@ -1389,26 +1383,26 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
         &payload_wire_owned
     } else if !payload_is_compressed {
         if r.remaining() < dsz {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         r.read_bytes(dsz)?
     } else {
         let comp_len = r.remaining();
         if comp_len < 1 {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         r.read_bytes(comp_len)?
     };
     #[cfg(not(feature = "cryptography"))]
     let payload_wire: &[u8] = if !payload_is_compressed {
         if r.remaining() < dsz {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         r.read_bytes(dsz)?
     } else {
         let comp_len = r.remaining();
         if comp_len < 1 {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         r.read_bytes(comp_len)?
     };
@@ -1418,7 +1412,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
         &payload_decompressed
     } else {
         if payload_wire.len() != dsz {
-            return Err(TelemetryError::Deserialize("payload length mismatch"));
+            return Err(TelemetryError::Unpack("payload length mismatch"));
         }
         payload_wire
     };
@@ -1439,10 +1433,10 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
         if ((bm[byte] >> bit) & 1) != 0 {
             let v = idx as u32;
             if v > MAX_VALUE_DATA_ENDPOINT {
-                return Err(TelemetryError::Deserialize("bad endpoint bit set"));
+                return Err(TelemetryError::Unpack("bad endpoint bit set"));
             }
             let ep = DataEndpoint::try_from_u32(v)
-                .ok_or(TelemetryError::Deserialize("bad endpoint bit set"))?;
+                .ok_or(TelemetryError::Unpack("bad endpoint bit set"))?;
             h = hash_bytes_u64(h, ep.as_str().as_bytes());
         }
     }
@@ -1517,15 +1511,15 @@ mod payload_compression {
     /// # Returns
     /// - `Vec<u8>`: Decompressed payload bytes.
     /// # Errors
-    /// - `TelemetryError::Deserialize` if decompression fails or the size
+    /// - `TelemetryError::Unpack` if decompression fails or the size
     ///   does not match `expected_len`.
     #[cfg(feature = "compression")]
     pub fn decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, TelemetryError> {
         let mut out = vec![0u8; expected_len];
         let written = zstd_safe::decompress(&mut out[..], compressed)
-            .map_err(|_| TelemetryError::Deserialize("decompression failed"))?;
+            .map_err(|_| TelemetryError::Unpack("decompression failed"))?;
         if written != expected_len {
-            return Err(TelemetryError::Deserialize("decompressed size mismatch"));
+            return Err(TelemetryError::Unpack("decompressed size mismatch"));
         }
         Ok(out)
     }
@@ -1540,7 +1534,7 @@ mod payload_compression {
     #[cfg(not(feature = "compression"))]
     /// Reports that compressed payloads cannot be decoded when compression support is disabled.
     pub fn decompress(_compressed: &[u8], _expected_len: usize) -> Result<Vec<u8>, TelemetryError> {
-        Err(TelemetryError::Deserialize(
+        Err(TelemetryError::Unpack(
             "compressed payloads not supported (compression feature disabled)",
         ))
     }

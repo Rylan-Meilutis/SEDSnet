@@ -2,7 +2,7 @@
 mod compression_memory_pool_test {
     use sedsnet::config::{DataEndpoint, DataType};
     use sedsnet::packet::Packet;
-    use sedsnet::serialize;
+    use sedsnet::wire_format;
 
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::mem::{align_of, size_of};
@@ -160,8 +160,8 @@ mod compression_memory_pool_test {
     fn compression_path_is_stable_under_limited_memory_pool() {
         // Warm-up outside the cap to initialize one-time internals.
         let warm = make_packet(&[b'W'; 128], 0);
-        let wire = serialize::serialize_packet(&warm);
-        let _ = serialize::deserialize_packet(&wire).expect("warm-up deserialize failed");
+        let wire = wire_format::pack_packet(&warm);
+        let _ = wire_format::unpack_packet(&wire).expect("warm-up unpack failed");
 
         // Keep this tight enough to catch regressions, but high enough for stable test runtime.
         let limit_bytes = 32 * 1024usize;
@@ -179,8 +179,8 @@ mod compression_memory_pool_test {
             };
 
             let pkt = make_packet(&payload, i + 1);
-            let wire = serialize::serialize_packet(&pkt);
-            let decoded = serialize::deserialize_packet(&wire).expect("deserialize failed");
+            let wire = wire_format::pack_packet(&pkt);
+            let decoded = wire_format::unpack_packet(&wire).expect("unpack failed");
             assert_eq!(decoded.payload(), payload.as_slice());
         }
 

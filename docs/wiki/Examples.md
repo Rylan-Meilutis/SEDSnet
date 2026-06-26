@@ -23,7 +23,7 @@ What it demonstrates:
 - Creating and sending packets.
 - Receiving and dispatching to handlers.
 - Time sync announce/request/response and offset math.
-- Managed-variable latest-value resync, bounded serialized sides, and E2E policy configuration.
+- Managed-variable latest-value resync, bounded packed sides, and E2E policy configuration.
 
 Suggested first steps:
 
@@ -105,7 +105,7 @@ Recommended structure:
 - Create a router with no remote sides for local-only logging, or add sides and control forwarding
   with runtime route rules.
 - Call `log_*` with a typed payload.
-- Call `rx_serialized` with the bytes you just sent (loopback).
+- Call `rx_packed` with the bytes you just sent (loopback).
 
 ## Recommended path
 

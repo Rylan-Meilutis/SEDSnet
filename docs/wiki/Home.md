@@ -45,7 +45,7 @@ Detailed pages that describe internals, data structures, and formats.
 -
 
 src/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/src)):
-core Rust library (schema, packet types, serialization, router/relay).
+core Rust library (schema, packet types, packing, router/relay).
 
 -
 
@@ -88,7 +88,7 @@ runnable examples.
 log(data)        rx(bytes)
     |               |
     v               v
-  Router <---- deserialize ---- wire ---- serialize ----> Router
+  Router <---- unpack ---- wire ---- pack ----> Router
     |  \                                         |  \
     |   \-- local endpoints                      |   \-- local endpoints
     |                                            |

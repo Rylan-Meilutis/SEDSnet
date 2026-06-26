@@ -135,7 +135,7 @@ int32_t seds_global_router_init_error(void)
     return seds_wrapper_router_init_error(&g_router);
 }
 
-SedsSideRef seds_wrapper_router_add_serialized_side(SedsWrapperRouter * node,
+SedsSideRef seds_wrapper_router_add_packed_side(SedsWrapperRouter * node,
                                                     SedsName name,
                                                     SedsTransmitFn tx,
                                                     void * tx_user,
@@ -147,7 +147,7 @@ SedsSideRef seds_wrapper_router_add_serialized_side(SedsWrapperRouter * node,
         return side;
     }
 
-    side.id = seds_router_add_side_serialized(node->router,
+    side.id = seds_router_add_side_packed(node->router,
                                               name.ptr,
                                               name.len,
                                               tx,
@@ -159,15 +159,15 @@ SedsSideRef seds_wrapper_router_add_serialized_side(SedsWrapperRouter * node,
     return side;
 }
 
-SedsSideRef seds_global_router_add_serialized_side(SedsName name,
+SedsSideRef seds_global_router_add_packed_side(SedsName name,
                                                    SedsTransmitFn tx,
                                                    void * tx_user,
                                                    bool reliable_enabled)
 {
-    return seds_wrapper_router_add_serialized_side(&g_router, name, tx, tx_user, reliable_enabled);
+    return seds_wrapper_router_add_packed_side(&g_router, name, tx, tx_user, reliable_enabled);
 }
 
-SedsSideRef seds_wrapper_router_add_serialized_small_side(SedsWrapperRouter * node,
+SedsSideRef seds_wrapper_router_add_packed_small_side(SedsWrapperRouter * node,
                                                           SedsName name,
                                                           SedsTransmitFn tx,
                                                           void * tx_user,
@@ -180,7 +180,7 @@ SedsSideRef seds_wrapper_router_add_serialized_small_side(SedsWrapperRouter * no
         return side;
     }
 
-    side.id = seds_router_add_side_serialized_small_packets(node->router,
+    side.id = seds_router_add_side_packed_small_packets(node->router,
                                                             name.ptr,
                                                             name.len,
                                                             tx,
@@ -193,13 +193,13 @@ SedsSideRef seds_wrapper_router_add_serialized_small_side(SedsWrapperRouter * no
     return side;
 }
 
-SedsSideRef seds_global_router_add_serialized_small_side(SedsName name,
+SedsSideRef seds_global_router_add_packed_small_side(SedsName name,
                                                          SedsTransmitFn tx,
                                                          void * tx_user,
                                                          bool reliable_enabled,
                                                          size_t max_frame_bytes)
 {
-    return seds_wrapper_router_add_serialized_small_side(&g_router,
+    return seds_wrapper_router_add_packed_small_side(&g_router,
                                                          name,
                                                          tx,
                                                          tx_user,
@@ -239,22 +239,22 @@ SedsSideRef seds_global_router_add_packet_side(SedsName name,
     return seds_wrapper_router_add_packet_side(&g_router, name, tx, tx_user, reliable_enabled);
 }
 
-SedsResult seds_wrapper_router_rx_serialized(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_rx_packed(SedsWrapperRouter * node,
                                              const uint8_t * bytes,
                                              size_t len)
 {
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_rx_serialized_packet_to_queue(node->router, bytes, len);
+    return seds_router_rx_packed_packet_to_queue(node->router, bytes, len);
 }
 
-SedsResult seds_global_router_rx_serialized(const uint8_t * bytes, size_t len)
+SedsResult seds_global_router_rx_packed(const uint8_t * bytes, size_t len)
 {
-    return seds_wrapper_router_rx_serialized(&g_router, bytes, len);
+    return seds_wrapper_router_rx_packed(&g_router, bytes, len);
 }
 
-SedsResult seds_wrapper_router_rx_serialized_from_side(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_rx_packed_from_side(SedsWrapperRouter * node,
                                                        SedsSideRef side,
                                                        const uint8_t * bytes,
                                                        size_t len)
@@ -262,17 +262,17 @@ SedsResult seds_wrapper_router_rx_serialized_from_side(SedsWrapperRouter * node,
     if (!node || !node->router || !seds_side_is_valid(side)) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_rx_serialized_packet_to_queue_from_side(node->router,
+    return seds_router_rx_packed_packet_to_queue_from_side(node->router,
                                                                (uint32_t)side.id,
                                                                bytes,
                                                                len);
 }
 
-SedsResult seds_global_router_rx_serialized_from_side(SedsSideRef side,
+SedsResult seds_global_router_rx_packed_from_side(SedsSideRef side,
                                                       const uint8_t * bytes,
                                                       size_t len)
 {
-    return seds_wrapper_router_rx_serialized_from_side(&g_router, side, bytes, len);
+    return seds_wrapper_router_rx_packed_from_side(&g_router, side, bytes, len);
 }
 
 SedsResult seds_wrapper_router_process(SedsWrapperRouter * node, uint32_t timeout_ms)
@@ -434,51 +434,51 @@ SedsResult seds_global_router_request_managed_variable(SedsTypeRef ty)
     return seds_wrapper_router_request_managed_variable(&g_router, ty);
 }
 
-SedsResult seds_wrapper_router_set_network_variable_serialized(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_set_network_variable_packed(SedsWrapperRouter * node,
                                                                const uint8_t * bytes,
                                                                size_t len)
 {
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_set_network_variable_serialized(node->router, bytes, len);
+    return seds_router_set_network_variable_packed(node->router, bytes, len);
 }
 
-SedsResult seds_global_router_set_network_variable_serialized(const uint8_t * bytes, size_t len)
+SedsResult seds_global_router_set_network_variable_packed(const uint8_t * bytes, size_t len)
 {
-    return seds_wrapper_router_set_network_variable_serialized(&g_router, bytes, len);
+    return seds_wrapper_router_set_network_variable_packed(&g_router, bytes, len);
 }
 
-SedsResult seds_wrapper_router_seed_managed_variable_serialized(SedsWrapperRouter * node,
+SedsResult seds_wrapper_router_seed_managed_variable_packed(SedsWrapperRouter * node,
                                                                 const uint8_t * bytes,
                                                                 size_t len)
 {
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_seed_managed_variable_serialized(node->router, bytes, len);
+    return seds_router_seed_managed_variable_packed(node->router, bytes, len);
 }
 
-SedsResult seds_global_router_seed_managed_variable_serialized(const uint8_t * bytes, size_t len)
+SedsResult seds_global_router_seed_managed_variable_packed(const uint8_t * bytes, size_t len)
 {
-    return seds_wrapper_router_seed_managed_variable_serialized(&g_router, bytes, len);
+    return seds_wrapper_router_seed_managed_variable_packed(&g_router, bytes, len);
 }
 
-int32_t seds_wrapper_router_cached_managed_variable_serialized_len(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_cached_managed_variable_packed_len(SedsWrapperRouter * node,
                                                                    SedsTypeRef ty)
 {
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_cached_managed_variable_serialized_len(node->router, ty.id);
+    return seds_router_cached_managed_variable_packed_len(node->router, ty.id);
 }
 
-int32_t seds_global_router_cached_managed_variable_serialized_len(SedsTypeRef ty)
+int32_t seds_global_router_cached_managed_variable_packed_len(SedsTypeRef ty)
 {
-    return seds_wrapper_router_cached_managed_variable_serialized_len(&g_router, ty);
+    return seds_wrapper_router_cached_managed_variable_packed_len(&g_router, ty);
 }
 
-int32_t seds_wrapper_router_cached_managed_variable_serialized(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_cached_managed_variable_packed(SedsWrapperRouter * node,
                                                                SedsTypeRef ty,
                                                                uint8_t * out,
                                                                size_t out_len)
@@ -486,33 +486,33 @@ int32_t seds_wrapper_router_cached_managed_variable_serialized(SedsWrapperRouter
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_cached_managed_variable_serialized(node->router, ty.id, out, out_len);
+    return seds_router_cached_managed_variable_packed(node->router, ty.id, out, out_len);
 }
 
-int32_t seds_global_router_cached_managed_variable_serialized(SedsTypeRef ty,
+int32_t seds_global_router_cached_managed_variable_packed(SedsTypeRef ty,
                                                               uint8_t * out,
                                                               size_t out_len)
 {
-    return seds_wrapper_router_cached_managed_variable_serialized(&g_router, ty, out, out_len);
+    return seds_wrapper_router_cached_managed_variable_packed(&g_router, ty, out, out_len);
 }
 
-int32_t seds_wrapper_router_get_network_variable_serialized_len(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_get_network_variable_packed_len(SedsWrapperRouter * node,
                                                                 SedsTypeRef ty,
                                                                 uint32_t stale_after_ms)
 {
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_get_network_variable_serialized_len(node->router, ty.id, stale_after_ms);
+    return seds_router_get_network_variable_packed_len(node->router, ty.id, stale_after_ms);
 }
 
-int32_t seds_global_router_get_network_variable_serialized_len(SedsTypeRef ty,
+int32_t seds_global_router_get_network_variable_packed_len(SedsTypeRef ty,
                                                                uint32_t stale_after_ms)
 {
-    return seds_wrapper_router_get_network_variable_serialized_len(&g_router, ty, stale_after_ms);
+    return seds_wrapper_router_get_network_variable_packed_len(&g_router, ty, stale_after_ms);
 }
 
-int32_t seds_wrapper_router_get_network_variable_serialized(SedsWrapperRouter * node,
+int32_t seds_wrapper_router_get_network_variable_packed(SedsWrapperRouter * node,
                                                             SedsTypeRef ty,
                                                             uint32_t stale_after_ms,
                                                             uint8_t * out,
@@ -521,15 +521,15 @@ int32_t seds_wrapper_router_get_network_variable_serialized(SedsWrapperRouter * 
     if (!node || !node->router) {
         return SEDS_BAD_ARG;
     }
-    return seds_router_get_network_variable_serialized(node->router, ty.id, stale_after_ms, out, out_len);
+    return seds_router_get_network_variable_packed(node->router, ty.id, stale_after_ms, out, out_len);
 }
 
-int32_t seds_global_router_get_network_variable_serialized(SedsTypeRef ty,
+int32_t seds_global_router_get_network_variable_packed(SedsTypeRef ty,
                                                            uint32_t stale_after_ms,
                                                            uint8_t * out,
                                                            size_t out_len)
 {
-    return seds_wrapper_router_get_network_variable_serialized(&g_router, ty, stale_after_ms, out, out_len);
+    return seds_wrapper_router_get_network_variable_packed(&g_router, ty, stale_after_ms, out, out_len);
 }
 
 SedsResult seds_wrapper_router_log_typed(SedsWrapperRouter * node,
@@ -791,7 +791,7 @@ int32_t seds_global_relay_init_error(void)
     return seds_wrapper_relay_init_error(&g_relay);
 }
 
-SedsSideRef seds_wrapper_relay_add_serialized_side(SedsWrapperRelay * node,
+SedsSideRef seds_wrapper_relay_add_packed_side(SedsWrapperRelay * node,
                                                    SedsName name,
                                                    SedsTransmitFn tx,
                                                    void * tx_user,
@@ -801,22 +801,22 @@ SedsSideRef seds_wrapper_relay_add_serialized_side(SedsWrapperRelay * node,
     if (!node || !node->relay) {
         return side;
     }
-    side.id = seds_relay_add_side_serialized(node->relay, name.ptr, name.len, tx, tx_user, reliable_enabled);
+    side.id = seds_relay_add_side_packed(node->relay, name.ptr, name.len, tx, tx_user, reliable_enabled);
     if (seds_side_is_valid(side) && !seds_side_is_valid(node->primary_side)) {
         node->primary_side = side;
     }
     return side;
 }
 
-SedsSideRef seds_global_relay_add_serialized_side(SedsName name,
+SedsSideRef seds_global_relay_add_packed_side(SedsName name,
                                                   SedsTransmitFn tx,
                                                   void * tx_user,
                                                   bool reliable_enabled)
 {
-    return seds_wrapper_relay_add_serialized_side(&g_relay, name, tx, tx_user, reliable_enabled);
+    return seds_wrapper_relay_add_packed_side(&g_relay, name, tx, tx_user, reliable_enabled);
 }
 
-SedsSideRef seds_wrapper_relay_add_serialized_small_side(SedsWrapperRelay * node,
+SedsSideRef seds_wrapper_relay_add_packed_small_side(SedsWrapperRelay * node,
                                                          SedsName name,
                                                          SedsTransmitFn tx,
                                                          void * tx_user,
@@ -827,7 +827,7 @@ SedsSideRef seds_wrapper_relay_add_serialized_small_side(SedsWrapperRelay * node
     if (!node || !node->relay) {
         return side;
     }
-    side.id = seds_relay_add_side_serialized_small_packets(node->relay,
+    side.id = seds_relay_add_side_packed_small_packets(node->relay,
                                                            name.ptr,
                                                            name.len,
                                                            tx,
@@ -840,13 +840,13 @@ SedsSideRef seds_wrapper_relay_add_serialized_small_side(SedsWrapperRelay * node
     return side;
 }
 
-SedsSideRef seds_global_relay_add_serialized_small_side(SedsName name,
+SedsSideRef seds_global_relay_add_packed_small_side(SedsName name,
                                                         SedsTransmitFn tx,
                                                         void * tx_user,
                                                         bool reliable_enabled,
                                                         size_t max_frame_bytes)
 {
-    return seds_wrapper_relay_add_serialized_small_side(&g_relay,
+    return seds_wrapper_relay_add_packed_small_side(&g_relay,
                                                         name,
                                                         tx,
                                                         tx_user,
@@ -879,7 +879,7 @@ SedsSideRef seds_global_relay_add_packet_side(SedsName name,
     return seds_wrapper_relay_add_packet_side(&g_relay, name, tx, tx_user, reliable_enabled);
 }
 
-SedsResult seds_wrapper_relay_rx_serialized_from_side(SedsWrapperRelay * node,
+SedsResult seds_wrapper_relay_rx_packed_from_side(SedsWrapperRelay * node,
                                                       SedsSideRef side,
                                                       const uint8_t * bytes,
                                                       size_t len)
@@ -887,14 +887,14 @@ SedsResult seds_wrapper_relay_rx_serialized_from_side(SedsWrapperRelay * node,
     if (!node || !node->relay || !seds_side_is_valid(side)) {
         return SEDS_BAD_ARG;
     }
-    return seds_relay_rx_serialized_from_side(node->relay, (uint32_t)side.id, bytes, len);
+    return seds_relay_rx_packed_from_side(node->relay, (uint32_t)side.id, bytes, len);
 }
 
-SedsResult seds_global_relay_rx_serialized_from_side(SedsSideRef side,
+SedsResult seds_global_relay_rx_packed_from_side(SedsSideRef side,
                                                      const uint8_t * bytes,
                                                      size_t len)
 {
-    return seds_wrapper_relay_rx_serialized_from_side(&g_relay, side, bytes, len);
+    return seds_wrapper_relay_rx_packed_from_side(&g_relay, side, bytes, len);
 }
 
 SedsResult seds_wrapper_relay_rx_packet_from_side(SedsWrapperRelay * node,

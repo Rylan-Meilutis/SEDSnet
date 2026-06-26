@@ -64,7 +64,7 @@ int main(void)
         fprintf(stderr, "router init failed\n");
         return 1;
     }
-    seds_router_add_side_serialized(r, "TX", 2, tx_send, NULL, true);
+    seds_router_add_side_packed(r, "TX", 2, tx_send, NULL, true);
     seds_router_configure_timesync(r, true, 1U, 10U, 5000U, 1000U, 1000U);
     seds_router_set_local_network_datetime_millis(r, 2025, 1, 1, 12, 0, 0, 0);
 

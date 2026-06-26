@@ -300,14 +300,13 @@ pub fn decode_discovery_announce(pkt: &Packet) -> TelemetryResult<Vec<DataEndpoi
 /// Decodes a discovery announce payload into a sorted, deduplicated endpoint list.
 pub fn decode_discovery_payload(payload: &[u8]) -> TelemetryResult<Vec<DataEndpoint>> {
     if !payload.len().is_multiple_of(4) {
-        return Err(TelemetryError::Deserialize("discovery payload width"));
+        return Err(TelemetryError::Unpack("discovery payload width"));
     }
 
     let mut endpoints = Vec::with_capacity(payload.len() / 4);
     for chunk in payload.chunks_exact(4) {
         let raw = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
-        let ep =
-            try_enum_from_u32(raw).ok_or(TelemetryError::Deserialize("bad discovery endpoint"))?;
+        let ep = try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
         if is_discovery_endpoint(ep) {
             continue;
         }
@@ -333,7 +332,7 @@ pub fn build_discovery_timesync_sources<S: AsRef<str>>(
     for source in deduped {
         let bytes = source.as_bytes();
         let len = u32::try_from(bytes.len())
-            .map_err(|_| TelemetryError::Serialize("discovery source id too long"))?;
+            .map_err(|_| TelemetryError::Pack("discovery source id too long"))?;
         payload.extend_from_slice(&len.to_le_bytes());
         payload.extend_from_slice(bytes);
     }
@@ -407,9 +406,7 @@ pub fn decode_discovery_link_capabilities(pkt: &Packet) -> TelemetryResult<LinkC
     }
     let payload = pkt.payload();
     if payload.len() != 18 {
-        return Err(TelemetryError::Deserialize(
-            "discovery link capabilities width",
-        ));
+        return Err(TelemetryError::Unpack("discovery link capabilities width"));
     }
     Ok(LinkCapabilities {
         version: payload[0],
@@ -445,14 +442,10 @@ pub fn decode_managed_variable_request(pkt: &Packet) -> TelemetryResult<DataType
     }
     let payload = pkt.payload();
     if payload.len() != 4 {
-        return Err(TelemetryError::Deserialize(
-            "managed variable request width",
-        ));
+        return Err(TelemetryError::Unpack("managed variable request width"));
     }
     let raw = u32::from_le_bytes(payload.try_into().expect("4-byte payload"));
-    try_enum_from_u32(raw).ok_or(TelemetryError::Deserialize(
-        "bad managed variable data type",
-    ))
+    try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad managed variable data type"))
 }
 
 /// Decodes a discovery time sync source packet into source identifiers.
@@ -466,9 +459,7 @@ pub fn decode_discovery_timesync_sources(pkt: &Packet) -> TelemetryResult<Vec<St
 /// Decodes a discovery time sync source payload into a sorted, deduplicated source list.
 pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryResult<Vec<String>> {
     if payload.len() < 4 {
-        return Err(TelemetryError::Deserialize(
-            "discovery timesync source count",
-        ));
+        return Err(TelemetryError::Unpack("discovery timesync source count"));
     }
 
     let count = u32::from_le_bytes(payload[..4].try_into().expect("4-byte count")) as usize;
@@ -477,29 +468,25 @@ pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryRes
 
     for _ in 0..count {
         if payload.len().saturating_sub(cursor) < 4 {
-            return Err(TelemetryError::Deserialize("discovery timesync source len"));
+            return Err(TelemetryError::Unpack("discovery timesync source len"));
         }
         let len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().expect("4-byte len"))
             as usize;
         cursor += 4;
         if payload.len().saturating_sub(cursor) < len {
-            return Err(TelemetryError::Deserialize(
-                "discovery timesync source bytes",
-            ));
+            return Err(TelemetryError::Unpack("discovery timesync source bytes"));
         }
         let raw = &payload[cursor..cursor + len];
         cursor += len;
         let source = core::str::from_utf8(raw)
-            .map_err(|_| TelemetryError::Deserialize("discovery timesync source utf8"))?;
+            .map_err(|_| TelemetryError::Unpack("discovery timesync source utf8"))?;
         if !source.is_empty() {
             out.push(source.to_string());
         }
     }
 
     if cursor != payload.len() {
-        return Err(TelemetryError::Deserialize(
-            "discovery timesync trailing bytes",
-        ));
+        return Err(TelemetryError::Unpack("discovery timesync trailing bytes"));
     }
 
     out.sort_unstable();
@@ -521,7 +508,7 @@ pub fn build_discovery_topology(
     for board in normalized {
         let sender_bytes = board.sender_id.as_bytes();
         let sender_len = u32::try_from(sender_bytes.len())
-            .map_err(|_| TelemetryError::Serialize("discovery topology sender id too long"))?;
+            .map_err(|_| TelemetryError::Pack("discovery topology sender id too long"))?;
         payload.extend_from_slice(&sender_len.to_le_bytes());
         payload.extend_from_slice(sender_bytes);
 
@@ -534,7 +521,7 @@ pub fn build_discovery_topology(
         for source in board.reachable_timesync_sources {
             let bytes = source.as_bytes();
             let len = u32::try_from(bytes.len())
-                .map_err(|_| TelemetryError::Serialize("discovery topology source id too long"))?;
+                .map_err(|_| TelemetryError::Pack("discovery topology source id too long"))?;
             payload.extend_from_slice(&len.to_le_bytes());
             payload.extend_from_slice(bytes);
         }
@@ -542,9 +529,8 @@ pub fn build_discovery_topology(
         payload.extend_from_slice(&(board.connections.len() as u32).to_le_bytes());
         for peer in board.connections {
             let bytes = peer.as_bytes();
-            let len = u32::try_from(bytes.len()).map_err(|_| {
-                TelemetryError::Serialize("discovery topology connection id too long")
-            })?;
+            let len = u32::try_from(bytes.len())
+                .map_err(|_| TelemetryError::Pack("discovery topology connection id too long"))?;
             payload.extend_from_slice(&len.to_le_bytes());
             payload.extend_from_slice(bytes);
         }
@@ -565,7 +551,7 @@ fn decode_string(
     label: &'static str,
 ) -> TelemetryResult<String> {
     if payload.len().saturating_sub(*cursor) < 4 {
-        return Err(TelemetryError::Deserialize(label));
+        return Err(TelemetryError::Unpack(label));
     }
     let len = u32::from_le_bytes(
         payload[*cursor..*cursor + 4]
@@ -574,13 +560,13 @@ fn decode_string(
     ) as usize;
     *cursor += 4;
     if payload.len().saturating_sub(*cursor) < len {
-        return Err(TelemetryError::Deserialize(label));
+        return Err(TelemetryError::Unpack(label));
     }
     let raw = &payload[*cursor..*cursor + len];
     *cursor += len;
     core::str::from_utf8(raw)
         .map(|s| s.to_string())
-        .map_err(|_| TelemetryError::Deserialize(label))
+        .map_err(|_| TelemetryError::Unpack(label))
 }
 
 /// Decodes a discovery topology packet into board-node records.
@@ -596,9 +582,7 @@ pub fn decode_discovery_topology_payload(
     payload: &[u8],
 ) -> TelemetryResult<Vec<TopologyBoardNode>> {
     if payload.len() < 4 {
-        return Err(TelemetryError::Deserialize(
-            "discovery topology board count",
-        ));
+        return Err(TelemetryError::Unpack("discovery topology board count"));
     }
 
     let count = u32::from_le_bytes(payload[..4].try_into().expect("4-byte count")) as usize;
@@ -609,9 +593,7 @@ pub fn decode_discovery_topology_payload(
         let sender_id = decode_string(payload, &mut cursor, "discovery topology sender id")?;
 
         if payload.len().saturating_sub(cursor) < 4 {
-            return Err(TelemetryError::Deserialize(
-                "discovery topology endpoint count",
-            ));
+            return Err(TelemetryError::Unpack("discovery topology endpoint count"));
         }
         let endpoint_count = u32::from_le_bytes(
             payload[cursor..cursor + 4]
@@ -622,20 +604,20 @@ pub fn decode_discovery_topology_payload(
         let mut reachable_endpoints = Vec::with_capacity(endpoint_count);
         for _ in 0..endpoint_count {
             if payload.len().saturating_sub(cursor) < 4 {
-                return Err(TelemetryError::Deserialize("discovery topology endpoint"));
+                return Err(TelemetryError::Unpack("discovery topology endpoint"));
             }
             let raw =
                 u32::from_le_bytes(payload[cursor..cursor + 4].try_into().expect("4-byte ep"));
             cursor += 4;
-            let ep = try_enum_from_u32(raw)
-                .ok_or(TelemetryError::Deserialize("bad discovery endpoint"))?;
+            let ep =
+                try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
             if !is_discovery_endpoint(ep) {
                 reachable_endpoints.push(ep);
             }
         }
 
         if payload.len().saturating_sub(cursor) < 4 {
-            return Err(TelemetryError::Deserialize(
+            return Err(TelemetryError::Unpack(
                 "discovery topology timesync source count",
             ));
         }
@@ -654,7 +636,7 @@ pub fn decode_discovery_topology_payload(
         }
 
         if payload.len().saturating_sub(cursor) < 4 {
-            return Err(TelemetryError::Deserialize(
+            return Err(TelemetryError::Unpack(
                 "discovery topology connection count",
             ));
         }
@@ -681,9 +663,7 @@ pub fn decode_discovery_topology_payload(
     }
 
     if cursor != payload.len() {
-        return Err(TelemetryError::Deserialize(
-            "discovery topology trailing bytes",
-        ));
+        return Err(TelemetryError::Unpack("discovery topology trailing bytes"));
     }
 
     normalize_topology_boards(&mut boards);
@@ -692,7 +672,7 @@ pub fn decode_discovery_topology_payload(
 
 fn encode_string(payload: &mut Vec<u8>, value: &str) -> TelemetryResult<()> {
     let len = u32::try_from(value.len())
-        .map_err(|_| TelemetryError::Serialize("discovery schema string too long"))?;
+        .map_err(|_| TelemetryError::Pack("discovery schema string too long"))?;
     payload.extend_from_slice(&len.to_le_bytes());
     payload.extend_from_slice(value.as_bytes());
     Ok(())
@@ -700,7 +680,7 @@ fn encode_string(payload: &mut Vec<u8>, value: &str) -> TelemetryResult<()> {
 
 fn read_u8(payload: &[u8], cursor: &mut usize, label: &'static str) -> TelemetryResult<u8> {
     if payload.len().saturating_sub(*cursor) < 1 {
-        return Err(TelemetryError::Deserialize(label));
+        return Err(TelemetryError::Unpack(label));
     }
     let out = payload[*cursor];
     *cursor += 1;
@@ -709,7 +689,7 @@ fn read_u8(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telemetry
 
 fn read_u32(payload: &[u8], cursor: &mut usize, label: &'static str) -> TelemetryResult<u32> {
     if payload.len().saturating_sub(*cursor) < 4 {
-        return Err(TelemetryError::Deserialize(label));
+        return Err(TelemetryError::Unpack(label));
     }
     let out = u32::from_le_bytes(
         payload[*cursor..*cursor + 4]
@@ -872,7 +852,7 @@ pub fn decode_discovery_schema_payload(
     let mut cursor = 0usize;
     let version = read_u32(payload, &mut cursor, "discovery schema version")?;
     if version != 1 && version != 2 && version != 3 {
-        return Err(TelemetryError::Deserialize("discovery schema version"));
+        return Err(TelemetryError::Unpack("discovery schema version"));
     }
 
     let endpoint_count =
@@ -921,18 +901,18 @@ pub fn decode_discovery_schema_payload(
             &mut cursor,
             "discovery schema data type",
         )?)
-        .ok_or(TelemetryError::Deserialize("discovery schema data type"))?;
+        .ok_or(TelemetryError::Unpack("discovery schema data type"))?;
         let class =
             message_class_from_code(read_u8(payload, &mut cursor, "discovery schema class")?)
-                .ok_or(TelemetryError::Deserialize("discovery schema class"))?;
+                .ok_or(TelemetryError::Unpack("discovery schema class"))?;
         let element = match element_kind {
             0 => MessageElement::Static(count, data_type, class),
             1 => MessageElement::Dynamic(data_type, class),
-            _ => return Err(TelemetryError::Deserialize("discovery schema element kind")),
+            _ => return Err(TelemetryError::Unpack("discovery schema element kind")),
         };
         let reliable =
             reliable_from_code(read_u8(payload, &mut cursor, "discovery schema reliable")?)
-                .ok_or(TelemetryError::Deserialize("discovery schema reliable"))?;
+                .ok_or(TelemetryError::Unpack("discovery schema reliable"))?;
         let priority = read_u8(payload, &mut cursor, "discovery schema priority")?;
         let e2e_encryption = if version >= 3 {
             e2e_encryption_policy_from_code(read_u8(
@@ -940,9 +920,7 @@ pub fn decode_discovery_schema_payload(
                 &mut cursor,
                 "discovery schema e2e cryptography",
             )?)
-            .ok_or(TelemetryError::Deserialize(
-                "discovery schema e2e cryptography",
-            ))?
+            .ok_or(TelemetryError::Unpack("discovery schema e2e cryptography"))?
         } else {
             E2eEncryptionPolicy::PreferOff
         };
@@ -969,9 +947,7 @@ pub fn decode_discovery_schema_payload(
     }
 
     if cursor != payload.len() {
-        return Err(TelemetryError::Deserialize(
-            "discovery schema trailing bytes",
-        ));
+        return Err(TelemetryError::Unpack("discovery schema trailing bytes"));
     }
     Ok(OwnedRuntimeSchemaSnapshot { endpoints, types })
 }

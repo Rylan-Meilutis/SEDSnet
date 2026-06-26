@@ -12,7 +12,7 @@ fn main() -> TelemetryResult<()> {
     let radio = register_endpoint_id_with_description(
         DataEndpoint(101),
         "RADIO",
-        "serialized radio link",
+        "packed radio link",
         false,
     )?;
     let flight_state = register_data_type_id_with_description_and_e2e_encryption(
@@ -34,7 +34,7 @@ fn main() -> TelemetryResult<()> {
     );
 
     router.enable_managed_variable(flight_state)?;
-    router.add_side_serialized("RADIO", |_bytes| Ok(()));
+    router.add_side_packed("RADIO", |_bytes| Ok(()));
 
     let state = [3_u8];
     router.log(flight_state, &state)?;

@@ -21,7 +21,7 @@ fn main() -> TelemetryResult<()> {
         )]),
         Box::new(|| now_ms()),
     );
-    router.add_side_serialized_with_options(
+    router.add_side_packed_with_options(
         "RADIO",
         |_bytes| Ok(()),
         RouterSideOptions {

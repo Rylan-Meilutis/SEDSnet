@@ -102,7 +102,7 @@ SedsResult bus_send(SimBus * bus, const SimNode * from, const uint8_t * bytes, s
     if (bus->relay && from != NULL)
     {
         // Treat this as "incoming from this side"
-        SedsResult r = seds_relay_rx_serialized_from_side(
+        SedsResult r = seds_relay_rx_packed_from_side(
             bus->relay,
             bus->relay_side_id,
             bytes,
@@ -294,11 +294,11 @@ SedsResult radio_handler_serial(const uint8_t * bytes, const size_t len, void * 
     (void) len;
     SimNode * self = (SimNode *) user;
 
-    // Deserialize into owned packet
-    SedsOwnedPacket * owned = seds_pkt_deserialize_owned(bytes, len);
+    // Unpack into owned packet
+    SedsOwnedPacket * owned = seds_pkt_unpack_owned(bytes, len);
     if (!owned)
     {
-        fprintf(stderr, "[RADIO] deserialize failed\n");
+        fprintf(stderr, "[RADIO] unpack failed\n");
         return SEDS_ERR;
     }
 
@@ -395,7 +395,7 @@ SedsResult node_init(SimNode * n, SimBus * bus, const char * name, int radio, in
     {
         locals[num++] = (SedsLocalEndpointDesc){
             .endpoint = TEST_EP_RADIO,
-            .serialized_handler = radio_handler_serial,
+            .packed_handler = radio_handler_serial,
             .user = (void *) n
         };
     }
@@ -434,7 +434,7 @@ SedsResult node_init(SimNode * n, SimBus * bus, const char * name, int radio, in
         n->r = NULL;
         return SEDS_ERR;
     }
-    int32_t side_id = seds_router_add_side_serialized(n->r, "BUS", 3, node_tx_send, n, true);
+    int32_t side_id = seds_router_add_side_packed(n->r, "BUS", 3, node_tx_send, n, true);
     if (side_id < 0)
     {
         fprintf(stderr, "[%s] Failed to add router side\n", n->name);
@@ -465,7 +465,7 @@ void node_rx(SimNode * n, const uint8_t * bytes, const size_t len)
 {
     if (!n || !n->r || !bytes || !len) return;
     // LOCK();
-    seds_router_rx_serialized_packet_to_queue_from_side(n->r, n->bus_side_id, bytes, len);
+    seds_router_rx_packed_packet_to_queue_from_side(n->r, n->bus_side_id, bytes, len);
 }
 
 SedsResult node_log(

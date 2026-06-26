@@ -56,7 +56,7 @@ fn main() -> TelemetryResult<()> {
 
     let router = Router::new(RouterConfig::new([handler]));
 
-    router.add_side_serialized("RADIO", |bytes| {
+    router.add_side_packed("RADIO", |bytes| {
         let _ = bytes;
         Ok(())
     });
@@ -159,7 +159,7 @@ The `cryptography` feature uses this provider order:
 - registered Rust provider, for Rust-only firmware or std applications wrapping OS crypto
 - built-in software fallback, only after the application registers a key for the packet `key_id`
 
-Serialized side traffic carries visible routing metadata and an encrypted payload; the visible
+Packed side traffic carries visible routing metadata and an encrypted payload; the visible
 header is authenticated as AAD so header tampering fails during open. The built-in fallback uses the
 provisioned key for authenticated cryptography, but it does not create identity by itself.
 
@@ -209,7 +209,7 @@ throttles only that measured slow side while fast sides keep the configured norm
 
 Routers and relays use named sides such as `UART`, `CAN`, or `RADIO`.
 
-- `add_side_serialized(...)` and `add_side_packet(...)` register egress handlers
+- `add_side_packed(...)` and `add_side_packet(...)` register egress handlers
 - `remove_side(...)` tombstones a side without renumbering the remaining side ids
 - `set_side_ingress_enabled(...)` and `set_side_egress_enabled(...)` control directional policy
 - `set_route(...)` and `set_typed_route(...)` define runtime forwarding rules
@@ -227,9 +227,9 @@ Example:
 use sedsnet::router::Router;
 
 let router = Router::new(RouterConfig::default());
-let side_a = router.add_side_serialized("A", tx_a);
-let side_b = router.add_side_serialized("B", tx_b);
-let side_c = router.add_side_serialized("C", tx_c);
+let side_a = router.add_side_packed("A", tx_a);
+let side_b = router.add_side_packed("B", tx_b);
+let side_c = router.add_side_packed("C", tx_c);
 
 router.set_route(None, side_b, false)?;        // local TX does not go to B
 router.set_route(Some(side_a), side_b, true)?; // allow A -> B
@@ -279,7 +279,7 @@ that side's TX callback.
 use sedsnet::router::{Router, RouterConfig, RouterSideOptions};
 
 let router = Router::new(RouterConfig::default());
-router.add_side_serialized_with_options(
+router.add_side_packed_with_options(
     "RADIO",
     tx,
     RouterSideOptions {
@@ -295,13 +295,13 @@ If the underlying transport is already reliable, disable the router-level reliab
 
 What `reliable_enabled` means on a side:
 
-- `reliable_enabled: true` on a serialized side wraps reliable schema traffic in the router/relay's
+- `reliable_enabled: true` on a packed side wraps reliable schema traffic in the router/relay's
   hop-level reliable framing for that side only
 - that hop-level framing adds sequence numbers, ACKs, packet requests, and retransmits
 - `reliable_enabled: false` sends the application packet once on that side without the router's
   hop-level reliable wrapper
 - packet-output sides (`add_side_packet*`) receive decoded `Packet` values, so they cannot carry
-  the serialized hop-level reliable wrapper even if `reliable_enabled` is set
+  the packed hop-level reliable wrapper even if `reliable_enabled` is set
 
 For routers specifically:
 
@@ -341,8 +341,8 @@ them. When the missing sequence arrives, the buffered packets are dispatched imm
 
 Common receive APIs:
 
-- `rx_serialized(bytes)`
-- `rx_serialized_queue(bytes)`
+- `rx_packed(bytes)`
+- `rx_packed_queue(bytes)`
 - `rx(packet)`
 - `rx_queue(packet)`
 
@@ -362,7 +362,7 @@ directly.
 
 Use side-aware ingress only when you need to override the ingress side explicitly:
 
-- `rx_serialized_from_side(bytes, side_id)`
+- `rx_packed_from_side(bytes, side_id)`
 - `rx_from_side(packet, side_id)`
 
 ## Queue processing
@@ -408,9 +408,9 @@ timestamp-delta and unchanged-timestamp compact frame counts, and the observed c
 overhead. Small-packet transport defaults to a 40-byte IPv6-like overhead target; call
 `with_ipv4_like_compact_header_target()` on the side options when a stable tiny telemetry stream
 should be held to a 20-byte IPv4-like target with unchanged compact timestamps omitted. Python
-exposes the same profile selection with `add_side_serialized_profile(..., profile="ipv4_like")`; C
-callers use `seds_router_add_side_serialized_profile(...)` or
-`seds_relay_add_side_serialized_profile(...)` with `SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE`.
+exposes the same profile selection with `add_side_packed_profile(..., profile="ipv4_like")`; C
+callers use `seds_router_add_side_packed_profile(...)` or
+`seds_relay_add_side_packed_profile(...)` with `SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE`.
 
 For mixed links, keep absolute/delta timestamps for most traffic and omit unchanged timestamps only
 for selected data types:

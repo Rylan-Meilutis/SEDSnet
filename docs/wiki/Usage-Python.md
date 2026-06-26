@@ -57,7 +57,7 @@ router = seds.Router(
     handlers=[(sd_card, on_packet, None)],
 )
 
-router.add_side_serialized("RADIO", tx, reliable_enabled=True)
+router.add_side_packed("RADIO", tx, reliable_enabled=True)
 router.log_f32(gps_data, [1.0, 2.0, 3.0])
 router.process_all_queues()
 ```
@@ -183,7 +183,7 @@ Call `announce_leave()` before a planned shutdown or disconnect so peers receive
 `SEDSNET_DISCOVERY_LEAVE` and remove that sender from topology immediately instead of waiting for
 the discovery TTL.
 
-Reliable delivery is enabled on a per-side basis with `reliable_enabled=True` for serialized
+Reliable delivery is enabled on a per-side basis with `reliable_enabled=True` for packed
 sides. Packets already in flight also carry a compact internal wire contract so topology or
 runtime-schema changes do not redirect them to the wrong holder or make them undecodable mid-flight.
 Applications do not construct that contract directly; routers and relays manage it internally.
@@ -223,10 +223,10 @@ Use `export_memory_layout_json()` on a router or relay to profile queue pressure
 shared allocated/used bytes plus per-area queue, reliable-buffer, schema, discovery, and
 network-variable-cache breakdowns.
 
-Use `add_side_serialized_profile(...)` to select a compact side-wire profile from Python:
+Use `add_side_packed_profile(...)` to select a compact side-wire profile from Python:
 
 ```python
-router.add_side_serialized_profile(
+router.add_side_packed_profile(
     "RADIO",
     tx,
     reliable_enabled=True,

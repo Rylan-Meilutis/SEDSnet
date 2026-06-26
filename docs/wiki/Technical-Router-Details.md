@@ -16,18 +16,18 @@ and how routing decisions are made.
 Handlers are typed:
 
 - `EndpointHandlerFn::Packet`: receives `Packet`.
-- `EndpointHandlerFn::Serialized`: receives raw bytes (already on wire).
+- `EndpointHandlerFn::Packed`: receives raw bytes (already on wire).
 
 ## Side model
 
 The router uses **named sides** (UART/CAN/RADIO/etc.) instead of LinkId.
 
-- You register sides with `add_side_serialized(...)` or `add_side_packet(...)`.
+- You register sides with `add_side_packed(...)` or `add_side_packet(...)`.
 - Side IDs remain stable after registration; removed sides become inactive tombstones.
-- As of v3.0.0, side tracking is internal. Most apps use `rx_serialized` / `rx` without
+- As of v3.0.0, side tracking is internal. Most apps use `rx_packed` / `rx` without
   threading side IDs through their handlers.
 - Side-aware RX functions can still tag an ingress side when you must override it:
-  `rx_serialized_from_side` / `rx_from_side`.
+  `rx_packed_from_side` / `rx_from_side`.
 - `Router` now starts from the same full-mesh forwarding model as `Relay`.
 - Runtime controls then shape the graph with per-side ingress/egress policy and per-path route
   overrides for `(local TX or source side) -> destination side`.
@@ -52,7 +52,7 @@ Reliable delivery (`reliable: true` / `reliable_mode` in the schema) is only app
 
 - the router config enables reliable (`RouterConfig::with_reliable_enabled(true)`), and
 - the side is marked reliable (`RouterSideOptions { reliable_enabled: true }`), and
-- the side handler is **serialized** (internal reliable control packets travel on the wire).
+- the side handler is **packed** (internal reliable control packets travel on the wire).
 
 `RouterSideOptions` defaults to `reliable_enabled: false`, so reliability is opt-in per side.
 
@@ -89,7 +89,7 @@ Discovery advertisements are adaptive:
 2) For reliable types, sequence headers are processed first and internal `RELIABLE_ACK` /
    `RELIABLE_PARTIAL_ACK` / `RELIABLE_PACKET_REQUEST` control packets are consumed here.
 3) Packet ID is computed for dedupe (unreliable / unsequenced frames).
-    - Serialized bytes use `packet_id_from_wire` when possible.
+    - Packed bytes use `packet_id_from_wire` when possible.
     - If wire parsing fails, raw bytes are hashed as fallback.
 4) Recent‑ID cache drops duplicates.
 5) Local handlers are invoked with retries.
@@ -124,8 +124,8 @@ With discovery enabled, forwarding also consults the learned side map:
 
 ## Transmit pipeline (log*, tx*)
 
-- `log*` builds a packet from typed data, validates it, and serializes it.
-- `tx*` accepts a packet or serialized bytes and forwards them.
+- `log*` builds a packet from typed data, validates it, and packs it.
+- `tx*` accepts a packet or packed bytes and forwards them.
 - Queue variants defer the work until `process_tx_queue()` or `process_all_queues()`.
 - `periodic()` bundles the built-in maintenance polling with queue draining.
 - `periodic_no_timesync()` skips the time-sync maintenance phase while still running discovery and
@@ -141,8 +141,8 @@ With discovery enabled, forwarding also consults the learned side map:
 
 The router exposes immediate and queued APIs for both RX and TX:
 
-- Immediate: `rx*`, `rx_serialized*`, `log*`, `tx*`.
-- Queued: `rx_*_queue`, `rx_serialized_queue`, `log_queue*`, `tx_queue*`.
+- Immediate: `rx*`, `rx_packed*`, `log*`, `tx*`.
+- Queued: `rx_*_queue`, `rx_packed_queue`, `log_queue*`, `tx_queue*`.
 
 Queues are processed using:
 

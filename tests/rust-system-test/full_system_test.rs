@@ -6,7 +6,7 @@ mod mega_library_system_tests {
     use sedsnet::relay::Relay;
     use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
 
-    use sedsnet::serialize::serialize_packet;
+    use sedsnet::wire_format::pack_packet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -59,21 +59,21 @@ mod mega_library_system_tests {
 
         let r_a_tx = bus_a_tx.clone();
         let relay_side_a =
-            relay.add_side_serialized("bus_a", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus_a", move |bytes: &[u8]| -> TelemetryResult<()> {
                 let _ = r_a_tx.send(("relay", bytes.to_vec()));
                 Ok(())
             });
 
         let r_b_tx = bus_b_tx.clone();
         let relay_side_b =
-            relay.add_side_serialized("bus_b", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus_b", move |bytes: &[u8]| -> TelemetryResult<()> {
                 let _ = r_b_tx.send(("relay", bytes.to_vec()));
                 Ok(())
             });
 
         let r_c_tx = bus_c_tx.clone();
         let relay_side_c =
-            relay.add_side_serialized("bus_c", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus_c", move |bytes: &[u8]| -> TelemetryResult<()> {
                 let _ = r_c_tx.send(("relay", bytes.to_vec()));
                 Ok(())
             });
@@ -102,7 +102,7 @@ mod mega_library_system_tests {
             ];
 
             let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
-            router.add_side_serialized("bus_a", {
+            router.add_side_packed("bus_a", {
                 let bus = bus_a_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
                     let _ = bus.send(("node_a", bytes.to_vec()));
@@ -119,7 +119,7 @@ mod mega_library_system_tests {
             ];
 
             let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
-            router.add_side_serialized("bus_b", {
+            router.add_side_packed("bus_b", {
                 let bus = bus_b_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
                     let _ = bus.send(("node_b", bytes.to_vec()));
@@ -136,7 +136,7 @@ mod mega_library_system_tests {
             ];
 
             let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
-            router.add_side_serialized("bus_c", {
+            router.add_side_packed("bus_c", {
                 let bus = bus_c_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
                     let _ = bus.send(("node_c", bytes.to_vec()));
@@ -151,21 +151,21 @@ mod mega_library_system_tests {
         // -------------------------------
         let (hub_router, hub_side_a, hub_side_b, hub_side_c) = {
             let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
-            let hub_side_a = router.add_side_serialized("bus_a", {
+            let hub_side_a = router.add_side_packed("bus_a", {
                 let bus = bus_a_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
                     let _ = bus.send(("hub_router", bytes.to_vec()));
                     Ok(())
                 }
             });
-            let hub_side_b = router.add_side_serialized("bus_b", {
+            let hub_side_b = router.add_side_packed("bus_b", {
                 let bus = bus_b_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
                     let _ = bus.send(("hub_router", bytes.to_vec()));
                     Ok(())
                 }
             });
-            let hub_side_c = router.add_side_serialized("bus_c", {
+            let hub_side_c = router.add_side_packed("bus_c", {
                 let bus = bus_c_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
                     let _ = bus.send(("hub_router", bytes.to_vec()));
@@ -193,18 +193,18 @@ mod mega_library_system_tests {
                 while !stop.load(Ordering::SeqCst) {
                     match rx.recv_timeout(Duration::from_millis(10)) {
                         Ok((_from, frame)) => {
-                            local_node.rx_serialized_queue(&frame).unwrap();
-                            hub.rx_serialized_queue_from_side(&frame, hub_side).unwrap();
-                            relay.rx_serialized_from_side(relay_side, &frame).unwrap();
+                            local_node.rx_packed_queue(&frame).unwrap();
+                            hub.rx_packed_queue_from_side(&frame, hub_side).unwrap();
+                            relay.rx_packed_from_side(relay_side, &frame).unwrap();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 while let Ok((_from, frame)) = rx.try_recv() {
-                    local_node.rx_serialized_queue(&frame).unwrap();
-                    hub.rx_serialized_queue_from_side(&frame, hub_side).unwrap();
-                    relay.rx_serialized_from_side(relay_side, &frame).unwrap();
+                    local_node.rx_packed_queue(&frame).unwrap();
+                    hub.rx_packed_queue_from_side(&frame, hub_side).unwrap();
+                    relay.rx_packed_from_side(relay_side, &frame).unwrap();
                 }
                 eprintln!("bus thread {name} exiting");
             })
@@ -279,7 +279,7 @@ mod mega_library_system_tests {
 
         // -------------------------------
         // 8) Generators
-        //   - nodes generate traffic (packet + serialized, queue + immediate)
+        //   - nodes generate traffic (packet + packed, queue + immediate)
         //   - hub ALSO generates traffic (forces hub TX paths to execute)
         // -------------------------------
         let gen_a = {
@@ -305,8 +305,8 @@ mod mega_library_system_tests {
 
                     r.tx_queue(pkt.clone()).unwrap();
 
-                    let wire = serialize_packet(&pkt);
-                    r.tx_serialized(wire).unwrap();
+                    let wire = pack_packet(&pkt);
+                    r.tx_packed(wire).unwrap();
 
                     thread::sleep(Duration::from_millis(3));
                 }
@@ -326,8 +326,8 @@ mod mega_library_system_tests {
                     )
                     .unwrap();
 
-                    let wire = serialize_packet(&pkt);
-                    r.tx_serialized_queue(wire).unwrap();
+                    let wire = pack_packet(&pkt);
+                    r.tx_packed_queue(wire).unwrap();
 
                     thread::sleep(Duration::from_millis(3));
                 }
@@ -347,9 +347,9 @@ mod mega_library_system_tests {
                     hub.tx_queue(pkt_a).unwrap();
 
                     let pkt_b = make_packet(DataType::named("BATTERY_STATUS"), &buf[..2], 2000 + i);
-                    let wire_b = serialize_packet(&pkt_b);
-                    hub.tx_serialized(wire_b.clone()).unwrap();
-                    hub.tx_serialized_queue(wire_b).unwrap();
+                    let wire_b = pack_packet(&pkt_b);
+                    hub.tx_packed(wire_b.clone()).unwrap();
+                    hub.tx_packed_queue(wire_b).unwrap();
 
                     let pkt_c = Packet::from_str_slice(
                         DataType::TelemetryError,
@@ -358,8 +358,8 @@ mod mega_library_system_tests {
                         3000 + i,
                     )
                     .unwrap();
-                    let wire_c = serialize_packet(&pkt_c);
-                    hub.tx_serialized_queue(wire_c).unwrap();
+                    let wire_c = pack_packet(&pkt_c);
+                    hub.tx_packed_queue(wire_c).unwrap();
 
                     thread::sleep(Duration::from_millis(2));
                 }

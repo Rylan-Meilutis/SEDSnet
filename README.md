@@ -90,10 +90,10 @@ cryptography while the application supplies a C provider, Rust provider, OS/hard
 
 When topology or schema changes are propagating, packets already on the wire now carry a compact frozen delivery and
 decode contract. New packets immediately use the latest endpoint bitmap/schema view, while in-flight packets continue to
-route only to their original intended holders and remain decodable against the shape they were serialized with. The
+route only to their original intended holders and remain decodable against the shape they were packed with. The
 contract is encoded compactly with bitmap-oriented metadata and sender hashes so header growth stays small.
 
-Serialized packets use compact varint fields, endpoint bitmaps, sender IDs/hashes, and optional per-side header
+Packed packets use compact varint fields, endpoint bitmaps, sender IDs/hashes, and optional per-side header
 templates, so the header is no longer best described as a fixed ~20-byte cost. The first packet for a route may carry
 the full sender/schema context, while later packets on small-packet transports can replace repeated header fields with a
 compact template ID. That keeps the header-to-payload ratio reasonable for small payloads such as three floats or a few
@@ -119,7 +119,7 @@ compact template ID. That keeps the header-to-payload ratio reasonable for small
 - Crypto providers can be supplied as C callbacks, Rust providers, or registered software fallback
   keys, and compact managed credentials support master-root deployments without user-managed cert
   files.
-- Fixed-size serialized sides transparently split/reassemble packets for CAN, I2C, and fixed-frame
+- Fixed-size packed sides transparently split/reassemble packets for CAN, I2C, and fixed-frame
   radios, while link-probe samples seed adaptive routing for asymmetric or time-sliced links.
 - Discovery-aware forwarding avoids blind unknown-route user-data flooding once topology exists,
   protecting low-bandwidth sides unless explicit route policy selects them.

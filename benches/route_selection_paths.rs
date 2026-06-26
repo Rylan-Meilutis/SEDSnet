@@ -77,17 +77,17 @@ fn benchmark_route_selection_paths(c: &mut Criterion) {
     let relay_out_a = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let relay_out_b = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let relay = Relay::new(zero_clock());
-    let ingress = relay.add_side_serialized("INGRESS", |_bytes| Ok(()));
+    let ingress = relay.add_side_packed("INGRESS", |_bytes| Ok(()));
     let path_a = {
         let relay_out_a = relay_out_a.clone();
-        relay.add_side_serialized("A", move |bytes| -> TelemetryResult<()> {
+        relay.add_side_packed("A", move |bytes| -> TelemetryResult<()> {
             relay_out_a.lock().unwrap().push(bytes.to_vec());
             Ok(())
         })
     };
     let path_b = {
         let relay_out_b = relay_out_b.clone();
-        relay.add_side_serialized("B", move |bytes| -> TelemetryResult<()> {
+        relay.add_side_packed("B", move |bytes| -> TelemetryResult<()> {
             relay_out_b.lock().unwrap().push(bytes.to_vec());
             Ok(())
         })
@@ -116,11 +116,11 @@ fn benchmark_route_selection_paths(c: &mut Criterion) {
     let relay_counter = AtomicU64::new(10_000);
     group.bench_function("relay_failover_forward", |b| {
         b.iter_batched(
-            || sedsnet::serialize::serialize_packet(&next_packet(&relay_counter)),
+            || sedsnet::wire_format::pack_packet(&next_packet(&relay_counter)),
             |frame| {
                 relay_out_a.lock().unwrap().clear();
                 relay_out_b.lock().unwrap().clear();
-                relay.rx_serialized_from_side(ingress, &frame).unwrap();
+                relay.rx_packed_from_side(ingress, &frame).unwrap();
                 relay.process_all_queues().unwrap();
             },
             BatchSize::SmallInput,

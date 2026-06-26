@@ -11,11 +11,11 @@ API docs.
   by the E2E payload wrapper so tampering is detected before handlers see the payload.
 - **AEAD**: Authenticated Cryptography with Associated Data. The style of cryptography expected from
   cryptography providers: encrypt the payload and authenticate both payload and selected visible header bytes.
-- **CRC**: Cyclic Redundancy Check. Serialized frames include a CRC32 trailer to reject corrupted
+- **CRC**: Cyclic Redundancy Check. Packed frames include a CRC32 trailer to reject corrupted
   bytes before dispatch.
 - **E2E**: End-to-end. In this project it can mean either end-to-end reliable delivery confirmation
   or end-to-end encrypted payloads, depending on context.
-- **Frame**: A serialized packet byte sequence ready to send over a side.
+- **Frame**: A packed packet byte sequence ready to send over a side.
 - **Packet**: The logical telemetry message before or after serialization. It has a sender, time,
   data type, endpoints, and payload.
 - **Payload**: The application data bytes inside a packet. With `cryptography`, these bytes can be
@@ -25,13 +25,13 @@ API docs.
 
 ## Routing and transport terms
 
-- **CAN**: Controller Area Network. A fixed-frame bus that usually benefits from serialized-side
+- **CAN**: Controller Area Network. A fixed-frame bus that usually benefits from packed-side
   max-size splitting.
 - **Endpoint**: A logical destination such as `RADIO`, `SD_CARD`, or `FLIGHT_SOFTWARE`.
 - **Flooding**: Forwarding to every eligible side. Current discovery-aware routing avoids blind
   unknown-route flooding for normal user data once topology exists.
 - **I2C**: Inter-Integrated Circuit. A short-distance bus that can benefit from fixed-size
-  serialized-side splitting.
+  packed-side splitting.
 - **Link-local**: Traffic that should stay on local software-bus or IPC sides and not be advertised
   onto normal network links.
 - **LoRa**: Long Range radio. Usually low bandwidth and sometimes time-sliced, so discovery-aware

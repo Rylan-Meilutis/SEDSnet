@@ -36,7 +36,7 @@ inline-optimized payload storage (`SmallPayload`).
 
 -
 
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/serialize.rs)):
+src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)):
 compact wire format, ULEB128 helpers, envelope peek, packet IDs from wire.
 
 -
@@ -109,7 +109,7 @@ Validation rules enforced by `Packet::new` and `Packet::validate`:
     - String types: trailing NULs are ignored and remaining bytes must be valid UTF-8.
     - Binary types: no UTF-8 requirement (raw bytes).
 
-Packet IDs are **not** serialized. `Packet::packet_id` hashes:
+Packet IDs are **not** packed. `Packet::packet_id` hashes:
 
 - sender bytes
 - message name (`DataType` as string)
@@ -132,7 +132,7 @@ Why this matters:
 ## Serialization and wire format
 
 The compact v2 wire format is implemented in
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/serialize.rs)).
+src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)).
 A packet is encoded as a compact v2 frame with a fixed-width endpoint bitmap, optional wire contract, optional reliable header, payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
 
 Design choices:
@@ -171,15 +171,15 @@ The router is the main API for logging, receiving, dispatching, and (optionally)
 Key structures:
 
 - `RouterConfig`: holds local `EndpointHandler` definitions in an `Arc<[EndpointHandler]>`.
-- `EndpointHandler`: packet or serialized handler for a specific `DataEndpoint`.
+- `EndpointHandler`: packet or packed handler for a specific `DataEndpoint`.
 - `RouterSideId`: identifies a named side (UART/CAN/RADIO/etc.).
-- `RouterItem`: either `Packet` or serialized bytes.
+- `RouterItem`: either `Packet` or packed bytes.
 
 Receive flow:
 
 1) RX bytes or packet are processed immediately or queued (`rx_*` vs `rx_*_queue`).
 2) Reliable side headers are handled first when the ingress side has reliable delivery enabled.
-3) Packet ID is computed. For serialized bytes, the router tries `packet_id_from_wire` and falls back to hashing raw
+3) Packet ID is computed. For packed bytes, the router tries `packet_id_from_wire` and falls back to hashing raw
    bytes if needed.
 4) If the packet ID is already in the recent cache, it is dropped.
 5) Local endpoint handlers are invoked.
@@ -195,8 +195,8 @@ Forwarding is driven by:
 
 Transmit flow:
 
-- `log*` builds a new `Packet` from typed data, validates sizes, and serializes it.
-- `tx*` sends a pre-built `Packet` (validated) or serialized bytes.
+- `log*` builds a new `Packet` from typed data, validates sizes, and packs it.
+- `tx*` sends a pre-built `Packet` (validated) or packed bytes.
 - Queue variants (`*_queue`) defer the work until `process_*_queue`.
 
 Error handling:
@@ -209,7 +209,7 @@ Error handling:
 
 `Relay` is schema-agnostic and purely forwards packets between named sides (UART/CAN/RADIO/etc.).
 
-- Each side registers a TX handler for serialized bytes or full packets.
+- Each side registers a TX handler for packed bytes or full packets.
 - Each side can opt out of reliable sequencing/ACKs (useful for TCP links).
 - The relay maintains RX/TX queues and a recent-ID cache like the router.
 - Fanout clones the `Arc` for payload sharing; it does not decode unless needed for a handler.
@@ -225,8 +225,8 @@ The clock source is injected via the `Clock` trait so embedded builds can supply
 ```
 Producer                      Router/Relay                         Consumer
 --------                      -------------                         --------
-log()/tx()  -> validate -> serialize -> tx(bytes, link) -> transport -> rx_serialized()
-rx(bytes)   -> deserialize -> dedupe -> handlers -> (optional) relay forward
+log()/tx()  -> validate -> pack -> tx(bytes, link) -> transport -> rx_packed()
+rx(bytes)   -> unpack -> dedupe -> handlers -> (optional) relay forward
 ```
 
 If you need build-time or schema details, see [Build-and-Configure](Build-and-Configure) and

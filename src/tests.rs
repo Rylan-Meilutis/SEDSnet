@@ -60,7 +60,7 @@ impl Clock for UnixClock {
 mod compression_memory_tests {
     use crate::config::{DataEndpoint, DataType};
     use crate::packet::Packet;
-    use crate::serialize;
+    use crate::wire_format;
     use std::sync::Arc;
 
     const FLAG_COMPRESSED_PAYLOAD: u8 = 0x01;
@@ -81,10 +81,10 @@ mod compression_memory_tests {
         let payload = vec![0u8; 4096];
         let pkt = make_message_packet(&payload, 11);
 
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
         assert_eq!(wire[0] & FLAG_COMPRESSED_PAYLOAD, FLAG_COMPRESSED_PAYLOAD);
 
-        let decoded = serialize::deserialize_packet(&wire).expect("deserialize failed");
+        let decoded = wire_format::unpack_packet(&wire).expect("unpack failed");
         assert_eq!(decoded.payload(), payload.as_slice());
     }
 
@@ -93,10 +93,10 @@ mod compression_memory_tests {
         let payload = b"small-msg".to_vec();
         let pkt = make_message_packet(&payload, 22);
 
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
         assert_eq!(wire[0] & FLAG_COMPRESSED_PAYLOAD, 0);
 
-        let decoded = serialize::deserialize_packet(&wire).expect("deserialize failed");
+        let decoded = wire_format::unpack_packet(&wire).expect("unpack failed");
         assert_eq!(decoded.payload(), payload.as_slice());
     }
 
@@ -114,8 +114,8 @@ mod compression_memory_tests {
             };
 
             let pkt = make_message_packet(&payload, i);
-            let wire = serialize::serialize_packet(&pkt);
-            let decoded = serialize::deserialize_packet(&wire).expect("deserialize failed");
+            let wire = wire_format::pack_packet(&pkt);
+            let decoded = wire_format::unpack_packet(&wire).expect("unpack failed");
             assert_eq!(decoded.payload(), payload.as_slice());
         }
     }
@@ -163,16 +163,16 @@ fn get_handler(rx_count_c: Arc<AtomicUsize>) -> EndpointHandler {
     })
 }
 
-pub(crate) fn serialized_frame_type(bytes: &[u8]) -> Option<DataType> {
-    crate::serialize::peek_envelope(bytes)
+pub(crate) fn packed_frame_type(bytes: &[u8]) -> Option<DataType> {
+    crate::wire_format::peek_envelope(bytes)
         .ok()
         .map(|env| env.ty)
 }
 
-pub(crate) fn count_serialized_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> usize {
+pub(crate) fn count_packed_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> usize {
     frames
         .iter()
-        .filter(|bytes| serialized_frame_type(bytes.as_slice()) == Some(ty))
+        .filter(|bytes| packed_frame_type(bytes.as_slice()) == Some(ty))
         .count()
 }
 
@@ -304,22 +304,22 @@ mod tests2 {
 
     use crate::tests::timeout_tests::StepClock;
     use crate::tests::{
-        SeenType, count_serialized_frames_of_type, get_sd_card_handler, serialized_frame_type,
+        SeenType, count_packed_frames_of_type, get_sd_card_handler, packed_frame_type,
     };
     use crate::{
         TelemetryResult,
         config::{DataEndpoint, DataType},
         packet::Packet,
         router::Router,
-        serialize,
+        wire_format,
     };
     use std::sync::{Arc, Mutex};
     use std::vec::Vec;
 
-    /// Serialize/deserialize a GPS packet and ensure all fields and payload
+    /// Pack/unpack a GPS packet and ensure all fields and payload
     /// bytes round-trip exactly.
     #[test]
-    fn serialize_roundtrip_gps() {
+    fn pack_roundtrip_gps() {
         // GPS: 3 * f32
         let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
         let pkt = Packet::from_f32_slice(
@@ -332,8 +332,8 @@ mod tests2 {
 
         pkt.validate().unwrap();
 
-        let bytes = serialize::serialize_packet(&pkt);
-        let rpkt = serialize::deserialize_packet(&bytes).unwrap();
+        let bytes = wire_format::pack_packet(&pkt);
+        let rpkt = wire_format::unpack_packet(&bytes).unwrap();
 
         rpkt.validate().unwrap();
         assert_eq!(rpkt.data_type(), pkt.data_type());
@@ -374,7 +374,7 @@ mod tests2 {
         assert!(text.contains("3.25"));
     }
 
-    /// End-to-end test: `Router::log` → TX callback (serialize/deserialize) →
+    /// End-to-end test: `Router::log` → TX callback (pack/unpack) →
     /// local handler decoding f32 payload.
     #[test]
     fn router_sends_and_receives() {
@@ -384,10 +384,10 @@ mod tests2 {
         let tx_seen: Arc<Mutex<Option<Packet>>> = Arc::new(Mutex::new(None));
         let sd_seen_decoded: SeenType = Arc::new(Mutex::new(None));
 
-        // transmitter: record the deserialized packet we "sent"
+        // transmitter: record the unpacked packet we "sent"
         let tx_seen_c = tx_seen.clone();
         let transmit = move |bytes: &[u8]| -> TelemetryResult<()> {
-            let pkt = serialize::deserialize_packet(bytes)?;
+            let pkt = wire_format::unpack_packet(bytes)?;
             *tx_seen_c.lock().unwrap() = Some(pkt);
             Ok(())
         };
@@ -398,7 +398,7 @@ mod tests2 {
         let box_clock = StepClock::new_default_box();
 
         let router = Router::new_with_clock(RouterConfig::new(vec![sd_handler]), box_clock);
-        router.add_side_serialized("tx", transmit);
+        router.add_side_packed("tx", transmit);
 
         // send GPS_DATA (3 * f32) using Router::log (uses default endpoints from schema)
         let data = [1.0_f32, 2.0, 3.0];
@@ -599,7 +599,7 @@ mod tests2 {
         let box_clock_rx = StepClock::new_default_box();
 
         let tx_router = Router::new_with_clock(Default::default(), box_clock_tx);
-        tx_router.add_side_serialized("tx", tx_fn);
+        tx_router.add_side_packed("tx", tx_fn);
 
         // --- Set up an RX router with a local SD handler that decodes f32 payloads ---
         let seen: SeenType = Arc::new(Mutex::new(None));
@@ -614,7 +614,7 @@ mod tests2 {
             crate::router::RouterConfig::new(vec![sd_handler]),
             box_clock_rx,
         );
-        rx_router.add_side_serialized("tx", tx_handler);
+        rx_router.add_side_packed("tx", tx_handler);
 
         // --- 1) Sender enqueues a packet for TX ---
         let data = [1.0_f32, 2.0, 3.0];
@@ -630,7 +630,7 @@ mod tests2 {
         let gps_frames: Vec<Vec<u8>> = frames
             .iter()
             .filter(|frame| {
-                serialized_frame_type(frame.as_slice()) == Some(DataType::named("GPS_DATA"))
+                packed_frame_type(frame.as_slice()) == Some(DataType::named("GPS_DATA"))
             })
             .cloned()
             .collect();
@@ -640,7 +640,7 @@ mod tests2 {
             "expected exactly one GPS_DATA TX frame"
         );
         for frame in &gps_frames {
-            rx_router.rx_serialized_queue(frame).unwrap();
+            rx_router.rx_packed_queue(frame).unwrap();
         }
 
         // --- 4) Drain RX queue -> invokes local handlers ---
@@ -652,7 +652,7 @@ mod tests2 {
         assert_eq!(vals, data);
     }
 
-    /// Demonstrate “self-delivery” by feeding serialized frames from a router’s
+    /// Demonstrate “self-delivery” by feeding packed frames from a router’s
     /// own TX back into its RX queue.
     #[test]
     fn queued_self_delivery_via_receive_queue() {
@@ -660,7 +660,7 @@ mod tests2 {
         let box_clock = StepClock::new_default_box();
 
         let router = Router::new_with_clock(Default::default(), box_clock);
-        router.add_side_serialized("tx", tx_fn);
+        router.add_side_packed("tx", tx_fn);
 
         // Enqueue for transmit
         let data = [10.0_f32, 10.25, 10.5];
@@ -681,16 +681,16 @@ mod tests2 {
         router.process_tx_queue().unwrap();
         let frames = bus.frames.lock().unwrap().clone();
         assert_eq!(
-            count_serialized_frames_of_type(&frames, DataType::named("GPS_DATA")),
+            count_packed_frames_of_type(&frames, DataType::named("GPS_DATA")),
             2
         );
         assert_eq!(
-            count_serialized_frames_of_type(&frames, DataType::named("BATTERY_STATUS")),
+            count_packed_frames_of_type(&frames, DataType::named("BATTERY_STATUS")),
             1
         );
 
         // Feed back into *the same* router's received queue
-        router.rx_serialized_queue(&frames[0]).unwrap();
+        router.rx_packed_queue(&frames[0]).unwrap();
 
         // Now draining the received queue should dispatch to any matching local endpoints.
         // (This router has no endpoints; this test just proves the queue path is exercised.)
@@ -935,7 +935,7 @@ mod handler_failure_tests {
         let box_clock = StepClock::new_default_box();
 
         let router = Router::new_with_clock(RouterConfig::new(vec![capturing]), box_clock);
-        router.add_side_serialized("tx", tx_fail);
+        router.add_side_packed("tx", tx_fail);
 
         let pkt = Packet::new(
             ty,
@@ -976,7 +976,7 @@ mod timeout_tests {
 
     use crate::config::DataEndpoint;
     use crate::router::EndpointHandler;
-    use crate::tests::{UnixClock, get_handler, serialized_frame_type};
+    use crate::tests::{UnixClock, get_handler, packed_frame_type};
     use crate::{
         DataType, TelemetryResult, packet::Packet, router::Clock, router::Router,
         router::RouterConfig,
@@ -1038,7 +1038,7 @@ mod timeout_tests {
     ) -> impl Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static {
         move |bytes: &[u8]| {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -1065,7 +1065,7 @@ mod timeout_tests {
         let box_clock = StepClock::new_default_box();
 
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), box_clock);
-        r.add_side_serialized("tx", tx);
+        r.add_side_packed("tx", tx);
 
         // Enqueue TX (3) – make each payload slightly different to avoid dedup.
         for i in 0..3usize {
@@ -1113,7 +1113,7 @@ mod timeout_tests {
             RouterConfig::new(vec![handler]),
             Box::new(|| UnixClock.now_ms()),
         );
-        r.add_side_serialized("tx", tx);
+        r.add_side_packed("tx", tx);
 
         // Seed work in both queues – make each item unique to avoid dedup.
         for i in 0..5u64 {
@@ -1172,7 +1172,7 @@ mod timeout_tests {
         let clock = StepClock::new_box(0, 5);
 
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), clock);
-        r.add_side_serialized("tx", tx);
+        r.add_side_packed("tx", tx);
 
         // Seed work in both queues – make each item unique to avoid dedup.
         for i in 0..5u64 {
@@ -1226,7 +1226,7 @@ mod timeout_tests {
         let start = u64::MAX - 1;
         let clock = StepClock::new_box(start, 2);
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), clock);
-        r.add_side_serialized("tx", tx);
+        r.add_side_packed("tx", tx);
 
         // One TX and one RX (RX is only-local to avoid creating extra TX on receive)
         r.log_queue(DataType::named("GPS_DATA"), &[1.0_f32, 2.0, 3.0])
@@ -1291,9 +1291,9 @@ mod timeout_tests {
             .unwrap();
         let discovery_pkt =
             build_discovery_announce("REMOTE_NODE", 0, &[DataEndpoint::named("RADIO")]).unwrap();
-        let discovery_bytes = crate::serialize::serialize_packet(&discovery_pkt);
+        let discovery_bytes = crate::wire_format::pack_packet(&discovery_pkt);
         router
-            .rx_serialized_queue_from_side(discovery_bytes.as_ref(), side_remote)
+            .rx_packed_queue_from_side(discovery_bytes.as_ref(), side_remote)
             .unwrap();
 
         router.process_all_queues_with_timeout(2).unwrap();
@@ -1324,7 +1324,7 @@ mod tests_extra {
         config::DataType,
         packet::Packet,
         router::{Clock, EndpointHandler, Router, RouterConfig},
-        serialize,
+        wire_format,
     };
     use alloc::{string::String, sync::Arc};
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -1344,7 +1344,7 @@ mod tests_extra {
         let samples = [
             TelemetryError::InvalidType,
             TelemetryError::EmptyEndpoints,
-            TelemetryError::Deserialize("oops"),
+            TelemetryError::Unpack("oops"),
             TelemetryError::Io("disk"),
             TelemetryError::HandlerError("fail"),
             TelemetryError::MissingPayload,
@@ -1365,21 +1365,21 @@ mod tests_extra {
     /// Ensure header-only peek fails on truncated buffers (short read during
     /// varint parsing).
     #[test]
-    fn deserialize_header_only_short_buffer_fails() {
+    fn unpack_header_only_short_buffer_fails() {
         // v2 header is varint-based. Force a definite short read in the first varint.
 
         // Case A: only NEP present (0 endpoints), but no bytes for `ty` varint.
         let tiny = [0x00u8]; // NEP = 0
-        let err = serialize::peek_envelope(&tiny).unwrap_err();
+        let err = wire_format::peek_envelope(&tiny).unwrap_err();
         matches_deser_err(err);
 
         // Case B: NEP present, and a *truncated* varint (continuation bit set, but no following byte).
         let truncated = [0x00u8, 0x80]; // NEP=0, then start varint with continuation bit
-        let err = serialize::peek_envelope(&truncated).unwrap_err();
+        let err = wire_format::peek_envelope(&truncated).unwrap_err();
         matches_deser_err(err);
     }
 
-    /// Ensure header size is a valid prefix of the serialized wire image.
+    /// Ensure header size is a valid prefix of the packed wire image.
     #[test]
     fn header_size_is_prefix_of_wire_image() {
         let pkt = Packet::from_f32_slice(
@@ -1390,39 +1390,39 @@ mod tests_extra {
         )
         .unwrap();
 
-        let wire = serialize::serialize_packet(&pkt);
-        let hdr = serialize::header_size_bytes(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
+        let hdr = wire_format::header_size_bytes(&pkt);
         assert!(hdr <= wire.len());
 
         // header must decode from the start (i.e., NEP + scalars exists)
         assert!(hdr > 0);
     }
 
-    /// Helper: assert an error is a `Deserialize` variant.
+    /// Helper: assert an error is a `Unpack` variant.
     fn matches_deser_err(e: TelemetryError) {
         match e {
-            TelemetryError::Deserialize(_) => {}
-            other => panic!("expected Deserialize error, got {other:?}"),
+            TelemetryError::Unpack(_) => {}
+            other => panic!("expected Unpack error, got {other:?}"),
         }
     }
 
     fn rewrite_crc32(buf: &mut [u8]) {
-        if buf.len() < serialize::CRC32_BYTES {
+        if buf.len() < wire_format::CRC32_BYTES {
             return;
         }
-        let data_len = buf.len() - serialize::CRC32_BYTES;
+        let data_len = buf.len() - wire_format::CRC32_BYTES;
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&buf[..data_len]);
         let crc = hasher.finalize();
         buf[data_len..].copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Ensure serialization is canonical: serialize → deserialize → serialize
+    /// Ensure packing is canonical: pack -> unpack -> pack
     /// produces identical bytes (ULEB128 canonical form).
     #[test]
-    fn serializer_is_canonical_roundtrip() {
+    fn packer_is_canonical_roundtrip() {
         use crate::config::{DataEndpoint, DataType};
-        use crate::{packet::Packet, serialize};
+        use crate::{packet::Packet, wire_format};
 
         // Dynamic payload to avoid schema constraints and let us vary sizes later.
         let msg = "hello world";
@@ -1434,20 +1434,38 @@ mod tests_extra {
         )
         .unwrap();
 
-        let wire1 = serialize::serialize_packet(&pkt);
-        let pkt2 = serialize::deserialize_packet(&wire1).unwrap();
-        let wire2 = serialize::serialize_packet(&pkt2);
+        let wire1 = wire_format::pack_packet(&pkt);
+        let pkt2 = wire_format::unpack_packet(&wire1).unwrap();
+        let wire2 = wire_format::pack_packet(&pkt2);
 
         // ULEB128 is canonical (no leading 0x80 “more” bytes), so bytes must match
-        assert_eq!(&*wire1, &*wire2, "serializer must be canonical");
+        assert_eq!(&*wire1, &*wire2, "packer must be canonical");
+    }
+
+    #[test]
+    fn pack_unpack_roundtrip_matches_packet_identity() {
+        let pkt = Packet::from_str_slice(
+            DataType::TelemetryError,
+            "pack/unpack roundtrip check",
+            &[DataEndpoint::TelemetryError],
+            456,
+        )
+        .unwrap();
+
+        let packed = wire_format::pack_packet(&pkt);
+        assert_eq!(packed, wire_format::pack_packet(&pkt));
+
+        let unpacked = wire_format::unpack_packet(&packed).unwrap();
+        assert_eq!(unpacked.packet_id(), pkt.packet_id());
+        assert_eq!(unpacked.payload(), pkt.payload());
     }
 
     /// Validate varint scalar growth: header and wire size should increase
     /// when fields that are encoded as varints get larger.
     #[test]
-    fn serializer_varint_scalars_grow_as_expected() {
+    fn packer_varint_scalars_grow_as_expected() {
         use crate::config::{DataEndpoint, DataType};
-        use crate::{packet::Packet, serialize};
+        use crate::{packet::Packet, wire_format};
 
         fn non_rle_ascii(len: usize) -> Vec<u8> {
             let mut out = Vec::with_capacity(len);
@@ -1475,21 +1493,21 @@ mod tests_extra {
 
         // Case 1: small (all varints fit in 1 byte)
         let p1 = pkt_with(10, 5, 0x7F); // <= 127
-        let w1 = serialize::serialize_packet(&p1);
-        let h1 = serialize::header_size_bytes(&p1);
+        let w1 = wire_format::pack_packet(&p1);
+        let h1 = wire_format::header_size_bytes(&p1);
         assert!(h1 > 4, "NEP + 4 one-byte varints minimum");
 
         // Case 2: two-byte varints for size/sender_len
         let p2 = pkt_with(200, 200, 0x7F);
-        let w2 = serialize::serialize_packet(&p2);
-        let h2 = serialize::header_size_bytes(&p2);
+        let w2 = wire_format::pack_packet(&p2);
+        let h2 = wire_format::header_size_bytes(&p2);
         assert!(w2.len() > w1.len(), "wire should grow with larger varints");
         assert!(h2 > h1, "header should grow with larger varints");
 
         // Case 3: bigger timestamp to push it beyond 1 byte (and usually >2)
         let p3 = pkt_with(200, 200, 1u64 << 40); // forces 6-byte varint
-        let w3 = serialize::serialize_packet(&p3);
-        let h3 = serialize::header_size_bytes(&p3);
+        let w3 = wire_format::pack_packet(&p3);
+        let h3 = wire_format::header_size_bytes(&p3);
         assert!(
             w3.len() > w2.len(),
             "wire should grow with larger timestamp"
@@ -1497,7 +1515,7 @@ mod tests_extra {
         assert!(h3 > h2, "header should grow with larger timestamp");
 
         // Size function must match exact output
-        assert_eq!(serialize::packet_wire_size(&p3), w3.len());
+        assert_eq!(wire_format::packet_wire_size(&p3), w3.len());
     }
 
     /// Stress test for endpoint bitpacking across many endpoints and repeated
@@ -1508,7 +1526,7 @@ mod tests_extra {
             MAX_VALUE_DATA_ENDPOINT,
             config::{DataEndpoint, DataType},
             packet::Packet,
-            serialize,
+            wire_format,
         };
 
         // Build a long endpoint list by cycling through all enum values (0..=MAX)
@@ -1535,22 +1553,22 @@ mod tests_extra {
         )
         .unwrap();
 
-        let wire = serialize::serialize_packet(&pkt);
-        let back = serialize::deserialize_packet(&wire).unwrap();
+        let wire = wire_format::pack_packet(&pkt);
+        let back = wire_format::unpack_packet(&wire).unwrap();
         let has_all_endpoints = back.endpoints().iter().all(|ep| endpoints.contains(ep));
         assert!(has_all_endpoints, "endpoints must roundtrip 1:1");
         assert_eq!(back.data_type(), pkt.data_type());
         assert_eq!(back.timestamp(), pkt.timestamp());
         assert_eq!(back.payload(), pkt.payload());
-        assert_eq!(serialize::packet_wire_size(&pkt), wire.len());
+        assert_eq!(wire_format::packet_wire_size(&pkt), wire.len());
     }
 
     /// For large sender/payload/timestamp, ensure `peek_envelope` and full
-    /// deserialization agree on header fields and payload.
+    /// unpacking agree on header fields and payload.
     #[test]
     fn peek_envelope_matches_full_parse_on_large_values() {
         use crate::config::{DataEndpoint, DataType};
-        use crate::{packet::Packet, serialize};
+        use crate::{packet::Packet, wire_format};
 
         let sender = "S".repeat(10_000); // big sender (varint grows)
         let payload = vec![b'h'; 4096];
@@ -1565,9 +1583,9 @@ mod tests_extra {
         )
         .unwrap();
 
-        let wire = serialize::serialize_packet(&pkt);
-        let env = serialize::peek_envelope(&wire).unwrap();
-        let full = serialize::deserialize_packet(&wire).unwrap();
+        let wire = wire_format::pack_packet(&pkt);
+        let env = wire_format::peek_envelope(&wire).unwrap();
+        let full = wire_format::unpack_packet(&wire).unwrap();
 
         assert_eq!(env.ty, pkt.data_type());
         assert_eq!(env.sender.as_ref(), pkt.sender());
@@ -1581,14 +1599,14 @@ mod tests_extra {
     }
 
     /// Corrupt endpoint bits in the bitmap to encode an out-of-range value,
-    /// and ensure deserialization fails with an appropriate error.
+    /// and ensure unpacking fails with an appropriate error.
     #[test]
     fn corrupt_endpoint_bits_yields_bad_endpoint_error() {
         use crate::{
             MAX_VALUE_DATA_ENDPOINT,
             config::{DataEndpoint, DataType},
             packet::Packet,
-            serialize,
+            wire_format,
         };
 
         // Recompute EP_BITS the same way the module does.
@@ -1609,10 +1627,10 @@ mod tests_extra {
             123,
         )
         .unwrap();
-        let mut wire = serialize::serialize_packet(&pkt).to_vec();
+        let mut wire = wire_format::pack_packet(&pkt).to_vec();
 
         // Compute where endpoint bits start (right after header varints)
-        let ep_offset = serialize::header_size_bytes(&pkt);
+        let ep_offset = wire_format::header_size_bytes(&pkt);
         assert!(ep_offset < wire.len());
 
         // Overwrite the *first* endpoint with an out-of-range value in the bitstream.
@@ -1631,20 +1649,20 @@ mod tests_extra {
         }
         rewrite_crc32(&mut wire);
 
-        // Now deserialization must fail with a Deserialize("bad endpoint") error.
-        let err = serialize::deserialize_packet(&wire).unwrap_err();
+        // Now unpacking must fail with a Unpack("bad endpoint") error.
+        let err = wire_format::unpack_packet(&wire).unwrap_err();
         match err {
-            TelemetryError::Deserialize(msg) if msg.contains("endpoint") => {}
-            other => panic!("expected bad endpoint deserialize error, got {other:?}"),
+            TelemetryError::Unpack(msg) if msg.contains("endpoint") => {}
+            other => panic!("expected bad endpoint unpack error, got {other:?}"),
         }
     }
 
     /// Sanity check that header size is between 0 and full packet size, and
-    /// that the computed wire size matches serialized length.
+    /// that the computed wire size matches packed length.
     #[test]
     fn header_size_is_prefix_and_less_than_total() {
         use crate::config::{DataEndpoint, DataType};
-        use crate::{packet::Packet, serialize};
+        use crate::{packet::Packet, wire_format};
 
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
@@ -1654,11 +1672,11 @@ mod tests_extra {
         )
         .unwrap();
 
-        let wire = serialize::serialize_packet(&pkt);
-        let hdr = serialize::header_size_bytes(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
+        let hdr = wire_format::header_size_bytes(&pkt);
 
         assert!(hdr > 0 && hdr < wire.len());
-        assert_eq!(serialize::packet_wire_size(&pkt), wire.len());
+        assert_eq!(wire_format::packet_wire_size(&pkt), wire.len());
     }
 
     // --------------------------- UTF-8 trimming behavior ---------------------------
@@ -1713,7 +1731,7 @@ mod tests_extra {
         );
 
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        r.add_side_serialized("tx", tx);
+        r.add_side_packed("tx", tx);
 
         // Enqueue one TX and one RX
         let pkt_tx = Packet::from_f32_slice(
@@ -1843,7 +1861,7 @@ mod tests_extra {
     /// Header-only peek (`peek_envelope`) should match full parse for a normal
     /// encoded GPS packet.
     #[test]
-    fn deserialize_header_only_then_full_parse_matches() {
+    fn unpack_header_only_then_full_parse_matches() {
         // Build a normal packet then compare header-only vs full.
         let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
         let pkt = Packet::from_f32_slice(
@@ -1853,15 +1871,15 @@ mod tests_extra {
             42,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
 
-        let env = serialize::peek_envelope(&wire).unwrap();
+        let env = wire_format::peek_envelope(&wire).unwrap();
         assert_eq!(env.ty, pkt.data_type());
         assert_eq!(&*env.endpoints, pkt.endpoints());
         assert_eq!(env.sender.as_ref(), pkt.sender());
         assert_eq!(env.timestamp_ms, pkt.timestamp());
 
-        let round = serialize::deserialize_packet(&wire).unwrap();
+        let round = wire_format::unpack_packet(&wire).unwrap();
         round.validate().unwrap();
         assert_eq!(round.data_type(), pkt.data_type());
         assert_eq!(round.data_size(), pkt.data_size());
@@ -1894,7 +1912,7 @@ mod tests_extra {
         );
 
         let r = Router::new_with_clock(RouterConfig::new(vec![capturing]), zero_clock());
-        r.add_side_serialized("tx", failing_tx);
+        r.add_side_packed("tx", failing_tx);
 
         // Include both a local and a non-local endpoint to force remote TX.
         let pkt = Packet::from_f32_slice(
@@ -1925,11 +1943,11 @@ mod tests_extra {
 // -----------------------------------------------------------------------------
 #[cfg(test)]
 mod tests_more {
-    //! Additional coverage tests for router, packet, and serialization logic.
+    //! Additional coverage tests for router, packet, and packing logic.
     //! These tests complement `tests_extra` by covering boundary,
     //! error, and fast-path behaviors not previously exercised.
     use crate::config::get_message_meta;
-    use crate::tests::{UnixClock, serialized_frame_type};
+    use crate::tests::{UnixClock, packed_frame_type};
     use crate::{
         MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, MessageDataType, MessageElement,
         TelemetryError, TelemetryErrorCode, TelemetryResult,
@@ -1937,7 +1955,7 @@ mod tests_more {
         get_data_type, get_needed_message_size, message_meta,
         packet::Packet,
         router::{Clock, EndpointHandler, Router, RouterConfig},
-        serialize,
+        wire_format,
     };
     use alloc::{sync::Arc, vec::Vec};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2031,26 +2049,26 @@ mod tests_more {
     // Serialization header math + ByteReader edge cases
     // ---------------------------------------------------------------------------
 
-    /// `packet_wire_size` must match the length of the serialized output.
+    /// `packet_wire_size` must match the length of the packed output.
     #[test]
-    fn packet_wire_size_matches_serialized_len() {
+    fn packet_wire_size_matches_packed_len() {
         let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
         let pkt =
             Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 9)
                 .unwrap();
-        let need = serialize::packet_wire_size(&pkt);
-        let out = serialize::serialize_packet(&pkt);
+        let need = wire_format::packet_wire_size(&pkt);
+        let out = wire_format::pack_packet(&pkt);
         assert_eq!(need, out.len());
     }
 
     // ---------------------------------------------------------------------------
-    // Router serialization/deserialization paths
+    // Router packing/unpacking paths
     // ---------------------------------------------------------------------------
 
-    /// If only `Serialized` handlers exist, the router must not deserialize the
+    /// If only `Packed` handlers exist, the router must not unpack the
     /// payload and just pass the raw bytes.
     #[test]
-    fn serialized_only_handlers_do_not_deserialize() {
+    fn packed_only_handlers_do_not_unpack() {
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
             &[1.0, 2.0, 3.0],
@@ -2058,40 +2076,40 @@ mod tests_more {
             123,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
 
         let called = StdArc::new(AtomicUsize::new(0));
         let c = called.clone();
-        let handler = EndpointHandler::new_serialized_handler(
+        let handler = EndpointHandler::new_packed_handler(
             DataEndpoint::named("SD_CARD"),
             move |bytes: &[u8]| {
-                assert!(bytes.len() >= serialize::header_size_bytes(&pkt));
+                assert!(bytes.len() >= wire_format::header_size_bytes(&pkt));
                 c.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
         );
 
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        r.rx_serialized(&wire).unwrap();
+        r.rx_packed(&wire).unwrap();
         assert_eq!(called.load(Ordering::SeqCst), 1);
     }
 
-    /// When mixing `Packet` and `Serialized` handlers, ensure:
-    /// - deserialization happens only once,
+    /// When mixing `Packet` and `Packed` handlers, ensure:
+    /// - unpacking happens only once,
     /// - each endpoint handler is invoked exactly once.
     #[test]
-    fn packet_handlers_trigger_single_deserialize_and_fan_out() {
+    fn packet_handlers_trigger_single_unpack_and_fan_out() {
         let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
         let pkt =
             Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 5)
                 .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
 
         let packet_called = StdArc::new(AtomicUsize::new(0));
-        let serialized_called = StdArc::new(AtomicUsize::new(0));
+        let packed_called = StdArc::new(AtomicUsize::new(0));
 
         let ph = packet_called.clone();
-        let sh = serialized_called.clone();
+        let sh = packed_called.clone();
 
         let packet_h =
             EndpointHandler::new_packet_handler(DataEndpoint::named("SD_CARD"), move |_pkt| {
@@ -2099,30 +2117,27 @@ mod tests_more {
                 Ok(())
             });
 
-        let serialized_h =
-            EndpointHandler::new_serialized_handler(DataEndpoint::named("RADIO"), move |_b| {
+        let packed_h =
+            EndpointHandler::new_packed_handler(DataEndpoint::named("RADIO"), move |_b| {
                 sh.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             });
 
-        let r = Router::new_with_clock(
-            RouterConfig::new(vec![packet_h, serialized_h]),
-            zero_clock(),
-        );
+        let r = Router::new_with_clock(RouterConfig::new(vec![packet_h, packed_h]), zero_clock());
 
-        r.rx_serialized(&wire).unwrap();
+        r.rx_packed(&wire).unwrap();
         assert_eq!(packet_called.load(Ordering::SeqCst), 1);
-        assert_eq!(serialized_called.load(Ordering::SeqCst), 1);
+        assert_eq!(packed_called.load(Ordering::SeqCst), 1);
     }
 
     /// If all addressed endpoints are local `Packet` handlers, router should
     /// avoid serializing at all and never call TX.
     #[test]
-    fn send_avoids_serialization_when_only_local_packet_handlers_exist() {
+    fn send_avoids_packing_when_only_local_packet_handlers_exist() {
         let tx_called = StdArc::new(AtomicUsize::new(0));
         let txc = tx_called.clone();
         let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -2140,7 +2155,7 @@ mod tests_more {
         );
 
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        r.add_side_serialized("tx", tx);
+        r.add_side_packed("tx", tx);
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
             &[1.0, 2.0, 3.0],
@@ -2200,7 +2215,7 @@ mod tests_more {
             });
 
         let r = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        r.add_side_serialized("tx", failing_tx);
+        r.add_side_packed("tx", failing_tx);
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
             &[1.0, 2.0, 3.0],
@@ -2291,27 +2306,27 @@ mod tests_more {
         buf.extend_from_slice(&crc.to_le_bytes());
     }
     /// Construct an invalid varint (11 continuation bytes), and ensure
-    /// `deserialize_packet` returns a `uleb128 too long` error.
+    /// `unpack_packet` returns a `uleb128 too long` error.
     #[test]
-    fn deserialize_packet_rejects_overflowed_varint() {
-        use crate::serialize;
+    fn unpack_packet_rejects_overflowed_varint() {
+        use crate::wire_format;
         // Construct a fake wire buffer with NEP=0, then an invalid varint (11 continuation bytes)
         let mut wire = vec![0x00u8]; // NEP = 0
         wire.extend([0xFFu8; 11]); // invalid ULEB128 (too long for u64)
         append_crc32(&mut wire);
-        let err = serialize::deserialize_packet(&wire).unwrap_err();
+        let err = wire_format::unpack_packet(&wire).unwrap_err();
         match err {
-            TelemetryError::Deserialize(msg) if msg.eq("uleb128 too long") => {}
-            other => panic!("expected Deserialize(uleb128 too long...) error, got {other:?}"),
+            TelemetryError::Unpack(msg) if msg.eq("uleb128 too long") => {}
+            other => panic!("expected Unpack(uleb128 too long...) error, got {other:?}"),
         }
     }
 
-    /// Endpoint order in the `endpoints` slice must not affect serialized bytes.
+    /// Endpoint order in the `endpoints` slice must not affect packed bytes.
     #[test]
-    fn serialize_packet_is_order_invariant_for_endpoints() {
+    fn pack_packet_is_order_invariant_for_endpoints() {
         crate::tests::ensure_common_test_schema();
         use crate::config::{DataEndpoint, DataType};
-        use crate::{packet::Packet, serialize};
+        use crate::{packet::Packet, wire_format};
 
         let eps_a = &[DataEndpoint::named("RADIO"), DataEndpoint::named("SD_CARD")];
         let eps_b = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
@@ -2323,10 +2338,10 @@ mod tests_more {
             .unwrap()
             .with_nonce(7);
 
-        let wa = serialize::serialize_packet(&pkt_a);
-        let wb = serialize::serialize_packet(&pkt_b);
+        let wa = wire_format::pack_packet(&pkt_a);
+        let wb = wire_format::pack_packet(&pkt_b);
 
-        assert_eq!(wa, wb, "endpoint order must not affect serialized bytes");
+        assert_eq!(wa, wb, "endpoint order must not affect packed bytes");
     }
 
     /// With a large number of TX and RX items, `process_all_queues_with_timeout(0)`
@@ -2343,7 +2358,7 @@ mod tests_more {
         let tx_count = Arc::new(AtomicUsize::new(0));
         let txc = tx_count.clone();
         let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -2361,7 +2376,7 @@ mod tests_more {
             RouterConfig::new(vec![handler]),
             Box::new(|| UnixClock.now_ms()),
         );
-        router.add_side_serialized("tx", tx);
+        router.add_side_packed("tx", tx);
 
         // Enqueue many TX and RX items with unique payloads/timestamps.
         const N: usize = 200;
@@ -2411,13 +2426,13 @@ mod concurrency_tests {
     //! Concurrency-focused tests that exercise Router’s thread-safety
     //! guarantees for logging, receiving, and processing.
 
-    use crate::tests::serialized_frame_type;
+    use crate::tests::packed_frame_type;
     use crate::{
         TelemetryResult,
         config::{DataEndpoint, DataType},
         packet::Packet,
         router::{Clock, EndpointHandler, Router, RouterConfig},
-        serialize,
+        wire_format,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2499,7 +2514,7 @@ mod concurrency_tests {
         );
     }
 
-    /// RTOS-like pattern: multiple ingress threads queue serialized packets while
+    /// RTOS-like pattern: multiple ingress threads queue packed packets while
     /// another thread continuously drains router queues. This should not deadlock
     /// and all queued packets should eventually be processed once.
     #[test]
@@ -2547,8 +2562,8 @@ mod concurrency_tests {
                         idx,
                     )
                     .unwrap();
-                    let wire = serialize::serialize_packet(&pkt);
-                    r.rx_serialized_queue(&wire).unwrap();
+                    let wire = wire_format::pack_packet(&pkt);
+                    r.rx_packed_queue(&wire).unwrap();
                 }
             }));
         }
@@ -2594,11 +2609,11 @@ mod concurrency_tests {
             zero_clock(),
         ));
 
-        let side0 = router.add_side_serialized("S0", move |_b| {
+        let side0 = router.add_side_packed("S0", move |_b| {
             tx_c0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
-        let side1 = router.add_side_serialized("S1", move |_b| {
+        let side1 = router.add_side_packed("S1", move |_b| {
             tx_c1.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -2630,8 +2645,8 @@ mod concurrency_tests {
                         idx,
                     )
                     .unwrap();
-                    let wire = serialize::serialize_packet(&pkt);
-                    r.rx_serialized_queue_from_side(&wire, side).unwrap();
+                    let wire = wire_format::pack_packet(&pkt);
+                    r.rx_packed_queue_from_side(&wire, side).unwrap();
                 }
             }));
         }
@@ -2736,13 +2751,13 @@ mod concurrency_tests {
     }
 
     // ------------------------------------------------------------------------
-    // Concurrent calls to receive_serialized
+    // Concurrent calls to receive_packed
     // ------------------------------------------------------------------------
 
-    /// Multiple threads call `receive_serialized` concurrently with the same
+    /// Multiple threads call `receive_packed` concurrently with the same
     /// wire buffer; each call should fan out once to the handler.
     #[test]
-    fn concurrent_receive_serialized_is_thread_safe() {
+    fn concurrent_receive_packed_is_thread_safe() {
         const THREADS: usize = 4;
         const ITERS_PER_THREAD: usize = 50;
         let total = THREADS * ITERS_PER_THREAD;
@@ -2775,10 +2790,8 @@ mod concurrency_tests {
                         idx,
                     )
                     .unwrap();
-                    let wire = serialize::serialize_packet(&pkt);
-                    r_cloned
-                        .rx_serialized(&wire)
-                        .expect("receive_serialized failed");
+                    let wire = wire_format::pack_packet(&pkt);
+                    r_cloned.rx_packed(&wire).expect("receive_packed failed");
                 }
             }));
         }
@@ -2790,7 +2803,7 @@ mod concurrency_tests {
         assert_eq!(
             hits.load(Ordering::SeqCst),
             total,
-            "expected {total} handler invocations from receive_serialized"
+            "expected {total} handler invocations from receive_packed"
         );
     }
 
@@ -2812,7 +2825,7 @@ mod concurrency_tests {
         let txc = tx_count.clone();
         let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -2831,7 +2844,7 @@ mod concurrency_tests {
 
         // Shared router: TX + one local endpoint.
         let router = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        router.add_side_serialized("tx", tx);
+        router.add_side_packed("tx", tx);
         let r = Arc::new(router);
 
         // ---------------- Logger thread ----------------
@@ -2883,7 +2896,7 @@ mod concurrency_tests {
         let txc = tx_count.clone();
         let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -2900,7 +2913,7 @@ mod concurrency_tests {
         );
 
         let router = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        router.add_side_serialized("tx", tx);
+        router.add_side_packed("tx", tx);
         let r = Arc::new(router);
 
         // ---------- Logger thread ----------
@@ -3029,7 +3042,7 @@ mod data_conversion_types {
 // -----------------------------------------------------------------------------
 #[cfg(test)]
 mod relay_tests {
-    //! Tests for the serialized relay fan-out behavior and timeout semantics.
+    //! Tests for the packed relay fan-out behavior and timeout semantics.
 
     use crate::config::{DataEndpoint, DataType};
     use crate::discovery::build_discovery_announce;
@@ -3037,8 +3050,8 @@ mod relay_tests {
 
     use crate::relay::{Relay, RelaySideOptions};
     use crate::tests::timeout_tests::StepClock;
-    use crate::tests::{count_serialized_frames_of_type, serialized_frame_type};
-    use crate::{TelemetryError, TelemetryResult, packet::Packet, serialize};
+    use crate::tests::{count_packed_frames_of_type, packed_frame_type};
+    use crate::{TelemetryError, TelemetryResult, packet::Packet, wire_format};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -3048,7 +3061,7 @@ mod relay_tests {
     }
 
     #[test]
-    fn relay_serialized_side_chunking_reassembles_for_fixed_size_links() {
+    fn relay_packed_side_chunking_reassembles_for_fixed_size_links() {
         crate::tests::ensure_common_test_schema();
         use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
 
@@ -3075,7 +3088,7 @@ mod relay_tests {
         let max_frame_bytes = 48usize;
 
         let input_side = relay.add_side_packet("input", |_pkt| Ok(()));
-        relay.add_side_serialized_small_packets(
+        relay.add_side_packed_small_packets(
             "fixed-link",
             move |bytes: &[u8]| {
                 chunk_count_c.fetch_add(1, Ordering::SeqCst);
@@ -3091,11 +3104,11 @@ mod relay_tests {
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             max_frame_bytes,
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "fixed-link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -3126,7 +3139,7 @@ mod relay_tests {
     }
 
     #[test]
-    fn relay_serialized_side_templates_can_omit_unchanged_timestamps() {
+    fn relay_packed_side_templates_can_omit_unchanged_timestamps() {
         crate::tests::ensure_common_test_schema();
         use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
 
@@ -3150,7 +3163,7 @@ mod relay_tests {
         let relay = Relay::new(zero_clock());
 
         let input_side = relay.add_side_packet("input", |_pkt| Ok(()));
-        let output_side = relay.add_side_serialized_with_options(
+        let output_side = relay.add_side_packed_with_options(
             "compact-link",
             move |bytes: &[u8]| {
                 frames_c.lock().unwrap().push(bytes.len());
@@ -3158,7 +3171,7 @@ mod relay_tests {
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             RelaySideOptions {
                 header_template_enabled: true,
@@ -3167,7 +3180,7 @@ mod relay_tests {
                     .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
             },
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "compact-link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -3250,7 +3263,7 @@ mod relay_tests {
             v,
         )
         .unwrap();
-        serialize::serialize_packet(&pkt)
+        wire_format::pack_packet(&pkt)
     }
 
     /// A small "bus" that records frames seen by each relay side.
@@ -3290,9 +3303,9 @@ mod relay_tests {
         let (bus_b, tx_b) = SideBus::new();
         let (bus_c, tx_c) = SideBus::new();
 
-        let id_a = relay.add_side_serialized("A", tx_a);
-        let id_b = relay.add_side_serialized("B", tx_b);
-        let id_c = relay.add_side_serialized("C", tx_c);
+        let id_a = relay.add_side_packed("A", tx_a);
+        let id_b = relay.add_side_packed("B", tx_b);
+        let id_c = relay.add_side_packed("C", tx_c);
 
         advertise_side(&relay, id_b, "SIDE_B", DataEndpoint::named("SD_CARD"));
         advertise_side(&relay, id_c, "SIDE_C", DataEndpoint::named("SD_CARD"));
@@ -3305,8 +3318,8 @@ mod relay_tests {
 
         // Inject from A
         relay
-            .rx_serialized_from_side(id_a, frame.as_ref())
-            .expect("rx_serialized_from_side failed");
+            .rx_packed_from_side(id_a, frame.as_ref())
+            .expect("rx_packed_from_side failed");
 
         // Drain all queues → should deliver once to B and once to C.
         relay
@@ -3317,17 +3330,17 @@ mod relay_tests {
         let frames_b = bus_b.frames.lock().unwrap().clone();
         let frames_c = bus_c.frames.lock().unwrap().clone();
         assert_eq!(
-            count_serialized_frames_of_type(&frames_a, DataType::named("GPS_DATA")),
+            count_packed_frames_of_type(&frames_a, DataType::named("GPS_DATA")),
             0,
             "source side must not receive its own GPS frame"
         );
         assert_eq!(
-            count_serialized_frames_of_type(&frames_b, DataType::named("GPS_DATA")),
+            count_packed_frames_of_type(&frames_b, DataType::named("GPS_DATA")),
             1,
             "side B should see one GPS frame"
         );
         assert_eq!(
-            count_serialized_frames_of_type(&frames_c, DataType::named("GPS_DATA")),
+            count_packed_frames_of_type(&frames_c, DataType::named("GPS_DATA")),
             1,
             "side C should see one GPS frame"
         );
@@ -3350,7 +3363,7 @@ mod relay_tests {
         let relay = Relay::new(zero_clock());
 
         // No sides registered; any index is invalid.
-        let res = relay.rx_serialized_from_side(0, &[0x01, 0x02]);
+        let res = relay.rx_packed_from_side(0, &[0x01, 0x02]);
         match res {
             Err(TelemetryError::HandlerError(msg)) => {
                 assert!(
@@ -3384,19 +3397,15 @@ mod relay_tests {
             Ok(())
         };
 
-        let id_a = relay.add_side_serialized("A", |_b| Ok(()));
-        relay.add_side_serialized("B", tx_b);
-        relay.add_side_serialized("C", tx_c);
+        let id_a = relay.add_side_packed("A", |_b| Ok(()));
+        relay.add_side_packed("B", tx_b);
+        relay.add_side_packed("C", tx_c);
 
         // Queue some RX work from A.
         let frame_a = wire_for_value(1);
         let frame_b = wire_for_value(2);
-        relay
-            .rx_serialized_from_side(id_a, frame_a.as_ref())
-            .unwrap();
-        relay
-            .rx_serialized_from_side(id_a, frame_b.as_ref())
-            .unwrap();
+        relay.rx_packed_from_side(id_a, frame_a.as_ref()).unwrap();
+        relay.rx_packed_from_side(id_a, frame_b.as_ref()).unwrap();
 
         // Expand RX → TX, but do not deliver yet.
         relay.process_rx_queue().unwrap();
@@ -3431,23 +3440,21 @@ mod relay_tests {
         let txc = tx_count.clone();
         let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
         };
 
-        let id_src = relay.add_side_serialized("SRC", |_b| Ok(()));
-        let id_dst = relay.add_side_serialized("DST", tx);
+        let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
+        let id_dst = relay.add_side_packed("DST", tx);
         advertise_side(&relay, id_dst, "DST_SIDE", DataEndpoint::named("SD_CARD"));
         relay.process_all_queues_with_timeout(0).unwrap();
 
         // Queue multiple RX items from SRC, each with a unique frame to avoid dedup.
         for i in 0..5u8 {
             let frame = wire_for_value(i as u64);
-            relay
-                .rx_serialized_from_side(id_src, frame.as_ref())
-                .unwrap();
+            relay.rx_packed_from_side(id_src, frame.as_ref()).unwrap();
         }
 
         // With step=10 and timeout=5:
@@ -3487,10 +3494,10 @@ mod relay_tests {
 
         let tx_count = Arc::new(AtomicUsize::new(0));
         let txc = tx_count.clone();
-        relay.add_side_serialized("SRC", |_b| Ok(()));
-        let dst = relay.add_side_serialized("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
+        relay.add_side_packed("SRC", |_b| Ok(()));
+        let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -3506,7 +3513,7 @@ mod relay_tests {
                     let idx = (tid * ITERS_PER_THREAD + i) as u8;
                     // Unique last byte per (thread, iteration) to avoid dedup.
                     let frame = wire_for_value(idx as u64);
-                    r.rx_serialized_from_side(0, frame.as_ref()).unwrap();
+                    r.rx_packed_from_side(0, frame.as_ref()).unwrap();
                 }
             }));
         }
@@ -3526,7 +3533,7 @@ mod relay_tests {
     fn relay_side_tx_reentry_defers_recursive_queue_drains() {
         let relay = Arc::new(Relay::new(zero_clock()));
         let remaining = Arc::new(AtomicUsize::new(6));
-        let ingress = relay.add_side_serialized("INGRESS", move |_bytes| Ok(()));
+        let ingress = relay.add_side_packed("INGRESS", move |_bytes| Ok(()));
 
         let relay_c = relay.clone();
         let remaining_c = remaining.clone();
@@ -3536,7 +3543,7 @@ mod relay_tests {
         let reentered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let in_tx_c = in_tx.clone();
         let reentered_c = reentered.clone();
-        relay.add_side_serialized("LOOP", move |bytes| {
+        relay.add_side_packed("LOOP", move |bytes| {
             loop_hits_c.fetch_add(1, Ordering::SeqCst);
             if in_tx_c.swap(true, Ordering::SeqCst) {
                 reentered_c.store(true, Ordering::SeqCst);
@@ -3545,7 +3552,7 @@ mod relay_tests {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
-                relay_c.rx_serialized_from_side(ingress, bytes)?;
+                relay_c.rx_packed_from_side(ingress, bytes)?;
                 relay_c.process_all_queues()?;
             }
             in_tx_c.store(false, Ordering::SeqCst);
@@ -3553,7 +3560,7 @@ mod relay_tests {
         });
 
         relay
-            .rx_serialized_from_side(ingress, wire_for_value(1).as_ref())
+            .rx_packed_from_side(ingress, wire_for_value(1).as_ref())
             .unwrap();
         relay.process_all_queues().unwrap();
         for _ in 0..8 {
@@ -3574,9 +3581,9 @@ mod dedupe_tests {
     use crate::discovery::build_discovery_announce;
     use crate::relay::Relay;
     use crate::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
-    use crate::tests::serialized_frame_type;
+    use crate::tests::packed_frame_type;
     use crate::tests::timeout_tests::StepClock;
-    use crate::{TelemetryResult, packet::Packet, serialize};
+    use crate::{TelemetryResult, packet::Packet, wire_format};
 
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -3595,7 +3602,7 @@ mod dedupe_tests {
             v,
         )
         .unwrap();
-        serialize::serialize_packet(&pkt)
+        wire_format::pack_packet(&pkt)
     }
 
     fn advertise_side(relay: &Relay, side: usize, sender: &str) {
@@ -3608,10 +3615,10 @@ mod dedupe_tests {
     // Router dedupe tests
     // -----------------------------------------------------------------------
 
-    /// Repeatedly calling `rx_serialized` with the *same* wire frame must only
+    /// Repeatedly calling `rx_packed` with the *same* wire frame must only
     /// deliver it once to local handlers.
     #[test]
-    fn router_rx_serialized_deduplicates_identical_frames() {
+    fn router_rx_packed_deduplicates_identical_frames() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_c = hits.clone();
 
@@ -3634,24 +3641,24 @@ mod dedupe_tests {
             0,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
 
         // Feed the identical frame many times.
         for _ in 0..5 {
-            r.rx_serialized(&wire).unwrap();
+            r.rx_packed(&wire).unwrap();
         }
 
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
-            "rx_serialized should deliver identical frames only once"
+            "rx_packed should deliver identical frames only once"
         );
     }
 
     /// Even if time advances between deliveries, the same frame must still be
     /// deduped (i.e. dedupe is not time-window based).
     #[test]
-    fn router_rx_serialized_dedup_persists_across_time_advance() {
+    fn router_rx_packed_dedup_persists_across_time_advance() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_c = hits.clone();
 
@@ -3674,12 +3681,12 @@ mod dedupe_tests {
             0,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
 
         // First time → delivered.
-        r.rx_serialized(&wire).unwrap();
+        r.rx_packed(&wire).unwrap();
         // Time advances inside router via Clock, but dedupe should still drop it.
-        r.rx_serialized(&wire).unwrap();
+        r.rx_packed(&wire).unwrap();
 
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -3691,7 +3698,7 @@ mod dedupe_tests {
     /// Two *different* frames must both be delivered, never deduped against
     /// each other.
     #[test]
-    fn router_rx_serialized_does_not_dedupe_different_frames() {
+    fn router_rx_packed_does_not_dedupe_different_frames() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_c = hits.clone();
 
@@ -3713,7 +3720,7 @@ mod dedupe_tests {
             0,
         )
         .unwrap();
-        let wire_a = serialize::serialize_packet(&pkt_a);
+        let wire_a = wire_format::pack_packet(&pkt_a);
 
         // Frame B (different payload)
         let pkt_b = Packet::from_f32_slice(
@@ -3723,10 +3730,10 @@ mod dedupe_tests {
             0,
         )
         .unwrap();
-        let wire_b = serialize::serialize_packet(&pkt_b);
+        let wire_b = wire_format::pack_packet(&pkt_b);
 
-        r.rx_serialized(&wire_a).unwrap();
-        r.rx_serialized(&wire_b).unwrap();
+        r.rx_packed(&wire_a).unwrap();
+        r.rx_packed(&wire_b).unwrap();
 
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -3736,7 +3743,7 @@ mod dedupe_tests {
     }
 
     #[test]
-    fn router_rx_serialized_does_not_dedupe_same_payload_same_ms_when_nonce_differs() {
+    fn router_rx_packed_does_not_dedupe_same_payload_same_ms_when_nonce_differs() {
         crate::tests::ensure_common_test_schema();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_c = hits.clone();
@@ -3766,18 +3773,18 @@ mod dedupe_tests {
         )
         .unwrap();
 
-        let wire_a = serialize::serialize_packet(&pkt_a);
-        let wire_b = serialize::serialize_packet(&pkt_b);
+        let wire_a = wire_format::pack_packet(&pkt_a);
+        let wire_b = wire_format::pack_packet(&pkt_b);
 
-        r.rx_serialized(&wire_a).unwrap();
-        r.rx_serialized(&wire_b).unwrap();
+        r.rx_packed(&wire_a).unwrap();
+        r.rx_packed(&wire_b).unwrap();
 
         assert_ne!(pkt_a.nonce(), pkt_b.nonce());
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn serialized_side_header_templates_reduce_followup_frame_size() {
+    fn packed_side_header_templates_reduce_followup_frame_size() {
         crate::tests::ensure_common_test_schema();
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_c = delivered.clone();
@@ -3798,7 +3805,7 @@ mod dedupe_tests {
         let receiver_c = receiver.clone();
 
         let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        sender.add_side_serialized_small_packets(
+        sender.add_side_packed_small_packets(
             "link",
             move |bytes: &[u8]| {
                 frames_c.lock().unwrap().push(bytes.len());
@@ -3806,11 +3813,11 @@ mod dedupe_tests {
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             0,
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -3871,7 +3878,7 @@ mod dedupe_tests {
     }
 
     #[test]
-    fn serialized_side_header_templates_can_omit_unchanged_timestamps() {
+    fn packed_side_header_templates_can_omit_unchanged_timestamps() {
         crate::tests::ensure_common_test_schema();
         let delivered_payloads = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
         let delivered_payloads_c = delivered_payloads.clone();
@@ -3896,7 +3903,7 @@ mod dedupe_tests {
         let receiver_c = receiver.clone();
 
         let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        sender.add_side_serialized_with_options(
+        sender.add_side_packed_with_options(
             "link",
             move |bytes: &[u8]| {
                 frames_c.lock().unwrap().push(bytes.len());
@@ -3904,7 +3911,7 @@ mod dedupe_tests {
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             RouterSideOptions {
                 header_template_enabled: true,
@@ -3913,7 +3920,7 @@ mod dedupe_tests {
                     .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
             },
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -3971,7 +3978,7 @@ mod dedupe_tests {
     }
 
     #[test]
-    fn serialized_side_timestamp_omission_policy_does_not_apply_to_other_types() {
+    fn packed_side_timestamp_omission_policy_does_not_apply_to_other_types() {
         crate::tests::ensure_common_test_schema();
         let other_ty = DataType::try_named("POLICY_OTHER_DATA").unwrap_or_else(|| {
             use crate::config::register_data_type_with_description;
@@ -4003,14 +4010,14 @@ mod dedupe_tests {
         let receiver_c = receiver.clone();
 
         let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        sender.add_side_serialized_with_options(
+        sender.add_side_packed_with_options(
             "link",
             move |bytes: &[u8]| {
                 let side = receiver_side_id_c
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             RouterSideOptions {
                 header_template_enabled: true,
@@ -4019,7 +4026,7 @@ mod dedupe_tests {
                     .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
             },
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -4065,7 +4072,7 @@ mod dedupe_tests {
     }
 
     #[test]
-    fn serialized_side_template_dictionary_is_bounded() {
+    fn packed_side_template_dictionary_is_bounded() {
         crate::tests::ensure_common_test_schema();
         let receiver = Arc::new(Router::new_with_clock(
             RouterConfig::default(),
@@ -4076,14 +4083,14 @@ mod dedupe_tests {
         let receiver_c = receiver.clone();
 
         let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        sender.add_side_serialized_with_options(
+        sender.add_side_packed_with_options(
             "bounded-link",
             move |bytes: &[u8]| {
                 let side = receiver_side_id_c
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             RouterSideOptions {
                 header_template_enabled: true,
@@ -4091,7 +4098,7 @@ mod dedupe_tests {
                 ..RouterSideOptions::default()
             },
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "bounded-link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -4145,14 +4152,14 @@ mod dedupe_tests {
         let receiver_c = receiver.clone();
 
         let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        sender.add_side_serialized_with_options(
+        sender.add_side_packed_with_options(
             "tight-target",
             move |bytes: &[u8]| {
                 let side = receiver_side_id_c
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             RouterSideOptions {
                 header_template_enabled: true,
@@ -4160,7 +4167,7 @@ mod dedupe_tests {
                 ..RouterSideOptions::default()
             },
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "tight-target",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -4193,7 +4200,7 @@ mod dedupe_tests {
     }
 
     #[test]
-    fn serialized_side_chunking_reassembles_for_fixed_size_links() {
+    fn packed_side_chunking_reassembles_for_fixed_size_links() {
         crate::tests::ensure_common_test_schema();
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_c = delivered.clone();
@@ -4217,7 +4224,7 @@ mod dedupe_tests {
         let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
         let max_frame_bytes = 48usize;
 
-        sender.add_side_serialized_small_packets(
+        sender.add_side_packed_small_packets(
             "fixed-link",
             move |bytes: &[u8]| {
                 chunk_count_c.fetch_add(1, Ordering::SeqCst);
@@ -4233,11 +4240,11 @@ mod dedupe_tests {
                     .lock()
                     .unwrap()
                     .expect("receiver side id");
-                receiver_c.rx_serialized_from_side(bytes, side)
+                receiver_c.rx_packed_from_side(bytes, side)
             },
             max_frame_bytes,
         );
-        let rx_side = receiver.add_side_serialized_with_options(
+        let rx_side = receiver.add_side_packed_with_options(
             "fixed-link",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -4270,7 +4277,7 @@ mod dedupe_tests {
     // Relay dedupe tests
     // -----------------------------------------------------------------------
 
-    /// For a single relay side, repeatedly injecting the *same* serialized
+    /// For a single relay side, repeatedly injecting the *same* packed
     /// frame should fan out exactly once to other sides.
     #[test]
     fn relay_deduplicates_identical_frames_per_side() {
@@ -4283,7 +4290,7 @@ mod dedupe_tests {
         let tx_b_c = tx_count_b.clone();
         let tx_b = move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 tx_b_c.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -4292,15 +4299,15 @@ mod dedupe_tests {
         let tx_c_c = tx_count_c.clone();
         let tx_c = move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 tx_c_c.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
         };
 
-        let id_src = relay.add_side_serialized("SRC", |_b| Ok(()));
-        let side_b = relay.add_side_serialized("B", tx_b);
-        let side_c = relay.add_side_serialized("C", tx_c);
+        let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
+        let side_b = relay.add_side_packed("B", tx_b);
+        let side_c = relay.add_side_packed("C", tx_c);
         relay
             .set_source_route_mode(Some(id_src), crate::RouteSelectionMode::Fanout)
             .unwrap();
@@ -4312,8 +4319,8 @@ mod dedupe_tests {
 
         for _ in 0..5 {
             relay
-                .rx_serialized_from_side(id_src, frame.as_ref())
-                .expect("rx_serialized_from_side failed");
+                .rx_packed_from_side(id_src, frame.as_ref())
+                .expect("rx_packed_from_side failed");
         }
 
         relay
@@ -4344,10 +4351,10 @@ mod dedupe_tests {
         let tx_count = Arc::new(AtomicUsize::new(0));
         let txc = tx_count.clone();
 
-        let id_src = relay.add_side_serialized("SRC", |_b| Ok(()));
-        let dst = relay.add_side_serialized("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
+        let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
+        let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -4358,8 +4365,8 @@ mod dedupe_tests {
         let frame = wire_for_value(1);
 
         relay
-            .rx_serialized_from_side(id_src, frame.as_ref())
-            .expect("first rx_serialized_from_side failed");
+            .rx_packed_from_side(id_src, frame.as_ref())
+            .expect("first rx_packed_from_side failed");
         relay
             .process_all_queues_with_timeout(0)
             .expect("first drain failed");
@@ -4367,8 +4374,8 @@ mod dedupe_tests {
         now_ms.store(1_000, Ordering::SeqCst);
 
         relay
-            .rx_serialized_from_side(id_src, frame.as_ref())
-            .expect("second rx_serialized_from_side failed");
+            .rx_packed_from_side(id_src, frame.as_ref())
+            .expect("second rx_packed_from_side failed");
         relay
             .process_all_queues_with_timeout(0)
             .expect("second drain failed");
@@ -4388,10 +4395,10 @@ mod dedupe_tests {
         let tx_count = Arc::new(AtomicUsize::new(0));
         let txc = tx_count.clone();
 
-        let id_src = relay.add_side_serialized("SRC", |_b| Ok(()));
-        let dst = relay.add_side_serialized("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
+        let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
+        let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
             assert!(!bytes.is_empty());
-            if serialized_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+            if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
                 txc.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
@@ -4403,11 +4410,11 @@ mod dedupe_tests {
         let frame_b = wire_for_value(2);
 
         relay
-            .rx_serialized_from_side(id_src, frame_a.as_ref())
-            .expect("rx_serialized_from_side A failed");
+            .rx_packed_from_side(id_src, frame_a.as_ref())
+            .expect("rx_packed_from_side A failed");
         relay
-            .rx_serialized_from_side(id_src, frame_b.as_ref())
-            .expect("rx_serialized_from_side B failed");
+            .rx_packed_from_side(id_src, frame_b.as_ref())
+            .expect("rx_packed_from_side B failed");
 
         relay
             .process_all_queues_with_timeout(0)
@@ -4427,9 +4434,9 @@ mod relay_reliable_tests {
     use crate::discovery::build_discovery_announce;
     use crate::relay::{Relay, RelaySideOptions};
     use crate::router::Clock;
-    use crate::tests::serialized_frame_type;
+    use crate::tests::packed_frame_type;
     use crate::tests::timeout_tests::StepClock;
-    use crate::{TelemetryResult, packet::Packet, serialize};
+    use crate::{TelemetryResult, packet::Packet, wire_format};
 
     use std::sync::{Arc, Mutex};
 
@@ -4447,7 +4454,7 @@ mod relay_reliable_tests {
     fn relay_reliable_seq_advances_with_ack() {
         let relay = Arc::new(Relay::new(zero_clock()));
 
-        relay.add_side_serialized_with_options(
+        relay.add_side_packed_with_options(
             "SRC",
             |_b| Ok(()),
             RelaySideOptions {
@@ -4460,16 +4467,16 @@ mod relay_reliable_tests {
         let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let sent_c = sent.clone();
         let relay_c = relay.clone();
-        let dst = relay.add_side_serialized_with_options(
+        let dst = relay.add_side_packed_with_options(
             "DST",
             move |bytes: &[u8]| -> TelemetryResult<()> {
                 sent_c.lock().unwrap().push(bytes.to_vec());
 
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if let Some(hdr) = frame.reliable {
                     let ack_bytes =
-                        serialize::serialize_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
-                    relay_c.rx_serialized_from_side(1, ack_bytes.as_ref())?;
+                        wire_format::pack_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
+                    relay_c.rx_packed_from_side(1, ack_bytes.as_ref())?;
                 }
                 Ok(())
             },
@@ -4506,7 +4513,7 @@ mod relay_reliable_tests {
         let gps_sent: Vec<_> = sent
             .iter()
             .filter(|bytes| {
-                serialized_frame_type(bytes.as_slice()) == Some(DataType::named("GPS_DATA"))
+                packed_frame_type(bytes.as_slice()) == Some(DataType::named("GPS_DATA"))
             })
             .collect();
         assert!(
@@ -4514,14 +4521,14 @@ mod relay_reliable_tests {
             "expected at least 2 forwarded GPS frames"
         );
 
-        let f1 = serialize::peek_frame_info(gps_sent[0]).unwrap();
-        let f2 = serialize::peek_frame_info(gps_sent[1]).unwrap();
+        let f1 = wire_format::peek_frame_info(gps_sent[0]).unwrap();
+        let f2 = wire_format::peek_frame_info(gps_sent[1]).unwrap();
         let h1 = f1.reliable.expect("frame 1 missing reliable header");
         let h2 = f2.reliable.expect("frame 2 missing reliable header");
         assert_eq!(h1.seq, 1);
         assert_eq!(h2.seq, 2);
-        assert_eq!(h1.flags & serialize::RELIABLE_FLAG_UNSEQUENCED, 0);
-        assert_eq!(h2.flags & serialize::RELIABLE_FLAG_UNSEQUENCED, 0);
+        assert_eq!(h1.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED, 0);
+        assert_eq!(h2.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED, 0);
     }
 
     #[test]
@@ -4550,7 +4557,7 @@ mod relay_reliable_tests {
         )));
         let relay2 = Arc::new(Relay::new(zero_clock()));
 
-        relay1.add_side_serialized_with_options(
+        relay1.add_side_packed_with_options(
             "SRC",
             |_b| Ok(()),
             RelaySideOptions {
@@ -4566,12 +4573,12 @@ mod relay_reliable_tests {
         let relay2_rx = relay2.clone();
         let link_sent: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let link_sent_c = link_sent.clone();
-        let relay1_mid = relay1.add_side_serialized_with_options(
+        let relay1_mid = relay1.add_side_packed_with_options(
             "MID",
             move |bytes: &[u8]| -> TelemetryResult<()> {
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if let Some(hdr) = frame.reliable
-                    && (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) == 0
+                    && (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) == 0
                     && frame.envelope.ty == reliable_ty
                 {
                     link_sent_c.lock().unwrap().push(hdr.seq);
@@ -4580,7 +4587,7 @@ mod relay_reliable_tests {
                         return Ok(());
                     }
                 }
-                relay2_rx.rx_serialized_from_side(0, bytes)
+                relay2_rx.rx_packed_from_side(0, bytes)
             },
             RelaySideOptions {
                 reliable_enabled: true,
@@ -4591,11 +4598,9 @@ mod relay_reliable_tests {
 
         // Link: relay2 -> relay1 (ACKs and reverse traffic)
         let relay1_rx = relay1.clone();
-        let _relay2_mid = relay2.add_side_serialized_with_options(
+        let _relay2_mid = relay2.add_side_packed_with_options(
             "MID",
-            move |bytes: &[u8]| -> TelemetryResult<()> {
-                relay1_rx.rx_serialized_from_side(1, bytes)
-            },
+            move |bytes: &[u8]| -> TelemetryResult<()> { relay1_rx.rx_packed_from_side(1, bytes) },
             RelaySideOptions {
                 reliable_enabled: true,
                 link_local_enabled: false,
@@ -4610,20 +4615,20 @@ mod relay_reliable_tests {
         let relay1_for_ack = relay1.clone();
         let relay2_dst_id: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let relay2_dst_id_c = relay2_dst_id.clone();
-        let relay2_dst = relay2.add_side_serialized_with_options(
+        let relay2_dst = relay2.add_side_packed_with_options(
             "DST",
             move |bytes: &[u8]| -> TelemetryResult<()> {
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if let Some(hdr) = frame.reliable
-                    && (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) == 0
+                    && (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) == 0
                 {
                     delivered_c.lock().unwrap().push(hdr.seq);
                     let ack_bytes =
-                        serialize::serialize_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
+                        wire_format::pack_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
                     if let Some(dst_id) = *relay2_dst_id_c.lock().unwrap() {
-                        relay2_for_ack.rx_serialized_from_side(dst_id, ack_bytes.as_ref())?;
+                        relay2_for_ack.rx_packed_from_side(dst_id, ack_bytes.as_ref())?;
                     }
-                    relay1_for_ack.rx_serialized_from_side(relay1_mid, ack_bytes.as_ref())?;
+                    relay1_for_ack.rx_packed_from_side(relay1_mid, ack_bytes.as_ref())?;
                 }
                 Ok(())
             },
@@ -4685,7 +4690,7 @@ mod relay_reliable_tests {
     fn relay_reliable_reorders_out_of_order_frames() {
         let relay = Arc::new(Relay::new(zero_clock()));
 
-        relay.add_side_serialized_with_options(
+        relay.add_side_packed_with_options(
             "SRC",
             |_b| Ok(()),
             RelaySideOptions {
@@ -4698,18 +4703,18 @@ mod relay_reliable_tests {
         let delivered: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let delivered_c = delivered.clone();
         let relay_for_ack = relay.clone();
-        let dst = relay.add_side_serialized_with_options(
+        let dst = relay.add_side_packed_with_options(
             "DST",
             move |bytes: &[u8]| -> TelemetryResult<()> {
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if frame.envelope.ty == DataType::named("GPS_DATA")
                     && let Some(hdr) = frame.reliable
-                    && (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) == 0
+                    && (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) == 0
                 {
                     delivered_c.lock().unwrap().push(hdr.seq);
                     let ack_bytes =
-                        serialize::serialize_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
-                    relay_for_ack.rx_serialized_from_side(1, ack_bytes.as_ref())?;
+                        wire_format::pack_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
+                    relay_for_ack.rx_packed_from_side(1, ack_bytes.as_ref())?;
                 }
                 Ok(())
             },
@@ -4737,17 +4742,17 @@ mod relay_reliable_tests {
         )
         .unwrap();
 
-        let seq1 = serialize::serialize_packet_with_reliable(
+        let seq1 = wire_format::pack_packet_with_reliable(
             &pkt1,
-            serialize::ReliableHeader {
+            wire_format::ReliableHeader {
                 flags: 0,
                 seq: 1,
                 ack: 0,
             },
         );
-        let seq2 = serialize::serialize_packet_with_reliable(
+        let seq2 = wire_format::pack_packet_with_reliable(
             &pkt2,
-            serialize::ReliableHeader {
+            wire_format::ReliableHeader {
                 flags: 0,
                 seq: 2,
                 ack: 0,
@@ -4755,9 +4760,9 @@ mod relay_reliable_tests {
         );
 
         // Out-of-order: seq2 arrives first, then seq1, then seq2 retransmit.
-        relay.rx_serialized_from_side(0, seq2.as_ref()).unwrap();
-        relay.rx_serialized_from_side(0, seq1.as_ref()).unwrap();
-        relay.rx_serialized_from_side(0, seq2.as_ref()).unwrap();
+        relay.rx_packed_from_side(0, seq2.as_ref()).unwrap();
+        relay.rx_packed_from_side(0, seq1.as_ref()).unwrap();
+        relay.rx_packed_from_side(0, seq2.as_ref()).unwrap();
 
         relay.process_all_queues_with_timeout(0).unwrap();
 
@@ -4773,7 +4778,7 @@ mod relay_reliable_tests {
     fn relay_reliable_sender_does_not_block_while_waiting_for_ack() {
         let relay = Arc::new(Relay::new(zero_clock()));
 
-        relay.add_side_serialized_with_options(
+        relay.add_side_packed_with_options(
             "SRC",
             |_b| Ok(()),
             RelaySideOptions {
@@ -4785,10 +4790,10 @@ mod relay_reliable_tests {
 
         let sent: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let sent_c = sent.clone();
-        relay.add_side_serialized_with_options(
+        relay.add_side_packed_with_options(
             "DST",
             move |bytes: &[u8]| -> TelemetryResult<()> {
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if frame.envelope.ty == DataType::named("GPS_DATA")
                     && let Some(hdr) = frame.reliable
                 {
@@ -4833,11 +4838,11 @@ mod reliable_tests {
         register_endpoint_with_description,
     };
     use crate::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
-    use crate::tests::serialized_frame_type;
+    use crate::tests::packed_frame_type;
     use crate::tests::timeout_tests::StepClock;
     use crate::{
         MessageClass, MessageDataType, MessageElement, ReliableMode, TelemetryResult,
-        packet::Packet, serialize,
+        packet::Packet, wire_format,
     };
 
     use std::sync::Once;
@@ -4903,11 +4908,11 @@ mod reliable_tests {
 
         let sender_for_ack = sender.clone();
         let sender_side_id_c = sender_side_id.clone();
-        let receiver_side = receiver.add_side_serialized_with_options(
+        let receiver_side = receiver.add_side_packed_with_options(
             "TO_SENDER",
             move |bytes: &[u8]| {
                 if let Some(side_id) = *sender_side_id_c.lock().unwrap() {
-                    sender_for_ack.rx_serialized_from_side(bytes, side_id)?;
+                    sender_for_ack.rx_packed_from_side(bytes, side_id)?;
                 }
                 Ok(())
             },
@@ -4928,12 +4933,12 @@ mod reliable_tests {
                 return Ok(());
             }
             if let Some(side_id) = *receiver_side_id_c.lock().unwrap() {
-                receiver_for_tx.rx_serialized_from_side(bytes, side_id)?;
+                receiver_for_tx.rx_packed_from_side(bytes, side_id)?;
             }
             Ok(())
         };
 
-        let sender_side = sender.add_side_serialized_with_options(
+        let sender_side = sender.add_side_packed_with_options(
             "TO_RECEIVER",
             tx,
             RouterSideOptions {
@@ -4971,7 +4976,7 @@ mod reliable_tests {
             RouterConfig::default().with_reliable_enabled(true),
             zero_clock(),
         );
-        sender.add_side_serialized_with_options(
+        sender.add_side_packed_with_options(
             "to_receiver",
             move |bytes: &[u8]| {
                 sent_frames_c.lock().unwrap().push(bytes.to_vec());
@@ -4999,7 +5004,7 @@ mod reliable_tests {
             RouterConfig::default().with_reliable_enabled(true),
             zero_clock(),
         );
-        let receiver_side = receiver.add_side_serialized_with_options(
+        let receiver_side = receiver.add_side_packed_with_options(
             "to_sender",
             move |bytes: &[u8]| {
                 controls_c.lock().unwrap().push(bytes.to_vec());
@@ -5011,14 +5016,12 @@ mod reliable_tests {
             },
         );
 
-        receiver
-            .rx_serialized_from_side(&frame, receiver_side)
-            .unwrap();
+        receiver.rx_packed_from_side(&frame, receiver_side).unwrap();
 
         let controls = controls.lock().unwrap().clone();
         assert!(
             controls.iter().any(|bytes| {
-                serialize::peek_envelope(bytes.as_slice())
+                wire_format::peek_envelope(bytes.as_slice())
                     .map(|env| env.ty == DataType::ReliableAck)
                     .unwrap_or(false)
             }),
@@ -5036,7 +5039,7 @@ mod reliable_tests {
             Err(crate::TelemetryError::Io("boom"))
         });
         let router = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
-        router.add_side_serialized("observer", move |bytes| {
+        router.add_side_packed("observer", move |bytes| {
             seen_c.lock().unwrap().push(bytes.to_vec());
             Ok(())
         });
@@ -5054,7 +5057,7 @@ mod reliable_tests {
         let seen = seen.lock().unwrap().clone();
         assert!(
             seen.iter().any(|bytes| {
-                serialize::peek_envelope(bytes.as_slice())
+                wire_format::peek_envelope(bytes.as_slice())
                     .map(|env| env.ty == DataType::TelemetryError)
                     .unwrap_or(false)
             }),
@@ -5076,8 +5079,8 @@ mod reliable_tests {
             RouterConfig::default(),
             zero_clock(),
         ));
-        router.add_side_serialized("BUS", move |bytes| -> TelemetryResult<()> {
-            if serialized_frame_type(bytes) != Some(DataType::named("BATTERY_STATUS")) {
+        router.add_side_packed("BUS", move |bytes| -> TelemetryResult<()> {
+            if packed_frame_type(bytes) != Some(DataType::named("BATTERY_STATUS")) {
                 return Ok(());
             }
             let hit = tx_hits_c.fetch_add(1, Ordering::SeqCst);
@@ -5132,7 +5135,7 @@ mod reliable_tests {
             RouterConfig::default().with_reliable_enabled(true),
             zero_clock(),
         );
-        let sender_side = sender.add_side_serialized_with_options(
+        let sender_side = sender.add_side_packed_with_options(
             "to_receiver",
             move |bytes: &[u8]| {
                 sent_frames_c.lock().unwrap().push(bytes.to_vec());
@@ -5170,7 +5173,7 @@ mod reliable_tests {
             RouterConfig::default().with_reliable_enabled(true),
             zero_clock(),
         );
-        let receiver_side = receiver.add_side_serialized_with_options(
+        let receiver_side = receiver.add_side_packed_with_options(
             "to_sender",
             move |bytes: &[u8]| {
                 receiver_controls_c.lock().unwrap().push(bytes.to_vec());
@@ -5183,17 +5186,17 @@ mod reliable_tests {
         );
 
         receiver
-            .rx_serialized_from_side(&frames[1], receiver_side)
+            .rx_packed_from_side(&frames[1], receiver_side)
             .unwrap();
         receiver.process_tx_queue().unwrap();
         let controls = receiver_controls.lock().unwrap().clone();
         assert!(controls.iter().any(|frame| {
-            serialize::peek_envelope(frame)
+            wire_format::peek_envelope(frame)
                 .map(|env| env.ty == DataType::ReliablePartialAck)
                 .unwrap_or(false)
         }));
         assert!(controls.iter().any(|frame| {
-            serialize::peek_envelope(frame)
+            wire_format::peek_envelope(frame)
                 .map(|env| env.ty == DataType::ReliablePacketRequest)
                 .unwrap_or(false)
         }));
@@ -5208,13 +5211,11 @@ mod reliable_tests {
         .unwrap();
         sender.rx_from_side(&ack1, sender_side).unwrap();
         for control in controls.iter().filter(|frame| {
-            serialize::peek_envelope(frame)
+            wire_format::peek_envelope(frame)
                 .map(|env| env.ty == DataType::ReliablePartialAck)
                 .unwrap_or(false)
         }) {
-            sender
-                .rx_serialized_from_side(control, sender_side)
-                .unwrap();
+            sender.rx_packed_from_side(control, sender_side).unwrap();
         }
 
         sent_frames.lock().unwrap().clear();
@@ -5233,7 +5234,7 @@ mod reliable_tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|frame| serialize::peek_frame_info(frame)
+                .any(|frame| wire_format::peek_frame_info(frame)
                     .ok()
                     .and_then(|info| info.reliable.map(|hdr| hdr.seq == 2))
                     .unwrap_or(false)),
@@ -5245,13 +5246,13 @@ mod reliable_tests {
     fn reliable_ordered_delivers_in_order() {
         let delivered: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let delivered_c = delivered.clone();
-        let handler = EndpointHandler::new_serialized_handler(
+        let handler = EndpointHandler::new_packed_handler(
             DataEndpoint::named("SD_CARD"),
             move |bytes: &[u8]| -> TelemetryResult<()> {
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if frame.envelope.ty == DataType::named("GPS_DATA")
                     && let Some(hdr) = frame.reliable
-                    && (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) == 0
+                    && (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) == 0
                 {
                     delivered_c.lock().unwrap().push(hdr.seq);
                 }
@@ -5264,7 +5265,7 @@ mod reliable_tests {
             zero_clock(),
         );
 
-        let side = router.add_side_serialized_with_options(
+        let side = router.add_side_packed_with_options(
             "SRC",
             |_b| Ok(()),
             RouterSideOptions {
@@ -5289,17 +5290,17 @@ mod reliable_tests {
         )
         .unwrap();
 
-        let seq1 = serialize::serialize_packet_with_reliable(
+        let seq1 = wire_format::pack_packet_with_reliable(
             &pkt1,
-            serialize::ReliableHeader {
+            wire_format::ReliableHeader {
                 flags: 0,
                 seq: 1,
                 ack: 0,
             },
         );
-        let seq2 = serialize::serialize_packet_with_reliable(
+        let seq2 = wire_format::pack_packet_with_reliable(
             &pkt2,
-            serialize::ReliableHeader {
+            wire_format::ReliableHeader {
                 flags: 0,
                 seq: 2,
                 ack: 0,
@@ -5307,9 +5308,9 @@ mod reliable_tests {
         );
 
         // Out-of-order: seq2 arrives first, then seq1, then seq2 retransmit.
-        router.rx_serialized_from_side(seq2.as_ref(), side).unwrap();
-        router.rx_serialized_from_side(seq1.as_ref(), side).unwrap();
-        router.rx_serialized_from_side(seq2.as_ref(), side).unwrap();
+        router.rx_packed_from_side(seq2.as_ref(), side).unwrap();
+        router.rx_packed_from_side(seq1.as_ref(), side).unwrap();
+        router.rx_packed_from_side(seq2.as_ref(), side).unwrap();
 
         let delivered = delivered.lock().unwrap().clone();
         assert_eq!(
@@ -5329,10 +5330,10 @@ mod reliable_tests {
             zero_clock(),
         );
 
-        router.add_side_serialized_with_options(
+        router.add_side_packed_with_options(
             "DST",
             move |bytes: &[u8]| -> TelemetryResult<()> {
-                let frame = serialize::peek_frame_info(bytes)?;
+                let frame = wire_format::peek_frame_info(bytes)?;
                 if frame.envelope.ty == DataType::named("GPS_DATA")
                     && let Some(hdr) = frame.reliable
                 {
@@ -5392,11 +5393,11 @@ mod reliable_tests {
             RouterConfig::new(vec![handler]).with_reliable_enabled(false),
             zero_clock(),
         ));
-        receiver.add_side_serialized("ACK", rx_direct);
+        receiver.add_side_packed("ACK", rx_direct);
 
         let rx_for_tx = receiver.clone();
         let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
-            rx_for_tx.rx_serialized_from_side(bytes, 0)?;
+            rx_for_tx.rx_packed_from_side(bytes, 0)?;
             Ok(())
         };
 
@@ -5404,7 +5405,7 @@ mod reliable_tests {
             RouterConfig::new(Vec::new()).with_reliable_enabled(false),
             zero_clock(),
         );
-        sender.add_side_serialized("TO_RECEIVER", tx);
+        sender.add_side_packed("TO_RECEIVER", tx);
 
         let pkt = Packet::from_f32_slice(
             DataType::named("GPS_DATA"),
@@ -5430,9 +5431,9 @@ mod router_tests {
     use crate::config::{DataEndpoint, DataType};
     use crate::packet::Packet;
     use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
-    use crate::tests::count_serialized_frames_of_type;
+    use crate::tests::count_packed_frames_of_type;
     use crate::tests::timeout_tests::StepClock;
-    use crate::{TelemetryResult, serialize};
+    use crate::{TelemetryResult, wire_format};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -5474,7 +5475,7 @@ mod router_tests {
             RouterConfig::new(vec![sd_handler]),
             StepClock::new_default_box(),
         );
-        router.add_side_serialized("tx", transmit);
+        router.add_side_packed("tx", transmit);
 
         // Include one local + one remote endpoint.
         let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
@@ -5491,7 +5492,7 @@ mod router_tests {
     }
 
     #[test]
-    fn queued_serialized_ingress_retries_side_tx_and_relays_between_router_sides() {
+    fn queued_packed_ingress_retries_side_tx_and_relays_between_router_sides() {
         crate::tests::ensure_common_test_schema();
         #[derive(Default)]
         struct TxState {
@@ -5503,7 +5504,7 @@ mod router_tests {
         let tx_state = Arc::new(TxState::default());
         let tx_state_c = tx_state.clone();
 
-        let side_a = router.add_side_serialized_with_options(
+        let side_a = router.add_side_packed_with_options(
             "can",
             |_bytes| Ok(()),
             RouterSideOptions {
@@ -5511,7 +5512,7 @@ mod router_tests {
                 ..RouterSideOptions::default()
             },
         );
-        router.add_side_serialized_with_options(
+        router.add_side_packed_with_options(
             "uart",
             move |bytes: &[u8]| -> TelemetryResult<()> {
                 let attempt = tx_state_c.attempts.fetch_add(1, Ordering::SeqCst);
@@ -5534,17 +5535,17 @@ mod router_tests {
             7,
         )
         .unwrap();
-        let wire = serialize::serialize_packet(&pkt);
+        let wire = wire_format::pack_packet(&pkt);
 
         router
-            .rx_serialized_queue_from_side(wire.as_ref(), side_a)
+            .rx_packed_queue_from_side(wire.as_ref(), side_a)
             .unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
 
         let delivered = tx_state.delivered.lock().unwrap().clone();
         assert!(tx_state.attempts.load(Ordering::SeqCst) >= 2);
         assert_eq!(
-            count_serialized_frames_of_type(&delivered, DataType::named("GPS_DATA")),
+            count_packed_frames_of_type(&delivered, DataType::named("GPS_DATA")),
             1
         );
         assert!(!delivered[0].is_empty());
@@ -5569,7 +5570,7 @@ mod router_tests {
             )]),
             StepClock::new_default_box(),
         );
-        let side = router.add_side_serialized("tx", transmit);
+        let side = router.add_side_packed("tx", transmit);
         router.set_route(None, side, false).unwrap();
 
         let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
@@ -5582,16 +5583,16 @@ mod router_tests {
         assert_eq!(TX_CALLS.load(Ordering::SeqCst), 0);
     }
 
-    /// Receiving the exact same serialized packet twice should be deduped
+    /// Receiving the exact same packed packet twice should be deduped
     /// and only delivered to local handlers once.
     #[test]
-    fn receive_dedupes_identical_serialized_frames() {
+    fn receive_dedupes_identical_packed_frames() {
         use crate::router::RouterConfig;
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_c = hits.clone();
         let sd_handler =
-            EndpointHandler::new_serialized_handler(DataEndpoint::named("SD_CARD"), move |_b| {
+            EndpointHandler::new_packed_handler(DataEndpoint::named("SD_CARD"), move |_b| {
                 hits_c.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             });
@@ -5605,24 +5606,24 @@ mod router_tests {
         let pkt =
             Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 0)
                 .unwrap();
-        let bytes = serialize::serialize_packet(&pkt);
+        let bytes = wire_format::pack_packet(&pkt);
 
-        router.rx_serialized(&bytes).unwrap();
-        router.rx_serialized(&bytes).unwrap();
+        router.rx_packed(&bytes).unwrap();
+        router.rx_packed(&bytes).unwrap();
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
-    /// When only a serialized handler exists for an endpoint, `rx_serialized`
+    /// When only a packed handler exists for an endpoint, `rx_packed`
     /// should still deliver the raw bytes.
     #[test]
-    fn rx_serialized_delivers_to_serialized_handlers() {
+    fn rx_packed_delivers_to_packed_handlers() {
         use crate::router::RouterConfig;
 
         let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let seen_c = seen.clone();
         let sd_handler =
-            EndpointHandler::new_serialized_handler(DataEndpoint::named("SD_CARD"), move |b| {
+            EndpointHandler::new_packed_handler(DataEndpoint::named("SD_CARD"), move |b| {
                 *seen_c.lock().unwrap() = Some(b.to_vec());
                 Ok(())
             });
@@ -5636,9 +5637,9 @@ mod router_tests {
         let pkt =
             Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 0)
                 .unwrap();
-        let bytes = serialize::serialize_packet(&pkt);
+        let bytes = wire_format::pack_packet(&pkt);
 
-        router.rx_serialized(&bytes).unwrap();
+        router.rx_packed(&bytes).unwrap();
         let got = seen.lock().unwrap().clone().expect("no bytes delivered");
         assert_eq!(*got, *bytes);
     }
@@ -5674,7 +5675,7 @@ mod router_tests {
             DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType,
             MessageElement, ReliableMode, RouteSelectionMode, TelemetryError, TelemetryResult,
         };
-        use crate::{packet::Packet, router::Router, serialize};
+        use crate::{packet::Packet, router::Router, wire_format};
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
 
@@ -6036,11 +6037,11 @@ mod router_tests {
 
             let b_for_a = b.clone();
             let b_ingress_from_a_c = b_ingress_from_a.clone();
-            let _a_to_b = a.add_side_serialized_with_options(
+            let _a_to_b = a.add_side_packed_with_options(
                 "A_TO_B",
                 move |bytes| {
                     if let Some(side) = *b_ingress_from_a_c.lock().unwrap() {
-                        b_for_a.rx_serialized_from_side(bytes, side)?;
+                        b_for_a.rx_packed_from_side(bytes, side)?;
                     }
                     Ok(())
                 },
@@ -6049,11 +6050,11 @@ mod router_tests {
 
             let a_for_b = a.clone();
             let a_ingress_from_b_c = a_ingress_from_b.clone();
-            let b_to_a = b.add_side_serialized_with_options(
+            let b_to_a = b.add_side_packed_with_options(
                 "B_TO_A",
                 move |bytes| {
                     if let Some(side) = *a_ingress_from_b_c.lock().unwrap() {
-                        a_for_b.rx_serialized_from_side(bytes, side)?;
+                        a_for_b.rx_packed_from_side(bytes, side)?;
                     }
                     Ok(())
                 },
@@ -6072,12 +6073,12 @@ mod router_tests {
             let c_to_b_frames_c = c_to_b_frames.clone();
             let c_for_b = c.clone();
             let c_ingress_from_b_c = c_ingress_from_b.clone();
-            let _b_to_c = b.add_side_serialized_with_options(
+            let _b_to_c = b.add_side_packed_with_options(
                 "B_TO_C",
                 move |bytes| {
                     b_to_c_frames_c.lock().unwrap().push(bytes.to_vec());
                     if let Some(side) = *c_ingress_from_b_c.lock().unwrap() {
-                        c_for_b.rx_serialized_from_side(bytes, side)?;
+                        c_for_b.rx_packed_from_side(bytes, side)?;
                     }
                     Ok(())
                 },
@@ -6086,12 +6087,12 @@ mod router_tests {
 
             let b_for_c = b.clone();
             let b_ingress_from_c_c = b_ingress_from_c.clone();
-            let c_to_b = c.add_side_serialized_with_options(
+            let c_to_b = c.add_side_packed_with_options(
                 "C_TO_B",
                 move |bytes| {
                     c_to_b_frames_c.lock().unwrap().push(bytes.to_vec());
                     if let Some(side) = *b_ingress_from_c_c.lock().unwrap() {
-                        b_for_c.rx_serialized_from_side(bytes, side)?;
+                        b_for_c.rx_packed_from_side(bytes, side)?;
                     }
                     Ok(())
                 },
@@ -6143,7 +6144,7 @@ mod router_tests {
 
             let request_frames = c_to_b_frames.lock().unwrap().clone();
             assert!(request_frames.iter().any(|bytes| {
-                serialize::peek_frame_info(bytes.as_slice())
+                wire_format::peek_frame_info(bytes.as_slice())
                     .map(|frame| {
                         frame.envelope.ty == DataType::DiscoveryTopologyRequest
                             && frame.reliable.is_some()
@@ -6155,8 +6156,8 @@ mod router_tests {
             let frame_summary: Vec<(DataType, String, bool)> = frames
                 .iter()
                 .map(|bytes| {
-                    let frame = serialize::peek_frame_info(bytes.as_slice()).unwrap();
-                    let pkt = serialize::deserialize_packet(bytes.as_slice()).unwrap();
+                    let frame = wire_format::peek_frame_info(bytes.as_slice()).unwrap();
+                    let pkt = wire_format::unpack_packet(bytes.as_slice()).unwrap();
                     (
                         frame.envelope.ty,
                         pkt.sender().to_string(),
@@ -6166,14 +6167,14 @@ mod router_tests {
                 .collect();
             assert!(
                 frames.iter().any(|bytes| {
-                    let frame = serialize::peek_frame_info(bytes.as_slice()).unwrap();
+                    let frame = wire_format::peek_frame_info(bytes.as_slice()).unwrap();
                     frame.envelope.ty == DataType::DiscoveryTopology && frame.reliable.is_some()
                 }),
                 "{frame_summary:?}"
             );
             assert!(
                 frames.iter().any(|bytes| {
-                    let frame = serialize::peek_frame_info(bytes.as_slice()).unwrap();
+                    let frame = wire_format::peek_frame_info(bytes.as_slice()).unwrap();
                     frame.envelope.ty == DataType::DiscoverySchema && frame.reliable.is_some()
                 }),
                 "{frame_summary:?}"
@@ -6497,7 +6498,7 @@ mod router_tests {
                     .with_sender("SRC"),
                 StepClock::new_box(0, 0),
             );
-            let side = router.add_side_serialized_with_options(
+            let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
                 crate::router::RouterSideOptions {
@@ -6540,7 +6541,7 @@ mod router_tests {
                 now_ms: now_ms.clone(),
             });
             let router = Router::new_with_clock(RouterConfig::default().with_sender("SRC"), clock);
-            let side = router.add_side_serialized_with_options(
+            let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
                 crate::router::RouterSideOptions {
@@ -6607,7 +6608,7 @@ mod router_tests {
                 RouterConfig::default().with_sender("SRC"),
                 StepClock::new_box(0, 0),
             );
-            let side = router.add_side_serialized_with_options(
+            let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
                 crate::router::RouterSideOptions {
@@ -6688,7 +6689,7 @@ mod router_tests {
                 RouterConfig::default().with_sender("SRC"),
                 StepClock::new_box(0, 0),
             );
-            let side = router.add_side_serialized_with_options(
+            let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
                 crate::router::RouterSideOptions {
@@ -6753,10 +6754,10 @@ mod router_tests {
                 41,
             )
             .unwrap();
-            let wire = crate::serialize::serialize_packet_with_wire_contract(
+            let wire = crate::wire_format::pack_packet_with_wire_contract(
                 &pkt,
-                Some(crate::serialize::ReliableHeader {
-                    flags: crate::serialize::RELIABLE_FLAG_UNSEQUENCED,
+                Some(crate::wire_format::ReliableHeader {
+                    flags: crate::wire_format::RELIABLE_FLAG_UNSEQUENCED,
                     seq: 0,
                     ack: 0,
                 }),
@@ -6767,7 +6768,7 @@ mod router_tests {
                 )],
             )
             .unwrap();
-            router.rx_serialized_from_side(&wire, side).unwrap();
+            router.rx_packed_from_side(&wire, side).unwrap();
             assert_eq!(hits.load(Ordering::SeqCst), 0);
         }
 
@@ -6777,7 +6778,7 @@ mod router_tests {
                 RouterConfig::default().with_sender("SRC"),
                 StepClock::new_box(0, 0),
             );
-            let side = router.add_side_serialized_with_options(
+            let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
                 crate::router::RouterSideOptions {
@@ -6828,7 +6829,7 @@ mod router_tests {
         #[test]
         fn discovery_topology_counts_against_shared_queue_budget() {
             let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
-            let side = router.add_side_serialized("link", |_bytes| Ok(()));
+            let side = router.add_side_packed("link", |_bytes| Ok(()));
 
             for idx in 0..128 {
                 let boards = vec![TopologyBoardNode {
@@ -6856,7 +6857,7 @@ mod router_tests {
         }
 
         #[test]
-        fn queued_serialized_discovery_learns_routes_for_locally_handled_endpoints() {
+        fn queued_packed_discovery_learns_routes_for_locally_handled_endpoints() {
             ensure_topology_test_schema();
             let seen_remote: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_remote_c = seen_remote.clone();
@@ -6877,9 +6878,9 @@ mod router_tests {
             let discovery_pkt =
                 build_discovery_announce("REMOTE_NODE", 0, &[DataEndpoint::named("RADIO")])
                     .unwrap();
-            let discovery_bytes = crate::serialize::serialize_packet(&discovery_pkt);
+            let discovery_bytes = crate::wire_format::pack_packet(&discovery_pkt);
             router
-                .rx_serialized_queue_from_side(discovery_bytes.as_ref(), side_remote)
+                .rx_packed_queue_from_side(discovery_bytes.as_ref(), side_remote)
                 .unwrap();
             router.process_rx_queue().unwrap();
 
@@ -6948,8 +6949,7 @@ mod router_tests {
         }
 
         #[test]
-        fn queued_serialized_discovery_timesync_sources_update_route_table_after_full_queue_drain()
-        {
+        fn queued_packed_discovery_timesync_sources_update_route_table_after_full_queue_drain() {
             let router = Router::new_with_clock(
                 RouterConfig::new(vec![EndpointHandler::new_packet_handler(
                     DataEndpoint::named("SD_CARD"),
@@ -6962,15 +6962,15 @@ mod router_tests {
 
             let announce =
                 build_discovery_announce("AB", 0, &[DataEndpoint::named("RADIO")]).unwrap();
-            let announce_bytes = crate::serialize::serialize_packet(&announce);
+            let announce_bytes = crate::wire_format::pack_packet(&announce);
             router
-                .rx_serialized_queue_from_side(announce_bytes.as_ref(), side_fill)
+                .rx_packed_queue_from_side(announce_bytes.as_ref(), side_fill)
                 .unwrap();
 
             let sources = build_discovery_timesync_sources("AB", 0, &["AB", "AB_BACKUP"]).unwrap();
-            let source_bytes = crate::serialize::serialize_packet(&sources);
+            let source_bytes = crate::wire_format::pack_packet(&sources);
             router
-                .rx_serialized_queue_from_side(source_bytes.as_ref(), side_fill)
+                .rx_packed_queue_from_side(source_bytes.as_ref(), side_fill)
                 .unwrap();
 
             router.process_all_queues_with_timeout(0).unwrap();
@@ -6993,8 +6993,7 @@ mod router_tests {
         }
 
         #[test]
-        fn queued_serialized_discovery_from_same_sender_is_ignored_and_local_endpoint_does_not_flood()
-         {
+        fn queued_packed_discovery_from_same_sender_is_ignored_and_local_endpoint_does_not_flood() {
             use crate::config::DEVICE_IDENTIFIER;
 
             let seen_remote: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -7016,9 +7015,9 @@ mod router_tests {
             let discovery_pkt =
                 build_discovery_announce(DEVICE_IDENTIFIER, 0, &[DataEndpoint::named("RADIO")])
                     .unwrap();
-            let discovery_bytes = crate::serialize::serialize_packet(&discovery_pkt);
+            let discovery_bytes = crate::wire_format::pack_packet(&discovery_pkt);
             router
-                .rx_serialized_queue_from_side(discovery_bytes.as_ref(), side_remote)
+                .rx_packed_queue_from_side(discovery_bytes.as_ref(), side_remote)
                 .unwrap();
             router.process_rx_queue().unwrap();
 
@@ -10510,7 +10509,7 @@ mod router_tests {
 
         #[cfg(feature = "cryptography")]
         #[test]
-        fn preferred_e2e_type_seals_serialized_side_payload_and_roundtrips() {
+        fn preferred_e2e_type_seals_packed_side_payload_and_roundtrips() {
             let _crypto_guard = crypto_test_guard();
             crate::tests::ensure_common_test_schema();
             register_test_encryption();
@@ -10537,7 +10536,7 @@ mod router_tests {
                     .with_e2e_key_id(0x5A),
                 zero_clock(),
             );
-            router.add_side_serialized("crypto-link", move |bytes| {
+            router.add_side_packed("crypto-link", move |bytes| {
                 *captured_for_side.lock().unwrap() = bytes.to_vec();
                 Ok(())
             });
@@ -10546,7 +10545,7 @@ mod router_tests {
             router.log(ty, &payload).unwrap();
             let wire = captured.lock().unwrap().clone();
             assert!(!wire.windows(payload.len()).any(|window| window == payload));
-            let decoded = serialize::deserialize_packet(&wire).unwrap();
+            let decoded = wire_format::unpack_packet(&wire).unwrap();
             assert_eq!(decoded.data_type(), ty);
             assert_eq!(decoded.payload(), payload);
 
@@ -10584,7 +10583,7 @@ mod router_tests {
                     .with_e2e_key_id(0x91),
                 zero_clock(),
             );
-            router.add_side_serialized("software-crypto-link", move |bytes| {
+            router.add_side_packed("software-crypto-link", move |bytes| {
                 *captured_for_side.lock().unwrap() = bytes.to_vec();
                 Ok(())
             });
@@ -10593,7 +10592,7 @@ mod router_tests {
             router.log(ty, &payload).unwrap();
             let wire = captured.lock().unwrap().clone();
             assert!(!wire.windows(payload.len()).any(|window| window == payload));
-            let decoded = serialize::deserialize_packet(&wire).unwrap();
+            let decoded = wire_format::unpack_packet(&wire).unwrap();
             assert_eq!(decoded.data_type(), ty);
             assert_eq!(decoded.payload(), payload);
 
@@ -10601,7 +10600,7 @@ mod router_tests {
             let data_len = tampered.len() - 4;
             tampered[data_len - 1] ^= 0x20;
             refresh_crc32(&mut tampered);
-            assert!(serialize::deserialize_packet(&tampered).is_err());
+            assert!(wire_format::unpack_packet(&tampered).is_err());
 
             let _ = remove_data_type(ty);
         }
@@ -10635,7 +10634,7 @@ mod router_tests {
                     .with_e2e_key_id(0x33),
                 zero_clock(),
             );
-            router.add_side_serialized("crypto-link", move |bytes| {
+            router.add_side_packed("crypto-link", move |bytes| {
                 *captured_for_side.lock().unwrap() = bytes.to_vec();
                 Ok(())
             });
@@ -10644,7 +10643,7 @@ mod router_tests {
             let mut wire = captured.lock().unwrap().clone();
             wire[1] ^= 0x01;
             refresh_crc32(&mut wire);
-            assert!(serialize::deserialize_packet(&wire).is_err());
+            assert!(wire_format::unpack_packet(&wire).is_err());
 
             let _ = remove_data_type(ty);
             crate::crypto::clear_c_cryptography_provider();
@@ -10703,11 +10702,11 @@ mod router_tests {
             let b = board_b.clone();
             let c = board_c.clone();
             let captured_for_side = captured.clone();
-            source.add_side_serialized("shared-radio", move |bytes| {
+            source.add_side_packed("shared-radio", move |bytes| {
                 *captured_for_side.lock().unwrap() = bytes.to_vec();
-                a.rx_serialized(bytes)?;
-                b.rx_serialized(bytes)?;
-                c.rx_serialized(bytes)?;
+                a.rx_packed(bytes)?;
+                b.rx_packed(bytes)?;
+                c.rx_packed(bytes)?;
                 Ok(())
             });
 
@@ -10723,13 +10722,13 @@ mod router_tests {
             let mut header_tampered = wire.clone();
             header_tampered[1] ^= 0x01;
             refresh_crc32(&mut header_tampered);
-            assert!(board_a.rx_serialized(&header_tampered).is_err());
+            assert!(board_a.rx_packed(&header_tampered).is_err());
 
             let mut payload_tampered = wire;
             let data_len = payload_tampered.len() - 4;
             payload_tampered[data_len - 1] ^= 0x55;
             refresh_crc32(&mut payload_tampered);
-            assert!(board_b.rx_serialized(&payload_tampered).is_err());
+            assert!(board_b.rx_packed(&payload_tampered).is_err());
 
             let _ = remove_data_type(ty);
             crate::crypto::clear_c_cryptography_provider();
@@ -11331,7 +11330,7 @@ mod router_tests {
                 Arc::<[u8]>::from(7u16.to_le_bytes().to_vec()),
             )
             .unwrap();
-            let wire = crate::serialize::serialize_packet_with_wire_contract(
+            let wire = crate::wire_format::pack_packet_with_wire_contract(
                 &pkt,
                 None,
                 Some(crate::message_meta(ty).element),
@@ -11351,7 +11350,7 @@ mod router_tests {
             )
             .unwrap();
 
-            let decoded = crate::serialize::deserialize_packet(&wire).unwrap();
+            let decoded = crate::wire_format::unpack_packet(&wire).unwrap();
             decoded.validate().unwrap();
             assert_eq!(decoded.data_as_u16().unwrap(), vec![7u16]);
         }

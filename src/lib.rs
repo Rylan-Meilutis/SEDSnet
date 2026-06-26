@@ -23,7 +23,8 @@
 //! - [`config`]: schema + data type/endpoint configuration.
 //! - [`router`]: the core Router abstraction.
 //! - [`packet`]: `Packet` and friends.
-//! - [`serialize`]: wire serialization helpers.
+//! - [`wire_format`]: packet wire-format packing and unpacking helpers.
+//! - [`wire_format`]: packet packing, unpacking, and wire inspection helpers.
 //!
 //! Version 4.0.0 highlights:
 //! - Telemetry endpoints and data types are runtime IDs with process-local registry metadata.
@@ -176,10 +177,10 @@ pub mod packet;
 mod queue;
 pub mod relay;
 pub mod router;
-pub mod serialize;
 mod small_payload;
 #[cfg(feature = "timesync")]
 pub mod timesync;
+pub mod wire_format;
 // ============================================================================
 //  Schema-derived global constants
 // ============================================================================
@@ -735,11 +736,11 @@ pub enum TelemetryError {
     /// Operation is not permitted for the current router/device policy.
     PermissionDenied,
 
-    /// Serialization error.
-    Serialize(&'static str),
+    /// Packing error.
+    Pack(&'static str),
 
-    /// Deserialization error.
-    Deserialize(&'static str),
+    /// Unpacking error.
+    Unpack(&'static str),
 
     /// IO / transport error.
     Io(&'static str),
@@ -772,8 +773,8 @@ impl TelemetryError {
             TelemetryError::HandlerError(_) => TelemetryErrorCode::HandlerError,
             TelemetryError::BadArg => TelemetryErrorCode::BadArg,
             TelemetryError::PermissionDenied => TelemetryErrorCode::PermissionDenied,
-            TelemetryError::Serialize(_) => TelemetryErrorCode::Serialize,
-            TelemetryError::Deserialize(_) => TelemetryErrorCode::Deserialize,
+            TelemetryError::Pack(_) => TelemetryErrorCode::Pack,
+            TelemetryError::Unpack(_) => TelemetryErrorCode::Unpack,
             TelemetryError::Io(_) => TelemetryErrorCode::Io,
             TelemetryError::InvalidUtf8 => TelemetryErrorCode::InvalidUtf8,
             TelemetryError::TypeMismatch { .. } => TelemetryErrorCode::TypeMismatch,
@@ -835,8 +836,8 @@ pub enum TelemetryErrorCode {
     HandlerError = -9,
     BadArg = -10,
     PermissionDenied = -11,
-    Serialize = -12,
-    Deserialize = -13,
+    Pack = -12,
+    Unpack = -13,
     Io = -14,
     InvalidUtf8 = -15,
     TypeMismatch = -16,
@@ -874,8 +875,8 @@ impl TelemetryErrorCode {
             TelemetryErrorCode::HandlerError => "{Handler Error}",
             TelemetryErrorCode::BadArg => "{Bad Arg}",
             TelemetryErrorCode::PermissionDenied => "{Permission Denied}",
-            TelemetryErrorCode::Serialize => "{Serialize Error}",
-            TelemetryErrorCode::Deserialize => "{Deserialize Error}",
+            TelemetryErrorCode::Pack => "{Pack Error}",
+            TelemetryErrorCode::Unpack => "{Unpack Error}",
             TelemetryErrorCode::Io => "{IO Error}",
             TelemetryErrorCode::InvalidUtf8 => "{Invalid UTF-8}",
             TelemetryErrorCode::TypeMismatch => "{Type Mismatch}",

@@ -23,7 +23,7 @@ void timesync_thread_entry(ULONG input)
 {
     (void) input;
     SedsRouter * r = seds_router_new(SEDS_RM_Sink, now_ms, NULL, NULL, 0);
-    seds_router_add_side_serialized(r, "RADIO", 5, tx_send, NULL, true);
+    seds_router_add_side_packed(r, "RADIO", 5, tx_send, NULL, true);
     seds_router_configure_timesync(r, true, 1U, 10U, 5000U, 1000U, 1000U);
     seds_router_set_local_network_datetime_millis(r, 2025, 1, 1, 12, 0, 0, 0);
 

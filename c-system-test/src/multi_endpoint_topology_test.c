@@ -53,7 +53,7 @@ static SedsResult capture_tx(const uint8_t *bytes, size_t len, void *user)
 
     state->tx_packets++;
 
-    owned = seds_pkt_deserialize_owned(bytes, len);
+    owned = seds_pkt_unpack_owned(bytes, len);
     assert(owned != NULL);
 
     assert(seds_owned_pkt_view(owned, &view) == SEDS_OK);
@@ -87,13 +87,13 @@ int main(void)
         {
             .endpoint = TEST_EP_RADIO,
             .packet_handler = noop_packet_handler,
-            .serialized_handler = NULL,
+            .packed_handler = NULL,
             .user = &state,
         },
         {
             .endpoint = TEST_EP_SD_CARD,
             .packet_handler = noop_packet_handler,
-            .serialized_handler = NULL,
+            .packed_handler = NULL,
             .user = &state,
         },
     };
@@ -106,7 +106,7 @@ int main(void)
         sizeof(locals) / sizeof(locals[0]));
     assert(r != NULL);
 
-    assert(seds_router_add_side_serialized(r, "CAN", 3, capture_tx, &state, false) >= 0);
+    assert(seds_router_add_side_packed(r, "CAN", 3, capture_tx, &state, false) >= 0);
     assert(seds_router_configure_timesync(r, true, 0U, 0ULL, 5000ULL, 2000ULL, 2000ULL) ==
            SEDS_OK);
 

@@ -32,10 +32,10 @@ fn main() -> TelemetryResult<()> {
     );
 
     let link = move |bytes: &[u8]| -> TelemetryResult<()> {
-        node_b.rx_serialized(bytes)?;
+        node_b.rx_packed(bytes)?;
         Ok(())
     };
-    node_a.add_side_serialized("LINK", link);
+    node_a.add_side_packed("LINK", link);
 
     node_a.log_f32(DataType::named("GPS_DATA"), &[1.0_f32, 2.0, 3.0])?;
     node_a.process_all_queues_with_timeout(0)?;

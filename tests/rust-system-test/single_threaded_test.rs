@@ -137,18 +137,18 @@ mod single_threaded_test {
                         if idx == from {
                             continue; // no loopback to sender on this bus
                         }
-                        if let Err(err) = node.router.rx_serialized_queue(&frame) {
+                        if let Err(err) = node.router.rx_packed_queue(&frame) {
                             match err {
                                 TelemetryError::Io("priority queue saturated") => {
                                     node.router
                                         .process_all_queues_with_timeout(0)
                                         .expect("bus1: process queues before retry failed");
                                     node.router
-                                        .rx_serialized_queue(&frame)
-                                        .expect("bus1: rx_serialized_queue retry failed");
+                                        .rx_packed_queue(&frame)
+                                        .expect("bus1: rx_packed_queue retry failed");
                                 }
                                 other => {
-                                    panic!("bus1: rx_serialized_packet_to_queue failed: {other:?}")
+                                    panic!("bus1: rx_packed_packet_to_queue failed: {other:?}")
                                 }
                             }
                         }
@@ -157,7 +157,7 @@ mod single_threaded_test {
                     // Feed into relay from bus1 side (even if it came from relay,
                     // dedupe in Relay will ignore duplicates).
                     relay
-                        .rx_serialized_from_side(bus1_side_id, &frame)
+                        .rx_packed_from_side(bus1_side_id, &frame)
                         .expect("bus1 -> relay failed");
                 }
                 Err(TryRecvError::Empty) => break,
@@ -178,18 +178,18 @@ mod single_threaded_test {
                         if idx == from {
                             continue;
                         }
-                        if let Err(err) = node.router.rx_serialized_queue(&frame) {
+                        if let Err(err) = node.router.rx_packed_queue(&frame) {
                             match err {
                                 TelemetryError::Io("priority queue saturated") => {
                                     node.router
                                         .process_all_queues_with_timeout(0)
                                         .expect("bus2: process queues before retry failed");
                                     node.router
-                                        .rx_serialized_queue(&frame)
-                                        .expect("bus2: rx_serialized_queue retry failed");
+                                        .rx_packed_queue(&frame)
+                                        .expect("bus2: rx_packed_queue retry failed");
                                 }
                                 other => {
-                                    panic!("bus2: rx_serialized_packet_to_queue failed: {other:?}")
+                                    panic!("bus2: rx_packed_packet_to_queue failed: {other:?}")
                                 }
                             }
                         }
@@ -197,7 +197,7 @@ mod single_threaded_test {
 
                     // Feed into relay from bus2 side
                     relay
-                        .rx_serialized_from_side(bus2_side_id, &frame)
+                        .rx_packed_from_side(bus2_side_id, &frame)
                         .expect("bus2 -> relay failed");
                 }
                 Err(TryRecvError::Empty) => break,
@@ -231,7 +231,7 @@ mod single_threaded_test {
         // Relay side for bus1: TX from relay -> bus1_rx
         let relay_bus1_tx = bus1_tx.clone();
         let bus1_side_id =
-            relay.add_side_serialized("bus1", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus1", move |bytes: &[u8]| -> TelemetryResult<()> {
                 // from = usize::MAX so we never skip this in bus1 delivery
                 relay_bus1_tx.send((usize::MAX, bytes.to_vec())).unwrap();
                 Ok(())
@@ -240,7 +240,7 @@ mod single_threaded_test {
         // Relay side for bus2: TX from relay -> bus2_rx
         let relay_bus2_tx = bus2_tx.clone();
         let bus2_side_id =
-            relay.add_side_serialized("bus2", move |bytes: &[u8]| -> TelemetryResult<()> {
+            relay.add_side_packed("bus2", move |bytes: &[u8]| -> TelemetryResult<()> {
                 relay_bus2_tx.send((usize::MAX, bytes.to_vec())).unwrap();
                 Ok(())
             });
@@ -295,7 +295,7 @@ mod single_threaded_test {
             } else {
                 Router::new_with_clock(RouterConfig::new(handlers), clock)
             };
-            router.add_side_serialized("bus", tx);
+            router.add_side_packed("bus", tx);
 
             nodes.push(SimNode {
                 router,

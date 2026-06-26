@@ -160,38 +160,38 @@ inline SedsResult request_managed_variable(SedsRouter * r, SedsTypeRef ty)
     return seds_router_request_managed_variable(r, ty.id);
 }
 
-inline SedsResult seed_managed_variable_serialized(SedsRouter * r, const uint8_t * bytes, size_t len)
+inline SedsResult seed_managed_variable_packed(SedsRouter * r, const uint8_t * bytes, size_t len)
 {
-    return seds_router_seed_managed_variable_serialized(r, bytes, len);
+    return seds_router_seed_managed_variable_packed(r, bytes, len);
 }
 
-inline SedsResult set_network_variable_serialized(SedsRouter * r, const uint8_t * bytes, size_t len)
+inline SedsResult set_network_variable_packed(SedsRouter * r, const uint8_t * bytes, size_t len)
 {
-    return seds_router_set_network_variable_serialized(r, bytes, len);
+    return seds_router_set_network_variable_packed(r, bytes, len);
 }
 
-inline int32_t cached_managed_variable_serialized_len(SedsRouter * r, SedsTypeRef ty)
+inline int32_t cached_managed_variable_packed_len(SedsRouter * r, SedsTypeRef ty)
 {
-    return seds_router_cached_managed_variable_serialized_len(r, ty.id);
+    return seds_router_cached_managed_variable_packed_len(r, ty.id);
 }
 
-inline int32_t cached_managed_variable_serialized(SedsRouter * r, SedsTypeRef ty, uint8_t * out, size_t out_len)
+inline int32_t cached_managed_variable_packed(SedsRouter * r, SedsTypeRef ty, uint8_t * out, size_t out_len)
 {
-    return seds_router_cached_managed_variable_serialized(r, ty.id, out, out_len);
+    return seds_router_cached_managed_variable_packed(r, ty.id, out, out_len);
 }
 
-inline int32_t get_network_variable_serialized_len(SedsRouter * r, SedsTypeRef ty, uint32_t stale_after_ms)
+inline int32_t get_network_variable_packed_len(SedsRouter * r, SedsTypeRef ty, uint32_t stale_after_ms)
 {
-    return seds_router_get_network_variable_serialized_len(r, ty.id, stale_after_ms);
+    return seds_router_get_network_variable_packed_len(r, ty.id, stale_after_ms);
 }
 
-inline int32_t get_network_variable_serialized(SedsRouter * r,
+inline int32_t get_network_variable_packed(SedsRouter * r,
                                                SedsTypeRef ty,
                                                uint32_t stale_after_ms,
                                                uint8_t * out,
                                                size_t out_len)
 {
-    return seds_router_get_network_variable_serialized(r, ty.id, stale_after_ms, out, out_len);
+    return seds_router_get_network_variable_packed(r, ty.id, stale_after_ms, out, out_len);
 }
 
 inline int32_t router_memory_layout_len(SedsRouter * r)

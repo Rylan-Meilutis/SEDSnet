@@ -22,11 +22,11 @@ fn main() -> TelemetryResult<()> {
         )]),
         Box::new(|| now_ms()),
     );
-    node.add_side_serialized("RADIO", |_bytes| Ok(()));
+    node.add_side_packed("RADIO", |_bytes| Ok(()));
 
     let relay = Relay::new(Box::new(|| now_ms()));
-    let _side_a = relay.add_side_serialized("CAN", |_bytes| Ok(()));
-    let _side_b = relay.add_side_serialized("RADIO", |_bytes| Ok(()));
+    let _side_a = relay.add_side_packed("CAN", |_bytes| Ok(()));
+    let _side_b = relay.add_side_packed("RADIO", |_bytes| Ok(()));
 
     let pkt = Packet::from_f32_slice(
         DataType::named("GPS_DATA"),

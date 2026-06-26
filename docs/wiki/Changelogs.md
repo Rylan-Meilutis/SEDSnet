@@ -4,7 +4,7 @@
 
 - Migration-safe wire contract:
     - In-flight packets can now carry a compact internal contract with inline payload shape and frozen destination sender hashes.
-    - This keeps already-serialized packets decodable and correctly targeted while runtime schema and topology changes are still propagating.
+    - This keeps already-packed packets decodable and correctly targeted while runtime schema and topology changes are still propagating.
     - New packets immediately use the latest schema/topology view, while old packets continue under their original delivery/decode contract.
 - Runtime-only schema:
     - User `DataEndpoint` and `DataType` entries are no longer generated at compile time.
@@ -59,11 +59,11 @@
     - Recent slow link-probe or driver timing samples throttle built-in discovery output across
       constrained sides to minimal reachability pings between infrequent full refreshes. Time sync
       is throttled per measured slow egress, while fast sides keep the configured normal cadence.
-    - Fixed-size serialized sides can split and reassemble messages for CAN, I2C, and fixed-frame
+    - Fixed-size packed sides can split and reassemble messages for CAN, I2C, and fixed-frame
       radio transports without changing the user API.
     - Link-probe sample APIs let measured bring-up or driver throughput seed adaptive route
       selection.
-    - Runtime sender IDs and serialized header templates reduce repeated header overhead after
+    - Runtime sender IDs and packed header templates reduce repeated header overhead after
       initial contact.
 - Topology and diagnostics:
     - Topology exports now include named endpoint fields, side names, filtered SEDSnet control
@@ -489,7 +489,7 @@ What's included:
 
 ## Version 3.0.0 highlights
 
-- Router side tracking is internal. Most applications should call the plain RX APIs (`rx_serialized` / `rx`) and only
+- Router side tracking is internal. Most applications should call the plain RX APIs (`rx_packed` / `rx`) and only
   use side-aware variants when explicitly overriding ingress (custom relays, multi-link bridges, etc.).
 - TCP-like reliability is now available for schema types marked `reliable` / `reliable_mode`, with ACKs, retransmits,
   and optional ordering. Enable per side and disable when the transport is already reliable.

@@ -246,13 +246,13 @@ typedef SedsResult (* SedsTransmitFn)(const uint8_t * bytes, size_t len, void * 
 
 typedef SedsResult (* SedsEndpointHandlerFn)(const SedsPacketView * pkt, void * user);
 
-typedef SedsResult (* SedsSerializedHandlerFn)(const uint8_t * bytes, size_t len, void * user);
+typedef SedsResult (* SedsPackedHandlerFn)(const uint8_t * bytes, size_t len, void * user);
 
 typedef struct SedsLocalEndpointDesc
 {
     uint32_t endpoint;
     SedsEndpointHandlerFn packet_handler; /* optional */
-    SedsSerializedHandlerFn serialized_handler; /* optional */
+    SedsPackedHandlerFn packed_handler; /* optional */
     void * user;
 } SedsLocalEndpointDesc;
 
@@ -474,47 +474,47 @@ void seds_router_disable_managed_variable(SedsRouter * r, SedsDataType ty);
 SedsResult seds_router_request_managed_variable(SedsRouter * r, SedsDataType ty);
 
 /**
- * @brief Set a network variable for the whole network from a serialized packet.
+ * @brief Set a network variable for the whole network from a packed packet.
  *
  * Returns SEDS_PERMISSION_DENIED if the local router policy does not allow writes.
  */
-SedsResult seds_router_set_network_variable_serialized(
+SedsResult seds_router_set_network_variable_packed(
     SedsRouter * r,
     const uint8_t * bytes,
     size_t len
 );
 
 /**
- * @brief Seed a managed variable cache entry from an already serialized packet.
+ * @brief Seed a managed variable cache entry from an already packed packet.
  */
-SedsResult seds_router_seed_managed_variable_serialized(
+SedsResult seds_router_seed_managed_variable_packed(
     SedsRouter * r,
     const uint8_t * bytes,
     size_t len
 );
 
 /**
- * @brief Return the serialized size of the cached value for `ty`, or 0 if none is cached.
+ * @brief Return the packed size of the cached value for `ty`, or 0 if none is cached.
  */
-int32_t seds_router_cached_managed_variable_serialized_len(SedsRouter * r, SedsDataType ty);
+int32_t seds_router_cached_managed_variable_packed_len(SedsRouter * r, SedsDataType ty);
 
 /**
- * @brief Return serialized cached network-variable size, requesting refresh if missing/stale.
+ * @brief Return packed cached network-variable size, requesting refresh if missing/stale.
  *
  * `stale_after_ms == 0` disables stale-age checks. Returns 0 if no value is currently cached.
  */
-int32_t seds_router_get_network_variable_serialized_len(
+int32_t seds_router_get_network_variable_packed_len(
     SedsRouter * r,
     SedsDataType ty,
     uint32_t stale_after_ms
 );
 
 /**
- * @brief Copy the cached managed-variable packet as serialized bytes.
+ * @brief Copy the cached managed-variable packet as packed bytes.
  *
  * Returns the copied byte count, 0 when no value is cached, or a negative SedsResult error.
  */
-int32_t seds_router_cached_managed_variable_serialized(
+int32_t seds_router_cached_managed_variable_packed(
     SedsRouter * r,
     SedsDataType ty,
     uint8_t * out,
@@ -526,7 +526,7 @@ int32_t seds_router_cached_managed_variable_serialized(
  *
  * Returns copied byte count, 0 when no value is cached yet, or a negative SedsResult.
  */
-int32_t seds_router_get_network_variable_serialized(
+int32_t seds_router_get_network_variable_packed(
     SedsRouter * r,
     SedsDataType ty,
     uint32_t stale_after_ms,
@@ -721,22 +721,22 @@ SedsResult seds_router_set_local_network_datetime_nanos(
    ============================== */
 
 /**
- * @brief Add a serialized router side.
+ * @brief Add a packed router side.
  *
  * @param r                 Router handle.
  * @param name              Optional UTF-8 side name used for topology/debug output.
  * @param name_len          Length of @p name in bytes.
- * @param tx                Side TX callback that receives serialized packet bytes.
+ * @param tx                Side TX callback that receives packed packet bytes.
  * @param tx_user           Opaque pointer passed back into @p tx.
  * @param reliable_enabled  Enable the router's hop-level reliable framing on this side.
- *                          When true, reliable schema traffic on this serialized side uses
+ *                          When true, reliable schema traffic on this packed side uses
  *                          router-managed sequence numbers, ACKs, packet requests, and retransmits.
  *                          When false, the router sends the application packet once on this side
  *                          without that hop-level reliable wrapper.
  *
  * @return Non-negative side id on success; negative SedsResult on failure.
  */
-int32_t seds_router_add_side_serialized(
+int32_t seds_router_add_side_packed(
     SedsRouter * r,
     const char * name,
     size_t name_len,
@@ -746,13 +746,13 @@ int32_t seds_router_add_side_serialized(
 );
 
 /**
- * @brief Add a serialized router side with compact/bounded side transport enabled.
+ * @brief Add a packed router side with compact/bounded side transport enabled.
  *
  * `max_frame_bytes == 0` enables compact header-template transport without chunking.
- * Values greater than zero also split outgoing serialized frames so each TX callback
+ * Values greater than zero also split outgoing packed frames so each TX callback
  * receives at most that many bytes.
  */
-int32_t seds_router_add_side_serialized_small_packets(
+int32_t seds_router_add_side_packed_small_packets(
     SedsRouter * r,
     const char * name,
     size_t name_len,
@@ -763,7 +763,7 @@ int32_t seds_router_add_side_serialized_small_packets(
 );
 
 /**
- * @brief Add a serialized router side using a named compact wire profile.
+ * @brief Add a packed router side using a named compact wire profile.
  *
  * Profiles:
  *  - SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL: canonical packet bytes, no side header templates.
@@ -775,7 +775,7 @@ int32_t seds_router_add_side_serialized_small_packets(
  * A compact_header_target_bytes value of 0 uses the profile default target.
  * max_frame_bytes may be 0 for template-only transport without chunking.
  */
-int32_t seds_router_add_side_serialized_profile(
+int32_t seds_router_add_side_packed_profile(
     SedsRouter * r,
     const char * name,
     size_t name_len,
@@ -797,9 +797,9 @@ int32_t seds_router_add_side_serialized_profile(
  * @param tx                Side TX callback that receives a decoded packet view.
  * @param tx_user           Opaque pointer passed back into @p tx.
  * @param reliable_enabled  Declares whether this side should be considered reliable-capable.
- *                          Packet-view callbacks receive decoded packets rather than serialized
+ *                          Packet-view callbacks receive decoded packets rather than packed
  *                          hop-level reliable framing, so the router's per-hop reliable wrapper is
- *                          most meaningful on serialized sides.
+ *                          most meaningful on packed sides.
  *
  * @return Non-negative side id on success; negative SedsResult on failure.
  */
@@ -964,8 +964,8 @@ SedsResult seds_router_log_string_ex(SedsRouter * r,
    Legacy convenience (still supported)
    ============================== */
 
-/** @brief Receive serialized packet bytes immediately (non-queued, treated as locally-originated input). */
-SedsResult seds_router_receive_serialized(SedsRouter * r, const uint8_t * bytes, size_t len);
+/** @brief Receive packed packet bytes immediately (non-queued, treated as locally-originated input). */
+SedsResult seds_router_receive_packed(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Receive a packet view immediately (non-queued, treated as locally-originated input). */
 SedsResult seds_router_receive(SedsRouter * r, const SedsPacketView * view);
@@ -979,17 +979,17 @@ SedsResult seds_router_process_tx_queue(SedsRouter * r);
 /** @brief Enqueue a packet view for TX processing. */
 SedsResult seds_router_transmit_message_queue(SedsRouter * r, const SedsPacketView * view);
 
-/** @brief Enqueue serialized bytes for TX processing. */
-SedsResult seds_router_transmit_serialized_message_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
+/** @brief Enqueue packed bytes for TX processing. */
+SedsResult seds_router_transmit_packed_message_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
 
-/** @brief Transmit serialized bytes immediately. */
-SedsResult seds_router_transmit_serialized_message(SedsRouter * r, const uint8_t * bytes, size_t len);
+/** @brief Transmit packed bytes immediately. */
+SedsResult seds_router_transmit_packed_message(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Process RX queue until empty. */
 SedsResult seds_router_process_rx_queue(SedsRouter * r);
 
-/** @brief Enqueue serialized bytes for RX processing. */
-SedsResult seds_router_rx_serialized_packet_to_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
+/** @brief Enqueue packed bytes for RX processing. */
+SedsResult seds_router_rx_packed_packet_to_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Enqueue a packet view for RX processing. */
 SedsResult seds_router_rx_packet_to_queue(SedsRouter * r, const SedsPacketView * view);
@@ -1016,15 +1016,15 @@ SedsResult seds_router_clear_rx_queue(SedsRouter * r);
 SedsResult seds_router_clear_tx_queue(SedsRouter * r);
 
 /** @brief Immediate receive with explicit ingress side id. */
-SedsResult seds_router_receive_serialized_from_side(
+SedsResult seds_router_receive_packed_from_side(
     SedsRouter* r, uint32_t side_id, const uint8_t* bytes, size_t len);
 
 /** @brief Immediate packet receive with explicit ingress side id. */
 SedsResult seds_router_receive_from_side(
     SedsRouter* r, uint32_t side_id, const SedsPacketView* view);
 
-/** @brief Enqueue serialized receive with explicit ingress side id. */
-SedsResult seds_router_rx_serialized_packet_to_queue_from_side(
+/** @brief Enqueue packed receive with explicit ingress side id. */
+SedsResult seds_router_rx_packed_packet_to_queue_from_side(
     SedsRouter* r, uint32_t side_id, const uint8_t* bytes, size_t len);
 
 /** @brief Enqueue packet receive with explicit ingress side id. */
@@ -1033,7 +1033,7 @@ SedsResult seds_router_rx_packet_to_queue_from_side(
 
 
 /* ==============================
-   Payload extraction / serialization helpers
+   Payload extraction / packing helpers
    ============================== */
 
 /** @brief Borrow raw payload bytes and optionally return length in bytes. */
@@ -1105,16 +1105,16 @@ SedsResult seds_pkt_get_typed(const SedsPacketView * pkt,
                               size_t elem_size,
                               SedsElemKind elem_kind);
 
-/** @brief Return required serialized length for @p view. */
-int32_t seds_pkt_serialize_len(const SedsPacketView * view);
+/** @brief Return required packed length for @p view. */
+int32_t seds_pkt_pack_len(const SedsPacketView * view);
 
-/** @brief Serialize packet view into @p out. */
-int32_t seds_pkt_serialize(const SedsPacketView * view, uint8_t * out, size_t out_len);
+/** @brief Pack packet view into @p out. */
+int32_t seds_pkt_pack(const SedsPacketView * view, uint8_t * out, size_t out_len);
 
 typedef struct SedsOwnedPacket SedsOwnedPacket;
 
-/** @brief Deserialize bytes into an owned packet object. */
-SedsOwnedPacket * seds_pkt_deserialize_owned(const uint8_t * bytes, size_t len);
+/** @brief Unpack bytes into an owned packet object. */
+SedsOwnedPacket * seds_pkt_unpack_owned(const uint8_t * bytes, size_t len);
 
 /** @brief Convert owned packet into borrowed packet view fields. */
 SedsResult seds_owned_pkt_view(const SedsOwnedPacket * pkt, SedsPacketView * out_view);
@@ -1122,13 +1122,13 @@ SedsResult seds_owned_pkt_view(const SedsOwnedPacket * pkt, SedsPacketView * out
 /** @brief Free owned packet object. */
 void seds_owned_pkt_free(SedsOwnedPacket * pkt);
 
-/** @brief Validate serialized packet bytes. */
-SedsResult seds_pkt_validate_serialized(const uint8_t * bytes, size_t len);
+/** @brief Validate packed packet bytes. */
+SedsResult seds_pkt_validate_packed(const uint8_t * bytes, size_t len);
 
 typedef struct SedsOwnedHeader SedsOwnedHeader;
 
-/** @brief Deserialize only packet header fields into an owned header object. */
-SedsOwnedHeader * seds_pkt_deserialize_header_owned(const uint8_t * bytes, size_t len);
+/** @brief Unpack only packet header fields into an owned header object. */
+SedsOwnedHeader * seds_pkt_unpack_header_owned(const uint8_t * bytes, size_t len);
 
 /** @brief Convert owned header into borrowed packet-view-compatible fields. */
 SedsResult seds_owned_header_view(const SedsOwnedHeader * h, SedsPacketView * out_view);
@@ -1266,7 +1266,7 @@ SedsResult seds_relay_periodic(SedsRelay * r, uint32_t timeout_ms);
  * @param name_len  Length of @p name in bytes (0 if unused).
  * @param tx        TX callback for this side (must not be NULL).
  * @param tx_user   Opaque user pointer passed to @p tx.
- * @param reliable_enabled  Enable the relay's hop-level reliable framing on this serialized side.
+ * @param reliable_enabled  Enable the relay's hop-level reliable framing on this packed side.
  *                          When true, reliable schema traffic on this side uses relay-managed
  *                          sequence numbers, ACKs, packet requests, and retransmits. When false,
  *                          the relay sends the application packet once on this side without that
@@ -1275,7 +1275,7 @@ SedsResult seds_relay_periodic(SedsRelay * r, uint32_t timeout_ms);
  * @return On success: non-negative side ID.
  *         On error:   negative SedsResult error code.
  */
-int32_t seds_relay_add_side_serialized(SedsRelay * r,
+int32_t seds_relay_add_side_packed(SedsRelay * r,
                             const char * name,
                             size_t name_len,
                             SedsTransmitFn tx,
@@ -1283,12 +1283,12 @@ int32_t seds_relay_add_side_serialized(SedsRelay * r,
                             bool reliable_enabled);
 
 /**
- * @brief Add a serialized relay side with bounded side transport enabled.
+ * @brief Add a packed relay side with bounded side transport enabled.
  *
  * `max_frame_bytes == 0` leaves relay frames unbounded. Values greater than zero split outgoing
- * serialized frames so each TX callback receives at most that many bytes.
+ * packed frames so each TX callback receives at most that many bytes.
  */
-int32_t seds_relay_add_side_serialized_small_packets(SedsRelay * r,
+int32_t seds_relay_add_side_packed_small_packets(SedsRelay * r,
                             const char * name,
                             size_t name_len,
                             SedsTransmitFn tx,
@@ -1297,7 +1297,7 @@ int32_t seds_relay_add_side_serialized_small_packets(SedsRelay * r,
                             size_t max_frame_bytes);
 
 /**
- * @brief Add a serialized relay side using a named compact wire profile.
+ * @brief Add a packed relay side using a named compact wire profile.
  *
  * SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE targets a 20-byte compact header and omits unchanged
  * compact timestamps.
@@ -1305,7 +1305,7 @@ int32_t seds_relay_add_side_serialized_small_packets(SedsRelay * r,
  * A compact_header_target_bytes value of 0 uses the profile default target.
  * max_frame_bytes may be 0 for template-only transport without chunking.
  */
-int32_t seds_relay_add_side_serialized_profile(SedsRelay * r,
+int32_t seds_relay_add_side_packed_profile(SedsRelay * r,
                             const char * name,
                             size_t name_len,
                             SedsTransmitFn tx,
@@ -1329,9 +1329,9 @@ int32_t seds_relay_add_side_serialized_profile(SedsRelay * r,
  * @param tx        TX callback for this side (packet-based, must not be NULL).
  * @param tx_user   Opaque user pointer passed to @p tx.
  * @param reliable_enabled  Declares whether this side should be considered reliable-capable.
- *                          Packet-view callbacks receive decoded packets rather than serialized
+ *                          Packet-view callbacks receive decoded packets rather than packed
  *                          hop-level reliable framing, so the relay's per-hop reliable wrapper is
- *                          most meaningful on serialized sides.
+ *                          most meaningful on packed sides.
  *
  * @return On success: non-negative side ID.
  *         On error:   negative SedsResult error code.
@@ -1377,19 +1377,19 @@ SedsResult seds_relay_clear_route_priority(SedsRelay * r, int32_t src_side_id, i
 
 
 /**
- * @brief Feed serialized bytes that arrived on a given side into the relay.
+ * @brief Feed packed bytes that arrived on a given side into the relay.
  *
  * This corresponds to “RX from network into relay”. The relay will fan-out
  * the packet to all other sides when you later call the process_* functions.
  *
  * @param r        Relay handle.
  * @param side_id  Side ID returned by seds_relay_add_side().
- * @param bytes    Serialized packet bytes.
+ * @param bytes    Packed packet bytes.
  * @param len      Length of @p bytes.
  *
  * @return SEDS_OK on success or a negative SedsResult on error.
  */
-SedsResult seds_relay_rx_serialized_from_side(SedsRelay * r,
+SedsResult seds_relay_rx_packed_from_side(SedsRelay * r,
                                               uint32_t side_id,
                                               const uint8_t * bytes,
                                               size_t len);
@@ -1399,7 +1399,7 @@ SedsResult seds_relay_rx_serialized_from_side(SedsRelay * r,
  * @brief Feed a Packet (described by SedsPacketView) that arrived on
  *        a given side into the relay.
  *
- * This is the packet-based counterpart to seds_relay_rx_serialized_from_side().
+ * This is the packet-based counterpart to seds_relay_rx_packed_from_side().
  *
  * @param r        Relay handle.
  * @param side_id  Side ID returned by seds_relay_add_side*().

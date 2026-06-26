@@ -1,7 +1,7 @@
 # Wire Format (Technical)
 
 This page documents the compact v2 wire format implemented in
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/serialize.rs)).
+src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)).
 
 ## Goals
 
@@ -10,6 +10,8 @@ src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/s
 - Endpoint bitmaps instead of repeated endpoint IDs.
 - Optional sender and payload compression.
 - CRC32 trailer for frame integrity.
+- Defer stable context such as sender names, route owners, endpoint names, schema metadata, and
+  link capabilities to discovery whenever it is safe to do so.
 - A compact in-flight wire contract so packets already on the wire remain routable and decodable
   while topology and runtime-schema changes are still propagating.
 
@@ -61,8 +63,8 @@ TAG_BYTES
 CIPHERTEXT_BYTES
 ```
 
-The authenticated data passed to the cryptography provider is the serialized frame prefix through the optional
-reliable header, excluding the payload wrapper and CRC. Deserializers built without `cryptography`
+The authenticated data passed to the cryptography provider is the packed frame prefix through the optional
+reliable header, excluding the payload wrapper and CRC. Unpackers built without `cryptography`
 reject frames with `0x10` rather than exposing ciphertext as application data.
 
 For multi-board endpoints, a sender can use an application-managed endpoint/group traffic key so
@@ -140,7 +142,7 @@ current registry definition.
 ### Frozen destination sender hashes
 
 The target list contains `u64` sender hashes for the destination holders the source intended when
-that packet was serialized.
+that packet was packed.
 
 Routers and relays use that list to:
 
@@ -173,8 +175,8 @@ traffic.
 
 ## Side Transport Wrappers
 
-Routers and relays can add a side-local wrapper around serialized frames for constrained links. This
-wrapper is not part of the application `Packet`; it is consumed by `rx_serialized_from_side(...)`
+Routers and relays can add a side-local wrapper around packed frames for constrained links. This
+wrapper is not part of the application `Packet`; it is consumed by `rx_packed_from_side(...)`
 before normal deserialization.
 
 ```text
@@ -186,15 +188,15 @@ before normal deserialization.
 
 Kinds:
 
-- `0x01`: full serialized frame plus a side-local ULEB template id
+- `0x01`: full packed frame plus a side-local ULEB template id
 - `0x02`: compact frame using a previously learned side-local template id
 - `0x03`: ordered chunk of a full or compact side-transport frame
 - `0x04`: compact frame using a template id plus timestamp delta from the previous frame for that
   template
 - `0x05`: compact frame using a template id and the unchanged previous timestamp for that template
 
-Router serialized sides support header-template reuse with
-`Router::add_side_serialized_small_packets(...)` or
+Router packed sides support header-template reuse with
+`Router::add_side_packed_small_packets(...)` or
 `RouterSideOptions::with_small_packet_transport(...)`. The first stable header shape is sent as a
 full `SDT` frame and assigns a compact side-local ULEB template id. Later packets with the same
 static header shape can use kind `0x02`, replacing repeated type/endpoint/sender/contract bytes with
@@ -205,11 +207,11 @@ enabled and the timestamp is identical to the previous frame for that template, 
 `0x05` and omits the timestamp field entirely. Omission can be enabled side-wide, by the IPv4-like
 profile, or for selected data types on a mixed link.
 
-Python and C bindings expose the same profiles through `add_side_serialized_profile(...)` and
-`seds_*_add_side_serialized_profile(...)`. `ipv6_like` uses a 40-byte compact-header profiling
+Python and C bindings expose the same profiles through `add_side_packed_profile(...)` and
+`seds_*_add_side_packed_profile(...)`. `ipv6_like` uses a 40-byte compact-header profiling
 target; `ipv4_like` uses a 20-byte target and enables unchanged-timestamp omission.
 
-Router and relay serialized sides both support bounded frame sizes. Relay small-packet sides use the
+Router and relay packed sides both support bounded frame sizes. Relay small-packet sides use the
 same side-local template id compaction when `max_frame_bytes` is non-zero. When the side-transport
 frame is too large, the sender emits kind `0x03` chunks whose individual callback payloads do not
 exceed the configured maximum. The receiver reassembles those chunks into the original
@@ -227,6 +229,10 @@ The practical target is:
 
 - **canonical full frame**: self-describing, migration-safe, and suitable for recovery after peer
   restart or lost side context
+- **discovery-deferred steady-state frame**: carries only the critical per-packet fields that cannot
+  be inferred from current discovery state, such as type ID, endpoint bitmap or compact route
+  selector, timestamp/nonce when needed, reliability/crypto flags, payload length, payload bytes, and
+  integrity/authentication data
 - **compact side-transport follow-up frame**: IPv6-like overhead target by default, with an
   IPv4-like target available for stable tiny telemetry streams
 
@@ -268,6 +274,20 @@ Side-local template dictionaries are bounded by `max_side_transport_templates`, 
 entry and later refreshes that shape with a full template frame. This keeps compact-link state
 bounded and makes template memory visible through the same runtime stats used to tune queue,
 reliability, discovery, and cache budgets.
+
+The intended next protocol-level header-reduction path is to add discovered router addresses as a
+canonical wire identity and treat the current sender string as a discovery hostname. In that model,
+discovery owns the address-to-sender-name mapping, endpoint/schema names, route capabilities, and
+stable link profile metadata. Steady-state packet headers should then carry a compact source address
+and only the per-packet fields that are safety-critical to route, dedupe, decrypt, verify, and unpack
+the payload. A peer that has lost discovery context can request or receive a full discovery/schema
+refresh, and a sender can fall back to the canonical full frame or side-template refresh when
+discovery state is stale.
+
+That needs a wire-versioned migration because sender strings are currently part of packet identity,
+discovery topology, reliable return-path learning, E2E ACK tracking, crypto authenticated header
+data, and the C/Python API surface. Until that protocol version exists, side-local templates are the
+supported way to replace repeated sender/type/endpoint header fields on constrained links.
 
 Full discovery snapshots also send `SEDSNET_DISCOVERY_LINK_CAPABILITIES` on each side. Its payload
 is fixed-width: version `u8`, capability flags `u32`, profile code `u8`, max frame bytes `u32`,
@@ -346,7 +366,7 @@ fully decoding payload data.
 
 ## Packet ID from wire
 
-`packet_id_from_wire(...)` computes the same ID as `Packet::packet_id()` from a serialized frame.
+`packet_id_from_wire(...)` computes the same ID as `Packet::packet_id()` from a packed frame.
 It hashes:
 
 - sender bytes after decompression

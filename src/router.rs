@@ -3,7 +3,7 @@
 //! Router with internal named sides (like Relay), plus local processing.
 //!
 //! Design:
-//! - Sides are registered with per-side TX handlers (serialized or packet).
+//! - Sides are registered with per-side TX handlers (packed or packet).
 //! - RX is tagged by source side; route rules decide whether it is forwarded.
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
@@ -47,7 +47,7 @@ use crate::{
     lock::{ReentryGate, RouterMutex},
     message_e2e_encryption_policy, message_meta, message_priority,
     packet::Packet,
-    reliable_mode, serialize,
+    reliable_mode, wire_format,
 };
 use alloc::string::{String, ToString};
 use alloc::{
@@ -83,7 +83,7 @@ const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
 const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
 const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
 const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
-const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + serialize::CRC32_BYTES;
+const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
 const SIDE_TIMESTAMP_POLICY_WORDS: usize = ((crate::MAX_VALUE_DATA_TYPE as usize) + 1).div_ceil(64);
 const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
 const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
@@ -291,7 +291,7 @@ enum SideCompactTimestampMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouterItem {
     Packet(Packet),
-    Serialized(Arc<[u8]>),
+    Packed(Arc<[u8]>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,7 +323,7 @@ impl ByteCost for RouterRxItem {
     fn byte_cost(&self) -> usize {
         match &self.data {
             RouterItem::Packet(pkt) => pkt.byte_cost(),
-            RouterItem::Serialized(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+            RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
         }
     }
 }
@@ -334,12 +334,12 @@ impl ByteCost for RouterTxItem {
         match self {
             RouterTxItem::Broadcast(data) => match data {
                 RouterItem::Packet(pkt) => pkt.byte_cost(),
-                RouterItem::Serialized(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+                RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
             },
             RouterTxItem::EndToEndReplay { .. } => size_of::<u64>(),
             RouterTxItem::ToSide { data, .. } => match data {
                 RouterItem::Packet(pkt) => pkt.byte_cost(),
-                RouterItem::Serialized(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+                RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
             },
             RouterTxItem::ReliableReplay { bytes, .. } => size_of::<Arc<[u8]>>() + bytes.len(),
         }
@@ -718,18 +718,18 @@ enum RouteSelectionOrigin {
 /// Packet Handler function type
 type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
-/// Serialized Handler function type
-type SerializedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
+/// Packed Handler function type
+type PackedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
 
 // Make handlers usable across tasks
 /// Endpoint handler function enum.
-/// Holds either a `Packet` handler or a serialized byte-slice handler.
+/// Holds either a `Packet` handler or a packed byte-slice handler.
 /// /// - Packet handler signature: `Fn(&Packet) -> TelemetryResult<()>`
-/// /// - Serialized handler signature: `Fn(&[u8]) -> TelemetryResult<()>`
+/// /// - Packed handler signature: `Fn(&[u8]) -> TelemetryResult<()>`
 #[derive(Clone)]
 pub enum EndpointHandlerFn {
     Packet(Arc<PacketHandlerFn>),
-    Serialized(Arc<SerializedHandlerFn>),
+    Packed(Arc<PackedHandlerFn>),
 }
 
 /// Endpoint handler for a specific data endpoint.
@@ -744,26 +744,22 @@ impl Debug for EndpointHandlerFn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             EndpointHandlerFn::Packet(_) => f.write_str("EndpointHandlerFn::Packet(<handler>)"),
-            EndpointHandlerFn::Serialized(_) => {
-                f.write_str("EndpointHandlerFn::Serialized(<handler>)")
-            }
+            EndpointHandlerFn::Packed(_) => f.write_str("EndpointHandlerFn::Packed(<handler>)"),
         }
     }
 }
 
-/// TX handler for a router side: either serialized or packet-based.
+/// TX handler for a router side: either packed or packet-based.
 #[derive(Clone)]
 pub enum RouterTxHandlerFn {
-    Serialized(Arc<SerializedHandlerFn>),
+    Packed(Arc<PackedHandlerFn>),
     Packet(Arc<PacketHandlerFn>),
 }
 
 impl Debug for RouterTxHandlerFn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            RouterTxHandlerFn::Serialized(_) => {
-                f.debug_tuple("Serialized").field(&"<handler>").finish()
-            }
+            RouterTxHandlerFn::Packed(_) => f.debug_tuple("Packed").field(&"<handler>").finish(),
             RouterTxHandlerFn::Packet(_) => f.debug_tuple("Packet").field(&"<handler>").finish(),
         }
     }
@@ -773,7 +769,7 @@ impl Debug for RouterTxHandlerFn {
 pub struct RouterSideOptions {
     /// Enables the router's per-link reliable transport layer on this side.
     ///
-    /// When `true` and the side uses a serialized TX handler, reliable schema types gain
+    /// When `true` and the side uses a packed TX handler, reliable schema types gain
     /// sequence numbers, ACKs, packet requests, and retransmits on this specific hop.
     /// When `false`, the router strips the reliable framing for that side and sends only the
     /// application packet payload once.
@@ -784,16 +780,16 @@ pub struct RouterSideOptions {
     pub reliable_enabled: bool,
     /// Marks the side as eligible for link-local-only endpoints and discovery routes.
     pub link_local_enabled: bool,
-    /// Enables a side-local header-template dictionary for serialized transport.
+    /// Enables a side-local header-template dictionary for packed transport.
     ///
     /// The first frame for a stable header shape is sent in full. Later frames
     /// on the same side can replace the repeated static header bytes with a
     /// compact template hash plus only the fields that still vary packet to
     /// packet.
     pub header_template_enabled: bool,
-    /// Maximum number of bytes to emit per serialized TX callback.
+    /// Maximum number of bytes to emit per packed TX callback.
     ///
-    /// When non-zero and a wrapped serialized frame would exceed this size, the
+    /// When non-zero and a wrapped packed frame would exceed this size, the
     /// router splits it into ordered chunks and reassembles those chunks on RX
     /// before normal packet processing.
     pub max_frame_bytes: usize,
@@ -848,7 +844,7 @@ impl Default for RouterSideOptions {
 }
 
 impl RouterSideOptions {
-    /// Convenience preset for compact serialized-side transport.
+    /// Convenience preset for compact packed-side transport.
     ///
     /// This enables header-template reuse and, when `max_frame_bytes > 0`,
     /// router-managed chunking/reassembly for fixed-size transports.
@@ -1016,11 +1012,11 @@ impl EndpointHandler {
         Ok(Self::new_packet_handler(endpoint.id, f))
     }
 
-    /// Create a new endpoint handler for serialized byte-slice callbacks.
+    /// Create a new endpoint handler for packed byte-slice callbacks.
     ///
     /// Handler signature is `Fn(&[u8]) -> TelemetryResult<()>`.
     #[inline]
-    pub fn new_serialized_handler<F>(endpoint: DataEndpoint, f: F) -> Self
+    pub fn new_packed_handler<F>(endpoint: DataEndpoint, f: F) -> Self
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
@@ -1033,29 +1029,29 @@ impl EndpointHandler {
             .expect("endpoint handler endpoint registration failed");
         Self {
             endpoint,
-            handler: EndpointHandlerFn::Serialized(Arc::new(f)),
+            handler: EndpointHandlerFn::Packed(Arc::new(f)),
         }
     }
 
-    /// Create a new serialized handler from a runtime endpoint definition.
+    /// Create a new packed handler from a runtime endpoint definition.
     #[inline]
-    pub fn new_serialized_handler_for<F>(endpoint: crate::config::EndpointDefinition, f: F) -> Self
+    pub fn new_packed_handler_for<F>(endpoint: crate::config::EndpointDefinition, f: F) -> Self
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        Self::new_serialized_handler(endpoint.id, f)
+        Self::new_packed_handler(endpoint.id, f)
     }
 
-    /// Create a new serialized handler by endpoint name.
+    /// Create a new packed handler by endpoint name.
     #[cfg(feature = "std")]
     #[inline]
-    pub fn new_serialized_handler_by_name<F>(endpoint_name: &str, f: F) -> TelemetryResult<Self>
+    pub fn new_packed_handler_by_name<F>(endpoint_name: &str, f: F) -> TelemetryResult<Self>
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         let endpoint = crate::config::endpoint_definition_by_name(endpoint_name)
             .ok_or(TelemetryError::BadArg)?;
-        Ok(Self::new_serialized_handler(endpoint.id, f))
+        Ok(Self::new_packed_handler(endpoint.id, f))
     }
 
     /// Return the endpoint that the handler is registered for.
@@ -1990,7 +1986,7 @@ fn with_retries<F>(
     dest: DataEndpoint,
     data: &RouterItem,
     pkt_for_ctx: Option<&Packet>,
-    env_for_ctx: Option<&serialize::TelemetryEnvelope>,
+    env_for_ctx: Option<&wire_format::TelemetryEnvelope>,
     called_from_queue: bool,
     run: F,
 ) -> TelemetryResult<()>
@@ -2297,7 +2293,7 @@ impl Router {
     fn queued_rx_item_is_discovery(item: &RouterRxItem) -> bool {
         match &item.data {
             RouterItem::Packet(pkt) => discovery::is_discovery_type(pkt.data_type()),
-            RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())
                 .map(|env| discovery::is_discovery_type(env.ty))
                 .unwrap_or(false),
         }
@@ -2478,15 +2474,15 @@ impl Router {
 
     fn router_item_wire_len(data: &RouterItem) -> TelemetryResult<usize> {
         match data {
-            RouterItem::Packet(pkt) => Ok(serialize::serialize_packet(pkt).len()),
-            RouterItem::Serialized(bytes) => Ok(bytes.len()),
+            RouterItem::Packet(pkt) => Ok(wire_format::pack_packet(pkt).len()),
+            RouterItem::Packed(bytes) => Ok(bytes.len()),
         }
     }
 
     /// Extract the logical packet ID targeted by an end-to-end reliable ACK item.
     ///
     /// Router TX and replay queues can carry either decoded `Packet` values or
-    /// serialized frames. This helper normalizes both forms so ACK-routing code
+    /// packed frames. This helper normalizes both forms so ACK-routing code
     /// can reason about them uniformly.
     ///
     /// Only router-generated end-to-end `ReliableAck` packets qualify here.
@@ -2503,14 +2499,14 @@ impl Router {
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
-            RouterItem::Serialized(bytes) => {
-                if serialize::peek_frame_info(bytes.as_ref())
+            RouterItem::Packed(bytes) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| frame.ack_only())
                 {
                     return Ok(None);
                 }
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 if pkt.data_type() != DataType::ReliableAck
                     || !Self::is_end_to_end_ack_sender(pkt.sender())
                 {
@@ -2523,7 +2519,7 @@ impl Router {
 
     fn decode_end_to_end_reliable_ack(payload: &[u8]) -> TelemetryResult<u64> {
         if payload.len() != 8 {
-            return Err(TelemetryError::Deserialize("bad reliable e2e ack payload"));
+            return Err(TelemetryError::Unpack("bad reliable e2e ack payload"));
         }
         Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
     }
@@ -2777,7 +2773,7 @@ impl Router {
         let now_ms = self.clock.now_ms();
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         let mut st = self.state.lock();
         #[cfg(feature = "discovery")]
@@ -2884,7 +2880,7 @@ impl Router {
                 .get(side)
                 .and_then(Option::as_ref)
                 .map(|side| &side.tx_handler),
-            Some(RouterTxHandlerFn::Serialized(_))
+            Some(RouterTxHandlerFn::Packed(_))
         )
     }
 
@@ -3026,7 +3022,7 @@ impl Router {
     fn router_item_priority(data: &RouterItem) -> TelemetryResult<u8> {
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         Ok(message_priority(ty))
     }
@@ -3134,8 +3130,8 @@ impl Router {
                 eps.dedup();
                 Ok((eps, pkt.data_type()))
             }
-            RouterItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 let mut eps: Vec<DataEndpoint> = env.endpoints.iter().copied().collect();
                 eps.sort_unstable();
                 eps.dedup();
@@ -3147,7 +3143,7 @@ impl Router {
     fn item_data_type(data: &RouterItem) -> TelemetryResult<DataType> {
         match data {
             RouterItem::Packet(pkt) => Ok(pkt.data_type()),
-            RouterItem::Serialized(bytes) => Ok(serialize::peek_envelope(bytes.as_ref())?.ty),
+            RouterItem::Packed(bytes) => Ok(wire_format::peek_envelope(bytes.as_ref())?.ty),
         }
     }
 
@@ -3190,9 +3186,9 @@ impl Router {
     }
 
     #[cfg(feature = "cryptography")]
-    fn e2e_seal_config_for_type(&self, ty: DataType) -> Option<serialize::E2eSealConfig> {
+    fn e2e_seal_config_for_type(&self, ty: DataType) -> Option<wire_format::E2eSealConfig> {
         if self.should_require_e2e_for_type(ty) && self.e2e_crypto_supported() {
-            Some(serialize::E2eSealConfig {
+            Some(wire_format::E2eSealConfig {
                 key_id: self.cfg.e2e_key_id(),
             })
         } else {
@@ -3201,14 +3197,14 @@ impl Router {
     }
 
     #[inline]
-    fn serialize_packet_for_router(
+    fn pack_packet_for_router(
         &self,
         pkt: &Packet,
-        reliable: Option<serialize::ReliableHeader>,
+        reliable: Option<wire_format::ReliableHeader>,
     ) -> TelemetryResult<Arc<[u8]>> {
         #[cfg(feature = "cryptography")]
         if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
-            return serialize::serialize_packet_with_wire_contract_e2e(
+            return wire_format::pack_packet_with_wire_contract_e2e(
                 pkt,
                 reliable,
                 pkt.wire_shape(),
@@ -3217,22 +3213,22 @@ impl Router {
             );
         }
         Ok(match reliable {
-            Some(hdr) => serialize::serialize_packet_with_reliable(pkt, hdr),
-            None => serialize::serialize_packet(pkt),
+            Some(hdr) => wire_format::pack_packet_with_reliable(pkt, hdr),
+            None => wire_format::pack_packet(pkt),
         })
     }
 
     #[inline]
-    fn serialize_packet_for_contract(
+    fn pack_packet_for_contract(
         &self,
         pkt: &Packet,
-        reliable: Option<serialize::ReliableHeader>,
+        reliable: Option<wire_format::ReliableHeader>,
         shape: Option<MessageElement>,
         target_senders: &[u64],
     ) -> TelemetryResult<Arc<[u8]>> {
         #[cfg(feature = "cryptography")]
         if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
-            return serialize::serialize_packet_with_wire_contract_e2e(
+            return wire_format::pack_packet_with_wire_contract_e2e(
                 pkt,
                 reliable,
                 shape,
@@ -3240,23 +3236,23 @@ impl Router {
                 e2e,
             );
         }
-        serialize::serialize_packet_with_wire_contract(pkt, reliable, shape, target_senders)
+        wire_format::pack_packet_with_wire_contract(pkt, reliable, shape, target_senders)
     }
 
     #[cfg(feature = "cryptography")]
     #[inline]
-    fn prepare_serialized_for_remote(
+    fn prepare_packed_for_remote(
         &self,
         bytes: Arc<[u8]>,
-        reliable_override: Option<Option<serialize::ReliableHeader>>,
+        reliable_override: Option<Option<wire_format::ReliableHeader>>,
     ) -> TelemetryResult<Arc<[u8]>> {
-        let frame = serialize::peek_frame_info(bytes.as_ref())?;
+        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
         if frame.ack_only() || self.e2e_seal_config_for_type(frame.envelope.ty).is_none() {
             return Ok(bytes);
         }
         let reliable = reliable_override.unwrap_or(frame.reliable);
-        let pkt = serialize::deserialize_packet(bytes.as_ref())?;
-        self.serialize_packet_for_contract(
+        let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+        self.pack_packet_for_contract(
             &pkt,
             reliable,
             frame.envelope.wire_shape,
@@ -3267,8 +3263,8 @@ impl Router {
     fn item_target_senders(&self, data: &RouterItem) -> TelemetryResult<Arc<[u64]>> {
         match data {
             RouterItem::Packet(pkt) => Ok(Arc::from(pkt.wire_target_senders())),
-            RouterItem::Serialized(bytes) => {
-                Ok(serialize::peek_envelope(bytes.as_ref())?.target_senders)
+            RouterItem::Packed(bytes) => {
+                Ok(wire_format::peek_envelope(bytes.as_ref())?.target_senders)
             }
         }
     }
@@ -3317,23 +3313,23 @@ impl Router {
         match data {
             RouterItem::Packet(pkt) => {
                 let reliable = if is_reliable_type(pkt.data_type()) {
-                    Some(serialize::ReliableHeader {
-                        flags: serialize::RELIABLE_FLAG_UNSEQUENCED,
+                    Some(wire_format::ReliableHeader {
+                        flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
                         seq: 0,
                         ack: 0,
                     })
                 } else {
                     None
                 };
-                let bytes = self.serialize_packet_for_contract(
+                let bytes = self.pack_packet_for_contract(
                     &pkt,
                     reliable,
                     Some(message_meta(pkt.data_type()).element),
                     target_senders,
                 )?;
-                Ok(RouterItem::Serialized(bytes))
+                Ok(RouterItem::Packed(bytes))
             }
-            RouterItem::Serialized(bytes) => Ok(RouterItem::Serialized(bytes)),
+            RouterItem::Packed(bytes) => Ok(RouterItem::Packed(bytes)),
         }
     }
 
@@ -3592,8 +3588,8 @@ impl Router {
                 }
                 _ => Ok(None),
             },
-            RouterItem::Serialized(bytes) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 self.preferred_timesync_route_source(&RouterItem::Packet(pkt), ty)
             }
         }
@@ -4500,11 +4496,11 @@ impl Router {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        let ty = serialize::peek_envelope(bytes.as_ref())
+        let ty = wire_format::peek_envelope(bytes.as_ref())
             .map(|env| env.ty)
             .unwrap_or(DataType::ReliableAck);
         let result = match handler {
-            RouterTxHandlerFn::Serialized(f) => {
+            RouterTxHandlerFn::Packed(f) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
@@ -4529,7 +4525,7 @@ impl Router {
                 return Ok(());
             }
             RouterTxHandlerFn::Packet(f) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
             }
         };
@@ -4562,7 +4558,7 @@ impl Router {
             (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
         };
 
-        let RouterTxHandlerFn::Serialized(f) = &handler else {
+        let RouterTxHandlerFn::Packed(f) = &handler else {
             return self.call_side_tx_handler(side, &handler, &data, relayed);
         };
 
@@ -4577,9 +4573,7 @@ impl Router {
 
         let ty = match &data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Serialized(bytes) => {
-                serialize::peek_frame_info(bytes.as_ref())?.envelope.ty
-            }
+            RouterItem::Packed(bytes) => wire_format::peek_frame_info(bytes.as_ref())?.envelope.ty,
         };
 
         if !is_reliable_type(ty) {
@@ -4601,27 +4595,27 @@ impl Router {
             let next = tx_state.next_seq.wrapping_add(1);
             tx_state.next_seq = if next == 0 { 1 } else { next };
             let flags = match reliable_mode(ty) {
-                crate::ReliableMode::Unordered => serialize::RELIABLE_FLAG_UNORDERED,
+                crate::ReliableMode::Unordered => wire_format::RELIABLE_FLAG_UNORDERED,
                 _ => 0,
             };
             (seq, flags)
         };
 
         let bytes: Arc<[u8]> = match data {
-            RouterItem::Packet(pkt) => self.serialize_packet_for_router(
+            RouterItem::Packet(pkt) => self.pack_packet_for_router(
                 &pkt,
-                Some(serialize::ReliableHeader { flags, seq, ack: 0 }),
+                Some(wire_format::ReliableHeader { flags, seq, ack: 0 }),
             )?,
-            RouterItem::Serialized(bytes) => {
+            RouterItem::Packed(bytes) => {
                 #[cfg(feature = "cryptography")]
                 if self.e2e_seal_config_for_type(ty).is_some() {
-                    self.prepare_serialized_for_remote(
+                    self.prepare_packed_for_remote(
                         bytes,
-                        Some(Some(serialize::ReliableHeader { flags, seq, ack: 0 })),
+                        Some(Some(wire_format::ReliableHeader { flags, seq, ack: 0 })),
                     )?
                 } else {
                     let mut v = bytes.to_vec();
-                    if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                    if !wire_format::rewrite_reliable_header(&mut v, flags, seq, 0)? {
                         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
                             return Err(TelemetryError::Io("side tx busy"));
                         };
@@ -4662,7 +4656,7 @@ impl Router {
                 #[cfg(not(feature = "cryptography"))]
                 {
                     let mut v = bytes.to_vec();
-                    if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                    if !wire_format::rewrite_reliable_header(&mut v, flags, seq, 0)? {
                         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
                             return Err(TelemetryError::Io("side tx busy"));
                         };
@@ -4755,9 +4749,7 @@ impl Router {
         let mut result = 0u64;
         let mut shift = 0u32;
         for _ in 0..10 {
-            let byte = *buf
-                .get(*off)
-                .ok_or(TelemetryError::Deserialize("short read"))?;
+            let byte = *buf.get(*off).ok_or(TelemetryError::Unpack("short read"))?;
             *off += 1;
             result |= u64::from(byte & 0x7F) << shift;
             if (byte & 0x80) == 0 {
@@ -4765,7 +4757,7 @@ impl Router {
             }
             shift += 7;
         }
-        Err(TelemetryError::Deserialize("uleb128 too long"))
+        Err(TelemetryError::Unpack("uleb128 too long"))
     }
 
     fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
@@ -4793,7 +4785,7 @@ impl Router {
 
     fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
         let mut out = Vec::with_capacity(
-            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + serialize::CRC32_BYTES,
+            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES,
         );
         out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
         out.push(kind);
@@ -4804,13 +4796,13 @@ impl Router {
     }
 
     fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
-        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + serialize::CRC32_BYTES {
+        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES {
             return Ok(None);
         }
         if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
             return Ok(None);
         }
-        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
         let expected = u32::from_le_bytes([
             bytes[data_len],
             bytes[data_len + 1],
@@ -4819,30 +4811,29 @@ impl Router {
         ]);
         let data = &bytes[..data_len];
         if Self::crc32_bytes(data) != expected {
-            return Err(TelemetryError::Deserialize("side transport crc32 mismatch"));
+            return Err(TelemetryError::Unpack("side transport crc32 mismatch"));
         }
         let kind = data[SIDE_TRANSPORT_MAGIC.len()];
         Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
     }
 
     fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
-        if bytes.len() < serialize::CRC32_BYTES + 4 {
-            return Err(TelemetryError::Deserialize("short buffer"));
+        if bytes.len() < wire_format::CRC32_BYTES + 4 {
+            return Err(TelemetryError::Unpack("short buffer"));
         }
-        let data_len = bytes.len() - serialize::CRC32_BYTES;
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
         let data = &bytes[..data_len];
         let mut off = 0usize;
         let flags = *data
             .get(off)
-            .ok_or(TelemetryError::Deserialize("short prelude"))?;
+            .ok_or(TelemetryError::Unpack("short prelude"))?;
         off += 1;
         off += 1; // NEP
         let ty_end_start = off;
         let ty_u64 = Self::read_uleb128_local(data, &mut off)?;
-        let ty_u32 =
-            u32::try_from(ty_u64).map_err(|_| TelemetryError::Deserialize("bad data type"))?;
+        let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
         if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
-            return Err(TelemetryError::Deserialize("bad data type"));
+            return Err(TelemetryError::Unpack("bad data type"));
         }
         let ty = DataType(ty_u32);
         let data_size_off = off;
@@ -4851,35 +4842,35 @@ impl Router {
         let timestamp = Self::read_uleb128_local(data, &mut off)?;
         let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
             u16::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Deserialize("packet nonce too large"))?
+                .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
         } else {
             0
         };
         let between_start = off;
         let sender_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-            .map_err(|_| TelemetryError::Deserialize("sender length too large"))?;
+            .map_err(|_| TelemetryError::Unpack("sender length too large"))?;
         let sender_wire_len = if (flags & SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED) != 0 {
             usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Deserialize("sender wire length too large"))?
+                .map_err(|_| TelemetryError::Unpack("sender wire length too large"))?
         } else {
             sender_len
         };
         if data.len() < off + SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         off += SIDE_TRANSPORT_EP_BITMAP_BYTES + sender_wire_len;
         if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
             let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Deserialize("wire contract length"))?;
+                .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
             if data.len() < off + contract_len {
-                return Err(TelemetryError::Deserialize("short buffer"));
+                return Err(TelemetryError::Unpack("short buffer"));
             }
             off += contract_len;
         }
-        let reliable_off = serialize::reliable_header_offset(bytes)?;
+        let reliable_off = wire_format::reliable_header_offset(bytes)?;
         let (reliable_flags, reliable_seq_ack, payload_off) = if let Some(rel_off) = reliable_off {
-            if data.len() < rel_off + serialize::RELIABLE_HEADER_BYTES {
-                return Err(TelemetryError::Deserialize("short buffer"));
+            if data.len() < rel_off + wire_format::RELIABLE_HEADER_BYTES {
+                return Err(TelemetryError::Unpack("short buffer"));
             }
             let rel_flags = data[rel_off];
             let seq = u32::from_le_bytes([
@@ -4897,13 +4888,13 @@ impl Router {
             (
                 Some(rel_flags),
                 Some((seq, ack)),
-                rel_off + serialize::RELIABLE_HEADER_BYTES,
+                rel_off + wire_format::RELIABLE_HEADER_BYTES,
             )
         } else {
             (None, None, off)
         };
         if payload_off > data.len() {
-            return Err(TelemetryError::Deserialize("short buffer"));
+            return Err(TelemetryError::Unpack("short buffer"));
         }
         let payload = &data[payload_off..];
         let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
@@ -4944,7 +4935,7 @@ impl Router {
         timestamp_base: Option<u64>,
     ) -> TelemetryResult<(Arc<[u8]>, u64)> {
         if body.is_empty() {
-            return Err(TelemetryError::Deserialize("short side compact frame"));
+            return Err(TelemetryError::Unpack("short side compact frame"));
         }
         let mut off = 0usize;
         let flags = body[off];
@@ -4952,24 +4943,24 @@ impl Router {
         if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
             != template.base_flags
         {
-            return Err(TelemetryError::Deserialize("side compact flags mismatch"));
+            return Err(TelemetryError::Unpack("side compact flags mismatch"));
         }
         let data_size = Self::read_uleb128_local(body, &mut off)?;
         let timestamp = match timestamp_mode {
             SideCompactTimestampMode::Absolute => Self::read_uleb128_local(body, &mut off)?,
             SideCompactTimestampMode::Delta => {
                 let timestamp_field = Self::read_uleb128_local(body, &mut off)?;
-                let base = timestamp_base.ok_or(TelemetryError::Deserialize(
+                let base = timestamp_base.ok_or(TelemetryError::Unpack(
                     "missing side compact timestamp context",
                 ))?;
                 base.checked_add(timestamp_field)
-                    .ok_or(TelemetryError::Deserialize(
+                    .ok_or(TelemetryError::Unpack(
                         "side compact timestamp delta overflow",
                     ))?
             }
-            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(
-                TelemetryError::Deserialize("missing side compact timestamp context"),
-            )?,
+            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(TelemetryError::Unpack(
+                "missing side compact timestamp context",
+            ))?,
         };
         let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
             Some(Self::read_uleb128_local(body, &mut off)?)
@@ -4978,7 +4969,7 @@ impl Router {
         };
         let reliable_seq_ack = if template.reliable_flags.is_some() {
             if body.len() < off + 8 {
-                return Err(TelemetryError::Deserialize("short side compact reliable"));
+                return Err(TelemetryError::Unpack("short side compact reliable"));
             }
             let seq = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
             let ack =
@@ -5002,8 +4993,8 @@ impl Router {
         raw.extend_from_slice(&template.between);
         if let Some(rel_flags) = template.reliable_flags {
             raw.push(rel_flags);
-            let (seq, ack) = reliable_seq_ack
-                .ok_or(TelemetryError::Deserialize("missing side compact reliable"))?;
+            let (seq, ack) =
+                reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
             raw.extend_from_slice(&seq.to_le_bytes());
             raw.extend_from_slice(&ack.to_le_bytes());
         }
@@ -5201,7 +5192,7 @@ impl Router {
             SIDE_TRANSPORT_KIND_FULL => {
                 let mut off = 0usize;
                 let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
                 let raw = Arc::<[u8]>::from(&body[off..]);
                 if let Ok((template, _, _, _, timestamp, _, _, _)) =
                     Self::extract_side_header_template(raw.as_ref())
@@ -5232,11 +5223,11 @@ impl Router {
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
             | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
                 if body.is_empty() {
-                    return Err(TelemetryError::Deserialize("short side compact frame"));
+                    return Err(TelemetryError::Unpack("short side compact frame"));
                 }
                 let mut off = 1usize;
                 let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                    .map_err(|_| TelemetryError::Deserialize("side template id too large"))?;
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
                 let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
                 compact_body.push(body[0]);
                 compact_body.extend_from_slice(&body[off..]);
@@ -5260,7 +5251,7 @@ impl Router {
                     (template, timestamp_base)
                 };
                 let template =
-                    template.ok_or(TelemetryError::Deserialize("unknown side compact template"))?;
+                    template.ok_or(TelemetryError::Unpack("unknown side compact template"))?;
                 let timestamp_mode = match kind {
                     SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
                     SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
@@ -5280,7 +5271,7 @@ impl Router {
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
                 if body.len() < 8 {
-                    return Err(TelemetryError::Deserialize("short side chunk frame"));
+                    return Err(TelemetryError::Unpack("short side chunk frame"));
                 }
                 let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let index = u16::from_le_bytes([body[4], body[5]]);
@@ -5297,20 +5288,20 @@ impl Router {
                         entry.total = total;
                     } else if entry.total != total {
                         side_state.rx_chunks.remove(&transfer_id);
-                        return Err(TelemetryError::Deserialize("side chunk total mismatch"));
+                        return Err(TelemetryError::Unpack("side chunk total mismatch"));
                     }
                     entry.received.entry(index).or_insert(payload);
                     if entry.received.len() == usize::from(total) {
                         let entry = side_state
                             .rx_chunks
                             .remove(&transfer_id)
-                            .ok_or(TelemetryError::Deserialize("side chunk missing"))?;
+                            .ok_or(TelemetryError::Unpack("side chunk missing"))?;
                         let mut out = Vec::new();
                         for idx in 0..entry.total {
                             let chunk = entry
                                 .received
                                 .get(&idx)
-                                .ok_or(TelemetryError::Deserialize("side chunk gap"))?;
+                                .ok_or(TelemetryError::Unpack("side chunk gap"))?;
                             out.extend_from_slice(chunk);
                         }
                         Some(Arc::<[u8]>::from(out))
@@ -5323,7 +5314,7 @@ impl Router {
                     None => Ok(None),
                 }
             }
-            _ => Err(TelemetryError::Deserialize("unknown side transport frame")),
+            _ => Err(TelemetryError::Unpack("unknown side transport frame")),
         }
     }
 
@@ -5344,12 +5335,12 @@ impl Router {
         let started_ms = self.clock.now_ms();
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         let result = match (handler, data) {
-            (RouterTxHandlerFn::Serialized(f), RouterItem::Serialized(bytes)) => {
+            (RouterTxHandlerFn::Packed(f), RouterItem::Packed(bytes)) => {
                 #[cfg(feature = "cryptography")]
-                let send_bytes = self.prepare_serialized_for_remote(bytes.clone(), None)?;
+                let send_bytes = self.prepare_packed_for_remote(bytes.clone(), None)?;
                 #[cfg(not(feature = "cryptography"))]
                 let send_bytes = bytes.clone();
                 let frames = self.encode_side_transport_frames(side, opts, send_bytes)?;
@@ -5378,8 +5369,8 @@ impl Router {
             (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => {
                 self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(pkt))
             }
-            (RouterTxHandlerFn::Serialized(f), RouterItem::Packet(pkt)) => {
-                let owned = self.serialize_packet_for_router(pkt, None)?;
+            (RouterTxHandlerFn::Packed(f), RouterItem::Packet(pkt)) => {
+                let owned = self.pack_packet_for_router(pkt, None)?;
                 let frames = self.encode_side_transport_frames(side, opts, owned)?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
@@ -5403,8 +5394,8 @@ impl Router {
                 self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
                 return Ok(());
             }
-            (RouterTxHandlerFn::Packet(f), RouterItem::Serialized(bytes)) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+            (RouterTxHandlerFn::Packet(f), RouterItem::Packed(bytes)) => {
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
             }
         };
@@ -5433,26 +5424,26 @@ impl Router {
         }
 
         match data {
-            RouterItem::Serialized(bytes) => {
-                let frame = serialize::peek_frame_info(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let frame = wire_format::peek_frame_info(bytes.as_ref())?;
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
-                    if (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) != 0 {
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) != 0 {
                         return Ok(None);
                     }
-                    if (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) == 0 {
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) == 0 {
                         let mut v = bytes.to_vec();
-                        let _ = serialize::rewrite_reliable_header(
+                        let _ = wire_format::rewrite_reliable_header(
                             &mut v,
-                            serialize::RELIABLE_FLAG_UNSEQUENCED,
+                            wire_format::RELIABLE_FLAG_UNSEQUENCED,
                             hdr.seq,
                             0,
                         )?;
-                        return Ok(Some(RouterItem::Serialized(Arc::from(v))));
+                        return Ok(Some(RouterItem::Packed(Arc::from(v))));
                     }
                 }
-                Ok(Some(RouterItem::Serialized(bytes)))
+                Ok(Some(RouterItem::Packed(bytes)))
             }
             RouterItem::Packet(pkt) => {
                 if matches!(
@@ -6277,25 +6268,25 @@ impl Router {
         *self.sender.lock() = Arc::from(sender.as_ref());
     }
 
-    /// Register a side whose TX callback consumes serialized packet bytes.
+    /// Register a side whose TX callback consumes packed packet bytes.
     ///
     /// `name` is exported in topology/debug views and does not affect routing semantics.
     /// `tx` is called whenever the router decides to send a packet toward this side.
     ///
     /// The default options disable the router's per-link reliable framing on this side. Use
-    /// [`Router::add_side_serialized_with_options`] when this hop should participate in router
+    /// [`Router::add_side_packed_with_options`] when this hop should participate in router
     /// reliable ACK/retransmit behavior.
-    pub fn add_side_serialized<F>(&self, name: &'static str, tx: F) -> RouterSideId
+    pub fn add_side_packed<F>(&self, name: &'static str, tx: F) -> RouterSideId
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        self.add_side_serialized_with_options(name, tx, RouterSideOptions::default())
+        self.add_side_packed_with_options(name, tx, RouterSideOptions::default())
     }
 
-    /// Register a serialized side with the compact small-packet transport preset enabled.
+    /// Register a packed side with the compact small-packet transport preset enabled.
     ///
     /// `max_frame_bytes == 0` keeps header-template reuse enabled without chunking.
-    pub fn add_side_serialized_small_packets<F>(
+    pub fn add_side_packed_small_packets<F>(
         &self,
         name: &'static str,
         tx: F,
@@ -6304,14 +6295,14 @@ impl Router {
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        self.add_side_serialized_with_options(
+        self.add_side_packed_with_options(
             name,
             tx,
             RouterSideOptions::default().with_small_packet_transport(max_frame_bytes),
         )
     }
 
-    /// Register a serialized-output side with explicit side options.
+    /// Register a packed-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` enables the router's per-hop reliable framing on this side only.
     /// That means reliable schema traffic on this side uses router-managed ACKs, packet requests,
@@ -6319,7 +6310,7 @@ impl Router {
     ///
     /// `opts.link_local_enabled` allows link-local-only endpoints and discovery routes to use this
     /// side. `ingress_enabled` and `egress_enabled` set the initial directional policy.
-    pub fn add_side_serialized_with_options<F>(
+    pub fn add_side_packed_with_options<F>(
         &self,
         name: &'static str,
         tx: F,
@@ -6332,7 +6323,7 @@ impl Router {
         let id = st.sides.len();
         st.sides.push(Some(RouterSide {
             name,
-            tx_handler: RouterTxHandlerFn::Serialized(Arc::new(tx)),
+            tx_handler: RouterTxHandlerFn::Packed(Arc::new(tx)),
             opts,
         }));
         st.side_runtime_stats
@@ -6345,8 +6336,8 @@ impl Router {
 
     /// Register a side whose TX callback receives decoded [`Packet`] values.
     ///
-    /// Packet-output sides do not preserve the serialized reliable hop framing, so
-    /// `RouterSideOptions::reliable_enabled` only has effect for serialized sides.
+    /// Packet-output sides do not preserve the packed reliable hop framing, so
+    /// `RouterSideOptions::reliable_enabled` only has effect for packed sides.
     pub fn add_side_packet<F>(&self, name: &'static str, tx: F) -> RouterSideId
     where
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
@@ -6357,8 +6348,8 @@ impl Router {
     /// Register a packet-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` still records the operator's intent for this side, but packet-based
-    /// callbacks receive decoded packets rather than the router's serialized reliable hop framing.
-    /// For router-managed per-link reliable sequencing and ACKs, use a serialized side instead.
+    /// callbacks receive decoded packets rather than the router's packed reliable hop framing.
+    /// For router-managed per-link reliable sequencing and ACKs, use a packed side instead.
     pub fn add_side_packet_with_options<F>(
         &self,
         name: &'static str,
@@ -7334,12 +7325,12 @@ impl Router {
 
     /// Compute a de-dupe hash for a RouterItem.
     /// Uses packet ID for Packet items, and attempts to extract packet ID from
-    /// serialized bytes. If extraction fails, hashes raw bytes as a fallback.
+    /// packed bytes. If extraction fails, hashes raw bytes as a fallback.
     fn get_hash(item: &RouterItem) -> u64 {
         match item {
             RouterItem::Packet(pkt) => pkt.packet_id(),
-            RouterItem::Serialized(bytes) => {
-                match serialize::packet_id_from_wire(bytes.as_ref()) {
+            RouterItem::Packed(bytes) => {
+                match wire_format::packet_id_from_wire(bytes.as_ref()) {
                     Ok(id) => id,
                     Err(_e) => {
                         // Fallback: if bytes are malformed (or compression feature mismatch),
@@ -7672,7 +7663,7 @@ impl Router {
             }
             RouterTxItem::ToSide { data, .. } => Self::router_item_priority(data)?,
             RouterTxItem::ReliableReplay { bytes, .. } => {
-                let ty = serialize::peek_envelope(bytes.as_ref())?.ty;
+                let ty = wire_format::peek_envelope(bytes.as_ref())?.ty;
                 Self::router_item_priority_bumped(ty)
             }
         };
@@ -7719,10 +7710,10 @@ impl Router {
         self.process_rx_queue_with_timeout(0)
     }
 
-    /// Enqueue serialized bytes for RX processing as locally-originated input.
+    /// Enqueue packed bytes for RX processing as locally-originated input.
     #[inline]
-    pub fn rx_serialized_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
-        let data = RouterItem::Serialized(Arc::from(bytes));
+    pub fn rx_packed_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
+        let data = RouterItem::Packed(Arc::from(bytes));
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -7733,13 +7724,13 @@ impl Router {
         Ok(())
     }
 
-    /// ISR-safe, non-blocking enqueue of serialized bytes for RX processing.
+    /// ISR-safe, non-blocking enqueue of packed bytes for RX processing.
     ///
     /// Returns `TelemetryError::Io("rx queue busy")` if another context is
     /// currently mutating the ISR RX queue.
     #[inline]
-    pub fn rx_serialized_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
-        let data = RouterItem::Serialized(Arc::from(bytes));
+    pub fn rx_packed_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
+        let data = RouterItem::Packed(Arc::from(bytes));
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: None,
@@ -7812,9 +7803,9 @@ impl Router {
         })
     }
 
-    /// Enqueue serialized bytes for RX processing with an explicit ingress side.
+    /// Enqueue packed bytes for RX processing with an explicit ingress side.
     #[inline]
-    pub fn rx_serialized_queue_from_side(
+    pub fn rx_packed_queue_from_side(
         &self,
         bytes: &[u8],
         side: RouterSideId,
@@ -7823,7 +7814,7 @@ impl Router {
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
         };
-        let data = RouterItem::Serialized(decoded);
+        let data = RouterItem::Packed(decoded);
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -7834,18 +7825,18 @@ impl Router {
         Ok(())
     }
 
-    /// ISR-safe, non-blocking enqueue of serialized bytes with source side.
+    /// ISR-safe, non-blocking enqueue of packed bytes with source side.
     ///
     /// Returns `TelemetryError::Io("rx queue busy")` if another context is
     /// currently mutating the ISR RX queue.
     #[inline]
-    pub fn rx_serialized_queue_from_side_isr(
+    pub fn rx_packed_queue_from_side_isr(
         &self,
         bytes: &[u8],
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let data = RouterItem::Packed(Arc::from(bytes));
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: Some(side),
@@ -7877,40 +7868,41 @@ impl Router {
             .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Packet(_)))
     }
 
-    /// Check if the specified endpoint has a serialized handler registered.
+    /// Check if the specified endpoint has a packed handler registered.
     #[inline]
-    fn endpoint_has_serialized_handler(&self, ep: DataEndpoint) -> bool {
+    fn endpoint_has_packed_handler(&self, ep: DataEndpoint) -> bool {
         self.cfg
             .handlers
             .iter()
-            .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Serialized(_)))
+            .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Packed(_)))
     }
 
     fn packet_has_local_handler(&self, pkt: &Packet) -> bool {
-        pkt.endpoints().iter().copied().any(|ep| {
-            self.endpoint_has_packet_handler(ep) || self.endpoint_has_serialized_handler(ep)
-        })
+        pkt.endpoints()
+            .iter()
+            .copied()
+            .any(|ep| self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep))
     }
 
     /// Call the specified endpoint handler with retries on failure.
     ///
     /// - `data` is present when called from RX processing (queue or immediate).
     /// - `pkt_for_ctx` is required for Packet handlers.
-    /// - `env_for_ctx` provides header-only context when we haven't deserialized.
+    /// - `env_for_ctx` provides header-only context when we haven't unpacked.
     fn call_handler_with_retries(
         &self,
         dest: DataEndpoint,
         handler: &EndpointHandler,
         data: Option<&[u8]>,
         pkt_for_ctx: Option<&Packet>,
-        env_for_ctx: Option<&serialize::TelemetryEnvelope>,
+        env_for_ctx: Option<&wire_format::TelemetryEnvelope>,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let owned_tmp: Option<RouterItem>;
 
         let item_for_ctx: &RouterItem = match (data, pkt_for_ctx) {
             (Some(d), _) => {
-                owned_tmp = Some(RouterItem::Serialized(Arc::from(d)));
+                owned_tmp = Some(RouterItem::Packed(Arc::from(d)));
                 owned_tmp.as_ref().unwrap()
             }
             (None, Some(pkt)) => {
@@ -7940,7 +7932,7 @@ impl Router {
                 )
             }
 
-            (EndpointHandlerFn::Serialized(f), Some(bytes)) => with_retries(
+            (EndpointHandlerFn::Packed(f), Some(bytes)) => with_retries(
                 self,
                 dest,
                 item_for_ctx,
@@ -7950,7 +7942,7 @@ impl Router {
                 || f(bytes),
             ),
 
-            (EndpointHandlerFn::Serialized(_), None) => Ok(()),
+            (EndpointHandlerFn::Packed(_), None) => Ok(()),
         }
     }
 
@@ -7960,7 +7952,7 @@ impl Router {
     /// If no local endpoints remain, falls back to `fallback_stdout`.
     fn handle_callback_error_from_env(
         &self,
-        env: &serialize::TelemetryEnvelope,
+        env: &wire_format::TelemetryEnvelope,
         dest: Option<DataEndpoint>,
         e: TelemetryError,
         called_from_queue: bool,
@@ -8049,7 +8041,7 @@ impl Router {
 
         let vals = pkt.data_as_u32()?;
         if vals.len() != 2 {
-            return Err(TelemetryError::Deserialize("bad reliable control payload"));
+            return Err(TelemetryError::Unpack("bad reliable control payload"));
         }
         let ty = DataType::try_from_u32(vals[0]).ok_or(TelemetryError::InvalidType)?;
         let seq = vals[1];
@@ -8071,7 +8063,7 @@ impl Router {
         }
     }
 
-    /// Core receive function handling both Packet and Serialized items.
+    /// Core receive function handling both Packet and Packed items.
     ///
     /// Relay mode: if a destination endpoint has no matching local handler and the packet has
     /// any remotely-forwardable endpoints, the router will rebroadcast the packet ONCE, excluding
@@ -8081,11 +8073,11 @@ impl Router {
             self.ensure_side_ingress_enabled(src)?;
             match &item.data {
                 RouterItem::Packet(pkt) => {
-                    let bytes = serialize::serialize_packet(pkt).len();
+                    let bytes = wire_format::pack_packet(pkt).len();
                     self.note_side_rx(src, pkt.data_type(), bytes, true);
                 }
-                RouterItem::Serialized(bytes) => {
-                    if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
+                RouterItem::Packed(bytes) => {
+                    if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
                         self.note_side_rx(src, env.ty, bytes.len(), true);
                     }
                 }
@@ -8098,11 +8090,11 @@ impl Router {
                         self.note_reliable_return_route(src, pkt.packet_id());
                     }
                 }
-                RouterItem::Serialized(bytes) => {
-                    if let Ok(env) = serialize::peek_envelope(bytes.as_ref())
+                RouterItem::Packed(bytes) => {
+                    if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
                         && is_reliable_type(env.ty)
                         && !is_internal_control_type(env.ty)
-                        && let Ok(packet_id) = serialize::packet_id_from_wire(bytes.as_ref())
+                        && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
                     {
                         self.note_reliable_return_route(src, packet_id);
                     }
@@ -8115,46 +8107,46 @@ impl Router {
                     self.remember_managed_variable_packet(pkt)?;
                 }
             }
-            RouterItem::Serialized(bytes) => {
-                if let Ok(env) = serialize::peek_envelope(bytes.as_ref())
+            RouterItem::Packed(bytes) => {
+                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
                     && !is_internal_control_type(env.ty)
                     && self.is_managed_variable_type(env.ty)
                 {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     self.remember_managed_variable_packet(&pkt)?;
                 }
             }
         }
         let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
-        if let (Some(src), RouterItem::Serialized(bytes)) = (item.src, &item.data) {
-            let (_opts, handler_is_serialized, hop_reliable_enabled) = {
+        if let (Some(src), RouterItem::Packed(bytes)) = (item.src, &item.data) {
+            let (_opts, handler_is_packed, hop_reliable_enabled) = {
                 let st = self.state.lock();
                 let side_ref = Self::side_ref(&st, src)?;
                 let opts = side_ref.opts;
                 (
                     opts,
-                    matches!(side_ref.tx_handler, RouterTxHandlerFn::Serialized(_)),
+                    matches!(side_ref.tx_handler, RouterTxHandlerFn::Packed(_)),
                     opts.reliable_enabled
                         && self.cfg.reliable_enabled()
                         && !self.side_has_multiple_announcers_locked(&st, src, self.clock.now_ms()),
                 )
             };
 
-            if hop_reliable_enabled && handler_is_serialized {
-                let frame = match serialize::peek_frame_info(bytes.as_ref()) {
+            if hop_reliable_enabled && handler_is_packed {
+                let frame = match wire_format::peek_frame_info(bytes.as_ref()) {
                     Ok(frame) => frame,
                     Err(e) => {
-                        if matches!(e, TelemetryError::Deserialize(msg) if msg == "crc32 mismatch")
-                        {
-                            if let Ok(frame) = serialize::peek_frame_info_unchecked(bytes.as_ref())
+                        if matches!(e, TelemetryError::Unpack(msg) if msg == "crc32 mismatch") {
+                            if let Ok(frame) =
+                                wire_format::peek_frame_info_unchecked(bytes.as_ref())
                                 && is_reliable_type(frame.envelope.ty)
                                 && let Some(hdr) = frame.reliable
                             {
                                 let unordered =
-                                    (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
+                                    (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
                                 let unsequenced =
-                                    (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                                    (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                                 if !unsequenced {
                                     let requested = if unordered {
@@ -8188,8 +8180,8 @@ impl Router {
                         self.handle_reliable_ack(src, frame.envelope.ty, hdr.ack);
                         return Ok(());
                     }
-                    let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
-                    let unsequenced = (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                    let unordered = (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
+                    let unsequenced = (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                     if !unsequenced {
                         if unordered {
@@ -8276,15 +8268,14 @@ impl Router {
                     }
                 }
             } else {
-                match serialize::peek_frame_info(bytes.as_ref()) {
+                match wire_format::peek_frame_info(bytes.as_ref()) {
                     Ok(frame) => {
                         if frame.ack_only() {
                             return Ok(());
                         }
                     }
                     Err(e) => {
-                        if matches!(e, TelemetryError::Deserialize(msg) if msg == "crc32 mismatch")
-                        {
+                        if matches!(e, TelemetryError::Unpack(msg) if msg == "crc32 mismatch") {
                             return Ok(());
                         }
                         return Err(e);
@@ -8306,8 +8297,8 @@ impl Router {
                     {
                         self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
                     }
-                    RouterItem::Serialized(bytes) => {
-                        if let Ok(pkt) = serialize::deserialize_packet(bytes.as_ref())
+                    RouterItem::Packed(bytes) => {
+                        if let Ok(pkt) = wire_format::unpack_packet(bytes.as_ref())
                             && (is_reliable_type(pkt.data_type())
                                 || !pkt.wire_target_senders().is_empty())
                             && pkt.sender() != local_sender.as_ref()
@@ -8326,7 +8317,7 @@ impl Router {
         self.dispatch_rx_data(item, called_from_queue)?;
 
         for release_bytes in released_buffered {
-            let release_data = RouterItem::Serialized(release_bytes.clone());
+            let release_data = RouterItem::Packed(release_bytes.clone());
             if self.is_duplicate_pkt(&release_data)? {
                 continue;
             }
@@ -8380,18 +8371,18 @@ impl Router {
                 eps.sort_unstable();
                 eps.dedup();
                 let had_local_handler = eps.iter().copied().any(|ep| {
-                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_serialized_handler(ep)
+                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
                 });
 
                 let has_remote = self.should_route_remote(&item.data, item.src)?;
                 let targets_local = self.item_targets_local_sender(&item.data)?;
 
-                let has_serialized_local = eps
+                let has_packed_local = eps
                     .iter()
                     .copied()
-                    .any(|ep| self.endpoint_has_serialized_handler(ep));
-                let bytes_opt = if has_serialized_local {
-                    Some(serialize::serialize_packet(pkt))
+                    .any(|ep| self.endpoint_has_packed_handler(ep));
+                let bytes_opt = if has_packed_local {
+                    Some(wire_format::pack_packet(pkt))
                 } else {
                     None
                 };
@@ -8400,7 +8391,7 @@ impl Router {
                     for dest in eps {
                         for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
                             let result = match (&h.handler, &bytes_opt) {
-                                (EndpointHandlerFn::Serialized(_), Some(bytes)) => self
+                                (EndpointHandlerFn::Packed(_), Some(bytes)) => self
                                     .call_handler_with_retries(
                                         dest,
                                         h,
@@ -8409,8 +8400,8 @@ impl Router {
                                         None,
                                         called_from_queue,
                                     ),
-                                (EndpointHandlerFn::Serialized(_), None) => {
-                                    let bytes = serialize::serialize_packet(pkt);
+                                (EndpointHandlerFn::Packed(_), None) => {
+                                    let bytes = wire_format::pack_packet(pkt);
                                     self.call_handler_with_retries(
                                         dest,
                                         h,
@@ -8465,8 +8456,8 @@ impl Router {
 
                 Ok(())
             }
-            RouterItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
 
                 if matches!(
                     env.ty,
@@ -8474,7 +8465,7 @@ impl Router {
                         | DataType::ReliablePartialAck
                         | DataType::ReliablePacketRequest
                 ) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     let _ =
                         self.handle_internal_reliable_packet(&pkt, item.src, called_from_queue)?;
@@ -8488,7 +8479,7 @@ impl Router {
                         | DataType::TimeSyncRequest
                         | DataType::TimeSyncResponse
                 ) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     self.handle_internal_timesync_packet(&pkt, item.src, called_from_queue)?;
                     return Ok(());
@@ -8496,7 +8487,7 @@ impl Router {
 
                 #[cfg(feature = "discovery")]
                 if discovery::is_discovery_type(env.ty) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     let _ = self.learn_discovery_packet(&pkt, item.src, called_from_queue)?;
                     if self.should_route_remote(&item.data, item.src)? {
@@ -8512,7 +8503,7 @@ impl Router {
                     .any(|ep| self.endpoint_has_packet_handler(ep));
 
                 let mut pkt_opt = if any_packet_needed {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     Some(pkt)
                 } else {
@@ -8523,7 +8514,7 @@ impl Router {
                 eps.sort_unstable();
                 eps.dedup();
                 let had_local_handler = eps.iter().copied().any(|ep| {
-                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_serialized_handler(ep)
+                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
                 });
 
                 let has_remote = self.should_route_remote(&item.data, item.src)?;
@@ -8533,7 +8524,7 @@ impl Router {
                     for dest in eps {
                         for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
                             let result = match &h.handler {
-                                EndpointHandlerFn::Serialized(_) => self.call_handler_with_retries(
+                                EndpointHandlerFn::Packed(_) => self.call_handler_with_retries(
                                     dest,
                                     h,
                                     Some(bytes.as_ref()),
@@ -8543,7 +8534,7 @@ impl Router {
                                 ),
                                 EndpointHandlerFn::Packet(_) => {
                                     if pkt_opt.is_none() {
-                                        let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                                        let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                                         pkt.validate()?;
                                         pkt_opt = Some(pkt);
                                     }
@@ -8583,7 +8574,7 @@ impl Router {
                 if has_remote {
                     let relay_item = match pkt_opt {
                         Some(ref p) => RouterItem::Packet(p.clone()),
-                        None => RouterItem::Serialized(bytes.clone()),
+                        None => RouterItem::Packed(bytes.clone()),
                     };
                     self.relay_send(relay_item, item.src, called_from_queue)?;
                 }
@@ -8613,12 +8604,12 @@ impl Router {
                 eps.sort_unstable();
                 eps.dedup();
 
-                let has_serialized_local = eps
+                let has_packed_local = eps
                     .iter()
                     .copied()
-                    .any(|ep| self.endpoint_has_serialized_handler(ep));
-                let bytes_opt = if has_serialized_local {
-                    Some(serialize::serialize_packet(pkt))
+                    .any(|ep| self.endpoint_has_packed_handler(ep));
+                let bytes_opt = if has_packed_local {
+                    Some(wire_format::pack_packet(pkt))
                 } else {
                     None
                 };
@@ -8626,7 +8617,7 @@ impl Router {
                 for dest in eps {
                     for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
                         match (&h.handler, &bytes_opt) {
-                            (EndpointHandlerFn::Serialized(_), Some(bytes)) => {
+                            (EndpointHandlerFn::Packed(_), Some(bytes)) => {
                                 self.call_handler_with_retries(
                                     dest,
                                     h,
@@ -8636,8 +8627,8 @@ impl Router {
                                     called_from_queue,
                                 )?;
                             }
-                            (EndpointHandlerFn::Serialized(_), None) => {
-                                let bytes = serialize::serialize_packet(pkt);
+                            (EndpointHandlerFn::Packed(_), None) => {
+                                let bytes = wire_format::pack_packet(pkt);
                                 self.call_handler_with_retries(
                                     dest,
                                     h,
@@ -8661,8 +8652,8 @@ impl Router {
                     }
                 }
             }
-            RouterItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 if is_internal_control_type(env.ty) {
                     return Ok(());
                 }
@@ -8678,7 +8669,7 @@ impl Router {
                     .any(|ep| self.endpoint_has_packet_handler(ep));
 
                 let mut pkt_opt = if any_packet_needed {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     Some(pkt)
                 } else {
@@ -8692,7 +8683,7 @@ impl Router {
                 for dest in eps {
                     for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
                         match &h.handler {
-                            EndpointHandlerFn::Serialized(_) => {
+                            EndpointHandlerFn::Packed(_) => {
                                 self.call_handler_with_retries(
                                     dest,
                                     h,
@@ -8704,7 +8695,7 @@ impl Router {
                             }
                             EndpointHandlerFn::Packet(_) => {
                                 if pkt_opt.is_none() {
-                                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                                     pkt.validate()?;
                                     pkt_opt = Some(pkt);
                                 }
@@ -8748,8 +8739,8 @@ impl Router {
                 }
                 #[cfg(feature = "discovery")]
                 let is_discovery = matches!(&data, RouterItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()))
-                    || matches!(&data, RouterItem::Serialized(bytes)
-                        if serialize::peek_envelope(bytes.as_ref())
+                    || matches!(&data, RouterItem::Packed(bytes)
+                        if wire_format::peek_envelope(bytes.as_ref())
                             .map(|env| discovery::is_discovery_type(env.ty))
                             .unwrap_or(false));
                 if !ignore_local {
@@ -8759,8 +8750,8 @@ impl Router {
                     #[cfg(feature = "discovery")]
                     if !is_discovery
                         && !matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        && !matches!(&data, RouterItem::Serialized(bytes)
-                            if serialize::peek_envelope(bytes.as_ref())
+                        && !matches!(&data, RouterItem::Packed(bytes)
+                            if wire_format::peek_envelope(bytes.as_ref())
                                 .map(|env| is_internal_control_type(env.ty))
                                 .unwrap_or(false))
                     {
@@ -8768,8 +8759,8 @@ impl Router {
                     }
                     #[cfg(not(feature = "discovery"))]
                     if !matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        && !matches!(&data, RouterItem::Serialized(bytes)
-                            if serialize::peek_envelope(bytes.as_ref())
+                        && !matches!(&data, RouterItem::Packed(bytes)
+                            if wire_format::peek_envelope(bytes.as_ref())
                                 .map(|env| is_internal_control_type(env.ty))
                                 .unwrap_or(false))
                     {
@@ -8782,8 +8773,8 @@ impl Router {
                         pkt.validate()?;
                         self.should_route_remote(&data, None)?
                     }
-                    RouterItem::Serialized(bytes) => {
-                        let _ = serialize::peek_envelope(bytes.as_ref())?;
+                    RouterItem::Packed(bytes) => {
+                        let _ = wire_format::peek_envelope(bytes.as_ref())?;
                         self.should_route_remote(&data, None)?
                     }
                 };
@@ -8794,7 +8785,7 @@ impl Router {
                 let mut data = data;
                 let ty = match &data {
                     RouterItem::Packet(pkt) => pkt.data_type(),
-                    RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+                    RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
                 };
                 if !ignore_local && !is_internal_control_type(ty) {
                     #[cfg(feature = "discovery")]
@@ -8839,8 +8830,8 @@ impl Router {
                             RouterItem::Packet(pkt) => {
                                 let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                             }
-                            RouterItem::Serialized(bytes) => {
-                                if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
+                            RouterItem::Packed(bytes) => {
+                                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
                                     let _ = self.handle_callback_error_from_env(
                                         &env,
                                         None,
@@ -8866,8 +8857,8 @@ impl Router {
                         return Ok(());
                     }
                     let suppress_local = matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        || matches!(&data, RouterItem::Serialized(bytes)
-                            if serialize::peek_envelope(bytes.as_ref())
+                        || matches!(&data, RouterItem::Packed(bytes)
+                            if wire_format::peek_envelope(bytes.as_ref())
                                 .map(|env| is_internal_control_type(env.ty))
                                 .unwrap_or(false));
                     if !suppress_local {
@@ -8878,8 +8869,8 @@ impl Router {
                     let mut st = self.state.lock();
                     let ty = match &data {
                         RouterItem::Packet(pkt) => Some(pkt.data_type()),
-                        RouterItem::Serialized(bytes) => {
-                            Some(serialize::peek_envelope(bytes.as_ref())?.ty)
+                        RouterItem::Packed(bytes) => {
+                            Some(wire_format::peek_envelope(bytes.as_ref())?.ty)
                         }
                     };
                     let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
@@ -8913,8 +8904,8 @@ impl Router {
                         RouterItem::Packet(pkt) => {
                             let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                         }
-                        RouterItem::Serialized(bytes) => {
-                            if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
+                        RouterItem::Packed(bytes) => {
+                            if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
                                 let _ = self.handle_callback_error_from_env(
                                     &env,
                                     None,
@@ -8955,8 +8946,8 @@ impl Router {
                             RouterItem::Packet(pkt) => {
                                 let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                             }
-                            RouterItem::Serialized(bytes) => {
-                                if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
+                            RouterItem::Packed(bytes) => {
+                                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
                                     let _ = self.handle_callback_error_from_env(
                                         &env,
                                         None,
@@ -8971,7 +8962,7 @@ impl Router {
                 }
             }
             RouterTxItem::ReliableReplay { dst, bytes } => {
-                let frame = serialize::peek_frame_info(bytes.as_ref())?;
+                let frame = wire_format::peek_frame_info(bytes.as_ref())?;
                 let ty = frame.envelope.ty;
                 let Some(hdr) = frame.reliable else {
                     return Ok(());
@@ -9013,16 +9004,16 @@ impl Router {
 
     // ---------- PUBLIC API: RX immediate ----------
 
-    /// Process serialized bytes immediately as locally-originated input.
+    /// Process packed bytes immediately as locally-originated input.
     ///
     /// If this call occurs while a side TX callback is already on the stack, the bytes are queued
     /// instead of being processed re-entrantly.
     #[inline]
-    pub fn rx_serialized(&self, bytes: &[u8]) -> TelemetryResult<()> {
+    pub fn rx_packed(&self, bytes: &[u8]) -> TelemetryResult<()> {
         if self.side_tx_active() {
-            return self.rx_serialized_queue(bytes);
+            return self.rx_packed_queue(bytes);
         }
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let data = RouterItem::Packed(Arc::from(bytes));
         let item = RouterRxItem {
             src: None,
             priority: Self::router_item_priority(&data)?,
@@ -9068,20 +9059,20 @@ impl Router {
         self.rx_item(&item, false)
     }
 
-    /// Process serialized bytes immediately with an explicit ingress side id.
+    /// Process packed bytes immediately with an explicit ingress side id.
     ///
     /// If this call occurs while a side TX callback is already on the stack, the bytes are queued
     /// instead of being processed re-entrantly.
     #[inline]
-    pub fn rx_serialized_from_side(&self, bytes: &[u8], side: RouterSideId) -> TelemetryResult<()> {
+    pub fn rx_packed_from_side(&self, bytes: &[u8], side: RouterSideId) -> TelemetryResult<()> {
         if self.side_tx_active() {
-            return self.rx_serialized_queue_from_side(bytes, side);
+            return self.rx_packed_queue_from_side(bytes, side);
         }
         self.ensure_side_ingress_enabled(side)?;
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
         };
-        let data = RouterItem::Serialized(decoded);
+        let data = RouterItem::Packed(decoded);
         let item = RouterRxItem {
             src: Some(side),
             priority: Self::router_item_priority(&data)?,
@@ -9106,18 +9097,18 @@ impl Router {
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
-    /// Transmit serialized bytes immediately.
+    /// Transmit packed bytes immediately.
     ///
     /// If called from inside a side TX callback, the bytes are queued instead of being sent
     /// re-entrantly.
     #[inline]
-    pub fn tx_serialized(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
+    pub fn tx_packed(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
         let _ = self.poll_discovery()?;
         if self.side_tx_active() {
-            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Serialized(pkt)));
+            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(pkt)));
         }
-        self.tx_item(RouterTxItem::Broadcast(RouterItem::Serialized(pkt)))
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packed(pkt)))
     }
 
     // ---------- PUBLIC API: TX queue ----------
@@ -9130,12 +9121,12 @@ impl Router {
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
-    /// Queue serialized bytes for later transmission.
+    /// Queue packed bytes for later transmission.
     #[inline]
-    pub fn tx_serialized_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
+    pub fn tx_packed_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
         let _ = self.poll_discovery()?;
-        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Serialized(data)))
+        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(data)))
     }
 
     // ---------- PUBLIC API: logging ----------

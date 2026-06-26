@@ -6,7 +6,7 @@ FLIGHT_STATE = 3100
 
 
 def main() -> None:
-    seds.register_endpoint(RADIO, "RADIO", False, "serialized radio link")
+    seds.register_endpoint(RADIO, "RADIO", False, "packed radio link")
     seds.register_data_type(
         FLIGHT_STATE,
         "FLIGHT_STATE",
@@ -23,7 +23,7 @@ def main() -> None:
     router = seds.Router(e2e_mode=1, e2e_key_id=7)  # RequiredOnly
     router.set_sender_id("FLIGHT_COMPUTER")
     router.enable_managed_variable(FLIGHT_STATE)
-    router.add_side_serialized("RADIO", lambda _bytes: None)
+    router.add_side_packed("RADIO", lambda _bytes: None)
 
     router.log_bytes(FLIGHT_STATE, bytes([3]))
     router.request_managed_variable(FLIGHT_STATE)

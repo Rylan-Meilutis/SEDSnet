@@ -113,7 +113,7 @@ void app_init(void)
     cfg.configure_timesync = true;
 
     seds_global_router_init(&cfg);
-    seds_global_router_add_serialized_small_side(
+    seds_global_router_add_packed_small_side(
         SEDS_NAME_LITERAL("CAN"),
         tx_can,
         NULL,
@@ -137,13 +137,13 @@ SedsWrapperRelayConfig cfg = seds_wrapper_relay_default_config();
 cfg.sender = SEDS_NAME_LITERAL("RF_RELAY");
 seds_global_relay_init(&cfg);
 
-SedsSideRef can = seds_global_relay_add_serialized_small_side(
+SedsSideRef can = seds_global_relay_add_packed_small_side(
     SEDS_NAME_LITERAL("CAN"), tx_can, NULL, true, 64);
-SedsSideRef uart = seds_global_relay_add_serialized_side(
+SedsSideRef uart = seds_global_relay_add_packed_side(
     SEDS_NAME_LITERAL("UART"), tx_uart, NULL, true);
 
 /* Feed bytes received from CAN. The relay owns queueing and forwarding. */
-seds_global_relay_rx_serialized_from_side(can, rx_bytes, rx_len);
+seds_global_relay_rx_packed_from_side(can, rx_bytes, rx_len);
 seds_global_relay_process(0);
 ```
 
@@ -226,7 +226,7 @@ int main(void)
         locals,
         sizeof(locals) / sizeof(locals[0])
     );
-    seds_router_add_side_serialized(r, "TX", 2, tx_send, NULL, true);
+    seds_router_add_side_packed(r, "TX", 2, tx_send, NULL, true);
 
     float data[3] = {1.0f, 2.0f, 3.0f};
     seds_router_log_typed_ex(
@@ -272,10 +272,10 @@ The shared helper surface includes:
 - `seds_type_ref_by_name(...)` and `seds_endpoint_ref_by_name(...)` resolve names once. Store the
   resulting typed refs and use those for logging, routing, and packet checks.
 - `SedsWrapperRouter` plus `SedsWrapperRouterConfig` wraps router creation, sender setup, optional
-  timesync configuration, initial discovery announce, serialized side registration, RX enqueue,
+  timesync configuration, initial discovery announce, packed side registration, RX enqueue,
   periodic queue processing, and typed/string logging.
-- `seds_router_add_side_serialized_small_packets(...)` and
-  `seds_relay_add_side_serialized_small_packets(...)` expose compact/bounded side transport from C.
+- `seds_router_add_side_packed_small_packets(...)` and
+  `seds_relay_add_side_packed_small_packets(...)` expose compact/bounded side transport from C.
   Use these for fixed-size links such as CAN or I2C.
 
 Example:
@@ -299,7 +299,7 @@ void telemetry_init(void)
 
     (void)seds_type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), &flight_state_ty);
     (void)seds_wrapper_router_init(&telemetry, &cfg);
-    (void)seds_wrapper_router_add_serialized_small_side(
+    (void)seds_wrapper_router_add_packed_small_side(
         &telemetry,
         SEDS_NAME_LITERAL("can"),
         can_tx,
@@ -311,7 +311,7 @@ void telemetry_init(void)
 
 void telemetry_rx_can(const uint8_t *bytes, size_t len)
 {
-    (void)seds_wrapper_router_rx_serialized_from_side(
+    (void)seds_wrapper_router_rx_packed_from_side(
         &telemetry,
         telemetry.primary_side,
         bytes,
@@ -354,13 +354,13 @@ seds_global_router_enable_network_variable(flight_state_ty, true, true);
 seds_global_router_on_network_variable_update(flight_state_ty, on_flight_state_update, NULL);
 
 /* If stale or missing, this queues an internal refresh and returns 0 until a value arrives. */
-int32_t need = seds_global_router_get_network_variable_serialized_len(flight_state_ty, 1000U);
+int32_t need = seds_global_router_get_network_variable_packed_len(flight_state_ty, 1000U);
 seds_global_router_process(0);
 ```
 
 Producers should also enable the same variable type. C firmware can set the network variable from a
-serialized packet with `seds_global_router_set_network_variable_serialized(...)`, or seed only the
-local cache with `seds_router_seed_managed_variable_serialized(...)`. If the local router lacks read
+packed packet with `seds_global_router_set_network_variable_packed(...)`, or seed only the
+local cache with `seds_router_seed_managed_variable_packed(...)`. If the local router lacks read
 or write permission, getters/setters return `SEDS_PERMISSION_DENIED`; peers answer denied refreshes
 with a telemetry error packet. `seds_router_on_network_variable_update(...)` runs only for inbound
 updates and refresh replies that change the local cache; local setters/seeds update the cache without
@@ -545,9 +545,9 @@ See [Time-Sync](Time-Sync) for the time sync packet flow and roles.
 
 Side-level reliability in the C API is controlled by the `reliable_enabled` argument passed to:
 
-- `seds_router_add_side_serialized`
+- `seds_router_add_side_packed`
 - `seds_router_add_side_packet`
-- `seds_relay_add_side_serialized`
+- `seds_relay_add_side_packed`
 - `seds_relay_add_side_packet`
 
 That flag is per hop, not global. It controls what the router/relay does on the connection between
@@ -557,12 +557,12 @@ What it means in practice:
 
 - reliable schema types only use the router/relay's hop-level reliable layer on sides where
   `reliable_enabled == true`
-- on serialized sides, that hop-level layer adds sequence numbers, ACKs, packet requests, and
+- on packed sides, that hop-level layer adds sequence numbers, ACKs, packet requests, and
   retransmits
 - on sides where `reliable_enabled == false`, the router/relay sends the application packet once
   without that hop-level reliable wrapper
-- packet-view side callbacks do not preserve the serialized hop-level wrapper, so the most complete
-  router/relay-managed reliable behavior is on serialized sides
+- packet-view side callbacks do not preserve the packed hop-level wrapper, so the most complete
+  router/relay-managed reliable behavior is on packed sides
 
 For routers, this side setting is separate from router-wide and end-to-end reliability:
 
@@ -643,9 +643,9 @@ and logging APIs.
 Common calls:
 
 - `seds_router_log` / `seds_router_log_ts`: log typed payloads.
-- `seds_router_transmit_serialized_message`: send raw bytes.
-- `seds_router_receive_serialized`: receive bytes immediately.
-- `seds_router_rx_serialized_packet_to_queue`: enqueue for later processing.
+- `seds_router_transmit_packed_message`: send raw bytes.
+- `seds_router_receive_packed`: receive bytes immediately.
+- `seds_router_rx_packed_packet_to_queue`: enqueue for later processing.
 - `seds_router_process_all_queues`: process queued RX/TX.
 
 Immediate vs queued variants:
@@ -668,9 +668,9 @@ As of v3.0.0, most applications should call the plain receive APIs above. Side I
 internally by the router. If you need to explicitly override ingress (custom relay or bridge),
 use the side-aware variants:
 
-- `seds_router_receive_serialized_from_side`
+- `seds_router_receive_packed_from_side`
 - `seds_router_receive_from_side`
-- `seds_router_rx_serialized_packet_to_queue_from_side`
+- `seds_router_rx_packed_packet_to_queue_from_side`
 - `seds_router_rx_packet_to_queue_from_side`
 
 Runtime side policy and routing controls are also available:
@@ -763,6 +763,6 @@ A simple stub is shown in `README.md` and can be adapted for your platform.
 ## Threading and reentrancy
 
 The router uses internal locking, so the C API is safe to call from multiple threads if your platform supports it. In
-bare-metal contexts, you may still want to serialize access around interrupts.
+bare-metal contexts, you may still want to synchronize access around interrupts.
 
 Do not call router/logging APIs from ISR context on RTOS targets, because platform lock hooks may block.
