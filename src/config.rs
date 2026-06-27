@@ -97,7 +97,7 @@ pub const RELIABLE_MAX_RETRIES: u32 = match option_env!("RELIABLE_MAX_RETRIES") 
 
 pub const RELIABLE_MAX_PENDING: usize = match option_env!("RELIABLE_MAX_PENDING") {
     Some(val) => parse_usize(val),
-    None => 16,
+    None => 32,
 };
 
 pub const RELIABLE_MAX_RETURN_ROUTES: usize = match option_env!("RELIABLE_MAX_RETURN_ROUTES") {
@@ -202,6 +202,8 @@ impl DataType {
     pub const MANAGED_VARIABLE_VALUE: Self = Self(14);
     pub const DISCOVERY_LEAVE: Self = Self(15);
     pub const DISCOVERY_LINK_CAPABILITIES: Self = Self(16);
+    pub const DISCOVERY_ADDRESS: Self = Self(17);
+    pub const P2P_MESSAGE: Self = Self(18);
 
     #[allow(non_upper_case_globals)]
     pub const TelemetryError: Self = Self::TELEMETRY_ERROR;
@@ -237,6 +239,10 @@ impl DataType {
     pub const DiscoveryLeave: Self = Self::DISCOVERY_LEAVE;
     #[allow(non_upper_case_globals)]
     pub const DiscoveryLinkCapabilities: Self = Self::DISCOVERY_LINK_CAPABILITIES;
+    #[allow(non_upper_case_globals)]
+    pub const DiscoveryAddress: Self = Self::DISCOVERY_ADDRESS;
+    #[allow(non_upper_case_globals)]
+    pub const P2pMessage: Self = Self::P2P_MESSAGE;
 
     #[inline]
     pub const fn as_u32(self) -> u32 {
@@ -283,6 +289,8 @@ impl core::fmt::Debug for DataType {
             Self::ManagedVariableValue => "SedsnetManagedVariableValue",
             Self::DiscoveryLeave => "SedsnetDiscoveryLeave",
             Self::DiscoveryLinkCapabilities => "SedsnetDiscoveryLinkCapabilities",
+            Self::DiscoveryAddress => "SedsnetDiscoveryAddress",
+            Self::P2pMessage => "SedsnetP2pMessage",
             _ => {
                 let meta = get_message_meta(*self);
                 if meta.name != "UNKNOWN_TYPE" {
@@ -590,7 +598,7 @@ impl Registry {
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
-            reliable: ReliableMode::Ordered,
+            reliable: ReliableMode::None,
             priority: 244,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
@@ -603,6 +611,28 @@ impl Registry {
             endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
             reliable: ReliableMode::None,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        })
+        .expect("built-in type");
+        reg.register_type_definition(DataTypeDefinition {
+            id: DataType::DiscoveryAddress,
+            name: "SEDSNET_DISCOVERY_ADDRESS",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            reliable: ReliableMode::Ordered,
+            priority: 244,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        })
+        .expect("built-in type");
+        reg.register_type_definition(DataTypeDefinition {
+            id: DataType::P2pMessage,
+            name: "SEDSNET_P2P_MESSAGE",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            reliable: ReliableMode::Ordered,
+            priority: 246,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
@@ -1553,6 +1583,8 @@ fn is_internal_data_type(ty: DataType) -> bool {
             | DataType::ManagedVariableValue
             | DataType::DiscoveryLeave
             | DataType::DiscoveryLinkCapabilities
+            | DataType::DiscoveryAddress
+            | DataType::P2pMessage
     )
 }
 
@@ -2064,7 +2096,7 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
             endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
+            reliable: ReliableMode::None,
             priority: 244,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
@@ -2076,6 +2108,26 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 240,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        },
+        DataTypeDefinition {
+            id: DataType::DiscoveryAddress,
+            name: "SEDSNET_DISCOVERY_ADDRESS",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: &[DataEndpoint::Discovery],
+            reliable: ReliableMode::Ordered,
+            priority: 244,
+            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+        },
+        DataTypeDefinition {
+            id: DataType::P2pMessage,
+            name: "SEDSNET_P2P_MESSAGE",
+            description: "",
+            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+            endpoints: &[DataEndpoint::Discovery],
+            reliable: ReliableMode::Ordered,
+            priority: 246,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
     ];

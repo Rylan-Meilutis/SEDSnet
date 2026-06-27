@@ -999,6 +999,7 @@ pub struct PyRouter {
     _ser_cbs: Vec<Py<PyAny>>,
     _side_cbs: Vec<Option<Py<PyAny>>>,
     _netvar_cbs: Vec<Py<PyAny>>,
+    _p2p_cbs: Vec<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -1036,6 +1037,7 @@ impl PyRouter {
                 _ser_cbs: Vec::new(),
                 _side_cbs: Vec::new(),
                 _netvar_cbs: Vec::new(),
+                _p2p_cbs: Vec::new(),
             });
         }
 
@@ -1057,6 +1059,7 @@ impl PyRouter {
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
             _netvar_cbs: Vec::new(),
+            _p2p_cbs: Vec::new(),
         })
     }
 
@@ -1083,6 +1086,7 @@ impl PyRouter {
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
             _netvar_cbs: Vec::new(),
+            _p2p_cbs: Vec::new(),
         })
     }
 
@@ -1101,6 +1105,106 @@ impl PyRouter {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
         rtr.set_sender(sender_id);
+        Ok(())
+    }
+
+    #[getter]
+    fn current_address(&self) -> PyResult<u32> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr.current_address())
+    }
+
+    fn resolve_hostname(&self, py: Python<'_>, hostname: &str) -> PyResult<Option<Py<PyAny>>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let Some(entry) = rtr.resolve_hostname(hostname) else {
+            return Ok(None);
+        };
+        let out = PyDict::new(py);
+        out.set_item("hostname", entry.hostname.as_ref())?;
+        out.set_item("address", entry.address)?;
+        out.set_item("requested_address", entry.requested_address)?;
+        out.set_item("birth_ms", entry.birth_ms)?;
+        out.set_item("owner_hash", entry.owner_hash)?;
+        Ok(Some(out.into()))
+    }
+
+    fn send_p2p_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: u16,
+        src_port: u16,
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bytes: &[u8] = payload.extract()?;
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.send_p2p_to_hostname(hostname, dst_port, src_port, bytes)
+            .map_err(py_err_from)
+    }
+
+    fn send_p2p_to_address(
+        &self,
+        address: u32,
+        dst_port: u16,
+        src_port: u16,
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bytes: &[u8] = payload.extract()?;
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.send_p2p_to_address(address, dst_port, src_port, bytes)
+            .map_err(py_err_from)
+    }
+
+    fn bind_p2p_port(&mut self, py: Python<'_>, port: u16, callback: Py<PyAny>) -> PyResult<()> {
+        let cb_keep = callback.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.bind_p2p_port(port, move |msg| {
+            Python::attach(|py| {
+                let meta = PyDict::new(py);
+                meta.set_item("source_hostname", msg.source_hostname)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                meta.set_item("source_address", msg.source_address)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                meta.set_item("source_port", msg.source_port)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                meta.set_item("destination_port", msg.destination_port)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                let payload = PyBytes::new(py, msg.payload);
+                match cb_for_closure.call1(py, (&meta, &payload)) {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        err.restore(py);
+                        Err(TelemetryError::Io("p2p handler error"))
+                    }
+                }
+            })
+        })
+        .map_err(py_err_from)?;
+        self._p2p_cbs.push(cb_keep);
+        Ok(())
+    }
+
+    fn clear_p2p_port(&self, port: u16) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.clear_p2p_port(port);
         Ok(())
     }
 

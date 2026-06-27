@@ -357,6 +357,17 @@ pub struct SedsDataTypeInfo {
     description_len: usize,
 }
 
+#[repr(C)]
+pub struct SedsP2pMessageView {
+    source_hostname: *const c_char,
+    source_hostname_len: usize,
+    source_address: u32,
+    source_port: u16,
+    destination_port: u16,
+    payload: *const u8,
+    payload_len: usize,
+}
+
 #[cfg(feature = "cryptography")]
 #[repr(C)]
 pub struct SedsManagedCredentialInfo {
@@ -376,6 +387,8 @@ type CEndpointHandler = Option<extern "C" fn(pkt: *const SedsPacketView, user: *
 
 /// Endpoint handler callback (packed bytes) (legacy).
 type CPackedHandler = Option<extern "C" fn(bytes: *const u8, len: usize, user: *mut c_void) -> i32>;
+
+type CP2pHandler = Option<extern "C" fn(msg: *const SedsP2pMessageView, user: *mut c_void) -> i32>;
 
 /// C-facing endpoint descriptor (legacy, must match C header).
 #[repr(C)]
@@ -1424,6 +1437,140 @@ pub extern "C" fn seds_router_set_sender_id(
     let router = unsafe { &mut *r };
     router.inner.set_sender(sender_id);
     status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_current_address(r: *mut SedsRouter, out_address: *mut u32) -> i32 {
+    if r.is_null() || out_address.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    unsafe { *out_address = router.current_address() };
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_resolve_hostname_address(
+    r: *mut SedsRouter,
+    hostname: *const c_char,
+    hostname_len: usize,
+    out_address: *mut u32,
+) -> i32 {
+    if r.is_null() || out_address.is_null() || (hostname_len > 0 && hostname.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let hostname = if hostname_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(hostname), hostname_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let router = unsafe { &(*r).inner };
+    let Some(entry) = router.resolve_hostname(hostname) else {
+        return status_from_err(TelemetryError::BadArg);
+    };
+    unsafe { *out_address = entry.address };
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_bind_p2p_port(
+    r: *mut SedsRouter,
+    port: u16,
+    cb: CP2pHandler,
+    user: *mut c_void,
+) -> i32 {
+    if r.is_null() || cb.is_none() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let cb_fn = cb.unwrap();
+    let user_addr = user as usize;
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.bind_p2p_port(port, move |msg| {
+        let view = SedsP2pMessageView {
+            source_hostname: msg.source_hostname.as_ptr() as *const c_char,
+            source_hostname_len: msg.source_hostname.len(),
+            source_address: msg.source_address,
+            source_port: msg.source_port,
+            destination_port: msg.destination_port,
+            payload: msg.payload.as_ptr(),
+            payload_len: msg.payload.len(),
+        };
+        let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+        if code == status_from_result_code(SedsResult::SedsOk) {
+            Ok(())
+        } else {
+            Err(TelemetryError::Io("p2p handler error"))
+        }
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_clear_p2p_port(r: *mut SedsRouter, port: u16) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.clear_p2p_port(port);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_send_p2p_to_hostname(
+    r: *mut SedsRouter,
+    hostname: *const c_char,
+    hostname_len: usize,
+    dst_port: u16,
+    src_port: u16,
+    payload: *const u8,
+    payload_len: usize,
+) -> i32 {
+    if r.is_null()
+        || (hostname_len > 0 && hostname.is_null())
+        || (payload_len > 0 && payload.is_null())
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let hostname = if hostname_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(hostname), hostname_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let payload = if payload_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(payload, payload_len) }
+    };
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.send_p2p_to_hostname(hostname, dst_port, src_port, payload))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_send_p2p_to_address(
+    r: *mut SedsRouter,
+    address: u32,
+    dst_port: u16,
+    src_port: u16,
+    payload: *const u8,
+    payload_len: usize,
+) -> i32 {
+    if r.is_null() || (payload_len > 0 && payload.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let payload = if payload_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(payload, payload_len) }
+    };
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.send_p2p_to_address(address, dst_port, src_port, payload))
 }
 
 #[cfg(feature = "timesync")]
@@ -5723,13 +5870,13 @@ mod tests {
 
         assert_eq!(seds_router_announce_discovery(router), 0);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
 
         now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
         assert_eq!(seds_router_poll_discovery(router, &mut did_queue), 0);
         assert!(did_queue);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 8);
+        assert_eq!(hits.load(Ordering::SeqCst), 6);
 
         seds_router_free(router);
     }
@@ -5936,7 +6083,7 @@ mod tests {
 
         assert_eq!(seds_router_announce_discovery(router), 0);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
 
         seds_router_free(router);
     }
@@ -6154,7 +6301,7 @@ mod tests {
         assert!(side_id >= 0);
 
         assert_eq!(seds_router_periodic_no_timesync(router, 0), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
 
         seds_router_free(router);
     }

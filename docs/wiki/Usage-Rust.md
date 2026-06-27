@@ -421,6 +421,53 @@ let opts = RouterSideOptions::default()
     .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"));
 ```
 
+## P2P Service Ports
+
+Discovery assigns and advertises compact node addresses and unique hostnames. Configure identity on
+the router config:
+
+```rust
+let router = Router::new(
+    RouterConfig::default()
+        .with_hostname("http-service")
+        .with_static_address(0x1020_3040),
+);
+```
+
+Use `with_dynamic_address()`, `with_requested_address(address)`, or
+`with_static_address(address)`. When segmented networks reunite, routers deconflict duplicate
+addresses and hostnames deterministically. Static addresses are preserved first; if two static
+nodes collide, the older identity keeps the address and newer identities move. Register
+`on_address_change(...)` to be notified when the local address or hostname changes.
+
+P2P service traffic is separate from endpoint broadcast telemetry. A service binds a port and
+receives opaque bytes:
+
+```rust
+router.bind_p2p_port(80, |msg| {
+    assert_eq!(msg.destination_port, 80);
+    let http_request = msg.payload;
+    Ok(())
+})?;
+```
+
+Clients send by hostname so address changes do not break them, or by address when an application
+needs explicit address targeting:
+
+```rust
+client.send_p2p_to_hostname(
+    "http-service",
+    80,
+    49152,
+    b"GET /status HTTP/1.1\r\nHost: http-service\r\n\r\n",
+)?;
+
+client.send_p2p_to_address(0x1020_3040, 80, 49152, b"GET / HTTP/1.1\r\n\r\n")?;
+```
+
+The service payload can carry protocols such as HTTP over SEDSnet links; SEDSnet supplies the
+addressing, routing, reliability, and discovery layer instead of IP.
+
 ## Topology export
 
 With discovery enabled, `export_topology()` returns the router's current learned view.

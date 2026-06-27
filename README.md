@@ -71,6 +71,12 @@ much slower cadence. Router-managed time sync keeps its normal cadence on fast s
 measured slow side independently receives sparse time-sync traffic, keeping asymmetric or
 time-sliced radio links available for user payloads.
 
+Discovery also assigns and advertises compact node addresses and hostnames for point-to-point
+service traffic. A router can bind a SEDSnet service port and receive opaque byte payloads targeted
+by hostname or address, so protocols such as HTTP can be carried over SEDSnet links without IP
+being the underlying transport. Broadcast endpoint delivery remains available for telemetry data
+types; P2P service frames use discovery identity and ports for board-to-board traffic.
+
 Queue memory is bounded by the compile-time `MAX_QUEUE_BUDGET`. Router and relay internals share that budget
 dynamically across RX work, TX work, reliable replay/out-of-order buffers, recent packet ID tracking, and learned
 discovery topology state. The recent packet ID cache preallocates its final storage because it is expected to fill

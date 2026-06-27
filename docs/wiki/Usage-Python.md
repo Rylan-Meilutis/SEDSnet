@@ -242,6 +242,20 @@ target for the selected profile. The `ipv4_like` profile also omits unchanged co
 The same method is available on `Relay`. Per-data-type timestamp omission policy is currently a
 Rust-side option; Python callers use profile-wide timestamp omission through `ipv4_like`.
 
+## P2P Service Ports
+
+Routers expose discovery-backed service ports for byte protocols that should run over SEDSnet
+instead of IP:
+
+```python
+router.bind_p2p_port(80, lambda meta, payload: handle_http(payload))
+client.send_p2p_to_hostname("http-service", 80, 49152, b"GET / HTTP/1.1\r\n\r\n")
+client.send_p2p_to_address(0x10203040, 80, 49152, b"GET / HTTP/1.1\r\n\r\n")
+```
+
+`router.current_address` returns the current compact address, and
+`router.resolve_hostname("name")` returns discovered address metadata when known.
+
 ## Time sync
 
 When built with `timesync`, `Router` keeps an internal network clock and handles `SEDSNET_TIME_SYNC`

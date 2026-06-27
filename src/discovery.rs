@@ -135,6 +135,12 @@ pub const LINK_PROFILE_TEMPLATE: u8 = 1;
 pub const LINK_PROFILE_IPV6_LIKE: u8 = 2;
 pub const LINK_PROFILE_IPV4_LIKE: u8 = 3;
 
+pub const ADDRESS_MODE_DYNAMIC: u8 = 0;
+pub const ADDRESS_MODE_REQUESTED: u8 = 1;
+pub const ADDRESS_MODE_STATIC: u8 = 2;
+pub const ADDRESS_STATE_REQUEST: u8 = 0;
+pub const ADDRESS_STATE_APPROVED: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkCapabilities {
     pub version: u8,
@@ -143,6 +149,20 @@ pub struct LinkCapabilities {
     pub max_frame_bytes: u32,
     pub compact_header_target_bytes: u32,
     pub max_side_transport_templates: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressAdvertisement {
+    pub hostname: String,
+    pub address: u32,
+    pub requested_address: u32,
+    pub mode: u8,
+    pub state: u8,
+    pub birth_ms: u64,
+    pub owner_hash: u64,
+    pub reachable_endpoints: Vec<DataEndpoint>,
+    pub reachable_timesync_sources: Vec<String>,
+    pub link_capabilities: LinkCapabilities,
 }
 
 #[inline]
@@ -174,6 +194,7 @@ pub const fn is_discovery_type(ty: DataType) -> bool {
             | DataType::ManagedVariableValue
             | DataType::DiscoveryLeave
             | DataType::DiscoveryLinkCapabilities
+            | DataType::DiscoveryAddress
     )
 }
 
@@ -185,6 +206,7 @@ pub const fn is_discovery_request_type(ty: DataType) -> bool {
             | DataType::DiscoverySchemaRequest
             | DataType::ManagedVariableRequest
             | DataType::DiscoveryLeave
+            | DataType::DiscoveryAddress
     )
 }
 
@@ -419,6 +441,153 @@ pub fn decode_discovery_link_capabilities(pkt: &Packet) -> TelemetryResult<LinkC
         max_side_transport_templates: u32::from_le_bytes(
             payload[14..18].try_into().expect("4-byte templates"),
         ),
+    })
+}
+
+pub fn build_discovery_address(
+    sender: &str,
+    timestamp_ms: u64,
+    ad: &AddressAdvertisement,
+) -> TelemetryResult<Packet> {
+    let mut payload = Vec::new();
+    payload.push(1);
+    payload.push(ad.mode);
+    payload.push(ad.state);
+    payload.extend_from_slice(&ad.address.to_le_bytes());
+    payload.extend_from_slice(&ad.requested_address.to_le_bytes());
+    payload.extend_from_slice(&ad.birth_ms.to_le_bytes());
+    payload.extend_from_slice(&ad.owner_hash.to_le_bytes());
+    encode_string(&mut payload, &ad.hostname)?;
+    let mut endpoints = ad.reachable_endpoints.clone();
+    endpoints.retain(|ep| !is_discovery_endpoint(*ep));
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    let endpoint_count = u32::try_from(endpoints.len())
+        .map_err(|_| TelemetryError::Pack("discovery address endpoint count"))?;
+    payload.extend_from_slice(&endpoint_count.to_le_bytes());
+    for ep in endpoints {
+        payload.extend_from_slice(&ep.as_u32().to_le_bytes());
+    }
+    let mut sources = ad.reachable_timesync_sources.clone();
+    sort_dedup_strings(&mut sources);
+    let source_count = u32::try_from(sources.len())
+        .map_err(|_| TelemetryError::Pack("discovery address source count"))?;
+    payload.extend_from_slice(&source_count.to_le_bytes());
+    for source in sources {
+        encode_string(&mut payload, &source)?;
+    }
+    payload.push(ad.link_capabilities.version);
+    payload.extend_from_slice(&ad.link_capabilities.flags.to_le_bytes());
+    payload.push(ad.link_capabilities.profile);
+    payload.extend_from_slice(&ad.link_capabilities.max_frame_bytes.to_le_bytes());
+    payload.extend_from_slice(
+        &ad.link_capabilities
+            .compact_header_target_bytes
+            .to_le_bytes(),
+    );
+    payload.extend_from_slice(
+        &ad.link_capabilities
+            .max_side_transport_templates
+            .to_le_bytes(),
+    );
+    Packet::new(
+        DataType::DiscoveryAddress,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        payload.into(),
+    )
+}
+
+pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertisement> {
+    if pkt.data_type() != DataType::DiscoveryAddress {
+        return Err(TelemetryError::InvalidType);
+    }
+    let payload = pkt.payload();
+    let mut cursor = 0usize;
+    let version = read_u8(payload, &mut cursor, "discovery address version")?;
+    if version != 1 {
+        return Err(TelemetryError::Unpack("discovery address version"));
+    }
+    let mode = read_u8(payload, &mut cursor, "discovery address mode")?;
+    let state = read_u8(payload, &mut cursor, "discovery address state")?;
+    let address = read_u32(payload, &mut cursor, "discovery address current")?;
+    let requested_address = read_u32(payload, &mut cursor, "discovery address requested")?;
+    if payload.len().saturating_sub(cursor) < 8 {
+        return Err(TelemetryError::Unpack("discovery address birth"));
+    }
+    let birth_ms = u64::from_le_bytes(
+        payload[cursor..cursor + 8]
+            .try_into()
+            .expect("8-byte birth"),
+    );
+    cursor += 8;
+    if payload.len().saturating_sub(cursor) < 8 {
+        return Err(TelemetryError::Unpack("discovery address owner"));
+    }
+    let owner_hash = u64::from_le_bytes(
+        payload[cursor..cursor + 8]
+            .try_into()
+            .expect("8-byte owner"),
+    );
+    cursor += 8;
+    let hostname = decode_string(payload, &mut cursor, "discovery address hostname")?;
+    let endpoint_count =
+        read_u32(payload, &mut cursor, "discovery address endpoint count")? as usize;
+    let mut reachable_endpoints = Vec::with_capacity(endpoint_count);
+    for _ in 0..endpoint_count {
+        let raw = read_u32(payload, &mut cursor, "discovery address endpoint")?;
+        let ep = try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
+        if !is_discovery_endpoint(ep) {
+            reachable_endpoints.push(ep);
+        }
+    }
+    reachable_endpoints.sort_unstable();
+    reachable_endpoints.dedup();
+    let source_count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
+    let mut reachable_timesync_sources = Vec::with_capacity(source_count);
+    for _ in 0..source_count {
+        let source = decode_string(payload, &mut cursor, "discovery address source")?;
+        if !source.is_empty() {
+            reachable_timesync_sources.push(source);
+        }
+    }
+    sort_dedup_strings(&mut reachable_timesync_sources);
+    let version = read_u8(payload, &mut cursor, "discovery address link version")?;
+    let flags = read_u32(payload, &mut cursor, "discovery address link flags")?;
+    let profile = read_u8(payload, &mut cursor, "discovery address link profile")?;
+    let max_frame_bytes = read_u32(payload, &mut cursor, "discovery address link max frame")?;
+    let compact_header_target_bytes = read_u32(
+        payload,
+        &mut cursor,
+        "discovery address link compact target",
+    )?;
+    let max_side_transport_templates =
+        read_u32(payload, &mut cursor, "discovery address link templates")?;
+    if cursor != payload.len() {
+        return Err(TelemetryError::Unpack("discovery address trailing bytes"));
+    }
+    if hostname.is_empty() || address == 0 {
+        return Err(TelemetryError::Unpack("bad discovery address"));
+    }
+    Ok(AddressAdvertisement {
+        hostname,
+        address,
+        requested_address,
+        mode,
+        state,
+        birth_ms,
+        owner_hash,
+        reachable_endpoints,
+        reachable_timesync_sources,
+        link_capabilities: LinkCapabilities {
+            version,
+            flags,
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        },
     })
 }
 

@@ -27,6 +27,7 @@ Start here:
 - docs/wiki/Technical-Architecture.md
 - docs/wiki/Technical-Telemetry-Schema.md
 - docs/wiki/Technical-Wire-Format.md
+- docs/wiki/Technical-Discovery-and-Internal-Formats.md
 - docs/wiki/Technical-Router-Details.md
 - docs/wiki/Technical-Queues-and-Memory.md
 - docs/wiki/Technical-Packet-Details.md

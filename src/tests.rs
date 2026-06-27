@@ -808,6 +808,204 @@ fn helpers_copy_telemetry_packet() {
     assert_eq!(dest.payload(), src.payload());
 }
 
+#[cfg(feature = "discovery")]
+mod p2p_address_tests {
+    use crate::{
+        TelemetryResult,
+        router::{AddressChange, AddressChangeReason, Router, RouterConfig},
+    };
+    use alloc::{sync::Arc, vec::Vec};
+    use std::sync::Mutex;
+
+    fn crosswire(a: &Arc<Router>, b: &Arc<Router>) {
+        let b_rx = b.clone();
+        a.add_side_packet("a-to-b", move |pkt| b_rx.rx_from_side(pkt, 0));
+        let a_rx = a.clone();
+        b.add_side_packet("b-to-a", move |pkt| a_rx.rx_from_side(pkt, 0));
+    }
+
+    fn exchange_discovery(a: &Router, b: &Router) {
+        a.announce_discovery().unwrap();
+        b.announce_discovery().unwrap();
+        a.process_all_queues().unwrap();
+        b.process_all_queues().unwrap();
+        a.process_all_queues().unwrap();
+        b.process_all_queues().unwrap();
+    }
+
+    #[test]
+    fn p2p_service_port_delivers_http_like_payload_by_hostname_and_address() {
+        let server_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let server_seen_c = server_seen.clone();
+
+        let client = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("client-node")
+                .with_dynamic_address(),
+        ));
+        let server = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("http-service")
+                .with_static_address(0x1020_3040),
+        ));
+        server
+            .bind_p2p_port(80, move |msg| -> TelemetryResult<()> {
+                assert_eq!(msg.source_hostname, "client-node");
+                assert_eq!(msg.source_port, 49_152);
+                assert_eq!(msg.destination_port, 80);
+                server_seen_c.lock().unwrap().push(msg.payload.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        crosswire(&client, &server);
+        exchange_discovery(&client, &server);
+
+        client
+            .send_p2p_to_hostname(
+                "http-service",
+                80,
+                49_152,
+                b"GET /status HTTP/1.1\r\nHost: http-service\r\n\r\n",
+            )
+            .unwrap();
+        server.process_all_queues().unwrap();
+        client.process_all_queues().unwrap();
+
+        client
+            .send_p2p_to_address(
+                0x1020_3040,
+                80,
+                49_152,
+                b"POST /upload HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        server.process_all_queues().unwrap();
+        client.process_all_queues().unwrap();
+
+        let seen = server_seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with(b"GET /status HTTP/1.1"));
+        assert!(seen[1].starts_with(b"POST /upload HTTP/1.1"));
+    }
+
+    #[test]
+    fn duplicate_dynamic_addresses_are_shifted_and_reported() {
+        let changes = Arc::new(Mutex::new(Vec::<AddressChange>::new()));
+        let changes_c = changes.clone();
+        let older = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("older-dynamic")
+                .with_requested_address(77),
+        ));
+        let newer = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("newer-dynamic")
+                .with_requested_address(77)
+                .on_address_change(move |change| {
+                    changes_c.lock().unwrap().push(change);
+                    Ok(())
+                }),
+        ));
+        crosswire(&older, &newer);
+        exchange_discovery(&older, &newer);
+
+        assert_eq!(older.current_address(), 77);
+        assert_ne!(newer.current_address(), 77);
+        let changes = changes.lock().unwrap().clone();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].reason, AddressChangeReason::RequestedConflict);
+        assert_eq!(changes[0].old_address, 77);
+        assert_eq!(changes[0].new_address, newer.current_address());
+    }
+
+    #[test]
+    fn static_address_beats_dynamic_and_duplicate_static_older_wins() {
+        let static_node = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("static-owner")
+                .with_static_address(0x55),
+        ));
+        let dynamic = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("dynamic-loser")
+                .with_requested_address(0x55),
+        ));
+        crosswire(&static_node, &dynamic);
+        exchange_discovery(&static_node, &dynamic);
+        assert_eq!(static_node.current_address(), 0x55);
+        assert_ne!(dynamic.current_address(), 0x55);
+
+        let static_changes = Arc::new(Mutex::new(Vec::<AddressChange>::new()));
+        let static_changes_c = static_changes.clone();
+        let newer_static = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("static-newer")
+                .with_static_address(0x55)
+                .on_address_change(move |change| {
+                    static_changes_c.lock().unwrap().push(change);
+                    Ok(())
+                }),
+        ));
+        crosswire(&static_node, &newer_static);
+        exchange_discovery(&static_node, &newer_static);
+
+        assert_eq!(static_node.current_address(), 0x55);
+        assert_ne!(newer_static.current_address(), 0x55);
+        let changes = static_changes.lock().unwrap().clone();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].reason, AddressChangeReason::StaticConflict);
+    }
+
+    #[test]
+    fn duplicate_hostnames_are_renamed_and_hostname_p2p_uses_discovered_name() {
+        let changes = Arc::new(Mutex::new(Vec::<AddressChange>::new()));
+        let changes_c = changes.clone();
+        let first = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("duplicate-host")
+                .with_static_address(0x301),
+        ));
+        let second_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let second_seen_c = second_seen.clone();
+        let second = Arc::new(Router::new(
+            RouterConfig::default()
+                .with_hostname("duplicate-host")
+                .with_static_address(0x302)
+                .on_address_change(move |change| {
+                    changes_c.lock().unwrap().push(change);
+                    Ok(())
+                }),
+        ));
+        second
+            .bind_p2p_port(443, move |msg| {
+                second_seen_c.lock().unwrap().push(msg.payload.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        crosswire(&first, &second);
+        exchange_discovery(&first, &second);
+
+        assert_eq!(first.hostname().as_ref(), "duplicate-host");
+        assert_ne!(second.hostname().as_ref(), "duplicate-host");
+        let renamed = second.hostname().to_string();
+        let changes = changes.lock().unwrap().clone();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].reason, AddressChangeReason::HostnameConflict);
+
+        first
+            .send_p2p_to_hostname(&renamed, 443, 50_000, b"GET /secure HTTP/1.1\r\n\r\n")
+            .unwrap();
+        second.process_all_queues().unwrap();
+        first.process_all_queues().unwrap();
+        assert_eq!(
+            second_seen.lock().unwrap().as_slice(),
+            &[b"GET /secure HTTP/1.1\r\n\r\n".to_vec()]
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Error propagation & handler-failure tests
 // -----------------------------------------------------------------------------
@@ -5933,9 +6131,11 @@ mod router_tests {
             let packets = seen.lock().unwrap();
             let caps_pkt = packets
                 .iter()
-                .find(|pkt| pkt.data_type() == DataType::DiscoveryLinkCapabilities)
-                .expect("missing link capabilities discovery packet");
-            let caps = decode_discovery_link_capabilities(caps_pkt).unwrap();
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
+                .expect("missing unified address discovery packet");
+            let caps = crate::discovery::decode_discovery_address(caps_pkt)
+                .unwrap()
+                .link_capabilities;
             assert_eq!(caps.version, 1);
             assert_eq!(caps.profile, LINK_PROFILE_IPV4_LIKE);
             assert_eq!(caps.max_frame_bytes, 64);
@@ -7801,9 +8001,11 @@ mod router_tests {
             let b_pkts = seen_b.lock().unwrap().clone();
             let announce = b_pkts
                 .iter()
-                .find(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
                 .unwrap();
-            let eps = crate::discovery::decode_discovery_announce(announce).unwrap();
+            let eps = crate::discovery::decode_discovery_address(announce)
+                .unwrap()
+                .reachable_endpoints;
             assert_eq!(eps, vec![DataEndpoint::named("RADIO")]);
             assert!(
                 b_pkts
@@ -9419,7 +9621,8 @@ mod router_tests {
             let pkts = seen.lock().unwrap().clone();
             assert!(pkts.iter().any(|pkt| matches!(
                 pkt.data_type(),
-                DataType::DiscoveryAnnounce
+                DataType::DiscoveryAddress
+                    | DataType::DiscoveryAnnounce
                     | DataType::DiscoveryTopology
                     | DataType::DiscoveryTimeSyncSources
             )));
@@ -9452,7 +9655,8 @@ mod router_tests {
             let pkts = seen.lock().unwrap().clone();
             assert!(pkts.iter().any(|pkt| matches!(
                 pkt.data_type(),
-                DataType::DiscoveryAnnounce
+                DataType::DiscoveryAddress
+                    | DataType::DiscoveryAnnounce
                     | DataType::DiscoveryTopology
                     | DataType::DiscoveryTimeSyncSources
             )));
@@ -10126,14 +10330,18 @@ mod router_tests {
             let ll = seen_ll.lock().unwrap().clone();
             let net_announce = net
                 .iter()
-                .find(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
                 .unwrap();
             let ll_announce = ll
                 .iter()
-                .find(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
                 .unwrap();
-            let net_eps = crate::discovery::decode_discovery_announce(net_announce).unwrap();
-            let ll_eps = crate::discovery::decode_discovery_announce(ll_announce).unwrap();
+            let net_eps = crate::discovery::decode_discovery_address(net_announce)
+                .unwrap()
+                .reachable_endpoints;
+            let ll_eps = crate::discovery::decode_discovery_address(ll_announce)
+                .unwrap()
+                .reachable_endpoints;
             assert!(!net_eps.contains(&software_bus));
             assert!(net_eps.contains(&DataEndpoint::named("RADIO")));
             assert!(ll_eps.contains(&software_bus));
@@ -10227,9 +10435,11 @@ mod router_tests {
             let pkts = seen.lock().unwrap().clone();
             let src_pkt = pkts
                 .iter()
-                .find(|pkt| pkt.data_type() == DataType::DiscoveryTimeSyncSources)
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
                 .unwrap();
-            let sources = crate::discovery::decode_discovery_timesync_sources(src_pkt).unwrap();
+            let sources = crate::discovery::decode_discovery_address(src_pkt)
+                .unwrap()
+                .reachable_timesync_sources;
             assert!(sources.contains(&crate::config::DEVICE_IDENTIFIER.to_string()));
         }
 

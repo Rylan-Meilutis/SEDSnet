@@ -11,6 +11,7 @@ internal behavior.
 ## Packet format and processing
 
 - [Technical-Wire-Format](Technical-Wire-Format)
+- [Technical-Discovery-and-Internal-Formats](Technical-Discovery-and-Internal-Formats)
 - [Technical-Packet-Details](Technical-Packet-Details)
 
 ## Routing and queues

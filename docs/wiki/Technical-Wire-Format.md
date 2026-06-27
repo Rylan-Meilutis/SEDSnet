@@ -199,8 +199,13 @@ Reliable control traffic now primarily uses built-in internal packet types such 
 - `ReliableAck`
 - `ReliablePartialAck`
 - `ReliablePacketRequest`
+- `DiscoveryAddress`
+- `P2pMessage`
 
 Those are router/relay-owned control packets, not user endpoint traffic.
+
+Their payload layouts are documented in
+[Technical-Discovery-and-Internal-Formats](Technical-Discovery-and-Internal-Formats).
 
 ## Side Transport Wrappers
 
@@ -278,36 +283,10 @@ Side-local template dictionaries are bounded by `max_side_transport_templates`, 
 64 entries per side. When the dictionary is full, the sender or receiver evicts a deterministic
 entry and later refreshes that shape with a full template frame.
 
-## Discovery Link Capabilities
+## Discovery and Internal Payloads
 
-Full discovery snapshots also send `SEDSNET_DISCOVERY_LINK_CAPABILITIES` on each side.
-
-Payload:
-
-```text
-[version: u8]
-[capability_flags: u32 LE]
-[profile_code: u8]
-[max_frame_bytes: u32 LE]
-[compact_header_target_bytes: u32 LE]
-[max_side_templates: u32 LE]
-```
-
-Capability flags advertise:
-
-- header templates
-- chunking
-- hop reliability
-- crypto support
-- end-to-end reliability support
-- unchanged compact timestamp omission
-
-Profile codes:
-
-- `0`: canonical
-- `1`: template
-- `2`: IPv6-like
-- `3`: IPv4-like
+Discovery, P2P, managed-variable, reliable-control, and time-sync packet payloads are documented in
+[Technical-Discovery-and-Internal-Formats](Technical-Discovery-and-Internal-Formats).
 
 ## Varints
 

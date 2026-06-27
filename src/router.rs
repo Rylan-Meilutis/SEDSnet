@@ -64,7 +64,7 @@ use core::fmt;
 use core::fmt::{Debug, Formatter};
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::time::Instant;
@@ -91,6 +91,7 @@ const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_
 pub const IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES: usize = 20;
 pub const IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES: usize = 40;
 pub const DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT: usize = 64;
+static ROUTER_INSTANCE_SEQ: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SideTransportProfile {
@@ -1127,6 +1128,105 @@ pub enum RouterE2eEncryptionMode {
     ForceAll,
 }
 
+pub type NodeAddress = u32;
+pub type P2pPort = u16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressAssignmentMode {
+    Dynamic,
+    Requested(NodeAddress),
+    Static(NodeAddress),
+}
+
+impl AddressAssignmentMode {
+    #[inline]
+    fn mode_code(self) -> u8 {
+        match self {
+            Self::Dynamic => 0,
+            Self::Requested(_) => 1,
+            Self::Static(_) => 2,
+        }
+    }
+
+    #[inline]
+    fn requested_address(self) -> NodeAddress {
+        match self {
+            Self::Dynamic => 0,
+            Self::Requested(addr) | Self::Static(addr) => addr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressChangeReason {
+    DynamicConflict,
+    RequestedConflict,
+    StaticConflict,
+    HostnameConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressChange {
+    pub old_hostname: Arc<str>,
+    pub new_hostname: Arc<str>,
+    pub old_address: NodeAddress,
+    pub new_address: NodeAddress,
+    pub reason: AddressChangeReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressBookEntry {
+    pub hostname: Arc<str>,
+    pub address: NodeAddress,
+    pub requested_address: NodeAddress,
+    pub mode: AddressAssignmentMode,
+    pub birth_ms: u64,
+    pub owner_hash: u64,
+    pub last_seen_ms: u64,
+}
+
+pub struct P2pMessage<'a> {
+    pub source_hostname: &'a str,
+    pub source_address: NodeAddress,
+    pub source_port: P2pPort,
+    pub destination_port: P2pPort,
+    pub payload: &'a [u8],
+}
+
+struct P2pDecoded<'a> {
+    source_hostname: &'a str,
+    source_address: NodeAddress,
+    source_port: P2pPort,
+    destination_port: P2pPort,
+    payload: &'a [u8],
+}
+
+type AddressChangeFn = dyn Fn(AddressChange) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct AddressChangeHandler {
+    handler: Arc<AddressChangeFn>,
+}
+
+impl Debug for AddressChangeHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("AddressChangeHandler(<handler>)")
+    }
+}
+
+type P2pPortHandlerFn = dyn Fn(P2pMessage<'_>) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct P2pPortHandler {
+    handler: Arc<P2pPortHandlerFn>,
+}
+
+impl Debug for P2pPortHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("P2pPortHandler(<handler>)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     /// Handlers for local endpoints.
@@ -1135,6 +1235,10 @@ pub struct RouterConfig {
     reliable_enabled: bool,
     /// Optional per-router sender override.
     sender: Option<Arc<str>>,
+    /// Address assignment policy used for P2P routing.
+    address_mode: AddressAssignmentMode,
+    /// Callbacks invoked when conflict resolution changes this router's identity.
+    address_change_handlers: Arc<[AddressChangeHandler]>,
     /// End-to-end cryptography behavior for user data.
     e2e_encryption: RouterE2eEncryptionMode,
     /// Application-defined key id passed to the cryptography provider.
@@ -1176,6 +1280,8 @@ impl RouterConfig {
             handlers,
             reliable_enabled: true,
             sender: None,
+            address_mode: AddressAssignmentMode::Dynamic,
+            address_change_handlers: Arc::from([]),
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
             #[cfg(feature = "timesync")]
@@ -1192,6 +1298,42 @@ impl RouterConfig {
     /// Override the sender identifier for this router instance.
     pub fn with_sender<S: AsRef<str>>(mut self, sender: S) -> Self {
         self.sender = Some(Arc::from(sender.as_ref()));
+        self
+    }
+
+    /// Alias for `with_sender`; discovery uses this name for P2P service resolution.
+    pub fn with_hostname<S: AsRef<str>>(self, hostname: S) -> Self {
+        self.with_sender(hostname)
+    }
+
+    /// Request a dynamic address assigned by the discovered network authority.
+    pub fn with_dynamic_address(mut self) -> Self {
+        self.address_mode = AddressAssignmentMode::Dynamic;
+        self
+    }
+
+    /// Request a preferred address. It is kept when unique and reassigned on conflict.
+    pub fn with_requested_address(mut self, address: NodeAddress) -> Self {
+        self.address_mode = AddressAssignmentMode::Requested(address);
+        self
+    }
+
+    /// Require a static address. If two static nodes conflict, the oldest keeps it.
+    pub fn with_static_address(mut self, address: NodeAddress) -> Self {
+        self.address_mode = AddressAssignmentMode::Static(address);
+        self
+    }
+
+    /// Register a callback for local address or hostname changes after conflict resolution.
+    pub fn on_address_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(AddressChange) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        let mut handlers = self.address_change_handlers.to_vec();
+        handlers.push(AddressChangeHandler {
+            handler: Arc::new(f),
+        });
+        self.address_change_handlers = Arc::from(handlers);
         self
     }
 
@@ -1234,6 +1376,11 @@ impl RouterConfig {
     }
 
     #[inline]
+    fn address_mode(&self) -> AddressAssignmentMode {
+        self.address_mode
+    }
+
+    #[inline]
     fn e2e_encryption(&self) -> RouterE2eEncryptionMode {
         self.e2e_encryption
     }
@@ -1257,6 +1404,8 @@ impl Default for RouterConfig {
             handlers: Arc::from([]),
             reliable_enabled: true,
             sender: None,
+            address_mode: AddressAssignmentMode::Dynamic,
+            address_change_handlers: Arc::from([]),
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
             #[cfg(feature = "timesync")]
@@ -1397,6 +1546,10 @@ struct RouterInner {
     managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
     managed_variable_latest: BTreeMap<u32, ManagedVariableCacheEntry>,
     network_variable_update_handlers: BTreeMap<u32, Vec<NetworkVariableUpdateHandler>>,
+    local_address: AddressBookEntry,
+    address_book: BTreeMap<String, AddressBookEntry>,
+    address_by_value: BTreeMap<NodeAddress, String>,
+    p2p_port_handlers: BTreeMap<P2pPort, Vec<P2pPortHandler>>,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     recent_rx: BoundedDeque<u64>,
@@ -1940,7 +2093,10 @@ fn has_nonlocal_endpoint(eps: &[DataEndpoint], cfg: &RouterConfig) -> bool {
 fn force_remote_for_type(ty: DataType) -> bool {
     matches!(
         ty,
-        DataType::ReliableAck | DataType::ReliablePartialAck | DataType::ReliablePacketRequest
+        DataType::ReliableAck
+            | DataType::ReliablePartialAck
+            | DataType::ReliablePacketRequest
+            | DataType::P2pMessage
     ) || {
         #[cfg(feature = "timesync")]
         {
@@ -1960,7 +2116,10 @@ fn force_remote_for_type(ty: DataType) -> bool {
 fn is_internal_control_type(ty: DataType) -> bool {
     if matches!(
         ty,
-        DataType::ReliableAck | DataType::ReliablePartialAck | DataType::ReliablePacketRequest
+        DataType::ReliableAck
+            | DataType::ReliablePartialAck
+            | DataType::ReliablePacketRequest
+            | DataType::P2pMessage
     ) {
         return true;
     }
@@ -2532,6 +2691,214 @@ impl Router {
     }
 
     #[inline]
+    fn fallback_address_for_hostname(hostname: &str) -> NodeAddress {
+        let hash = Self::sender_hash(hostname);
+        let mut address = (hash as u32) ^ ((hash >> 32) as u32);
+        if address == 0 {
+            address = 1;
+        }
+        address
+    }
+
+    fn address_mode_from_code(mode: u8, requested: NodeAddress) -> AddressAssignmentMode {
+        match mode {
+            2 => AddressAssignmentMode::Static(if requested == 0 { 1 } else { requested }),
+            1 => AddressAssignmentMode::Requested(if requested == 0 { 1 } else { requested }),
+            _ => AddressAssignmentMode::Dynamic,
+        }
+    }
+
+    fn address_winner_pref(entry: &AddressBookEntry) -> (u8, core::cmp::Reverse<u64>, u64) {
+        let rank = match entry.mode {
+            AddressAssignmentMode::Static(_) => 2,
+            AddressAssignmentMode::Requested(_) => 1,
+            AddressAssignmentMode::Dynamic => 0,
+        };
+        (
+            rank,
+            core::cmp::Reverse(entry.birth_ms),
+            u64::MAX - entry.owner_hash,
+        )
+    }
+
+    fn identity_winner_pref(entry: &AddressBookEntry) -> (core::cmp::Reverse<u64>, u64) {
+        (
+            core::cmp::Reverse(entry.birth_ms),
+            u64::MAX - entry.owner_hash,
+        )
+    }
+
+    fn allocate_free_address_locked(st: &RouterInner, seed: NodeAddress) -> NodeAddress {
+        let mut candidate = if seed == 0 { 1 } else { seed };
+        for _ in 0..u32::MAX {
+            if candidate != 0 && !st.address_by_value.contains_key(&candidate) {
+                return candidate;
+            }
+            candidate = candidate.wrapping_add(1);
+            if candidate == 0 {
+                candidate = 1;
+            }
+        }
+        1
+    }
+
+    fn unique_hostname_locked(st: &RouterInner, base: &str, owner_hash: u64) -> String {
+        if !st.address_book.contains_key(base) {
+            return base.to_string();
+        }
+        let stem = if base.is_empty() { "node" } else { base };
+        let mut candidate = format!("{stem}-{owner_hash:08x}");
+        let mut suffix = 1u32;
+        while st.address_book.contains_key(&candidate) {
+            candidate = format!("{stem}-{owner_hash:08x}-{suffix}");
+            suffix = suffix.saturating_add(1);
+        }
+        candidate
+    }
+
+    fn update_local_identity_locked(
+        &self,
+        st: &mut RouterInner,
+        mut local: AddressBookEntry,
+        reason: AddressChangeReason,
+    ) -> AddressChange {
+        let old = st.local_address.clone();
+        st.address_book.remove(old.hostname.as_ref());
+        st.address_by_value.remove(&old.address);
+        local.last_seen_ms = self.clock.now_ms();
+        st.address_by_value
+            .insert(local.address, local.hostname.to_string());
+        st.address_book
+            .insert(local.hostname.to_string(), local.clone());
+        st.local_address = local.clone();
+        *self.sender.lock() = local.hostname.clone();
+        #[cfg(feature = "discovery")]
+        Self::note_discovery_topology_change_locked(st, self.clock.now_ms());
+        AddressChange {
+            old_hostname: old.hostname,
+            new_hostname: local.hostname,
+            old_address: old.address,
+            new_address: local.address,
+            reason,
+        }
+    }
+
+    fn notify_address_change(&self, change: AddressChange) -> TelemetryResult<()> {
+        for handler in self.cfg.address_change_handlers.iter() {
+            (handler.handler)(change.clone())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn local_address_advertisement(
+        &self,
+        reachable_endpoints: Vec<DataEndpoint>,
+        reachable_timesync_sources: Vec<String>,
+        link_capabilities: discovery::LinkCapabilities,
+        state: u8,
+    ) -> discovery::AddressAdvertisement {
+        let st = self.state.lock();
+        discovery::AddressAdvertisement {
+            hostname: st.local_address.hostname.to_string(),
+            address: st.local_address.address,
+            requested_address: st.local_address.requested_address,
+            mode: st.local_address.mode.mode_code(),
+            state,
+            birth_ms: st.local_address.birth_ms,
+            owner_hash: st.local_address.owner_hash,
+            reachable_endpoints,
+            reachable_timesync_sources,
+            link_capabilities,
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn ingest_address_advertisement(
+        &self,
+        ad: discovery::AddressAdvertisement,
+    ) -> TelemetryResult<bool> {
+        let now_ms = self.clock.now_ms();
+        let mut remote = AddressBookEntry {
+            hostname: Arc::from(ad.hostname.as_str()),
+            address: ad.address,
+            requested_address: ad.requested_address,
+            mode: Self::address_mode_from_code(ad.mode, ad.requested_address),
+            birth_ms: ad.birth_ms,
+            owner_hash: ad.owner_hash,
+            last_seen_ms: now_ms,
+        };
+        let mut change = None;
+        let mut changed = false;
+        {
+            let mut st = self.state.lock();
+            let local = st.local_address.clone();
+            let hostname_conflict =
+                remote.hostname == local.hostname && remote.owner_hash != local.owner_hash;
+            let address_conflict =
+                remote.address == local.address && remote.owner_hash != local.owner_hash;
+
+            if hostname_conflict
+                && Self::identity_winner_pref(&remote) > Self::identity_winner_pref(&local)
+            {
+                let mut next = local.clone();
+                next.hostname = Arc::from(Self::unique_hostname_locked(
+                    &st,
+                    local.hostname.as_ref(),
+                    local.owner_hash,
+                ));
+                change = Some(self.update_local_identity_locked(
+                    &mut st,
+                    next,
+                    AddressChangeReason::HostnameConflict,
+                ));
+                changed = true;
+            } else if address_conflict
+                && Self::address_winner_pref(&remote) > Self::address_winner_pref(&local)
+            {
+                let mut next = local.clone();
+                let seed = next
+                    .requested_address
+                    .max(Self::fallback_address_for_hostname(next.hostname.as_ref()));
+                next.address = Self::allocate_free_address_locked(&st, seed);
+                let reason = match next.mode {
+                    AddressAssignmentMode::Static(_) => AddressChangeReason::StaticConflict,
+                    AddressAssignmentMode::Requested(_) => AddressChangeReason::RequestedConflict,
+                    AddressAssignmentMode::Dynamic => AddressChangeReason::DynamicConflict,
+                };
+                change = Some(self.update_local_identity_locked(&mut st, next, reason));
+                changed = true;
+            } else if hostname_conflict {
+                remote.hostname = Arc::from(Self::unique_hostname_locked(
+                    &st,
+                    remote.hostname.as_ref(),
+                    remote.owner_hash,
+                ));
+                changed = true;
+            } else if address_conflict {
+                let seed = remote
+                    .requested_address
+                    .max(Self::fallback_address_for_hostname(
+                        remote.hostname.as_ref(),
+                    ));
+                remote.address = Self::allocate_free_address_locked(&st, seed);
+                changed = true;
+            }
+
+            st.address_book.remove(remote.hostname.as_ref());
+            st.address_by_value.remove(&remote.address);
+            st.address_by_value
+                .insert(remote.address, remote.hostname.to_string());
+            st.address_book
+                .insert(remote.hostname.to_string(), remote.clone());
+        }
+        if let Some(change) = change {
+            self.notify_address_change(change)?;
+        }
+        Ok(changed)
+    }
+
+    #[inline]
     fn is_end_to_end_ack_sender(sender: &str) -> bool {
         sender == Self::END_TO_END_ACK_SENDER || sender.starts_with(Self::END_TO_END_ACK_PREFIX)
     }
@@ -2559,6 +2926,89 @@ impl Router {
         let mut payload = Vec::with_capacity(8);
         payload.extend_from_slice(&packet_id.to_le_bytes());
         Arc::from(payload)
+    }
+
+    fn encode_p2p_payload(
+        src_hostname: &str,
+        src_address: NodeAddress,
+        src_port: P2pPort,
+        dst_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let host_len = u16::try_from(src_hostname.len())
+            .map_err(|_| TelemetryError::Pack("p2p hostname too long"))?;
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| TelemetryError::Pack("p2p payload too long"))?;
+        let mut out = Vec::with_capacity(
+            15usize
+                .saturating_add(src_hostname.len())
+                .saturating_add(payload.len()),
+        );
+        out.push(1);
+        out.extend_from_slice(&dst_port.to_le_bytes());
+        out.extend_from_slice(&src_port.to_le_bytes());
+        out.extend_from_slice(&src_address.to_le_bytes());
+        out.extend_from_slice(&host_len.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(src_hostname.as_bytes());
+        out.extend_from_slice(payload);
+        Ok(out.into())
+    }
+
+    fn decode_p2p_payload<'a>(payload: &'a [u8]) -> TelemetryResult<P2pDecoded<'a>> {
+        if payload.len() < 15 {
+            return Err(TelemetryError::Unpack("p2p frame short"));
+        }
+        if payload[0] != 1 {
+            return Err(TelemetryError::Unpack("p2p frame version"));
+        }
+        let destination_port =
+            u16::from_le_bytes(payload[1..3].try_into().expect("2-byte dst port"));
+        let source_port = u16::from_le_bytes(payload[3..5].try_into().expect("2-byte src port"));
+        let source_address = u32::from_le_bytes(payload[5..9].try_into().expect("4-byte address"));
+        let host_len =
+            u16::from_le_bytes(payload[9..11].try_into().expect("2-byte host len")) as usize;
+        let body_len =
+            u32::from_le_bytes(payload[11..15].try_into().expect("4-byte body len")) as usize;
+        let host_start = 15usize;
+        let host_end = host_start.saturating_add(host_len);
+        let body_end = host_end.saturating_add(body_len);
+        if host_end > payload.len() || body_end != payload.len() {
+            return Err(TelemetryError::Unpack("p2p frame length"));
+        }
+        let source_hostname = core::str::from_utf8(&payload[host_start..host_end])
+            .map_err(|_| TelemetryError::Unpack("p2p hostname utf8"))?;
+        Ok(P2pDecoded {
+            source_hostname,
+            source_address,
+            source_port,
+            destination_port,
+            payload: &payload[host_end..body_end],
+        })
+    }
+
+    fn dispatch_p2p_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
+        if pkt.data_type() != DataType::P2pMessage {
+            return Ok(());
+        }
+        let decoded = Self::decode_p2p_payload(pkt.payload())?;
+        let handlers = {
+            let st = self.state.lock();
+            st.p2p_port_handlers
+                .get(&decoded.destination_port)
+                .cloned()
+                .unwrap_or_default()
+        };
+        for handler in handlers {
+            (handler.handler)(P2pMessage {
+                source_hostname: decoded.source_hostname,
+                source_address: decoded.source_address,
+                source_port: decoded.source_port,
+                destination_port: decoded.destination_port,
+                payload: decoded.payload,
+            })?;
+        }
+        Ok(())
     }
 
     /// Record the side that most recently led toward `packet_id`.
@@ -2713,6 +3163,13 @@ impl Router {
             if !target_senders.is_empty()
                 && !Self::side_matches_target_senders_locked(st, side, target_senders, now_ms)
             {
+                continue;
+            }
+            if !target_senders.is_empty() {
+                out.push(DiscoveryCandidateMatch {
+                    side,
+                    overlap: usize::MAX,
+                });
                 continue;
             }
             if preferred_timesync_source
@@ -2938,13 +3395,21 @@ impl Router {
         pkt: &Packet,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
+        self.queue_end_to_end_reliable_ack_for_packet_id(pkt.packet_id(), called_from_queue)
+    }
+
+    fn queue_end_to_end_reliable_ack_for_packet_id(
+        &self,
+        packet_id: u64,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
         let ack_sender = self.encode_end_to_end_ack_sender();
         let ack = Packet::new(
             DataType::ReliableAck,
             message_meta(DataType::ReliableAck).endpoints,
             ack_sender.as_str(),
             self.packet_timestamp_ms(),
-            Self::encode_end_to_end_reliable_ack(pkt.packet_id()),
+            Self::encode_end_to_end_reliable_ack(packet_id),
         )?;
         self.emit_internal_tx(
             RouterTxItem::Broadcast(RouterItem::Packet(ack)),
@@ -3919,6 +4384,8 @@ impl Router {
                         .map(|side| (side_id, side.opts.link_local_enabled, side.opts))
                 })
                 .collect::<Vec<_>>();
+            let local_is_master =
+                self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
             let mut per_side = Vec::new();
             for (side_id, link_local_enabled, opts) in side_entries {
                 if !self.route_allowed_locked(&st, None, Some(DataType::DiscoveryAnnounce), side_id)
@@ -3938,6 +4405,7 @@ impl Router {
                         Vec::new(),
                         Vec::new(),
                         capabilities,
+                        local_is_master,
                     ));
                     continue;
                 }
@@ -3956,11 +4424,21 @@ impl Router {
                         link_local_enabled,
                     ),
                     capabilities,
+                    local_is_master,
                 ));
             }
             per_side
         };
-        for (side_id, level, endpoints, timesync_sources, topology, capabilities) in per_side {
+        for (
+            side_id,
+            level,
+            endpoints,
+            timesync_sources,
+            topology,
+            capabilities,
+            local_is_master,
+        ) in per_side
+        {
             let sender = self.sender_arc();
             if include_schema && level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
@@ -3975,11 +4453,17 @@ impl Router {
                 )?;
             }
             if level == DiscoveryAdvertiseLevel::Full {
-                let pkt = discovery::build_discovery_link_capabilities(
-                    sender.as_ref(),
-                    now_ms,
+                let address = self.local_address_advertisement(
+                    endpoints.clone(),
+                    timesync_sources.clone(),
                     capabilities,
-                )?;
+                    if local_is_master {
+                        discovery::ADDRESS_STATE_APPROVED
+                    } else {
+                        discovery::ADDRESS_STATE_REQUEST
+                    },
+                );
+                let pkt = discovery::build_discovery_address(sender.as_ref(), now_ms, &address)?;
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
                         src: None,
@@ -3990,27 +4474,11 @@ impl Router {
                     called_from_queue,
                 )?;
             }
-            if level == DiscoveryAdvertiseLevel::MinimalPing || !endpoints.is_empty() {
+            if level == DiscoveryAdvertiseLevel::MinimalPing {
                 let pkt = discovery::build_discovery_announce(
                     sender.as_ref(),
                     now_ms,
                     endpoints.as_slice(),
-                )?;
-                self.emit_internal_tx(
-                    RouterTxItem::ToSide {
-                        src: None,
-                        dst: side_id,
-                        data: RouterItem::Packet(pkt),
-                    },
-                    true,
-                    called_from_queue,
-                )?;
-            }
-            if level == DiscoveryAdvertiseLevel::Full && !timesync_sources.is_empty() {
-                let pkt = discovery::build_discovery_timesync_sources(
-                    sender.as_ref(),
-                    now_ms,
-                    timesync_sources.as_slice(),
                 )?;
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
@@ -4103,6 +4571,49 @@ impl Router {
         let Some(side) = src else {
             return Ok(true);
         };
+        if pkt.data_type() == DataType::DiscoveryAddress {
+            let mut ad = discovery::decode_discovery_address(pkt)?;
+            let mut changed = self.ingest_address_advertisement(ad.clone())?;
+            let now_ms = self.clock.now_ms();
+            let mut st = self.state.lock();
+            let side_link_local_enabled = st
+                .sides
+                .get(side)
+                .and_then(|entry| entry.as_ref())
+                .map(|side_ref| side_ref.opts.link_local_enabled)
+                .unwrap_or(false);
+            if !side_link_local_enabled {
+                ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
+            }
+            let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+            let mut sender_state = route
+                .announcers
+                .get(pkt.sender())
+                .cloned()
+                .unwrap_or_default();
+            let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+            if board.reachable_endpoints != ad.reachable_endpoints {
+                board.reachable_endpoints = ad.reachable_endpoints;
+                changed = true;
+            }
+            if board.reachable_timesync_sources != ad.reachable_timesync_sources {
+                board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                changed = true;
+            }
+            Self::refresh_sender_topology_state(&mut sender_state);
+            sender_state.last_seen_ms = now_ms;
+            route
+                .announcers
+                .insert(pkt.sender().to_string(), sender_state);
+            Self::recompute_discovery_side_state(&mut route);
+            st.discovery_routes.insert(side, route);
+            st.fit_discovery_budget();
+            self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+            if changed {
+                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+            }
+            return Ok(true);
+        }
         let local_sender = self.sender_arc();
         if pkt.sender() == local_sender.as_ref() {
             return Ok(true);
@@ -4567,7 +5078,10 @@ impl Router {
         if !hop_reliable_enabled {
             let mut adjusted_opts = opts;
             adjusted_opts.reliable_enabled = false;
-            if let Some(adjusted) = self.adjust_reliable_for_side(adjusted_opts, data)? {
+            let preserve_end_to_end_ack = opts.reliable_enabled && self.cfg.reliable_enabled();
+            if let Some(adjusted) =
+                self.adjust_reliable_for_side(adjusted_opts, data, preserve_end_to_end_ack)?
+            {
                 return self.call_side_tx_handler(side, &handler, &adjusted, relayed);
             }
             return Ok(());
@@ -4579,7 +5093,7 @@ impl Router {
         };
 
         if !is_reliable_type(ty) {
-            if let Some(adjusted) = self.adjust_reliable_for_side(opts, data)? {
+            if let Some(adjusted) = self.adjust_reliable_for_side(opts, data, true)? {
                 self.call_side_tx_handler(side, &handler, &adjusted, relayed)?;
             }
             return Ok(());
@@ -5416,6 +5930,7 @@ impl Router {
         &self,
         opts: RouterSideOptions,
         data: RouterItem,
+        preserve_end_to_end_ack: bool,
     ) -> TelemetryResult<Option<RouterItem>> {
         if opts.reliable_enabled {
             return Ok(Some(data));
@@ -5452,6 +5967,12 @@ impl Router {
                         | DataType::ReliablePartialAck
                         | DataType::ReliablePacketRequest
                 ) {
+                    if preserve_end_to_end_ack
+                        && pkt.data_type() == DataType::ReliableAck
+                        && Self::is_end_to_end_ack_sender(pkt.sender())
+                    {
+                        return Ok(Some(RouterItem::Packet(pkt)));
+                    }
                     return Ok(None);
                 }
                 Ok(Some(RouterItem::Packet(pkt)))
@@ -6196,8 +6717,31 @@ impl Router {
     pub fn new_with_clock(cfg: RouterConfig, clock: Box<dyn Clock + Send + Sync>) -> Self {
         #[cfg(feature = "timesync")]
         let timesync_cfg = cfg.timesync_config();
+        let hostname: Arc<str> = Arc::from(cfg.sender());
+        let address_mode = cfg.address_mode();
+        let instance_seq = u64::from(ROUTER_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed));
+        let owner_hash = Self::sender_hash(hostname.as_ref()) ^ instance_seq;
+        let fallback = Self::fallback_address_for_hostname(hostname.as_ref());
+        let requested = address_mode.requested_address();
+        let address = if requested == 0 { fallback } else { requested };
+        let local_address = AddressBookEntry {
+            hostname: hostname.clone(),
+            address,
+            requested_address: requested,
+            mode: address_mode,
+            birth_ms: clock
+                .now_ms()
+                .saturating_mul(1_000_000)
+                .saturating_add(instance_seq),
+            owner_hash,
+            last_seen_ms: clock.now_ms(),
+        };
+        let mut address_book = BTreeMap::new();
+        address_book.insert(hostname.to_string(), local_address.clone());
+        let mut address_by_value = BTreeMap::new();
+        address_by_value.insert(address, hostname.to_string());
         Self {
-            sender: RouterMutex::new(Arc::from(cfg.sender())),
+            sender: RouterMutex::new(hostname),
             cfg,
             state: RouterMutex::new(RouterInner {
                 sides: Vec::new(),
@@ -6214,6 +6758,10 @@ impl Router {
                 managed_variable_permissions: BTreeMap::new(),
                 managed_variable_latest: BTreeMap::new(),
                 network_variable_update_handlers: BTreeMap::new(),
+                local_address,
+                address_book,
+                address_by_value,
+                p2p_port_handlers: BTreeMap::new(),
                 received_queue: BoundedDeque::new(
                     MAX_QUEUE_BUDGET,
                     STARTING_QUEUE_SIZE,
@@ -6264,8 +6812,131 @@ impl Router {
         self.sender_arc()
     }
 
+    pub fn current_address(&self) -> NodeAddress {
+        self.state.lock().local_address.address
+    }
+
+    pub fn hostname(&self) -> Arc<str> {
+        self.sender_arc()
+    }
+
+    pub fn address_book(&self) -> Vec<AddressBookEntry> {
+        self.state.lock().address_book.values().cloned().collect()
+    }
+
+    pub fn resolve_hostname(&self, hostname: &str) -> Option<AddressBookEntry> {
+        self.state.lock().address_book.get(hostname).cloned()
+    }
+
+    pub fn resolve_address(&self, address: NodeAddress) -> Option<AddressBookEntry> {
+        let st = self.state.lock();
+        st.address_by_value
+            .get(&address)
+            .and_then(|hostname| st.address_book.get(hostname))
+            .cloned()
+    }
+
+    pub fn bind_p2p_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>
+    where
+        F: Fn(P2pMessage<'_>) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        if port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let mut st = self.state.lock();
+        st.p2p_port_handlers
+            .entry(port)
+            .or_default()
+            .push(P2pPortHandler {
+                handler: Arc::new(f),
+            });
+        Ok(())
+    }
+
+    pub fn clear_p2p_port(&self, port: P2pPort) {
+        self.state.lock().p2p_port_handlers.remove(&port);
+    }
+
+    fn send_p2p_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        if dst_port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let local = self.state.lock().local_address.clone();
+        let payload = Self::encode_p2p_payload(
+            local.hostname.as_ref(),
+            local.address,
+            src_port,
+            dst_port,
+            payload,
+        )?;
+        let pkt = Packet::new(
+            DataType::P2pMessage,
+            &[DataEndpoint::Discovery],
+            local.hostname.as_ref(),
+            self.packet_timestamp_ms(),
+            payload,
+        )?;
+        let target = Self::sender_hash(dst.hostname.as_ref());
+        let item = self.attach_wire_contract_to_item(RouterItem::Packet(pkt.clone()), &[target])?;
+        if target == Self::sender_hash(self.sender_arc().as_ref()) {
+            self.dispatch_p2p_packet(&pkt)?;
+            return Ok(());
+        }
+        self.tx_item_impl(RouterTxItem::Broadcast(item), true, false)
+    }
+
+    pub fn send_p2p_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        let dst = self
+            .resolve_hostname(hostname)
+            .ok_or(TelemetryError::BadArg)?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, payload)
+    }
+
+    pub fn send_p2p_to_address(
+        &self,
+        address: NodeAddress,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        let dst = self
+            .resolve_address(address)
+            .ok_or(TelemetryError::BadArg)?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, payload)
+    }
+
     pub fn set_sender<S: AsRef<str>>(&self, sender: S) {
-        *self.sender.lock() = Arc::from(sender.as_ref());
+        let hostname: Arc<str> = Arc::from(sender.as_ref());
+        *self.sender.lock() = hostname.clone();
+        let mut st = self.state.lock();
+        let mut local = st.local_address.clone();
+        st.address_book.remove(local.hostname.as_ref());
+        st.address_by_value.remove(&local.address);
+        local.hostname = hostname.clone();
+        local.owner_hash = Self::sender_hash(hostname.as_ref());
+        if matches!(local.mode, AddressAssignmentMode::Dynamic) {
+            local.address = Self::fallback_address_for_hostname(hostname.as_ref());
+            local.requested_address = 0;
+        }
+        local.last_seen_ms = self.clock.now_ms();
+        st.address_by_value
+            .insert(local.address, hostname.to_string());
+        st.address_book.insert(hostname.to_string(), local.clone());
+        st.local_address = local;
+        #[cfg(feature = "discovery")]
+        Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
     }
 
     /// Register a side whose TX callback consumes packed packet bytes.
@@ -8305,7 +8976,12 @@ impl Router {
                             && self.item_targets_local_sender(&item.data)?
                             && self.packet_has_local_handler(&pkt)
                         {
-                            self.queue_end_to_end_reliable_ack(&pkt, called_from_queue)?;
+                            let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                                .unwrap_or_else(|_| pkt.packet_id());
+                            self.queue_end_to_end_reliable_ack_for_packet_id(
+                                packet_id,
+                                called_from_queue,
+                            )?;
                         }
                     }
                     _ => {}
@@ -8342,6 +9018,23 @@ impl Router {
                 pkt.validate()?;
 
                 if self.handle_internal_reliable_packet(pkt, item.src, called_from_queue)? {
+                    return Ok(());
+                }
+
+                if pkt.data_type() == DataType::P2pMessage {
+                    if self.item_targets_local_sender(&item.data)? {
+                        self.dispatch_p2p_packet(pkt)?;
+                        if item.src.is_some() {
+                            self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
+                        }
+                    }
+                    if self.should_route_remote(&item.data, item.src)? {
+                        self.relay_send(
+                            RouterItem::Packet(pkt.to_owned()),
+                            item.src,
+                            called_from_queue,
+                        )?;
+                    }
                     return Ok(());
                 }
 
@@ -8472,6 +9165,26 @@ impl Router {
                     return Ok(());
                 }
 
+                if env.ty == DataType::P2pMessage {
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    pkt.validate()?;
+                    if self.item_targets_local_sender(&item.data)? {
+                        self.dispatch_p2p_packet(&pkt)?;
+                        if item.src.is_some() {
+                            let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                                .unwrap_or_else(|_| pkt.packet_id());
+                            self.queue_end_to_end_reliable_ack_for_packet_id(
+                                packet_id,
+                                called_from_queue,
+                            )?;
+                        }
+                    }
+                    if self.should_route_remote(&item.data, item.src)? {
+                        self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
+                    }
+                    return Ok(());
+                }
+
                 #[cfg(feature = "timesync")]
                 if matches!(
                     env.ty,
@@ -8568,7 +9281,9 @@ impl Router {
                     && (is_reliable_type(env.ty) || !env.target_senders.is_empty())
                     && let Some(pkt) = pkt_opt.as_ref()
                 {
-                    self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
+                    let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                        .unwrap_or_else(|_| pkt.packet_id());
+                    self.queue_end_to_end_reliable_ack_for_packet_id(packet_id, called_from_queue)?;
                 }
 
                 if has_remote {

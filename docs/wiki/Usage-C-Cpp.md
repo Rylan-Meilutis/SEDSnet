@@ -541,6 +541,21 @@ for a more complete example. Time sync is demonstrated in c-example-code/src/tim
 ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c)).
 See [Time-Sync](Time-Sync) for the time sync packet flow and roles.
 
+## P2P Service Ports
+
+The C ABI exposes discovery-backed service ports for byte protocols that should run over SEDSnet
+instead of IP:
+
+- `seds_router_bind_p2p_port(...)`
+- `seds_router_send_p2p_to_hostname(...)`
+- `seds_router_send_p2p_to_address(...)`
+- `seds_router_current_address(...)`
+- `seds_router_resolve_hostname_address(...)`
+
+The callback receives a `SedsP2pMessageView` containing source hostname/address, source and
+destination ports, and opaque payload bytes. This is suitable for carrying protocols such as HTTP
+over SEDSnet links while normal telemetry data types continue to use endpoint broadcast routing.
+
 ## Side reliability
 
 Side-level reliability in the C API is controlled by the `reliable_enabled` argument passed to:

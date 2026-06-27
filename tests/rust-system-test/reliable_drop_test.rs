@@ -131,7 +131,9 @@ mod reliable_drop_tests {
             ensure_common_test_schema();
             let now = Arc::new(AtomicU64::new(0));
             let gs = Router::new_with_clock(
-                RouterConfig::default().with_sender("GS"),
+                RouterConfig::default()
+                    .with_sender("GS")
+                    .with_static_address(0x1001),
                 shared_clock(now.clone()),
             );
             let gw = Relay::new(shared_clock(now.clone()));
@@ -150,7 +152,8 @@ mod reliable_drop_tests {
                         Ok(())
                     },
                 )])
-                .with_sender("AB"),
+                .with_sender("AB")
+                .with_static_address(0x2001),
                 shared_clock(now.clone()),
             );
             let valve = Router::new_with_clock(
@@ -158,19 +161,26 @@ mod reliable_drop_tests {
                     DataEndpoint::named("SD_CARD"),
                     |_pkt| Ok(()),
                 )])
-                .with_sender("VB"),
+                .with_sender("VB")
+                .with_requested_address(0x2001),
                 shared_clock(now.clone()),
             );
             let daq = Router::new_with_clock(
-                RouterConfig::default().with_sender("DAQ"),
+                RouterConfig::default()
+                    .with_sender("DAQ")
+                    .with_dynamic_address(),
                 shared_clock(now.clone()),
             );
             let power = Router::new_with_clock(
-                RouterConfig::default().with_sender("PB"),
+                RouterConfig::default()
+                    .with_sender("PB")
+                    .with_requested_address(0x3001),
                 shared_clock(now.clone()),
             );
             let flight = Router::new_with_clock(
-                RouterConfig::default().with_sender("FC"),
+                RouterConfig::default()
+                    .with_sender("FC")
+                    .with_dynamic_address(),
                 shared_clock(now.clone()),
             );
 
@@ -785,10 +795,15 @@ mod reliable_drop_tests {
                 Ok(())
             });
 
-        let source = Router::new_with_clock(RouterConfig::default(), shared_clock(now.clone()));
+        let source = Router::new_with_clock(
+            RouterConfig::default().with_hostname("SOURCE"),
+            shared_clock(now.clone()),
+        );
         let relay = Relay::new(shared_clock(now.clone()));
-        let dest =
-            Router::new_with_clock(RouterConfig::new(vec![handler]), shared_clock(now.clone()));
+        let dest = Router::new_with_clock(
+            RouterConfig::new(vec![handler]).with_hostname("DEST"),
+            shared_clock(now.clone()),
+        );
 
         let s_to_r: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
         let r_to_s: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -3056,10 +3071,56 @@ mod reliable_drop_tests {
             .actuator
             .set_timesync_config(Some(TimeSyncConfig::default()));
 
+        let p2p_hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let hits = p2p_hits.clone();
+            topology
+                .actuator
+                .bind_p2p_port(80, move |msg| {
+                    let payload = core::str::from_utf8(msg.payload).unwrap_or("<binary>");
+                    hits.lock().unwrap().push(format!(
+                        "AB:{}:{}:{payload}",
+                        msg.source_hostname, msg.source_port
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        {
+            let hits = p2p_hits.clone();
+            topology
+                .valve
+                .bind_p2p_port(8080, move |msg| {
+                    let payload = core::str::from_utf8(msg.payload).unwrap_or("<binary>");
+                    hits.lock().unwrap().push(format!(
+                        "VB:{}:{}:{payload}",
+                        msg.source_hostname, msg.source_port
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        {
+            let hits = p2p_hits.clone();
+            topology
+                .daq
+                .bind_p2p_port(7000, move |msg| {
+                    let payload = core::str::from_utf8(msg.payload).unwrap_or("<binary>");
+                    hits.lock().unwrap().push(format!(
+                        "DAQ:{}:{}:{payload}",
+                        msg.source_hostname, msg.source_port
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
         let mut policy = SoakLinkPolicy::new();
         let mut issued_reliable = 0u32;
         let mut issued_variables = 0u32;
         let mut issued_large_payloads = 0u32;
+        let mut issued_p2p_hostname = 0u32;
+        let mut issued_p2p_address = 0u32;
 
         topology.gs.announce_discovery().unwrap();
         topology.gw.announce_discovery().unwrap();
@@ -3147,6 +3208,41 @@ mod reliable_drop_tests {
                 .unwrap();
                 topology.gs.tx(pkt).unwrap();
                 issued_large_payloads += 1;
+            }
+
+            if tick % 72 == 0 {
+                let payload = format!("GET /status/{issued_p2p_hostname} HTTP/1.1\r\n\r\n");
+                if topology
+                    .gs
+                    .send_p2p_to_hostname("AB", 80, 49_152, payload.as_bytes())
+                    .is_ok()
+                {
+                    issued_p2p_hostname += 1;
+                }
+            }
+
+            if tick % 108 == 0 {
+                let payload = format!("POST /valve/{issued_p2p_hostname} HTTP/1.1\r\n\r\n");
+                if topology
+                    .gs
+                    .send_p2p_to_hostname("VB", 8080, 49_153, payload.as_bytes())
+                    .is_ok()
+                {
+                    issued_p2p_hostname += 1;
+                }
+            }
+
+            if tick % 120 == 0
+                && let Some(entry) = topology.gs.resolve_hostname("DAQ")
+            {
+                let payload = format!("GET /samples/{issued_p2p_address} HTTP/1.1\r\n\r\n");
+                if topology
+                    .gs
+                    .send_p2p_to_address(entry.address, 7000, 49_154, payload.as_bytes())
+                    .is_ok()
+                {
+                    issued_p2p_address += 1;
+                }
             }
 
             if tick % 50 == 0 {
@@ -3238,6 +3334,46 @@ mod reliable_drop_tests {
         );
         assert!(topology.gs.network_time_ms().is_some());
         assert!(issued_large_payloads > 0);
+        assert_eq!(topology.gs.current_address(), 0x1001);
+        assert_eq!(topology.actuator.current_address(), 0x2001);
+        assert_eq!(topology.power.current_address(), 0x3001);
+        assert_ne!(
+            topology.valve.current_address(),
+            0x2001,
+            "requested valve address should shift when it conflicts with AB's static address"
+        );
+        assert_ne!(topology.daq.current_address(), 0);
+        let gs_ab = topology.gs.resolve_hostname("AB").unwrap();
+        let gs_vb = topology.gs.resolve_hostname("VB").unwrap();
+        let gs_daq = topology.gs.resolve_hostname("DAQ").unwrap();
+        assert_eq!(gs_ab.address, 0x2001);
+        assert_eq!(
+            gs_ab.mode,
+            sedsnet::router::AddressAssignmentMode::Static(0x2001)
+        );
+        assert_ne!(gs_vb.address, 0x2001);
+        assert_eq!(gs_daq.address, topology.daq.current_address());
+        assert!(issued_p2p_hostname > 0);
+        assert!(issued_p2p_address > 0);
+        let p2p_hits = p2p_hits.lock().unwrap().clone();
+        assert!(
+            p2p_hits
+                .iter()
+                .any(|hit| hit.starts_with("AB:GS:49152:GET /status/")),
+            "static-address P2P hostname service was not exercised: {p2p_hits:?}"
+        );
+        assert!(
+            p2p_hits
+                .iter()
+                .any(|hit| hit.starts_with("VB:GS:49153:POST /valve/")),
+            "requested-address P2P hostname service was not exercised: {p2p_hits:?}"
+        );
+        assert!(
+            p2p_hits
+                .iter()
+                .any(|hit| hit.starts_with("DAQ:GS:49154:GET /samples/")),
+            "dynamic-address P2P address service was not exercised: {p2p_hits:?}"
+        );
 
         exercise_compact_side_transport_in_soak(topology.now.clone());
 

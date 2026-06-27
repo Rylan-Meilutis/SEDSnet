@@ -331,6 +331,7 @@ fn is_internal_control_type(ty: crate::DataType) -> bool {
         crate::DataType::ReliableAck
             | crate::DataType::ReliablePartialAck
             | crate::DataType::ReliablePacketRequest
+            | crate::DataType::P2pMessage
     ) {
         return true;
     }
@@ -2160,9 +2161,13 @@ impl Relay {
                 if !self.route_allowed_locked(&st, Some(exclude), Some(ty), side) {
                     continue;
                 }
-                if !target_senders.is_empty()
-                    && !Self::side_matches_target_senders_locked(&st, side, &target_senders, now_ms)
-                {
+                if !target_senders.is_empty() {
+                    if !Self::side_matches_target_senders_locked(&st, side, &target_senders, now_ms)
+                    {
+                        continue;
+                    }
+                    had_known = true;
+                    generic_targets.push(side);
                     continue;
                 }
                 if preferred_timesync_source.as_deref().is_some_and(|source| {
@@ -2954,6 +2959,15 @@ impl Relay {
             self.reconcile_end_to_end_acked_destinations_locked(&mut st);
             return Ok(());
         }
+        let address_ad = if pkt.data_type() == crate::DataType::DiscoveryAddress {
+            Some(discovery::decode_discovery_address(&pkt)?)
+        } else {
+            None
+        };
+        let announcer_id = address_ad
+            .as_ref()
+            .map(|ad| ad.hostname.clone())
+            .unwrap_or_else(|| pkt.sender().to_string());
         let mut route = st.discovery_routes.get(&src).cloned().unwrap_or_default();
         let side_link_local_enabled = st
             .sides
@@ -2963,10 +2977,24 @@ impl Relay {
             .unwrap_or(false);
         let mut sender_state = route
             .announcers
-            .get(pkt.sender())
+            .get(&announcer_id)
             .cloned()
             .unwrap_or_default();
         let changed = match pkt.data_type() {
+            crate::DataType::DiscoveryAddress => {
+                let ad = address_ad.expect("decoded above");
+                let mut reachable = ad.reachable_endpoints;
+                if !side_link_local_enabled {
+                    reachable.retain(|ep| !ep.is_link_local_only());
+                }
+                let board = Self::sender_topology_board_mut(&mut sender_state, &ad.hostname);
+                let changed = board.reachable_endpoints != reachable
+                    || board.reachable_timesync_sources != ad.reachable_timesync_sources;
+                board.reachable_endpoints = reachable;
+                board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                Self::refresh_sender_topology_state(&mut sender_state);
+                changed
+            }
             crate::DataType::DiscoveryAnnounce => {
                 let mut reachable = discovery::decode_discovery_announce(&pkt)?;
                 if !side_link_local_enabled {
@@ -3004,9 +3032,7 @@ impl Relay {
             _ => false,
         };
         sender_state.last_seen_ms = now_ms;
-        route
-            .announcers
-            .insert(pkt.sender().to_string(), sender_state);
+        route.announcers.insert(announcer_id, sender_state);
         Self::recompute_discovery_side_state(&mut route);
         st.discovery_routes.insert(src, route);
         st.fit_discovery_budget();

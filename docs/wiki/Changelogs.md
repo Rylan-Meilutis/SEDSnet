@@ -30,6 +30,12 @@
     - Nodes merge compatible schemas and resolve ID/name conflicts deterministically.
     - Direct registration still rejects a data type name/ID that already exists with a different
       shape.
+- P2P service ports:
+    - Discovery carries compact node address and hostname advertisements.
+    - Routers deconflict duplicate dynamic/requested/static addresses and duplicate hostnames after
+      segmented networks reunite, notifying local code when local identity changes.
+    - Applications can bind service ports and send opaque byte payloads by hostname or address,
+      allowing protocols such as HTTP to ride over SEDSnet instead of IP.
 - Metadata and memory:
     - Endpoints and data types now carry human-readable descriptions.
     - Runtime JSON accepts both `description` and legacy `doc`.

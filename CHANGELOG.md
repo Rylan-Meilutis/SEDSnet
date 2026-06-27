@@ -25,6 +25,11 @@
   internally request a refresh when the cache is missing or stale. Refreshes can be answered by any
   nearby router that has enabled or seen the variable, and applications can register update
   callbacks for inbound cache changes.
+- Added discovery-backed P2P service ports. Routers now advertise compact node addresses and
+  hostnames, deconflict duplicate static/requested/dynamic addresses after partitions merge, and
+  notify local code when identity changes. Applications can bind a SEDSnet service port and send
+  opaque byte payloads to a hostname or address, enabling protocols such as HTTP to run over
+  SEDSnet instead of IP while normal endpoint broadcast telemetry remains unchanged.
 - Added end-to-end payload encryption policy hooks under the `cryptography` feature:
     - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn`.
     - Routers can run in `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll` mode.

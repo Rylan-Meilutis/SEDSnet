@@ -35,6 +35,7 @@ Detailed pages that describe internals, data structures, and formats.
 - [Technical-Architecture](Technical-Architecture)
 - [Technical-Telemetry-Schema](Technical-Telemetry-Schema)
 - [Technical-Wire-Format](Technical-Wire-Format)
+- [Technical-Discovery-and-Internal-Formats](Technical-Discovery-and-Internal-Formats)
 - [Technical-Router-Details](Technical-Router-Details)
 - [Technical-Queues-and-Memory](Technical-Queues-and-Memory)
 - [Technical-Packet-Details](Technical-Packet-Details)

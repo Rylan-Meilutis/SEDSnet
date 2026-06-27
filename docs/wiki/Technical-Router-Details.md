@@ -65,6 +65,7 @@ With the `discovery` feature enabled, the router has a built-in internal control
 - `SEDSNET_DISCOVERY` endpoint and `SEDSNET_DISCOVERY_ANNOUNCE` type are built in.
 - When `timesync` is also enabled, `SEDSNET_DISCOVERY_TIMESYNC_SOURCES` is also built in.
 - `SEDSNET_DISCOVERY_TOPOLOGY` is also built in and carries the transitive router graph.
+- `SEDSNET_DISCOVERY_ADDRESS` carries hostname/address ownership for P2P service routing.
 - `SEDSNET_DISCOVERY_LEAVE` lets a planned shutdown prune topology immediately.
 - Discovery packets are handled internally, not through user endpoint handlers.
 - The router keeps soft-state reachability data per side:
@@ -82,6 +83,9 @@ Discovery advertisements are adaptive:
   they want explicit control over discovery maintenance. `announce_discovery()` still forces an
   immediate advertise.
 - Apps can inspect the current learned topology with `export_topology()`.
+
+The concrete discovery and router-internal payload layouts are documented in
+[Technical-Discovery-and-Internal-Formats](Technical-Discovery-and-Internal-Formats).
 
 ## Receive pipeline (rx*)
 
@@ -112,6 +116,9 @@ With discovery enabled, forwarding also consults the learned side map:
   policy can still intentionally select a side. Before any discovery topology has been learned,
   legacy single-side fallback remains available for simple non-discovery deployments.
 - Link-local-only endpoints are only forwarded to sides marked `link_local_enabled: true`.
+- P2P service frames (`SEDSNET_P2P_MESSAGE`) use frozen target-sender hashes and service ports
+  instead of endpoint overlap, so a bound service can receive byte payloads by hostname/address
+  while broadcast telemetry keeps using endpoint subscriptions.
 - If typed route overrides exist for `(source side or local TX, packet type)`, only those enabled
   destination sides remain eligible before path selection and discovery matching are applied.
 - Reliable packets are sent to all known candidate sides for their endpoints.
