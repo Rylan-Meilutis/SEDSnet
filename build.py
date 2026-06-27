@@ -30,6 +30,7 @@ Options (can be combined where it makes sense):
   check                   Run `cargo clippy` for default, python, and embedded feature variants with `-D warnings`.
   test                    Run Rust tests, a stable Criterion benchmark smoke pass, and validate python +
   embedded build if cross C toolchain exists.
+  full                    With `test`, also run long-duration Rust tests marked `#[ignore]`.
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
@@ -54,6 +55,8 @@ New (compile-time env vars):
                           injection for embedded C dependencies.
   env:SEDSNET_TEST_RUNNER=auto|nextest|cargo Select Rust test runner for `build.py test`.
                           `auto` uses cargo-nextest when installed and falls back to cargo test.
+                          `build.py test full` includes Rust tests marked `#[ignore]`, so future
+                          soak tests are included automatically.
 
 Special:
   -h, --help, help        Show this help message and exit.
@@ -66,6 +69,7 @@ Examples:
   build.py check
   build.py check release
   build.py test
+  build.py test full
   build.py test release
   build.py maturin-build max_stack_payload=256
   build.py maturin-install max_recent_rx_ids=256 env:MAX_STACK_PAYLOAD=128
@@ -288,7 +292,12 @@ def cargo_nextest_available(env: dict[str, str]) -> bool:
         return False
 
 
-def test_runner_cmds(*, env: dict[str, str], features: list[str]) -> tuple[str, list[list[str]]]:
+def test_runner_cmds(
+        *,
+        env: dict[str, str],
+        features: list[str],
+        include_ignored: bool = False,
+) -> tuple[str, list[list[str]]]:
     feature_arg = ",".join(features)
     runner = env.get("SEDSNET_TEST_RUNNER", "auto").strip().lower()
     if runner not in ("auto", "nextest", "cargo"):
@@ -305,17 +314,23 @@ def test_runner_cmds(*, env: dict[str, str], features: list[str]) -> tuple[str, 
         )
 
     if runner == "nextest" or (runner == "auto" and has_nextest):
+        nextest_cmd = ["cargo", "nextest", "run", "--features", feature_arg]
+        if include_ignored:
+            nextest_cmd.extend(["--run-ignored", "all"])
         return (
             "cargo nextest",
             [
-                ["cargo", "nextest", "run", "--features", feature_arg],
+                nextest_cmd,
                 ["cargo", "test", "--doc", "--features", feature_arg],
             ],
         )
 
     if runner == "auto":
         print("info: cargo-nextest not found; falling back to `cargo test`.")
-    return "cargo test", [["cargo", "test", "--features", feature_arg]]
+    cargo_cmd = ["cargo", "test", "--features", feature_arg]
+    if include_ignored:
+        cargo_cmd.extend(["--", "--include-ignored"])
+    return "cargo test", [cargo_cmd]
 
 
 def run_cmd(
@@ -844,6 +859,7 @@ def main(argv: list[str]) -> None:
     build_mode: list[str] = []
     checks = False
     tests = False
+    test_full = False
     build_embedded = False
     build_python = False
     build_timesync = False
@@ -869,6 +885,9 @@ def main(argv: list[str]) -> None:
 
         elif arg == "test":
             tests = True
+
+        elif arg == "full":
+            test_full = True
 
         elif arg == "check":
             checks = True
@@ -959,6 +978,9 @@ def main(argv: list[str]) -> None:
         else:
             print_help(f"Unknown option: {arg}")
 
+    if test_full and not tests:
+        print_help("full is only valid with test, e.g. `build.py test full`")
+
     env = os.environ.copy()
     if device_id:
         env["DEVICE_IDENTIFIER"] = device_id
@@ -1026,7 +1048,11 @@ def main(argv: list[str]) -> None:
         )
         _success("Clippy checks passed.")
 
-        runner_name, test_cmds = test_runner_cmds(env=env, features=feature_parts)
+        runner_name, test_cmds = test_runner_cmds(
+            env=env,
+            features=feature_parts,
+            include_ignored=test_full,
+        )
         for idx, cmd in enumerate(test_cmds):
             title_suffix = runner_name if idx == 0 else "cargo test (doctests)"
             run_cmd(
@@ -1038,20 +1064,23 @@ def main(argv: list[str]) -> None:
             )
         _success("Tests passed.")
 
+        next_step = 5
+
         run_cmd(
             cargo_bench_smoke_cmd(),
             env=env,
             repo_root=repo_root,
-            title=f"5/{total_steps} cargo bench (smoke)",
+            title=f"{next_step}/{total_steps} cargo bench (smoke)",
             release_build=True,
         )
         _success("Benchmark smoke pass finished.")
+        next_step += 1
 
         run_cmd(
             ["cargo", "build", "--features", f"python{feature_suffix}", *build_mode],
             env=env,
             repo_root=repo_root,
-            title=f"6/{total_steps} cargo build (python feature)",
+            title=f"{next_step}/{total_steps} cargo build (python feature)",
             release_build=release_build,
         )
         _success(f"Python-feature build finished. Output is under: {repo_root / 'target'}")
@@ -1060,6 +1089,7 @@ def main(argv: list[str]) -> None:
             target=target,
             profile="release" if release_build else "debug",
         )
+        next_step += 1
 
         if can_check_embedded:
             ensure_rust_target_installed(embedded_target)
@@ -1092,7 +1122,7 @@ def main(argv: list[str]) -> None:
                 ],
                 env=env,
                 repo_root=repo_root,
-                title=f"7/{total_steps} cargo build (embedded feature)",
+                title=f"{next_step}/{total_steps} cargo build (embedded feature)",
                 target=embedded_target,
                 release_build=release_build,
                 embedded_profile=uses_custom_profile,
