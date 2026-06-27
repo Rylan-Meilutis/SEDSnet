@@ -64,7 +64,8 @@
     - Link-probe sample APIs let measured bring-up or driver throughput seed adaptive route
       selection.
     - Runtime sender IDs and packed header templates reduce repeated header overhead after
-      initial contact.
+      initial contact. Canonical packet frames now carry a compact source address instead of
+      repeating sender hostnames; sender names are learned through discovery/config state.
 - Topology and diagnostics:
     - Topology exports now include named endpoint fields, side names, filtered SEDSnet control
       endpoints, and a top-level `links` list for graph rendering.

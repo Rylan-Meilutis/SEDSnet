@@ -93,11 +93,11 @@ decode contract. New packets immediately use the latest schema-default endpoint 
 route only to their original intended holders and remain decodable against the shape they were packed with. The
 contract is encoded compactly with bitmap-oriented metadata and sender hashes so header growth stays small.
 
-Packed packets use compact varint fields, schema-derived endpoints, sender IDs/hashes, and optional per-side header
-templates, so the header is no longer best described as a fixed ~20-byte cost. The first packet for a route may carry
-the full sender/schema context, while later packets on small-packet transports can replace repeated header fields with a
-compact template ID. That keeps the header-to-payload ratio reasonable for small payloads such as three floats or a few
-`u8` values, which matters on low-bandwidth links.
+Packed packets use compact varint fields, schema-derived endpoints, a compact source address instead of a repeated
+sender hostname, and optional per-side header templates. Hostnames and endpoint holders are learned through discovery
+and network configuration; the packet header carries only the source address needed for identity/routing. Per-side
+templates can then replace repeated header fields with a compact template ID on small-packet transports, keeping the
+header-to-payload ratio reasonable for small payloads such as three floats or a few `u8` values.
 
 ---
 

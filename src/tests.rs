@@ -1476,7 +1476,7 @@ mod tests_extra {
             out
         }
 
-        // Helper to build a TelemetryError payload and sender of given lengths.
+        // Helper to build a TelemetryError payload with a sender of the given length.
         fn pkt_with(len: usize, sender_len: usize, ts: u64) -> Packet {
             let sender_bytes = non_rle_ascii(sender_len);
             let s: String = sender_bytes.iter().map(|b| char::from(*b)).collect();
@@ -1497,12 +1497,13 @@ mod tests_extra {
         let h1 = wire_format::header_size_bytes(&p1);
         assert!(h1 > 4, "NEP + 4 one-byte varints minimum");
 
-        // Case 2: two-byte varints for size/sender_len
+        // Case 2: larger payload grows data_size; sender text itself is discovery metadata,
+        // not part of the packet header.
         let p2 = pkt_with(200, 200, 0x7F);
         let w2 = wire_format::pack_packet(&p2);
         let h2 = wire_format::header_size_bytes(&p2);
         assert!(w2.len() > w1.len(), "wire should grow with larger varints");
-        assert!(h2 > h1, "header should grow with larger varints");
+        assert!(h2 >= h1, "header should not shrink with larger varints");
 
         // Case 3: bigger timestamp to push it beyond 1 byte (and usually >2)
         let p3 = pkt_with(200, 200, 1u64 << 40); // forces 6-byte varint
@@ -1584,6 +1585,12 @@ mod tests_extra {
         .unwrap();
 
         let wire = wire_format::pack_packet(&pkt);
+        assert!(
+            !wire
+                .windows(sender.len())
+                .any(|window| window == sender.as_bytes()),
+            "sender hostname must be discovery/config metadata, not packet-header bytes"
+        );
         let env = wire_format::peek_envelope(&wire).unwrap();
         let full = wire_format::unpack_packet(&wire).unwrap();
 
@@ -1949,8 +1956,8 @@ mod tests_more {
     use crate::config::get_message_meta;
     use crate::tests::{UnixClock, packed_frame_type};
     use crate::{
-        MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, MessageDataType, MessageElement,
-        TelemetryError, TelemetryErrorCode, TelemetryResult,
+        MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, MessageClass, MessageDataType,
+        MessageElement, ReliableMode, TelemetryError, TelemetryErrorCode, TelemetryResult,
         config::{DataEndpoint, DataType},
         get_data_type, get_needed_message_size, message_meta,
         packet::Packet,
@@ -2103,6 +2110,123 @@ mod tests_more {
         assert_eq!(
             wire_format::packet_id_from_wire(&subset_wire).unwrap(),
             subset_pkt.packet_id()
+        );
+    }
+
+    fn ensure_compact_reliable_test_type() -> (DataType, DataEndpoint) {
+        let ep = DataEndpoint::try_named("COMPACT_RELIABLE_EP").unwrap_or_else(|| {
+            crate::config::register_endpoint_with_description(
+                "COMPACT_RELIABLE_EP",
+                "compact reliable test endpoint",
+                false,
+            )
+            .unwrap_or_else(|_| DataEndpoint::named("COMPACT_RELIABLE_EP"))
+        });
+        let ty = DataType::try_named("COMPACT_RELIABLE_TYPE").unwrap_or_else(|| {
+            crate::config::register_data_type_with_description(
+                "COMPACT_RELIABLE_TYPE",
+                "compact reliable test type",
+                MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+                &[ep],
+                ReliableMode::Ordered,
+                1,
+            )
+            .unwrap_or_else(|_| DataType::named("COMPACT_RELIABLE_TYPE"))
+        });
+        (ty, ep)
+    }
+
+    #[test]
+    fn compact_reliable_header_roundtrips_and_shrinks_data_frames() {
+        let (ty, ep) = ensure_compact_reliable_test_type();
+        let pkt = Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[ep], 9)
+            .unwrap()
+            .with_nonce(7);
+
+        let compact = wire_format::pack_packet_with_reliable(
+            &pkt,
+            wire_format::ReliableHeader {
+                flags: 0,
+                seq: 1,
+                ack: 0,
+            },
+        );
+        let fixed = wire_format::pack_packet_with_reliable(
+            &pkt,
+            wire_format::ReliableHeader {
+                flags: 0,
+                seq: u32::MAX,
+                ack: u32::MAX,
+            },
+        );
+
+        assert_ne!(
+            compact[0] & 0x40,
+            0,
+            "small seq uses compact reliable header"
+        );
+        assert_eq!(
+            fixed[0] & 0x40,
+            0,
+            "large seq+ack keeps fixed reliable header"
+        );
+        assert!(compact.len() + 7 <= fixed.len());
+
+        let info = wire_format::peek_frame_info(&compact).unwrap();
+        assert_eq!(
+            info.reliable,
+            Some(wire_format::ReliableHeader {
+                flags: 0,
+                seq: 1,
+                ack: 0
+            })
+        );
+        assert_eq!(
+            wire_format::unpack_packet(&compact).unwrap().packet_id(),
+            pkt.packet_id()
+        );
+    }
+
+    #[test]
+    fn compact_reliable_ack_and_owned_rewrite_roundtrip() {
+        let (ty, ep) = ensure_compact_reliable_test_type();
+        let ack = wire_format::pack_reliable_ack("DST", ty, 0, 3);
+        assert_ne!(
+            ack[0] & 0x40,
+            0,
+            "small ACK-only frame uses compact reliable header"
+        );
+        let ack_info = wire_format::peek_frame_info(&ack).unwrap();
+        assert_eq!(
+            ack_info.reliable,
+            Some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_ACK_ONLY,
+                seq: 0,
+                ack: 3
+            })
+        );
+
+        let pkt = Packet::from_f32_slice(ty, &[4.0, 5.0, 6.0], &[ep], 10).unwrap();
+        let fixed = wire_format::pack_packet_with_reliable(
+            &pkt,
+            wire_format::ReliableHeader {
+                flags: 0,
+                seq: u32::MAX,
+                ack: u32::MAX,
+            },
+        );
+        let rewritten = wire_format::rewrite_reliable_header_owned(&fixed, 0, 4, 0)
+            .unwrap()
+            .expect("reliable header present");
+        assert_ne!(rewritten[0] & 0x40, 0);
+        assert!(rewritten.len() < fixed.len());
+        assert_eq!(
+            wire_format::peek_frame_info(&rewritten).unwrap().reliable,
+            Some(wire_format::ReliableHeader {
+                flags: 0,
+                seq: 4,
+                ack: 0
+            })
         );
     }
 

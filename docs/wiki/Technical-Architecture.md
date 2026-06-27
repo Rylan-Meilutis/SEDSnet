@@ -111,7 +111,7 @@ Validation rules enforced by `Packet::new` and `Packet::validate`:
 
 Packet IDs are **not** packed. `Packet::packet_id` hashes:
 
-- sender bytes
+- compact source address derived from the sender/discovery mapping
 - message name (`DataType` as string)
 - endpoint names (in order)
 - timestamp + data_size (little-endian)

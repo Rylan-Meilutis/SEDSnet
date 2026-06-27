@@ -79,10 +79,10 @@ const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
 const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
 const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
 const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
-const SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED: u8 = 0x02;
 const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
 const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
 const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
+const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
 const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
 const SIDE_TIMESTAMP_POLICY_WORDS: usize = ((crate::MAX_VALUE_DATA_TYPE as usize) + 1).div_ceil(64);
@@ -130,6 +130,7 @@ struct SideHeaderTemplate {
     prefix: Arc<[u8]>,
     between: Arc<[u8]>,
     reliable_flags: Option<u8>,
+    reliable_compact: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4615,8 +4616,9 @@ impl Router {
                         Some(Some(wire_format::ReliableHeader { flags, seq, ack: 0 })),
                     )?
                 } else {
-                    let mut v = bytes.to_vec();
-                    if !wire_format::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                    let Some(rewritten) =
+                        wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
+                    else {
                         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
                             return Err(TelemetryError::Io("side tx busy"));
                         };
@@ -4651,13 +4653,14 @@ impl Router {
                         );
                         self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
                         return Ok(());
-                    }
-                    Arc::from(v)
+                    };
+                    rewritten
                 }
                 #[cfg(not(feature = "cryptography"))]
                 {
-                    let mut v = bytes.to_vec();
-                    if !wire_format::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+                    let Some(rewritten) =
+                        wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
+                    else {
                         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
                             return Err(TelemetryError::Io("side tx busy"));
                         };
@@ -4692,8 +4695,8 @@ impl Router {
                         );
                         self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
                         return Ok(());
-                    }
-                    Arc::from(v)
+                    };
+                    rewritten
                 }
             }
         };
@@ -4848,23 +4851,17 @@ impl Router {
             0
         };
         let between_start = off;
-        let sender_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("sender length too large"))?;
-        let sender_wire_len = if (flags & SIDE_TRANSPORT_FLAG_SENDER_COMPRESSED) != 0 {
-            usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("sender wire length too large"))?
-        } else {
-            sender_len
-        };
+        let _source_address = u32::try_from(Self::read_uleb128_local(data, &mut off)?)
+            .map_err(|_| TelemetryError::Unpack("source address too large"))?;
         let endpoint_bitmap_bytes = if (flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT) != 0 {
             SIDE_TRANSPORT_EP_BITMAP_BYTES
         } else {
             0
         };
-        if data.len() < off + endpoint_bitmap_bytes + sender_wire_len {
+        if data.len() < off + endpoint_bitmap_bytes {
             return Err(TelemetryError::Unpack("short buffer"));
         }
-        off += endpoint_bitmap_bytes + sender_wire_len;
+        off += endpoint_bitmap_bytes;
         if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
             let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
                 .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
@@ -4873,38 +4870,30 @@ impl Router {
             }
             off += contract_len;
         }
-        let reliable_off = wire_format::reliable_header_offset(bytes)?;
-        let (reliable_flags, reliable_seq_ack, payload_off) = if let Some(rel_off) = reliable_off {
-            if data.len() < rel_off + wire_format::RELIABLE_HEADER_BYTES {
-                return Err(TelemetryError::Unpack("short buffer"));
-            }
-            let rel_flags = data[rel_off];
-            let seq = u32::from_le_bytes([
-                data[rel_off + 1],
-                data[rel_off + 2],
-                data[rel_off + 3],
-                data[rel_off + 4],
-            ]);
-            let ack = u32::from_le_bytes([
-                data[rel_off + 5],
-                data[rel_off + 6],
-                data[rel_off + 7],
-                data[rel_off + 8],
-            ]);
-            (
-                Some(rel_flags),
-                Some((seq, ack)),
-                rel_off + wire_format::RELIABLE_HEADER_BYTES,
-            )
-        } else {
-            (None, None, off)
-        };
+        let reliable_span = wire_format::reliable_header_span(bytes)?;
+        let (reliable_flags, reliable_seq_ack, reliable_compact, payload_off) =
+            if let Some((rel_off, rel_len, hdr)) = reliable_span {
+                if data.len() < rel_off + rel_len {
+                    return Err(TelemetryError::Unpack("short buffer"));
+                }
+                (
+                    Some(hdr.flags),
+                    Some((hdr.seq, hdr.ack)),
+                    (flags & SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER) != 0,
+                    rel_off + rel_len,
+                )
+            } else {
+                (None, None, false, off)
+            };
         if payload_off > data.len() {
             return Err(TelemetryError::Unpack("short buffer"));
         }
         let payload = &data[payload_off..];
         let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
-        let between = Arc::<[u8]>::from(&data[between_start..reliable_off.unwrap_or(payload_off)]);
+        let between_end = reliable_span
+            .map(|(rel_off, _, _)| rel_off)
+            .unwrap_or(payload_off);
+        let between = Arc::<[u8]>::from(&data[between_start..between_end]);
         let base_flags =
             flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
         let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
@@ -4920,6 +4909,7 @@ impl Router {
             prefix,
             between,
             reliable_flags,
+            reliable_compact,
         };
         let _ = ty_end_start;
         Ok((
@@ -4974,13 +4964,10 @@ impl Router {
             None
         };
         let reliable_seq_ack = if template.reliable_flags.is_some() {
-            if body.len() < off + 8 {
-                return Err(TelemetryError::Unpack("short side compact reliable"));
-            }
-            let seq = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-            let ack =
-                u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
-            off += 8;
+            let seq = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("side compact reliable seq too large"))?;
+            let ack = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("side compact reliable ack too large"))?;
             Some((seq, ack))
         } else {
             None
@@ -4998,18 +4985,23 @@ impl Router {
         }
         raw.extend_from_slice(&template.between);
         if let Some(rel_flags) = template.reliable_flags {
-            raw.push(rel_flags);
             let (seq, ack) =
                 reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
-            raw.extend_from_slice(&seq.to_le_bytes());
-            raw.extend_from_slice(&ack.to_le_bytes());
+            wire_format::write_reliable_header_encoded(
+                wire_format::ReliableHeader {
+                    flags: rel_flags,
+                    seq,
+                    ack,
+                },
+                template.reliable_compact,
+                &mut raw,
+            );
         }
         raw.extend_from_slice(payload);
         let crc = Self::crc32_bytes(&raw);
         raw.extend_from_slice(&crc.to_le_bytes());
         Ok((Arc::from(raw), timestamp))
     }
-
     fn split_side_transport_frame(
         &self,
         side: RouterSideId,
@@ -5126,8 +5118,8 @@ impl Router {
                     Self::write_uleb128_local(u64::from(nonce), &mut body);
                 }
                 if let Some((seq, ack)) = reliable_seq_ack {
-                    body.extend_from_slice(&seq.to_le_bytes());
-                    body.extend_from_slice(&ack.to_le_bytes());
+                    Self::write_uleb128_local(u64::from(seq), &mut body);
+                    Self::write_uleb128_local(u64::from(ack), &mut body);
                 }
                 body.extend_from_slice(payload);
                 {
@@ -5439,14 +5431,16 @@ impl Router {
                         return Ok(None);
                     }
                     if (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) == 0 {
-                        let mut v = bytes.to_vec();
-                        let _ = wire_format::rewrite_reliable_header(
-                            &mut v,
+                        let Some(rewritten) = wire_format::rewrite_reliable_header_owned(
+                            bytes.as_ref(),
                             wire_format::RELIABLE_FLAG_UNSEQUENCED,
                             hdr.seq,
                             0,
-                        )?;
-                        return Ok(Some(RouterItem::Packed(Arc::from(v))));
+                        )?
+                        else {
+                            return Ok(Some(RouterItem::Packed(bytes)));
+                        };
+                        return Ok(Some(RouterItem::Packed(rewritten)));
                     }
                 }
                 Ok(Some(RouterItem::Packed(bytes)))

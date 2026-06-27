@@ -17,9 +17,15 @@ use crate::{
     {MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, config::DataType},
 };
 
-use crate::packet::hash_bytes_u64;
-use alloc::{borrow::ToOwned, string::String, sync::Arc, vec, vec::Vec};
+use crate::packet::{hash_bytes_u64, sender_address_u32};
+#[cfg(feature = "std")]
+use alloc::borrow::ToOwned;
+#[cfg(feature = "std")]
+use alloc::collections::BTreeMap;
+use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
+#[cfg(feature = "std")]
+use std::sync::{Mutex, OnceLock};
 
 /// Lightweight header-only view of a packed [`Packet`].
 ///
@@ -30,8 +36,10 @@ pub struct TelemetryEnvelope {
     pub ty: DataType,
     /// All endpoints this packet is destined for (set bits in the bitmap).
     pub endpoints: Arc<[DataEndpoint]>,
-    /// Sender identity as UTF-8 string.
+    /// Sender identity resolved from discovery/config address state.
     pub sender: Arc<str>,
+    /// Compact source address carried by the packet header.
+    pub source_address: u32,
     /// Timestamp in milliseconds (as stored on the wire).
     pub timestamp_ms: u64,
     /// Inline wire-format payload shape, if present.
@@ -66,8 +74,8 @@ pub const CRC32_BYTES: usize = 4;
 //
 //   [FLAGS: u8]
 //       Bit 0: payload compressed flag (1 = compressed)
-//       Bit 1: sender compressed flag (1 = compressed)
 //       Bit 5: endpoint bitmap present (0 = derive endpoints from data type metadata)
+//       Bit 6: compact reliable header present (if a reliable header exists)
 //
 //   [NEP: u8]
 //       Number of selected endpoints.
@@ -76,11 +84,9 @@ pub const CRC32_BYTES: usize = 4;
 //   VARINT(data_size: u64)           -- ULEB128   (LOGICAL payload size, uncompressed)
 //   VARINT(timestamp: u64)           -- ULEB128
 //   [VARINT(nonce: u16 as u64)]      -- ULEB128   (ONLY if bit3 set)
-//   VARINT(sender_len: u64)          -- ULEB128   (LOGICAL sender length, uncompressed)
-//   [VARINT(sender_wire_len: u64)]   -- ULEB128   (ONLY if sender compressed)
+//   VARINT(src_addr: u32 as u64)     -- ULEB128
 //
 //   [ENDPOINTS_BITMAP]               -- ONLY if bit5 set; 1 bit per possible endpoint
-//   SENDER BYTES                     -- raw or compressed, length = sender_wire_len
 //   [RELIABLE HEADER]                -- present if type is configured `reliable`
 //       [REL_FLAGS: u8]
 //       [SEQ: u32 LE]
@@ -92,15 +98,19 @@ pub const CRC32_BYTES: usize = 4;
 // ULEB128 (varint) encoding helpers
 // ===========================================================================
 const FLAG_COMPRESSED_PAYLOAD: u8 = 0x01;
-const FLAG_COMPRESSED_SENDER: u8 = 0x02;
 const FLAG_WIRE_CONTRACT: u8 = 0x04;
 const FLAG_PACKET_NONCE: u8 = 0x08;
 #[cfg(feature = "cryptography")]
 const FLAG_E2E_ENCRYPTED_PAYLOAD: u8 = 0x10;
 const FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
+const FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
 const CONTRACT_FLAG_TARGETS: u8 = 0x01;
 const CONTRACT_FLAG_SHAPE: u8 = 0x02;
 const CONTRACT_FLAG_RELIABLE_HEADER: u8 = 0x04;
+const RELIABLE_WIRE_FLAG_SEQ_PRESENT: u8 = 0x04;
+const RELIABLE_WIRE_FLAG_ACK_PRESENT: u8 = 0x08;
+const RELIABLE_PUBLIC_FLAGS_MASK: u8 =
+    RELIABLE_FLAG_ACK_ONLY | RELIABLE_FLAG_UNORDERED | RELIABLE_FLAG_UNSEQUENCED;
 #[cfg(feature = "cryptography")]
 const E2E_NONCE_LEN: usize = 12;
 #[cfg(feature = "cryptography")]
@@ -454,6 +464,59 @@ fn write_reliable_header(h: ReliableHeader, out: &mut Vec<u8>) {
 }
 
 #[inline]
+fn reliable_compact_size(h: ReliableHeader) -> usize {
+    let seq_present = (h.flags & RELIABLE_FLAG_ACK_ONLY) == 0 || h.seq != 0;
+    let ack_present = h.ack != 0 || (h.flags & RELIABLE_FLAG_ACK_ONLY) != 0;
+    1 + if seq_present {
+        uleb128_size(h.seq as u64)
+    } else {
+        0
+    } + if ack_present {
+        uleb128_size(h.ack as u64)
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn should_compact_reliable_header(h: ReliableHeader) -> bool {
+    reliable_compact_size(h) < RELIABLE_HEADER_BYTES
+}
+
+#[inline]
+fn reliable_wire_size(h: ReliableHeader, compact: bool) -> usize {
+    if compact {
+        reliable_compact_size(h)
+    } else {
+        RELIABLE_HEADER_BYTES
+    }
+}
+
+pub(crate) fn write_reliable_header_encoded(h: ReliableHeader, compact: bool, out: &mut Vec<u8>) {
+    if !compact {
+        write_reliable_header(h, out);
+        return;
+    }
+
+    let seq_present = (h.flags & RELIABLE_FLAG_ACK_ONLY) == 0 || h.seq != 0;
+    let ack_present = h.ack != 0 || (h.flags & RELIABLE_FLAG_ACK_ONLY) != 0;
+    let mut wire_flags = h.flags & RELIABLE_PUBLIC_FLAGS_MASK;
+    if seq_present {
+        wire_flags |= RELIABLE_WIRE_FLAG_SEQ_PRESENT;
+    }
+    if ack_present {
+        wire_flags |= RELIABLE_WIRE_FLAG_ACK_PRESENT;
+    }
+    out.push(wire_flags);
+    if seq_present {
+        write_uleb128(h.seq as u64, out);
+    }
+    if ack_present {
+        write_uleb128(h.ack as u64, out);
+    }
+}
+
+#[inline]
 fn read_reliable_header(r: &mut ByteReader) -> Result<ReliableHeader, TelemetryError> {
     let flags = r.read_bytes(1)?[0];
     let seq = read_u32_le(r)?;
@@ -461,21 +524,79 @@ fn read_reliable_header(r: &mut ByteReader) -> Result<ReliableHeader, TelemetryE
     Ok(ReliableHeader { flags, seq, ack })
 }
 
-fn decode_sender_name(
-    sender_wire_bytes: &[u8],
-    sender_is_compressed: bool,
-    sender_len: usize,
-) -> TelemetryResult<String> {
-    if sender_is_compressed {
-        let decompressed = payload_compression::decompress(sender_wire_bytes, sender_len)?;
-        Ok(core::str::from_utf8(&decompressed)
-            .map_err(|_| TelemetryError::Unpack("sender not UTF-8 after decompress"))?
-            .to_owned())
+fn read_reliable_header_compact(r: &mut ByteReader) -> Result<ReliableHeader, TelemetryError> {
+    let wire_flags = r.read_bytes(1)?[0];
+    let seq = if (wire_flags & RELIABLE_WIRE_FLAG_SEQ_PRESENT) != 0 {
+        u32::try_from(read_uleb128(r)?)
+            .map_err(|_| TelemetryError::Unpack("reliable seq too large"))?
     } else {
-        Ok(core::str::from_utf8(sender_wire_bytes)
-            .map_err(|_| TelemetryError::Unpack("sender not UTF-8"))?
-            .to_owned())
+        0
+    };
+    let ack = if (wire_flags & RELIABLE_WIRE_FLAG_ACK_PRESENT) != 0 {
+        u32::try_from(read_uleb128(r)?)
+            .map_err(|_| TelemetryError::Unpack("reliable ack too large"))?
+    } else {
+        0
+    };
+    Ok(ReliableHeader {
+        flags: wire_flags & RELIABLE_PUBLIC_FLAGS_MASK,
+        seq,
+        ack,
+    })
+}
+
+#[inline]
+fn read_reliable_header_encoded(
+    r: &mut ByteReader,
+    compact: bool,
+) -> Result<ReliableHeader, TelemetryError> {
+    if compact {
+        read_reliable_header_compact(r)
+    } else {
+        read_reliable_header(r)
     }
+}
+
+#[cfg(feature = "std")]
+static ADDRESS_BOOK: OnceLock<Mutex<BTreeMap<u32, Arc<str>>>> = OnceLock::new();
+
+#[cfg(feature = "std")]
+fn address_book() -> &'static Mutex<BTreeMap<u32, Arc<str>>> {
+    ADDRESS_BOOK.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[inline]
+pub(crate) fn source_address_for_sender(sender: &str) -> u32 {
+    let addr = sender_address_u32(sender);
+    remember_source_address(addr, sender);
+    addr
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn remember_source_address(addr: u32, sender: &str) {
+    address_book()
+        .lock()
+        .expect("wire address book poisoned")
+        .entry(addr)
+        .or_insert_with(|| Arc::<str>::from(sender));
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) fn remember_source_address(_addr: u32, _sender: &str) {}
+
+#[cfg(feature = "std")]
+fn sender_name_for_address(addr: u32) -> String {
+    address_book()
+        .lock()
+        .expect("wire address book poisoned")
+        .get(&addr)
+        .map(|sender| sender.as_ref().to_owned())
+        .unwrap_or_else(|| format!("@addr:{addr}"))
+}
+
+#[cfg(not(feature = "std"))]
+fn sender_name_for_address(addr: u32) -> String {
+    format!("@addr:{addr}")
 }
 
 // ===========================================================================
@@ -633,39 +754,32 @@ pub fn pack_packet_with_reliable(pkt: &Packet, header: ReliableHeader) -> Arc<[u
 /// by the router's reliable layer.
 pub fn pack_reliable_ack(sender: &str, ty: DataType, timestamp_ms: u64, ack: u32) -> Arc<[u8]> {
     let bm = [0u8; EP_BITMAP_BYTES];
-
-    let sender_bytes = sender.as_bytes();
-    let (sender_compressed, sender_wire) =
-        payload_compression::compress_if_beneficial(sender_bytes);
+    let source_address = source_address_for_sender(sender);
 
     // No payload for ACK-only control frames.
-    let mut out = Vec::with_capacity(32 + EP_BITMAP_BYTES + sender_wire.len() + CRC32_BYTES);
+    let mut out = Vec::with_capacity(32 + EP_BITMAP_BYTES + CRC32_BYTES);
 
-    let mut flags: u8 = FLAG_ENDPOINT_BITMAP_PRESENT;
-    if sender_compressed {
-        flags |= FLAG_COMPRESSED_SENDER;
-    }
+    let flags: u8 = FLAG_ENDPOINT_BITMAP_PRESENT;
     out.push(flags);
     out.push(0u8); // NEP = 0
 
     write_uleb128(ty.as_u32() as u64, &mut out);
     write_uleb128(0u64, &mut out); // payload size
     write_uleb128(timestamp_ms, &mut out);
-    write_uleb128(sender_bytes.len() as u64, &mut out);
-    if sender_compressed {
-        write_uleb128(sender_wire.len() as u64, &mut out);
-    }
+    write_uleb128(source_address as u64, &mut out);
 
     out.extend_from_slice(&bm);
-    out.extend_from_slice(&sender_wire);
-    write_reliable_header(
-        ReliableHeader {
-            flags: RELIABLE_FLAG_ACK_ONLY,
-            seq: 0,
-            ack,
-        },
-        &mut out,
-    );
+    let reliable = ReliableHeader {
+        flags: RELIABLE_FLAG_ACK_ONLY,
+        seq: 0,
+        ack,
+    };
+    if should_compact_reliable_header(reliable) {
+        out[0] |= FLAG_COMPACT_RELIABLE_HEADER;
+        write_reliable_header_encoded(reliable, true, &mut out);
+    } else {
+        write_reliable_header_encoded(reliable, false, &mut out);
+    }
     append_crc32(&mut out);
 
     Arc::<[u8]>::from(out)
@@ -744,18 +858,16 @@ fn pack_packet_inner_with_contract(
         0
     };
 
-    // Decide whether to compress the sender.
-    let sender_bytes = pkt.sender().as_bytes();
-    let (sender_compressed, sender_wire) =
-        payload_compression::compress_if_beneficial(sender_bytes);
+    let source_address = source_address_for_sender(pkt.sender());
 
     // Decide whether to compress the payload.
     let payload = pkt.payload();
     let (payload_compressed, payload_wire) = payload_compression::compress_if_beneficial(payload);
 
-    // Heuristic capacity: fixed prelude + bitmap + sender_wire + reliable + payload_wire.
-    let reliable_len = if reliable.is_some() {
-        RELIABLE_HEADER_BYTES
+    // Heuristic capacity: fixed prelude + bitmap + reliable + payload_wire.
+    let reliable_is_compact = reliable.is_some_and(should_compact_reliable_header);
+    let reliable_len = if let Some(hdr) = reliable {
+        reliable_wire_size(hdr, reliable_is_compact)
     } else {
         0
     };
@@ -767,21 +879,13 @@ fn pack_packet_inner_with_contract(
         0
     };
     let mut out = Vec::with_capacity(
-        16 + endpoint_bytes
-            + sender_wire.len()
-            + contract_len
-            + reliable_len
-            + payload_wire.len()
-            + CRC32_BYTES,
+        16 + endpoint_bytes + contract_len + reliable_len + payload_wire.len() + CRC32_BYTES,
     );
 
     // FLAGS byte
     let mut flags: u8 = 0;
     if payload_compressed {
         flags |= FLAG_COMPRESSED_PAYLOAD;
-    }
-    if sender_compressed {
-        flags |= FLAG_COMPRESSED_SENDER;
     }
     if carries_wire_contract {
         flags |= FLAG_WIRE_CONTRACT;
@@ -791,6 +895,9 @@ fn pack_packet_inner_with_contract(
     }
     if endpoint_bitmap_present {
         flags |= FLAG_ENDPOINT_BITMAP_PRESENT;
+    }
+    if reliable_is_compact {
+        flags |= FLAG_COMPACT_RELIABLE_HEADER;
     }
     #[cfg(feature = "cryptography")]
     if e2e.is_some() {
@@ -812,18 +919,11 @@ fn pack_packet_inner_with_contract(
         write_uleb128(pkt.nonce() as u64, &mut out);
     }
 
-    // Logical sender length (uncompressed).
-    write_uleb128(sender_bytes.len() as u64, &mut out);
-
-    // If sender compressed, we also need its wire length to find the payload.
-    if sender_compressed {
-        write_uleb128(sender_wire.len() as u64, &mut out);
-    }
+    write_uleb128(source_address as u64, &mut out);
 
     if endpoint_bitmap_present {
         out.extend_from_slice(&bm);
     }
-    out.extend_from_slice(&sender_wire);
     if (flags & FLAG_WIRE_CONTRACT) != 0 {
         // The contract must appear before the reliable header because it may
         // carry the "reliable header present" bit for packets whose current
@@ -832,7 +932,7 @@ fn pack_packet_inner_with_contract(
         out.extend_from_slice(&contract);
     }
     if let Some(hdr) = reliable {
-        write_reliable_header(hdr, &mut out);
+        write_reliable_header_encoded(hdr, reliable_is_compact, &mut out);
     }
     #[cfg(feature = "cryptography")]
     if let Some(e2e) = e2e {
@@ -883,8 +983,8 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 
     let flags = r.read_bytes(1)?[0];
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
-    let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
     let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
+    let compact_reliable_header = (flags & FLAG_COMPACT_RELIABLE_HEADER) != 0;
     #[cfg(feature = "cryptography")]
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
     #[cfg(not(feature = "cryptography"))]
@@ -903,14 +1003,9 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     } else {
         0
     };
-    let slen = read_uleb128(&mut r)? as usize; // logical (uncompressed) sender length
-
-    // If sender is compressed, next varint is its wire length; else wire_len == slen.
-    let sender_wire_len = if sender_is_compressed {
-        read_uleb128(&mut r)? as usize
-    } else {
-        slen
-    };
+    let source_address = u32::try_from(read_uleb128(&mut r)?)
+        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
+    let sender_str = sender_name_for_address(source_address);
     let ty_u32 = data_type_id_from_wire(ty_v)?;
     let known_ty = DataType::try_from_u32(ty_u32);
     let endpoint_bytes = if endpoint_bitmap_present {
@@ -919,21 +1014,18 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
         0
     };
 
-    // For uncompressed payload: bitmap + sender_wire + [contract] + [reliable] + payload(dsz)
-    // For compressed payload: bitmap + sender_wire + [contract] + [reliable] + at least 1 byte.
+    // For uncompressed payload: bitmap + [contract] + [reliable] + payload(dsz)
+    // For compressed payload: bitmap + [contract] + [reliable] + at least 1 byte.
     if !payload_is_compressed {
-        if r.remaining() < endpoint_bytes + sender_wire_len + dsz {
+        if r.remaining() < endpoint_bytes + dsz {
             return Err(TelemetryError::Unpack("short buffer"));
         }
-    } else if r.remaining() < endpoint_bytes + sender_wire_len + 1 {
+    } else if r.remaining() < endpoint_bytes + 1 {
         return Err(TelemetryError::Unpack("short buffer"));
     }
 
     let eps = endpoints_from_wire_or_schema(&mut r, endpoint_bitmap_present, known_ty, nep)?;
 
-    // ----- Sender handling -----
-    let sender_wire_bytes = r.read_bytes(sender_wire_len)?;
-    let sender_str = decode_sender_name(sender_wire_bytes, sender_is_compressed, slen)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
     let ty = known_ty
         .or_else(|| contract.shape.map(|_| DataType(ty_u32)))
@@ -942,7 +1034,7 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     // ----- Reliable header (optional) -----
     let mut reliable_hdr: Option<ReliableHeader> = None;
     if is_reliable_type(ty) || contract.has_reliable_header {
-        let hdr = read_reliable_header(&mut r)?;
+        let hdr = read_reliable_header_encoded(&mut r, compact_reliable_header)?;
         if (hdr.flags & RELIABLE_FLAG_ACK_ONLY) != 0 {
             return Err(TelemetryError::Unpack("reliable control frame"));
         }
@@ -1028,7 +1120,6 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     let mut r = ByteReader::new(data);
 
     let flags = r.read_bytes(1)?[0];
-    let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
     let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
     // We don't care about payload compression here.
     let _payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
@@ -1041,13 +1132,9 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     if (flags & FLAG_PACKET_NONCE) != 0 {
         let _ = read_uleb128(&mut r)?;
     }
-    let slen = read_uleb128(&mut r)? as usize;
-
-    let sender_wire_len = if sender_is_compressed {
-        read_uleb128(&mut r)? as usize
-    } else {
-        slen
-    };
+    let source_address = u32::try_from(read_uleb128(&mut r)?)
+        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
+    let sender_str = sender_name_for_address(source_address);
     let ty_u32 = data_type_id_from_wire(ty_v)?;
     let known_ty = DataType::try_from_u32(ty_u32);
     let endpoint_bytes = if endpoint_bitmap_present {
@@ -1056,14 +1143,12 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
         0
     };
 
-    if r.remaining() < endpoint_bytes + sender_wire_len {
+    if r.remaining() < endpoint_bytes {
         return Err(TelemetryError::Unpack("short buffer"));
     }
 
     let eps = endpoints_from_wire_or_schema(&mut r, endpoint_bitmap_present, known_ty, nep)?;
 
-    let sender_wire_bytes = r.read_bytes(sender_wire_len)?;
-    let sender_str = decode_sender_name(sender_wire_bytes, sender_is_compressed, slen)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
     let ty = known_ty
         .or_else(|| contract.shape.map(|_| DataType(ty_u32)))
@@ -1073,6 +1158,7 @@ pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
         ty,
         endpoints: eps,
         sender: Arc::<str>::from(sender_str),
+        source_address,
         timestamp_ms: ts_v,
         wire_shape: contract.shape,
         target_senders: contract.target_senders,
@@ -1102,8 +1188,8 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     let mut r = ByteReader::new(buf);
 
     let flags = r.read_bytes(1)?[0];
-    let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
     let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
+    let compact_reliable_header = (flags & FLAG_COMPACT_RELIABLE_HEADER) != 0;
     let _payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
 
     let nep = r.read_bytes(1)?[0] as usize;
@@ -1114,13 +1200,9 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     if (flags & FLAG_PACKET_NONCE) != 0 {
         let _ = read_uleb128(&mut r)?;
     }
-    let slen = read_uleb128(&mut r)? as usize;
-
-    let sender_wire_len = if sender_is_compressed {
-        read_uleb128(&mut r)? as usize
-    } else {
-        slen
-    };
+    let source_address = u32::try_from(read_uleb128(&mut r)?)
+        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
+    let sender_str = sender_name_for_address(source_address);
     let ty_u32 = data_type_id_from_wire(ty_v)?;
     let known_ty = DataType::try_from_u32(ty_u32);
     let endpoint_bytes = if endpoint_bitmap_present {
@@ -1129,24 +1211,25 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
         0
     };
 
-    if r.remaining() < endpoint_bytes + sender_wire_len {
+    if r.remaining() < endpoint_bytes {
         return Err(TelemetryError::Unpack("short buffer"));
     }
 
     let eps = endpoints_from_wire_or_schema(&mut r, endpoint_bitmap_present, known_ty, nep)?;
 
-    let sender_wire_bytes = r.read_bytes(sender_wire_len)?;
-    let sender_str = decode_sender_name(sender_wire_bytes, sender_is_compressed, slen)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
     let ty = known_ty
         .or_else(|| contract.shape.map(|_| DataType(ty_u32)))
         .ok_or(TelemetryError::InvalidType)?;
 
     let reliable = if is_reliable_type(ty) || contract.has_reliable_header {
-        if r.remaining() < RELIABLE_HEADER_BYTES {
+        if r.remaining() < 1 {
             return Err(TelemetryError::Unpack("short buffer"));
         }
-        Some(read_reliable_header(&mut r)?)
+        Some(read_reliable_header_encoded(
+            &mut r,
+            compact_reliable_header,
+        )?)
     } else {
         None
     };
@@ -1156,6 +1239,7 @@ fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
             ty,
             endpoints: eps,
             sender: Arc::<str>::from(sender_str),
+            source_address,
             timestamp_ms: ts_v,
             wire_shape: contract.shape,
             target_senders: contract.target_senders,
@@ -1186,7 +1270,7 @@ pub fn peek_frame_info_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryFrameIn
 
 /// Locate the reliable-header byte offset within a packed frame.
 ///
-/// The offset is computed after walking the sender bytes and optional wire
+/// The offset is computed after walking the source address and optional wire
 /// contract. This matters because the contract can explicitly state that a
 /// reliable header is present even if the current runtime schema no longer
 /// marks the type as reliable.
@@ -1199,6 +1283,12 @@ pub fn peek_frame_info_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryFrameIn
 /// - `Ok(None)` when the frame carries no reliable header.
 /// - `Err(TelemetryError)` when the frame is malformed.
 pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
+    Ok(reliable_header_span(buf)?.map(|(off, _, _)| off))
+}
+
+pub(crate) fn reliable_header_span(
+    buf: &[u8],
+) -> TelemetryResult<Option<(usize, usize, ReliableHeader)>> {
     if buf.len() < CRC32_BYTES + 1 {
         return Err(TelemetryError::Unpack("short prelude"));
     }
@@ -1206,8 +1296,8 @@ pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
     let mut r = ByteReader::new(&buf[..data_len]);
 
     let flags = r.read_bytes(1)?[0];
-    let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
     let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
+    let compact_reliable_header = (flags & FLAG_COMPACT_RELIABLE_HEADER) != 0;
 
     let _nep = r.read_bytes(1)?[0] as usize;
 
@@ -1217,27 +1307,21 @@ pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
     if (flags & FLAG_PACKET_NONCE) != 0 {
         let _ = read_uleb128(&mut r)?;
     }
-    let slen = read_uleb128(&mut r)? as usize;
-
-    let sender_wire_len = if sender_is_compressed {
-        read_uleb128(&mut r)? as usize
-    } else {
-        slen
-    };
+    let _source_address = u32::try_from(read_uleb128(&mut r)?)
+        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
     let endpoint_bytes = if endpoint_bitmap_present {
         EP_BITMAP_BYTES
     } else {
         0
     };
 
-    if r.remaining() < endpoint_bytes + sender_wire_len {
+    if r.remaining() < endpoint_bytes {
         return Err(TelemetryError::Unpack("short buffer"));
     }
 
     if endpoint_bitmap_present {
         r.read_bytes(EP_BITMAP_BYTES)?;
     }
-    r.read_bytes(sender_wire_len)?;
     let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
     let ty_u32 = data_type_id_from_wire(ty_v)?;
     let ty = DataType::try_from_u32(ty_u32)
@@ -1247,7 +1331,9 @@ pub fn reliable_header_offset(buf: &[u8]) -> TelemetryResult<Option<usize>> {
         return Ok(None);
     }
 
-    Ok(Some(r.off))
+    let off = r.off;
+    let hdr = read_reliable_header_encoded(&mut r, compact_reliable_header)?;
+    Ok(Some((off, r.off - off, hdr)))
 }
 
 /// Rewrite the reliable header in-place and refresh the frame CRC32.
@@ -1271,22 +1357,66 @@ pub fn rewrite_reliable_header(
     seq: u32,
     ack: u32,
 ) -> TelemetryResult<bool> {
-    let Some(off) = reliable_header_offset(buf)? else {
+    let Some((off, old_len, _)) = reliable_header_span(buf)? else {
         return Ok(false);
     };
+    let hdr = ReliableHeader { flags, seq, ack };
+    let compact = should_compact_reliable_header(hdr);
+    if reliable_wire_size(hdr, compact) != old_len {
+        return Err(TelemetryError::Unpack(
+            "reliable header rewrite changes wire size",
+        ));
+    }
     let data_len = buf.len().saturating_sub(CRC32_BYTES);
-    if data_len.saturating_sub(off) < RELIABLE_HEADER_BYTES {
+    if data_len.saturating_sub(off) < old_len {
         return Err(TelemetryError::Unpack("short buffer"));
     }
-    buf[off] = flags;
-    buf[off + 1..off + 5].copy_from_slice(&seq.to_le_bytes());
-    buf[off + 5..off + 9].copy_from_slice(&ack.to_le_bytes());
+    if compact {
+        buf[0] |= FLAG_COMPACT_RELIABLE_HEADER;
+    } else {
+        buf[0] &= !FLAG_COMPACT_RELIABLE_HEADER;
+    }
+    let mut encoded = Vec::with_capacity(old_len);
+    write_reliable_header_encoded(hdr, compact, &mut encoded);
+    buf[off..off + old_len].copy_from_slice(&encoded);
     if buf.len() < CRC32_BYTES {
         return Err(TelemetryError::Unpack("short buffer"));
     }
     let crc = crc32_bytes(&buf[..data_len]);
     buf[data_len..data_len + CRC32_BYTES].copy_from_slice(&crc.to_le_bytes());
     Ok(true)
+}
+
+pub(crate) fn rewrite_reliable_header_owned(
+    buf: &[u8],
+    flags: u8,
+    seq: u32,
+    ack: u32,
+) -> TelemetryResult<Option<Arc<[u8]>>> {
+    let Some((off, old_len, _)) = reliable_header_span(buf)? else {
+        return Ok(None);
+    };
+    let data_len = buf.len().saturating_sub(CRC32_BYTES);
+    if data_len < off + old_len {
+        return Err(TelemetryError::Unpack("short buffer"));
+    }
+    let hdr = ReliableHeader { flags, seq, ack };
+    let compact = should_compact_reliable_header(hdr);
+    let mut encoded = Vec::with_capacity(reliable_wire_size(hdr, compact));
+    write_reliable_header_encoded(hdr, compact, &mut encoded);
+
+    let mut out = Vec::with_capacity(data_len - old_len + encoded.len() + CRC32_BYTES);
+    out.extend_from_slice(&buf[..off]);
+    if compact {
+        out[0] |= FLAG_COMPACT_RELIABLE_HEADER;
+    } else {
+        out[0] &= !FLAG_COMPACT_RELIABLE_HEADER;
+    }
+    out.extend_from_slice(&encoded);
+    out.extend_from_slice(&buf[off + old_len..data_len]);
+    let crc = crc32_bytes(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(Some(Arc::from(out)))
 }
 
 // ===========================================================================
@@ -1296,8 +1426,8 @@ pub fn rewrite_reliable_header(
 /// Compute the encoded metadata-prefix size for `pkt`.
 ///
 /// This includes the fixed prelude and top-level varints, but excludes the
-/// optional endpoint bitmap, sender bytes, optional wire contract, optional reliable
-/// header, payload bytes, and CRC32 trailer.
+/// optional endpoint bitmap, optional wire contract, optional reliable header,
+/// payload bytes, and CRC32 trailer.
 ///
 /// # Parameters
 /// - `pkt`: Packet to size.
@@ -1307,9 +1437,7 @@ pub fn rewrite_reliable_header(
 pub fn header_size_bytes(pkt: &Packet) -> usize {
     let prelude = 2; // FLAGS (u8) + NEP (u8)
 
-    let sender_bytes = pkt.sender().as_bytes();
-    let (sender_compressed, sender_wire) =
-        payload_compression::compress_if_beneficial(sender_bytes);
+    let source_address = sender_address_u32(pkt.sender());
 
     prelude
         + uleb128_size(pkt.data_type().as_u32() as u64)
@@ -1320,13 +1448,7 @@ pub fn header_size_bytes(pkt: &Packet) -> usize {
         } else {
             0
         }
-        + uleb128_size(sender_bytes.len() as u64)
-        + if sender_compressed {
-            // extra varint for sender_wire_len when compressed
-            uleb128_size(sender_wire.len() as u64)
-        } else {
-            0
-        }
+        + uleb128_size(source_address as u64)
 }
 
 /// Compute the full packed wire size for `pkt`.
@@ -1343,15 +1465,16 @@ pub fn header_size_bytes(pkt: &Packet) -> usize {
 pub fn packet_wire_size(pkt: &Packet) -> usize {
     let header = header_size_bytes(pkt);
 
-    let sender_bytes = pkt.sender().as_bytes();
-    let (_sender_compressed, sender_wire) =
-        payload_compression::compress_if_beneficial(sender_bytes);
-
     let payload = pkt.payload();
     let (_payload_compressed, payload_wire) = payload_compression::compress_if_beneficial(payload);
 
     let reliable_len = if is_reliable_type(pkt.data_type()) {
-        RELIABLE_HEADER_BYTES
+        let hdr = ReliableHeader {
+            flags: 0,
+            seq: 0,
+            ack: 0,
+        };
+        reliable_wire_size(hdr, should_compact_reliable_header(hdr))
     } else {
         0
     };
@@ -1361,7 +1484,7 @@ pub fn packet_wire_size(pkt: &Packet) -> usize {
         EP_BITMAP_BYTES
     };
 
-    header + endpoint_len + sender_wire.len() + reliable_len + payload_wire.len() + CRC32_BYTES
+    header + endpoint_len + reliable_len + payload_wire.len() + CRC32_BYTES
 }
 
 #[inline]
@@ -1376,8 +1499,8 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
 
     let flags = r.read_bytes(1)?[0];
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
-    let sender_is_compressed = (flags & FLAG_COMPRESSED_SENDER) != 0;
     let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
+    let compact_reliable_header = (flags & FLAG_COMPACT_RELIABLE_HEADER) != 0;
     #[cfg(feature = "cryptography")]
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
     #[cfg(not(feature = "cryptography"))]
@@ -1396,13 +1519,8 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     } else {
         0
     };
-    let slen = read_uleb128(&mut r)? as usize; // logical sender len (uncompressed)
-
-    let sender_wire_len = if sender_is_compressed {
-        read_uleb128(&mut r)? as usize
-    } else {
-        slen
-    };
+    let source_address = u32::try_from(read_uleb128(&mut r)?)
+        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
     let ty_u32 = data_type_id_from_wire(ty_v)?;
     let known_ty = DataType::try_from_u32(ty_u32);
     let endpoint_bytes = if endpoint_bitmap_present {
@@ -1411,21 +1529,12 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
         0
     };
 
-    if r.remaining() < endpoint_bytes + sender_wire_len {
+    if r.remaining() < endpoint_bytes {
         return Err(TelemetryError::Unpack("short buffer"));
     }
 
     let endpoints = endpoints_from_wire_or_schema(&mut r, endpoint_bitmap_present, known_ty, _nep)?;
 
-    // ---- sender bytes (must hash *decompressed* bytes if compressed) ----
-    let sender_wire_bytes = r.read_bytes(sender_wire_len)?;
-    let sender_decompressed: Vec<u8>;
-    let sender_bytes: &[u8] = if sender_is_compressed {
-        sender_decompressed = payload_compression::decompress(sender_wire_bytes, slen)?;
-        &sender_decompressed
-    } else {
-        sender_wire_bytes
-    };
     let _contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
     let ty = known_ty
         .or_else(|| _contract.shape.map(|_| DataType(ty_u32)))
@@ -1433,7 +1542,7 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
 
     // ---- reliable header (optional) ----
     if is_reliable_type(ty) || _contract.has_reliable_header {
-        let hdr = read_reliable_header(&mut r)?;
+        let hdr = read_reliable_header_encoded(&mut r, compact_reliable_header)?;
         if (hdr.flags & RELIABLE_FLAG_ACK_ONLY) != 0 {
             return Err(TelemetryError::Unpack("reliable control frame"));
         }
@@ -1487,8 +1596,8 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     // ---- hash exactly like Packet::packet_id() ----
     let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
 
-    // Sender (string bytes)
-    h = hash_bytes_u64(h, sender_bytes);
+    // Compact source address.
+    h = hash_bytes_u64(h, &source_address.to_le_bytes());
 
     // Logical type as string bytes
     h = hash_bytes_u64(h, get_message_name(ty).as_bytes());

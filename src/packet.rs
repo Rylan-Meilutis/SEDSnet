@@ -133,6 +133,17 @@ pub fn hash_bytes_u64(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+/// Stable compact source address derived from a logical sender name.
+///
+/// Network-master address assignment can override the discovery mapping at the
+/// routing layer, but standalone packets need a deterministic address so the
+/// canonical wire header never has to carry the sender string.
+#[inline]
+pub(crate) fn sender_address_u32(sender: &str) -> u32 {
+    let raw = hash_bytes_u64(0xA6D3_8C21_4B7F_19E5, sender.as_bytes()) as u32;
+    if raw == 0 { 1 } else { raw }
+}
+
 /// Validate the payload of a dynamic-length message.
 ///
 /// - For `String`: trims trailing NULs for validation and ensures UTF-8 (if non-empty).
@@ -411,8 +422,9 @@ impl Packet {
         // Seed with an arbitrary non-zero constant.
         let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
 
-        // Sender (string)
-        h = hash_bytes_u64(h, self.sender.as_bytes());
+        // Compact source address. Sender names are discovery/config metadata,
+        // not packet-header identity.
+        h = hash_bytes_u64(h, &sender_address_u32(self.sender.as_ref()).to_le_bytes());
 
         // Logical type as string
         h = hash_bytes_u64(h, get_message_name(self.ty).as_bytes());

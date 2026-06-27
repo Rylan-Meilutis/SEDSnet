@@ -60,7 +60,7 @@ For dynamic layouts, element width is derived from `MessageDataType`:
 
 `Packet::packet_id()` generates a stable 64-bit dedupe ID. It hashes:
 
-- sender bytes
+- compact source address derived from the sender/discovery mapping
 - message name
 - endpoint names in packet order
 - timestamp bytes

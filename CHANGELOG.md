@@ -36,8 +36,9 @@
 - Added compact 80-byte managed credential helpers for master-root deployments. A master/root key
   can issue short-lived board credentials containing subject, key, epoch, validity window, and
   permission bits; peers verify them before accepting issued session or group keys.
-- Added runtime sender ID update APIs and reduced follow-up packed header overhead by caching
-  sender/header templates on packed sides.
+- Added runtime sender ID update APIs and reduced packed header overhead. Canonical packet frames
+  now carry a compact source address instead of repeating sender hostnames; sender names are
+  discovery/config metadata, and packed sides can still cache header templates for follow-up frames.
 - Added fixed-size packed side splitting/reassembly for transports such as CAN, I2C, and
   fixed-frame radio links. Router and relay sides can cap outbound packed chunks without
   changing the user packet/logging API.

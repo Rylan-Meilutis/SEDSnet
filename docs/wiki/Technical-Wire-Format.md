@@ -41,21 +41,20 @@ These functions pack and unpack SEDSnet protocol frames.
 ```text
 [FLAGS: u8]
     bit0: payload compressed
-    bit1: sender compressed
+    bit1: reserved
     bit2: wire contract present
     bit3: packet nonce present
     bit4: E2E encrypted payload wrapper present
     bit5: endpoint bitmap present
-    bit6..7: reserved
+    bit6: reliable header uses compact varint form
+    bit7: reserved
 [NEP: u8]                         // number of selected endpoints
 VARINT(ty: u32 as u64)            // ULEB128
 VARINT(data_size: u64)            // logical payload size after decompression
 VARINT(timestamp_ms: u64)
 [VARINT(nonce: u16 as u64)]       // only when bit3 is set
-VARINT(sender_len: u64)           // logical sender length after decompression
-[VARINT(sender_wire_len: u64)]    // only when sender is compressed
+VARINT(src_addr: u32 as u64)      // assigned/discovered source address
 [ENDPOINT_BITMAP]                 // only when bit5 is set
-SENDER_BYTES                      // raw or compressed
 [VARINT(contract_len: u64)]       // only when bit2 is set
 [WIRE_CONTRACT_BYTES]
 [RELIABLE_HEADER]                 // present for reliable schema types or when contract says so
@@ -68,11 +67,11 @@ PAYLOAD_BYTES                     // raw/compressed, or E2E wrapper around those
 Top-level frame flags:
 
 - `0x01`: payload compressed
-- `0x02`: sender compressed
 - `0x04`: wire contract present
 - `0x08`: packet nonce present
 - `0x10`: payload bytes are wrapped by the feature-gated E2E cryptography provider
 - `0x20`: endpoint bitmap present
+- `0x40`: reliable header uses compact varint form
 
 When `0x10` is set, routing metadata remains visible, but the payload region is:
 
@@ -111,10 +110,9 @@ When flag `0x20` is clear, no endpoint bitmap bytes are present. The endpoint se
 endpoint set from the local data type metadata for `ty`, expanded in ascending endpoint-ID order,
 and `NEP` must match that set size.
 
-When flag `0x20` is set, a fixed-width endpoint bitmap follows the sender length fields and appears
-before `SENDER_BYTES`. This form is used for custom endpoint sets, subsets, ACK-only reliable
-control frames, wire-contract frames, and frames whose endpoints cannot be inferred from the data
-type metadata.
+When flag `0x20` is set, a fixed-width endpoint bitmap follows `src_addr`. This form is used for
+custom endpoint sets, subsets, ACK-only reliable control frames, wire-contract frames, and frames
+whose endpoints cannot be inferred from the data type metadata.
 
 - `EP_BITMAP_BITS = MAX_VALUE_DATA_ENDPOINT + 1`
 - `EP_BITMAP_BYTES = ceil(EP_BITMAP_BITS / 8)`
@@ -127,7 +125,7 @@ change the bitmap width.
 
 ## Wire contract
 
-When `FLAG_WIRE_CONTRACT` is set, the frame carries a compact contract immediately after the sender
+When `FLAG_WIRE_CONTRACT` is set, the frame carries a compact contract immediately after the source address
 bytes.
 
 ```text
@@ -168,7 +166,10 @@ list as an explicit destination set for the packed frame.
 
 ## Reliable header
 
-The reliable header is a fixed 9-byte block:
+The reliable header appears after the optional wire contract for reliable schema types or when the
+wire contract says a reliable header is present.
+
+When top-level flag `0x40` is clear, the reliable header is the fixed 9-byte form:
 
 ```text
 [REL_FLAGS: u8]
@@ -176,7 +177,22 @@ The reliable header is a fixed 9-byte block:
 [ACK: u32 LE]
 ```
 
-For normal reliable data frames this header appears after the optional wire contract.
+When top-level flag `0x40` is set, the reliable header is the compact form:
+
+```text
+[REL_WIRE_FLAGS: u8]
+    bit0: ACK-only reliable control frame
+    bit1: reliable but unordered
+    bit2: SEQ varint present
+    bit3: ACK varint present
+    bit7: unsequenced best-effort reliable wrapper
+[VARINT(seq)]                    // only when REL_WIRE_FLAGS bit2 is set
+[VARINT(ack)]                    // only when REL_WIRE_FLAGS bit3 is set
+```
+
+The compact form is used only when it is smaller than the fixed form. Normal reliable data frames
+with small sequence numbers and no piggyback ACK encode as `REL_WIRE_FLAGS + VARINT(seq)`.
+ACK-only reliable frames with small ACK values encode as `REL_WIRE_FLAGS + VARINT(ack)`.
 
 Reliable control traffic now primarily uses built-in internal packet types such as:
 
@@ -309,15 +325,22 @@ This includes:
 
 `read_uleb128` rejects values that require more than 10 bytes.
 
+## Source Address
+
+The canonical packet header does not carry the sender hostname. It carries `src_addr`, a compact
+source address assigned or learned through network configuration and discovery. Hostnames, board
+names, endpoint holders, and topology are discovery/config state rather than repeated packet-header
+data.
+
+Standalone pack/unpack helpers maintain a host-side address cache so decoded `Packet` values can
+still expose `sender()` when the process has seen the corresponding sender name. If no mapping is
+known, the decoded sender is represented as `@addr:<number>`.
+
 ## Compression
 
-Sender and payload compression are evaluated independently.
-
-- Compression is only used when it is actually smaller on the wire.
-- The logical uncompressed length is still transmitted in the frame metadata.
-- Decode validates the decompressed size against that logical length.
-
-Compressed sender and payload bytes use the crate's `payload_compression` backend.
+Payload compression is used only when it is actually smaller on the wire. The logical uncompressed
+payload length is still transmitted in the frame metadata, and decode validates the decompressed size
+against that logical length.
 
 ## Decode flow
 
@@ -327,7 +350,7 @@ High-level decode order:
 2. Parse the fixed prelude and varints.
 3. Resolve endpoints from the fixed-width endpoint bitmap when flag `0x20` is set, otherwise from
    the default endpoint list in local data type metadata.
-4. Decode sender bytes.
+4. Resolve the source address to a sender name from discovery/config state.
 5. Decode the optional wire contract.
 6. Decode the reliable header if current schema or contract says it is present.
 7. Decode the payload bytes.
@@ -343,6 +366,7 @@ and routing.
 - `ty`
 - `endpoints`
 - `sender`
+- `source_address`
 - `timestamp_ms`
 - `wire_shape`
 - `target_senders`
@@ -357,7 +381,7 @@ payload data.
 `packet_id_from_wire(...)` computes the same ID as `Packet::packet_id()` from a packed frame.
 It hashes:
 
-- sender bytes after decompression
+- compact source address
 - message name
 - endpoint names in ascending bitmap order
 - timestamp
