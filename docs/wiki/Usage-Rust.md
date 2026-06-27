@@ -468,6 +468,33 @@ client.send_p2p_to_address(0x1020_3040, 80, 49152, b"GET / HTTP/1.1\r\n\r\n")?;
 The service payload can carry protocols such as HTTP over SEDSnet links; SEDSnet supplies the
 addressing, routing, reliability, and discovery layer instead of IP.
 
+For protocols that want a connection lifecycle instead of standalone datagrams, bind a stream port
+and open a stream:
+
+```rust
+router.bind_p2p_stream_port(8080, |event| {
+    match event.kind {
+        sedsnet::router::P2pStreamEventKind::Accepted => {
+            // Store event.stream_id if this service wants to write a response.
+        }
+        sedsnet::router::P2pStreamEventKind::Data => {
+            let bytes = event.payload;
+        }
+        sedsnet::router::P2pStreamEventKind::Closed
+        | sedsnet::router::P2pStreamEventKind::Reset => {}
+        sedsnet::router::P2pStreamEventKind::Connected => {}
+    }
+    Ok(())
+})?;
+
+let stream = client.open_p2p_stream_to_hostname("http-service", 8080, 49152)?;
+client.send_p2p_stream(stream, b"GET /stream HTTP/1.1\r\n\r\n")?;
+client.close_p2p_stream(stream)?;
+```
+
+Stream frames are carried inside `SEDSNET_P2P_MESSAGE`, so they use the same discovery routing,
+compact addresses, target-sender contracts, and ordered reliable control path as P2P datagrams.
+
 ## Topology export
 
 With discovery enabled, `export_topology()` returns the router's current learned view.

@@ -5,12 +5,16 @@ build-backend = "maturin"
 [project]
 name = "sedsnet"
 version = "4.0.0"
-description = "Rust telemetry networking stack with routing, discovery, reliability, and C/Python bindings"
+description = "Embedded networking stack with routing, discovery, reliability, P2P streams, and Rust/C/Python bindings"
 authors = [{ name = "Rylan Meilutis", email = "rylan.meilutis@gmail.com" }]
 readme = "README.md"
-license = "GPL-2"
+license = "GPL-2.0-only"
 requires-python = ">=3.8"
 
+[project.urls]
+Homepage = "https://github.com/rylan-meilutis/SEDSnet"
+Documentation = "https://github.com/rylan-meilutis/SEDSnet/wiki"
+Repository = "https://github.com/rylan-meilutis/SEDSnet"
 
 [tool.maturin]
 bindings = "pyo3"

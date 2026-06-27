@@ -21,6 +21,7 @@ These pages are written for readers who want a clear mental model before digging
 Step-by-step setup and usage by language.
 
 - [Build-and-Configure](Build-and-Configure)
+- [Release-Checklist](Release-Checklist)
 - [Time-Sync](Time-Sync)
 - [Usage-Rust](Usage-Rust)
 - [Usage-C-Cpp](Usage-C-Cpp)

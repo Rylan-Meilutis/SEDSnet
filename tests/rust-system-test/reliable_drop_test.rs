@@ -3072,6 +3072,7 @@ mod reliable_drop_tests {
             .set_timesync_config(Some(TimeSyncConfig::default()));
 
         let p2p_hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let p2p_stream_hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let hits = p2p_hits.clone();
             topology
@@ -3114,6 +3115,20 @@ mod reliable_drop_tests {
                 })
                 .unwrap();
         }
+        {
+            let hits = p2p_stream_hits.clone();
+            topology
+                .actuator
+                .bind_p2p_stream_port(8081, move |event| {
+                    let payload = core::str::from_utf8(event.payload).unwrap_or("<binary>");
+                    hits.lock().unwrap().push(format!(
+                        "{:?}:{}:{}:{}:{payload}",
+                        event.kind, event.peer_hostname, event.peer_port, event.sequence
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+        }
 
         let mut policy = SoakLinkPolicy::new();
         let mut issued_reliable = 0u32;
@@ -3121,6 +3136,10 @@ mod reliable_drop_tests {
         let mut issued_large_payloads = 0u32;
         let mut issued_p2p_hostname = 0u32;
         let mut issued_p2p_address = 0u32;
+        let mut issued_p2p_streams = 0u32;
+        let mut active_stream: Option<u32> = None;
+        let mut active_stream_opened_tick = 0usize;
+        let mut active_stream_sent = false;
 
         topology.gs.announce_discovery().unwrap();
         topology.gw.announce_discovery().unwrap();
@@ -3245,6 +3264,49 @@ mod reliable_drop_tests {
                 }
             }
 
+            if tick >= 80
+                && tick % 20 == 0
+                && active_stream.is_none()
+                && let Ok(stream) = topology.gs.open_p2p_stream_to_hostname("AB", 8081, 49_155)
+            {
+                active_stream = Some(stream);
+                active_stream_opened_tick = tick;
+                active_stream_sent = false;
+            }
+
+            if tick >= 80
+                && !active_stream_sent
+                && tick.saturating_sub(active_stream_opened_tick) > 80
+                && let Some(stream) = active_stream.take()
+            {
+                let _ = topology.gs.reset_p2p_stream(stream);
+                active_stream_sent = false;
+            }
+
+            if tick >= 80
+                && tick % 16 == 0
+                && let Some(stream) = active_stream
+            {
+                let payload = format!("GET /stream/{issued_p2p_streams} HTTP/1.1\r\n\r\n");
+                if topology
+                    .gs
+                    .send_p2p_stream(stream, payload.as_bytes())
+                    .is_ok()
+                {
+                    issued_p2p_streams += 1;
+                    active_stream_sent = true;
+                }
+            }
+
+            if tick >= 160
+                && active_stream_sent
+                && tick % 160 == 120
+                && let Some(stream) = active_stream.take()
+            {
+                let _ = topology.gs.close_p2p_stream(stream);
+                active_stream_sent = false;
+            }
+
             if tick % 50 == 0 {
                 topology.gs.announce_discovery().unwrap();
                 topology.gw.announce_discovery().unwrap();
@@ -3355,6 +3417,11 @@ mod reliable_drop_tests {
         assert_eq!(gs_daq.address, topology.daq.current_address());
         assert!(issued_p2p_hostname > 0);
         assert!(issued_p2p_address > 0);
+        let p2p_stream_hits = p2p_stream_hits.lock().unwrap().clone();
+        assert!(
+            issued_p2p_streams > 0,
+            "P2P stream data was never issued; stream hits: {p2p_stream_hits:?}"
+        );
         let p2p_hits = p2p_hits.lock().unwrap().clone();
         assert!(
             p2p_hits
@@ -3373,6 +3440,18 @@ mod reliable_drop_tests {
                 .iter()
                 .any(|hit| hit.starts_with("DAQ:GS:49154:GET /samples/")),
             "dynamic-address P2P address service was not exercised: {p2p_hits:?}"
+        );
+        assert!(
+            p2p_stream_hits
+                .iter()
+                .any(|hit| hit.starts_with("Accepted:GS:49155:0:")),
+            "P2P stream accept was not exercised: {p2p_stream_hits:?}"
+        );
+        assert!(
+            p2p_stream_hits
+                .iter()
+                .any(|hit| hit.contains("GET /stream/")),
+            "P2P stream data was not exercised: {p2p_stream_hits:?}"
         );
 
         exercise_compact_side_transport_in_soak(topology.now.clone());

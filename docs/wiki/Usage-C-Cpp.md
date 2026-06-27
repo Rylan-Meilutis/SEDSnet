@@ -551,10 +551,19 @@ instead of IP:
 - `seds_router_send_p2p_to_address(...)`
 - `seds_router_current_address(...)`
 - `seds_router_resolve_hostname_address(...)`
+- `seds_router_bind_p2p_stream_port(...)`
+- `seds_router_open_p2p_stream_to_hostname(...)`
+- `seds_router_open_p2p_stream_to_address(...)`
+- `seds_router_send_p2p_stream(...)`
+- `seds_router_close_p2p_stream(...)`
+- `seds_router_reset_p2p_stream(...)`
 
 The callback receives a `SedsP2pMessageView` containing source hostname/address, source and
 destination ports, and opaque payload bytes. This is suitable for carrying protocols such as HTTP
 over SEDSnet links while normal telemetry data types continue to use endpoint broadcast routing.
+Stream callbacks receive `SedsP2pStreamEventView`, whose `kind` is one of
+`SEDS_P2P_STREAM_ACCEPTED`, `SEDS_P2P_STREAM_CONNECTED`, `SEDS_P2P_STREAM_DATA`,
+`SEDS_P2P_STREAM_CLOSED`, or `SEDS_P2P_STREAM_RESET`.
 
 ## Side reliability
 

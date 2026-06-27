@@ -368,6 +368,21 @@ pub struct SedsP2pMessageView {
     payload_len: usize,
 }
 
+#[repr(C)]
+pub struct SedsP2pStreamEventView {
+    kind: u8,
+    stream_id: u32,
+    peer_stream_id: u32,
+    sequence: u32,
+    peer_hostname: *const c_char,
+    peer_hostname_len: usize,
+    peer_address: u32,
+    local_port: u16,
+    peer_port: u16,
+    payload: *const u8,
+    payload_len: usize,
+}
+
 #[cfg(feature = "cryptography")]
 #[repr(C)]
 pub struct SedsManagedCredentialInfo {
@@ -389,6 +404,8 @@ type CEndpointHandler = Option<extern "C" fn(pkt: *const SedsPacketView, user: *
 type CPackedHandler = Option<extern "C" fn(bytes: *const u8, len: usize, user: *mut c_void) -> i32>;
 
 type CP2pHandler = Option<extern "C" fn(msg: *const SedsP2pMessageView, user: *mut c_void) -> i32>;
+type CP2pStreamHandler =
+    Option<extern "C" fn(event: *const SedsP2pStreamEventView, user: *mut c_void) -> i32>;
 
 /// C-facing endpoint descriptor (legacy, must match C header).
 #[repr(C)]
@@ -1571,6 +1588,148 @@ pub extern "C" fn seds_router_send_p2p_to_address(
     };
     let router = unsafe { &(*r).inner };
     ok_or_status(router.send_p2p_to_address(address, dst_port, src_port, payload))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_bind_p2p_stream_port(
+    r: *mut SedsRouter,
+    port: u16,
+    cb: CP2pStreamHandler,
+    user: *mut c_void,
+) -> i32 {
+    if r.is_null() || cb.is_none() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let cb_fn = cb.unwrap();
+    let user_addr = user as usize;
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.bind_p2p_stream_port(port, move |event| {
+        let kind = match event.kind {
+            crate::router::P2pStreamEventKind::Accepted => 1,
+            crate::router::P2pStreamEventKind::Connected => 2,
+            crate::router::P2pStreamEventKind::Data => 3,
+            crate::router::P2pStreamEventKind::Closed => 4,
+            crate::router::P2pStreamEventKind::Reset => 5,
+        };
+        let view = SedsP2pStreamEventView {
+            kind,
+            stream_id: event.stream_id,
+            peer_stream_id: event.peer_stream_id,
+            sequence: event.sequence,
+            peer_hostname: event.peer_hostname.as_ptr() as *const c_char,
+            peer_hostname_len: event.peer_hostname.len(),
+            peer_address: event.peer_address,
+            local_port: event.local_port,
+            peer_port: event.peer_port,
+            payload: event.payload.as_ptr(),
+            payload_len: event.payload.len(),
+        };
+        let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+        if code == status_from_result_code(SedsResult::SedsOk) {
+            Ok(())
+        } else {
+            Err(TelemetryError::Io("p2p stream handler error"))
+        }
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_clear_p2p_stream_port(r: *mut SedsRouter, port: u16) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.clear_p2p_stream_port(port);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_open_p2p_stream_to_hostname(
+    r: *mut SedsRouter,
+    hostname: *const c_char,
+    hostname_len: usize,
+    dst_port: u16,
+    src_port: u16,
+    out_stream_id: *mut u32,
+) -> i32 {
+    if r.is_null() || out_stream_id.is_null() || (hostname_len > 0 && hostname.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let hostname = if hostname_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(hostname), hostname_len) };
+        match from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let router = unsafe { &(*r).inner };
+    match router.open_p2p_stream_to_hostname(hostname, dst_port, src_port) {
+        Ok(stream_id) => {
+            unsafe { *out_stream_id = stream_id };
+            status_from_result_code(SedsResult::SedsOk)
+        }
+        Err(err) => status_from_err(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_open_p2p_stream_to_address(
+    r: *mut SedsRouter,
+    address: u32,
+    dst_port: u16,
+    src_port: u16,
+    out_stream_id: *mut u32,
+) -> i32 {
+    if r.is_null() || out_stream_id.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    match router.open_p2p_stream_to_address(address, dst_port, src_port) {
+        Ok(stream_id) => {
+            unsafe { *out_stream_id = stream_id };
+            status_from_result_code(SedsResult::SedsOk)
+        }
+        Err(err) => status_from_err(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_send_p2p_stream(
+    r: *mut SedsRouter,
+    stream_id: u32,
+    payload: *const u8,
+    payload_len: usize,
+) -> i32 {
+    if r.is_null() || (payload_len > 0 && payload.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let payload = if payload_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(payload, payload_len) }
+    };
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.send_p2p_stream(stream_id, payload))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_close_p2p_stream(r: *mut SedsRouter, stream_id: u32) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.close_p2p_stream(stream_id))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_reset_p2p_stream(r: *mut SedsRouter, stream_id: u32) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.reset_p2p_stream(stream_id))
 }
 
 #[cfg(feature = "timesync")]

@@ -36,6 +36,8 @@
       segmented networks reunite, notifying local code when local identity changes.
     - Applications can bind service ports and send opaque byte payloads by hostname or address,
       allowing protocols such as HTTP to ride over SEDSnet instead of IP.
+    - Service ports also support lightweight stream sessions with connect/accept/data/close/reset
+      events.
 - Metadata and memory:
     - Endpoints and data types now carry human-readable descriptions.
     - Runtime JSON accepts both `description` and legacy `doc`.

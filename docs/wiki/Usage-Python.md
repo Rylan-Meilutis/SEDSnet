@@ -256,6 +256,18 @@ client.send_p2p_to_address(0x10203040, 80, 49152, b"GET / HTTP/1.1\r\n\r\n")
 `router.current_address` returns the current compact address, and
 `router.resolve_hostname("name")` returns discovered address metadata when known.
 
+For byte protocols that need a session lifecycle, bind a stream port and open a stream:
+
+```python
+router.bind_p2p_stream_port(8080, lambda meta, payload: handle_stream(meta, payload))
+stream = client.open_p2p_stream_to_hostname("http-service", 8080, 49152)
+client.send_p2p_stream(stream, b"GET /stream HTTP/1.1\r\n\r\n")
+client.close_p2p_stream(stream)
+```
+
+The stream callback receives a metadata dictionary with `kind`, `stream_id`, `peer_stream_id`,
+`sequence`, `peer_hostname`, `peer_address`, `local_port`, and `peer_port`.
+
 ## Time sync
 
 When built with `timesync`, `Router` keeps an internal network clock and handles `SEDSNET_TIME_SYNC`

@@ -1130,6 +1130,15 @@ pub enum RouterE2eEncryptionMode {
 
 pub type NodeAddress = u32;
 pub type P2pPort = u16;
+pub type P2pStreamId = u32;
+
+const P2P_STREAM_MAGIC: [u8; 4] = *b"SDSP";
+const P2P_STREAM_VERSION: u8 = 1;
+const P2P_STREAM_SYN: u8 = 0x01;
+const P2P_STREAM_ACK: u8 = 0x02;
+const P2P_STREAM_FIN: u8 = 0x04;
+const P2P_STREAM_RST: u8 = 0x08;
+const P2P_STREAM_DATA: u8 = 0x10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressAssignmentMode {
@@ -1193,11 +1202,41 @@ pub struct P2pMessage<'a> {
     pub payload: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2pStreamEventKind {
+    Accepted,
+    Connected,
+    Data,
+    Closed,
+    Reset,
+}
+
+pub struct P2pStreamEvent<'a> {
+    pub kind: P2pStreamEventKind,
+    pub stream_id: P2pStreamId,
+    pub peer_stream_id: P2pStreamId,
+    pub sequence: u32,
+    pub peer_hostname: &'a str,
+    pub peer_address: NodeAddress,
+    pub local_port: P2pPort,
+    pub peer_port: P2pPort,
+    pub payload: &'a [u8],
+}
+
 struct P2pDecoded<'a> {
     source_hostname: &'a str,
     source_address: NodeAddress,
     source_port: P2pPort,
     destination_port: P2pPort,
+    payload: &'a [u8],
+}
+
+#[derive(Debug, Clone)]
+struct P2pStreamDecoded<'a> {
+    flags: u8,
+    source_stream_id: P2pStreamId,
+    destination_stream_id: P2pStreamId,
+    sequence: u32,
     payload: &'a [u8],
 }
 
@@ -1225,6 +1264,42 @@ impl Debug for P2pPortHandler {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("P2pPortHandler(<handler>)")
     }
+}
+
+type P2pStreamHandlerFn = dyn Fn(P2pStreamEvent<'_>) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct P2pStreamHandler {
+    handler: Arc<P2pStreamHandlerFn>,
+}
+
+impl Debug for P2pStreamHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("P2pStreamHandler(<handler>)")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct P2pStreamSession {
+    peer_hostname: Arc<str>,
+    peer_address: NodeAddress,
+    local_port: P2pPort,
+    peer_port: P2pPort,
+    peer_stream_id: P2pStreamId,
+    next_sequence: u32,
+    connected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingP2pStreamEvent {
+    handlers: Vec<P2pStreamHandler>,
+    kind: P2pStreamEventKind,
+    stream_id: P2pStreamId,
+    peer_stream_id: P2pStreamId,
+    peer_hostname: Arc<str>,
+    peer_address: NodeAddress,
+    local_port: P2pPort,
+    peer_port: P2pPort,
 }
 
 #[derive(Debug, Clone)]
@@ -1550,6 +1625,9 @@ struct RouterInner {
     address_book: BTreeMap<String, AddressBookEntry>,
     address_by_value: BTreeMap<NodeAddress, String>,
     p2p_port_handlers: BTreeMap<P2pPort, Vec<P2pPortHandler>>,
+    p2p_stream_handlers: BTreeMap<P2pPort, Vec<P2pStreamHandler>>,
+    p2p_stream_sessions: BTreeMap<P2pStreamId, P2pStreamSession>,
+    next_p2p_stream_id: P2pStreamId,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     recent_rx: BoundedDeque<u64>,
@@ -2987,11 +3065,79 @@ impl Router {
         })
     }
 
+    fn encode_p2p_stream_payload(
+        flags: u8,
+        source_stream_id: P2pStreamId,
+        destination_stream_id: P2pStreamId,
+        sequence: u32,
+        payload: &[u8],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| TelemetryError::Pack("p2p stream payload too long"))?;
+        let mut out = Vec::with_capacity(22usize.saturating_add(payload.len()));
+        out.extend_from_slice(&P2P_STREAM_MAGIC);
+        out.push(P2P_STREAM_VERSION);
+        out.push(flags);
+        out.extend_from_slice(&source_stream_id.to_le_bytes());
+        out.extend_from_slice(&destination_stream_id.to_le_bytes());
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(payload);
+        Ok(out.into())
+    }
+
+    fn decode_p2p_stream_payload<'a>(
+        payload: &'a [u8],
+    ) -> TelemetryResult<Option<P2pStreamDecoded<'a>>> {
+        if !payload.starts_with(&P2P_STREAM_MAGIC) {
+            return Ok(None);
+        }
+        if payload.len() < 22 {
+            return Err(TelemetryError::Unpack("p2p stream frame short"));
+        }
+        if payload[4] != P2P_STREAM_VERSION {
+            return Err(TelemetryError::Unpack("p2p stream frame version"));
+        }
+        let flags = payload[5];
+        let source_stream_id =
+            u32::from_le_bytes(payload[6..10].try_into().expect("stream source id"));
+        let destination_stream_id =
+            u32::from_le_bytes(payload[10..14].try_into().expect("stream destination id"));
+        let sequence = u32::from_le_bytes(payload[14..18].try_into().expect("stream sequence"));
+        let body_len =
+            u32::from_le_bytes(payload[18..22].try_into().expect("stream body len")) as usize;
+        let body_end = 22usize.saturating_add(body_len);
+        if body_end != payload.len() {
+            return Err(TelemetryError::Unpack("p2p stream frame length"));
+        }
+        Ok(Some(P2pStreamDecoded {
+            flags,
+            source_stream_id,
+            destination_stream_id,
+            sequence,
+            payload: &payload[22..],
+        }))
+    }
+
+    fn allocate_p2p_stream_id_locked(st: &mut RouterInner) -> P2pStreamId {
+        for _ in 0..u32::MAX {
+            let id = st.next_p2p_stream_id.max(1);
+            st.next_p2p_stream_id = st.next_p2p_stream_id.wrapping_add(1).max(1);
+            if !st.p2p_stream_sessions.contains_key(&id) {
+                return id;
+            }
+        }
+        0
+    }
+
     fn dispatch_p2p_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
         if pkt.data_type() != DataType::P2pMessage {
             return Ok(());
         }
         let decoded = Self::decode_p2p_payload(pkt.payload())?;
+        if let Some(stream) = Self::decode_p2p_stream_payload(decoded.payload)? {
+            return self.dispatch_p2p_stream_frame(&decoded, &stream);
+        }
         let handlers = {
             let st = self.state.lock();
             st.p2p_port_handlers
@@ -3007,6 +3153,172 @@ impl Router {
                 destination_port: decoded.destination_port,
                 payload: decoded.payload,
             })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_p2p_stream_frame(
+        &self,
+        msg: &P2pDecoded<'_>,
+        frame: &P2pStreamDecoded<'_>,
+    ) -> TelemetryResult<()> {
+        let mut events: Vec<PendingP2pStreamEvent> = Vec::new();
+        let mut reply: Option<(AddressBookEntry, P2pPort, P2pPort, Arc<[u8]>)> = None;
+        {
+            let mut st = self.state.lock();
+            if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK == 0 {
+                let peer_hostname: Arc<str> = Arc::from(msg.source_hostname);
+                let existing_id = st.p2p_stream_sessions.iter().find_map(|(id, session)| {
+                    (session.peer_stream_id == frame.source_stream_id
+                        && session.local_port == msg.destination_port
+                        && session.peer_port == msg.source_port
+                        && session.peer_address == msg.source_address
+                        && session.peer_hostname.as_ref() == msg.source_hostname)
+                        .then_some(*id)
+                });
+                let local_id = if let Some(local_id) = existing_id {
+                    local_id
+                } else {
+                    let local_id = Self::allocate_p2p_stream_id_locked(&mut st);
+                    if local_id == 0 {
+                        return Err(TelemetryError::Io("p2p stream id exhausted"));
+                    }
+                    st.p2p_stream_sessions.insert(
+                        local_id,
+                        P2pStreamSession {
+                            peer_hostname: peer_hostname.clone(),
+                            peer_address: msg.source_address,
+                            local_port: msg.destination_port,
+                            peer_port: msg.source_port,
+                            peer_stream_id: frame.source_stream_id,
+                            next_sequence: 1,
+                            connected: true,
+                        },
+                    );
+                    let handlers = st
+                        .p2p_stream_handlers
+                        .get(&msg.destination_port)
+                        .cloned()
+                        .unwrap_or_default();
+                    events.push(PendingP2pStreamEvent {
+                        handlers,
+                        kind: P2pStreamEventKind::Accepted,
+                        stream_id: local_id,
+                        peer_stream_id: frame.source_stream_id,
+                        peer_hostname: peer_hostname.clone(),
+                        peer_address: msg.source_address,
+                        local_port: msg.destination_port,
+                        peer_port: msg.source_port,
+                    });
+                    local_id
+                };
+                let dst =
+                    st.address_book
+                        .get(msg.source_hostname)
+                        .cloned()
+                        .unwrap_or(AddressBookEntry {
+                            hostname: peer_hostname,
+                            address: msg.source_address,
+                            requested_address: msg.source_address,
+                            mode: AddressAssignmentMode::Dynamic,
+                            birth_ms: self.clock.now_ms(),
+                            owner_hash: Self::sender_hash(msg.source_hostname),
+                            last_seen_ms: self.clock.now_ms(),
+                        });
+                let payload = Self::encode_p2p_stream_payload(
+                    P2P_STREAM_SYN | P2P_STREAM_ACK,
+                    local_id,
+                    frame.source_stream_id,
+                    0,
+                    &[],
+                )?;
+                reply = Some((dst, msg.source_port, msg.destination_port, payload));
+            } else if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK != 0 {
+                if let Some(session) = st.p2p_stream_sessions.get_mut(&frame.destination_stream_id)
+                {
+                    session.peer_stream_id = frame.source_stream_id;
+                    session.connected = true;
+                    let peer_hostname = session.peer_hostname.clone();
+                    let peer_address = session.peer_address;
+                    let local_port = session.local_port;
+                    let peer_port = session.peer_port;
+                    let handlers = st
+                        .p2p_stream_handlers
+                        .get(&local_port)
+                        .cloned()
+                        .unwrap_or_default();
+                    events.push(PendingP2pStreamEvent {
+                        handlers,
+                        kind: P2pStreamEventKind::Connected,
+                        stream_id: frame.destination_stream_id,
+                        peer_stream_id: frame.source_stream_id,
+                        peer_hostname,
+                        peer_address,
+                        local_port,
+                        peer_port,
+                    });
+                }
+            } else if frame.flags & (P2P_STREAM_FIN | P2P_STREAM_RST | P2P_STREAM_DATA) != 0 {
+                let kind = if frame.flags & P2P_STREAM_RST != 0 {
+                    P2pStreamEventKind::Reset
+                } else if frame.flags & P2P_STREAM_FIN != 0 {
+                    P2pStreamEventKind::Closed
+                } else {
+                    P2pStreamEventKind::Data
+                };
+                let session_id = if frame.destination_stream_id != 0 {
+                    Some(frame.destination_stream_id)
+                } else {
+                    st.p2p_stream_sessions.iter().find_map(|(id, session)| {
+                        (session.peer_stream_id == frame.source_stream_id
+                            && session.local_port == msg.destination_port
+                            && session.peer_port == msg.source_port
+                            && session.peer_address == msg.source_address
+                            && session.peer_hostname.as_ref() == msg.source_hostname)
+                            .then_some(*id)
+                    })
+                };
+                if let Some(session_id) = session_id
+                    && let Some(session) = st.p2p_stream_sessions.get(&session_id)
+                {
+                    let handlers = st
+                        .p2p_stream_handlers
+                        .get(&session.local_port)
+                        .cloned()
+                        .unwrap_or_default();
+                    events.push(PendingP2pStreamEvent {
+                        handlers,
+                        kind,
+                        stream_id: session_id,
+                        peer_stream_id: frame.source_stream_id,
+                        peer_hostname: session.peer_hostname.clone(),
+                        peer_address: session.peer_address,
+                        local_port: session.local_port,
+                        peer_port: session.peer_port,
+                    });
+                    if matches!(kind, P2pStreamEventKind::Closed | P2pStreamEventKind::Reset) {
+                        st.p2p_stream_sessions.remove(&session_id);
+                    }
+                }
+            }
+        }
+        if let Some((dst, dst_port, src_port, payload)) = reply {
+            self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+        }
+        for pending in events {
+            for handler in pending.handlers {
+                (handler.handler)(P2pStreamEvent {
+                    kind: pending.kind,
+                    stream_id: pending.stream_id,
+                    peer_stream_id: pending.peer_stream_id,
+                    sequence: frame.sequence,
+                    peer_hostname: pending.peer_hostname.as_ref(),
+                    peer_address: pending.peer_address,
+                    local_port: pending.local_port,
+                    peer_port: pending.peer_port,
+                    payload: frame.payload,
+                })?;
+            }
         }
         Ok(())
     }
@@ -6762,6 +7074,9 @@ impl Router {
                 address_book,
                 address_by_value,
                 p2p_port_handlers: BTreeMap::new(),
+                p2p_stream_handlers: BTreeMap::new(),
+                p2p_stream_sessions: BTreeMap::new(),
+                next_p2p_stream_id: 1,
                 received_queue: BoundedDeque::new(
                     MAX_QUEUE_BUDGET,
                     STARTING_QUEUE_SIZE,
@@ -6857,6 +7172,27 @@ impl Router {
         self.state.lock().p2p_port_handlers.remove(&port);
     }
 
+    pub fn bind_p2p_stream_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>
+    where
+        F: Fn(P2pStreamEvent<'_>) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        if port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let mut st = self.state.lock();
+        st.p2p_stream_handlers
+            .entry(port)
+            .or_default()
+            .push(P2pStreamHandler {
+                handler: Arc::new(f),
+            });
+        Ok(())
+    }
+
+    pub fn clear_p2p_stream_port(&self, port: P2pPort) {
+        self.state.lock().p2p_stream_handlers.remove(&port);
+    }
+
     fn send_p2p_to_entry(
         &self,
         dst: AddressBookEntry,
@@ -6915,6 +7251,124 @@ impl Router {
             .resolve_address(address)
             .ok_or(TelemetryError::BadArg)?;
         self.send_p2p_to_entry(dst, dst_port, src_port, payload)
+    }
+
+    fn open_p2p_stream_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+    ) -> TelemetryResult<P2pStreamId> {
+        if dst_port == 0 || src_port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let stream_id = {
+            let mut st = self.state.lock();
+            let stream_id = Self::allocate_p2p_stream_id_locked(&mut st);
+            if stream_id == 0 {
+                return Err(TelemetryError::Io("p2p stream id exhausted"));
+            }
+            st.p2p_stream_sessions.insert(
+                stream_id,
+                P2pStreamSession {
+                    peer_hostname: dst.hostname.clone(),
+                    peer_address: dst.address,
+                    local_port: src_port,
+                    peer_port: dst_port,
+                    peer_stream_id: 0,
+                    next_sequence: 1,
+                    connected: false,
+                },
+            );
+            stream_id
+        };
+        let payload = Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+        Ok(stream_id)
+    }
+
+    pub fn open_p2p_stream_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+    ) -> TelemetryResult<P2pStreamId> {
+        let dst = self
+            .resolve_hostname(hostname)
+            .ok_or(TelemetryError::BadArg)?;
+        self.open_p2p_stream_to_entry(dst, dst_port, src_port)
+    }
+
+    pub fn open_p2p_stream_to_address(
+        &self,
+        address: NodeAddress,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+    ) -> TelemetryResult<P2pStreamId> {
+        let dst = self
+            .resolve_address(address)
+            .ok_or(TelemetryError::BadArg)?;
+        self.open_p2p_stream_to_entry(dst, dst_port, src_port)
+    }
+
+    fn send_p2p_stream_control(
+        &self,
+        stream_id: P2pStreamId,
+        flags: u8,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        let (dst, dst_port, src_port, peer_stream_id, seq, refresh_syn) = {
+            let mut st = self.state.lock();
+            let Some(session) = st.p2p_stream_sessions.get_mut(&stream_id) else {
+                return Err(TelemetryError::BadArg);
+            };
+            let peer_hostname = session.peer_hostname.clone();
+            let peer_address = session.peer_address;
+            let peer_port = session.peer_port;
+            let local_port = session.local_port;
+            let peer_stream_id = session.peer_stream_id;
+            let refresh_syn = peer_stream_id == 0 && flags & P2P_STREAM_SYN == 0;
+            let seq = session.next_sequence;
+            session.next_sequence = session.next_sequence.wrapping_add(1).max(1);
+            let dst = st
+                .address_book
+                .get(peer_hostname.as_ref())
+                .cloned()
+                .unwrap_or(AddressBookEntry {
+                    hostname: peer_hostname.clone(),
+                    address: peer_address,
+                    requested_address: peer_address,
+                    mode: AddressAssignmentMode::Dynamic,
+                    birth_ms: self.clock.now_ms(),
+                    owner_hash: Self::sender_hash(peer_hostname.as_ref()),
+                    last_seen_ms: self.clock.now_ms(),
+                });
+            (dst, peer_port, local_port, peer_stream_id, seq, refresh_syn)
+        };
+        if refresh_syn {
+            let syn_payload =
+                Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
+            self.send_p2p_to_entry(dst.clone(), dst_port, src_port, &syn_payload)?;
+        }
+        let stream_payload =
+            Self::encode_p2p_stream_payload(flags, stream_id, peer_stream_id, seq, payload)?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, &stream_payload)?;
+        if flags & (P2P_STREAM_FIN | P2P_STREAM_RST) != 0 {
+            self.state.lock().p2p_stream_sessions.remove(&stream_id);
+        }
+        Ok(())
+    }
+
+    pub fn send_p2p_stream(&self, stream_id: P2pStreamId, payload: &[u8]) -> TelemetryResult<()> {
+        self.send_p2p_stream_control(stream_id, P2P_STREAM_DATA, payload)
+    }
+
+    pub fn close_p2p_stream(&self, stream_id: P2pStreamId) -> TelemetryResult<()> {
+        self.send_p2p_stream_control(stream_id, P2P_STREAM_FIN, &[])
+    }
+
+    pub fn reset_p2p_stream(&self, stream_id: P2pStreamId) -> TelemetryResult<()> {
+        self.send_p2p_stream_control(stream_id, P2P_STREAM_RST, &[])
     }
 
     pub fn set_sender<S: AsRef<str>>(&self, sender: S) {

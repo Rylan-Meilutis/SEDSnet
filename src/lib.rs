@@ -10,27 +10,26 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unused_doc_comments)]
-//! Crate root: common telemetry types, error codes, and feature-gated glue.
+//! SEDSnet is a compact networking stack for embedded and host telemetry systems.
 //!
-//! This module:
-//! - Sets up `no_std` vs `std` behavior.
-//! - Provides an embedded allocator / panic handler when targeting bare metal.
-//! - Re-exports core telemetry configuration and metadata helpers
-//!   (`MessageElementCount`, `MessageMeta`, `TelemetryError`, etc.).
-//! - Wires in the C and Python FFI layers (`c_api`, `python_api`).
+//! It provides runtime schema registration, compact packet packing, discovery-driven routing,
+//! reliable delivery, managed state synchronization, time synchronization, P2P service ports and
+//! streams, optional E2E payload cryptography, and C/Python bindings.
 //!
 //! Most user-facing APIs live in:
 //! - [`config`]: schema + data type/endpoint configuration.
-//! - [`router`]: the core Router abstraction.
+//! - [`router`]: routers, relays, sides, discovery, routing policy, P2P, and managed variables.
 //! - [`packet`]: `Packet` and friends.
-//! - [`wire_format`]: packet wire-format packing and unpacking helpers.
 //! - [`wire_format`]: packet packing, unpacking, and wire inspection helpers.
 //!
 //! Version 4.0.0 highlights:
 //! - Telemetry endpoints and data types are runtime IDs with process-local registry metadata.
 //! - The build no longer reads `telemetry_config.json` or generates schema-specific Rust enums.
 //! - A JSON schema can still seed the runtime registry with `SEDSNET_STATIC_SCHEMA_PATH`.
-//! - Nodes can export known endpoints/types and register new ones over time.
+//! - Nodes can export known endpoints/types, sync schemas through discovery, and register new
+//!   schema entries over time.
+//! - Discovery assigns compact node addresses and hostnames for P2P service traffic while
+//!   broadcast endpoint telemetry continues to use endpoint subscriptions.
 
 extern crate alloc;
 extern crate core;

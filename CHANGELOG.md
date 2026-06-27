@@ -30,6 +30,9 @@
   notify local code when identity changes. Applications can bind a SEDSnet service port and send
   opaque byte payloads to a hostname or address, enabling protocols such as HTTP to run over
   SEDSnet instead of IP while normal endpoint broadcast telemetry remains unchanged.
+- Added lightweight P2P stream sessions on top of service ports. Streams exchange local/peer stream
+  IDs and expose connect/accept/data/close/reset events while continuing to use discovery-targeted
+  ordered `SEDSNET_P2P_MESSAGE` frames.
 - Added end-to-end payload encryption policy hooks under the `cryptography` feature:
     - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn`.
     - Routers can run in `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll` mode.

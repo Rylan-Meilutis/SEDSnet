@@ -1208,6 +1208,114 @@ impl PyRouter {
         Ok(())
     }
 
+    fn bind_p2p_stream_port(
+        &mut self,
+        py: Python<'_>,
+        port: u16,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        let cb_keep = callback.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.bind_p2p_stream_port(port, move |event| {
+            Python::attach(|py| {
+                let meta = PyDict::new(py);
+                meta.set_item("kind", format!("{:?}", event.kind))
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("stream_id", event.stream_id)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_stream_id", event.peer_stream_id)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("sequence", event.sequence)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_hostname", event.peer_hostname)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_address", event.peer_address)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("local_port", event.local_port)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_port", event.peer_port)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                let payload = PyBytes::new(py, event.payload);
+                match cb_for_closure.call1(py, (&meta, &payload)) {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        err.restore(py);
+                        Err(TelemetryError::Io("p2p stream handler error"))
+                    }
+                }
+            })
+        })
+        .map_err(py_err_from)?;
+        self._p2p_cbs.push(cb_keep);
+        Ok(())
+    }
+
+    fn clear_p2p_stream_port(&self, port: u16) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.clear_p2p_stream_port(port);
+        Ok(())
+    }
+
+    fn open_p2p_stream_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: u16,
+        src_port: u16,
+    ) -> PyResult<u32> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.open_p2p_stream_to_hostname(hostname, dst_port, src_port)
+            .map_err(py_err_from)
+    }
+
+    fn open_p2p_stream_to_address(
+        &self,
+        address: u32,
+        dst_port: u16,
+        src_port: u16,
+    ) -> PyResult<u32> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.open_p2p_stream_to_address(address, dst_port, src_port)
+            .map_err(py_err_from)
+    }
+
+    fn send_p2p_stream(&self, stream_id: u32, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes: &[u8] = payload.extract()?;
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.send_p2p_stream(stream_id, bytes).map_err(py_err_from)
+    }
+
+    fn close_p2p_stream(&self, stream_id: u32) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.close_p2p_stream(stream_id).map_err(py_err_from)
+    }
+
+    fn reset_p2p_stream(&self, stream_id: u32) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.reset_p2p_stream(stream_id).map_err(py_err_from)
+    }
+
     // ------------------------------------------------------------------------
     //  Side registration
     // ------------------------------------------------------------------------

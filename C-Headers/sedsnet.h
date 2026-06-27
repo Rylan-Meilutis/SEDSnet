@@ -180,6 +180,27 @@ typedef struct SedsP2pMessageView
     size_t payload_len;
 } SedsP2pMessageView;
 
+#define SEDS_P2P_STREAM_ACCEPTED 1U
+#define SEDS_P2P_STREAM_CONNECTED 2U
+#define SEDS_P2P_STREAM_DATA 3U
+#define SEDS_P2P_STREAM_CLOSED 4U
+#define SEDS_P2P_STREAM_RESET 5U
+
+typedef struct SedsP2pStreamEventView
+{
+    uint8_t kind;
+    uint32_t stream_id;
+    uint32_t peer_stream_id;
+    uint32_t sequence;
+    const char * peer_hostname;
+    size_t peer_hostname_len;
+    uint32_t peer_address;
+    uint16_t local_port;
+    uint16_t peer_port;
+    const uint8_t * payload;
+    size_t payload_len;
+} SedsP2pStreamEventView;
+
 typedef struct SedsEndpointInfo
 {
     bool exists;
@@ -260,6 +281,8 @@ typedef SedsResult (* SedsEndpointHandlerFn)(const SedsPacketView * pkt, void * 
 typedef SedsResult (* SedsPackedHandlerFn)(const uint8_t * bytes, size_t len, void * user);
 
 typedef SedsResult (* SedsP2pHandlerFn)(const SedsP2pMessageView * msg, void * user);
+
+typedef SedsResult (* SedsP2pStreamHandlerFn)(const SedsP2pStreamEventView * event, void * user);
 
 typedef struct SedsLocalEndpointDesc
 {
@@ -396,6 +419,28 @@ SedsResult seds_router_send_p2p_to_address(SedsRouter * r,
                                            uint16_t src_port,
                                            const uint8_t * payload,
                                            size_t payload_len);
+SedsResult seds_router_bind_p2p_stream_port(SedsRouter * r,
+                                            uint16_t port,
+                                            SedsP2pStreamHandlerFn cb,
+                                            void * user);
+SedsResult seds_router_clear_p2p_stream_port(SedsRouter * r, uint16_t port);
+SedsResult seds_router_open_p2p_stream_to_hostname(SedsRouter * r,
+                                                   const char * hostname,
+                                                   size_t hostname_len,
+                                                   uint16_t dst_port,
+                                                   uint16_t src_port,
+                                                   uint32_t * out_stream_id);
+SedsResult seds_router_open_p2p_stream_to_address(SedsRouter * r,
+                                                  uint32_t address,
+                                                  uint16_t dst_port,
+                                                  uint16_t src_port,
+                                                  uint32_t * out_stream_id);
+SedsResult seds_router_send_p2p_stream(SedsRouter * r,
+                                       uint32_t stream_id,
+                                       const uint8_t * payload,
+                                       size_t payload_len);
+SedsResult seds_router_close_p2p_stream(SedsRouter * r, uint32_t stream_id);
+SedsResult seds_router_reset_p2p_stream(SedsRouter * r, uint32_t stream_id);
 
 /**
  * @brief Read the router's current internally-synthesized network time in Unix milliseconds.

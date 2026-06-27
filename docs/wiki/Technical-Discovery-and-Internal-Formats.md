@@ -258,9 +258,39 @@ destination address or hostname is not repeated inside the P2P payload.
 [payload: payload_len]
 ```
 
-Routers dispatch the decoded payload to handlers registered with `bind_p2p_port(...)`. Senders can
-target by discovered hostname or by current node address. Hostname targeting survives address
+Routers dispatch normal decoded payloads to handlers registered with `bind_p2p_port(...)`. Senders
+can target by discovered hostname or by current node address. Hostname targeting survives address
 changes because the router resolves the current address book entry before sending.
+
+### P2P Stream Payload
+
+If the P2P payload begins with `SDSP`, it is consumed by the stream/session layer instead of normal
+datagram handlers.
+
+```text
+[magic: "SDSP"]
+[version: u8]                     // current: 1
+[flags: u8]
+[source_stream_id: u32 LE]
+[destination_stream_id: u32 LE]
+[sequence: u32 LE]
+[payload_len: u32 LE]
+[payload: payload_len]
+```
+
+Stream flags:
+
+| Mask | Meaning |
+| --- | --- |
+| `0x01` | SYN/open |
+| `0x02` | ACK/open accepted |
+| `0x04` | FIN/close |
+| `0x08` | reset |
+| `0x10` | data |
+
+The outer P2P message still carries source hostname/address and source/destination ports. Stream
+IDs are local to each endpoint; the SYN/ACK frame exchanges the peer stream IDs used for later data,
+close, and reset frames.
 
 ## Managed Variable Control
 

@@ -16,6 +16,7 @@ Start here:
 ## How-to guides
 
 - docs/wiki/Build-and-Configure.md
+- docs/wiki/Release-Checklist.md
 - docs/wiki/Usage-Rust.md
 - docs/wiki/Usage-C-Cpp.md
 - docs/wiki/Usage-Python.md

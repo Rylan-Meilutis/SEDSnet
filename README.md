@@ -1,8 +1,12 @@
 # SEDSnet
 
-A Rust networking stack with compact packets, runtime schema, discovery, routing,
-reliability, managed state sync, optional E2E payload cryptography, and C/Python bindings build for use in distributed 
-embedded and non embedded systems.
+A Rust networking stack with compact packets, runtime schema, discovery, routing, reliability,
+managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
+bindings for distributed embedded and host systems.
+
+Crate API docs are published on [docs.rs](https://docs.rs/SEDSnet). The implementation-level wiki,
+including wire/discovery formats and binding guides, is mirrored in
+[docs/wiki](./docs/wiki/Home.md) and on the project wiki.
 
 ---
 
@@ -73,9 +77,10 @@ time-sliced radio links available for user payloads.
 
 Discovery also assigns and advertises compact node addresses and hostnames for point-to-point
 service traffic. A router can bind a SEDSnet service port and receive opaque byte payloads targeted
-by hostname or address, so protocols such as HTTP can be carried over SEDSnet links without IP
-being the underlying transport. Broadcast endpoint delivery remains available for telemetry data
-types; P2P service frames use discovery identity and ports for board-to-board traffic.
+by hostname or address, or open a P2P stream with connect/accept/data/close events. Protocols such
+as HTTP can be carried over SEDSnet links without IP being the underlying transport. Broadcast
+endpoint delivery remains available for telemetry data types; P2P service frames use discovery
+identity and ports for board-to-board traffic.
 
 Queue memory is bounded by the compile-time `MAX_QUEUE_BUDGET`. Router and relay internals share that budget
 dynamically across RX work, TX work, reliable replay/out-of-order buffers, recent packet ID tracking, and learned
@@ -120,6 +125,8 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
 - C and Python expose matching schema register/info/info-by-name/remove APIs.
 - Managed network variables let restarted boards request the latest cached state through normal
   endpoint handlers, and update callbacks can run when an inbound network update changes the cache.
+- Discovery-backed P2P service ports support datagrams and lightweight stream sessions with
+  connect/accept/data/close/reset events for byte protocols that need board-to-board sessions.
 - End-to-end payload cryptography is enabled by default and can be preferred or required per data type;
   routers choose whether to encrypt required, preferred, or all user data.
 - Crypto providers can be supplied as C callbacks, Rust providers, or registered software fallback

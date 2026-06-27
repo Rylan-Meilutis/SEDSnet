@@ -2,6 +2,13 @@
 name = "sedsnet_macros"
 version = "2.0.0"
 edition = "2024"
+authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
+description = "Compile-time helper macros for SEDSnet embedded configuration."
+license = "GPL-2.0-only"
+repository = "https://github.com/rylan-meilutis/SEDSnet"
+documentation = "https://docs.rs/sedsnet_macros"
+keywords = ["telemetry", "networking", "embedded", "proc-macro"]
+categories = ["embedded", "no-std"]
 
 [lib]
 proc-macro = true
@@ -12,4 +19,3 @@ quote = "1.0.45"
 syn = { version = "2.0.117", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-
