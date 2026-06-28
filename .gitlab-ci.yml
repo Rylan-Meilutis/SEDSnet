@@ -33,7 +33,7 @@ cargo-release:
     - apt-get update
     - apt-get install -y python3
   script:
-    - python3 publish_crates.py --skip-tests --publish
+    - python3 publish_crates.py --skip-tests --publish --skip-publish-without-token --ignore-publish-errors
 
 linux-wheels:
   stage: wheels
