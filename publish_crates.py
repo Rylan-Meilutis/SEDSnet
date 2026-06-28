@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -52,6 +53,18 @@ def run(
     shown = display_cmd if display_cmd is not None else cmd
     print(f"\n$ {' '.join(shown)}", flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
+
+
+def run_optional(cmd: list[str], *, display_cmd: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+    shown = display_cmd if display_cmd is not None else cmd
+    print(f"\n$ {' '.join(shown)}", flush=True)
+    return subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
 
 
 def capture(cmd: list[str]) -> str:
@@ -137,6 +150,11 @@ def cargo_publish(
     allow_dirty: bool,
     token: str | None,
 ) -> None:
+    crate_name, crate_version = manifest_package(manifest)
+    if publish and crate_version_exists(crate_name, crate_version):
+        print(f"\n{crate_name} v{crate_version} is already on crates.io; skipping upload.")
+        return
+
     cmd = ["cargo", "publish", "--manifest-path", str(manifest)]
     if not publish:
         cmd.append("--dry-run")
@@ -144,7 +162,18 @@ def cargo_publish(
         cmd.append("--allow-dirty")
     if token:
         cmd.extend(["--token", token])
-    run(cmd)
+    if not publish:
+        run(cmd)
+        return
+
+    result = run_optional(cmd)
+    print(result.stdout, end="")
+    if result.returncode == 0:
+        return
+    if is_already_published_output(result.stdout):
+        print(f"\n{crate_name} v{crate_version} was already published; continuing.")
+        return
+    raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
 
 
 def maturin_build() -> None:
@@ -278,12 +307,43 @@ def local_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
         )
 
 
+def macos_linker_prefix(target: str) -> str:
+    if target == "x86_64-apple-darwin":
+        return "x86_64-apple-darwin21.4"
+    if target == "aarch64-apple-darwin":
+        return "aarch64-apple-darwin21.4"
+    raise SystemExit(f"No configured macOS linker prefix for target {target}")
+
+
 def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
     require_tool("docker")
     for target in targets:
         image = MACOS_DOCKER_IMAGES.get(target)
         if image is None:
             raise SystemExit(f"No configured macOS Docker image for target {target}")
+        linker_prefix = macos_linker_prefix(target)
+        rustflags = (
+            "-C link-arg=-undefined "
+            "-C link-arg=dynamic_lookup"
+        )
+        shell_cmd = (
+            "set -e; "
+            "export PATH=/opt/osxcross/bin:$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH; "
+            "apt-get update >/dev/null; "
+            "apt-get install -y python3-pip curl ca-certificates >/dev/null; "
+            "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal >/tmp/rustup.log; "
+            "source $HOME/.cargo/env; "
+            "python3 -m pip install maturin >/dev/null; "
+            f"cd /io; rustup target add {shlex.quote(target)}; "
+            f"export CC_{target.replace('-', '_')}={shlex.quote(linker_prefix + '-clang')}; "
+            f"export CXX_{target.replace('-', '_')}={shlex.quote(linker_prefix + '-clang++')}; "
+            f"export AR_{target.replace('-', '_')}={shlex.quote(linker_prefix + '-ar')}; "
+            f"export CARGO_TARGET_{target.replace('-', '_').upper()}_LINKER={shlex.quote(linker_prefix + '-clang')}; "
+            f"export CARGO_TARGET_{target.replace('-', '_').upper()}_AR={shlex.quote(linker_prefix + '-ar')}; "
+            f"export CARGO_TARGET_{target.replace('-', '_').upper()}_RUSTFLAGS={shlex.quote(rustflags)}; "
+            "maturin build --release --compatibility pypi "
+            f"--out {shlex.quote(out_dir)} --target {shlex.quote(target)}"
+        )
         try:
             run(
                 [
@@ -295,8 +355,7 @@ def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
                     image,
                     "bash",
                     "-lc",
-                    "cd /io && (python3 -m pip install maturin || pip3 install maturin) && "
-                    f"maturin build --release --compatibility pypi --out {out_dir} --target {target}",
+                    shell_cmd,
                 ]
             )
         except subprocess.CalledProcessError:
@@ -327,24 +386,55 @@ def maturin_publish(
         idx = display_cmd.index("--password")
         if idx + 1 < len(display_cmd):
             display_cmd[idx + 1] = "<redacted>"
-    run(cmd, display_cmd=display_cmd)
+    result = run_optional(cmd, display_cmd=display_cmd)
+    print(result.stdout, end="")
+    if result.returncode == 0:
+        return
+    if skip_existing and is_already_published_output(result.stdout):
+        print("\nPyPI artifacts already exist; continuing.")
+        return
+    raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+
+
+def cargo_search_output(crate_name: str) -> str:
+    return capture(["cargo", "search", crate_name, "--limit", "10"])
 
 
 def cargo_search(crate_name: str) -> bool:
     try:
-        out = capture(["cargo", "search", crate_name, "--limit", "5"])
+        out = cargo_search_output(crate_name)
     except subprocess.CalledProcessError:
         return False
     needle = f"{crate_name} ="
     return any(line.startswith(needle) for line in out.splitlines())
 
 
+def crate_version_exists(crate_name: str, version: str) -> bool:
+    try:
+        out = cargo_search_output(crate_name)
+    except subprocess.CalledProcessError:
+        return False
+    pattern = re.compile(rf"^{re.escape(crate_name)}\s*=\s*\"{re.escape(version)}\"")
+    return any(pattern.match(line) for line in out.splitlines())
+
+
+def is_already_published_output(output: str) -> bool:
+    lowered = output.lower()
+    return (
+        "already uploaded" in lowered
+        or "already exists" in lowered
+        or "crate version" in lowered and "is already uploaded" in lowered
+        or "file already exists" in lowered
+        or "400 bad request" in lowered and "already" in lowered
+    )
+
+
 def wait_for_index(crate_name: str, version: str, timeout_s: int, interval_s: int) -> None:
     deadline = time.monotonic() + timeout_s
     print(f"\nWaiting for crates.io index to expose {crate_name} v{version}...")
     while time.monotonic() < deadline:
-        if cargo_search(crate_name):
-            print(f"crates.io index can see {crate_name}; continuing.")
+        if crate_version_exists(crate_name, version):
+            print(f"crates.io index can see {crate_name} v{version}; continuing.")
             return
         print(f"{crate_name} not visible yet; sleeping {interval_s}s...")
         time.sleep(interval_s)
@@ -459,8 +549,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pypi-skip-existing",
+        dest="pypi_skip_existing",
         action="store_true",
-        help="Pass --skip-existing to maturin publish.",
+        default=True,
+        help="Pass --skip-existing to maturin publish. This is the default.",
+    )
+    parser.add_argument(
+        "--pypi-no-skip-existing",
+        dest="pypi_skip_existing",
+        action="store_false",
+        help="Fail PyPI publish when an artifact already exists.",
     )
     parser.add_argument(
         "--skip-tests",

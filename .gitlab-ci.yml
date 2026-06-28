@@ -45,6 +45,8 @@ linux-wheels:
           - armv7-unknown-linux-gnueabihf
           - i686-unknown-linux-gnu
   script:
+    - python3 -m pip install ziglang
+    - rustup target add "$TARGET"
     - maturin build --release --compatibility pypi --out dist --target "$TARGET" --zig
   artifacts:
     paths:
@@ -84,13 +86,32 @@ macos-cross-wheels:
     matrix:
       - TARGET: x86_64-apple-darwin
         MACOS_IMAGE: registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin
+        LINKER_PREFIX: x86_64-apple-darwin21.4
       - TARGET: aarch64-apple-darwin
         MACOS_IMAGE: registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin
+        LINKER_PREFIX: aarch64-apple-darwin21.4
   image:
     name: $MACOS_IMAGE
     entrypoint: [""]
+  before_script:
+    - export PATH="/opt/osxcross/bin:$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
+    - apt-get update
+    - apt-get install -y python3-pip curl ca-certificates
+    - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+    - source "$HOME/.cargo/env"
+    - python3 -m pip install maturin
   script:
-    - python3 -m pip install maturin || pip3 install maturin
+    - export PATH="/opt/osxcross/bin:$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
+    - source "$HOME/.cargo/env"
+    - rustup target add "$TARGET"
+    - export TARGET_ENV="${TARGET//-/_}"
+    - export TARGET_ENV_UPPER="$(echo "$TARGET_ENV" | tr '[:lower:]' '[:upper:]')"
+    - export "CC_${TARGET_ENV}=${LINKER_PREFIX}-clang"
+    - export "CXX_${TARGET_ENV}=${LINKER_PREFIX}-clang++"
+    - export "AR_${TARGET_ENV}=${LINKER_PREFIX}-ar"
+    - export "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=${LINKER_PREFIX}-clang"
+    - export "CARGO_TARGET_${TARGET_ENV_UPPER}_AR=${LINKER_PREFIX}-ar"
+    - export "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-C link-arg=-undefined -C link-arg=dynamic_lookup"
     - maturin build --release --compatibility pypi --out dist --target "$TARGET"
   artifacts:
     paths:
@@ -129,7 +150,7 @@ pypi-release:
       optional: true
   script:
     - python3 -m pip install maturin
-    - maturin upload --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/*
+    - maturin upload --skip-existing --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/*
 
 sast:
   stage: test

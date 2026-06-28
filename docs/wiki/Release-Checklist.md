@@ -71,6 +71,8 @@ python3 build.py maturin-login
 That command validates the PyPI token before saving it to `.sedsnet-release.toml`. The file is
 ignored by git and read automatically by `publish_crates.py --publish-pypi`. If no environment token
 or saved config exists, `publish_crates.py --publish-pypi` starts the login flow before upload.
+PyPI upload uses skip-existing behavior by default so rerunning a release does not fail only because
+the same wheel or sdist is already present.
 
 ## CI Releases
 
@@ -91,6 +93,10 @@ The GitLab pipeline also has tag-gated release jobs for Linux-only self-hosted r
 - Windows `win_amd64` cross wheels build in Docker by default
 - macOS cross wheels build in Docker by default using the SmartCopy osxcross images
 - PyPI publishing uses `MATURIN_PYPI_TOKEN`
+
+Release upload jobs tolerate already-published crate or PyPI versions. The pipeline should fail for
+test failures or release artifact build failures, not for rerunning an upload after artifacts have
+already reached crates.io or PyPI.
 
 If the macOS cross images are unavailable to a GitLab instance, disable the `macos-cross-wheels`
 job or replace `MACOS_IMAGE` with an equivalent osxcross image.
