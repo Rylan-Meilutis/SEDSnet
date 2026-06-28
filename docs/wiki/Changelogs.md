@@ -92,6 +92,17 @@
 - Test and release tooling:
     - `./build.py test` auto-detects `cargo-nextest` when installed, falls back to Cargo's built-in
       test runner when it is not, and keeps doctests covered.
+    - `publish_crates.py` can dry-run or publish the ordered `sedsnet_macros`/`SEDSnet` crates,
+      build Python wheels and sdists, and build Linux/macOS/Windows wheels through Docker or local
+      macOS tooling.
+    - PyPI uploads use Twine instead of maturin's deprecated upload/publish commands. The helper
+      supports validated ignored local credentials, skip-existing uploads, and the same upload path
+      in CI and local release runs.
+    - GitHub and GitLab tag release workflows build crates, wheels, and sdists. GitLab uses Docker
+      for Linux, Windows, and macOS cross-wheel jobs so Linux-only self-hosted runners can produce
+      the release artifacts.
+    - Package metadata was expanded for crates.io and PyPI, including README-backed long
+      descriptions, keywords, project URLs, license metadata, and release checklist guidance.
     - Criterion benchmark smoke runs still execute, but use a dedicated `sedsnet_smoke`
       baseline, longer timing, disabled plots, and a wider smoke noise threshold.
 - Tests and examples:
