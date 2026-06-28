@@ -5,15 +5,24 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import ssl
+from base64 import b64encode
+from getpass import getpass
 from pathlib import Path
 
 # The line pattern in .gitignore we want to temporarily comment out.
 # This is treated as a literal and turned into a whole-line regex.
 PYI_IGNORE_LINE = "python-files/sedsnet/sedsnet.pyi"
 PYI_IGNORE_REGEX = re.compile(rf"^{re.escape(PYI_IGNORE_LINE)}$")
+RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
+PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
 def print_help(error: str | None = None) -> None:
@@ -38,6 +47,7 @@ Options (can be combined where it makes sense):
   maturin-build           Run `maturin build` with the .pyi .gitignore hack.
   maturin-develop         Run `maturin develop` with the .pyi .gitignore hack.
   maturin-install         Build wheel and install it with `uv pip install`.
+  maturin-login           Validate and store PyPI/maturin publish credentials in .sedsnet-release.toml.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
   static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
@@ -72,6 +82,7 @@ Examples:
   build.py test full
   build.py test release
   build.py maturin-build max_stack_payload=256
+  build.py maturin-login
   build.py maturin-install max_recent_rx_ids=256 env:MAX_STACK_PAYLOAD=128
 """,
         file=out,
@@ -127,6 +138,94 @@ def _fmt_bytes(n: int) -> str:
     if u == 0:
         return f"{int(x)} {units[u]}"
     return f"{x:.2f} {units[u]}"
+
+
+def _toml_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+def validate_pypi_credentials(username: str, token: str) -> None:
+    auth = b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    body = urllib.parse.urlencode(
+        {
+            ":action": "file_upload",
+            "protocol_version": "1",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        PYPI_LEGACY_UPLOAD_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "SEDSnet-release-helper",
+        },
+    )
+    context = None
+    try:
+        import certifi  # type: ignore[import-not-found]
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = None
+
+    try:
+        urllib.request.urlopen(req, timeout=20, context=context).close()
+    except urllib.error.HTTPError as e:
+        response_body = e.read().decode("utf-8", "replace").lower()
+        if e.code in (401, 403) or "invalid or non-existent authentication" in response_body:
+            raise SystemExit("PyPI rejected the credentials; config was not written.") from e
+        # Valid credentials should get a non-auth upload/form error because this validation
+        # deliberately does not include a distribution file.
+        return
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Could not validate PyPI credentials: {e}") from e
+
+
+def write_maturin_login_config(repo_root: Path) -> None:
+    config_path = repo_root / RELEASE_CONFIG_FILE
+    print(f"Writing PyPI credentials to ignored config: {config_path}")
+    print("Use a PyPI API token. Username defaults to __token__.")
+
+    username = os.environ.get("MATURIN_PYPI_USERNAME", "").strip()
+    token = os.environ.get("MATURIN_PYPI_TOKEN", "").strip()
+
+    if not username and sys.stdin.isatty():
+        entered = input("PyPI username [__token__]: ").strip()
+        username = entered or "__token__"
+    elif not username:
+        username = "__token__"
+
+    if not token and sys.stdin.isatty():
+        token = getpass("PyPI API token: ").strip()
+
+    if not token:
+        raise SystemExit(
+            "No PyPI token provided. Set MATURIN_PYPI_TOKEN or run interactively."
+        )
+
+    print("Validating PyPI credentials before saving...")
+    validate_pypi_credentials(username, token)
+
+    body = "\n".join(
+        [
+            "# Local release credentials. This file is ignored by git.",
+            "[pypi]",
+            f"username = {_toml_string(username)}",
+            f"token = {_toml_string(token)}",
+            "",
+        ]
+    )
+    config_path.write_text(body, encoding="utf-8")
+    config_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    _success(f"Saved PyPI credentials to {config_path}")
 
 
 def shared_lib_name() -> str:
@@ -868,6 +967,7 @@ def main(argv: list[str]) -> None:
     develop_wheel = False
     release_build = False
     install_wheel = False
+    maturin_login = False
     target = ""
     device_id = ""
     schema_path = ""
@@ -919,6 +1019,9 @@ def main(argv: list[str]) -> None:
         elif arg == "maturin-install":
             print("Installing Python wheel.")
             install_wheel = True
+
+        elif arg == "maturin-login":
+            maturin_login = True
 
         elif arg.startswith("target="):
             target = arg.split("=", 1)[1]
@@ -995,6 +1098,10 @@ def main(argv: list[str]) -> None:
         if test_ipc_schema.exists():
             env_overrides["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = str(test_ipc_schema)
     _apply_env_overrides(env, env_overrides)
+
+    if maturin_login:
+        write_maturin_login_config(repo_root)
+        return
 
     if release_build:
         build_mode = ["--release"]

@@ -42,6 +42,16 @@ first if it is not already available:
 python3 -m pip install maturin
 ```
 
+For local PyPI publishing without exporting the token every shell session, run:
+
+```sh
+python3 build.py maturin-login
+```
+
+That command validates the PyPI token before saving it to `.sedsnet-release.toml`. The file is
+ignored by git and read automatically by `publish_crates.py --publish-pypi`. If no environment token
+or saved config exists, `publish_crates.py --publish-pypi` starts the login flow before upload.
+
 `SEDSnet` depends on `sedsnet_macros` through a versioned path dependency. Publish order matters:
 
 1. Publish `sedsnet_macros`.

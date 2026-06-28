@@ -20,10 +20,17 @@ REPO_ROOT = Path(__file__).resolve().parent
 MACROS_MANIFEST = REPO_ROOT / "sedsnet_macros" / "Cargo.toml"
 MAIN_MANIFEST = REPO_ROOT / "Cargo.toml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+RELEASE_CONFIG = REPO_ROOT / ".sedsnet-release.toml"
 
 
-def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
-    print(f"\n$ {' '.join(cmd)}", flush=True)
+def run(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    display_cmd: list[str] | None = None,
+) -> None:
+    shown = display_cmd if display_cmd is not None else cmd
+    print(f"\n$ {' '.join(shown)}", flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
 
 
@@ -41,6 +48,36 @@ def pyproject_package(pyproject: Path) -> tuple[str, str]:
     data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     project = data["project"]
     return str(project["name"]), str(project["version"])
+
+
+def load_pypi_credentials(token_env: str) -> tuple[str | None, str | None]:
+    token = os.environ.get(token_env) or os.environ.get("MATURIN_PYPI_TOKEN")
+    username = os.environ.get("MATURIN_PYPI_USERNAME") or "__token__"
+    if token:
+        return username, token
+    if not RELEASE_CONFIG.exists():
+        return None, None
+    data = tomllib.loads(RELEASE_CONFIG.read_text(encoding="utf-8"))
+    pypi = data.get("pypi", {})
+    username = str(pypi.get("username", "__token__"))
+    token_value = pypi.get("token")
+    if not token_value:
+        return None, None
+    return username, str(token_value)
+
+
+def ensure_pypi_credentials(token_env: str) -> tuple[str | None, str | None]:
+    username, token = load_pypi_credentials(token_env)
+    if token:
+        return username, token
+    if not sys.stdin.isatty():
+        return None, None
+    print(
+        f"\nNo PyPI token found in {token_env}, MATURIN_PYPI_TOKEN, or {RELEASE_CONFIG}."
+    )
+    print("Starting `build.py maturin-login` to validate and save local credentials.")
+    run(["python3", "build.py", "maturin-login"])
+    return load_pypi_credentials(token_env)
 
 
 def require_clean_tree(allow_dirty: bool) -> None:
@@ -95,15 +132,25 @@ def maturin_build() -> None:
     run(["maturin", "build"])
 
 
-def maturin_publish(*, token_env: str, skip_existing: bool) -> None:
+def maturin_publish(
+    *,
+    token_env: str,
+    skip_existing: bool,
+    username: str | None,
+    token: str | None,
+) -> None:
     require_tool("maturin")
     cmd = ["maturin", "publish"]
-    token = os.environ.get(token_env)
     if token:
-        cmd.extend(["--username", "__token__", "--password", token])
+        cmd.extend(["--username", username or "__token__", "--password", token])
     if skip_existing:
         cmd.append("--skip-existing")
-    run(cmd)
+    display_cmd = list(cmd)
+    if token and "--password" in display_cmd:
+        idx = display_cmd.index("--password")
+        if idx + 1 < len(display_cmd):
+            display_cmd[idx + 1] = "<redacted>"
+    run(cmd, display_cmd=display_cmd)
 
 
 def cargo_search(crate_name: str) -> bool:
@@ -286,13 +333,16 @@ def main() -> int:
     if args.pypi or args.publish_pypi:
         if args.publish_pypi:
             print(f"\nPyPI publish mode: {py_name} v{py_version} will be uploaded.")
-            if not os.environ.get(args.pypi_token_env):
-                print(
-                    f"info: {args.pypi_token_env} is not set; maturin will use its configured credentials."
+            pypi_username, pypi_token = ensure_pypi_credentials(args.pypi_token_env)
+            if not pypi_token:
+                raise SystemExit(
+                    "No PyPI credentials available. Run `python3 build.py maturin-login` first."
                 )
             maturin_publish(
                 token_env=args.pypi_token_env,
                 skip_existing=args.pypi_skip_existing,
+                username=pypi_username,
+                token=pypi_token,
             )
             print(f"\nPublished Python package {py_name} v{py_version}.")
         else:
