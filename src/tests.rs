@@ -7318,6 +7318,7 @@ mod router_tests {
 
         #[test]
         fn discovery_topology_counts_against_shared_queue_budget() {
+            ensure_topology_test_schema();
             let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
             let side = router.add_side_packed("link", |_bytes| Ok(()));
 
@@ -7331,12 +7332,8 @@ mod router_tests {
                     reachable_timesync_sources: vec![format!("TIME_{idx}_{}", "y".repeat(256))],
                     connections: vec![format!("CONN_{idx}_{}", "z".repeat(512))],
                 }];
-                let pkt = build_discovery_topology(
-                    Box::leak(format!("SRC_{idx}").into_boxed_str()),
-                    idx as u64,
-                    &boards,
-                )
-                .unwrap();
+                let sender = format!("SRC_{idx}");
+                let pkt = build_discovery_topology(&sender, idx as u64, &boards).unwrap();
                 router.rx_from_side(&pkt, side).unwrap();
             }
 
@@ -11369,7 +11366,7 @@ mod router_tests {
 
     #[cfg(feature = "discovery")]
     mod schema_sync_tests {
-        use alloc::{boxed::Box, sync::Arc};
+        use alloc::sync::Arc;
 
         use crate::{
             DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType,
@@ -11394,19 +11391,19 @@ mod router_tests {
 
         #[test]
         fn discovery_schema_packet_roundtrips_and_merges_new_entries() {
+            static ENDPOINTS_230: [DataEndpoint; 1] = [DataEndpoint(230)];
             let endpoint = EndpointDefinition {
                 id: DataEndpoint(230),
                 name: "SCHEMA_SYNC_EP_230",
                 description: "",
                 link_local_only: false,
             };
-            let endpoints = Arc::<[DataEndpoint]>::from([endpoint.id]);
             let ty = DataTypeDefinition {
                 id: DataType(3001),
                 name: "SCHEMA_SYNC_TYPE_3001",
                 description: "",
                 element: MessageElement::Static(2, MessageDataType::UInt16, MessageClass::Data),
-                endpoints: Box::leak(endpoints.to_vec().into_boxed_slice()),
+                endpoints: &ENDPOINTS_230,
                 reliable: ReliableMode::None,
                 priority: 17,
                 e2e_encryption: E2eEncryptionPolicy::PreferOn,
@@ -11752,19 +11749,19 @@ mod router_tests {
 
         #[test]
         fn conflicting_schema_type_layout_resolves_deterministically() {
+            static ENDPOINTS_231: [DataEndpoint; 1] = [DataEndpoint(231)];
             let endpoint = EndpointDefinition {
                 id: DataEndpoint(231),
                 name: "SCHEMA_SYNC_EP_231",
                 description: "",
                 link_local_only: false,
             };
-            let endpoints = Box::leak(vec![endpoint.id].into_boxed_slice());
             let a = DataTypeDefinition {
                 id: DataType(3002),
                 name: "SCHEMA_SYNC_TYPE_3002",
                 description: "",
                 element: MessageElement::Static(1, MessageDataType::UInt16, MessageClass::Data),
-                endpoints,
+                endpoints: &ENDPOINTS_231,
                 reliable: ReliableMode::None,
                 priority: 1,
                 e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -11774,7 +11771,7 @@ mod router_tests {
                 name: "SCHEMA_SYNC_TYPE_3002",
                 description: "",
                 element: MessageElement::Static(2, MessageDataType::UInt16, MessageClass::Data),
-                endpoints,
+                endpoints: &ENDPOINTS_231,
                 reliable: ReliableMode::None,
                 priority: 1,
                 e2e_encryption: E2eEncryptionPolicy::PreferOff,
