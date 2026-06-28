@@ -35,6 +35,23 @@ python3 publish_crates.py --publish-pypi
 python3 publish_crates.py --skip-crates --publish-pypi
 ```
 
+For local Linux wheel builds without depending on CI, use Docker:
+
+```sh
+python3 publish_crates.py --skip-crates --skip-tests --docker-wheels --docker-sdist
+python3 publish_crates.py --skip-crates --skip-tests --docker-all-wheels --docker-sdist
+python3 publish_crates.py --skip-crates --skip-tests --docker-wheels \
+  --docker-target x86_64-unknown-linux-gnu \
+  --docker-target aarch64-unknown-linux-gnu
+```
+
+The Docker path uses the maturin manylinux image and writes artifacts to `dist/` by default.
+Linux and Windows wheels use the maturin Docker image. macOS wheels use the same osxcross Docker
+images as SmartCopy:
+
+- `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin`
+- `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin`
+
 For PyPI uploads, set `MATURIN_PYPI_TOKEN` or use maturin's configured credentials. Install maturin
 first if it is not already available:
 
@@ -51,6 +68,29 @@ python3 build.py maturin-login
 That command validates the PyPI token before saving it to `.sedsnet-release.toml`. The file is
 ignored by git and read automatically by `publish_crates.py --publish-pypi`. If no environment token
 or saved config exists, `publish_crates.py --publish-pypi` starts the login flow before upload.
+
+## CI Releases
+
+Pushing a tag matching `v*` starts the GitHub release workflow:
+
+- publishes `sedsnet_macros` and then `SEDSnet` to crates.io using `CARGO_REGISTRY_TOKEN`
+- builds PyPI wheels for Linux, macOS, and Windows
+- builds an sdist
+- publishes all Python artifacts to PyPI using trusted publishing
+
+GitHub PyPI publishing expects the project to be configured as a PyPI trusted publisher for the
+release workflow.
+
+The GitLab pipeline also has tag-gated release jobs for Linux-only self-hosted runners:
+
+- crates.io publishing uses `CARGO_REGISTRY_TOKEN`
+- Linux wheels and sdist build inside Docker images
+- Windows cross wheels build in Docker by default
+- macOS cross wheels build in Docker by default using the SmartCopy osxcross images
+- PyPI publishing uses `MATURIN_PYPI_TOKEN`
+
+If the macOS cross images are unavailable to a GitLab instance, disable the `macos-cross-wheels`
+job or replace `MACOS_IMAGE` with an equivalent osxcross image.
 
 `SEDSnet` depends on `sedsnet_macros` through a versioned path dependency. Publish order matters:
 

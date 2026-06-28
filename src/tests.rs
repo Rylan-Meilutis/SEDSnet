@@ -191,7 +191,7 @@ fn recent_rx_cache_preallocates_and_reserves_shared_budget() {
     assert_eq!(max_bytes, RECENT_RX_QUEUE_BYTES.max(1));
     assert_eq!(
         capacity,
-        (RECENT_RX_QUEUE_BYTES.max(1) / core::mem::size_of::<u64>()).max(1)
+        (RECENT_RX_QUEUE_BYTES.max(1) / size_of::<u64>()).max(1)
     );
     assert!(capacity <= MAX_RECENT_RX_IDS.max(1));
     assert!(
@@ -247,7 +247,7 @@ fn runtime_sender_id_updates_are_reflected_in_topology_exports() {
             .any(|board| board.sender_id == "ROUTER_NEW")
     );
 
-    let relay = Relay::new(Box::new(crate::tests::timeout_tests::StepClock::new(0, 0)));
+    let relay = Relay::new(Box::new(timeout_tests::StepClock::new(0, 0)));
     relay.set_sender("RELAY_NEW");
     let relay_topology = relay.export_topology();
     assert!(
@@ -2391,7 +2391,7 @@ mod tests_more {
     fn schema_default_endpoints_omit_wire_bitmap_but_custom_endpoints_keep_it() {
         crate::tests::ensure_common_test_schema();
         let ty = DataType::named("GPS_DATA");
-        let mut default_eps = crate::message_meta(ty).endpoints.to_vec();
+        let mut default_eps = message_meta(ty).endpoints.to_vec();
         default_eps.sort_unstable();
         let subset_eps = &default_eps[..1];
 
@@ -2404,7 +2404,7 @@ mod tests_more {
 
         let default_wire = wire_format::pack_packet(&default_pkt);
         let subset_wire = wire_format::pack_packet(&subset_pkt);
-        let bitmap_bytes = ((crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1).div_ceil(8);
+        let bitmap_bytes = ((MAX_VALUE_DATA_ENDPOINT as usize) + 1).div_ceil(8);
 
         assert_eq!(
             default_wire[0] & 0x20,
@@ -4037,7 +4037,7 @@ mod relay_tests {
                 reentered_c.store(true, Ordering::SeqCst);
             }
             if remaining_c
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 relay_c.rx_packed_from_side(ingress, bytes)?;
@@ -6173,7 +6173,7 @@ mod router_tests {
 
         #[cfg(feature = "cryptography")]
         fn crypto_test_guard() -> std::sync::MutexGuard<'static, ()> {
-            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            static LOCK: Mutex<()> = Mutex::new(());
             let guard = LOCK.lock().unwrap();
             crate::crypto::clear_c_cryptography_provider();
             crate::crypto::clear_rust_cryptography_provider();
@@ -6502,9 +6502,9 @@ mod router_tests {
         fn topology_requests_use_elected_master_and_late_joiners_get_fresh_topology() {
             ensure_topology_test_schema();
 
-            let opts = crate::router::RouterSideOptions {
+            let opts = RouterSideOptions {
                 reliable_enabled: true,
-                ..crate::router::RouterSideOptions::default()
+                ..RouterSideOptions::default()
             };
 
             let a = Arc::new(Router::new_with_clock(
@@ -6991,10 +6991,10 @@ mod router_tests {
             let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: false,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -7034,10 +7034,10 @@ mod router_tests {
             let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: false,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -7101,10 +7101,10 @@ mod router_tests {
             let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: false,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -7182,10 +7182,10 @@ mod router_tests {
             let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: true,
                     link_local_enabled: false,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -7244,10 +7244,10 @@ mod router_tests {
                 41,
             )
             .unwrap();
-            let wire = crate::wire_format::pack_packet_with_wire_contract(
+            let wire = wire_format::pack_packet_with_wire_contract(
                 &pkt,
-                Some(crate::wire_format::ReliableHeader {
-                    flags: crate::wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                Some(wire_format::ReliableHeader {
+                    flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
                     seq: 0,
                     ack: 0,
                 }),
@@ -7271,9 +7271,9 @@ mod router_tests {
             let side = router.add_side_packed_with_options(
                 "link",
                 |_bytes| Ok(()),
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: true,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -7365,7 +7365,7 @@ mod router_tests {
             let discovery_pkt =
                 build_discovery_announce("REMOTE_NODE", 0, &[DataEndpoint::named("RADIO")])
                     .unwrap();
-            let discovery_bytes = crate::wire_format::pack_packet(&discovery_pkt);
+            let discovery_bytes = wire_format::pack_packet(&discovery_pkt);
             router
                 .rx_packed_queue_from_side(discovery_bytes.as_ref(), side_remote)
                 .unwrap();
@@ -7449,13 +7449,13 @@ mod router_tests {
 
             let announce =
                 build_discovery_announce("AB", 0, &[DataEndpoint::named("RADIO")]).unwrap();
-            let announce_bytes = crate::wire_format::pack_packet(&announce);
+            let announce_bytes = wire_format::pack_packet(&announce);
             router
                 .rx_packed_queue_from_side(announce_bytes.as_ref(), side_fill)
                 .unwrap();
 
             let sources = build_discovery_timesync_sources("AB", 0, &["AB", "AB_BACKUP"]).unwrap();
-            let source_bytes = crate::wire_format::pack_packet(&sources);
+            let source_bytes = wire_format::pack_packet(&sources);
             router
                 .rx_packed_queue_from_side(source_bytes.as_ref(), side_fill)
                 .unwrap();
@@ -7502,7 +7502,7 @@ mod router_tests {
             let discovery_pkt =
                 build_discovery_announce(DEVICE_IDENTIFIER, 0, &[DataEndpoint::named("RADIO")])
                     .unwrap();
-            let discovery_bytes = crate::wire_format::pack_packet(&discovery_pkt);
+            let discovery_bytes = wire_format::pack_packet(&discovery_pkt);
             router
                 .rx_packed_queue_from_side(discovery_bytes.as_ref(), side_remote)
                 .unwrap();
@@ -10164,10 +10164,10 @@ mod router_tests {
                     seen_ll_c.lock().unwrap().push(pkt.clone());
                     Ok(())
                 },
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: false,
                     link_local_enabled: true,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -10234,10 +10234,10 @@ mod router_tests {
                     seen_ll_c.lock().unwrap().push(pkt.clone());
                     Ok(())
                 },
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: false,
                     link_local_enabled: true,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -10295,10 +10295,10 @@ mod router_tests {
                     seen_ll_c.lock().unwrap().push(pkt.clone());
                     Ok(())
                 },
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: false,
                     link_local_enabled: true,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -10434,10 +10434,10 @@ mod router_tests {
                     seen_ll_c.lock().unwrap().push(pkt.clone());
                     Ok(())
                 },
-                crate::router::RouterSideOptions {
+                RouterSideOptions {
                     reliable_enabled: false,
                     link_local_enabled: true,
-                    ..crate::router::RouterSideOptions::default()
+                    ..RouterSideOptions::default()
                 },
             );
 
@@ -10509,8 +10509,7 @@ mod router_tests {
             });
 
             let discovery_pkt =
-                crate::discovery::build_discovery_timesync_sources("REMOTE_A", 0, &["REMOTE_A"])
-                    .unwrap();
+                build_discovery_timesync_sources("REMOTE_A", 0, &["REMOTE_A"]).unwrap();
             router.rx_from_side(&discovery_pkt, side_a).unwrap();
             let announce =
                 crate::timesync::build_timesync_announce_with_sender("REMOTE_A", 1, 1_000).unwrap();
@@ -11250,7 +11249,7 @@ mod router_tests {
                     DataEndpoint::named("RADIO"),
                     move |_pkt: &Packet| {
                         if a_remaining
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                             .is_err()
                         {
                             return Ok(());
@@ -11283,7 +11282,7 @@ mod router_tests {
                     DataEndpoint::named("SD_CARD"),
                     move |_pkt: &Packet| {
                         if b_remaining
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                             .is_err()
                         {
                             return Ok(());
@@ -11311,10 +11310,10 @@ mod router_tests {
             *a_slot.lock().unwrap() = Some(router_a.clone());
             *b_slot.lock().unwrap() = Some(router_b.clone());
 
-            let a_in_tx = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let a_reentered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let b_in_tx = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let b_reentered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let a_in_tx = Arc::new(AtomicBool::new(false));
+            let a_reentered = Arc::new(AtomicBool::new(false));
+            let b_in_tx = Arc::new(AtomicBool::new(false));
+            let b_reentered = Arc::new(AtomicBool::new(false));
 
             let router_b_for_side = router_b.clone();
             let a_in_tx_flag = a_in_tx.clone();
@@ -11802,9 +11801,7 @@ mod router_tests {
             crate::tests::ensure_common_test_schema();
             let endpoint = DataEndpoint::named("RADIO");
             let ty = (13..=crate::MAX_VALUE_DATA_TYPE)
-                .find_map(|id| {
-                    (!crate::config::data_type_exists(DataType(id))).then_some(DataType(id))
-                })
+                .find_map(|id| (!data_type_exists(DataType(id))).then_some(DataType(id)))
                 .expect("free runtime data type id");
             let ty_name = "SCHEMA_WIRE_TYPE_4090";
             let _ = remove_data_type_by_name(ty_name);
@@ -11830,7 +11827,7 @@ mod router_tests {
             let wire = crate::wire_format::pack_packet_with_wire_contract(
                 &pkt,
                 None,
-                Some(crate::message_meta(ty).element),
+                Some(message_meta(ty).element),
                 &[],
             )
             .unwrap();

@@ -22,6 +22,23 @@ MAIN_MANIFEST = REPO_ROOT / "Cargo.toml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 RELEASE_CONFIG = REPO_ROOT / ".sedsnet-release.toml"
 
+DEFAULT_LINUX_DOCKER_TARGETS = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "armv7-unknown-linux-gnueabihf",
+    "i686-unknown-linux-gnu",
+]
+
+DEFAULT_WINDOWS_DOCKER_TARGETS = [
+    "i686-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+]
+
+MACOS_DOCKER_IMAGES = {
+    "x86_64-apple-darwin": "registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin",
+    "aarch64-apple-darwin": "registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin",
+}
+
 
 def run(
     cmd: list[str],
@@ -129,7 +146,76 @@ def cargo_publish(
 
 def maturin_build() -> None:
     require_tool("maturin")
-    run(["maturin", "build"])
+    run(["maturin", "build", "--release", "--compatibility", "pypi"])
+
+
+def docker_maturin_build(
+    *,
+    image: str,
+    targets: list[str],
+    out_dir: str,
+    use_zig: bool,
+) -> None:
+    require_tool("docker")
+    for target in targets:
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{REPO_ROOT}:/io",
+            image,
+            "build",
+            "--release",
+            "--compatibility",
+            "pypi",
+            "--out",
+            out_dir,
+            "--target",
+            target,
+        ]
+        if use_zig:
+            cmd.append("--zig")
+        run(cmd)
+
+
+def docker_maturin_sdist(*, image: str, out_dir: str) -> None:
+    require_tool("docker")
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{REPO_ROOT}:/io",
+            image,
+            "sdist",
+            "--out",
+            out_dir,
+        ]
+    )
+
+
+def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
+    require_tool("docker")
+    for target in targets:
+        image = MACOS_DOCKER_IMAGES.get(target)
+        if image is None:
+            raise SystemExit(f"No configured macOS Docker image for target {target}")
+        run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{REPO_ROOT}:/io",
+                image,
+                "bash",
+                "-lc",
+                "cd /io && (python3 -m pip install maturin || pip3 install maturin) && "
+                f"maturin build --release --compatibility pypi --out {out_dir} --target {target}",
+            ]
+        )
 
 
 def maturin_publish(
@@ -205,6 +291,67 @@ def parse_args() -> argparse.Namespace:
         "--publish-pypi",
         action="store_true",
         help="Upload the Python package to PyPI with maturin publish.",
+    )
+    parser.add_argument(
+        "--docker-wheels",
+        action="store_true",
+        help="Build Linux Python wheels in Docker using the maturin manylinux image.",
+    )
+    parser.add_argument(
+        "--docker-windows-wheels",
+        action="store_true",
+        help="Build Windows Python wheels in Docker using maturin's Windows cross support.",
+    )
+    parser.add_argument(
+        "--docker-all-wheels",
+        action="store_true",
+        help="Build Linux, Windows, and macOS Docker wheels.",
+    )
+    parser.add_argument(
+        "--docker-sdist",
+        action="store_true",
+        help="Build the Python source distribution in Docker.",
+    )
+    parser.add_argument(
+        "--docker-macos-wheels",
+        action="store_true",
+        help="Build macOS Python wheels in Docker using the same osxcross images as SmartCopy.",
+    )
+    parser.add_argument(
+        "--docker-macos-target",
+        action="append",
+        dest="docker_macos_targets",
+        help="macOS Rust target triple for Docker wheel builds. Repeatable.",
+    )
+    parser.add_argument(
+        "--docker-image",
+        default="ghcr.io/pyo3/maturin:latest",
+        help="Docker image used for --docker-wheels/--docker-sdist.",
+    )
+    parser.add_argument(
+        "--docker-target",
+        action="append",
+        dest="docker_targets",
+        help=(
+            "Linux Rust target triple for Docker wheel builds. Repeatable. "
+            "Defaults to x86_64/aarch64/armv7/i686 GNU Linux targets."
+        ),
+    )
+    parser.add_argument(
+        "--docker-windows-target",
+        action="append",
+        dest="docker_windows_targets",
+        help="Windows Rust target triple for Docker wheel builds. Repeatable.",
+    )
+    parser.add_argument(
+        "--docker-no-zig",
+        action="store_true",
+        help="Do not pass --zig to Docker maturin builds.",
+    )
+    parser.add_argument(
+        "--wheel-out",
+        default="dist",
+        help="Wheel/sdist output directory for Docker builds. Defaults to dist.",
     )
     parser.add_argument(
         "--pypi-token-env",
@@ -329,6 +476,46 @@ def main() -> int:
                 print(
                     f"\nPublished {macro_name} v{macro_version} and {main_name} v{main_version}."
                 )
+
+    if args.docker_all_wheels:
+        args.docker_wheels = True
+        args.docker_windows_wheels = True
+        args.docker_macos_wheels = True
+
+    if args.docker_wheels:
+        targets = args.docker_targets or DEFAULT_LINUX_DOCKER_TARGETS
+        print(f"\nBuilding Docker manylinux wheels into {args.wheel_out}:")
+        for target in targets:
+            print(f"  - {target}")
+        docker_maturin_build(
+            image=args.docker_image,
+            targets=targets,
+            out_dir=args.wheel_out,
+            use_zig=not args.docker_no_zig,
+        )
+
+    if args.docker_windows_wheels:
+        targets = args.docker_windows_targets or DEFAULT_WINDOWS_DOCKER_TARGETS
+        print(f"\nBuilding Docker Windows wheels into {args.wheel_out}:")
+        for target in targets:
+            print(f"  - {target}")
+        docker_maturin_build(
+            image=args.docker_image,
+            targets=targets,
+            out_dir=args.wheel_out,
+            use_zig=False,
+        )
+
+    if args.docker_sdist:
+        print(f"\nBuilding Docker source distribution into {args.wheel_out}.")
+        docker_maturin_sdist(image=args.docker_image, out_dir=args.wheel_out)
+
+    if args.docker_macos_wheels:
+        targets = args.docker_macos_targets or list(MACOS_DOCKER_IMAGES)
+        print(f"\nBuilding Docker macOS wheels into {args.wheel_out}:")
+        for target in targets:
+            print(f"  - {target}")
+        docker_maturin_macos_build(targets=targets, out_dir=args.wheel_out)
 
     if args.pypi or args.publish_pypi:
         if args.publish_pypi:

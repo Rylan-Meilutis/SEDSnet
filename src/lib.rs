@@ -193,7 +193,7 @@ pub const MAX_VALUE_DATA_TYPE: u32 = 4095;
 /// Maximum enum value for `RouteSelectionMode` (inclusive).
 pub const MAX_VALUE_ROUTE_SELECTION_MODE: i32 = 2;
 
-impl crate::macros::ReprU32Enum for DataType {
+impl ReprU32Enum for DataType {
     const MAX: u32 = MAX_VALUE_DATA_TYPE;
 
     #[inline]
@@ -202,7 +202,7 @@ impl crate::macros::ReprU32Enum for DataType {
     }
 }
 
-impl crate::macros::ReprU32Enum for DataEndpoint {
+impl ReprU32Enum for DataEndpoint {
     const MAX: u32 = MAX_VALUE_DATA_ENDPOINT;
 
     #[inline]

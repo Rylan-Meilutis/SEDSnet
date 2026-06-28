@@ -1853,7 +1853,7 @@ impl PyRouter {
         let mut bytes: Vec<u8> = if let Ok(b) = data.extract::<&[u8]>() {
             b.to_vec()
         } else if let Ok(py_str) = data.cast::<pyo3::types::PyString>() {
-            py_str.to_str()?.as_bytes().to_vec()
+            py_str.extract::<String>()?.into_bytes()
         } else {
             let builtins = PyModule::import(py, "builtins")?;
             match builtins.call_method1("bytes", (data.clone(),)) {
@@ -3071,16 +3071,17 @@ pub fn register_schema_json_bytes_py(data: &Bound<'_, PyAny>) -> PyResult<()> {
 #[pyfunction(name = "register_schema_json_file")]
 pub fn register_schema_json_file_py(path: &str) -> PyResult<()> {
     #[cfg(feature = "std")]
-    {
-        crate::config::register_schema_json_path(path).map_err(py_err_from)
-    }
+    let result = crate::config::register_schema_json_path(path).map_err(py_err_from);
+
     #[cfg(not(feature = "std"))]
-    {
+    let result = {
         let _ = path;
         Err(PyRuntimeError::new_err(
             "schema JSON file loading requires std",
         ))
-    }
+    };
+
+    result
 }
 
 // ============================================================================

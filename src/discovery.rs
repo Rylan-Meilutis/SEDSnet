@@ -683,7 +683,7 @@ pub fn build_discovery_topology(
 
         payload.extend_from_slice(&(board.reachable_endpoints.len() as u32).to_le_bytes());
         for ep in board.reachable_endpoints {
-            payload.extend_from_slice(&(ep.as_u32()).to_le_bytes());
+            payload.extend_from_slice(&ep.as_u32().to_le_bytes());
         }
 
         payload.extend_from_slice(&(board.reachable_timesync_sources.len() as u32).to_le_bytes());

@@ -987,7 +987,7 @@ pub fn ensure_endpoint_id(
     if endpoint_exists(id) {
         return Ok(id);
     }
-    register_endpoint_id(id, &alloc::format!("ENDPOINT_{}", id.0), link_local_only)
+    register_endpoint_id(id, &format!("ENDPOINT_{}", id.0), link_local_only)
 }
 
 #[cfg(feature = "std")]

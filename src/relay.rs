@@ -539,7 +539,7 @@ impl AdaptiveRouteStats {
             return 0;
         }
         let elapsed_ms = now_ms.saturating_sub(self.window_started_ms).max(1);
-        ((u128::from(self.window_bytes)).saturating_mul(1000) / u128::from(elapsed_ms))
+        (u128::from(self.window_bytes).saturating_mul(1000) / u128::from(elapsed_ms))
             .min(u128::from(u64::MAX)) as u64
     }
 

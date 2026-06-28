@@ -463,9 +463,7 @@ fn is_discovery_type(ty: &JsonType) -> bool {
         (ty.rust.as_str(), ty.name.as_str()),
         ("DiscoveryAnnounce", _)
             | (_, "DISCOVERY_ANNOUNCE")
-            | ("DiscoveryTimeSyncSources", _)
             | (_, "DISCOVERY_TIMESYNC_SOURCES")
-            | ("DiscoveryTopology", _)
             | (_, "DISCOVERY_TOPOLOGY")
     )
 }

@@ -2063,7 +2063,7 @@ pub extern "C" fn seds_router_cached_managed_variable_packed(
         });
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
     }
     i32::try_from(bytes.len()).unwrap_or(i32::MAX)
 }
@@ -2101,7 +2101,7 @@ pub extern "C" fn seds_router_get_network_variable_packed(
         });
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
     }
     i32::try_from(bytes.len()).unwrap_or(i32::MAX)
 }
@@ -5649,7 +5649,7 @@ mod tests {
         if attempt == 0 {
             return status_from_result_code(SedsResult::SedsErr);
         }
-        let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
+        let slice = unsafe { slice::from_raw_parts(bytes, len) };
         state.delivered.lock().unwrap().push(slice.to_vec());
         status_from_result_code(SedsResult::SedsOk)
     }

@@ -502,7 +502,7 @@ impl AdaptiveRouteStats {
             return 0;
         }
         let elapsed_ms = now_ms.saturating_sub(self.window_started_ms).max(1);
-        ((u128::from(self.window_bytes)).saturating_mul(1000) / u128::from(elapsed_ms))
+        (u128::from(self.window_bytes).saturating_mul(1000) / u128::from(elapsed_ms))
             .min(u128::from(u64::MAX)) as u64
     }
 
@@ -2238,7 +2238,7 @@ where
                 let mut st = this.state.lock();
                 st.total_handler_retries = st
                     .total_handler_retries
-                    .saturating_add((attempts.saturating_sub(1)) as u64);
+                    .saturating_add(attempts.saturating_sub(1) as u64);
             }
             Ok(())
         }
@@ -3033,7 +3033,7 @@ impl Router {
         Ok(out.into())
     }
 
-    fn decode_p2p_payload<'a>(payload: &'a [u8]) -> TelemetryResult<P2pDecoded<'a>> {
+    fn decode_p2p_payload(payload: &[u8]) -> TelemetryResult<P2pDecoded<'_>> {
         if payload.len() < 15 {
             return Err(TelemetryError::Unpack("p2p frame short"));
         }
@@ -3086,9 +3086,7 @@ impl Router {
         Ok(out.into())
     }
 
-    fn decode_p2p_stream_payload<'a>(
-        payload: &'a [u8],
-    ) -> TelemetryResult<Option<P2pStreamDecoded<'a>>> {
+    fn decode_p2p_stream_payload(payload: &[u8]) -> TelemetryResult<Option<P2pStreamDecoded<'_>>> {
         if !payload.starts_with(&P2P_STREAM_MAGIC) {
             return Ok(None);
         }
@@ -8361,7 +8359,7 @@ impl Router {
             .map(|entry| entry.packet.byte_cost())
             .sum::<usize>();
         let mut out = String::new();
-        let _ = core::fmt::Write::write_fmt(
+        let _ = fmt::Write::write_fmt(
             &mut out,
             format_args!(
                 "{{\"kind\":\"router\",\
