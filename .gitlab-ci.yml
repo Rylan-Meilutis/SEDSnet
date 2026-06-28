@@ -53,17 +53,23 @@ linux-wheels:
 
 windows-cross-wheels:
   stage: wheels
-  image:
-    name: ghcr.io/pyo3/maturin:latest
-    entrypoint: [""]
+  image: rust:bookworm
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
   parallel:
     matrix:
       - TARGET:
-          - i686-pc-windows-msvc
           - x86_64-pc-windows-msvc
+  before_script:
+    - apt-get update
+    - apt-get install -y clang lld llvm python3-pip curl ca-certificates
+    - ln -sf "$(command -v clang)" /usr/local/bin/clang-cl
+    - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+    - export PATH="/usr/local/cargo/bin:$PATH"
+    - python3 -m pip install --break-system-packages maturin
   script:
+    - export PATH="/usr/local/cargo/bin:$PATH"
+    - rustup target add "$TARGET"
     - maturin build --release --compatibility pypi --out dist --target "$TARGET"
   artifacts:
     paths:

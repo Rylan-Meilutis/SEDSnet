@@ -45,9 +45,12 @@ python3 publish_crates.py --skip-crates --skip-tests --docker-wheels \
   --docker-target aarch64-unknown-linux-gnu
 ```
 
-The Docker path uses the maturin manylinux image and writes artifacts to `dist/` by default.
-Linux and Windows wheels use the maturin Docker image. macOS wheels use the same osxcross Docker
-images as SmartCopy:
+The Docker path writes artifacts to `dist/` by default. Linux wheels use the maturin manylinux
+image. Windows wheels default to `x86_64-pc-windows-msvc` and use `rust:bookworm` with LLVM/xwin
+setup because the generic maturin image does not include the MSVC-compatible tools needed by
+native C dependencies such as `zstd-sys`. macOS wheels use the same osxcross Docker images as
+SmartCopy when those images are reachable. On a macOS host, the helper falls back to local maturin
+macOS builds if the osxcross image cannot be pulled.
 
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin`
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin`
@@ -85,7 +88,7 @@ The GitLab pipeline also has tag-gated release jobs for Linux-only self-hosted r
 
 - crates.io publishing uses `CARGO_REGISTRY_TOKEN`
 - Linux wheels and sdist build inside Docker images
-- Windows cross wheels build in Docker by default
+- Windows `win_amd64` cross wheels build in Docker by default
 - macOS cross wheels build in Docker by default using the SmartCopy osxcross images
 - PyPI publishing uses `MATURIN_PYPI_TOKEN`
 

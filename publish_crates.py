@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,9 +32,10 @@ DEFAULT_LINUX_DOCKER_TARGETS = [
 ]
 
 DEFAULT_WINDOWS_DOCKER_TARGETS = [
-    "i686-pc-windows-msvc",
     "x86_64-pc-windows-msvc",
 ]
+
+DEFAULT_WINDOWS_DOCKER_IMAGE = "rust:bookworm"
 
 MACOS_DOCKER_IMAGES = {
     "x86_64-apple-darwin": "registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin",
@@ -158,13 +161,8 @@ def docker_maturin_build(
 ) -> None:
     require_tool("docker")
     for target in targets:
-        cmd = [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{REPO_ROOT}:/io",
-            image,
+        maturin_cmd = [
+            "maturin",
             "build",
             "--release",
             "--compatibility",
@@ -175,7 +173,26 @@ def docker_maturin_build(
             target,
         ]
         if use_zig:
-            cmd.append("--zig")
+            maturin_cmd.append("--zig")
+
+        shell_cmd = "cd /io && "
+        if use_zig:
+            shell_cmd += "python3 -m pip install ziglang && "
+        shell_cmd += f"rustup target add {shlex.quote(target)} && "
+        shell_cmd += " ".join(shlex.quote(part) for part in maturin_cmd)
+
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{REPO_ROOT}:/io",
+            "--entrypoint",
+            "bash",
+            image,
+            "-lc",
+            shell_cmd,
+        ]
         run(cmd)
 
 
@@ -196,12 +213,36 @@ def docker_maturin_sdist(*, image: str, out_dir: str) -> None:
     )
 
 
-def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
+def docker_maturin_windows_build(
+    *,
+    image: str,
+    targets: list[str],
+    out_dir: str,
+) -> None:
     require_tool("docker")
     for target in targets:
-        image = MACOS_DOCKER_IMAGES.get(target)
-        if image is None:
-            raise SystemExit(f"No configured macOS Docker image for target {target}")
+        maturin_cmd = [
+            "maturin",
+            "build",
+            "--release",
+            "--compatibility",
+            "pypi",
+            "--out",
+            out_dir,
+            "--target",
+            target,
+        ]
+        shell_cmd = (
+            "set -e; "
+            "apt-get update >/dev/null; "
+            "apt-get install -y clang lld llvm python3-pip curl ca-certificates >/dev/null; "
+            "ln -sf $(command -v clang) /usr/local/bin/clang-cl; "
+            "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal >/tmp/rustup.log; "
+            "source /usr/local/cargo/env; "
+            "python3 -m pip install --break-system-packages maturin >/dev/null; "
+            f"cd /io; rustup target add {shlex.quote(target)}; "
+            + " ".join(shlex.quote(part) for part in maturin_cmd)
+        )
         run(
             [
                 "docker",
@@ -212,10 +253,60 @@ def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
                 image,
                 "bash",
                 "-lc",
-                "cd /io && (python3 -m pip install maturin || pip3 install maturin) && "
-                f"maturin build --release --compatibility pypi --out {out_dir} --target {target}",
+                shell_cmd,
             ]
         )
+
+
+def local_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
+    require_tool("maturin")
+    require_tool("rustup")
+    for target in targets:
+        run(["rustup", "target", "add", target])
+        run(
+            [
+                "maturin",
+                "build",
+                "--release",
+                "--compatibility",
+                "pypi",
+                "--out",
+                out_dir,
+                "--target",
+                target,
+            ]
+        )
+
+
+def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
+    require_tool("docker")
+    for target in targets:
+        image = MACOS_DOCKER_IMAGES.get(target)
+        if image is None:
+            raise SystemExit(f"No configured macOS Docker image for target {target}")
+        try:
+            run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{REPO_ROOT}:/io",
+                    image,
+                    "bash",
+                    "-lc",
+                    "cd /io && (python3 -m pip install maturin || pip3 install maturin) && "
+                    f"maturin build --release --compatibility pypi --out {out_dir} --target {target}",
+                ]
+            )
+        except subprocess.CalledProcessError:
+            if platform.system() != "Darwin":
+                raise
+            print(
+                "\nmacOS Docker image was unavailable; falling back to local macOS maturin build "
+                f"for {target}."
+            )
+            local_maturin_macos_build(targets=[target], out_dir=out_dir)
 
 
 def maturin_publish(
@@ -341,7 +432,15 @@ def parse_args() -> argparse.Namespace:
         "--docker-windows-target",
         action="append",
         dest="docker_windows_targets",
-        help="Windows Rust target triple for Docker wheel builds. Repeatable.",
+        help=(
+            "Windows Rust target triple for Docker wheel builds. Repeatable. "
+            "Defaults to x86_64-pc-windows-msvc."
+        ),
+    )
+    parser.add_argument(
+        "--docker-windows-image",
+        default=DEFAULT_WINDOWS_DOCKER_IMAGE,
+        help="Docker image used for Windows cross wheel builds.",
     )
     parser.add_argument(
         "--docker-no-zig",
@@ -499,11 +598,10 @@ def main() -> int:
         print(f"\nBuilding Docker Windows wheels into {args.wheel_out}:")
         for target in targets:
             print(f"  - {target}")
-        docker_maturin_build(
-            image=args.docker_image,
+        docker_maturin_windows_build(
+            image=args.docker_windows_image,
             targets=targets,
             out_dir=args.wheel_out,
-            use_zig=False,
         )
 
     if args.docker_sdist:
