@@ -6,15 +6,41 @@ build-backend = "maturin"
 name = "sedsnet"
 version = "4.0.0"
 description = "Embedded networking stack with routing, discovery, reliability, P2P streams, and Rust/C/Python bindings"
-authors = [{ name = "Rylan Meilutis", email = "rylan.meilutis@gmail.com" }]
+authors = [{ name = "Rylan Meilutis", email = "rylan@rylanswebsite.com" }]
 readme = "README.md"
 license = "GPL-2.0-only"
 requires-python = ">=3.8"
+keywords = ["telemetry", "networking", "embedded", "routing", "p2p"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Communications",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
 
 [project.urls]
 Homepage = "https://github.com/rylan-meilutis/SEDSnet"
-Documentation = "https://github.com/rylan-meilutis/SEDSnet/wiki"
+Documentation = "https://docs.rs/SEDSnet"
+Wiki = "https://github.com/rylan-meilutis/SEDSnet/wiki"
 Repository = "https://github.com/rylan-meilutis/SEDSnet"
+Issues = "https://github.com/rylan-meilutis/SEDSnet/issues"
+Changelog = "https://github.com/rylan-meilutis/SEDSnet/blob/main/CHANGELOG.md"
+Security = "https://github.com/rylan-meilutis/SEDSnet/blob/main/SECURITY.md"
 
 [tool.maturin]
 bindings = "pyo3"
