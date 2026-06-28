@@ -19,6 +19,29 @@ cargo package --no-verify
 maturin build
 ```
 
+Or run the crate release helper. It defaults to a dry-run and will not upload crates unless
+`--publish` is passed:
+
+```sh
+python3 publish_crates.py
+python3 publish_crates.py --publish
+```
+
+The same helper has explicit PyPI opt-ins:
+
+```sh
+python3 publish_crates.py --pypi
+python3 publish_crates.py --publish-pypi
+python3 publish_crates.py --skip-crates --publish-pypi
+```
+
+For PyPI uploads, set `MATURIN_PYPI_TOKEN` or use maturin's configured credentials. Install maturin
+first if it is not already available:
+
+```sh
+python3 -m pip install maturin
+```
+
 `SEDSnet` depends on `sedsnet_macros` through a versioned path dependency. Publish order matters:
 
 1. Publish `sedsnet_macros`.
