@@ -80,18 +80,27 @@ def run_optional(
     cmd: list[str],
     *,
     env: dict[str, str] | None = None,
+    timeout_s: int | None = None,
     display_cmd: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     shown = display_cmd if display_cmd is not None else cmd
     print(f"\n$ {' '.join(shown)}", flush=True)
-    return subprocess.run(
-        cmd,
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as e:
+        output = e.output or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        output += f"\nerror: command timed out after {timeout_s}s\n"
+        return subprocess.CompletedProcess(cmd, 124, output)
 
 
 def capture(cmd: list[str], *, env: dict[str, str] | None = None) -> str:
@@ -189,6 +198,7 @@ def cargo_publish(
     allow_dirty: bool,
     token: str | None,
     ignore_errors: bool,
+    timeout_s: int,
 ) -> bool:
     crate_name, crate_version = manifest_package(manifest)
     if publish and crate_version_exists(crate_name, crate_version):
@@ -206,7 +216,7 @@ def cargo_publish(
         run(cmd, env=cargo_env())
         return True
 
-    result = run_optional(cmd, env=cargo_env())
+    result = run_optional(cmd, env=cargo_env(), timeout_s=timeout_s)
     print(result.stdout, end="")
     if result.returncode == 0:
         return True
@@ -671,6 +681,12 @@ def parse_args() -> argparse.Namespace:
         help="Treat crates.io upload failures as warnings after package checks have passed.",
     )
     parser.add_argument(
+        "--publish-timeout",
+        type=int,
+        default=180,
+        help="Seconds to allow each cargo publish upload attempt before timing out.",
+    )
+    parser.add_argument(
         "--index-timeout",
         type=int,
         default=300,
@@ -729,6 +745,7 @@ def main() -> int:
             allow_dirty=args.allow_dirty,
             token=token,
             ignore_errors=args.ignore_publish_errors,
+            timeout_s=args.publish_timeout,
         )
 
         if args.publish and macro_publish_ok:
@@ -765,6 +782,7 @@ def main() -> int:
                 allow_dirty=args.allow_dirty,
                 token=token,
                 ignore_errors=args.ignore_publish_errors,
+                timeout_s=args.publish_timeout,
             )
 
             if args.publish:

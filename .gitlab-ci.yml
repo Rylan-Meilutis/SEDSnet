@@ -33,7 +33,7 @@ cargo-release:
     - apt-get update
     - apt-get install -y python3
   script:
-    - python3 publish_crates.py --skip-tests --publish --skip-publish-without-token --ignore-publish-errors
+    - python3 publish_crates.py --skip-tests --publish --ignore-publish-errors
 
 linux-wheels:
   stage: wheels
@@ -155,7 +155,7 @@ pypi-release:
       optional: true
   script:
     - python3 -m pip install twine
-    - python3 -m twine upload --skip-existing --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/*
+    - python3 -m twine upload --skip-existing --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/* || echo "warning: PyPI upload failed; artifacts were already built"
 
 sast:
   stage: test

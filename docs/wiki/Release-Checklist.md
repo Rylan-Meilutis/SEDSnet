@@ -31,12 +31,13 @@ CI release jobs use:
 
 ```sh
 python3 publish_crates.py --skip-tests --publish \
-  --skip-publish-without-token \
   --ignore-publish-errors
 ```
 
-That still fails for package/build errors, but it skips crates.io uploads when no token is
-configured and treats upload-side failures as non-fatal after package checks have passed.
+That still fails for package/build errors, attempts crates.io upload, times out a stuck upload, and
+treats upload-side failures as non-fatal after package checks have passed. GitHub PyPI trusted
+publishing uses the `pypi` environment claim; configure PyPI's trusted publisher to match the
+repository, `release.yml` workflow, tag refs, and that environment.
 
 The same helper has explicit PyPI opt-ins:
 
