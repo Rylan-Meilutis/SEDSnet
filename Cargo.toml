@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "4.0.0"
+version = "4.0.1"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
