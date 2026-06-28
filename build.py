@@ -47,7 +47,7 @@ Options (can be combined where it makes sense):
   maturin-build           Run `maturin build` with the .pyi .gitignore hack.
   maturin-develop         Run `maturin develop` with the .pyi .gitignore hack.
   maturin-install         Build wheel and install it with `uv pip install`.
-  maturin-login           Validate and store PyPI/maturin publish credentials in .sedsnet-release.toml.
+  maturin-login           Validate and store PyPI upload credentials in .sedsnet-release.toml.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
   static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.

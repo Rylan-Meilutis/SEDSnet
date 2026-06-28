@@ -149,8 +149,8 @@ pypi-release:
       artifacts: true
       optional: true
   script:
-    - python3 -m pip install maturin
-    - maturin upload --skip-existing --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/*
+    - python3 -m pip install twine
+    - python3 -m twine upload --skip-existing --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/*
 
 sast:
   stage: test

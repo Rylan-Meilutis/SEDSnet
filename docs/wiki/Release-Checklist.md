@@ -55,11 +55,11 @@ macOS builds if the osxcross image cannot be pulled.
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin`
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin`
 
-For PyPI uploads, set `MATURIN_PYPI_TOKEN` or use maturin's configured credentials. Install maturin
-first if it is not already available:
+For PyPI uploads, set `MATURIN_PYPI_TOKEN` or use the ignored local release config. Install maturin
+for builds and Twine for uploads if they are not already available:
 
 ```sh
-python3 -m pip install maturin
+python3 -m pip install maturin twine
 ```
 
 For local PyPI publishing without exporting the token every shell session, run:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import platform
 import re
@@ -9,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -141,6 +143,18 @@ def require_tool(name: str) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def require_python_module(name: str, install_hint: str | None = None) -> None:
+    if importlib.util.find_spec(name) is not None:
+        return
+    hint = install_hint or name
+    print(
+        f"error: required Python module `{name}` was not found. "
+        f"Install it first, for example: python3 -m pip install {hint}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def cargo_publish(
@@ -368,19 +382,29 @@ def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
             local_maturin_macos_build(targets=[target], out_dir=out_dir)
 
 
-def maturin_publish(
+def pypi_artifacts_from_dir(out_dir: str) -> list[Path]:
+    root = REPO_ROOT / out_dir
+    artifacts = sorted([*root.glob("*.whl"), *root.glob("*.tar.gz")])
+    return artifacts
+
+
+def twine_upload(
     *,
     token_env: str,
     skip_existing: bool,
     username: str | None,
     token: str | None,
+    artifacts: list[Path],
 ) -> None:
-    require_tool("maturin")
-    cmd = ["maturin", "publish"]
-    if token:
-        cmd.extend(["--username", username or "__token__", "--password", token])
+    require_python_module("twine")
+    if not artifacts:
+        raise SystemExit("No PyPI artifacts found to upload.")
+    cmd = [sys.executable, "-m", "twine", "upload"]
     if skip_existing:
         cmd.append("--skip-existing")
+    if token:
+        cmd.extend(["--username", username or "__token__", "--password", token])
+    cmd.extend(str(path) for path in artifacts)
     display_cmd = list(cmd)
     if token and "--password" in display_cmd:
         idx = display_cmd.index("--password")
@@ -394,6 +418,13 @@ def maturin_publish(
         print("\nPyPI artifacts already exist; continuing.")
         return
     raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+
+
+def build_local_pypi_artifacts(out_dir: str) -> list[Path]:
+    require_tool("maturin")
+    run(["maturin", "build", "--release", "--compatibility", "pypi", "--out", out_dir])
+    run(["maturin", "sdist", "--out", out_dir])
+    return pypi_artifacts_from_dir(out_dir)
 
 
 def cargo_search_output(crate_name: str) -> str:
@@ -471,7 +502,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--publish-pypi",
         action="store_true",
-        help="Upload the Python package to PyPI with maturin publish.",
+        help="Build/upload the Python package to PyPI with twine.",
     )
     parser.add_argument(
         "--docker-wheels",
@@ -552,7 +583,7 @@ def parse_args() -> argparse.Namespace:
         dest="pypi_skip_existing",
         action="store_true",
         default=True,
-        help="Pass --skip-existing to maturin publish. This is the default.",
+        help="Pass --skip-existing to twine upload. This is the default.",
     )
     parser.add_argument(
         "--pypi-no-skip-existing",
@@ -679,6 +710,8 @@ def main() -> int:
         args.docker_windows_wheels = True
         args.docker_macos_wheels = True
 
+    built_pypi_artifacts = False
+
     if args.docker_wheels:
         targets = args.docker_targets or DEFAULT_LINUX_DOCKER_TARGETS
         print(f"\nBuilding Docker manylinux wheels into {args.wheel_out}:")
@@ -690,6 +723,7 @@ def main() -> int:
             out_dir=args.wheel_out,
             use_zig=not args.docker_no_zig,
         )
+        built_pypi_artifacts = True
 
     if args.docker_windows_wheels:
         targets = args.docker_windows_targets or DEFAULT_WINDOWS_DOCKER_TARGETS
@@ -701,10 +735,12 @@ def main() -> int:
             targets=targets,
             out_dir=args.wheel_out,
         )
+        built_pypi_artifacts = True
 
     if args.docker_sdist:
         print(f"\nBuilding Docker source distribution into {args.wheel_out}.")
         docker_maturin_sdist(image=args.docker_image, out_dir=args.wheel_out)
+        built_pypi_artifacts = True
 
     if args.docker_macos_wheels:
         targets = args.docker_macos_targets or list(MACOS_DOCKER_IMAGES)
@@ -712,6 +748,7 @@ def main() -> int:
         for target in targets:
             print(f"  - {target}")
         docker_maturin_macos_build(targets=targets, out_dir=args.wheel_out)
+        built_pypi_artifacts = True
 
     if args.pypi or args.publish_pypi:
         if args.publish_pypi:
@@ -721,11 +758,26 @@ def main() -> int:
                 raise SystemExit(
                     "No PyPI credentials available. Run `python3 build.py maturin-login` first."
                 )
-            maturin_publish(
+            if built_pypi_artifacts:
+                artifacts = pypi_artifacts_from_dir(args.wheel_out)
+            else:
+                with tempfile.TemporaryDirectory(prefix="sedsnet-pypi-") as tmp:
+                    artifacts = build_local_pypi_artifacts(tmp)
+                    twine_upload(
+                        token_env=args.pypi_token_env,
+                        skip_existing=args.pypi_skip_existing,
+                        username=pypi_username,
+                        token=pypi_token,
+                        artifacts=artifacts,
+                    )
+                    print(f"\nPublished Python package {py_name} v{py_version}.")
+                    return 0
+            twine_upload(
                 token_env=args.pypi_token_env,
                 skip_existing=args.pypi_skip_existing,
                 username=pypi_username,
                 token=pypi_token,
+                artifacts=artifacts,
             )
             print(f"\nPublished Python package {py_name} v{py_version}.")
         else:
