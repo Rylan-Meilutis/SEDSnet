@@ -15,8 +15,10 @@ That runs:
 
 - strict `cargo clippy -D warnings` checks for the default host build, the `python` feature build,
   and the embedded-feature build when the matching cross toolchain exists
-- `cargo test --features timesync`
-- a short Criterion benchmark smoke pass
+- `cargo nextest run --features timesync` when cargo-nextest is installed, otherwise
+  `cargo test --features timesync`
+- `cargo test --doc --features timesync` when nextest is used
+- a stable Criterion smoke pass for benchmark target validation
 - `cargo build --features python`
 - embedded build validation when the target toolchain is available
 
@@ -30,9 +32,15 @@ The unit tests live primarily in `src/tests.rs`.
 
 They cover:
 
-- packet construction, validation, serialization, and deserialization
+- packet construction, validation, packing, and unpacking
 - queue behavior, timeout budgeting, and dedupe
 - runtime routing policy, typed routes, route selection modes, and discovery-informed forwarding
+- network-variable getter/setter permissions, tiered cache refresh, and update callbacks
+- topology graph export, control-endpoint filtering, leave-announcement pruning, client stats, and
+  memory-layout snapshots
+- fixed-size packed side splitting/reassembly and side-local header-template compaction
+- E2E payload cryptography policies, software fallback crypto, multi-holder encrypted fanout, and
+  tamper rejection
 - router and relay reliable-delivery internals
 - C ABI behavior that can be exercised directly from Rust tests
 - time-sync internals when the `timesync` feature is enabled
@@ -45,19 +53,23 @@ The Rust system tests live under `tests/rust-system-test/`.
 
 They exercise multi-node flows that are awkward to validate in a single unit test, including:
 
-- router-to-router serialized links
+- router-to-router packed links
 - router-to-relay-to-router forwarding
 - discovery convergence and multi-hop routing
 - reliable delivery under dropped frames and retransmit recovery
 - end-to-end reliable acknowledgement routing without flooding unrelated sides
 - time-sync election, failover, and multi-node clock behavior
+- time-sync convergence across constrained scheduler models such as RFBOARD26-style TDMA slots,
+  high-latency FIFO radios, bursty shared serial links, and CAN-FD tick scheduling, with assertions
+  that each modeled board converges to an accurate clock and that slow links are not monopolized by
+  time-sync traffic
 - compression and memory-pool behavior
 
 These tests validate behavior closer to how the crate is actually embedded into larger systems.
 
 ### C system tests
 
-The C system test harness lives in `tests/c-system-test/` and executes the generated C ABI through
+The C system test harness lives in `tests/c-system-test/` and executes the static C ABI through
 compiled test binaries.
 
 It covers:
@@ -68,17 +80,20 @@ It covers:
 - multi-node forwarding through the exported ABI
 - discovery and time-sync behavior from the C caller’s point of view
 
-This is the compatibility net for the generated C interface, not just the Rust core.
+This is the compatibility net for the C interface, not just the Rust core.
 
 ### Benchmark smoke tests
 
-`./build.py test` also runs short Criterion benchmark smoke passes for:
+`./build.py test` also runs stable Criterion benchmark smoke passes for:
 
 - `benches/packet_paths.rs`
 - `benches/router_system_paths.rs`
 
 These are not pass/fail performance gates today. They are there to catch obvious pathological
-regressions in hot paths while still keeping the test command practical for local use.
+regressions in hot paths while still keeping the test command practical for local use. The smoke
+runner saves into a dedicated `sedsnet_smoke` baseline, disables plots, uses a longer measurement
+window than the old fast smoke path, and applies a wider noise threshold so normal host variance
+does not show up as alternating regression/improvement noise against the default benchmark baseline.
 
 ## Reliability coverage
 
@@ -132,6 +147,38 @@ cargo test --lib
 cargo test --test reliable_drop_test
 cargo test --test rust-system-test
 ```
+
+If installed, nextest is the preferred fast runner for non-doctest suites:
+
+```bash
+cargo nextest run --features timesync
+```
+
+`./build.py test` auto-detects nextest. Set `SEDSNET_TEST_RUNNER=cargo` to force Cargo's
+built-in runner, or `SEDSNET_TEST_RUNNER=nextest` to require nextest.
+
+Ignored long-form soak:
+
+```bash
+cargo test --test reliable_drop_test comprehensive_multinode_churn_soak_exercises_stack_features -- --ignored --nocapture
+```
+
+This deterministic multi-node soak is intentionally ignored by default because the normal settings
+simulate several virtual minutes of unreliable network behavior. It exercises gateway and RF relay
+paths, links with different bandwidth budgets, random disconnect/reconnect windows, planned side
+disable/enable windows, temporary side add/remove operations, discovery and topology export,
+source and typed route policies, reliable recovery, network-variable cache propagation, large
+dynamic payload forwarding, side-transport compaction/chunking, time-sync configuration, runtime
+stats, memory-layout export, and E2E crypto when the `cryptography` feature is enabled.
+
+The soak can be shortened for local iteration:
+
+```bash
+SEDSNET_SOAK_TICKS=160 SEDSNET_SOAK_TICK_MS=250 cargo test --test reliable_drop_test comprehensive_multinode_churn_soak_exercises_stack_features -- --ignored --nocapture
+```
+
+`SEDSNET_SOAK_TICKS` controls how many virtual ticks run before the recovery drain, and
+`SEDSNET_SOAK_TICK_MS` controls the virtual milliseconds advanced per tick.
 
 Broader validation:
 

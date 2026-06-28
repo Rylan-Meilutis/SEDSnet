@@ -5,35 +5,63 @@ This is the primary API and the source of truth for the Rust-facing behavior.
 ## Add as a dependency
 
 ```toml
-sedsprintf_rs = { path = "path/to/sedsprintf_rs" }
+sedsnet = { path = "path/to/sedsnet" }
 ```
 
 Or from git:
 
 ```toml
-sedsprintf_rs = { git = "https://github.com/Rylan-Meilutis/sedsprintf_rs.git", branch = "main" }
+sedsnet = { git = "https://github.com/Rylan-Meilutis/sedsnet.git", branch = "main" }
 ```
 
 ## Minimal router example
 
 ```rust
-use sedsprintf_rs::router::{EndpointHandler, Router, RouterConfig};
-use sedsprintf_rs::{DataEndpoint, DataType, TelemetryResult};
+use sedsnet::config::{
+    register_data_type_id_with_description, register_endpoint_id_with_description,
+};
+use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+use sedsnet::{
+    DataEndpoint, DataType, MessageClass, MessageDataType, MessageElement, ReliableMode,
+    TelemetryResult,
+};
 
 fn main() -> TelemetryResult<()> {
-    let handler = EndpointHandler::new_packet_handler(DataEndpoint::SdCard, |pkt| {
+    let sd_card = register_endpoint_id_with_description(
+        DataEndpoint(100),
+        "SD_CARD",
+        "Local storage endpoint",
+        false,
+    )?;
+    let radio = register_endpoint_id_with_description(
+        DataEndpoint(101),
+        "RADIO",
+        "External radio link",
+        false,
+    )?;
+    register_data_type_id_with_description(
+        DataType(100),
+        "GPS_DATA",
+        "Three f32 GPS values",
+        MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+        &[sd_card, radio],
+        ReliableMode::None,
+        80,
+    )?;
+
+    let handler = EndpointHandler::new_packet_handler(DataEndpoint::named("SD_CARD"), |pkt| {
         println!("rx: {pkt}");
         Ok(())
     });
 
     let router = Router::new(RouterConfig::new([handler]));
 
-    router.add_side_serialized("RADIO", |bytes| {
+    router.add_side_packed("RADIO", |bytes| {
         let _ = bytes;
         Ok(())
     });
 
-    router.log(DataType::GpsData, &[1.0_f32, 2.0, 3.0])?;
+    router.log(DataType::named("GPS_DATA"), &[1.0_f32, 2.0, 3.0])?;
     router.process_all_queues()?;
     Ok(())
 }
@@ -42,11 +70,146 @@ fn main() -> TelemetryResult<()> {
 On `std` builds, `Router::new(...)` uses an internal monotonic clock. For tests, simulation, or
 `no_std`, use `Router::new_with_clock(...)`.
 
+## Runtime schema
+
+User endpoints and data types are registered at runtime. There are no generated Rust variants for
+application schema entries in v4.0.0.
+
+Common options:
+
+- call `register_endpoint(...)` / `register_data_type(...)` when the process starts
+- call the `_id` variants when you need stable numeric IDs on the wire
+- load a JSON seed with `register_schema_json_file(...)`, `register_schema_json_path(...)`, or
+  `register_schema_json_bytes(...)`
+- use `DataEndpoint::named("GROUNDSTATION")` and `DataType::named("GPS_DATA")` after registration
+- use `try_named(...)` or `endpoint_definition_by_name(...)` / `data_type_definition_by_name(...)`
+  when missing schema should be handled as a normal error path
+
+Registering an endpoint handler for a missing endpoint auto-creates that endpoint in `std` builds
+and broadcasts the new schema through discovery. Registering a data type or endpoint with the same
+name/ID and a different shape returns an error.
+
+## Network Variables and E2E Payloads
+
+Network variables are latest-value caches for user data types. A router that enables a network
+variable remembers the newest local or received packet for that type. User code uses a setter and
+getter rather than registering a special endpoint: the setter commits the value to the network when
+permissions allow, and the getter returns the cached value while internally requesting a refresh if
+the value has never been seen or is stale. Caches are tiered: any router that has enabled or seen the
+variable can answer the refresh from its local cache, so reconnecting boards can resync from a nearby
+node instead of always reaching the original producer/master.
+
+Data types can also advertise an E2E cryptography preference:
+
+```rust
+use sedsnet::config::register_data_type_id_with_description_and_e2e_encryption;
+use sedsnet::router::{
+    NetworkVariablePermissions, Router, RouterConfig, RouterE2eEncryptionMode,
+};
+use sedsnet::{
+    DataEndpoint, DataType, E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement,
+    ReliableMode,
+};
+
+let flight_state = register_data_type_id_with_description_and_e2e_encryption(
+    DataType(3100),
+    "FLIGHT_STATE",
+    "network-managed flight state",
+    MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+    &[DataEndpoint::named("RADIO")],
+    ReliableMode::None,
+    90,
+    E2eEncryptionPolicy::RequireOn,
+)?;
+
+let router = Router::new(
+    RouterConfig::default()
+        .with_e2e_encryption(RouterE2eEncryptionMode::RequiredOnly)
+        .with_e2e_key_id(7),
+);
+router.enable_network_variable(flight_state, NetworkVariablePermissions::READ_WRITE)?;
+router.on_network_variable_update(flight_state, |pkt| {
+    let state = pkt.data_as_u8()?;
+    Ok(())
+})?;
+router.set_network_variable(pkt)?;
+let cached = router.get_network_variable(flight_state, Some(1_000))?;
+```
+
+When a refresh request finds a peer with the value, the original value packet is replayed through
+normal endpoint handlers. If the local router lacks read or write permission, the getter/setter
+returns `TelemetryError::PermissionDenied` and peers answer refresh requests with a permission
+error packet. `on_network_variable_update(...)` runs only for inbound updates and refresh replies
+that change the local cache; local setters/seeds update the cache without firing that callback.
+
+Router modes are:
+
+- `Disabled`: never encrypt; reject data types marked `RequireOn`
+- `RequiredOnly`: encrypt only required data types
+- `Preferred`: encrypt required and preferred data types
+- `ForceAll`: encrypt every non-control user data type
+
+`RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically with the
+default `cryptography` feature; minimal builds that explicitly omit `cryptography` default to
+`Disabled`.
+
+The `cryptography` feature uses this provider order:
+
+- registered C provider, for C firmware, OS crypto, secure elements, or hardware accelerators
+- registered Rust provider, for Rust-only firmware or std applications wrapping OS crypto
+- built-in software fallback, only after the application registers a key for the packet `key_id`
+
+Packed side traffic carries visible routing metadata and an encrypted payload; the visible
+header is authenticated as AAD so header tampering fails during open. The built-in fallback uses the
+provisioned key for authenticated cryptography, but it does not create identity by itself.
+
+```rust
+#[cfg(feature = "cryptography")]
+sedsnet::crypto::register_software_key(
+    7,
+    b"32-byte minimum deployment secret....",
+)?;
+```
+
+For MITM resistance, boards must authenticate the key source. Common deployments use either
+factory-provisioned PSKs or a network master that acts as the root authority. In the master-root
+model, boards ship with the master public key or a join PSK, the master signs short-lived board
+credentials, and peer/session keys are accepted only when the key exchange transcript validates back
+to that root. Without that authenticated root, an active attacker can substitute keys before the
+AEAD layer ever sees a packet.
+
+The `cryptography` feature includes a compact 80-byte managed credential helper for this
+master-root model. The master issues a `ManagedCredential` containing subject id, key id, epoch,
+validity window, and permission bits; peers verify it against the provisioned root key before
+accepting issued session/group keys.
+
+For board-to-board deployments, run your board-owned quantum-resistant asynchronous key exchange
+when discovery learns a peer, derive a low-cost symmetric traffic key, and pass that key through the
+provider by `key_id`. Multi-drop endpoint traffic can use a shared group traffic key when every holder of
+that endpoint must decode the same message; AEAD authentication still prevents a receiver from
+modifying the frame for downstream boards without detection.
+
+Fragmented links should encrypt the original message before splitting it. Fragments then carry a
+message id, fragment index/count, source epoch, and route metadata; the receiver reassembles and
+opens the original authenticated payload. On reconnect, routers should discard incomplete fragments
+from older master epochs, refresh time/topology, and use network-variable getters to refresh any
+state that is missing or stale. If the master epoch changed, resync from the current snapshot.
+
+Discovery-enabled routers do not flood unknown user-data routes by fallback. They forward user data
+only when discovery or explicit route policy identifies a path; discovery/control traffic still
+propagates so the network can recover after partitions. For time-sliced radios, have the TX callback
+return `TelemetryError::Io("side tx busy")` while the radio is in an RX window. Queued work will be
+retried later, and measured bring-up/slot throughput can be fed into
+`note_side_link_probe_sample(side, bytes, duration_ms)` to seed adaptive path selection and
+control-plane throttling. Once a side is measured as slow, discovery sends minimal reachability
+pings between infrequent full schema/topology/time-source refreshes, and router-managed time sync
+throttles only that measured slow side while fast sides keep the configured normal cadence.
+
 ## Sides and routing
 
 Routers and relays use named sides such as `UART`, `CAN`, or `RADIO`.
 
-- `add_side_serialized(...)` and `add_side_packet(...)` register egress handlers
+- `add_side_packed(...)` and `add_side_packet(...)` register egress handlers
 - `remove_side(...)` tombstones a side without renumbering the remaining side ids
 - `set_side_ingress_enabled(...)` and `set_side_egress_enabled(...)` control directional policy
 - `set_route(...)` and `set_typed_route(...)` define runtime forwarding rules
@@ -61,17 +224,17 @@ There is no `RouterMode` anymore.
 Example:
 
 ```rust
-use sedsprintf_rs::router::Router;
+use sedsnet::router::Router;
 
 let router = Router::new(RouterConfig::default());
-let side_a = router.add_side_serialized("A", tx_a);
-let side_b = router.add_side_serialized("B", tx_b);
-let side_c = router.add_side_serialized("C", tx_c);
+let side_a = router.add_side_packed("A", tx_a);
+let side_b = router.add_side_packed("B", tx_b);
+let side_c = router.add_side_packed("C", tx_c);
 
 router.set_route(None, side_b, false)?;        // local TX does not go to B
 router.set_route(Some(side_a), side_b, true)?; // allow A -> B
 router.set_route(Some(side_b), side_a, false)?;// block B -> A
-router.set_typed_route(None, DataType::GpsData, side_c, true)?;
+router.set_typed_route(None, DataType::named("GPS_DATA"), side_c, true)?;
 router.set_side_egress_enabled(side_c, false)?; // ingress only
 ```
 
@@ -80,8 +243,11 @@ router.set_side_egress_enabled(side_c, false)?; // ingress only
 With the `discovery` feature enabled, routers and relays learn which endpoints are reachable
 through which sides.
 
-- known paths are preferred over flooding
-- unknown paths still fall back to flood/bootstrap behavior
+- known paths are used directly
+- unknown user-data paths are not flooded by fallback; discovery/control traffic still bootstraps
+  route learning
+- measured slow links receive minimal discovery pings most of the time, with full refreshes spaced
+  out to preserve bandwidth
 - link-local-only endpoints stay on sides marked `link_local_enabled`
 - local plus source-side route rules still gate what discovery is allowed to use
 - discovery also carries a transitive router graph, so exported topology keeps sender ownership and
@@ -95,6 +261,10 @@ When discovery reports multiple candidate paths:
 - `set_source_route_mode(...)`, `set_route_weight(...)`, and `set_route_priority(...)` can still
   override the defaults
 
+Packets already in flight also carry a compact internal wire contract: a frozen destination holder set
+and enough payload-shape metadata to stay decodable while schema and topology updates are still propagating.
+Applications do not build that contract manually; routers and relays attach and honor it automatically.
+
 ## Reliable delivery
 
 Reliable delivery has two switches:
@@ -106,10 +276,10 @@ That side option is per hop, not global. It controls what happens between the ro
 that side's TX callback.
 
 ```rust
-use sedsprintf_rs::router::{Router, RouterConfig, RouterSideOptions};
+use sedsnet::router::{Router, RouterConfig, RouterSideOptions};
 
 let router = Router::new(RouterConfig::default());
-router.add_side_serialized_with_options(
+router.add_side_packed_with_options(
     "RADIO",
     tx,
     RouterSideOptions {
@@ -125,13 +295,13 @@ If the underlying transport is already reliable, disable the router-level reliab
 
 What `reliable_enabled` means on a side:
 
-- `reliable_enabled: true` on a serialized side wraps reliable schema traffic in the router/relay's
+- `reliable_enabled: true` on a packed side wraps reliable schema traffic in the router/relay's
   hop-level reliable framing for that side only
 - that hop-level framing adds sequence numbers, ACKs, packet requests, and retransmits
 - `reliable_enabled: false` sends the application packet once on that side without the router's
   hop-level reliable wrapper
 - packet-output sides (`add_side_packet*`) receive decoded `Packet` values, so they cannot carry
-  the serialized hop-level reliable wrapper even if `reliable_enabled` is set
+  the packed hop-level reliable wrapper even if `reliable_enabled` is set
 
 For routers specifically:
 
@@ -171,8 +341,8 @@ them. When the missing sequence arrives, the buffered packets are dispatched imm
 
 Common receive APIs:
 
-- `rx_serialized(bytes)`
-- `rx_serialized_queue(bytes)`
+- `rx_packed(bytes)`
+- `rx_packed_queue(bytes)`
 - `rx(packet)`
 - `rx_queue(packet)`
 
@@ -186,11 +356,13 @@ Meaning of the variants:
 
 If an immediate router receive/transmit API is called from inside a side TX callback, the router
 now defers that work onto its queue instead of recursively re-entering forwarding on the same
-stack.
+stack. Internal `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` traffic stays router-owned;
+applications should use the public discovery/time-sync APIs instead of constructing those packets
+directly.
 
 Use side-aware ingress only when you need to override the ingress side explicitly:
 
-- `rx_serialized_from_side(bytes, side_id)`
+- `rx_packed_from_side(bytes, side_id)`
 - `rx_from_side(packet, side_id)`
 
 ## Queue processing
@@ -224,15 +396,131 @@ topology. Recent packet ID caches preallocate their final storage and reserve th
 immediately. If the remaining budget is exhausted, older queued state is evicted; discovery
 topology eviction emits a warning in `std` builds.
 
+Use `router.export_memory_layout_json()` or `relay.export_memory_layout_json()` when profiling a
+running node. The JSON reports shared allocated/used bytes plus per-area used/allocated bytes for
+RX, ISR RX, TX, replay queues, reliable buffers, discovery, schema, and the network-variable cache.
+
+Use `router.export_runtime_stats()` / `relay.export_runtime_stats()` or the matching C/Python
+exports when profiling constrained links. Each side reports whether header-template compaction is
+enabled, its effective side-transport profile, fixed-frame size, the compact-header target,
+full/compact/chunk side-transport frame counts, emitted bytes, bytes saved versus canonical frames,
+timestamp-delta and unchanged-timestamp compact frame counts, and the observed compact follow-up
+overhead. Small-packet transport defaults to a 40-byte IPv6-like overhead target; call
+`with_ipv4_like_compact_header_target()` on the side options when a stable tiny telemetry stream
+should be held to a 20-byte IPv4-like target with unchanged compact timestamps omitted. Python
+exposes the same profile selection with `add_side_packed_profile(..., profile="ipv4_like")`; C
+callers use `seds_router_add_side_packed_profile(...)` or
+`seds_relay_add_side_packed_profile(...)` with `SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE`.
+
+For mixed links, keep absolute/delta timestamps for most traffic and omit unchanged timestamps only
+for selected data types:
+
+```rust
+let opts = RouterSideOptions::default()
+    .with_ipv6_like_compact_header_target()
+    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"));
+```
+
+## P2P Service Ports
+
+Discovery assigns and advertises compact node addresses and unique hostnames. Configure identity on
+the router config:
+
+```rust
+let router = Router::new(
+    RouterConfig::default()
+        .with_hostname("http-service")
+        .with_static_address(0x1020_3040),
+);
+```
+
+Use `with_dynamic_address()`, `with_requested_address(address)`, or
+`with_static_address(address)`. When segmented networks reunite, routers deconflict duplicate
+addresses and hostnames deterministically. Static addresses are preserved first; if two static
+nodes collide, the older identity keeps the address and newer identities move. Register
+`on_address_change(...)` to be notified when the local address or hostname changes.
+
+P2P service traffic is separate from endpoint broadcast telemetry. A service binds a port and
+receives opaque bytes:
+
+```rust
+router.bind_p2p_port(80, |msg| {
+    assert_eq!(msg.destination_port, 80);
+    let http_request = msg.payload;
+    Ok(())
+})?;
+```
+
+Clients send by hostname so address changes do not break them, or by address when an application
+needs explicit address targeting:
+
+```rust
+client.send_p2p_to_hostname(
+    "http-service",
+    80,
+    49152,
+    b"GET /status HTTP/1.1\r\nHost: http-service\r\n\r\n",
+)?;
+
+client.send_p2p_to_address(0x1020_3040, 80, 49152, b"GET / HTTP/1.1\r\n\r\n")?;
+```
+
+The service payload can carry protocols such as HTTP over SEDSnet links; SEDSnet supplies the
+addressing, routing, reliability, and discovery layer instead of IP.
+
+For protocols that want a connection lifecycle instead of standalone datagrams, bind a stream port
+and open a stream:
+
+```rust
+router.bind_p2p_stream_port(8080, |event| {
+    match event.kind {
+        sedsnet::router::P2pStreamEventKind::Accepted => {
+            // Store event.stream_id if this service wants to write a response.
+        }
+        sedsnet::router::P2pStreamEventKind::Data => {
+            let bytes = event.payload;
+        }
+        sedsnet::router::P2pStreamEventKind::Closed
+        | sedsnet::router::P2pStreamEventKind::Reset => {}
+        sedsnet::router::P2pStreamEventKind::Connected => {}
+    }
+    Ok(())
+})?;
+
+let stream = client.open_p2p_stream_to_hostname("http-service", 8080, 49152)?;
+client.send_p2p_stream(stream, b"GET /stream HTTP/1.1\r\n\r\n")?;
+client.close_p2p_stream(stream)?;
+```
+
+Stream frames are carried inside `SEDSNET_P2P_MESSAGE`, so they use the same discovery routing,
+compact addresses, target-sender contracts, and ordered reliable control path as P2P datagrams.
+
 ## Topology export
 
 With discovery enabled, `export_topology()` returns the router's current learned view.
 
 - `topology.routers` contains the top-level discovered router graph
 - each router entry includes the sender ID, owned endpoints, owned time-sync source IDs, and
-  connected routers
+  connected router sender IDs
+- `topology.links` is a deduplicated board-to-board edge list (`source`, `target`) for direct graph
+  rendering
+- exported JSON/Python dictionaries use `reachable_endpoints` and `advertised_endpoints` for
+  schema-advertised names, with `reachable_endpoint_ids` and `advertised_endpoint_ids` available
+  when code needs stable numeric validation
+- SEDSnet-owned control endpoints (`SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, `SEDSNET_ERROR`) are
+  filtered out of user endpoint reachability fields
 - each side route also includes `announcers`, so you can see which upstream router advertised the
   exported topology
+
+Use `router.client_stats("BOARD_ID")` or `relay.client_stats("BOARD_ID")` to inspect one
+discovered client. The snapshot includes connected/disconnected state, side IDs and side names,
+last-seen/age timing, named reachable endpoints, reachable time-sync sources, and packet/byte
+counters aggregated from the side(s) currently reaching that client.
+
+Use `router.announce_leave()` or `relay.announce_leave()` before a planned shutdown or disconnect.
+That queues a `SEDSNET_DISCOVERY_LEAVE` control packet so peers can prune topology immediately
+instead of waiting for the discovery TTL. The C ABI also attempts this on router/relay free, but an
+explicit leave is preferred when shutdown order matters.
 
 ## Reserved internal endpoints
 
@@ -246,7 +534,7 @@ Those endpoints are owned by the router’s built-in control traffic.
 ## Time sync
 
 When the `timesync` feature is enabled, the router maintains an internal network clock and handles
-`TIME_SYNC` traffic internally.
+`SEDSNET_TIME_SYNC` traffic internally.
 
 For ordinary loops, prefer `periodic(timeout_ms)` so time sync, discovery, and queue draining run
 together.

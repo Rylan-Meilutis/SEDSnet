@@ -3,20 +3,27 @@ use crate::config::{
     RELIABLE_MAX_END_TO_END_ACK_CACHE, RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_PENDING,
     RELIABLE_MAX_RETRIES, RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS, STARTING_QUEUE_SIZE,
 };
+use crate::diagnostics::{
+    AdaptiveLinkStats, DiscoveryRuntimeStats, QueueRuntimeStats, ReliableRuntimeStats,
+    RouteModeStats, RouteOverrideStats, RoutePriorityStats, RouteWeightStats, RuntimeSideStats,
+    RuntimeStatsSnapshot, RuntimeTypeStats, TypedRouteOverrideStats,
+};
 #[cfg(feature = "discovery")]
 use crate::discovery::{
-    self, DiscoveryCadenceState, TopologyAnnouncerRoute, TopologyBoardNode, TopologySideRoute,
-    TopologySnapshot, DISCOVERY_ROUTE_TTL_MS,
+    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS,
+    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState,
+    TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
+    TopologySideRoute, TopologySnapshot,
 };
-use crate::packet::{hash_bytes_u64, Packet};
+use crate::packet::{Packet, hash_bytes_u64};
 use crate::queue::{BoundedDeque, ByteCost};
-use crate::serialize;
+use crate::wire_format;
 use crate::{is_reliable_type, message_meta, message_priority, reliable_mode};
 use crate::{
-    router::Clock,
+    router::{Clock, CompactTimestampOmissionPolicy, SideTransportProfile},
     {
-        lock::{ReentryGate, ReentryGuard, RouterMutex}, RouteSelectionMode, TelemetryError,
-        TelemetryResult,
+        RouteSelectionMode, TelemetryError, TelemetryResult,
+        lock::{ReentryGate, ReentryGuard, RouterMutex},
     },
 };
 use alloc::borrow::ToOwned;
@@ -25,19 +32,41 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::mem::size_of;
+use crc32fast::Hasher as Crc32Hasher;
 
 /// Logical side index (CAN, UART, RADIO, etc.)
 pub type RelaySideId = usize;
+const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
+const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
+const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
+const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
+const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
+const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
+const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
+const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
+const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
+const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
+const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
+const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
+const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
+const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
+const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
+pub const IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES: usize =
+    crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES;
+pub const IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES: usize =
+    crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+pub const DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT: usize =
+    crate::router::DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT;
 /// Packet Handler function type
 type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
-/// Serialized Handler function type
-type SerializedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
+/// Packed Handler function type
+type PackedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
 
-/// TX handler for a relay side: either serialized or packet-based.
+/// TX handler for a relay side: either packed or packet-based.
 #[derive(Clone)]
 pub enum RelayTxHandlerFn {
-    Serialized(Arc<SerializedHandlerFn>),
+    Packed(Arc<PackedHandlerFn>),
     Packet(Arc<PacketHandlerFn>),
 }
 
@@ -45,9 +74,9 @@ pub enum RelayTxHandlerFn {
 pub struct RelaySideOptions {
     /// Enables the relay's per-link reliable transport layer on this side.
     ///
-    /// When `true` and the side uses a serialized TX handler, reliable schema traffic on this hop
+    /// When `true` and the side uses a packed TX handler, reliable schema traffic on this hop
     /// gains relay-managed sequence numbers, ACKs, packet requests, and retransmits.
-    /// Packet-output sides still receive decoded packets rather than serialized reliable framing.
+    /// Packet-output sides still receive decoded packets rather than packed reliable framing.
     pub reliable_enabled: bool,
     /// Marks the side as eligible for link-local-only endpoints and discovery routes.
     pub link_local_enabled: bool,
@@ -55,6 +84,25 @@ pub struct RelaySideOptions {
     pub ingress_enabled: bool,
     /// Allows the relay to transmit packets toward this side.
     pub egress_enabled: bool,
+    /// Enables side-local header-template reuse for packed transport.
+    pub header_template_enabled: bool,
+    /// Maximum number of bytes to emit per packed TX callback.
+    ///
+    /// When non-zero and a packed frame would exceed this size, the relay
+    /// splits it into ordered side-transport chunks and reassembles them on RX
+    /// before normal relay processing. This is intended for fixed-size links
+    /// such as CAN or I2C while keeping the user API packet-oriented.
+    pub max_frame_bytes: usize,
+    /// Target total side-transport overhead for compact follow-up frames.
+    pub compact_header_target_bytes: usize,
+    /// Maximum side-local header templates retained for TX and RX dictionaries.
+    pub max_side_transport_templates: usize,
+    /// Omits the timestamp field from compact follow-up frames when it is unchanged.
+    pub omit_unchanged_compact_timestamps: bool,
+    /// Optional per-data-type timestamp omission policy for compact follow-up frames.
+    pub compact_timestamp_omission_types: CompactTimestampOmissionPolicy,
+    /// Declared compact-link profile for stats and future negotiation.
+    pub side_transport_profile: SideTransportProfile,
 }
 
 impl Default for RelaySideOptions {
@@ -64,6 +112,114 @@ impl Default for RelaySideOptions {
             link_local_enabled: false,
             ingress_enabled: true,
             egress_enabled: true,
+            header_template_enabled: false,
+            max_frame_bytes: 0,
+            compact_header_target_bytes: 0,
+            max_side_transport_templates: DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT,
+            omit_unchanged_compact_timestamps: false,
+            compact_timestamp_omission_types: CompactTimestampOmissionPolicy::none(),
+            side_transport_profile: SideTransportProfile::Canonical,
+        }
+    }
+}
+
+impl RelaySideOptions {
+    /// Convenience preset for bounded packed-side transport.
+    ///
+    /// `max_frame_bytes == 0` leaves packed frames unbounded. Values greater
+    /// than zero enable relay-managed chunking/reassembly on this side.
+    #[inline]
+    pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
+        self.header_template_enabled = true;
+        self.max_frame_bytes = max_frame_bytes;
+        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_ipv4_like_compact_header_target(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.compact_header_target_bytes = IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.omit_unchanged_compact_timestamps = true;
+        self.side_transport_profile = SideTransportProfile::Ipv4Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_ipv6_like_compact_header_target(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_template_transport(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.side_transport_profile = SideTransportProfile::Template;
+        self
+    }
+
+    #[inline]
+    pub fn with_omitted_unchanged_compact_timestamps(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.omit_unchanged_compact_timestamps = true;
+        self
+    }
+
+    #[inline]
+    pub fn with_omitted_unchanged_compact_timestamps_for_type(
+        mut self,
+        ty: crate::DataType,
+    ) -> Self {
+        self.header_template_enabled = true;
+        self.compact_timestamp_omission_types.insert(ty);
+        self
+    }
+
+    #[inline]
+    pub fn effective_transport_profile(self) -> SideTransportProfile {
+        if !self.header_template_enabled && self.max_frame_bytes == 0 {
+            SideTransportProfile::Canonical
+        } else if self.side_transport_profile == SideTransportProfile::Canonical {
+            SideTransportProfile::Template
+        } else {
+            self.side_transport_profile
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    #[inline]
+    pub fn link_capabilities(self) -> discovery::LinkCapabilities {
+        let mut flags = discovery::LINK_CAPABILITY_END_TO_END_RELIABILITY;
+        if self.header_template_enabled {
+            flags |= discovery::LINK_CAPABILITY_HEADER_TEMPLATES;
+        }
+        if self.max_frame_bytes != 0 {
+            flags |= discovery::LINK_CAPABILITY_CHUNKING;
+        }
+        if self.reliable_enabled {
+            flags |= discovery::LINK_CAPABILITY_RELIABILITY;
+        }
+        if self.omit_unchanged_compact_timestamps
+            || !self.compact_timestamp_omission_types.is_empty()
+        {
+            flags |= discovery::LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS;
+        }
+        #[cfg(feature = "cryptography")]
+        {
+            flags |= discovery::LINK_CAPABILITY_CRYPTO;
+        }
+        discovery::LinkCapabilities {
+            version: 1,
+            flags,
+            profile: self.effective_transport_profile().discovery_code(),
+            max_frame_bytes: self.max_frame_bytes.min(u32::MAX as usize) as u32,
+            compact_header_target_bytes: self.compact_header_target_bytes.min(u32::MAX as usize)
+                as u32,
+            max_side_transport_templates: self.max_side_transport_templates.min(u32::MAX as usize)
+                as u32,
         }
     }
 }
@@ -78,7 +234,7 @@ pub struct RelaySide {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayItem {
-    Serialized(Arc<[u8]>),
+    Packed(Arc<[u8]>),
     Packet(Arc<Packet>),
 }
 
@@ -93,7 +249,7 @@ struct RelayRxItem {
 impl ByteCost for RelayRxItem {
     fn byte_cost(&self) -> usize {
         match &self.data {
-            RelayItem::Serialized(bytes) => bytes.len(),
+            RelayItem::Packed(bytes) => bytes.len(),
             RelayItem::Packet(pkt) => pkt.byte_cost(),
         }
     }
@@ -118,7 +274,7 @@ struct RelayReplayItem {
 impl ByteCost for RelayTxItem {
     fn byte_cost(&self) -> usize {
         match &self.data {
-            RelayItem::Serialized(bytes) => bytes.len(),
+            RelayItem::Packed(bytes) => bytes.len(),
             RelayItem::Packet(pkt) => pkt.byte_cost(),
         }
     }
@@ -175,6 +331,7 @@ fn is_internal_control_type(ty: crate::DataType) -> bool {
         crate::DataType::ReliableAck
             | crate::DataType::ReliablePartialAck
             | crate::DataType::ReliablePacketRequest
+            | crate::DataType::P2pMessage
     ) {
         return true;
     }
@@ -207,15 +364,148 @@ struct DiscoverySideState {
     announcers: BTreeMap<String, DiscoverySenderState>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SideChunkAssembly {
+    total: u16,
+    received: BTreeMap<u16, Arc<[u8]>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SideTransportState {
+    tx_template_ids: BTreeMap<u64, u32>,
+    tx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    tx_last_timestamps: BTreeMap<u32, u64>,
+    rx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
+    rx_last_timestamps: BTreeMap<u32, u64>,
+    rx_chunks: BTreeMap<u32, SideChunkAssembly>,
+    next_chunk_id: u32,
+    next_template_id: u32,
+}
+
+impl SideTransportState {
+    fn tx_template_count(&self) -> usize {
+        self.tx_template_ids.len()
+    }
+
+    fn rx_template_count(&self) -> usize {
+        self.rx_templates_by_id.len()
+    }
+
+    fn insert_tx_template(
+        &mut self,
+        template: SideHeaderTemplate,
+        template_id: u32,
+        max_templates: usize,
+    ) -> bool {
+        if max_templates == 0 {
+            return false;
+        }
+        let mut evicted = false;
+        if self.tx_template_ids.len() >= max_templates
+            && !self.tx_template_ids.contains_key(&template.hash)
+            && let Some(old_hash) = self.tx_template_ids.keys().next().copied()
+        {
+            if let Some(old_id) = self.tx_template_ids.remove(&old_hash) {
+                self.tx_last_timestamps.remove(&old_id);
+            }
+            self.tx_templates.remove(&old_hash);
+            evicted = true;
+        }
+        self.tx_template_ids.insert(template.hash, template_id);
+        self.tx_templates.insert(template.hash, template);
+        evicted
+    }
+
+    fn insert_rx_template(
+        &mut self,
+        template_id: u32,
+        template: SideHeaderTemplate,
+        max_templates: usize,
+    ) -> bool {
+        if max_templates == 0 {
+            return false;
+        }
+        let mut evicted = false;
+        if self.rx_templates_by_id.len() >= max_templates
+            && !self.rx_templates_by_id.contains_key(&template_id)
+            && let Some(old_id) = self.rx_templates_by_id.keys().next().copied()
+            && let Some(old_template) = self.rx_templates_by_id.remove(&old_id)
+        {
+            self.rx_templates.remove(&old_template.hash);
+            self.rx_last_timestamps.remove(&old_id);
+            evicted = true;
+        }
+        self.rx_templates_by_id
+            .insert(template_id, template.clone());
+        self.rx_templates.insert(template.hash, template);
+        evicted
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SideHeaderTemplate {
+    hash: u64,
+    base_flags: u8,
+    prefix: Arc<[u8]>,
+    between: Arc<[u8]>,
+    reliable_flags: Option<u8>,
+    reliable_compact: bool,
+}
+
+type SideTemplateExtract<'a> = (
+    SideHeaderTemplate,
+    crate::DataType,
+    u8,
+    u64,
+    u64,
+    u16,
+    Option<(u32, u32)>,
+    &'a [u8],
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SideCompactTimestampMode {
+    Absolute,
+    Delta,
+    Omitted,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AdaptiveRouteStats {
     estimated_bandwidth_bps: u64,
+    peak_bandwidth_bps: u64,
     last_observed_ms: u64,
+    last_slow_observed_ms: u64,
+    sample_count: u64,
+    window_started_ms: u64,
+    window_bytes: u64,
+    peak_usage_bps: u64,
+}
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Default)]
+struct DiscoverySideThrottleState {
+    next_ping_ms: u64,
+    next_full_ms: u64,
+}
+
+#[cfg(all(feature = "discovery", feature = "timesync"))]
+#[derive(Debug, Clone, Default)]
+struct TimeSyncSideThrottleState {
+    next_allowed_ms: u64,
+}
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryAdvertiseLevel {
+    MinimalPing,
+    Full,
 }
 
 impl AdaptiveRouteStats {
     #[inline]
-    fn observe(&mut self, sample_bps: u64, now_ms: u64) {
+    fn observe(&mut self, bytes: usize, sample_bps: u64, now_ms: u64) {
         self.estimated_bandwidth_bps = if self.estimated_bandwidth_bps == 0 {
             sample_bps
         } else if sample_bps >= self.estimated_bandwidth_bps {
@@ -229,12 +519,209 @@ impl AdaptiveRouteStats {
                 .saturating_add(sample_bps)
                 / 8
         };
+        self.peak_bandwidth_bps = self.peak_bandwidth_bps.max(sample_bps);
         self.last_observed_ms = now_ms;
+        if sample_bps > 0 && sample_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS {
+            self.last_slow_observed_ms = now_ms;
+        }
+        self.sample_count = self.sample_count.saturating_add(1);
+        if self.window_started_ms == 0 || now_ms.saturating_sub(self.window_started_ms) > 1_000 {
+            self.window_started_ms = now_ms;
+            self.window_bytes = 0;
+        }
+        self.window_bytes = self.window_bytes.saturating_add(bytes as u64);
+        self.peak_usage_bps = self.peak_usage_bps.max(self.current_usage_bps(now_ms));
     }
 
     #[inline]
-    fn weight(&self) -> u64 {
-        self.estimated_bandwidth_bps.max(1)
+    fn current_usage_bps(&self, now_ms: u64) -> u64 {
+        if self.window_started_ms == 0 {
+            return 0;
+        }
+        let elapsed_ms = now_ms.saturating_sub(self.window_started_ms).max(1);
+        (u128::from(self.window_bytes).saturating_mul(1000) / u128::from(elapsed_ms))
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    #[inline]
+    fn available_headroom_bps(&self, now_ms: u64) -> u64 {
+        let capacity = self
+            .estimated_bandwidth_bps
+            .max(self.peak_bandwidth_bps)
+            .max(1);
+        capacity.saturating_sub(self.current_usage_bps(now_ms))
+    }
+
+    #[inline]
+    fn weight(&self, now_ms: u64) -> u64 {
+        self.available_headroom_bps(now_ms).max(1)
+    }
+
+    #[inline]
+    fn snapshot(&self, now_ms: u64, auto_balancing_enabled: bool) -> AdaptiveLinkStats {
+        let current_usage_bps = self.current_usage_bps(now_ms);
+        let estimated_capacity_bps = self.estimated_bandwidth_bps.max(1);
+        let peak_capacity_bps = self.peak_bandwidth_bps.max(estimated_capacity_bps);
+        let available_headroom_bps = peak_capacity_bps.saturating_sub(current_usage_bps);
+        AdaptiveLinkStats {
+            auto_balancing_enabled,
+            estimated_capacity_bps,
+            peak_capacity_bps,
+            current_usage_bps,
+            peak_usage_bps: self.peak_usage_bps.max(current_usage_bps),
+            available_headroom_bps,
+            effective_weight: available_headroom_bps.max(1),
+            last_observed_ms: self.last_observed_ms,
+            sample_count: self.sample_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TypeRuntimeStatsInner {
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    relayed_tx_packets: u64,
+    relayed_tx_bytes: u64,
+    relayed_rx_packets: u64,
+    relayed_rx_bytes: u64,
+    tx_retries: u64,
+    handler_failures: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SideRuntimeStatsInner {
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    relayed_tx_packets: u64,
+    relayed_tx_bytes: u64,
+    relayed_rx_packets: u64,
+    relayed_rx_bytes: u64,
+    tx_retries: u64,
+    tx_handler_failures: u64,
+    total_handler_retries: u64,
+    side_transport_full_frames: u64,
+    side_transport_compact_frames: u64,
+    side_transport_compact_delta_frames: u64,
+    side_transport_compact_omitted_timestamp_frames: u64,
+    side_transport_chunk_frames: u64,
+    side_transport_raw_bytes: u64,
+    side_transport_wire_bytes: u64,
+    side_transport_bytes_saved: u64,
+    side_transport_min_compact_overhead_bytes: Option<usize>,
+    side_transport_max_compact_overhead_bytes: Option<usize>,
+    side_transport_compact_target_misses: u64,
+    side_transport_template_evictions: u64,
+    data_types: BTreeMap<u32, TypeRuntimeStatsInner>,
+}
+
+impl SideRuntimeStatsInner {
+    fn type_stats_mut(&mut self, ty: crate::DataType) -> &mut TypeRuntimeStatsInner {
+        self.data_types.entry(ty.as_u32()).or_default()
+    }
+
+    fn note_tx(&mut self, ty: crate::DataType, bytes: usize, retries: usize) {
+        self.tx_packets = self.tx_packets.saturating_add(1);
+        self.tx_bytes = self.tx_bytes.saturating_add(bytes as u64);
+        self.relayed_tx_packets = self.relayed_tx_packets.saturating_add(1);
+        self.relayed_tx_bytes = self.relayed_tx_bytes.saturating_add(bytes as u64);
+        self.tx_retries = self.tx_retries.saturating_add(retries as u64);
+        self.total_handler_retries = self.total_handler_retries.saturating_add(retries as u64);
+        let stats = self.type_stats_mut(ty);
+        stats.tx_packets = stats.tx_packets.saturating_add(1);
+        stats.tx_bytes = stats.tx_bytes.saturating_add(bytes as u64);
+        stats.relayed_tx_packets = stats.relayed_tx_packets.saturating_add(1);
+        stats.relayed_tx_bytes = stats.relayed_tx_bytes.saturating_add(bytes as u64);
+        stats.tx_retries = stats.tx_retries.saturating_add(retries as u64);
+    }
+
+    fn note_rx(&mut self, ty: crate::DataType, bytes: usize) {
+        self.rx_packets = self.rx_packets.saturating_add(1);
+        self.rx_bytes = self.rx_bytes.saturating_add(bytes as u64);
+        self.relayed_rx_packets = self.relayed_rx_packets.saturating_add(1);
+        self.relayed_rx_bytes = self.relayed_rx_bytes.saturating_add(bytes as u64);
+        let stats = self.type_stats_mut(ty);
+        stats.rx_packets = stats.rx_packets.saturating_add(1);
+        stats.rx_bytes = stats.rx_bytes.saturating_add(bytes as u64);
+        stats.relayed_rx_packets = stats.relayed_rx_packets.saturating_add(1);
+        stats.relayed_rx_bytes = stats.relayed_rx_bytes.saturating_add(bytes as u64);
+    }
+
+    fn note_tx_failure(&mut self, ty: crate::DataType, retries: usize) {
+        self.tx_handler_failures = self.tx_handler_failures.saturating_add(1);
+        self.tx_retries = self.tx_retries.saturating_add(retries as u64);
+        self.total_handler_retries = self.total_handler_retries.saturating_add(retries as u64);
+        let stats = self.type_stats_mut(ty);
+        stats.handler_failures = stats.handler_failures.saturating_add(1);
+        stats.tx_retries = stats.tx_retries.saturating_add(retries as u64);
+    }
+
+    fn note_side_transport_full(&mut self, raw_bytes: usize, wire_bytes: usize) {
+        self.side_transport_full_frames = self.side_transport_full_frames.saturating_add(1);
+        self.note_side_transport_bytes(raw_bytes, wire_bytes);
+    }
+
+    fn note_side_transport_compact(
+        &mut self,
+        raw_bytes: usize,
+        wire_bytes: usize,
+        compact_overhead_bytes: usize,
+        used_timestamp_delta: bool,
+        omitted_timestamp: bool,
+    ) {
+        self.side_transport_compact_frames = self.side_transport_compact_frames.saturating_add(1);
+        if used_timestamp_delta {
+            self.side_transport_compact_delta_frames =
+                self.side_transport_compact_delta_frames.saturating_add(1);
+        }
+        if omitted_timestamp {
+            self.side_transport_compact_omitted_timestamp_frames = self
+                .side_transport_compact_omitted_timestamp_frames
+                .saturating_add(1);
+        }
+        self.note_side_transport_bytes(raw_bytes, wire_bytes);
+        self.side_transport_min_compact_overhead_bytes = Some(
+            self.side_transport_min_compact_overhead_bytes
+                .map_or(compact_overhead_bytes, |v| v.min(compact_overhead_bytes)),
+        );
+        self.side_transport_max_compact_overhead_bytes = Some(
+            self.side_transport_max_compact_overhead_bytes
+                .map_or(compact_overhead_bytes, |v| v.max(compact_overhead_bytes)),
+        );
+    }
+
+    fn note_side_transport_chunks(&mut self, chunks: usize) {
+        self.side_transport_chunk_frames = self
+            .side_transport_chunk_frames
+            .saturating_add(chunks as u64);
+    }
+
+    fn note_side_transport_bytes(&mut self, raw_bytes: usize, wire_bytes: usize) {
+        self.side_transport_raw_bytes = self
+            .side_transport_raw_bytes
+            .saturating_add(raw_bytes as u64);
+        self.side_transport_wire_bytes = self
+            .side_transport_wire_bytes
+            .saturating_add(wire_bytes as u64);
+        if raw_bytes > wire_bytes {
+            self.side_transport_bytes_saved = self
+                .side_transport_bytes_saved
+                .saturating_add((raw_bytes - wire_bytes) as u64);
+        }
+    }
+
+    fn note_side_transport_compact_target_miss(&mut self) {
+        self.side_transport_compact_target_misses =
+            self.side_transport_compact_target_misses.saturating_add(1);
+    }
+
+    fn note_side_transport_template_eviction(&mut self) {
+        self.side_transport_template_evictions =
+            self.side_transport_template_evictions.saturating_add(1);
     }
 }
 
@@ -254,6 +741,8 @@ struct RelayInner {
     source_route_modes: BTreeMap<Option<RelaySideId>, RouteSelectionMode>,
     route_selection_cursors: BTreeMap<Option<RelaySideId>, u64>,
     adaptive_route_stats: BTreeMap<RelaySideId, AdaptiveRouteStats>,
+    side_runtime_stats: BTreeMap<RelaySideId, SideRuntimeStatsInner>,
+    side_transport: BTreeMap<RelaySideId, SideTransportState>,
     rx_queue: BoundedDeque<RelayRxItem>,
     tx_queue: BoundedDeque<RelayTxItem>,
     replay_queue: BoundedDeque<RelayReplayItem>,
@@ -264,10 +753,16 @@ struct RelayInner {
     reliable_return_route_order: VecDeque<u64>,
     end_to_end_acked_destinations: BTreeMap<u64, BTreeSet<u64>>,
     end_to_end_acked_destination_order: VecDeque<u64>,
+    total_handler_failures: u64,
+    total_handler_retries: u64,
     #[cfg(feature = "discovery")]
     discovery_routes: BTreeMap<RelaySideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
+    #[cfg(feature = "discovery")]
+    discovery_side_throttle: BTreeMap<RelaySideId, DiscoverySideThrottleState>,
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    timesync_side_throttle: BTreeMap<RelaySideId, TimeSyncSideThrottleState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,6 +860,7 @@ impl RelayInner {
             .saturating_add(self.replay_queue.bytes_used())
             .saturating_add(self.recent_rx.max_bytes())
             .saturating_add(self.reliable_rx_buffered_bytes())
+            .saturating_add(crate::config::schema_bytes_used())
             .saturating_add({
                 #[cfg(feature = "discovery")]
                 {
@@ -497,7 +993,7 @@ impl RelayInner {
     #[inline]
     fn queue_budget_warning(msg: &str) {
         #[cfg(feature = "std")]
-        eprintln!("sedsprintf_rs queue budget warning: {msg}");
+        eprintln!("sedsnet queue budget warning: {msg}");
         let _ = msg;
     }
 
@@ -569,10 +1065,11 @@ impl RelayInner {
 }
 
 /// Relay that fans out packets from one side to all others.
-/// - Supports both serialized bytes and full Packet.
+/// - Supports both packed bytes and full Packet.
 /// - Has RX & TX queues, like Router.
 /// - Uses a Clock for the *_with_timeout APIs, same style as Router.
 pub struct Relay {
+    sender: RouterMutex<Arc<str>>,
     state: RouterMutex<RelayInner>,
     side_tx_gate: ReentryGate,
     clock: Box<dyn Clock + Send + Sync>,
@@ -589,7 +1086,7 @@ impl Relay {
     fn relay_item_priority(data: &RelayItem) -> TelemetryResult<u8> {
         let ty = match data {
             RelayItem::Packet(pkt) => pkt.data_type(),
-            RelayItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RelayItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         Ok(message_priority(ty))
     }
@@ -606,7 +1103,7 @@ impl Relay {
         }) else {
             return Ok(false);
         };
-        let frame = serialize::peek_frame_info(item.bytes.as_ref())?;
+        let frame = wire_format::peek_frame_info(item.bytes.as_ref())?;
         let ty = frame.envelope.ty;
         let Some(hdr) = frame.reliable else {
             return Ok(false);
@@ -662,17 +1159,26 @@ impl Relay {
         data: RelayItem,
     ) -> TelemetryResult<bool> {
         let allowed = {
-            let st = self.state.lock();
+            let mut st = self.state.lock();
             let ty = match &data {
                 RelayItem::Packet(pkt) => Some(pkt.data_type()),
-                RelayItem::Serialized(bytes) => Some(serialize::peek_envelope(bytes.as_ref())?.ty),
+                RelayItem::Packed(bytes) => Some(wire_format::peek_envelope(bytes.as_ref())?.ty),
             };
-            self.route_allowed_locked(&st, src, ty, dst)
+            let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
+            #[cfg(all(feature = "discovery", feature = "timesync"))]
+            let timesync_allowed = ty
+                .map(|ty| {
+                    Self::timesync_allowed_for_side_locked(&mut st, dst, ty, self.clock.now_ms())
+                })
+                .unwrap_or(true);
+            #[cfg(not(all(feature = "discovery", feature = "timesync")))]
+            let timesync_allowed = true;
+            route_allowed && timesync_allowed
         };
         if !allowed {
             return Ok(false);
         }
-        if opts.reliable_enabled && matches!(handler, RelayTxHandlerFn::Serialized(_)) {
+        if opts.reliable_enabled && matches!(handler, RelayTxHandlerFn::Packed(_)) {
             self.send_reliable_to_side(dst, data)?;
             Ok(true)
         } else if let Some(adjusted) = self.adjust_reliable_for_side(opts, data)? {
@@ -686,6 +1192,7 @@ impl Relay {
     /// Create a new relay with the given clock.
     pub fn new(clock: Box<dyn Clock + Send + Sync>) -> Self {
         Self {
+            sender: RouterMutex::new(Arc::from("RELAY")),
             state: RouterMutex::new(RelayInner {
                 sides: Vec::new(),
                 route_overrides: BTreeMap::new(),
@@ -695,6 +1202,8 @@ impl Relay {
                 source_route_modes: BTreeMap::new(),
                 route_selection_cursors: BTreeMap::new(),
                 adaptive_route_stats: BTreeMap::new(),
+                side_runtime_stats: BTreeMap::new(),
+                side_transport: BTreeMap::new(),
                 rx_queue: BoundedDeque::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
                 tx_queue: BoundedDeque::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
                 replay_queue: BoundedDeque::new(
@@ -713,14 +1222,34 @@ impl Relay {
                 reliable_return_route_order: VecDeque::new(),
                 end_to_end_acked_destinations: BTreeMap::new(),
                 end_to_end_acked_destination_order: VecDeque::new(),
+                total_handler_failures: 0,
+                total_handler_retries: 0,
                 #[cfg(feature = "discovery")]
                 discovery_routes: BTreeMap::new(),
                 #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
+                #[cfg(feature = "discovery")]
+                discovery_side_throttle: BTreeMap::new(),
+                #[cfg(all(feature = "discovery", feature = "timesync"))]
+                timesync_side_throttle: BTreeMap::new(),
             }),
             side_tx_gate: ReentryGate::new(),
             clock,
         }
+    }
+
+    #[inline]
+    fn sender_arc(&self) -> Arc<str> {
+        self.sender.lock().clone()
+    }
+
+    #[inline]
+    pub fn sender(&self) -> Arc<str> {
+        self.sender_arc()
+    }
+
+    pub fn set_sender<S: AsRef<str>>(&self, sender: S) {
+        *self.sender.lock() = Arc::from(sender.as_ref());
     }
 
     #[inline]
@@ -739,6 +1268,32 @@ impl Relay {
             .get(side)
             .and_then(|side| side.as_ref())
             .ok_or(TelemetryError::HandlerError("relay: invalid side id"))
+    }
+
+    fn note_side_tx_success(
+        &self,
+        side: RelaySideId,
+        ty: crate::DataType,
+        bytes: usize,
+        attempts: usize,
+    ) {
+        let mut st = self.state.lock();
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_tx(ty, bytes, attempts.saturating_sub(1));
+    }
+
+    fn note_side_tx_failure(&self, side: RelaySideId, ty: crate::DataType, attempts: usize) {
+        let mut st = self.state.lock();
+        st.total_handler_failures = st.total_handler_failures.saturating_add(1);
+        st.total_handler_retries = st.total_handler_retries.saturating_add(attempts as u64);
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_tx_failure(ty, attempts);
+    }
+
+    fn note_side_rx(&self, side: RelaySideId, ty: crate::DataType, bytes: usize) {
+        let mut st = self.state.lock();
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_rx(ty, bytes);
     }
 
     #[inline]
@@ -787,15 +1342,25 @@ impl Relay {
         if st
             .typed_route_overrides
             .keys()
-            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty as u32)
+            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty.as_u32())
         {
             return st
                 .typed_route_overrides
-                .get(&(src, ty as u32, dst))
+                .get(&(src, ty.as_u32(), dst))
                 .copied()
                 .unwrap_or(false);
         }
         true
+    }
+
+    fn has_typed_route_overrides_locked(
+        st: &RelayInner,
+        src: Option<RelaySideId>,
+        ty: crate::DataType,
+    ) -> bool {
+        st.typed_route_overrides
+            .keys()
+            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty.as_u32())
     }
 
     fn eligible_side_ids_locked(
@@ -894,11 +1459,12 @@ impl Relay {
             return vec![unmeasured.swap_remove(pick)];
         }
 
+        let now_ms = self.clock.now_ms();
         let total_weight = sides.iter().fold(0_u64, |acc, side| {
             acc + st
                 .adaptive_route_stats
                 .get(side)
-                .map(AdaptiveRouteStats::weight)
+                .map(|stats| stats.weight(now_ms))
                 .unwrap_or(1)
         });
         if total_weight == 0 {
@@ -914,7 +1480,7 @@ impl Relay {
             let weight = st
                 .adaptive_route_stats
                 .get(&side)
-                .map(AdaptiveRouteStats::weight)
+                .map(|stats| stats.weight(now_ms))
                 .unwrap_or(1);
             if remaining < weight {
                 return vec![side];
@@ -938,20 +1504,39 @@ impl Relay {
         st.adaptive_route_stats
             .entry(side)
             .or_default()
-            .observe(sample_bps, ended_ms);
+            .observe(bytes, sample_bps, ended_ms);
+    }
+
+    /// Seed adaptive route selection with a transport-measured link probe.
+    ///
+    /// Call this after a side-specific bring-up probe, or whenever the transport already knows the
+    /// duration for a frame. The relay does not emit synthetic probe frames by itself.
+    pub fn note_side_link_probe_sample(
+        &self,
+        side: RelaySideId,
+        bytes: usize,
+        duration_ms: u64,
+    ) -> TelemetryResult<()> {
+        {
+            let st = self.state.lock();
+            let _ = Self::side_ref(&st, side).map_err(|_| TelemetryError::BadArg)?;
+        }
+        let ended_ms = self.clock.now_ms();
+        self.record_side_tx_sample(side, bytes, ended_ms.saturating_sub(duration_ms), ended_ms);
+        Ok(())
     }
 
     fn relay_item_wire_len(data: &RelayItem) -> TelemetryResult<usize> {
         match data {
-            RelayItem::Packet(pkt) => Ok(serialize::serialize_packet(pkt).len()),
-            RelayItem::Serialized(bytes) => Ok(bytes.len()),
+            RelayItem::Packet(pkt) => Ok(wire_format::pack_packet(pkt).len()),
+            RelayItem::Packed(bytes) => Ok(bytes.len()),
         }
     }
 
     #[inline]
     fn decode_end_to_end_reliable_ack(payload: &[u8]) -> TelemetryResult<u64> {
         if payload.len() != 8 {
-            return Err(TelemetryError::Deserialize("bad reliable e2e ack payload"));
+            return Err(TelemetryError::Unpack("bad reliable e2e ack payload"));
         }
         Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
     }
@@ -974,10 +1559,18 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
-    fn is_end_to_end_destination_sender(sender: &str) -> bool {
-        sender != "RELAY" && !Self::is_end_to_end_ack_sender(sender)
+    fn is_end_to_end_destination_sender(&self, sender: &str) -> bool {
+        sender != self.sender_arc().as_ref() && !Self::is_end_to_end_ack_sender(sender)
     }
 
+    /// Extract the logical packet ID targeted by an end-to-end reliable ACK item.
+    ///
+    /// Relay queues can hold either decoded packets or packed frames. This
+    /// helper normalizes both forms so relay ACK-routing logic can treat them
+    /// uniformly.
+    ///
+    /// Only relay-visible end-to-end `ReliableAck` packets qualify here.
+    /// Unrelated traffic returns `Ok(None)`.
     fn reliable_control_target_packet_id(data: &RelayItem) -> TelemetryResult<Option<u64>> {
         match data {
             RelayItem::Packet(pkt) => {
@@ -988,8 +1581,14 @@ impl Relay {
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
-            RelayItem::Serialized(bytes) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(None);
+                }
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 if pkt.data_type() != crate::DataType::ReliableAck
                     || !Self::is_end_to_end_ack_sender(pkt.sender())
                 {
@@ -1007,6 +1606,11 @@ impl Relay {
             .insert(packet_id, ReliableReturnRouteState { side });
     }
 
+    /// Refresh or insert `packet_id` in the bounded reliable return-route cache.
+    ///
+    /// The relay uses this cache to route end-to-end acknowledgements back
+    /// toward the source side that most recently forwarded the corresponding
+    /// reliable data packet.
     fn remember_reliable_return_route_locked(st: &mut RelayInner, packet_id: u64) {
         let cap = RELIABLE_MAX_RETURN_ROUTES.max(1);
         st.reliable_return_route_order
@@ -1050,7 +1654,7 @@ impl Relay {
 
     #[inline]
     fn reliable_key(side: RelaySideId, ty: crate::DataType) -> (RelaySideId, u32) {
-        (side, ty as u32)
+        (side, ty.as_u32())
     }
 
     fn reliable_tx_state_mut<'a>(
@@ -1116,12 +1720,13 @@ impl Relay {
         ty: crate::DataType,
         seq: u32,
     ) -> TelemetryResult<Packet> {
+        let sender = self.sender_arc();
         Packet::new(
             control_ty,
             message_meta(control_ty).endpoints,
-            "RELAY",
+            sender.as_ref(),
             self.clock.now_ms(),
-            crate::router::encode_slice_le(&[ty as u32, seq]),
+            crate::router::encode_slice_le(&[ty.as_u32(), seq]),
         )
     }
 
@@ -1217,28 +1822,50 @@ impl Relay {
         side: RelaySideId,
         bytes: Arc<[u8]>,
     ) -> TelemetryResult<()> {
-        let handler = {
+        let (handler, opts) = {
             let st = self.state.lock();
             let side_ref = Self::side_ref(&st, side)?;
             if !side_ref.opts.egress_enabled {
                 return Ok(());
             }
-            side_ref.tx_handler.clone()
+            (side_ref.tx_handler.clone(), side_ref.opts)
         };
 
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
+        let ty = wire_format::peek_envelope(bytes.as_ref())
+            .map(|env| env.ty)
+            .unwrap_or(crate::DataType::ReliableAck);
         let result = match handler {
-            RelayTxHandlerFn::Serialized(f) => f(bytes.as_ref()),
+            RelayTxHandlerFn::Packed(f) => {
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    f(frame.as_ref())?;
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, 1);
+                return Ok(());
+            }
             RelayTxHandlerFn::Packet(f) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                if wire_format::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(());
+                }
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 f(&pkt)
             }
         };
         if result.is_ok() {
             self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
+            self.note_side_tx_success(side, ty, bytes.len(), 1);
+        } else {
+            self.note_side_tx_failure(side, ty, 1);
         }
         result
     }
@@ -1253,7 +1880,7 @@ impl Relay {
             (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
         };
 
-        let RelayTxHandlerFn::Serialized(f) = &handler else {
+        let RelayTxHandlerFn::Packed(f) = &handler else {
             return self.call_tx_handler(side, &handler, &data);
         };
 
@@ -1268,8 +1895,8 @@ impl Relay {
 
         let ty = match &data {
             RelayItem::Packet(pkt) => pkt.data_type(),
-            RelayItem::Serialized(bytes) => {
-                let Ok(frame) = serialize::peek_frame_info(bytes.as_ref()) else {
+            RelayItem::Packed(bytes) => {
+                let Ok(frame) = wire_format::peek_frame_info(bytes.as_ref()) else {
                     return self.call_tx_handler(side, &handler, &data);
                 };
                 frame.envelope.ty
@@ -1295,29 +1922,36 @@ impl Relay {
             let next = tx_state.next_seq.wrapping_add(1);
             tx_state.next_seq = if next == 0 { 1 } else { next };
             let flags = match reliable_mode(ty) {
-                crate::ReliableMode::Unordered => serialize::RELIABLE_FLAG_UNORDERED,
+                crate::ReliableMode::Unordered => wire_format::RELIABLE_FLAG_UNORDERED,
                 _ => 0,
             };
             (seq, flags)
         };
 
         let bytes: Arc<[u8]> = match data {
-            RelayItem::Packet(pkt) => serialize::serialize_packet_with_reliable(
+            RelayItem::Packet(pkt) => wire_format::pack_packet_with_reliable(
                 &pkt,
-                serialize::ReliableHeader { flags, seq, ack: 0 },
+                wire_format::ReliableHeader { flags, seq, ack: 0 },
             ),
-            RelayItem::Serialized(bytes) => {
-                let mut v = bytes.to_vec();
-                if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
+            RelayItem::Packed(bytes) => {
+                let Some(rewritten) =
+                    wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
+                else {
                     let Some(_side_tx_guard) = self.try_enter_side_tx() else {
                         return Err(TelemetryError::Io("side tx busy"));
                     };
                     let started_ms = self.clock.now_ms();
-                    f(bytes.as_ref())?;
-                    self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
+                    let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                    let mut sent_bytes = 0usize;
+                    for frame in frames {
+                        f(frame.as_ref())?;
+                        sent_bytes = sent_bytes.saturating_add(frame.len());
+                    }
+                    self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                    self.note_side_tx_success(side, ty, sent_bytes, 1);
                     return Ok(());
-                }
-                Arc::from(v)
+                };
+                rewritten
             }
         };
 
@@ -1325,8 +1959,14 @@ impl Relay {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        f(bytes.as_ref())?;
-        self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
+        let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+        let mut sent_bytes = 0usize;
+        for frame in frames {
+            f(frame.as_ref())?;
+            sent_bytes = sent_bytes.saturating_add(frame.len());
+        }
+        self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+        self.note_side_tx_success(side, ty, sent_bytes, 1);
 
         {
             let mut st = self.state.lock();
@@ -1358,8 +1998,8 @@ impl Relay {
                 eps.dedup();
                 Ok((eps, pkt.data_type()))
             }
-            RelayItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 let mut eps: Vec<crate::DataEndpoint> = env.endpoints.iter().copied().collect();
                 eps.sort_unstable();
                 eps.dedup();
@@ -1372,6 +2012,53 @@ impl Relay {
         !eps.is_empty() && eps.iter().all(|ep| ep.is_link_local_only())
     }
 
+    fn item_target_senders(&self, data: &RelayItem) -> TelemetryResult<Arc<[u64]>> {
+        match data {
+            RelayItem::Packet(pkt) => Ok(Arc::from(pkt.wire_target_senders())),
+            RelayItem::Packed(bytes) => {
+                Ok(wire_format::peek_envelope(bytes.as_ref())?.target_senders)
+            }
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn has_explicit_route_policy_locked(
+        st: &RelayInner,
+        src: Option<RelaySideId>,
+        ty: crate::DataType,
+    ) -> bool {
+        st.route_overrides
+            .keys()
+            .any(|(route_src, _)| *route_src == src)
+            || Self::has_typed_route_overrides_locked(st, src, ty)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn side_matches_target_senders_locked(
+        st: &RelayInner,
+        side: RelaySideId,
+        target_senders: &[u64],
+        now_ms: u64,
+    ) -> bool {
+        st.discovery_routes
+            .get(&side)
+            .map(|route| {
+                if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                    return false;
+                }
+                route.announcers.values().any(|sender_state| {
+                    if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                        return false;
+                    }
+                    sender_state
+                        .topology_boards
+                        .iter()
+                        .any(|board| target_senders.contains(&Self::sender_hash(&board.sender_id)))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     fn remote_side_plan(
         &self,
         data: &RelayItem,
@@ -1380,6 +2067,7 @@ impl Relay {
         #[cfg(feature = "discovery")]
         {
             let (eps, ty) = self.item_route_info(data)?;
+            let target_senders = self.item_target_senders(data)?;
             let preferred_packet_id = Self::reliable_control_target_packet_id(data)?;
             if discovery::is_discovery_type(ty) {
                 let mut st = self.state.lock();
@@ -1407,6 +2095,15 @@ impl Relay {
                         .map(|route| route.side),
                 );
                 if let Some(side) = target_side {
+                    #[cfg(feature = "timesync")]
+                    if !Self::timesync_allowed_for_side_locked(
+                        &mut st,
+                        side,
+                        ty,
+                        self.clock.now_ms(),
+                    ) {
+                        return Ok(RemoteSidePlan::Target(Vec::new()));
+                    }
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
                 return Ok(RemoteSidePlan::Target(Vec::new()));
@@ -1418,22 +2115,26 @@ impl Relay {
                 RouteSelectionOrigin::Discovered
             };
             if st.discovery_routes.is_empty() {
-                if restrict_link_local {
-                    let targets = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), true);
-                    return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                        &mut st,
-                        Some(exclude),
-                        targets,
-                        RouteSelectionOrigin::Flood,
-                    )));
-                }
-                let targets = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), false);
-                return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
+                let mut fallback = self.eligible_side_ids_locked(
+                    &st,
                     Some(exclude),
-                    targets,
-                    RouteSelectionOrigin::Flood,
-                )));
+                    Some(ty),
+                    restrict_link_local,
+                );
+                #[cfg(feature = "timesync")]
+                {
+                    fallback = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        fallback,
+                    );
+                }
+                return Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
+                    fallback
+                } else {
+                    Vec::new()
+                }));
             }
             let now_ms = self.clock.now_ms();
             let mut had_exact = false;
@@ -1460,6 +2161,15 @@ impl Relay {
                 if !self.route_allowed_locked(&st, Some(exclude), Some(ty), side) {
                     continue;
                 }
+                if !target_senders.is_empty() {
+                    if !Self::side_matches_target_senders_locked(&st, side, &target_senders, now_ms)
+                    {
+                        continue;
+                    }
+                    had_known = true;
+                    generic_targets.push(side);
+                    continue;
+                }
                 if preferred_timesync_source.as_deref().is_some_and(|source| {
                     route.reachable_timesync_sources.iter().any(|s| s == source)
                 }) {
@@ -1474,6 +2184,15 @@ impl Relay {
             }
 
             if had_exact {
+                #[cfg(feature = "timesync")]
+                {
+                    exact_targets = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        exact_targets,
+                    );
+                }
                 let targets = self.filter_end_to_end_satisfied_sides_locked(
                     &st,
                     data,
@@ -1488,6 +2207,15 @@ impl Relay {
                     discovered_origin,
                 )))
             } else if had_known {
+                #[cfg(feature = "timesync")]
+                {
+                    generic_targets = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        generic_targets,
+                    );
+                }
                 let targets = self.filter_end_to_end_satisfied_sides_locked(
                     &st,
                     data,
@@ -1501,22 +2229,32 @@ impl Relay {
                     targets,
                     discovered_origin,
                 )))
-            } else if restrict_link_local {
-                let targets = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), true);
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    Some(exclude),
-                    targets,
-                    RouteSelectionOrigin::Flood,
-                )))
             } else {
-                let targets = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), false);
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    Some(exclude),
-                    targets,
-                    RouteSelectionOrigin::Flood,
-                )))
+                if Self::has_explicit_route_policy_locked(&st, Some(exclude), ty) {
+                    let mut sides = self.eligible_side_ids_locked(
+                        &st,
+                        Some(exclude),
+                        Some(ty),
+                        restrict_link_local,
+                    );
+                    #[cfg(feature = "timesync")]
+                    {
+                        sides = Self::filter_timesync_sides_locked(
+                            &mut st,
+                            ty,
+                            self.clock.now_ms(),
+                            sides,
+                        );
+                    }
+                    Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
+                        &mut st,
+                        Some(exclude),
+                        sides,
+                        RouteSelectionOrigin::Flood,
+                    )))
+                } else {
+                    Ok(RemoteSidePlan::Target(Vec::new()))
+                }
             }
         }
         #[cfg(not(feature = "discovery"))]
@@ -1571,11 +2309,16 @@ impl Relay {
         }
         let packet_id = match data {
             RelayItem::Packet(pkt) => pkt.packet_id(),
-            RelayItem::Serialized(bytes) => serialize::packet_id_from_wire(bytes.as_ref())?,
+            RelayItem::Packed(bytes) => match wire_format::packet_id_from_wire(bytes.as_ref()) {
+                Ok(packet_id) => packet_id,
+                Err(TelemetryError::Unpack("reliable control frame")) => return Ok(sides),
+                Err(err) => return Err(err),
+            },
         };
         let Some(acked) = st.end_to_end_acked_destinations.get(&packet_id) else {
             return Ok(sides);
         };
+        let now_ms = self.clock.now_ms();
         let mut filtered = Vec::new();
         for side in sides {
             let Some(route) = st.discovery_routes.get(&side) else {
@@ -1585,20 +2328,30 @@ impl Relay {
             let mut still_pending = false;
             let mut had_destination_board = false;
             for sender_state in route.announcers.values() {
+                if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                    continue;
+                }
                 for board in sender_state.topology_boards.iter() {
-                    if !Self::is_end_to_end_destination_sender(&board.sender_id) {
+                    if !self.is_end_to_end_destination_sender(&board.sender_id) {
                         continue;
                     }
                     had_destination_board = true;
+                    let sender_hash = Self::sender_hash(&board.sender_id);
+                    if acked.contains(&sender_hash) {
+                        continue;
+                    }
                     if eps
                         .iter()
                         .copied()
                         .any(|ep| board.reachable_endpoints.contains(&ep))
-                        && !acked.contains(&Self::sender_hash(&board.sender_id))
                     {
                         still_pending = true;
                         break;
                     }
+                    // Keep forwarding while any discovered destination sender for this packet
+                    // remains unacked, even if topology/schema metadata changed for new packets.
+                    still_pending = true;
+                    break;
                 }
                 if still_pending {
                     break;
@@ -1711,8 +2464,9 @@ impl Relay {
         }
         connections.sort_unstable();
         connections.dedup();
+        let sender = self.sender_arc();
         TopologyBoardNode {
-            sender_id: "RELAY".to_string(),
+            sender_id: sender.to_string(),
             reachable_endpoints: Vec::new(),
             reachable_timesync_sources: Vec::new(),
             connections,
@@ -1737,17 +2491,18 @@ impl Relay {
                 }
                 let mut sender_boards = sender_state.topology_boards.clone();
                 if sender_boards.is_empty() {
+                    let sender = self.sender_arc();
                     sender_boards.push(TopologyBoardNode {
                         sender_id: announcer.clone(),
                         reachable_endpoints: sender_state.reachable.clone(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
-                        connections: vec!["RELAY".to_string()],
+                        connections: vec![sender.to_string()],
                     });
                 } else if let Some(board) = sender_boards
                     .iter_mut()
                     .find(|board| board.sender_id == *announcer)
                 {
-                    board.connections.push("RELAY".to_string());
+                    board.connections.push(self.sender_arc().to_string());
                 }
                 if !link_local_enabled {
                     for board in sender_boards.iter_mut() {
@@ -1782,12 +2537,12 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
-    fn reconcile_end_to_end_acked_destinations_locked(st: &mut RelayInner) {
+    fn reconcile_end_to_end_acked_destinations_locked(&self, st: &mut RelayInner) {
         let mut active_senders = BTreeSet::new();
         for route in st.discovery_routes.values() {
             for sender_state in route.announcers.values() {
                 for board in sender_state.topology_boards.iter() {
-                    if Self::is_end_to_end_destination_sender(&board.sender_id) {
+                    if self.is_end_to_end_destination_sender(&board.sender_id) {
                         active_senders.insert(Self::sender_hash(&board.sender_id));
                     }
                 }
@@ -1846,11 +2601,108 @@ impl Relay {
 
         let sender = match data {
             RelayItem::Packet(pkt) => pkt.sender().to_owned(),
-            RelayItem::Serialized(bytes) => serialize::deserialize_packet(bytes.as_ref())?
-                .sender()
-                .to_owned(),
+            RelayItem::Packed(bytes) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(None);
+                }
+                wire_format::unpack_packet(bytes.as_ref())?
+                    .sender()
+                    .to_owned()
+            }
         };
         Ok(Some(sender))
+    }
+
+    #[cfg(feature = "discovery")]
+    #[inline]
+    fn side_is_slow_control_link_locked(
+        st: &RelayInner,
+        side_id: RelaySideId,
+        now_ms: u64,
+    ) -> bool {
+        st.adaptive_route_stats.get(&side_id).is_some_and(|stats| {
+            let recent_slow = stats.last_slow_observed_ms > 0
+                && now_ms.saturating_sub(stats.last_slow_observed_ms)
+                    <= DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS;
+            stats.sample_count > 0
+                && ((stats.estimated_bandwidth_bps > 0
+                    && stats.estimated_bandwidth_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS)
+                    || recent_slow)
+        })
+    }
+
+    #[cfg(feature = "discovery")]
+    fn discovery_level_for_side_locked(
+        st: &mut RelayInner,
+        side_id: RelaySideId,
+        now_ms: u64,
+    ) -> Option<DiscoveryAdvertiseLevel> {
+        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
+            st.discovery_side_throttle.remove(&side_id);
+            return Some(DiscoveryAdvertiseLevel::Full);
+        }
+
+        let throttle = st.discovery_side_throttle.entry(side_id).or_default();
+        if now_ms >= throttle.next_full_ms {
+            throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
+            throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+            return Some(DiscoveryAdvertiseLevel::Full);
+        }
+        if now_ms >= throttle.next_ping_ms {
+            throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+            return Some(DiscoveryAdvertiseLevel::MinimalPing);
+        }
+        None
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[inline]
+    fn is_timesync_type(ty: crate::DataType) -> bool {
+        matches!(
+            ty,
+            crate::DataType::TimeSyncAnnounce
+                | crate::DataType::TimeSyncRequest
+                | crate::DataType::TimeSyncResponse
+        )
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn timesync_allowed_for_side_locked(
+        st: &mut RelayInner,
+        side_id: RelaySideId,
+        ty: crate::DataType,
+        now_ms: u64,
+    ) -> bool {
+        if !Self::is_timesync_type(ty) {
+            return true;
+        }
+        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
+            st.timesync_side_throttle.remove(&side_id);
+            return true;
+        }
+
+        let throttle = st.timesync_side_throttle.entry(side_id).or_default();
+        if now_ms >= throttle.next_allowed_ms {
+            throttle.next_allowed_ms = now_ms.saturating_add(TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn filter_timesync_sides_locked(
+        st: &mut RelayInner,
+        ty: crate::DataType,
+        now_ms: u64,
+        sides: Vec<RelaySideId>,
+    ) -> Vec<RelaySideId> {
+        sides
+            .into_iter()
+            .filter(|side| Self::timesync_allowed_for_side_locked(st, *side, ty, now_ms))
+            .collect()
     }
 
     #[cfg(feature = "discovery")]
@@ -1859,7 +2711,7 @@ impl Relay {
         let per_side = {
             let mut st = self.state.lock();
             if Self::prune_discovery_routes_locked(&mut st, now_ms) {
-                Self::reconcile_end_to_end_acked_destinations_locked(&mut st);
+                self.reconcile_end_to_end_acked_destinations_locked(&mut st);
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
             st.fit_discovery_budget();
@@ -1867,40 +2719,69 @@ impl Relay {
                 return Ok(());
             }
             st.discovery_cadence.on_announce_sent(now_ms);
-            st.sides
+            let side_entries = st
+                .sides
                 .iter()
                 .enumerate()
                 .filter_map(|(side_id, side)| {
-                    let side = side.as_ref()?;
-                    if !self.route_allowed_locked(
-                        &st,
-                        None,
-                        Some(crate::DataType::DiscoveryAnnounce),
-                        side_id,
-                    ) {
-                        return None;
-                    }
-                    let endpoints = self.advertised_discovery_endpoints_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    );
-                    let timesync_sources =
-                        self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
-                    let topology = self.advertised_discovery_topology_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    );
-                    Some((side_id, endpoints, timesync_sources, topology))
+                    side.as_ref()
+                        .map(|side| (side_id, side.opts.link_local_enabled, side.opts))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let mut per_side = Vec::new();
+            for (side_id, link_local_enabled, opts) in side_entries {
+                if !self.route_allowed_locked(
+                    &st,
+                    None,
+                    Some(crate::DataType::DiscoveryAnnounce),
+                    side_id,
+                ) {
+                    continue;
+                }
+                let Some(level) = Self::discovery_level_for_side_locked(&mut st, side_id, now_ms)
+                else {
+                    continue;
+                };
+                let capabilities = opts.link_capabilities();
+                if level == DiscoveryAdvertiseLevel::MinimalPing {
+                    per_side.push((
+                        side_id,
+                        level,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        capabilities,
+                    ));
+                    continue;
+                }
+                let endpoints = self.advertised_discovery_endpoints_for_link_locked(
+                    &st,
+                    now_ms,
+                    link_local_enabled,
+                );
+                let timesync_sources =
+                    self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+                let topology = self.advertised_discovery_topology_for_link_locked(
+                    &st,
+                    now_ms,
+                    link_local_enabled,
+                );
+                per_side.push((
+                    side_id,
+                    level,
+                    endpoints,
+                    timesync_sources,
+                    topology,
+                    capabilities,
+                ));
+            }
+            per_side
         };
         let mut st = self.state.lock();
-        for (dst, endpoints, timesync_sources, topology) in per_side {
-            if !endpoints.is_empty() {
-                let pkt =
-                    discovery::build_discovery_announce("RELAY", now_ms, endpoints.as_slice())?;
+        for (dst, level, endpoints, timesync_sources, topology, capabilities) in per_side {
+            let sender = self.sender_arc();
+            if level == DiscoveryAdvertiseLevel::Full {
+                let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
                 let data = RelayItem::Packet(Arc::new(pkt));
                 let priority = Self::relay_item_priority(&data)?;
                 st.push_tx(RelayTxItem {
@@ -1910,9 +2791,39 @@ impl Relay {
                     priority,
                 })?;
             }
-            if !timesync_sources.is_empty() {
+            if level == DiscoveryAdvertiseLevel::Full {
+                let pkt = discovery::build_discovery_link_capabilities(
+                    sender.as_ref(),
+                    now_ms,
+                    capabilities,
+                )?;
+                let data = RelayItem::Packet(Arc::new(pkt));
+                let priority = Self::relay_item_priority(&data)?;
+                st.push_tx(RelayTxItem {
+                    src: None,
+                    dst,
+                    data,
+                    priority,
+                })?;
+            }
+            if level == DiscoveryAdvertiseLevel::MinimalPing || !endpoints.is_empty() {
+                let pkt = discovery::build_discovery_announce(
+                    sender.as_ref(),
+                    now_ms,
+                    endpoints.as_slice(),
+                )?;
+                let data = RelayItem::Packet(Arc::new(pkt));
+                let priority = Self::relay_item_priority(&data)?;
+                st.push_tx(RelayTxItem {
+                    src: None,
+                    dst,
+                    data,
+                    priority,
+                })?;
+            }
+            if level == DiscoveryAdvertiseLevel::Full && !timesync_sources.is_empty() {
                 let pkt = discovery::build_discovery_timesync_sources(
-                    "RELAY",
+                    sender.as_ref(),
                     now_ms,
                     timesync_sources.as_slice(),
                 )?;
@@ -1925,8 +2836,8 @@ impl Relay {
                     priority,
                 })?;
             }
-            if !topology.is_empty() {
-                let pkt = discovery::build_discovery_topology("RELAY", now_ms, &topology)?;
+            if level == DiscoveryAdvertiseLevel::Full && !topology.is_empty() {
+                let pkt = discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?;
                 let data = RelayItem::Packet(Arc::new(pkt));
                 let priority = Self::relay_item_priority(&data)?;
                 st.push_tx(RelayTxItem {
@@ -1947,7 +2858,7 @@ impl Relay {
             let mut st = self.state.lock();
             let removed = Self::prune_discovery_routes_locked(&mut st, now_ms);
             if removed {
-                Self::reconcile_end_to_end_acked_destinations_locked(&mut st);
+                self.reconcile_end_to_end_acked_destinations_locked(&mut st);
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
             st.fit_discovery_budget();
@@ -1963,23 +2874,8 @@ impl Relay {
                 ) {
                     return false;
                 }
-                !self
-                    .advertised_discovery_endpoints_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    )
-                    .is_empty()
-                    || !self
-                        .advertised_discovery_timesync_sources_for_link_locked(&st, now_ms)
-                        .is_empty()
-                    || !self
-                        .advertised_discovery_topology_for_link_locked(
-                            &st,
-                            now_ms,
-                            side.opts.link_local_enabled,
-                        )
-                        .is_empty()
+                let _ = side;
+                true
             });
             if !st.sides.iter().any(|side| side.is_some()) || !has_any {
                 return Ok(false);
@@ -2002,17 +2898,76 @@ impl Relay {
                 }
                 pkt.as_ref().clone()
             }
-            RelayItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 if !discovery::is_discovery_type(env.ty) {
                     return Ok(());
                 }
-                serialize::deserialize_packet(bytes.as_ref())?
+                if wire_format::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(());
+                }
+                wire_format::unpack_packet(bytes.as_ref())?
             }
         };
 
         let now_ms = self.clock.now_ms();
+        if pkt.data_type() == crate::DataType::DiscoverySchema {
+            let snapshot = discovery::decode_discovery_schema(&pkt)?;
+            let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
+            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RelayQueueKind::Discovery)?;
+            drop(st);
+            let report =
+                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, MAX_QUEUE_BUDGET)?;
+            if report.changed() {
+                let mut st = self.state.lock();
+                st.fit_discovery_budget();
+                Self::note_discovery_topology_change_locked(&mut st, now_ms);
+            }
+            return Ok(());
+        }
+        if pkt.data_type() == crate::DataType::DiscoveryLinkCapabilities {
+            let _ = discovery::decode_discovery_link_capabilities(&pkt)?;
+            return Ok(());
+        }
         let mut st = self.state.lock();
+        if pkt.data_type() == crate::DataType::DiscoveryLeave {
+            let leaving = pkt.sender();
+            let before = st.discovery_routes.clone();
+            for route in st.discovery_routes.values_mut() {
+                route.announcers.remove(leaving);
+                for sender_state in route.announcers.values_mut() {
+                    sender_state
+                        .topology_boards
+                        .retain(|board| board.sender_id != leaving);
+                    for board in sender_state.topology_boards.iter_mut() {
+                        board.connections.retain(|peer| peer != leaving);
+                    }
+                    Self::refresh_sender_topology_state(sender_state);
+                }
+                Self::recompute_discovery_side_state(route);
+            }
+            st.discovery_routes
+                .retain(|_, route| !route.announcers.is_empty());
+            if st.discovery_routes != before {
+                Self::note_discovery_topology_change_locked(&mut st, now_ms);
+            }
+            let _ = Self::prune_discovery_routes_locked(&mut st, now_ms);
+            self.reconcile_end_to_end_acked_destinations_locked(&mut st);
+            return Ok(());
+        }
+        let address_ad = if pkt.data_type() == crate::DataType::DiscoveryAddress {
+            Some(discovery::decode_discovery_address(&pkt)?)
+        } else {
+            None
+        };
+        let announcer_id = address_ad
+            .as_ref()
+            .map(|ad| ad.hostname.clone())
+            .unwrap_or_else(|| pkt.sender().to_string());
         let mut route = st.discovery_routes.get(&src).cloned().unwrap_or_default();
         let side_link_local_enabled = st
             .sides
@@ -2022,10 +2977,24 @@ impl Relay {
             .unwrap_or(false);
         let mut sender_state = route
             .announcers
-            .get(pkt.sender())
+            .get(&announcer_id)
             .cloned()
             .unwrap_or_default();
         let changed = match pkt.data_type() {
+            crate::DataType::DiscoveryAddress => {
+                let ad = address_ad.expect("decoded above");
+                let mut reachable = ad.reachable_endpoints;
+                if !side_link_local_enabled {
+                    reachable.retain(|ep| !ep.is_link_local_only());
+                }
+                let board = Self::sender_topology_board_mut(&mut sender_state, &ad.hostname);
+                let changed = board.reachable_endpoints != reachable
+                    || board.reachable_timesync_sources != ad.reachable_timesync_sources;
+                board.reachable_endpoints = reachable;
+                board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                Self::refresh_sender_topology_state(&mut sender_state);
+                changed
+            }
             crate::DataType::DiscoveryAnnounce => {
                 let mut reachable = discovery::decode_discovery_announce(&pkt)?;
                 if !side_link_local_enabled {
@@ -2059,12 +3028,11 @@ impl Relay {
                 Self::refresh_sender_topology_state(&mut sender_state);
                 changed
             }
+            crate::DataType::DiscoverySchema => false,
             _ => false,
         };
         sender_state.last_seen_ms = now_ms;
-        route
-            .announcers
-            .insert(pkt.sender().to_string(), sender_state);
+        route.announcers.insert(announcer_id, sender_state);
         Self::recompute_discovery_side_state(&mut route);
         st.discovery_routes.insert(src, route);
         st.fit_discovery_budget();
@@ -2072,7 +3040,7 @@ impl Relay {
             Self::note_discovery_topology_change_locked(&mut st, now_ms);
         }
         let _ = Self::prune_discovery_routes_locked(&mut st, now_ms);
-        Self::reconcile_end_to_end_acked_destinations_locked(&mut st);
+        self.reconcile_end_to_end_acked_destinations_locked(&mut st);
         Ok(())
     }
 
@@ -2136,23 +3104,23 @@ impl Relay {
 
     /// Compute a de-dupe hash for a QueueItem.
     /// Uses packet ID for Packet items, and attempts to extract packet ID from
-    /// serialized bytes. If extraction fails, hashes raw bytes as a fallback.
+    /// packed bytes. If extraction fails, hashes raw bytes as a fallback.
     fn get_hash(item: &RelayRxItem) -> u64 {
         match &item.data {
             RelayItem::Packet(pkt) => pkt.packet_id(),
-            RelayItem::Serialized(bytes) => {
-                let reliable_seq = serialize::peek_frame_info(bytes.as_ref())
+            RelayItem::Packed(bytes) => {
+                let reliable_seq = wire_format::peek_frame_info(bytes.as_ref())
                     .ok()
                     .and_then(|frame| frame.reliable)
                     .and_then(|hdr| {
-                        if (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) != 0 {
+                        if (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) != 0 {
                             None
                         } else {
                             Some(hdr.seq)
                         }
                     });
 
-                match serialize::packet_id_from_wire(bytes.as_ref()) {
+                match wire_format::packet_id_from_wire(bytes.as_ref()) {
                     Ok(id) => {
                         if let Some(seq) = reliable_seq {
                             hash_bytes_u64(id, &seq.to_le_bytes())
@@ -2207,23 +3175,42 @@ impl Relay {
             .any(|side| self.side_has_multiple_announcers_locked(&st, side, now_ms)))
     }
 
-    /// Register a side whose TX callback consumes serialized packet bytes.
+    /// Register a side whose TX callback consumes packed packet bytes.
     ///
-    /// Returns the side id later used for ingress APIs such as `rx_serialized_from_side`.
+    /// Returns the side id later used for ingress APIs such as `rx_packed_from_side`.
     /// The default options disable the relay's per-link reliable framing on this side.
-    pub fn add_side_serialized<F>(&self, name: &'static str, tx: F) -> RelaySideId
+    pub fn add_side_packed<F>(&self, name: &'static str, tx: F) -> RelaySideId
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        self.add_side_serialized_with_options(name, tx, RelaySideOptions::default())
+        self.add_side_packed_with_options(name, tx, RelaySideOptions::default())
     }
 
-    /// Register a serialized-output side with explicit side options.
+    /// Register a packed side with bounded-frame transport enabled.
+    ///
+    /// `max_frame_bytes == 0` leaves frames unbounded.
+    pub fn add_side_packed_small_packets<F>(
+        &self,
+        name: &'static str,
+        tx: F,
+        max_frame_bytes: usize,
+    ) -> RelaySideId
+    where
+        F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        self.add_side_packed_with_options(
+            name,
+            tx,
+            RelaySideOptions::default().with_small_packet_transport(max_frame_bytes),
+        )
+    }
+
+    /// Register a packed-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` enables relay-managed per-hop ACK/retransmit behavior on this side.
     /// `opts.link_local_enabled` gates link-local-only forwarding and discovery use of this side.
     /// `ingress_enabled` and `egress_enabled` set the initial directional policy.
-    pub fn add_side_serialized_with_options<F>(
+    pub fn add_side_packed_with_options<F>(
         &self,
         name: &'static str,
         tx: F,
@@ -2236,9 +3223,12 @@ impl Relay {
         let id = st.sides.len();
         st.sides.push(Some(RelaySide {
             name,
-            tx_handler: RelayTxHandlerFn::Serialized(Arc::new(tx)),
+            tx_handler: RelayTxHandlerFn::Packed(Arc::new(tx)),
             opts,
         }));
+        st.side_runtime_stats
+            .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -2246,8 +3236,8 @@ impl Relay {
 
     /// Register a side whose TX callback receives decoded [`Packet`] values.
     ///
-    /// Packet-output sides do not preserve the relay's serialized reliable hop framing, so use a
-    /// serialized side when this hop should participate in relay-managed per-link reliability.
+    /// Packet-output sides do not preserve the relay's packed reliable hop framing, so use a
+    /// packed side when this hop should participate in relay-managed per-link reliability.
     pub fn add_side_packet<F>(&self, name: &'static str, tx: F) -> RelaySideId
     where
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
@@ -2272,6 +3262,9 @@ impl Relay {
             tx_handler: RelayTxHandlerFn::Packet(Arc::new(tx)),
             opts,
         }));
+        st.side_runtime_stats
+            .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -2300,6 +3293,11 @@ impl Relay {
         st.source_route_modes.remove(&Some(side));
         st.route_selection_cursors.remove(&Some(side));
         st.adaptive_route_stats.remove(&side);
+        #[cfg(feature = "discovery")]
+        st.discovery_side_throttle.remove(&side);
+        #[cfg(all(feature = "discovery", feature = "timesync"))]
+        st.timesync_side_throttle.remove(&side);
+        st.side_runtime_stats.remove(&side);
         st.reliable_return_routes
             .retain(|_, route| route.side != side);
         st.rx_queue.retain(|queued| queued.src != side);
@@ -2493,7 +3491,7 @@ impl Relay {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.typed_route_overrides
-            .insert((src, ty as u32, dst), enabled);
+            .insert((src, ty.as_u32(), dst), enabled);
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
@@ -2512,7 +3510,7 @@ impl Relay {
         if let Some(src) = src {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
-        st.typed_route_overrides.remove(&(src, ty as u32, dst));
+        st.typed_route_overrides.remove(&(src, ty.as_u32(), dst));
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
@@ -2538,6 +3536,29 @@ impl Relay {
         self.queue_discovery_announce()
     }
 
+    /// Broadcast that this relay is leaving so peers can prune topology immediately.
+    pub fn announce_leave(&self) -> TelemetryResult<()> {
+        let pkt = discovery::build_discovery_leave("relay", self.clock.now_ms())?;
+        let mut st = self.state.lock();
+        let dsts: Vec<usize> = st
+            .sides
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, side)| side.as_ref().map(|_| idx))
+            .collect();
+        for dst in dsts {
+            let data = RelayItem::Packet(Arc::new(pkt.clone()));
+            let priority = Self::relay_item_priority(&data)?;
+            st.push_tx(RelayTxItem {
+                src: None,
+                dst,
+                data,
+                priority,
+            })?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "discovery")]
     /// Polls discovery state and queues an announce if the cadence says one is due.
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
@@ -2550,7 +3571,7 @@ impl Relay {
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         if Self::prune_discovery_routes_locked(&mut st, now_ms) {
-            Self::reconcile_end_to_end_acked_destinations_locked(&mut st);
+            self.reconcile_end_to_end_acked_destinations_locked(&mut st);
             Self::note_discovery_topology_change_locked(&mut st, now_ms);
         }
         let routes = st
@@ -2563,7 +3584,12 @@ impl Relay {
                     .iter()
                     .map(|(sender_id, sender_state)| TopologyAnnouncerRoute {
                         sender_id: sender_id.clone(),
-                        reachable_endpoints: sender_state.reachable.clone(),
+                        reachable_endpoints: sender_state
+                            .reachable
+                            .iter()
+                            .copied()
+                            .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                            .collect(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
                         routers: sender_state.topology_boards.clone(),
                         last_seen_ms: sender_state.last_seen_ms,
@@ -2573,7 +3599,12 @@ impl Relay {
                 Some(TopologySideRoute {
                     side_id,
                     side_name: side.name,
-                    reachable_endpoints: route.reachable.clone(),
+                    reachable_endpoints: route
+                        .reachable
+                        .iter()
+                        .copied()
+                        .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                        .collect(),
                     reachable_timesync_sources: route.reachable_timesync_sources.clone(),
                     announcers,
                     last_seen_ms: route.last_seen_ms,
@@ -2586,14 +3617,347 @@ impl Relay {
             self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true);
         let advertised_timesync_sources =
             self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+        let links = discovery::topology_links_from_boards(&routers);
         TopologySnapshot {
             advertised_endpoints,
             advertised_timesync_sources,
             routers,
+            links,
             routes,
             current_announce_interval_ms: st.discovery_cadence.current_interval_ms,
             next_announce_ms: st.discovery_cadence.next_announce_ms,
         }
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn client_stats(&self, sender_id: &str) -> Option<ClientStatsSnapshot> {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        let mut side_ids = Vec::new();
+        let mut side_names = Vec::new();
+        let mut last_seen_ms = None::<u64>;
+        let mut reachable_endpoints = Vec::new();
+        let mut reachable_timesync_sources = Vec::new();
+        let mut packets_sent = 0u64;
+        let mut packets_received = 0u64;
+        let mut bytes_sent = 0u64;
+        let mut bytes_received = 0u64;
+
+        for (side_id, route) in &st.discovery_routes {
+            let Some(sender_state) = route.announcers.get(sender_id) else {
+                continue;
+            };
+            side_ids.push(*side_id);
+            if let Some(side_name) = st
+                .sides
+                .get(*side_id)
+                .and_then(|side| side.as_ref())
+                .map(|side| side.name)
+            {
+                side_names.push(side_name);
+            }
+            last_seen_ms = Some(last_seen_ms.unwrap_or(0).max(sender_state.last_seen_ms));
+            reachable_endpoints.extend(sender_state.reachable.iter().copied());
+            reachable_timesync_sources
+                .extend(sender_state.reachable_timesync_sources.iter().cloned());
+            if let Some(stats) = st.side_runtime_stats.get(side_id) {
+                packets_sent = packets_sent.saturating_add(stats.tx_packets);
+                packets_received = packets_received.saturating_add(stats.rx_packets);
+                bytes_sent = bytes_sent.saturating_add(stats.tx_bytes);
+                bytes_received = bytes_received.saturating_add(stats.rx_bytes);
+            }
+        }
+
+        if side_ids.is_empty() {
+            return None;
+        }
+        reachable_endpoints.retain(|ep| !discovery::is_router_control_endpoint(*ep));
+        reachable_endpoints.sort_unstable();
+        reachable_endpoints.dedup();
+        reachable_timesync_sources.sort_unstable();
+        reachable_timesync_sources.dedup();
+        side_ids.sort_unstable();
+        side_ids.dedup();
+        side_names.sort_unstable();
+        side_names.dedup();
+        let age_ms = last_seen_ms.map(|seen| now_ms.saturating_sub(seen));
+        Some(ClientStatsSnapshot {
+            sender_id: sender_id.to_string(),
+            connected: age_ms.is_some_and(|age| age <= DISCOVERY_ROUTE_TTL_MS),
+            side_ids,
+            side_names,
+            last_seen_ms,
+            age_ms,
+            reachable_endpoints,
+            reachable_timesync_sources,
+            packets_sent,
+            packets_received,
+            bytes_sent,
+            bytes_received,
+        })
+    }
+
+    pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+
+        let mut sides = Vec::new();
+        for (side_id, side) in st.sides.iter().enumerate() {
+            let Some(side) = side.as_ref() else { continue };
+            let stats = st
+                .side_runtime_stats
+                .get(&side_id)
+                .cloned()
+                .unwrap_or_default();
+            let adaptive = st
+                .adaptive_route_stats
+                .get(&side_id)
+                .cloned()
+                .unwrap_or_default()
+                .snapshot(now_ms, true);
+            let (tx_template_count, rx_template_count) = st
+                .side_transport
+                .get(&side_id)
+                .map(|state| (state.tx_template_count(), state.rx_template_count()))
+                .unwrap_or((0, 0));
+            let mut data_types: Vec<RuntimeTypeStats> = stats
+                .data_types
+                .into_iter()
+                .map(|(ty, item)| RuntimeTypeStats {
+                    data_type: crate::DataType(ty),
+                    tx_packets: item.tx_packets,
+                    tx_bytes: item.tx_bytes,
+                    rx_packets: item.rx_packets,
+                    rx_bytes: item.rx_bytes,
+                    relayed_tx_packets: item.relayed_tx_packets,
+                    relayed_tx_bytes: item.relayed_tx_bytes,
+                    relayed_rx_packets: item.relayed_rx_packets,
+                    relayed_rx_bytes: item.relayed_rx_bytes,
+                    tx_retries: item.tx_retries,
+                    handler_failures: item.handler_failures,
+                })
+                .collect();
+            data_types.sort_unstable_by_key(|item| item.data_type.as_u32());
+            sides.push(RuntimeSideStats {
+                side_id,
+                side_name: side.name,
+                reliable_enabled: side.opts.reliable_enabled,
+                link_local_enabled: side.opts.link_local_enabled,
+                header_template_enabled: side.opts.header_template_enabled,
+                max_frame_bytes: side.opts.max_frame_bytes,
+                compact_header_target_bytes: side.opts.compact_header_target_bytes,
+                side_transport_profile: side.opts.effective_transport_profile().as_str(),
+                ingress_enabled: side.opts.ingress_enabled,
+                egress_enabled: side.opts.egress_enabled,
+                tx_packets: stats.tx_packets,
+                tx_bytes: stats.tx_bytes,
+                rx_packets: stats.rx_packets,
+                rx_bytes: stats.rx_bytes,
+                relayed_tx_packets: stats.relayed_tx_packets,
+                relayed_tx_bytes: stats.relayed_tx_bytes,
+                relayed_rx_packets: stats.relayed_rx_packets,
+                relayed_rx_bytes: stats.relayed_rx_bytes,
+                local_delivery_packets: 0,
+                tx_retries: stats.tx_retries,
+                tx_handler_failures: stats.tx_handler_failures,
+                local_handler_failures: 0,
+                total_handler_retries: stats.total_handler_retries,
+                side_transport_full_frames: stats.side_transport_full_frames,
+                side_transport_compact_frames: stats.side_transport_compact_frames,
+                side_transport_compact_delta_frames: stats.side_transport_compact_delta_frames,
+                side_transport_compact_omitted_timestamp_frames: stats
+                    .side_transport_compact_omitted_timestamp_frames,
+                side_transport_chunk_frames: stats.side_transport_chunk_frames,
+                side_transport_raw_bytes: stats.side_transport_raw_bytes,
+                side_transport_wire_bytes: stats.side_transport_wire_bytes,
+                side_transport_bytes_saved: stats.side_transport_bytes_saved,
+                side_transport_min_compact_overhead_bytes: stats
+                    .side_transport_min_compact_overhead_bytes,
+                side_transport_max_compact_overhead_bytes: stats
+                    .side_transport_max_compact_overhead_bytes,
+                side_transport_compact_target_misses: stats.side_transport_compact_target_misses,
+                side_transport_template_evictions: stats.side_transport_template_evictions,
+                side_transport_tx_template_count: tx_template_count,
+                side_transport_rx_template_count: rx_template_count,
+                max_side_transport_templates: side.opts.max_side_transport_templates,
+                adaptive,
+                data_types,
+            });
+        }
+
+        let mut route_modes: Vec<RouteModeStats> = st
+            .route_selection_cursors
+            .iter()
+            .map(|(src, cursor)| RouteModeStats {
+                src_side_id: *src,
+                selection_mode: st.source_route_modes.get(src).copied(),
+                cursor: *cursor,
+            })
+            .collect();
+        for src in st.source_route_modes.keys() {
+            if !route_modes.iter().any(|mode| mode.src_side_id == *src) {
+                route_modes.push(RouteModeStats {
+                    src_side_id: *src,
+                    selection_mode: st.source_route_modes.get(src).copied(),
+                    cursor: 0,
+                });
+            }
+        }
+        route_modes.sort_unstable_by_key(|mode| mode.src_side_id.unwrap_or(usize::MAX));
+
+        let mut route_overrides: Vec<RouteOverrideStats> = st
+            .route_overrides
+            .iter()
+            .map(|((src, dst), enabled)| RouteOverrideStats {
+                src_side_id: *src,
+                dst_side_id: *dst,
+                enabled: *enabled,
+            })
+            .collect();
+        route_overrides.sort_unstable_by_key(|item| {
+            (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
+        });
+
+        let mut typed_route_overrides: Vec<TypedRouteOverrideStats> = st
+            .typed_route_overrides
+            .iter()
+            .map(|((src, ty, dst), enabled)| TypedRouteOverrideStats {
+                src_side_id: *src,
+                data_type: crate::DataType(*ty),
+                dst_side_id: *dst,
+                enabled: *enabled,
+            })
+            .collect();
+        typed_route_overrides.sort_unstable_by_key(|item| {
+            (
+                item.src_side_id.unwrap_or(usize::MAX),
+                item.data_type.as_u32(),
+                item.dst_side_id,
+            )
+        });
+
+        let mut route_weights: Vec<RouteWeightStats> = st
+            .route_weights
+            .iter()
+            .map(|((src, dst), weight)| RouteWeightStats {
+                src_side_id: *src,
+                dst_side_id: *dst,
+                weight: *weight,
+            })
+            .collect();
+        route_weights.sort_unstable_by_key(|item| {
+            (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
+        });
+
+        let mut route_priorities: Vec<RoutePriorityStats> = st
+            .route_priorities
+            .iter()
+            .map(|((src, dst), priority)| RoutePriorityStats {
+                src_side_id: *src,
+                dst_side_id: *dst,
+                priority: *priority,
+            })
+            .collect();
+        route_priorities.sort_unstable_by_key(|item| {
+            (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
+        });
+
+        #[cfg(feature = "discovery")]
+        let discovery = DiscoveryRuntimeStats {
+            route_count: st.discovery_routes.len(),
+            announcer_count: st
+                .discovery_routes
+                .values()
+                .map(|route| route.announcers.len())
+                .sum(),
+            current_announce_interval_ms: Some(st.discovery_cadence.current_interval_ms),
+            next_announce_ms: Some(st.discovery_cadence.next_announce_ms),
+        };
+        #[cfg(not(feature = "discovery"))]
+        let discovery = DiscoveryRuntimeStats {
+            route_count: 0,
+            announcer_count: 0,
+            current_announce_interval_ms: None,
+            next_announce_ms: None,
+        };
+
+        RuntimeStatsSnapshot {
+            sides,
+            route_modes,
+            route_overrides,
+            typed_route_overrides,
+            route_weights,
+            route_priorities,
+            queues: QueueRuntimeStats {
+                rx_len: st.rx_queue.len(),
+                rx_bytes: st.rx_queue.bytes_used(),
+                tx_len: st.tx_queue.len(),
+                tx_bytes: st.tx_queue.bytes_used(),
+                replay_len: st.replay_queue.len(),
+                replay_bytes: st.replay_queue.bytes_used(),
+                recent_rx_len: st.recent_rx.len(),
+                recent_rx_bytes: st.recent_rx.bytes_used(),
+                reliable_rx_buffered_len: st.reliable_rx_buffer_len(),
+                reliable_rx_buffered_bytes: st.reliable_rx_buffered_bytes(),
+                shared_queue_bytes_used: st.shared_queue_bytes_used(),
+            },
+            reliable: ReliableRuntimeStats {
+                reliable_return_route_count: st.reliable_return_routes.len(),
+                end_to_end_pending_count: 0,
+                end_to_end_pending_destination_count: 0,
+                end_to_end_acked_cache_count: st.end_to_end_acked_destinations.len(),
+            },
+            discovery,
+            total_handler_failures: st.total_handler_failures,
+            total_handler_retries: st.total_handler_retries,
+        }
+    }
+
+    /// Export current relay memory usage/layout as JSON for profiling.
+    pub fn export_memory_layout_json(&self) -> String {
+        let st = self.state.lock();
+        #[cfg(feature = "discovery")]
+        let discovery_bytes = st.discovery_bytes_used();
+        #[cfg(not(feature = "discovery"))]
+        let discovery_bytes = 0usize;
+        let schema_bytes = crate::config::schema_bytes_used();
+        let mut out = String::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"kind\":\"relay\",\
+                 \"shared_queue_bytes_used\":{},\"shared_queue_bytes_allocated\":{},\
+                 \"rx_queue_bytes_used\":{},\"rx_queue_bytes_allocated\":{},\"rx_queue_len\":{},\
+                 \"tx_queue_bytes_used\":{},\"tx_queue_bytes_allocated\":{},\"tx_queue_len\":{},\
+                 \"replay_queue_bytes_used\":{},\"replay_queue_bytes_allocated\":{},\"replay_queue_len\":{},\
+                 \"recent_rx_bytes_used\":{},\"recent_rx_bytes_allocated\":{},\"recent_rx_len\":{},\
+                 \"reliable_rx_buffer_bytes_used\":{},\"reliable_rx_buffer_bytes_allocated\":{},\"reliable_rx_buffer_len\":{},\
+                 \"discovery_bytes_used\":{},\"discovery_bytes_allocated\":{},\
+                 \"schema_bytes_used\":{},\"schema_bytes_allocated\":{}}}",
+                st.shared_queue_bytes_used(),
+                MAX_QUEUE_BUDGET,
+                st.rx_queue.bytes_used(),
+                st.rx_queue.max_bytes(),
+                st.rx_queue.len(),
+                st.tx_queue.bytes_used(),
+                st.tx_queue.max_bytes(),
+                st.tx_queue.len(),
+                st.replay_queue.bytes_used(),
+                st.replay_queue.max_bytes(),
+                st.replay_queue.len(),
+                st.recent_rx.bytes_used(),
+                st.recent_rx.max_bytes(),
+                st.recent_rx.len(),
+                st.reliable_rx_buffered_bytes(),
+                MAX_QUEUE_BUDGET,
+                st.reliable_rx_buffer_len(),
+                discovery_bytes,
+                MAX_QUEUE_BUDGET,
+                schema_bytes,
+                MAX_QUEUE_BUDGET,
+            ),
+        );
+        out
     }
 
     #[cfg(test)]
@@ -2616,15 +3980,18 @@ impl Relay {
         st.reliable_return_routes.len()
     }
 
-    /// Enqueue serialized bytes that originated from `src` into the relay RX queue.
+    /// Enqueue packed bytes that originated from `src` into the relay RX queue.
     ///
     /// Note: `Arc::from(bytes)` allocates and copies `len` bytes into a new `Arc<[u8]>`.
     /// This is still “fast enough” for many cases, but it is not allocation-free / ISR-safe.
-    pub fn rx_serialized_from_side(&self, src: RelaySideId, bytes: &[u8]) -> TelemetryResult<()> {
+    pub fn rx_packed_from_side(&self, src: RelaySideId, bytes: &[u8]) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(src)?;
+        let Some(bytes) = self.decode_side_transport_frame(src, bytes)? else {
+            return Ok(());
+        };
         let mut st = self.state.lock();
 
-        let data = RelayItem::Serialized(Arc::from(bytes));
+        let data = RelayItem::Packed(bytes);
         let priority = Self::relay_item_priority(&data)?;
         st.push_rx(RelayRxItem {
             src,
@@ -2676,29 +4043,40 @@ impl Relay {
         self.ensure_side_ingress_enabled(item.src)?;
         match &item.data {
             RelayItem::Packet(pkt) => {
+                let bytes = wire_format::pack_packet(pkt).len();
+                self.note_side_rx(item.src, pkt.data_type(), bytes);
+            }
+            RelayItem::Packed(bytes) => {
+                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                    self.note_side_rx(item.src, env.ty, bytes.len());
+                }
+            }
+        }
+        match &item.data {
+            RelayItem::Packet(pkt) => {
                 if is_reliable_type(pkt.data_type()) && !is_internal_control_type(pkt.data_type()) {
                     self.note_reliable_return_route(item.src, pkt.packet_id());
                 }
             }
-            RelayItem::Serialized(bytes) => {
-                if let Ok(env) = serialize::peek_envelope(bytes.as_ref())
+            RelayItem::Packed(bytes) => {
+                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
                     && is_reliable_type(env.ty)
                     && !is_internal_control_type(env.ty)
-                    && let Ok(packet_id) = serialize::packet_id_from_wire(bytes.as_ref())
+                    && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
                 {
                     self.note_reliable_return_route(item.src, packet_id);
                 }
             }
         }
         let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
-        if let RelayItem::Serialized(bytes) = &item.data {
-            let (_opts, handler_is_serialized, hop_reliable_enabled) = {
+        if let RelayItem::Packed(bytes) = &item.data {
+            let (_opts, handler_is_packed, hop_reliable_enabled) = {
                 let st = self.state.lock();
                 let side_ref = Self::side_ref(&st, item.src)?;
                 let opts = side_ref.opts;
                 (
                     opts,
-                    matches!(side_ref.tx_handler, RelayTxHandlerFn::Serialized(_)),
+                    matches!(side_ref.tx_handler, RelayTxHandlerFn::Packed(_)),
                     opts.reliable_enabled
                         && !self.side_has_multiple_announcers_locked(
                             &st,
@@ -2708,20 +4086,20 @@ impl Relay {
                 )
             };
 
-            let frame = match serialize::peek_frame_info(bytes.as_ref()) {
+            let frame = match wire_format::peek_frame_info(bytes.as_ref()) {
                 Ok(frame) => frame,
                 Err(e) => {
-                    if matches!(e, TelemetryError::Deserialize(msg) if msg == "crc32 mismatch")
+                    if matches!(e, TelemetryError::Unpack(msg) if msg == "crc32 mismatch")
                         && hop_reliable_enabled
-                        && handler_is_serialized
-                        && let Ok(frame) = serialize::peek_frame_info_unchecked(bytes.as_ref())
+                        && handler_is_packed
+                        && let Ok(frame) = wire_format::peek_frame_info_unchecked(bytes.as_ref())
                     {
                         if is_reliable_type(frame.envelope.ty)
                             && let Some(hdr) = frame.reliable
                         {
-                            let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
+                            let unordered = (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
                             let unsequenced =
-                                (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                                (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                             if !unsequenced {
                                 let requested = if unordered {
@@ -2749,12 +4127,16 @@ impl Relay {
             };
 
             if hop_reliable_enabled
-                && handler_is_serialized
+                && handler_is_packed
                 && is_reliable_type(frame.envelope.ty)
                 && let Some(hdr) = frame.reliable
             {
-                let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
-                let unsequenced = (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                if frame.ack_only() {
+                    self.handle_reliable_ack(item.src, frame.envelope.ty, hdr.ack);
+                    return Ok(());
+                }
+                let unordered = (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
+                let unsequenced = (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                 if !unsequenced {
                     if unordered {
@@ -2833,8 +4215,8 @@ impl Relay {
         for release_bytes in released_buffered {
             let release_item = RelayRxItem {
                 src: item.src,
-                priority: Self::relay_item_priority(&RelayItem::Serialized(release_bytes.clone()))?,
-                data: RelayItem::Serialized(release_bytes),
+                priority: Self::relay_item_priority(&RelayItem::Packed(release_bytes.clone()))?,
+                data: RelayItem::Packed(release_bytes),
             };
             if self.is_duplicate_pkt(&release_item)?
                 && !self.should_forward_duplicate_reliable_item(&release_item)?
@@ -2873,9 +4255,7 @@ impl Relay {
                     } else {
                         let vals = pkt.data_as_u32()?;
                         if vals.len() != 2 {
-                            return Err(TelemetryError::Deserialize(
-                                "bad reliable control payload",
-                            ));
+                            return Err(TelemetryError::Unpack("bad reliable control payload"));
                         }
                         let ty = crate::DataType::try_from_u32(vals[0])
                             .ok_or(TelemetryError::InvalidType)?;
@@ -2896,15 +4276,15 @@ impl Relay {
                     }
                 }
             }
-            RelayItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 if matches!(
                     env.ty,
                     crate::DataType::ReliableAck
                         | crate::DataType::ReliablePacketRequest
                         | crate::DataType::ReliablePartialAck
                 ) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     return self.dispatch_relay_rx_item(&RelayRxItem {
                         src: item.src,
                         data: RelayItem::Packet(Arc::new(pkt)),
@@ -2933,33 +4313,631 @@ impl Relay {
         Ok(())
     }
 
+    #[inline]
+    fn crc32_bytes(data: &[u8]) -> u32 {
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
+        let mut out = Vec::with_capacity(
+            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES,
+        );
+        out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
+        out.push(kind);
+        out.extend_from_slice(body);
+        let crc = Self::crc32_bytes(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        Arc::from(out)
+    }
+
+    fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
+        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES {
+            return Ok(None);
+        }
+        if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
+            return Ok(None);
+        }
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
+        let expected = u32::from_le_bytes([
+            bytes[data_len],
+            bytes[data_len + 1],
+            bytes[data_len + 2],
+            bytes[data_len + 3],
+        ]);
+        let data = &bytes[..data_len];
+        if Self::crc32_bytes(data) != expected {
+            return Err(TelemetryError::Unpack("side transport crc32 mismatch"));
+        }
+        let kind = data[SIDE_TRANSPORT_MAGIC.len()];
+        Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
+    }
+
+    fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        for _ in 0..10 {
+            let byte = *buf.get(*off).ok_or(TelemetryError::Unpack("short read"))?;
+            *off += 1;
+            result |= u64::from(byte & 0x7F) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+        Err(TelemetryError::Unpack("uleb128 too long"))
+    }
+
+    fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn uleb128_len_local(mut value: u64) -> usize {
+        let mut len = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
+        if bytes.len() < wire_format::CRC32_BYTES + 4 {
+            return Err(TelemetryError::Unpack("short buffer"));
+        }
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
+        let data = &bytes[..data_len];
+        let mut off = 0usize;
+        let flags = *data
+            .get(off)
+            .ok_or(TelemetryError::Unpack("short prelude"))?;
+        off += 1;
+        off += 1; // NEP
+        let ty_u64 = Self::read_uleb128_local(data, &mut off)?;
+        let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
+        if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
+            return Err(TelemetryError::Unpack("bad data type"));
+        }
+        let ty = crate::DataType(ty_u32);
+        let data_size_off = off;
+        let data_size = Self::read_uleb128_local(data, &mut off)?;
+        let timestamp = Self::read_uleb128_local(data, &mut off)?;
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            u16::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
+        } else {
+            0
+        };
+        let between_start = off;
+        let _source_address = u32::try_from(Self::read_uleb128_local(data, &mut off)?)
+            .map_err(|_| TelemetryError::Unpack("source address too large"))?;
+        let endpoint_bitmap_bytes = if (flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT) != 0 {
+            SIDE_TRANSPORT_EP_BITMAP_BYTES
+        } else {
+            0
+        };
+        if data.len() < off + endpoint_bitmap_bytes {
+            return Err(TelemetryError::Unpack("short buffer"));
+        }
+        off += endpoint_bitmap_bytes;
+        if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
+            let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
+            if data.len() < off + contract_len {
+                return Err(TelemetryError::Unpack("short buffer"));
+            }
+            off += contract_len;
+        }
+        let reliable_span = wire_format::reliable_header_span(bytes)?;
+        let (reliable_flags, reliable_seq_ack, reliable_compact, payload_off) =
+            if let Some((rel_off, rel_len, hdr)) = reliable_span {
+                if data.len() < rel_off + rel_len {
+                    return Err(TelemetryError::Unpack("short buffer"));
+                }
+                (
+                    Some(hdr.flags),
+                    Some((hdr.seq, hdr.ack)),
+                    (flags & SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER) != 0,
+                    rel_off + rel_len,
+                )
+            } else {
+                (None, None, false, off)
+            };
+        if payload_off > data.len() {
+            return Err(TelemetryError::Unpack("short buffer"));
+        }
+        let payload = &data[payload_off..];
+        let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
+        let between_end = reliable_span
+            .map(|(rel_off, _, _)| rel_off)
+            .unwrap_or(payload_off);
+        let between = Arc::<[u8]>::from(&data[between_start..between_end]);
+        let base_flags =
+            flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
+        let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
+        hash = hash_bytes_u64(hash, &[base_flags]);
+        hash = hash_bytes_u64(hash, &prefix);
+        hash = hash_bytes_u64(hash, &between);
+        if let Some(rel_flags) = reliable_flags {
+            hash = hash_bytes_u64(hash, &[rel_flags]);
+        }
+        let template = SideHeaderTemplate {
+            hash,
+            base_flags,
+            prefix,
+            between,
+            reliable_flags,
+            reliable_compact,
+        };
+        Ok((
+            template,
+            ty,
+            flags,
+            data_size,
+            timestamp,
+            nonce,
+            reliable_seq_ack,
+            payload,
+        ))
+    }
+
+    fn reconstruct_side_compact_frame(
+        template: &SideHeaderTemplate,
+        body: &[u8],
+        timestamp_mode: SideCompactTimestampMode,
+        timestamp_base: Option<u64>,
+    ) -> TelemetryResult<(Arc<[u8]>, u64)> {
+        if body.is_empty() {
+            return Err(TelemetryError::Unpack("short side compact frame"));
+        }
+        let mut off = 0usize;
+        let flags = body[off];
+        off += 1;
+        if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
+            != template.base_flags
+        {
+            return Err(TelemetryError::Unpack("side compact flags mismatch"));
+        }
+        let data_size = Self::read_uleb128_local(body, &mut off)?;
+        let timestamp = match timestamp_mode {
+            SideCompactTimestampMode::Absolute => Self::read_uleb128_local(body, &mut off)?,
+            SideCompactTimestampMode::Delta => {
+                let timestamp_field = Self::read_uleb128_local(body, &mut off)?;
+                let base = timestamp_base.ok_or(TelemetryError::Unpack(
+                    "missing side compact timestamp context",
+                ))?;
+                base.checked_add(timestamp_field)
+                    .ok_or(TelemetryError::Unpack(
+                        "side compact timestamp delta overflow",
+                    ))?
+            }
+            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(TelemetryError::Unpack(
+                "missing side compact timestamp context",
+            ))?,
+        };
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            Some(Self::read_uleb128_local(body, &mut off)?)
+        } else {
+            None
+        };
+        let reliable_seq_ack = if template.reliable_flags.is_some() {
+            let seq = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("side compact reliable seq too large"))?;
+            let ack = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("side compact reliable ack too large"))?;
+            Some((seq, ack))
+        } else {
+            None
+        };
+        let payload = &body[off..];
+        let mut raw = Vec::with_capacity(
+            1 + template.prefix.len() + template.between.len() + payload.len() + 32,
+        );
+        raw.push(flags);
+        raw.extend_from_slice(&template.prefix);
+        Self::write_uleb128_local(data_size, &mut raw);
+        Self::write_uleb128_local(timestamp, &mut raw);
+        if let Some(nonce) = nonce {
+            Self::write_uleb128_local(nonce, &mut raw);
+        }
+        raw.extend_from_slice(&template.between);
+        if let Some(rel_flags) = template.reliable_flags {
+            let (seq, ack) =
+                reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
+            wire_format::write_reliable_header_encoded(
+                wire_format::ReliableHeader {
+                    flags: rel_flags,
+                    seq,
+                    ack,
+                },
+                template.reliable_compact,
+                &mut raw,
+            );
+        }
+        raw.extend_from_slice(payload);
+        let crc = Self::crc32_bytes(&raw);
+        raw.extend_from_slice(&crc.to_le_bytes());
+        Ok((Arc::from(raw), timestamp))
+    }
+
+    fn split_side_transport_frame(
+        &self,
+        side: RelaySideId,
+        frame: Arc<[u8]>,
+        max_frame_bytes: usize,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
+            return Err(TelemetryError::BadArg);
+        }
+        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
+        let mut st = self.state.lock();
+        let side_state = st
+            .side_transport
+            .get_mut(&side)
+            .ok_or(TelemetryError::BadArg)?;
+        let transfer_id = side_state.next_chunk_id.wrapping_add(1).max(1);
+        side_state.next_chunk_id = transfer_id;
+        drop(st);
+
+        let total = frame.len().div_ceil(payload_budget);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let mut frames = Vec::with_capacity(total);
+        for (idx, chunk) in frame.chunks(payload_budget).enumerate() {
+            let mut body = Vec::with_capacity(8 + chunk.len());
+            body.extend_from_slice(&transfer_id.to_le_bytes());
+            body.extend_from_slice(&(idx as u16).to_le_bytes());
+            body.extend_from_slice(&total_u16.to_le_bytes());
+            body.extend_from_slice(chunk);
+            frames.push(Self::wrap_side_transport_frame(
+                SIDE_TRANSPORT_KIND_CHUNK,
+                &body,
+            ));
+        }
+        Ok(frames)
+    }
+
+    fn encode_side_transport_frames(
+        &self,
+        side: RelaySideId,
+        opts: RelaySideOptions,
+        raw: Arc<[u8]>,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
+            return Ok(vec![raw]);
+        }
+        let raw_len = raw.len();
+        let mut compact_payload_len = None;
+        let mut used_compact = false;
+        let mut used_timestamp_delta = false;
+        let mut omitted_timestamp = false;
+        let (template, ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+            Self::extract_side_header_template(raw.as_ref())?;
+        let (template_id, use_compact, previous_timestamp) = {
+            let mut st = self.state.lock();
+            let side_state = st
+                .side_transport
+                .get_mut(&side)
+                .ok_or(TelemetryError::BadArg)?;
+            if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
+                let previous = side_state.tx_last_timestamps.get(&id).copied();
+                (id, true, previous)
+            } else {
+                let next = side_state.next_template_id.wrapping_add(1).max(1);
+                side_state.next_template_id = next;
+                let evicted = side_state.insert_tx_template(
+                    template,
+                    next,
+                    opts.max_side_transport_templates,
+                );
+                if evicted {
+                    st.side_runtime_stats
+                        .entry(side)
+                        .or_default()
+                        .note_side_transport_template_eviction();
+                }
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.tx_last_timestamps.insert(next, timestamp);
+                }
+                (next, false, None)
+            }
+        };
+        let wrapped = if use_compact {
+            used_compact = true;
+            compact_payload_len = Some(payload.len());
+            let timestamp_field = if let Some(previous) = previous_timestamp {
+                let delta = timestamp.saturating_sub(previous);
+                let omit_timestamp = opts.omit_unchanged_compact_timestamps
+                    || opts.compact_timestamp_omission_types.contains(ty);
+                if omit_timestamp && timestamp == previous {
+                    omitted_timestamp = true;
+                    None
+                } else if timestamp >= previous
+                    && Self::uleb128_len_local(delta) < Self::uleb128_len_local(timestamp)
+                {
+                    used_timestamp_delta = true;
+                    Some(delta)
+                } else {
+                    Some(timestamp)
+                }
+            } else {
+                Some(timestamp)
+            };
+            let mut body = Vec::with_capacity(payload.len() + 32);
+            body.push(flags);
+            Self::write_uleb128_local(u64::from(template_id), &mut body);
+            Self::write_uleb128_local(data_size, &mut body);
+            if let Some(timestamp_field) = timestamp_field {
+                Self::write_uleb128_local(timestamp_field, &mut body);
+            }
+            if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+                Self::write_uleb128_local(u64::from(nonce), &mut body);
+            }
+            if let Some((seq, ack)) = reliable_seq_ack {
+                Self::write_uleb128_local(u64::from(seq), &mut body);
+                Self::write_uleb128_local(u64::from(ack), &mut body);
+            }
+            body.extend_from_slice(payload);
+            {
+                let mut st = self.state.lock();
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.tx_last_timestamps.insert(template_id, timestamp);
+                }
+            }
+            let kind = if omitted_timestamp {
+                SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+            } else if used_timestamp_delta {
+                SIDE_TRANSPORT_KIND_COMPACT_DELTA
+            } else {
+                SIDE_TRANSPORT_KIND_COMPACT
+            };
+            Self::wrap_side_transport_frame(kind, &body)
+        } else {
+            let mut body = Vec::with_capacity(raw.len() + 4);
+            Self::write_uleb128_local(u64::from(template_id), &mut body);
+            body.extend_from_slice(raw.as_ref());
+            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
+        };
+        let frames = if opts.max_frame_bytes != 0 && wrapped.len() > opts.max_frame_bytes {
+            self.split_side_transport_frame(side, wrapped, opts.max_frame_bytes)
+        } else {
+            Ok(vec![wrapped])
+        }?;
+        let wire_len = frames.iter().map(|frame| frame.len()).sum::<usize>();
+        let mut st = self.state.lock();
+        let stats = st.side_runtime_stats.entry(side).or_default();
+        if used_compact {
+            let overhead = compact_payload_len
+                .map(|payload_len| wire_len.saturating_sub(payload_len))
+                .unwrap_or(wire_len);
+            stats.note_side_transport_compact(
+                raw_len,
+                wire_len,
+                overhead,
+                used_timestamp_delta,
+                omitted_timestamp,
+            );
+            if opts.compact_header_target_bytes != 0 && overhead > opts.compact_header_target_bytes
+            {
+                stats.note_side_transport_compact_target_miss();
+            }
+        } else {
+            stats.note_side_transport_full(raw_len, wire_len);
+        }
+        if frames.len() > 1 {
+            stats.note_side_transport_chunks(frames.len());
+        }
+        Ok(frames)
+    }
+
+    fn decode_side_transport_frame(
+        &self,
+        side: RelaySideId,
+        bytes: &[u8],
+    ) -> TelemetryResult<Option<Arc<[u8]>>> {
+        let Some((kind, body)) = Self::parse_side_transport_wrapper(bytes)? else {
+            return Ok(Some(Arc::from(bytes)));
+        };
+        match kind {
+            SIDE_TRANSPORT_KIND_FULL => {
+                let mut off = 0usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                let raw = Arc::<[u8]>::from(&body[off..]);
+                if let Ok((template, _, _, _, timestamp, _, _, _)) =
+                    Self::extract_side_header_template(raw.as_ref())
+                {
+                    let mut st = self.state.lock();
+                    let max_templates = st
+                        .sides
+                        .get(side)
+                        .and_then(|side| side.as_ref())
+                        .map(|side| side.opts.max_side_transport_templates)
+                        .unwrap_or(DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT);
+                    let evicted = st.side_transport.get_mut(&side).is_some_and(|side_state| {
+                        let evicted =
+                            side_state.insert_rx_template(template_id, template, max_templates);
+                        side_state.rx_last_timestamps.insert(template_id, timestamp);
+                        evicted
+                    });
+                    if evicted {
+                        st.side_runtime_stats
+                            .entry(side)
+                            .or_default()
+                            .note_side_transport_template_eviction();
+                    }
+                }
+                Ok(Some(raw))
+            }
+            SIDE_TRANSPORT_KIND_COMPACT
+            | SIDE_TRANSPORT_KIND_COMPACT_DELTA
+            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
+                if body.is_empty() {
+                    return Err(TelemetryError::Unpack("short side compact frame"));
+                }
+                let mut off = 1usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
+                compact_body.push(body[0]);
+                compact_body.extend_from_slice(&body[off..]);
+                let (template, timestamp_base) = {
+                    let st = self.state.lock();
+                    let state = st.side_transport.get(&side);
+                    let template = state
+                        .and_then(|state| state.rx_templates_by_id.get(&template_id))
+                        .cloned();
+                    let timestamp_base = if matches!(
+                        kind,
+                        SIDE_TRANSPORT_KIND_COMPACT_DELTA
+                            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+                    ) {
+                        state
+                            .and_then(|state| state.rx_last_timestamps.get(&template_id))
+                            .copied()
+                    } else {
+                        None
+                    };
+                    (template, timestamp_base)
+                };
+                let template =
+                    template.ok_or(TelemetryError::Unpack("unknown side compact template"))?;
+                let timestamp_mode = match kind {
+                    SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
+                    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
+                    _ => SideCompactTimestampMode::Absolute,
+                };
+                let (frame, timestamp) = Self::reconstruct_side_compact_frame(
+                    &template,
+                    &compact_body,
+                    timestamp_mode,
+                    timestamp_base,
+                )?;
+                let mut st = self.state.lock();
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.rx_last_timestamps.insert(template_id, timestamp);
+                }
+                Ok(Some(frame))
+            }
+            SIDE_TRANSPORT_KIND_CHUNK => {
+                if body.len() < 8 {
+                    return Err(TelemetryError::Unpack("short side chunk frame"));
+                }
+                let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let index = u16::from_le_bytes([body[4], body[5]]);
+                let total = u16::from_le_bytes([body[6], body[7]]);
+                let payload = Arc::<[u8]>::from(&body[8..]);
+                let assembled = {
+                    let mut st = self.state.lock();
+                    let side_state = st
+                        .side_transport
+                        .get_mut(&side)
+                        .ok_or(TelemetryError::BadArg)?;
+                    let entry = side_state.rx_chunks.entry(transfer_id).or_default();
+                    if entry.total == 0 {
+                        entry.total = total;
+                    } else if entry.total != total {
+                        side_state.rx_chunks.remove(&transfer_id);
+                        return Err(TelemetryError::Unpack("side chunk total mismatch"));
+                    }
+                    entry.received.entry(index).or_insert(payload);
+                    if entry.received.len() == usize::from(total) {
+                        let entry = side_state
+                            .rx_chunks
+                            .remove(&transfer_id)
+                            .ok_or(TelemetryError::Unpack("side chunk missing"))?;
+                        let mut out = Vec::new();
+                        for idx in 0..entry.total {
+                            let chunk = entry
+                                .received
+                                .get(&idx)
+                                .ok_or(TelemetryError::Unpack("side chunk gap"))?;
+                            out.extend_from_slice(chunk);
+                        }
+                        Some(Arc::<[u8]>::from(out))
+                    } else {
+                        None
+                    }
+                };
+                match assembled {
+                    Some(frame) => self.decode_side_transport_frame(side, frame.as_ref()),
+                    None => Ok(None),
+                }
+            }
+            _ => Err(TelemetryError::Unpack("unknown side transport frame")),
+        }
+    }
+
     /// Helper: call a TX handler with the best representation we have.
     /// - Packet handler + Packet item: direct.
-    /// - Serialized handler + Serialized item: direct.
-    /// - Packet handler + Serialized item: deserialize for this call.
-    /// - Serialized handler + Packet item: serialize for this call.
+    /// - Packed handler + Packed item: direct.
+    /// - Packet handler + Packed item: unpack for this call.
+    /// - Packed handler + Packet item: pack for this call.
     fn call_tx_handler(
         &self,
         side: RelaySideId,
         handler: &RelayTxHandlerFn,
         data: &RelayItem,
     ) -> TelemetryResult<()> {
+        let opts = {
+            let st = self.state.lock();
+            Self::side_ref(&st, side)?.opts
+        };
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
+        let ty = match data {
+            RelayItem::Packet(pkt) => pkt.data_type(),
+            RelayItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
+        };
         let result = match (handler, data) {
             // Fast paths
-            (RelayTxHandlerFn::Serialized(f), RelayItem::Serialized(bytes)) => f(bytes.as_ref()),
+            (RelayTxHandlerFn::Packed(f), RelayItem::Packed(bytes)) => {
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    f(frame.as_ref())?;
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, 1);
+                return Ok(());
+            }
             (RelayTxHandlerFn::Packet(f), RelayItem::Packet(pkt)) => f(pkt),
 
             // Conversion paths
-            (RelayTxHandlerFn::Serialized(f), RelayItem::Packet(pkt)) => {
-                let owned = serialize::serialize_packet(pkt);
-                f(&owned)
+            (RelayTxHandlerFn::Packed(f), RelayItem::Packet(pkt)) => {
+                let owned = wire_format::pack_packet(pkt);
+                let frames = self.encode_side_transport_frames(side, opts, owned)?;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    f(frame.as_ref())?;
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, 1);
+                return Ok(());
             }
-            (RelayTxHandlerFn::Packet(f), RelayItem::Serialized(bytes)) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+            (RelayTxHandlerFn::Packet(f), RelayItem::Packed(bytes)) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(());
+                }
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 f(&pkt)
             }
         };
@@ -2967,6 +4945,9 @@ impl Relay {
             && let Ok(bytes) = Self::relay_item_wire_len(data)
         {
             self.record_side_tx_sample(side, bytes, started_ms, self.clock.now_ms());
+            self.note_side_tx_success(side, ty, bytes, 1);
+        } else if result.is_err() {
+            self.note_side_tx_failure(side, ty, 1);
         }
         result
     }
@@ -2981,29 +4962,31 @@ impl Relay {
         }
 
         match data {
-            RelayItem::Serialized(bytes) => {
-                let frame = match serialize::peek_frame_info(bytes.as_ref()) {
+            RelayItem::Packed(bytes) => {
+                let frame = match wire_format::peek_frame_info(bytes.as_ref()) {
                     Ok(frame) => frame,
-                    Err(_) => return Ok(Some(RelayItem::Serialized(bytes))),
+                    Err(_) => return Ok(Some(RelayItem::Packed(bytes))),
                 };
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
-                    if (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) != 0 {
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) != 0 {
                         return Ok(None);
                     }
-                    if (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) == 0 {
-                        let mut v = bytes.to_vec();
-                        let _ = serialize::rewrite_reliable_header(
-                            &mut v,
-                            serialize::RELIABLE_FLAG_UNSEQUENCED,
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) == 0 {
+                        let Some(rewritten) = wire_format::rewrite_reliable_header_owned(
+                            bytes.as_ref(),
+                            wire_format::RELIABLE_FLAG_UNSEQUENCED,
                             hdr.seq,
                             0,
-                        )?;
-                        return Ok(Some(RelayItem::Serialized(Arc::from(v))));
+                        )?
+                        else {
+                            return Ok(Some(RelayItem::Packed(bytes)));
+                        };
+                        return Ok(Some(RelayItem::Packed(rewritten)));
                     }
                 }
-                Ok(Some(RelayItem::Serialized(bytes)))
+                Ok(Some(RelayItem::Packed(bytes)))
             }
             RelayItem::Packet(pkt) => {
                 if matches!(
@@ -3048,6 +5031,10 @@ impl Relay {
         if self.side_tx_active() {
             return Ok(());
         }
+        #[cfg(feature = "discovery")]
+        {
+            let _ = self.poll_discovery()?;
+        }
         let start = self.clock.now_ms();
         loop {
             self.process_reliable_timeouts()?;
@@ -3088,6 +5075,10 @@ impl Relay {
 
     /// Process RX queue with timeout.
     pub fn process_rx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        {
+            let _ = self.poll_discovery()?;
+        }
         let start = self.clock.now_ms();
         loop {
             let item_opt = {
@@ -3111,6 +5102,10 @@ impl Relay {
     pub fn process_all_queues_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         if self.side_tx_active() {
             return Ok(());
+        }
+        #[cfg(feature = "discovery")]
+        {
+            let _ = self.poll_discovery()?;
         }
         let drain_fully = timeout_ms == 0;
         let start = if drain_fully { 0 } else { self.clock.now_ms() };

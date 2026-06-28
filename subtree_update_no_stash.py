@@ -19,7 +19,7 @@ def _hint_for_cmd(cmd: List[str], returncode: int) -> str | None:
         key = cmd[-1] if cmd else "<key>"
         return f"Set it with `git config {key} <value>` from the super-repo root."
     if cmd[:2] == ["git", "fetch"]:
-        return "Check that remote `sedsprintf-upstream` exists (`git remote -v`) and auth/network are valid."
+        return "Check that remote `sedsnet-upstream` exists (`git remote -v`) and auth/network are valid."
     if cmd[:2] == ["git", "subtree"]:
         return "Confirm prefix/branch are correct and worktree is clean. Try the same git subtree command manually."
     return f"Run `{_cmd_text(cmd)}` manually for full git output."
@@ -71,10 +71,10 @@ def is_git_repo(path: Path) -> bool:
 
 
 def main() -> None:
-    # Script should live in: <super_repo_root>/sedsprintf_rs/update_subtree.py
+    # Script should live in: <super_repo_root>/sedsnet/update_subtree.py
     subtree_prefix = Path(__file__).parent.resolve()
     super_repo_root = subtree_prefix.parent
-    subtree_name = subtree_prefix.name  # "sedsprintf_rs"
+    subtree_name = subtree_prefix.name  # "sedsnet"
 
     if is_git_repo(subtree_prefix):
         raise SystemExit(
@@ -105,7 +105,7 @@ def main() -> None:
     print(f"Commit message: {commit_msg}")
 
     # Stable local remote name
-    remote_name = "sedsprintf-upstream"
+    remote_name = "sedsnet-upstream"
 
     # Fetch latest
     run(["git", "fetch", "--prune", remote_name])
@@ -139,7 +139,7 @@ def main() -> None:
             return
         raise SystemExit(
             f"Command failed with exit code {pull_proc.returncode}: {_cmd_text(cmd)}. "
-            "Hint: Verify `sedsprintf-upstream` remote/branch, ensure a clean worktree, and rerun."
+            "Hint: Verify `sedsnet-upstream` remote/branch, ensure a clean worktree, and rerun."
         )
 
     print("Subtree updated successfully.")

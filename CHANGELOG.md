@@ -1,5 +1,118 @@
 # Changelog
 
+## 4.0.0
+
+- Removed compile-time user schema generation. `build.rs` no longer turns
+  `telemetry_config.json` into Rust `DataType` / `DataEndpoint` variants or generated schema
+  constants. User endpoints and data types are runtime registry entries.
+- Added runtime schema registration and lookup APIs:
+    - Rust: `register_endpoint*`, `register_data_type*`, `endpoint_definition_by_name`,
+      `data_type_definition_by_name`, `DataEndpoint::named(...)`, and `DataType::named(...)`.
+    - C ABI: endpoint/type register, info, info-by-name, JSON registration, and removal functions.
+    - Python: matching register, info, info-by-name, JSON registration, and removal functions.
+- Endpoint and data type definitions now include human-readable `description` metadata. Runtime
+  JSON accepts both `description` and legacy `doc` fields.
+- Handler registration now auto-creates missing runtime endpoints. If an endpoint handler is
+  registered for an unknown endpoint ID, the registry creates a named placeholder and advertises it
+  through schema discovery.
+- Added schema discovery sync. Nodes now advertise the current runtime schema, merge compatible
+  endpoint/type definitions, and resolve conflicts deterministically when IDs or names collide.
+  Type shape conflicts remain rejected by direct registration.
+- Schema registry memory is now part of the same shared router/relay queue budget used for RX/TX
+  queues, reliable state, recent packet IDs, discovery topology, and other queue-backed state.
+- Added network-variable latest-value caching. Routers can mark a data type as network-managed with
+  local read/write permissions, set the value for the network, read the cached value, and
+  internally request a refresh when the cache is missing or stale. Refreshes can be answered by any
+  nearby router that has enabled or seen the variable, and applications can register update
+  callbacks for inbound cache changes.
+- Added discovery-backed P2P service ports. Routers now advertise compact node addresses and
+  hostnames, deconflict duplicate static/requested/dynamic addresses after partitions merge, and
+  notify local code when identity changes. Applications can bind a SEDSnet service port and send
+  opaque byte payloads to a hostname or address, enabling protocols such as HTTP to run over
+  SEDSnet instead of IP while normal endpoint broadcast telemetry remains unchanged.
+- Added lightweight P2P stream sessions on top of service ports. Streams exchange local/peer stream
+  IDs and expose connect/accept/data/close/reset events while continuing to use discovery-targeted
+  ordered `SEDSNET_P2P_MESSAGE` frames.
+- Added end-to-end payload encryption policy hooks under the `cryptography` feature:
+    - Data types can declare `PreferOff`, `PreferOn`, or `RequireOn`.
+    - Routers can run in `Disabled`, `RequiredOnly`, `Preferred`, or `ForceAll` mode.
+    - Builds without crypto support reject required encrypted traffic instead of silently
+      downgrading it.
+- Added process-wide crypto provider support. The provider order is C provider, Rust provider, then a
+  software fallback key, so std applications can wrap OS crypto APIs and embedded applications can
+  use secure elements or hardware accelerators without changing the router API.
+- Added compact 80-byte managed credential helpers for master-root deployments. A master/root key
+  can issue short-lived board credentials containing subject, key, epoch, validity window, and
+  permission bits; peers verify them before accepting issued session or group keys.
+- Added runtime sender ID update APIs and reduced packed header overhead. Canonical packet frames
+  now carry a compact source address instead of repeating sender hostnames; sender names are
+  discovery/config metadata, and packed sides can still cache header templates for follow-up frames.
+- Added fixed-size packed side splitting/reassembly for transports such as CAN, I2C, and
+  fixed-frame radio links. Router and relay sides can cap outbound packed chunks without
+  changing the user packet/logging API.
+- Added link-probe sample APIs for routers and relays so transport bring-up or driver-measured
+  throughput can seed adaptive path selection.
+- Tightened discovery-aware forwarding for low-bandwidth links. Once topology exists, unknown
+  user-data routes are not blindly flooded; discovery/control traffic still propagates and explicit
+  route policy can still intentionally select a side.
+- Added dynamic control-plane throttling for measured slow links. Routers and relays use recent
+  link-probe or driver timing samples to send minimal discovery reachability pings across slow
+  sides between infrequent full schema/topology/time-source refreshes, and router-managed time sync
+  throttles only the measured slow egress while fast sides keep the configured normal cadence.
+- Topology exports now include a deduplicated `links` graph, named endpoint fields, side names, and
+  filtered SEDSnet control endpoints so graphing tools see user-facing network structure instead of
+  router-only internals.
+- Added explicit leave announcements. Routers and relays can queue `SEDSNET_DISCOVERY_LEAVE` so
+  peers prune topology and client stats immediately during planned shutdown or disconnect.
+- Added per-client stats snapshots for routers and relays. Rust exposes typed snapshots, Python
+  returns dictionaries, and C/C++ expose JSON exports keyed by sender ID. Packet and byte counters
+  are aggregated from the side(s) currently reaching the client.
+- Added memory-layout JSON exports for routers and relays, including shared allocation/used bytes,
+  queue breakdowns, reliable buffers, schema/discovery state, and network-variable cache usage.
+- Static JSON config is now runtime seeding only. `SEDSNET_STATIC_SCHEMA_PATH` and
+  `SEDSNET_STATIC_IPC_SCHEMA_PATH` can seed the registry at startup, and explicit path/bytes
+  APIs are available for Rust/C/Python. Default `build.py` builds do not include application JSON.
+- Embedded builds include `telemetry_config.json` bytes only when an application provides that file
+  locally before building, then decode those bytes through the normal runtime JSON parser. Builds
+  remain publishable without a required local JSON file, and the repo no longer carries a default
+  user schema. Downstream applications can still add and package their own schema files
+  intentionally.
+- Runtime removal APIs can remove user endpoints or data types by ID or name. Built-in internal
+  discovery, time-sync, telemetry-error, and reliable-control entries remain protected.
+- The checked-in C header is now static for the runtime-schema ABI. Optional reusable C and C++
+  convenience wrappers can be selected from upstream CMake without forcing wrapper code into
+  projects that only want the raw ABI.
+- Built-in runtime endpoint/type names now use the `SEDSNET_*` prefix for router-owned control
+  traffic such as `SEDSNET_DISCOVERY`, `SEDSNET_TIME_SYNC`, and `SEDSNET_ERROR`.
+- C API coverage now includes router/relay global helper wrappers, network variables, update
+  callbacks, cryptography provider registration, software fallback keys, managed credentials,
+  runtime sender IDs, fixed-size packed sides, link-probe samples, leave announcements, memory
+  layout, client stats, and topology/runtime-stat exports.
+- `./build.py test` now auto-detects `cargo-nextest` for non-doctest Rust suites when installed,
+  falls back to `cargo test` when it is not, and keeps doctests covered with Cargo's built-in test
+  runner.
+- Added release automation for crates.io and PyPI. `publish_crates.py` can dry-run or publish the
+  ordered `sedsnet_macros`/`SEDSnet` crates, build Python wheels and sdists, build Linux/macOS/
+  Windows wheels through Docker or local macOS tooling, and tolerate already-published artifacts so
+  rerunning a release does not fail only because an upload previously succeeded.
+- PyPI uploads now use Twine instead of maturin's deprecated upload/publish commands. The release
+  helper can validate and reuse ignored local PyPI credentials, checks wheel/sdist artifacts before
+  upload, and keeps CI and local release paths on the same upload mechanism.
+- Updated package metadata for crates.io and PyPI, including package descriptions, README-backed
+  long descriptions, keywords, project URLs, license metadata, and release checklist guidance for
+  GitHub/GitLab tag builds.
+- Benchmark smoke validation still executes Criterion benchmarks, but now uses a dedicated
+  `sedsnet_smoke` baseline, longer timing windows, disabled plots, and a wider smoke-test noise
+  threshold so normal host variance does not print alternating regression/improvement noise.
+- Updated Rust tests and benches to use readable runtime names such as
+  `DataEndpoint::named("RADIO")` and `DataType::named("GPS_DATA")` instead of raw legacy IDs.
+- Added regression coverage for schema sync, deterministic conflict resolution, budget accounting,
+  runtime string lookups, description metadata, handler construction from endpoint definitions,
+  runtime schema removal, network-variable getter/setter/cache/callback behavior, crypto
+  credentials/providers, topology graph exports, leave pruning, client stats, memory layout,
+  fixed-size side splitting, link probing, slow-link discovery/time-sync throttling, and
+  nextest-aware test execution.
+
 ## 3.12.0
 
 - Queue sizing now uses one shared dynamic `MAX_QUEUE_BUDGET` across router and relay internals
@@ -32,12 +145,12 @@
   belong to which router, and which routers are connected to each other when that topology is
   forwarded across the network.
 - `export_topology()` now exposes:
-  - a top-level `routers` list with per-router endpoints, time-sync source IDs, and connections
-  - per-side announcer detail so applications can see which upstream router advertised each
-    portion of the graph
+    - a top-level `routers` list with per-router endpoints, time-sync source IDs, and connections
+    - per-side announcer detail so applications can see which upstream router advertised each
+      portion of the graph
 - Added client-facing topology export parity:
-  - Python `Router.export_topology()` / `Relay.export_topology()`
-  - C `seds_router_export_topology[_len]` / `seds_relay_export_topology[_len]` JSON exports
+    - Python `Router.export_topology()` / `Relay.export_topology()`
+    - C `seds_router_export_topology[_len]` / `seds_relay_export_topology[_len]` JSON exports
 - Updated discovery, time-sync, Rust, Python, and C/C++ documentation to describe the richer
   topology model and export surfaces.
 
@@ -193,8 +306,8 @@
   `./build.py test release` passes with the new behavior.
 - Added `./build.py check`, which runs `cargo clippy -D warnings` across the default, python, and embedded builds, and
   folded that clippy coverage into `./build.py test`.
-- Fixed generated C headers so the checked-in ABI header includes the current logging entry points, including
+- Fixed the static C ABI header so the checked-in header includes the current logging entry points, including
   `seds_router_log_typed`, `seds_router_log_queue_typed`, `seds_router_log_bytes`, and `seds_router_log_f32`.
-- Updated the C header generation path in `build.rs` so `C-Headers/sedsprintf.h` is regenerated with the current ABI
-  instead of drifting behind the exported symbols.
+- Moved `C-Headers/sedsnet.h` to a static runtime-schema ABI header so user data types and endpoints are resolved
+  by runtime registration instead of generated schema constants.
 - Updated Python stub generation and example telemetry code to match the current public ABI and discovery helpers.

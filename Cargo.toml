@@ -1,30 +1,37 @@
 [package]
-name = "sedsprintf_rs"
-version = "3.12.0"
+name = "SEDSnet"
+version = "4.0.0"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
-description = "A memory safe, no_std-capable telemetry library in Rust with Python and C bindings for use in building a telemetry network stack."
-license = "GPL-2"
-repository = "github.com/rylanmeilutis/sedsprintf_rs"
-keywords = ["sprintf", "no_std", "embedded", "python", "pyo3"]
+description = "A memory safe, no_std-capable networking stack with routing, discovery, reliability, and Rust/C/Python bindings."
+license = "GPL-2.0-only"
+repository = "https://github.com/rylan-meilutis/SEDSnet"
+documentation = "https://docs.rs/SEDSnet"
+keywords = ["telemetry", "networking", "no_std", "embedded", "pyo3"]
 categories = ["embedded", "no-std"]
 readme = "README.md"
 
 [lib]
+name = "sedsnet"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["std", "compression", "timesync", "discovery"]
-std = []
-embedded = ["compression", "timesync", "discovery"]
-python = ["std", "pyo3/extension-module", "compression", "timesync", "discovery"]
+default = ["std", "compression", "timesync", "discovery", "cryptography"]
+std = ["serde", "serde/std", "serde_json", "serde_json/std"]
+embedded = ["compression", "timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
+python = ["std", "pyo3/extension-module", "pyo3/abi3-py38", "compression", "timesync", "discovery", "cryptography"]
 compression = ["zstd-safe"]
 timesync = []
 discovery = []
+cryptography = []
 
 [package.metadata.maturin]
 bindings = "pyo3"
+
+[package.metadata.docs.rs]
+features = ["std", "compression", "timesync", "discovery", "cryptography"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [[test]]
 name = "rust-system-test"
@@ -74,20 +81,14 @@ name = "route_selection_paths"
 harness = false
 
 [dependencies]
-sedsprintf_macros = { path = "sedsprintf_macros" }
-strum_macros = { version = "0.28.0", default-features = false }
-strum = { version = "0.28.0", default-features = false }
+sedsnet_macros = { version = "2.0.0", path = "sedsnet_macros" }
 crc32fast = { version = "1.5.0", default-features = false }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"], optional = true }
+serde_json = { version = "1.0.149", default-features = false, optional = true }
 
 # Optional dependencies enabled by features
-pyo3 = { version = "0.28.3", optional = true, features = ["auto-initialize", "extension-module", "multiple-pymethods"] }
+pyo3 = { version = "0.29.0", optional = true, features = ["auto-initialize", "extension-module", "multiple-pymethods"] }
 zstd-safe = { version = "7.2.4", optional = true, default-features = false }
-
-# Build dependencies for code generation in build.rs
-[build-dependencies]
-regex = "1.12.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
 
 [dev-dependencies]
 criterion = "0.8.2"

@@ -1,12 +1,12 @@
 #[cfg(test)]
 mod mega_library_system_tests {
-    use sedsprintf_rs::TelemetryResult;
-    use sedsprintf_rs::config::{DataEndpoint, DataType};
-    use sedsprintf_rs::packet::Packet;
-    use sedsprintf_rs::relay::Relay;
-    use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig};
+    use sedsnet::TelemetryResult;
+    use sedsnet::config::{DataEndpoint, DataType};
+    use sedsnet::packet::Packet;
+    use sedsnet::relay::Relay;
+    use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
 
-    use sedsprintf_rs::serialize::serialize_packet;
+    use sedsnet::wire_format::pack_packet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -34,7 +34,13 @@ mod mega_library_system_tests {
 
     fn make_packet(ty: DataType, vals: &[f32], ts: u64) -> Packet {
         // Every packet targets BOTH endpoints (full coverage)
-        Packet::from_f32_slice(ty, vals, &[DataEndpoint::SdCard, DataEndpoint::Radio], ts).unwrap()
+        Packet::from_f32_slice(
+            ty,
+            vals,
+            &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
+            ts,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -53,22 +59,22 @@ mod mega_library_system_tests {
 
         let r_a_tx = bus_a_tx.clone();
         let relay_side_a =
-            relay.add_side_serialized("bus_a", move |bytes: &[u8]| -> TelemetryResult<()> {
-                r_a_tx.send(("relay", bytes.to_vec())).unwrap();
+            relay.add_side_packed("bus_a", move |bytes: &[u8]| -> TelemetryResult<()> {
+                let _ = r_a_tx.send(("relay", bytes.to_vec()));
                 Ok(())
             });
 
         let r_b_tx = bus_b_tx.clone();
         let relay_side_b =
-            relay.add_side_serialized("bus_b", move |bytes: &[u8]| -> TelemetryResult<()> {
-                r_b_tx.send(("relay", bytes.to_vec())).unwrap();
+            relay.add_side_packed("bus_b", move |bytes: &[u8]| -> TelemetryResult<()> {
+                let _ = r_b_tx.send(("relay", bytes.to_vec()));
                 Ok(())
             });
 
         let r_c_tx = bus_c_tx.clone();
         let relay_side_c =
-            relay.add_side_serialized("bus_c", move |bytes: &[u8]| -> TelemetryResult<()> {
-                r_c_tx.send(("relay", bytes.to_vec())).unwrap();
+            relay.add_side_packed("bus_c", move |bytes: &[u8]| -> TelemetryResult<()> {
+                let _ = r_c_tx.send(("relay", bytes.to_vec()));
                 Ok(())
             });
 
@@ -91,15 +97,15 @@ mod mega_library_system_tests {
         // -------------------------------
         let node_a_router = {
             let handlers = vec![
-                mk_counter_handler(DataEndpoint::Radio, a_radio_hits.clone()),
-                mk_counter_handler(DataEndpoint::SdCard, a_sd_hits.clone()),
+                mk_counter_handler(DataEndpoint::named("RADIO"), a_radio_hits.clone()),
+                mk_counter_handler(DataEndpoint::named("SD_CARD"), a_sd_hits.clone()),
             ];
 
             let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
-            router.add_side_serialized("bus_a", {
+            router.add_side_packed("bus_a", {
                 let bus = bus_a_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
-                    bus.send(("node_a", bytes.to_vec())).unwrap();
+                    let _ = bus.send(("node_a", bytes.to_vec()));
                     Ok(())
                 }
             });
@@ -108,15 +114,15 @@ mod mega_library_system_tests {
 
         let node_b_router = {
             let handlers = vec![
-                mk_counter_handler(DataEndpoint::Radio, b_radio_hits.clone()),
-                mk_counter_handler(DataEndpoint::SdCard, b_sd_hits.clone()),
+                mk_counter_handler(DataEndpoint::named("RADIO"), b_radio_hits.clone()),
+                mk_counter_handler(DataEndpoint::named("SD_CARD"), b_sd_hits.clone()),
             ];
 
             let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
-            router.add_side_serialized("bus_b", {
+            router.add_side_packed("bus_b", {
                 let bus = bus_b_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
-                    bus.send(("node_b", bytes.to_vec())).unwrap();
+                    let _ = bus.send(("node_b", bytes.to_vec()));
                     Ok(())
                 }
             });
@@ -125,15 +131,15 @@ mod mega_library_system_tests {
 
         let node_c_router = {
             let handlers = vec![
-                mk_counter_handler(DataEndpoint::Radio, c_radio_hits.clone()),
-                mk_counter_handler(DataEndpoint::SdCard, c_sd_hits.clone()),
+                mk_counter_handler(DataEndpoint::named("RADIO"), c_radio_hits.clone()),
+                mk_counter_handler(DataEndpoint::named("SD_CARD"), c_sd_hits.clone()),
             ];
 
             let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
-            router.add_side_serialized("bus_c", {
+            router.add_side_packed("bus_c", {
                 let bus = bus_c_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
-                    bus.send(("node_c", bytes.to_vec())).unwrap();
+                    let _ = bus.send(("node_c", bytes.to_vec()));
                     Ok(())
                 }
             });
@@ -145,24 +151,24 @@ mod mega_library_system_tests {
         // -------------------------------
         let (hub_router, hub_side_a, hub_side_b, hub_side_c) = {
             let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
-            let hub_side_a = router.add_side_serialized("bus_a", {
+            let hub_side_a = router.add_side_packed("bus_a", {
                 let bus = bus_a_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
-                    bus.send(("hub_router", bytes.to_vec())).unwrap();
+                    let _ = bus.send(("hub_router", bytes.to_vec()));
                     Ok(())
                 }
             });
-            let hub_side_b = router.add_side_serialized("bus_b", {
+            let hub_side_b = router.add_side_packed("bus_b", {
                 let bus = bus_b_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
-                    bus.send(("hub_router", bytes.to_vec())).unwrap();
+                    let _ = bus.send(("hub_router", bytes.to_vec()));
                     Ok(())
                 }
             });
-            let hub_side_c = router.add_side_serialized("bus_c", {
+            let hub_side_c = router.add_side_packed("bus_c", {
                 let bus = bus_c_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
-                    bus.send(("hub_router", bytes.to_vec())).unwrap();
+                    let _ = bus.send(("hub_router", bytes.to_vec()));
                     Ok(())
                 }
             });
@@ -187,18 +193,18 @@ mod mega_library_system_tests {
                 while !stop.load(Ordering::SeqCst) {
                     match rx.recv_timeout(Duration::from_millis(10)) {
                         Ok((_from, frame)) => {
-                            local_node.rx_serialized_queue(&frame).unwrap();
-                            hub.rx_serialized_queue_from_side(&frame, hub_side).unwrap();
-                            relay.rx_serialized_from_side(relay_side, &frame).unwrap();
+                            local_node.rx_packed_queue(&frame).unwrap();
+                            hub.rx_packed_queue_from_side(&frame, hub_side).unwrap();
+                            relay.rx_packed_from_side(relay_side, &frame).unwrap();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 while let Ok((_from, frame)) = rx.try_recv() {
-                    local_node.rx_serialized_queue(&frame).unwrap();
-                    hub.rx_serialized_queue_from_side(&frame, hub_side).unwrap();
-                    relay.rx_serialized_from_side(relay_side, &frame).unwrap();
+                    local_node.rx_packed_queue(&frame).unwrap();
+                    hub.rx_packed_queue_from_side(&frame, hub_side).unwrap();
+                    relay.rx_packed_from_side(relay_side, &frame).unwrap();
                 }
                 eprintln!("bus thread {name} exiting");
             })
@@ -273,7 +279,7 @@ mod mega_library_system_tests {
 
         // -------------------------------
         // 8) Generators
-        //   - nodes generate traffic (packet + serialized, queue + immediate)
+        //   - nodes generate traffic (packet + packed, queue + immediate)
         //   - hub ALSO generates traffic (forces hub TX paths to execute)
         // -------------------------------
         let gen_a = {
@@ -282,7 +288,7 @@ mod mega_library_system_tests {
                 let mut buf = [0.0_f32; 8];
                 for i in 0..8 {
                     make_series(&mut buf[..3], 10.0);
-                    let pkt = make_packet(DataType::GpsData, &buf[..3], i);
+                    let pkt = make_packet(DataType::named("GPS_DATA"), &buf[..3], i);
                     r.tx(pkt).unwrap();
                     thread::sleep(Duration::from_millis(3));
                 }
@@ -295,12 +301,12 @@ mod mega_library_system_tests {
                 let mut buf = [0.0_f32; 8];
                 for i in 0..8 {
                     make_series(&mut buf[..2], 3.7);
-                    let pkt = make_packet(DataType::BatteryStatus, &buf[..2], 100 + i);
+                    let pkt = make_packet(DataType::named("BATTERY_STATUS"), &buf[..2], 100 + i);
 
                     r.tx_queue(pkt.clone()).unwrap();
 
-                    let wire = serialize_packet(&pkt);
-                    r.tx_serialized(wire).unwrap();
+                    let wire = pack_packet(&pkt);
+                    r.tx_packed(wire).unwrap();
 
                     thread::sleep(Duration::from_millis(3));
                 }
@@ -315,13 +321,13 @@ mod mega_library_system_tests {
                     let pkt = Packet::from_str_slice(
                         DataType::TelemetryError,
                         &msg,
-                        &[DataEndpoint::SdCard, DataEndpoint::Radio],
+                        &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
                         200 + i as u64,
                     )
                     .unwrap();
 
-                    let wire = serialize_packet(&pkt);
-                    r.tx_serialized_queue(wire).unwrap();
+                    let wire = pack_packet(&pkt);
+                    r.tx_packed_queue(wire).unwrap();
 
                     thread::sleep(Duration::from_millis(3));
                 }
@@ -336,24 +342,24 @@ mod mega_library_system_tests {
                 for i in 0..6 {
                     make_series(&mut buf[..3], 42.0 + i as f32);
 
-                    let pkt_a = make_packet(DataType::GpsData, &buf[..3], 1000 + i);
+                    let pkt_a = make_packet(DataType::named("GPS_DATA"), &buf[..3], 1000 + i);
                     hub.tx(pkt_a.clone()).unwrap();
                     hub.tx_queue(pkt_a).unwrap();
 
-                    let pkt_b = make_packet(DataType::BatteryStatus, &buf[..2], 2000 + i);
-                    let wire_b = serialize_packet(&pkt_b);
-                    hub.tx_serialized(wire_b.clone()).unwrap();
-                    hub.tx_serialized_queue(wire_b).unwrap();
+                    let pkt_b = make_packet(DataType::named("BATTERY_STATUS"), &buf[..2], 2000 + i);
+                    let wire_b = pack_packet(&pkt_b);
+                    hub.tx_packed(wire_b.clone()).unwrap();
+                    hub.tx_packed_queue(wire_b).unwrap();
 
                     let pkt_c = Packet::from_str_slice(
                         DataType::TelemetryError,
                         "hub-msg",
-                        &[DataEndpoint::SdCard, DataEndpoint::Radio],
+                        &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
                         3000 + i,
                     )
                     .unwrap();
-                    let wire_c = serialize_packet(&pkt_c);
-                    hub.tx_serialized_queue(wire_c).unwrap();
+                    let wire_c = pack_packet(&pkt_c);
+                    hub.tx_packed_queue(wire_c).unwrap();
 
                     thread::sleep(Duration::from_millis(2));
                 }

@@ -1,4 +1,5 @@
 /target
+/dist/
 /Cargo.lock
 /CMakeFiles
 /Makefile
@@ -7,19 +8,18 @@
 .idea
 venv/
 __pycache__/
+.sedsnet-release.toml
 
 c-system-test/build/
 
 c-example-code/build/
 
-C-Headers/sedsprintf.h
-
-python-files/sedsprintf_rs/sedsprintf_rs.pyi
+python-files/sedsnet/sedsnet.pyi
 
 *.so
 *.pyi
-/sedsprintf_macros/target/
-/sedsprintf_macros/Cargo.lock
+/sedsnet_macros/target/
+/sedsnet_macros/Cargo.lock
 
 *..wiki/
 /inspection/

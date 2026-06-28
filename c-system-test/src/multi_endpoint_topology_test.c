@@ -1,18 +1,22 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "sedsprintf.h"
+#include "sedsnet.h"
+
+enum {
+    TEST_EP_SD_CARD = 100,
+    TEST_EP_RADIO = 101
+};
 
 typedef struct
 {
     unsigned packet_handler_hits;
     unsigned tx_packets;
-    unsigned saw_radio_endpoint;
-    unsigned saw_sdcard_endpoint;
 } CaptureState;
 
 static uint64_t host_now_ms(void *user)
@@ -39,8 +43,6 @@ static SedsResult capture_tx(const uint8_t *bytes, size_t len, void *user)
     CaptureState *state = (CaptureState *)user;
     SedsOwnedPacket *owned = NULL;
     SedsPacketView view;
-    uint32_t endpoints[16];
-    int32_t got = 0;
 
     assert(state != NULL);
     assert(bytes != NULL);
@@ -48,27 +50,10 @@ static SedsResult capture_tx(const uint8_t *bytes, size_t len, void *user)
 
     state->tx_packets++;
 
-    owned = seds_pkt_deserialize_owned(bytes, len);
+    owned = seds_pkt_unpack_owned(bytes, len);
     assert(owned != NULL);
 
     assert(seds_owned_pkt_view(owned, &view) == SEDS_OK);
-
-    memset(endpoints, 0, sizeof(endpoints));
-    got = seds_pkt_get_u32(&view, endpoints, sizeof(endpoints) / sizeof(endpoints[0]));
-    if (got > 0)
-    {
-        for (int32_t i = 0; i < got; ++i)
-        {
-            if (endpoints[i] == (uint32_t)SEDS_EP_RADIO)
-            {
-                state->saw_radio_endpoint = 1U;
-            }
-            if (endpoints[i] == (uint32_t)SEDS_EP_SD_CARD)
-            {
-                state->saw_sdcard_endpoint = 1U;
-            }
-        }
-    }
 
     seds_owned_pkt_free(owned);
     return SEDS_OK;
@@ -80,15 +65,15 @@ int main(void)
     bool did_queue = false;
     const SedsLocalEndpointDesc locals[] = {
         {
-            .endpoint = SEDS_EP_RADIO,
+            .endpoint = TEST_EP_RADIO,
             .packet_handler = noop_packet_handler,
-            .serialized_handler = NULL,
+            .packed_handler = NULL,
             .user = &state,
         },
         {
-            .endpoint = SEDS_EP_SD_CARD,
+            .endpoint = TEST_EP_SD_CARD,
             .packet_handler = noop_packet_handler,
-            .serialized_handler = NULL,
+            .packed_handler = NULL,
             .user = &state,
         },
     };
@@ -101,7 +86,7 @@ int main(void)
         sizeof(locals) / sizeof(locals[0]));
     assert(r != NULL);
 
-    assert(seds_router_add_side_serialized(r, "CAN", 3, capture_tx, &state, false) >= 0);
+    assert(seds_router_add_side_packed(r, "CAN", 3, capture_tx, &state, false) >= 0);
     assert(seds_router_configure_timesync(r, true, 0U, 0ULL, 5000ULL, 2000ULL, 2000ULL) ==
            SEDS_OK);
 
@@ -115,13 +100,15 @@ int main(void)
     assert(seds_router_process_tx_queue_with_timeout(r, 5U) == SEDS_OK);
 
     assert(state.tx_packets >= 2U);
-    assert(state.saw_radio_endpoint != 0U);
-    assert(state.saw_sdcard_endpoint != 0U);
+    int32_t topology_len = seds_router_export_topology_len(r);
+    assert(topology_len > 0);
+    char *topology_json = (char *)malloc((size_t)topology_len);
+    assert(topology_json != NULL);
+    assert(seds_router_export_topology(r, topology_json, (size_t)topology_len) == SEDS_OK);
+    assert(strstr(topology_json, "\"advertised_endpoint_ids\":[100,101]") != NULL);
+    free(topology_json);
 
-    printf("multi-endpoint topology ok: tx=%u radio=%u sd=%u\n",
-           state.tx_packets,
-           state.saw_radio_endpoint,
-           state.saw_sdcard_endpoint);
+    printf("multi-endpoint topology ok: tx=%u\n", state.tx_packets);
 
     seds_router_free(r);
     return 0;

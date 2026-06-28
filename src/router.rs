@@ -3,7 +3,7 @@
 //! Router with internal named sides (like Relay), plus local processing.
 //!
 //! Design:
-//! - Sides are registered with per-side TX handlers (serialized or packet).
+//! - Sides are registered with per-side TX handlers (packed or packet).
 //! - RX is tagged by source side; route rules decide whether it is forwarded.
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
@@ -12,10 +12,17 @@ use crate::config::{
     MAX_QUEUE_BUDGET, MAX_RECENT_RX_IDS, QUEUE_GROW_STEP, RECENT_RX_QUEUE_BYTES,
     STARTING_QUEUE_SIZE,
 };
+use crate::diagnostics::{
+    AdaptiveLinkStats, DiscoveryRuntimeStats, QueueRuntimeStats, ReliableRuntimeStats,
+    RouteModeStats, RouteOverrideStats, RoutePriorityStats, RouteWeightStats, RuntimeSideStats,
+    RuntimeStatsSnapshot, RuntimeTypeStats, TypedRouteOverrideStats,
+};
 #[cfg(feature = "discovery")]
 use crate::discovery::{
-    self, DiscoveryCadenceState, TopologyAnnouncerRoute, TopologyBoardNode, TopologySideRoute,
-    TopologySnapshot, DISCOVERY_ROUTE_TTL_MS,
+    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS,
+    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState,
+    TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
+    TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::hash_bytes_u64;
 use crate::queue::{BoundedDeque, ByteCost};
@@ -23,30 +30,30 @@ use crate::queue::{BoundedDeque, ByteCost};
 use crate::seds_error_msg;
 #[cfg(feature = "timesync")]
 use crate::timesync::{
-    advance_network_time, compute_network_time_sample, decode_timesync_announce,
-    decode_timesync_request, decode_timesync_response, NetworkClock,
+    INTERNAL_TIMESYNC_SOURCE_ID, LOCAL_TIMESYNC_DATE_SOURCE_ID, LOCAL_TIMESYNC_FULL_SOURCE_ID,
+    LOCAL_TIMESYNC_SUBSEC_SOURCE_ID, LOCAL_TIMESYNC_TOD_SOURCE_ID, NetworkClock,
     NetworkTimeReading, PartialNetworkTime, SlewedNetworkClock, TimeSyncConfig, TimeSyncLeader,
-    TimeSyncTracker, INTERNAL_TIMESYNC_SOURCE_ID, LOCAL_TIMESYNC_DATE_SOURCE_ID, LOCAL_TIMESYNC_FULL_SOURCE_ID,
-    LOCAL_TIMESYNC_SUBSEC_SOURCE_ID, LOCAL_TIMESYNC_TOD_SOURCE_ID,
+    TimeSyncTracker, advance_network_time, compute_network_time_sample, decode_timesync_announce,
+    decode_timesync_request, decode_timesync_response,
 };
 use crate::{
+    E2eEncryptionPolicy, MessageElement, RouteSelectionMode, TelemetryError, TelemetryResult,
     config::{
-        DataEndpoint, DataType, DEVICE_IDENTIFIER, MAX_HANDLER_RETRIES,
+        DEVICE_IDENTIFIER, DataEndpoint, DataType, MAX_HANDLER_RETRIES,
         RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_PENDING, RELIABLE_MAX_RETRIES,
         RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS,
-    }, get_needed_message_size, impl_letype_num, is_reliable_type,
+    },
+    get_needed_message_size, impl_letype_num, is_reliable_type,
     lock::{ReentryGate, RouterMutex},
-    message_meta, message_priority, packet::Packet,
-    reliable_mode,
-    serialize, MessageElement,
-    RouteSelectionMode,
-    TelemetryError, TelemetryResult,
+    message_e2e_encryption_policy, message_meta, message_priority,
+    packet::Packet,
+    reliable_mode, wire_format,
 };
 use alloc::string::{String, ToString};
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     format,
     sync::Arc,
     vec,
@@ -57,17 +64,237 @@ use core::fmt;
 use core::fmt::{Debug, Formatter};
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
 /// Logical side index (CAN, UART, RADIO, etc.)
 pub type RouterSideId = usize;
 
+const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
+const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
+const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
+const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
+const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
+const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
+const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
+const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
+const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
+const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
+const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
+const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
+const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
+const SIDE_TIMESTAMP_POLICY_WORDS: usize = ((crate::MAX_VALUE_DATA_TYPE as usize) + 1).div_ceil(64);
+const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
+const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
+pub const IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES: usize = 20;
+pub const IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES: usize = 40;
+pub const DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT: usize = 64;
+static ROUTER_INSTANCE_SEQ: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideTransportProfile {
+    Canonical,
+    Template,
+    Ipv6Like,
+    Ipv4Like,
+}
+
+impl SideTransportProfile {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Template => "template",
+            Self::Ipv6Like => "ipv6_like",
+            Self::Ipv4Like => "ipv4_like",
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    #[inline]
+    pub const fn discovery_code(self) -> u8 {
+        match self {
+            Self::Canonical => discovery::LINK_PROFILE_CANONICAL,
+            Self::Template => discovery::LINK_PROFILE_TEMPLATE,
+            Self::Ipv6Like => discovery::LINK_PROFILE_IPV6_LIKE,
+            Self::Ipv4Like => discovery::LINK_PROFILE_IPV4_LIKE,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SideHeaderTemplate {
+    hash: u64,
+    base_flags: u8,
+    prefix: Arc<[u8]>,
+    between: Arc<[u8]>,
+    reliable_flags: Option<u8>,
+    reliable_compact: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SideChunkAssembly {
+    total: u16,
+    received: BTreeMap<u16, Arc<[u8]>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SideTransportState {
+    tx_template_ids: BTreeMap<u64, u32>,
+    tx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    tx_last_timestamps: BTreeMap<u32, u64>,
+    rx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
+    rx_last_timestamps: BTreeMap<u32, u64>,
+    rx_chunks: BTreeMap<u32, SideChunkAssembly>,
+    next_chunk_id: u32,
+    next_template_id: u32,
+}
+
+impl SideTransportState {
+    fn tx_template_count(&self) -> usize {
+        self.tx_template_ids.len()
+    }
+
+    fn rx_template_count(&self) -> usize {
+        self.rx_templates_by_id.len()
+    }
+
+    fn insert_tx_template(
+        &mut self,
+        template: SideHeaderTemplate,
+        template_id: u32,
+        max_templates: usize,
+    ) -> bool {
+        if max_templates == 0 {
+            return false;
+        }
+        let mut evicted = false;
+        if self.tx_template_ids.len() >= max_templates
+            && !self.tx_template_ids.contains_key(&template.hash)
+            && let Some(old_hash) = self.tx_template_ids.keys().next().copied()
+        {
+            if let Some(old_id) = self.tx_template_ids.remove(&old_hash) {
+                self.tx_last_timestamps.remove(&old_id);
+            }
+            self.tx_templates.remove(&old_hash);
+            evicted = true;
+        }
+        self.tx_template_ids.insert(template.hash, template_id);
+        self.tx_templates.insert(template.hash, template);
+        evicted
+    }
+
+    fn insert_rx_template(
+        &mut self,
+        template_id: u32,
+        template: SideHeaderTemplate,
+        max_templates: usize,
+    ) -> bool {
+        if max_templates == 0 {
+            return false;
+        }
+        let mut evicted = false;
+        if self.rx_templates_by_id.len() >= max_templates
+            && !self.rx_templates_by_id.contains_key(&template_id)
+            && let Some(old_id) = self.rx_templates_by_id.keys().next().copied()
+            && let Some(old_template) = self.rx_templates_by_id.remove(&old_id)
+        {
+            self.rx_templates.remove(&old_template.hash);
+            self.rx_last_timestamps.remove(&old_id);
+            evicted = true;
+        }
+        self.rx_templates_by_id
+            .insert(template_id, template.clone());
+        self.rx_templates.insert(template.hash, template);
+        evicted
+    }
+}
+
+type SideTemplateExtract<'a> = (
+    SideHeaderTemplate,
+    DataType,
+    u8,
+    u64,
+    u64,
+    u16,
+    Option<(u32, u32)>,
+    &'a [u8],
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactTimestampOmissionPolicy {
+    all: bool,
+    words: [u64; SIDE_TIMESTAMP_POLICY_WORDS],
+}
+
+impl CompactTimestampOmissionPolicy {
+    #[inline]
+    pub const fn none() -> Self {
+        Self {
+            all: false,
+            words: [0; SIDE_TIMESTAMP_POLICY_WORDS],
+        }
+    }
+
+    #[inline]
+    pub const fn all() -> Self {
+        Self {
+            all: true,
+            words: [0; SIDE_TIMESTAMP_POLICY_WORDS],
+        }
+    }
+
+    #[inline]
+    pub fn with_data_type(mut self, ty: DataType) -> Self {
+        self.insert(ty);
+        self
+    }
+
+    #[inline]
+    pub fn insert(&mut self, ty: DataType) {
+        let id = ty.as_u32() as usize;
+        if id <= crate::MAX_VALUE_DATA_TYPE as usize {
+            self.words[id / 64] |= 1u64 << (id % 64);
+        }
+    }
+
+    #[inline]
+    pub fn contains(self, ty: DataType) -> bool {
+        if self.all {
+            return true;
+        }
+        let id = ty.as_u32() as usize;
+        id <= crate::MAX_VALUE_DATA_TYPE as usize
+            && (self.words[id / 64] & (1u64 << (id % 64))) != 0
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        !self.all && self.words.iter().all(|word| *word == 0)
+    }
+}
+
+impl Default for CompactTimestampOmissionPolicy {
+    #[inline]
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SideCompactTimestampMode {
+    Absolute,
+    Delta,
+    Omitted,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouterItem {
     Packet(Packet),
-    Serialized(Arc<[u8]>),
+    Packed(Arc<[u8]>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +326,7 @@ impl ByteCost for RouterRxItem {
     fn byte_cost(&self) -> usize {
         match &self.data {
             RouterItem::Packet(pkt) => pkt.byte_cost(),
-            RouterItem::Serialized(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+            RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
         }
     }
 }
@@ -110,12 +337,12 @@ impl ByteCost for RouterTxItem {
         match self {
             RouterTxItem::Broadcast(data) => match data {
                 RouterItem::Packet(pkt) => pkt.byte_cost(),
-                RouterItem::Serialized(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+                RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
             },
             RouterTxItem::EndToEndReplay { .. } => size_of::<u64>(),
             RouterTxItem::ToSide { data, .. } => match data {
                 RouterItem::Packet(pkt) => pkt.byte_cost(),
-                RouterItem::Serialized(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+                RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
             },
             RouterTxItem::ReliableReplay { bytes, .. } => size_of::<Arc<[u8]>>() + bytes.len(),
         }
@@ -207,15 +434,41 @@ struct DiscoverySideState {
     announcers: BTreeMap<String, DiscoverySenderState>,
 }
 
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Default)]
+struct DiscoverySideThrottleState {
+    next_ping_ms: u64,
+    next_full_ms: u64,
+}
+
+#[cfg(all(feature = "discovery", feature = "timesync"))]
+#[derive(Debug, Clone, Default)]
+struct TimeSyncSideThrottleState {
+    next_allowed_ms: u64,
+}
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryAdvertiseLevel {
+    MinimalPing,
+    Full,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AdaptiveRouteStats {
     estimated_bandwidth_bps: u64,
+    peak_bandwidth_bps: u64,
     last_observed_ms: u64,
+    last_slow_observed_ms: u64,
+    sample_count: u64,
+    window_started_ms: u64,
+    window_bytes: u64,
+    peak_usage_bps: u64,
 }
 
 impl AdaptiveRouteStats {
     #[inline]
-    fn observe(&mut self, sample_bps: u64, now_ms: u64) {
+    fn observe(&mut self, bytes: usize, sample_bps: u64, now_ms: u64) {
         self.estimated_bandwidth_bps = if self.estimated_bandwidth_bps == 0 {
             sample_bps
         } else if sample_bps >= self.estimated_bandwidth_bps {
@@ -229,12 +482,232 @@ impl AdaptiveRouteStats {
                 .saturating_add(sample_bps)
                 / 8
         };
+        self.peak_bandwidth_bps = self.peak_bandwidth_bps.max(sample_bps);
         self.last_observed_ms = now_ms;
+        if sample_bps > 0 && sample_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS {
+            self.last_slow_observed_ms = now_ms;
+        }
+        self.sample_count = self.sample_count.saturating_add(1);
+        if self.window_started_ms == 0 || now_ms.saturating_sub(self.window_started_ms) > 1_000 {
+            self.window_started_ms = now_ms;
+            self.window_bytes = 0;
+        }
+        self.window_bytes = self.window_bytes.saturating_add(bytes as u64);
+        self.peak_usage_bps = self.peak_usage_bps.max(self.current_usage_bps(now_ms));
     }
 
     #[inline]
-    fn weight(&self) -> u64 {
-        self.estimated_bandwidth_bps.max(1)
+    fn current_usage_bps(&self, now_ms: u64) -> u64 {
+        if self.window_started_ms == 0 {
+            return 0;
+        }
+        let elapsed_ms = now_ms.saturating_sub(self.window_started_ms).max(1);
+        (u128::from(self.window_bytes).saturating_mul(1000) / u128::from(elapsed_ms))
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    #[inline]
+    fn available_headroom_bps(&self, now_ms: u64) -> u64 {
+        let capacity = self
+            .estimated_bandwidth_bps
+            .max(self.peak_bandwidth_bps)
+            .max(1);
+        capacity.saturating_sub(self.current_usage_bps(now_ms))
+    }
+
+    #[inline]
+    fn weight(&self, now_ms: u64) -> u64 {
+        self.available_headroom_bps(now_ms).max(1)
+    }
+
+    #[inline]
+    fn snapshot(&self, now_ms: u64, auto_balancing_enabled: bool) -> AdaptiveLinkStats {
+        let current_usage_bps = self.current_usage_bps(now_ms);
+        let estimated_capacity_bps = self.estimated_bandwidth_bps.max(1);
+        let peak_capacity_bps = self.peak_bandwidth_bps.max(estimated_capacity_bps);
+        let available_headroom_bps = peak_capacity_bps.saturating_sub(current_usage_bps);
+        AdaptiveLinkStats {
+            auto_balancing_enabled,
+            estimated_capacity_bps,
+            peak_capacity_bps,
+            current_usage_bps,
+            peak_usage_bps: self.peak_usage_bps.max(current_usage_bps),
+            available_headroom_bps,
+            effective_weight: available_headroom_bps.max(1),
+            last_observed_ms: self.last_observed_ms,
+            sample_count: self.sample_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TypeRuntimeStatsInner {
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    relayed_tx_packets: u64,
+    relayed_tx_bytes: u64,
+    relayed_rx_packets: u64,
+    relayed_rx_bytes: u64,
+    tx_retries: u64,
+    handler_failures: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SideRuntimeStatsInner {
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    relayed_tx_packets: u64,
+    relayed_tx_bytes: u64,
+    relayed_rx_packets: u64,
+    relayed_rx_bytes: u64,
+    local_delivery_packets: u64,
+    tx_retries: u64,
+    tx_handler_failures: u64,
+    local_handler_failures: u64,
+    total_handler_retries: u64,
+    side_transport_full_frames: u64,
+    side_transport_compact_frames: u64,
+    side_transport_compact_delta_frames: u64,
+    side_transport_compact_omitted_timestamp_frames: u64,
+    side_transport_chunk_frames: u64,
+    side_transport_raw_bytes: u64,
+    side_transport_wire_bytes: u64,
+    side_transport_bytes_saved: u64,
+    side_transport_min_compact_overhead_bytes: Option<usize>,
+    side_transport_max_compact_overhead_bytes: Option<usize>,
+    side_transport_compact_target_misses: u64,
+    side_transport_template_evictions: u64,
+    data_types: BTreeMap<u32, TypeRuntimeStatsInner>,
+}
+
+impl SideRuntimeStatsInner {
+    fn type_stats_mut(&mut self, ty: DataType) -> &mut TypeRuntimeStatsInner {
+        self.data_types.entry(ty.as_u32()).or_default()
+    }
+
+    fn note_tx(&mut self, ty: DataType, bytes: usize, relayed: bool, retries: usize) {
+        self.tx_packets = self.tx_packets.saturating_add(1);
+        self.tx_bytes = self.tx_bytes.saturating_add(bytes as u64);
+        self.tx_retries = self.tx_retries.saturating_add(retries as u64);
+        self.total_handler_retries = self.total_handler_retries.saturating_add(retries as u64);
+        if relayed {
+            self.relayed_tx_packets = self.relayed_tx_packets.saturating_add(1);
+            self.relayed_tx_bytes = self.relayed_tx_bytes.saturating_add(bytes as u64);
+        }
+        let stats = self.type_stats_mut(ty);
+        stats.tx_packets = stats.tx_packets.saturating_add(1);
+        stats.tx_bytes = stats.tx_bytes.saturating_add(bytes as u64);
+        stats.tx_retries = stats.tx_retries.saturating_add(retries as u64);
+        if relayed {
+            stats.relayed_tx_packets = stats.relayed_tx_packets.saturating_add(1);
+            stats.relayed_tx_bytes = stats.relayed_tx_bytes.saturating_add(bytes as u64);
+        }
+    }
+
+    fn note_rx(&mut self, ty: DataType, bytes: usize, relayed: bool) {
+        self.rx_packets = self.rx_packets.saturating_add(1);
+        self.rx_bytes = self.rx_bytes.saturating_add(bytes as u64);
+        if relayed {
+            self.relayed_rx_packets = self.relayed_rx_packets.saturating_add(1);
+            self.relayed_rx_bytes = self.relayed_rx_bytes.saturating_add(bytes as u64);
+        }
+        let stats = self.type_stats_mut(ty);
+        stats.rx_packets = stats.rx_packets.saturating_add(1);
+        stats.rx_bytes = stats.rx_bytes.saturating_add(bytes as u64);
+        if relayed {
+            stats.relayed_rx_packets = stats.relayed_rx_packets.saturating_add(1);
+            stats.relayed_rx_bytes = stats.relayed_rx_bytes.saturating_add(bytes as u64);
+        }
+    }
+
+    fn note_local_delivery(&mut self, ty: DataType) {
+        self.local_delivery_packets = self.local_delivery_packets.saturating_add(1);
+        let stats = self.type_stats_mut(ty);
+        stats.rx_packets = stats.rx_packets.saturating_add(1);
+    }
+
+    fn note_local_handler_failure(&mut self, ty: DataType, retries: usize) {
+        self.local_handler_failures = self.local_handler_failures.saturating_add(1);
+        self.total_handler_retries = self.total_handler_retries.saturating_add(retries as u64);
+        let stats = self.type_stats_mut(ty);
+        stats.handler_failures = stats.handler_failures.saturating_add(1);
+    }
+
+    fn note_tx_failure(&mut self, ty: DataType, retries: usize) {
+        self.tx_handler_failures = self.tx_handler_failures.saturating_add(1);
+        self.total_handler_retries = self.total_handler_retries.saturating_add(retries as u64);
+        self.tx_retries = self.tx_retries.saturating_add(retries as u64);
+        let stats = self.type_stats_mut(ty);
+        stats.handler_failures = stats.handler_failures.saturating_add(1);
+        stats.tx_retries = stats.tx_retries.saturating_add(retries as u64);
+    }
+
+    fn note_side_transport_full(&mut self, raw_bytes: usize, wire_bytes: usize) {
+        self.side_transport_full_frames = self.side_transport_full_frames.saturating_add(1);
+        self.note_side_transport_bytes(raw_bytes, wire_bytes);
+    }
+
+    fn note_side_transport_compact(
+        &mut self,
+        raw_bytes: usize,
+        wire_bytes: usize,
+        compact_overhead_bytes: usize,
+        used_timestamp_delta: bool,
+        omitted_timestamp: bool,
+    ) {
+        self.side_transport_compact_frames = self.side_transport_compact_frames.saturating_add(1);
+        if used_timestamp_delta {
+            self.side_transport_compact_delta_frames =
+                self.side_transport_compact_delta_frames.saturating_add(1);
+        }
+        if omitted_timestamp {
+            self.side_transport_compact_omitted_timestamp_frames = self
+                .side_transport_compact_omitted_timestamp_frames
+                .saturating_add(1);
+        }
+        self.note_side_transport_bytes(raw_bytes, wire_bytes);
+        self.side_transport_min_compact_overhead_bytes = Some(
+            self.side_transport_min_compact_overhead_bytes
+                .map_or(compact_overhead_bytes, |v| v.min(compact_overhead_bytes)),
+        );
+        self.side_transport_max_compact_overhead_bytes = Some(
+            self.side_transport_max_compact_overhead_bytes
+                .map_or(compact_overhead_bytes, |v| v.max(compact_overhead_bytes)),
+        );
+    }
+
+    fn note_side_transport_chunks(&mut self, chunks: usize) {
+        self.side_transport_chunk_frames = self
+            .side_transport_chunk_frames
+            .saturating_add(chunks as u64);
+    }
+
+    fn note_side_transport_bytes(&mut self, raw_bytes: usize, wire_bytes: usize) {
+        self.side_transport_raw_bytes = self
+            .side_transport_raw_bytes
+            .saturating_add(raw_bytes as u64);
+        self.side_transport_wire_bytes = self
+            .side_transport_wire_bytes
+            .saturating_add(wire_bytes as u64);
+        if raw_bytes > wire_bytes {
+            self.side_transport_bytes_saved = self
+                .side_transport_bytes_saved
+                .saturating_add((raw_bytes - wire_bytes) as u64);
+        }
+    }
+
+    fn note_side_transport_compact_target_miss(&mut self) {
+        self.side_transport_compact_target_misses =
+            self.side_transport_compact_target_misses.saturating_add(1);
+    }
+
+    fn note_side_transport_template_eviction(&mut self) {
+        self.side_transport_template_evictions =
+            self.side_transport_template_evictions.saturating_add(1);
     }
 }
 
@@ -248,18 +721,18 @@ enum RouteSelectionOrigin {
 /// Packet Handler function type
 type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
-/// Serialized Handler function type
-type SerializedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
+/// Packed Handler function type
+type PackedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
 
 // Make handlers usable across tasks
 /// Endpoint handler function enum.
-/// Holds either a `Packet` handler or a serialized byte-slice handler.
+/// Holds either a `Packet` handler or a packed byte-slice handler.
 /// /// - Packet handler signature: `Fn(&Packet) -> TelemetryResult<()>`
-/// /// - Serialized handler signature: `Fn(&[u8]) -> TelemetryResult<()>`
+/// /// - Packed handler signature: `Fn(&[u8]) -> TelemetryResult<()>`
 #[derive(Clone)]
 pub enum EndpointHandlerFn {
     Packet(Arc<PacketHandlerFn>),
-    Serialized(Arc<SerializedHandlerFn>),
+    Packed(Arc<PackedHandlerFn>),
 }
 
 /// Endpoint handler for a specific data endpoint.
@@ -274,26 +747,22 @@ impl Debug for EndpointHandlerFn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             EndpointHandlerFn::Packet(_) => f.write_str("EndpointHandlerFn::Packet(<handler>)"),
-            EndpointHandlerFn::Serialized(_) => {
-                f.write_str("EndpointHandlerFn::Serialized(<handler>)")
-            }
+            EndpointHandlerFn::Packed(_) => f.write_str("EndpointHandlerFn::Packed(<handler>)"),
         }
     }
 }
 
-/// TX handler for a router side: either serialized or packet-based.
+/// TX handler for a router side: either packed or packet-based.
 #[derive(Clone)]
 pub enum RouterTxHandlerFn {
-    Serialized(Arc<SerializedHandlerFn>),
+    Packed(Arc<PackedHandlerFn>),
     Packet(Arc<PacketHandlerFn>),
 }
 
 impl Debug for RouterTxHandlerFn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            RouterTxHandlerFn::Serialized(_) => {
-                f.debug_tuple("Serialized").field(&"<handler>").finish()
-            }
+            RouterTxHandlerFn::Packed(_) => f.debug_tuple("Packed").field(&"<handler>").finish(),
             RouterTxHandlerFn::Packet(_) => f.debug_tuple("Packet").field(&"<handler>").finish(),
         }
     }
@@ -303,7 +772,7 @@ impl Debug for RouterTxHandlerFn {
 pub struct RouterSideOptions {
     /// Enables the router's per-link reliable transport layer on this side.
     ///
-    /// When `true` and the side uses a serialized TX handler, reliable schema types gain
+    /// When `true` and the side uses a packed TX handler, reliable schema types gain
     /// sequence numbers, ACKs, packet requests, and retransmits on this specific hop.
     /// When `false`, the router strips the reliable framing for that side and sends only the
     /// application packet payload once.
@@ -314,6 +783,45 @@ pub struct RouterSideOptions {
     pub reliable_enabled: bool,
     /// Marks the side as eligible for link-local-only endpoints and discovery routes.
     pub link_local_enabled: bool,
+    /// Enables a side-local header-template dictionary for packed transport.
+    ///
+    /// The first frame for a stable header shape is sent in full. Later frames
+    /// on the same side can replace the repeated static header bytes with a
+    /// compact template hash plus only the fields that still vary packet to
+    /// packet.
+    pub header_template_enabled: bool,
+    /// Maximum number of bytes to emit per packed TX callback.
+    ///
+    /// When non-zero and a wrapped packed frame would exceed this size, the
+    /// router splits it into ordered chunks and reassembles those chunks on RX
+    /// before normal packet processing.
+    pub max_frame_bytes: usize,
+    /// Target total side-transport overhead for compact follow-up frames.
+    ///
+    /// This is a profiling/negotiation target rather than a hard limit. The
+    /// canonical packet is still reconstructed before normal router handling,
+    /// so constrained links should watch runtime stats to confirm compact
+    /// frames are meeting their IPv4/IPv6-like overhead budget.
+    pub compact_header_target_bytes: usize,
+    /// Maximum side-local header templates retained for TX and RX dictionaries.
+    ///
+    /// This keeps compact-link state bounded. When the dictionary is full, the
+    /// oldest deterministic entry is evicted and a later packet with that
+    /// shape will refresh the receiver with a full template frame.
+    pub max_side_transport_templates: usize,
+    /// Omits the timestamp field from compact follow-up frames when it is unchanged.
+    ///
+    /// The receiver reconstructs the canonical packet from the previous timestamp for that
+    /// side-local template. This is only used after a full or compact frame has established
+    /// timestamp context.
+    pub omit_unchanged_compact_timestamps: bool,
+    /// Optional per-data-type timestamp omission policy for compact follow-up frames.
+    ///
+    /// This allows a side to omit unchanged timestamps only for selected traffic while keeping
+    /// absolute/delta timestamps for other data types on the same link.
+    pub compact_timestamp_omission_types: CompactTimestampOmissionPolicy,
+    /// Declared compact-link profile for stats and future negotiation.
+    pub side_transport_profile: SideTransportProfile,
     /// Allows packets received from this side to enter router processing.
     pub ingress_enabled: bool,
     /// Allows the router to transmit packets toward this side.
@@ -325,8 +833,113 @@ impl Default for RouterSideOptions {
         Self {
             reliable_enabled: false,
             link_local_enabled: false,
+            header_template_enabled: false,
+            max_frame_bytes: 0,
+            compact_header_target_bytes: 0,
+            max_side_transport_templates: DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT,
+            omit_unchanged_compact_timestamps: false,
+            compact_timestamp_omission_types: CompactTimestampOmissionPolicy::none(),
+            side_transport_profile: SideTransportProfile::Canonical,
             ingress_enabled: true,
             egress_enabled: true,
+        }
+    }
+}
+
+impl RouterSideOptions {
+    /// Convenience preset for compact packed-side transport.
+    ///
+    /// This enables header-template reuse and, when `max_frame_bytes > 0`,
+    /// router-managed chunking/reassembly for fixed-size transports.
+    #[inline]
+    pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
+        self.header_template_enabled = true;
+        self.max_frame_bytes = max_frame_bytes;
+        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_ipv4_like_compact_header_target(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.compact_header_target_bytes = IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.omit_unchanged_compact_timestamps = true;
+        self.side_transport_profile = SideTransportProfile::Ipv4Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_ipv6_like_compact_header_target(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
+        self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    #[inline]
+    pub fn with_template_transport(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.side_transport_profile = SideTransportProfile::Template;
+        self
+    }
+
+    #[inline]
+    pub fn with_omitted_unchanged_compact_timestamps(mut self) -> Self {
+        self.header_template_enabled = true;
+        self.omit_unchanged_compact_timestamps = true;
+        self
+    }
+
+    #[inline]
+    pub fn with_omitted_unchanged_compact_timestamps_for_type(mut self, ty: DataType) -> Self {
+        self.header_template_enabled = true;
+        self.compact_timestamp_omission_types.insert(ty);
+        self
+    }
+
+    #[inline]
+    pub fn effective_transport_profile(self) -> SideTransportProfile {
+        if !self.header_template_enabled && self.max_frame_bytes == 0 {
+            SideTransportProfile::Canonical
+        } else if self.side_transport_profile == SideTransportProfile::Canonical {
+            SideTransportProfile::Template
+        } else {
+            self.side_transport_profile
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    #[inline]
+    pub fn link_capabilities(self) -> discovery::LinkCapabilities {
+        let mut flags = discovery::LINK_CAPABILITY_END_TO_END_RELIABILITY;
+        if self.header_template_enabled {
+            flags |= discovery::LINK_CAPABILITY_HEADER_TEMPLATES;
+        }
+        if self.max_frame_bytes != 0 {
+            flags |= discovery::LINK_CAPABILITY_CHUNKING;
+        }
+        if self.reliable_enabled {
+            flags |= discovery::LINK_CAPABILITY_RELIABILITY;
+        }
+        if self.omit_unchanged_compact_timestamps
+            || !self.compact_timestamp_omission_types.is_empty()
+        {
+            flags |= discovery::LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS;
+        }
+        #[cfg(feature = "cryptography")]
+        {
+            flags |= discovery::LINK_CAPABILITY_CRYPTO;
+        }
+        discovery::LinkCapabilities {
+            version: 1,
+            flags,
+            profile: self.effective_transport_profile().discovery_code(),
+            max_frame_bytes: self.max_frame_bytes.min(u32::MAX as usize) as u32,
+            compact_header_target_bytes: self.compact_header_target_bytes.min(u32::MAX as usize)
+                as u32,
+            max_side_transport_templates: self.max_side_transport_templates.min(u32::MAX as usize)
+                as u32,
         }
     }
 }
@@ -372,17 +985,41 @@ impl EndpointHandler {
             !endpoint_is_router_internal(endpoint),
             "reserved internal endpoint handlers must not be user-registered"
         );
+        #[cfg(feature = "std")]
+        crate::config::ensure_endpoint_id(endpoint, false)
+            .expect("endpoint handler endpoint registration failed");
         Self {
             endpoint,
             handler: EndpointHandlerFn::Packet(Arc::new(f)),
         }
     }
 
-    /// Create a new endpoint handler for serialized byte-slice callbacks.
+    /// Create a new packet handler from a runtime endpoint definition.
+    #[inline]
+    pub fn new_packet_handler_for<F>(endpoint: crate::config::EndpointDefinition, f: F) -> Self
+    where
+        F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        Self::new_packet_handler(endpoint.id, f)
+    }
+
+    /// Create a new packet handler by endpoint name.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub fn new_packet_handler_by_name<F>(endpoint_name: &str, f: F) -> TelemetryResult<Self>
+    where
+        F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        let endpoint = crate::config::endpoint_definition_by_name(endpoint_name)
+            .ok_or(TelemetryError::BadArg)?;
+        Ok(Self::new_packet_handler(endpoint.id, f))
+    }
+
+    /// Create a new endpoint handler for packed byte-slice callbacks.
     ///
     /// Handler signature is `Fn(&[u8]) -> TelemetryResult<()>`.
     #[inline]
-    pub fn new_serialized_handler<F>(endpoint: DataEndpoint, f: F) -> Self
+    pub fn new_packed_handler<F>(endpoint: DataEndpoint, f: F) -> Self
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
@@ -390,10 +1027,34 @@ impl EndpointHandler {
             !endpoint_is_router_internal(endpoint),
             "reserved internal endpoint handlers must not be user-registered"
         );
+        #[cfg(feature = "std")]
+        crate::config::ensure_endpoint_id(endpoint, false)
+            .expect("endpoint handler endpoint registration failed");
         Self {
             endpoint,
-            handler: EndpointHandlerFn::Serialized(Arc::new(f)),
+            handler: EndpointHandlerFn::Packed(Arc::new(f)),
         }
+    }
+
+    /// Create a new packed handler from a runtime endpoint definition.
+    #[inline]
+    pub fn new_packed_handler_for<F>(endpoint: crate::config::EndpointDefinition, f: F) -> Self
+    where
+        F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        Self::new_packed_handler(endpoint.id, f)
+    }
+
+    /// Create a new packed handler by endpoint name.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub fn new_packed_handler_by_name<F>(endpoint_name: &str, f: F) -> TelemetryResult<Self>
+    where
+        F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        let endpoint = crate::config::endpoint_definition_by_name(endpoint_name)
+            .ok_or(TelemetryError::BadArg)?;
+        Ok(Self::new_packed_handler(endpoint.id, f))
     }
 
     /// Return the endpoint that the handler is registered for.
@@ -454,6 +1115,193 @@ impl Clock for StdMonotonicClock {
     }
 }
 
+/// Router-level E2E cryptography behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterE2eEncryptionMode {
+    /// Do not use E2E cryptography. Data types marked `RequireOn` are rejected.
+    Disabled,
+    /// Use E2E cryptography only for data types that require it.
+    RequiredOnly,
+    /// Use E2E cryptography for required and preferred data types.
+    Preferred,
+    /// Require E2E cryptography for every non-control data type.
+    ForceAll,
+}
+
+pub type NodeAddress = u32;
+pub type P2pPort = u16;
+pub type P2pStreamId = u32;
+
+const P2P_STREAM_MAGIC: [u8; 4] = *b"SDSP";
+const P2P_STREAM_VERSION: u8 = 1;
+const P2P_STREAM_SYN: u8 = 0x01;
+const P2P_STREAM_ACK: u8 = 0x02;
+const P2P_STREAM_FIN: u8 = 0x04;
+const P2P_STREAM_RST: u8 = 0x08;
+const P2P_STREAM_DATA: u8 = 0x10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressAssignmentMode {
+    Dynamic,
+    Requested(NodeAddress),
+    Static(NodeAddress),
+}
+
+impl AddressAssignmentMode {
+    #[inline]
+    fn mode_code(self) -> u8 {
+        match self {
+            Self::Dynamic => 0,
+            Self::Requested(_) => 1,
+            Self::Static(_) => 2,
+        }
+    }
+
+    #[inline]
+    fn requested_address(self) -> NodeAddress {
+        match self {
+            Self::Dynamic => 0,
+            Self::Requested(addr) | Self::Static(addr) => addr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressChangeReason {
+    DynamicConflict,
+    RequestedConflict,
+    StaticConflict,
+    HostnameConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressChange {
+    pub old_hostname: Arc<str>,
+    pub new_hostname: Arc<str>,
+    pub old_address: NodeAddress,
+    pub new_address: NodeAddress,
+    pub reason: AddressChangeReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressBookEntry {
+    pub hostname: Arc<str>,
+    pub address: NodeAddress,
+    pub requested_address: NodeAddress,
+    pub mode: AddressAssignmentMode,
+    pub birth_ms: u64,
+    pub owner_hash: u64,
+    pub last_seen_ms: u64,
+}
+
+pub struct P2pMessage<'a> {
+    pub source_hostname: &'a str,
+    pub source_address: NodeAddress,
+    pub source_port: P2pPort,
+    pub destination_port: P2pPort,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2pStreamEventKind {
+    Accepted,
+    Connected,
+    Data,
+    Closed,
+    Reset,
+}
+
+pub struct P2pStreamEvent<'a> {
+    pub kind: P2pStreamEventKind,
+    pub stream_id: P2pStreamId,
+    pub peer_stream_id: P2pStreamId,
+    pub sequence: u32,
+    pub peer_hostname: &'a str,
+    pub peer_address: NodeAddress,
+    pub local_port: P2pPort,
+    pub peer_port: P2pPort,
+    pub payload: &'a [u8],
+}
+
+struct P2pDecoded<'a> {
+    source_hostname: &'a str,
+    source_address: NodeAddress,
+    source_port: P2pPort,
+    destination_port: P2pPort,
+    payload: &'a [u8],
+}
+
+#[derive(Debug, Clone)]
+struct P2pStreamDecoded<'a> {
+    flags: u8,
+    source_stream_id: P2pStreamId,
+    destination_stream_id: P2pStreamId,
+    sequence: u32,
+    payload: &'a [u8],
+}
+
+type AddressChangeFn = dyn Fn(AddressChange) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct AddressChangeHandler {
+    handler: Arc<AddressChangeFn>,
+}
+
+impl Debug for AddressChangeHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("AddressChangeHandler(<handler>)")
+    }
+}
+
+type P2pPortHandlerFn = dyn Fn(P2pMessage<'_>) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct P2pPortHandler {
+    handler: Arc<P2pPortHandlerFn>,
+}
+
+impl Debug for P2pPortHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("P2pPortHandler(<handler>)")
+    }
+}
+
+type P2pStreamHandlerFn = dyn Fn(P2pStreamEvent<'_>) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct P2pStreamHandler {
+    handler: Arc<P2pStreamHandlerFn>,
+}
+
+impl Debug for P2pStreamHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("P2pStreamHandler(<handler>)")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct P2pStreamSession {
+    peer_hostname: Arc<str>,
+    peer_address: NodeAddress,
+    local_port: P2pPort,
+    peer_port: P2pPort,
+    peer_stream_id: P2pStreamId,
+    next_sequence: u32,
+    connected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingP2pStreamEvent {
+    handlers: Vec<P2pStreamHandler>,
+    kind: P2pStreamEventKind,
+    stream_id: P2pStreamId,
+    peer_stream_id: P2pStreamId,
+    peer_hostname: Arc<str>,
+    peer_address: NodeAddress,
+    local_port: P2pPort,
+    peer_port: P2pPort,
+}
+
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     /// Handlers for local endpoints.
@@ -462,11 +1310,35 @@ pub struct RouterConfig {
     reliable_enabled: bool,
     /// Optional per-router sender override.
     sender: Option<Arc<str>>,
+    /// Address assignment policy used for P2P routing.
+    address_mode: AddressAssignmentMode,
+    /// Callbacks invoked when conflict resolution changes this router's identity.
+    address_change_handlers: Arc<[AddressChangeHandler]>,
+    /// End-to-end cryptography behavior for user data.
+    e2e_encryption: RouterE2eEncryptionMode,
+    /// Application-defined key id passed to the cryptography provider.
+    #[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
+    e2e_key_id: u32,
     #[cfg(feature = "timesync")]
     timesync: Option<TimeSyncConfig>,
 }
 
 impl RouterConfig {
+    /// Default router E2E mode for this build.
+    ///
+    /// Builds with cryptography prefer encrypted payloads automatically for data types that request
+    /// it. Minimal builds without cryptography stay disabled and reject `RequireOn` traffic.
+    pub fn default_e2e_encryption_mode() -> RouterE2eEncryptionMode {
+        #[cfg(feature = "cryptography")]
+        {
+            RouterE2eEncryptionMode::Preferred
+        }
+        #[cfg(not(feature = "cryptography"))]
+        {
+            RouterE2eEncryptionMode::Disabled
+        }
+    }
+
     /// Create a new router configuration with the specified local endpoint handlers.
     pub fn new<H>(handlers: H) -> Self
     where
@@ -483,6 +1355,10 @@ impl RouterConfig {
             handlers,
             reliable_enabled: true,
             sender: None,
+            address_mode: AddressAssignmentMode::Dynamic,
+            address_change_handlers: Arc::from([]),
+            e2e_encryption: Self::default_e2e_encryption_mode(),
+            e2e_key_id: 0,
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -497,6 +1373,54 @@ impl RouterConfig {
     /// Override the sender identifier for this router instance.
     pub fn with_sender<S: AsRef<str>>(mut self, sender: S) -> Self {
         self.sender = Some(Arc::from(sender.as_ref()));
+        self
+    }
+
+    /// Alias for `with_sender`; discovery uses this name for P2P service resolution.
+    pub fn with_hostname<S: AsRef<str>>(self, hostname: S) -> Self {
+        self.with_sender(hostname)
+    }
+
+    /// Request a dynamic address assigned by the discovered network authority.
+    pub fn with_dynamic_address(mut self) -> Self {
+        self.address_mode = AddressAssignmentMode::Dynamic;
+        self
+    }
+
+    /// Request a preferred address. It is kept when unique and reassigned on conflict.
+    pub fn with_requested_address(mut self, address: NodeAddress) -> Self {
+        self.address_mode = AddressAssignmentMode::Requested(address);
+        self
+    }
+
+    /// Require a static address. If two static nodes conflict, the oldest keeps it.
+    pub fn with_static_address(mut self, address: NodeAddress) -> Self {
+        self.address_mode = AddressAssignmentMode::Static(address);
+        self
+    }
+
+    /// Register a callback for local address or hostname changes after conflict resolution.
+    pub fn on_address_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(AddressChange) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        let mut handlers = self.address_change_handlers.to_vec();
+        handlers.push(AddressChangeHandler {
+            handler: Arc::new(f),
+        });
+        self.address_change_handlers = Arc::from(handlers);
+        self
+    }
+
+    /// Configure this router's end-to-end cryptography policy.
+    pub fn with_e2e_encryption(mut self, mode: RouterE2eEncryptionMode) -> Self {
+        self.e2e_encryption = mode;
+        self
+    }
+
+    /// Configure the application-defined key id used for E2E encrypted payloads.
+    pub fn with_e2e_key_id(mut self, key_id: u32) -> Self {
+        self.e2e_key_id = key_id;
         self
     }
 
@@ -526,6 +1450,22 @@ impl RouterConfig {
         self.sender.as_deref().unwrap_or(DEVICE_IDENTIFIER)
     }
 
+    #[inline]
+    fn address_mode(&self) -> AddressAssignmentMode {
+        self.address_mode
+    }
+
+    #[inline]
+    fn e2e_encryption(&self) -> RouterE2eEncryptionMode {
+        self.e2e_encryption
+    }
+
+    #[cfg(feature = "cryptography")]
+    #[inline]
+    fn e2e_key_id(&self) -> u32 {
+        self.e2e_key_id
+    }
+
     #[cfg(feature = "timesync")]
     #[inline]
     fn timesync_config(&self) -> Option<TimeSyncConfig> {
@@ -539,6 +1479,10 @@ impl Default for RouterConfig {
             handlers: Arc::from([]),
             reliable_enabled: true,
             sender: None,
+            address_mode: AddressAssignmentMode::Dynamic,
+            address_change_handlers: Arc::from([]),
+            e2e_encryption: Self::default_e2e_encryption_mode(),
+            e2e_key_id: 0,
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -602,7 +1546,7 @@ fn make_error_payload(msg: &str) -> Arc<[u8]> {
 /// Builds a Packet from the provided data slice and passes it to the
 /// provided transmission function.
 fn log_raw<T, F>(
-    sender: &'static str,
+    sender: &str,
     ty: DataType,
     data: &[T],
     timestamp: u64,
@@ -671,6 +1615,19 @@ struct RouterInner {
     source_route_modes: BTreeMap<Option<RouterSideId>, RouteSelectionMode>,
     route_selection_cursors: BTreeMap<Option<RouterSideId>, u64>,
     adaptive_route_stats: BTreeMap<RouterSideId, AdaptiveRouteStats>,
+    side_runtime_stats: BTreeMap<RouterSideId, SideRuntimeStatsInner>,
+    side_transport: BTreeMap<RouterSideId, SideTransportState>,
+    managed_variable_types: BTreeSet<u32>,
+    managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
+    managed_variable_latest: BTreeMap<u32, ManagedVariableCacheEntry>,
+    network_variable_update_handlers: BTreeMap<u32, Vec<NetworkVariableUpdateHandler>>,
+    local_address: AddressBookEntry,
+    address_book: BTreeMap<String, AddressBookEntry>,
+    address_by_value: BTreeMap<NodeAddress, String>,
+    p2p_port_handlers: BTreeMap<P2pPort, Vec<P2pPortHandler>>,
+    p2p_stream_handlers: BTreeMap<P2pPort, Vec<P2pStreamHandler>>,
+    p2p_stream_sessions: BTreeMap<P2pStreamId, P2pStreamSession>,
+    next_p2p_stream_id: P2pStreamId,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     recent_rx: BoundedDeque<u64>,
@@ -680,10 +1637,61 @@ struct RouterInner {
     reliable_return_route_order: VecDeque<u64>,
     end_to_end_reliable_tx: BTreeMap<u64, EndToEndReliableSent>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
+    total_handler_failures: u64,
+    total_handler_retries: u64,
     #[cfg(feature = "discovery")]
     discovery_routes: BTreeMap<RouterSideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
+    #[cfg(feature = "discovery")]
+    discovery_side_throttle: BTreeMap<RouterSideId, DiscoverySideThrottleState>,
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    timesync_side_throttle: BTreeMap<RouterSideId, TimeSyncSideThrottleState>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedVariableCacheEntry {
+    packet: Packet,
+    cached_at_ms: u64,
+}
+
+type NetworkVariableUpdateFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct NetworkVariableUpdateHandler {
+    handler: Arc<NetworkVariableUpdateFn>,
+}
+
+impl Debug for NetworkVariableUpdateHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("NetworkVariableUpdateHandler(<handler>)")
+    }
+}
+
+/// Local permission policy for a network-managed variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkVariablePermissions {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl NetworkVariablePermissions {
+    pub const NONE: Self = Self {
+        read: false,
+        write: false,
+    };
+    pub const READ_ONLY: Self = Self {
+        read: true,
+        write: false,
+    };
+    pub const WRITE_ONLY: Self = Self {
+        read: false,
+        write: true,
+    };
+    pub const READ_WRITE: Self = Self {
+        read: true,
+        write: true,
+    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,6 +1789,7 @@ impl RouterInner {
             .saturating_add(self.transmit_queue.bytes_used())
             .saturating_add(self.recent_rx.max_bytes())
             .saturating_add(self.reliable_rx_buffered_bytes())
+            .saturating_add(crate::config::schema_bytes_used())
             .saturating_add({
                 #[cfg(feature = "discovery")]
                 {
@@ -907,7 +1916,7 @@ impl RouterInner {
     #[inline]
     fn queue_budget_warning(msg: &str) {
         #[cfg(feature = "std")]
-        eprintln!("sedsprintf_rs queue budget warning: {msg}");
+        eprintln!("sedsnet queue budget warning: {msg}");
         let _ = msg;
     }
 
@@ -1056,13 +2065,19 @@ impl IsrRxQueue {
         g.clear();
         Ok(())
     }
+
+    #[inline]
+    fn snapshot(&self) -> Option<(usize, usize)> {
+        let g = self.try_lock().ok()?;
+        Some((g.len(), g.bytes_used()))
+    }
 }
 
 /// Telemetry Router for handling incoming and outgoing telemetry packets.
 /// Supports queuing, processing, and dispatching to local endpoint handlers.
 /// Thread-safe via internal locking.
 pub struct Router {
-    sender: &'static str,
+    sender: RouterMutex<Arc<str>>,
     cfg: RouterConfig,
     state: RouterMutex<RouterInner>,
     isr_rx_queue: IsrRxQueue,
@@ -1126,10 +2141,18 @@ enum RemoteSidePlan {
     Target(Vec<RouterSideId>),
 }
 
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiscoveryCandidateMatch {
+    side: RouterSideId,
+    overlap: usize,
+}
+
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let sender = self.sender();
         f.debug_struct("Router")
-            .field("sender", &self.sender)
+            .field("sender", &sender)
             .field("cfg", &self.cfg)
             .field("state", &"<mutex>")
             .field("clock", &"Clock")
@@ -1141,16 +2164,40 @@ impl Debug for Router {
 /// discovery is unavailable and routing falls back to local-vs-remote schema.
 #[inline]
 fn has_nonlocal_endpoint(eps: &[DataEndpoint], cfg: &RouterConfig) -> bool {
-    eps.iter()
-        .copied()
-        .any(|ep| !cfg.is_local_endpoint(ep) && !ep.is_link_local_only())
+    eps.iter().copied().any(|ep| !cfg.is_local_endpoint(ep))
+}
+
+#[inline]
+fn force_remote_for_type(ty: DataType) -> bool {
+    matches!(
+        ty,
+        DataType::ReliableAck
+            | DataType::ReliablePartialAck
+            | DataType::ReliablePacketRequest
+            | DataType::P2pMessage
+    ) || {
+        #[cfg(feature = "timesync")]
+        {
+            matches!(
+                ty,
+                DataType::TimeSyncAnnounce | DataType::TimeSyncRequest | DataType::TimeSyncResponse
+            )
+        }
+        #[cfg(not(feature = "timesync"))]
+        {
+            false
+        }
+    }
 }
 
 #[inline]
 fn is_internal_control_type(ty: DataType) -> bool {
     if matches!(
         ty,
-        DataType::ReliableAck | DataType::ReliablePartialAck | DataType::ReliablePacketRequest
+        DataType::ReliableAck
+            | DataType::ReliablePartialAck
+            | DataType::ReliablePacketRequest
+            | DataType::P2pMessage
     ) {
         return true;
     }
@@ -1178,25 +2225,43 @@ fn with_retries<F>(
     dest: DataEndpoint,
     data: &RouterItem,
     pkt_for_ctx: Option<&Packet>,
-    env_for_ctx: Option<&serialize::TelemetryEnvelope>,
+    env_for_ctx: Option<&wire_format::TelemetryEnvelope>,
+    called_from_queue: bool,
     run: F,
 ) -> TelemetryResult<()>
 where
     F: Fn() -> TelemetryResult<()>,
 {
-    this.retry(MAX_HANDLER_RETRIES, run).map_err(|e| {
-        // If handler fails, remove from dedupe so it can be retried later if resent.
-        this.remove_pkt_id(data);
-
-        // Emit error packet (to local endpoints).
-        if let Some(pkt) = pkt_for_ctx {
-            let _ = this.handle_callback_error(pkt, Some(dest), e);
-        } else if let Some(env) = env_for_ctx {
-            let _ = this.handle_callback_error_from_env(env, Some(dest), e);
+    match this.retry_with_attempts(MAX_HANDLER_RETRIES, run) {
+        Ok(((), attempts)) => {
+            if attempts > 1 {
+                let mut st = this.state.lock();
+                st.total_handler_retries = st
+                    .total_handler_retries
+                    .saturating_add(attempts.saturating_sub(1) as u64);
+            }
+            Ok(())
         }
+        Err((e, attempts)) => {
+            {
+                let mut st = this.state.lock();
+                st.total_handler_failures = st.total_handler_failures.saturating_add(1);
+                st.total_handler_retries = st.total_handler_retries.saturating_add(attempts as u64);
+            }
 
-        TelemetryError::HandlerError("local handler failed")
-    })
+            // If handler fails, remove from dedupe so it can be retried later if resent.
+            this.remove_pkt_id(data);
+
+            // Emit error packet (to local endpoints).
+            if let Some(pkt) = pkt_for_ctx {
+                let _ = this.handle_callback_error(pkt, Some(dest), e, called_from_queue);
+            } else if let Some(env) = env_for_ctx {
+                let _ = this.handle_callback_error_from_env(env, Some(dest), e, called_from_queue);
+            }
+
+            Err(TelemetryError::HandlerError("local handler failed"))
+        }
+    }
 }
 /// Router implementation
 impl Router {
@@ -1209,6 +2274,126 @@ impl Router {
             .get(side)
             .and_then(|side| side.as_ref())
             .ok_or(TelemetryError::HandlerError("router: invalid side id"))
+    }
+
+    fn note_side_tx_success(
+        &self,
+        side: RouterSideId,
+        ty: DataType,
+        bytes: usize,
+        relayed: bool,
+        attempts: usize,
+    ) {
+        let mut st = self.state.lock();
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_tx(ty, bytes, relayed, attempts.saturating_sub(1));
+    }
+
+    fn note_side_tx_failure(&self, side: RouterSideId, ty: DataType, attempts: usize) {
+        let mut st = self.state.lock();
+        st.total_handler_failures = st.total_handler_failures.saturating_add(1);
+        st.total_handler_retries = st.total_handler_retries.saturating_add(attempts as u64);
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_tx_failure(ty, attempts);
+    }
+
+    fn note_side_rx(&self, side: RouterSideId, ty: DataType, bytes: usize, relayed: bool) {
+        let mut st = self.state.lock();
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_rx(ty, bytes, relayed);
+    }
+
+    fn note_side_local_delivery(&self, side: RouterSideId, ty: DataType) {
+        let mut st = self.state.lock();
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_local_delivery(ty);
+    }
+
+    fn note_side_local_handler_failure(&self, side: RouterSideId, ty: DataType, retries: usize) {
+        let mut st = self.state.lock();
+        let entry = st.side_runtime_stats.entry(side).or_default();
+        entry.note_local_handler_failure(ty, retries);
+    }
+
+    fn cache_managed_variable_packet(
+        &self,
+        pkt: &Packet,
+        notify_handlers: bool,
+    ) -> TelemetryResult<()> {
+        let handlers = {
+            let mut st = self.state.lock();
+            if !st
+                .managed_variable_types
+                .contains(&pkt.data_type().as_u32())
+            {
+                return Ok(());
+            }
+            let changed = st
+                .managed_variable_latest
+                .get(&pkt.data_type().as_u32())
+                .is_none_or(|entry| entry.packet != *pkt);
+            st.managed_variable_latest.insert(
+                pkt.data_type().as_u32(),
+                ManagedVariableCacheEntry {
+                    packet: pkt.clone(),
+                    cached_at_ms: self.clock.now_ms(),
+                },
+            );
+            if notify_handlers && changed {
+                st.network_variable_update_handlers
+                    .get(&pkt.data_type().as_u32())
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+        for handler in handlers {
+            (handler.handler)(pkt)?;
+        }
+        Ok(())
+    }
+
+    fn remember_managed_variable_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
+        self.cache_managed_variable_packet(pkt, true)
+    }
+
+    fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
+        let st = self.state.lock();
+        st.managed_variable_latest
+            .get(&ty.as_u32())
+            .map(|entry| entry.packet.clone())
+    }
+
+    fn managed_variable_latest_with_age(&self, ty: DataType) -> Option<(Packet, u64)> {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        st.managed_variable_latest.get(&ty.as_u32()).map(|entry| {
+            (
+                entry.packet.clone(),
+                now_ms.saturating_sub(entry.cached_at_ms),
+            )
+        })
+    }
+
+    fn is_managed_variable_type(&self, ty: DataType) -> bool {
+        let st = self.state.lock();
+        st.managed_variable_types.contains(&ty.as_u32())
+    }
+
+    fn managed_variable_permissions_locked(
+        st: &RouterInner,
+        ty: DataType,
+    ) -> NetworkVariablePermissions {
+        st.managed_variable_permissions
+            .get(&ty.as_u32())
+            .copied()
+            .unwrap_or(NetworkVariablePermissions::READ_WRITE)
+    }
+
+    fn can_read_managed_variable(&self, ty: DataType) -> bool {
+        let st = self.state.lock();
+        Self::managed_variable_permissions_locked(&st, ty).read
     }
 
     #[inline]
@@ -1266,15 +2451,101 @@ impl Router {
         if st
             .typed_route_overrides
             .keys()
-            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty as u32)
+            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty.as_u32())
         {
             return st
                 .typed_route_overrides
-                .get(&(src, ty as u32, dst))
+                .get(&(src, ty.as_u32(), dst))
                 .copied()
                 .unwrap_or(false);
         }
         true
+    }
+
+    fn has_typed_route_overrides_locked(
+        st: &RouterInner,
+        src: Option<RouterSideId>,
+        ty: DataType,
+    ) -> bool {
+        st.typed_route_overrides
+            .keys()
+            .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty.as_u32())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn endpoint_overlap_count<I>(reachable: I, eps: &[DataEndpoint]) -> usize
+    where
+        I: IntoIterator<Item = DataEndpoint>,
+    {
+        let mut overlap = 0usize;
+        for ep in reachable {
+            if eps.contains(&ep) {
+                overlap = overlap.saturating_add(1);
+            }
+        }
+        overlap
+    }
+
+    #[inline]
+    fn preferred_scoring_endpoints(
+        &self,
+        eps: &[DataEndpoint],
+        prefer_nonlocal: bool,
+    ) -> Vec<DataEndpoint> {
+        if !prefer_nonlocal {
+            return eps.to_vec();
+        }
+        let nonlocal: Vec<DataEndpoint> = eps
+            .iter()
+            .copied()
+            .filter(|&ep| !self.cfg.is_local_endpoint(ep))
+            .collect();
+        if nonlocal.is_empty() {
+            eps.to_vec()
+        } else {
+            nonlocal
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn pop_next_queued_discovery_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
+        {
+            let mut isr_rx = self.isr_rx_queue.try_lock()?;
+            let idx = isr_rx.iter().position(Self::queued_rx_item_is_discovery);
+            if let Some(idx) = idx {
+                return Ok(isr_rx.remove_pos(idx));
+            }
+        }
+
+        let mut st = self.state.lock();
+        let idx = st
+            .received_queue
+            .iter()
+            .position(Self::queued_rx_item_is_discovery);
+        if let Some(idx) = idx {
+            return Ok(st.received_queue.remove_pos(idx));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn queued_rx_item_is_discovery(item: &RouterRxItem) -> bool {
+        match &item.data {
+            RouterItem::Packet(pkt) => discovery::is_discovery_type(pkt.data_type()),
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())
+                .map(|env| discovery::is_discovery_type(env.ty))
+                .unwrap_or(false),
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn drain_queued_discovery_rx_before_tx(&self) -> TelemetryResult<bool> {
+        let mut did_any = false;
+        while let Some(item) = self.pop_next_queued_discovery_rx_item()? {
+            self.process_rx_queue_item(item)?;
+            did_any = true;
+        }
+        Ok(did_any)
     }
 
     fn eligible_side_ids_locked(
@@ -1373,11 +2644,12 @@ impl Router {
             return vec![unmeasured.swap_remove(pick)];
         }
 
+        let now_ms = self.clock.now_ms();
         let total_weight = sides.iter().fold(0_u64, |acc, side| {
             acc + st
                 .adaptive_route_stats
                 .get(side)
-                .map(AdaptiveRouteStats::weight)
+                .map(|stats| stats.weight(now_ms))
                 .unwrap_or(1)
         });
         if total_weight == 0 {
@@ -1393,7 +2665,7 @@ impl Router {
             let weight = st
                 .adaptive_route_stats
                 .get(&side)
-                .map(AdaptiveRouteStats::weight)
+                .map(|stats| stats.weight(now_ms))
                 .unwrap_or(1);
             if remaining < weight {
                 return vec![side];
@@ -1417,16 +2689,44 @@ impl Router {
         st.adaptive_route_stats
             .entry(side)
             .or_default()
-            .observe(sample_bps, ended_ms);
+            .observe(bytes, sample_bps, ended_ms);
+    }
+
+    /// Seed adaptive route selection with a transport-measured link probe.
+    ///
+    /// Call this after a side-specific bring-up probe, or whenever the transport already knows the
+    /// duration for a frame. The router does not emit synthetic probe frames by itself.
+    pub fn note_side_link_probe_sample(
+        &self,
+        side: RouterSideId,
+        bytes: usize,
+        duration_ms: u64,
+    ) -> TelemetryResult<()> {
+        {
+            let st = self.state.lock();
+            let _ = Self::side_ref(&st, side).map_err(|_| TelemetryError::BadArg)?;
+        }
+        let ended_ms = self.clock.now_ms();
+        self.record_side_tx_sample(side, bytes, ended_ms.saturating_sub(duration_ms), ended_ms);
+        Ok(())
     }
 
     fn router_item_wire_len(data: &RouterItem) -> TelemetryResult<usize> {
         match data {
-            RouterItem::Packet(pkt) => Ok(serialize::serialize_packet(pkt).len()),
-            RouterItem::Serialized(bytes) => Ok(bytes.len()),
+            RouterItem::Packet(pkt) => Ok(wire_format::pack_packet(pkt).len()),
+            RouterItem::Packed(bytes) => Ok(bytes.len()),
         }
     }
 
+    /// Extract the logical packet ID targeted by an end-to-end reliable ACK item.
+    ///
+    /// Router TX and replay queues can carry either decoded `Packet` values or
+    /// packed frames. This helper normalizes both forms so ACK-routing code
+    /// can reason about them uniformly.
+    ///
+    /// Only router-generated end-to-end `ReliableAck` packets qualify here.
+    /// Ordinary application traffic and hop-level reliable control frames return
+    /// `Ok(None)`.
     #[inline]
     fn reliable_control_target_packet_id(data: &RouterItem) -> TelemetryResult<Option<u64>> {
         match data {
@@ -1438,8 +2738,14 @@ impl Router {
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
-            RouterItem::Serialized(bytes) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                if wire_format::peek_frame_info(bytes.as_ref())
+                    .ok()
+                    .is_some_and(|frame| frame.ack_only())
+                {
+                    return Ok(None);
+                }
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 if pkt.data_type() != DataType::ReliableAck
                     || !Self::is_end_to_end_ack_sender(pkt.sender())
                 {
@@ -1452,7 +2758,7 @@ impl Router {
 
     fn decode_end_to_end_reliable_ack(payload: &[u8]) -> TelemetryResult<u64> {
         if payload.len() != 8 {
-            return Err(TelemetryError::Deserialize("bad reliable e2e ack payload"));
+            return Err(TelemetryError::Unpack("bad reliable e2e ack payload"));
         }
         Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
     }
@@ -1460,6 +2766,214 @@ impl Router {
     #[inline]
     fn sender_hash(sender: &str) -> u64 {
         hash_bytes_u64(0x517C_C1B7_2722_0A95, sender.as_bytes())
+    }
+
+    #[inline]
+    fn fallback_address_for_hostname(hostname: &str) -> NodeAddress {
+        let hash = Self::sender_hash(hostname);
+        let mut address = (hash as u32) ^ ((hash >> 32) as u32);
+        if address == 0 {
+            address = 1;
+        }
+        address
+    }
+
+    fn address_mode_from_code(mode: u8, requested: NodeAddress) -> AddressAssignmentMode {
+        match mode {
+            2 => AddressAssignmentMode::Static(if requested == 0 { 1 } else { requested }),
+            1 => AddressAssignmentMode::Requested(if requested == 0 { 1 } else { requested }),
+            _ => AddressAssignmentMode::Dynamic,
+        }
+    }
+
+    fn address_winner_pref(entry: &AddressBookEntry) -> (u8, core::cmp::Reverse<u64>, u64) {
+        let rank = match entry.mode {
+            AddressAssignmentMode::Static(_) => 2,
+            AddressAssignmentMode::Requested(_) => 1,
+            AddressAssignmentMode::Dynamic => 0,
+        };
+        (
+            rank,
+            core::cmp::Reverse(entry.birth_ms),
+            u64::MAX - entry.owner_hash,
+        )
+    }
+
+    fn identity_winner_pref(entry: &AddressBookEntry) -> (core::cmp::Reverse<u64>, u64) {
+        (
+            core::cmp::Reverse(entry.birth_ms),
+            u64::MAX - entry.owner_hash,
+        )
+    }
+
+    fn allocate_free_address_locked(st: &RouterInner, seed: NodeAddress) -> NodeAddress {
+        let mut candidate = if seed == 0 { 1 } else { seed };
+        for _ in 0..u32::MAX {
+            if candidate != 0 && !st.address_by_value.contains_key(&candidate) {
+                return candidate;
+            }
+            candidate = candidate.wrapping_add(1);
+            if candidate == 0 {
+                candidate = 1;
+            }
+        }
+        1
+    }
+
+    fn unique_hostname_locked(st: &RouterInner, base: &str, owner_hash: u64) -> String {
+        if !st.address_book.contains_key(base) {
+            return base.to_string();
+        }
+        let stem = if base.is_empty() { "node" } else { base };
+        let mut candidate = format!("{stem}-{owner_hash:08x}");
+        let mut suffix = 1u32;
+        while st.address_book.contains_key(&candidate) {
+            candidate = format!("{stem}-{owner_hash:08x}-{suffix}");
+            suffix = suffix.saturating_add(1);
+        }
+        candidate
+    }
+
+    fn update_local_identity_locked(
+        &self,
+        st: &mut RouterInner,
+        mut local: AddressBookEntry,
+        reason: AddressChangeReason,
+    ) -> AddressChange {
+        let old = st.local_address.clone();
+        st.address_book.remove(old.hostname.as_ref());
+        st.address_by_value.remove(&old.address);
+        local.last_seen_ms = self.clock.now_ms();
+        st.address_by_value
+            .insert(local.address, local.hostname.to_string());
+        st.address_book
+            .insert(local.hostname.to_string(), local.clone());
+        st.local_address = local.clone();
+        *self.sender.lock() = local.hostname.clone();
+        #[cfg(feature = "discovery")]
+        Self::note_discovery_topology_change_locked(st, self.clock.now_ms());
+        AddressChange {
+            old_hostname: old.hostname,
+            new_hostname: local.hostname,
+            old_address: old.address,
+            new_address: local.address,
+            reason,
+        }
+    }
+
+    fn notify_address_change(&self, change: AddressChange) -> TelemetryResult<()> {
+        for handler in self.cfg.address_change_handlers.iter() {
+            (handler.handler)(change.clone())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn local_address_advertisement(
+        &self,
+        reachable_endpoints: Vec<DataEndpoint>,
+        reachable_timesync_sources: Vec<String>,
+        link_capabilities: discovery::LinkCapabilities,
+        state: u8,
+    ) -> discovery::AddressAdvertisement {
+        let st = self.state.lock();
+        discovery::AddressAdvertisement {
+            hostname: st.local_address.hostname.to_string(),
+            address: st.local_address.address,
+            requested_address: st.local_address.requested_address,
+            mode: st.local_address.mode.mode_code(),
+            state,
+            birth_ms: st.local_address.birth_ms,
+            owner_hash: st.local_address.owner_hash,
+            reachable_endpoints,
+            reachable_timesync_sources,
+            link_capabilities,
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn ingest_address_advertisement(
+        &self,
+        ad: discovery::AddressAdvertisement,
+    ) -> TelemetryResult<bool> {
+        let now_ms = self.clock.now_ms();
+        let mut remote = AddressBookEntry {
+            hostname: Arc::from(ad.hostname.as_str()),
+            address: ad.address,
+            requested_address: ad.requested_address,
+            mode: Self::address_mode_from_code(ad.mode, ad.requested_address),
+            birth_ms: ad.birth_ms,
+            owner_hash: ad.owner_hash,
+            last_seen_ms: now_ms,
+        };
+        let mut change = None;
+        let mut changed = false;
+        {
+            let mut st = self.state.lock();
+            let local = st.local_address.clone();
+            let hostname_conflict =
+                remote.hostname == local.hostname && remote.owner_hash != local.owner_hash;
+            let address_conflict =
+                remote.address == local.address && remote.owner_hash != local.owner_hash;
+
+            if hostname_conflict
+                && Self::identity_winner_pref(&remote) > Self::identity_winner_pref(&local)
+            {
+                let mut next = local.clone();
+                next.hostname = Arc::from(Self::unique_hostname_locked(
+                    &st,
+                    local.hostname.as_ref(),
+                    local.owner_hash,
+                ));
+                change = Some(self.update_local_identity_locked(
+                    &mut st,
+                    next,
+                    AddressChangeReason::HostnameConflict,
+                ));
+                changed = true;
+            } else if address_conflict
+                && Self::address_winner_pref(&remote) > Self::address_winner_pref(&local)
+            {
+                let mut next = local.clone();
+                let seed = next
+                    .requested_address
+                    .max(Self::fallback_address_for_hostname(next.hostname.as_ref()));
+                next.address = Self::allocate_free_address_locked(&st, seed);
+                let reason = match next.mode {
+                    AddressAssignmentMode::Static(_) => AddressChangeReason::StaticConflict,
+                    AddressAssignmentMode::Requested(_) => AddressChangeReason::RequestedConflict,
+                    AddressAssignmentMode::Dynamic => AddressChangeReason::DynamicConflict,
+                };
+                change = Some(self.update_local_identity_locked(&mut st, next, reason));
+                changed = true;
+            } else if hostname_conflict {
+                remote.hostname = Arc::from(Self::unique_hostname_locked(
+                    &st,
+                    remote.hostname.as_ref(),
+                    remote.owner_hash,
+                ));
+                changed = true;
+            } else if address_conflict {
+                let seed = remote
+                    .requested_address
+                    .max(Self::fallback_address_for_hostname(
+                        remote.hostname.as_ref(),
+                    ));
+                remote.address = Self::allocate_free_address_locked(&st, seed);
+                changed = true;
+            }
+
+            st.address_book.remove(remote.hostname.as_ref());
+            st.address_by_value.remove(&remote.address);
+            st.address_by_value
+                .insert(remote.address, remote.hostname.to_string());
+            st.address_book
+                .insert(remote.hostname.to_string(), remote.clone());
+        }
+        if let Some(change) = change {
+            self.notify_address_change(change)?;
+        }
+        Ok(changed)
     }
 
     #[inline]
@@ -1477,7 +2991,8 @@ impl Router {
     }
 
     fn encode_end_to_end_ack_sender(&self) -> String {
-        format!("{}{}", Self::END_TO_END_ACK_PREFIX, self.sender)
+        let sender = self.sender_arc();
+        format!("{}{}", Self::END_TO_END_ACK_PREFIX, sender)
     }
 
     #[cfg(feature = "discovery")]
@@ -1491,6 +3006,326 @@ impl Router {
         Arc::from(payload)
     }
 
+    fn encode_p2p_payload(
+        src_hostname: &str,
+        src_address: NodeAddress,
+        src_port: P2pPort,
+        dst_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let host_len = u16::try_from(src_hostname.len())
+            .map_err(|_| TelemetryError::Pack("p2p hostname too long"))?;
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| TelemetryError::Pack("p2p payload too long"))?;
+        let mut out = Vec::with_capacity(
+            15usize
+                .saturating_add(src_hostname.len())
+                .saturating_add(payload.len()),
+        );
+        out.push(1);
+        out.extend_from_slice(&dst_port.to_le_bytes());
+        out.extend_from_slice(&src_port.to_le_bytes());
+        out.extend_from_slice(&src_address.to_le_bytes());
+        out.extend_from_slice(&host_len.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(src_hostname.as_bytes());
+        out.extend_from_slice(payload);
+        Ok(out.into())
+    }
+
+    fn decode_p2p_payload(payload: &[u8]) -> TelemetryResult<P2pDecoded<'_>> {
+        if payload.len() < 15 {
+            return Err(TelemetryError::Unpack("p2p frame short"));
+        }
+        if payload[0] != 1 {
+            return Err(TelemetryError::Unpack("p2p frame version"));
+        }
+        let destination_port =
+            u16::from_le_bytes(payload[1..3].try_into().expect("2-byte dst port"));
+        let source_port = u16::from_le_bytes(payload[3..5].try_into().expect("2-byte src port"));
+        let source_address = u32::from_le_bytes(payload[5..9].try_into().expect("4-byte address"));
+        let host_len =
+            u16::from_le_bytes(payload[9..11].try_into().expect("2-byte host len")) as usize;
+        let body_len =
+            u32::from_le_bytes(payload[11..15].try_into().expect("4-byte body len")) as usize;
+        let host_start = 15usize;
+        let host_end = host_start.saturating_add(host_len);
+        let body_end = host_end.saturating_add(body_len);
+        if host_end > payload.len() || body_end != payload.len() {
+            return Err(TelemetryError::Unpack("p2p frame length"));
+        }
+        let source_hostname = core::str::from_utf8(&payload[host_start..host_end])
+            .map_err(|_| TelemetryError::Unpack("p2p hostname utf8"))?;
+        Ok(P2pDecoded {
+            source_hostname,
+            source_address,
+            source_port,
+            destination_port,
+            payload: &payload[host_end..body_end],
+        })
+    }
+
+    fn encode_p2p_stream_payload(
+        flags: u8,
+        source_stream_id: P2pStreamId,
+        destination_stream_id: P2pStreamId,
+        sequence: u32,
+        payload: &[u8],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| TelemetryError::Pack("p2p stream payload too long"))?;
+        let mut out = Vec::with_capacity(22usize.saturating_add(payload.len()));
+        out.extend_from_slice(&P2P_STREAM_MAGIC);
+        out.push(P2P_STREAM_VERSION);
+        out.push(flags);
+        out.extend_from_slice(&source_stream_id.to_le_bytes());
+        out.extend_from_slice(&destination_stream_id.to_le_bytes());
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(payload);
+        Ok(out.into())
+    }
+
+    fn decode_p2p_stream_payload(payload: &[u8]) -> TelemetryResult<Option<P2pStreamDecoded<'_>>> {
+        if !payload.starts_with(&P2P_STREAM_MAGIC) {
+            return Ok(None);
+        }
+        if payload.len() < 22 {
+            return Err(TelemetryError::Unpack("p2p stream frame short"));
+        }
+        if payload[4] != P2P_STREAM_VERSION {
+            return Err(TelemetryError::Unpack("p2p stream frame version"));
+        }
+        let flags = payload[5];
+        let source_stream_id =
+            u32::from_le_bytes(payload[6..10].try_into().expect("stream source id"));
+        let destination_stream_id =
+            u32::from_le_bytes(payload[10..14].try_into().expect("stream destination id"));
+        let sequence = u32::from_le_bytes(payload[14..18].try_into().expect("stream sequence"));
+        let body_len =
+            u32::from_le_bytes(payload[18..22].try_into().expect("stream body len")) as usize;
+        let body_end = 22usize.saturating_add(body_len);
+        if body_end != payload.len() {
+            return Err(TelemetryError::Unpack("p2p stream frame length"));
+        }
+        Ok(Some(P2pStreamDecoded {
+            flags,
+            source_stream_id,
+            destination_stream_id,
+            sequence,
+            payload: &payload[22..],
+        }))
+    }
+
+    fn allocate_p2p_stream_id_locked(st: &mut RouterInner) -> P2pStreamId {
+        for _ in 0..u32::MAX {
+            let id = st.next_p2p_stream_id.max(1);
+            st.next_p2p_stream_id = st.next_p2p_stream_id.wrapping_add(1).max(1);
+            if !st.p2p_stream_sessions.contains_key(&id) {
+                return id;
+            }
+        }
+        0
+    }
+
+    fn dispatch_p2p_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
+        if pkt.data_type() != DataType::P2pMessage {
+            return Ok(());
+        }
+        let decoded = Self::decode_p2p_payload(pkt.payload())?;
+        if let Some(stream) = Self::decode_p2p_stream_payload(decoded.payload)? {
+            return self.dispatch_p2p_stream_frame(&decoded, &stream);
+        }
+        let handlers = {
+            let st = self.state.lock();
+            st.p2p_port_handlers
+                .get(&decoded.destination_port)
+                .cloned()
+                .unwrap_or_default()
+        };
+        for handler in handlers {
+            (handler.handler)(P2pMessage {
+                source_hostname: decoded.source_hostname,
+                source_address: decoded.source_address,
+                source_port: decoded.source_port,
+                destination_port: decoded.destination_port,
+                payload: decoded.payload,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_p2p_stream_frame(
+        &self,
+        msg: &P2pDecoded<'_>,
+        frame: &P2pStreamDecoded<'_>,
+    ) -> TelemetryResult<()> {
+        let mut events: Vec<PendingP2pStreamEvent> = Vec::new();
+        let mut reply: Option<(AddressBookEntry, P2pPort, P2pPort, Arc<[u8]>)> = None;
+        {
+            let mut st = self.state.lock();
+            if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK == 0 {
+                let peer_hostname: Arc<str> = Arc::from(msg.source_hostname);
+                let existing_id = st.p2p_stream_sessions.iter().find_map(|(id, session)| {
+                    (session.peer_stream_id == frame.source_stream_id
+                        && session.local_port == msg.destination_port
+                        && session.peer_port == msg.source_port
+                        && session.peer_address == msg.source_address
+                        && session.peer_hostname.as_ref() == msg.source_hostname)
+                        .then_some(*id)
+                });
+                let local_id = if let Some(local_id) = existing_id {
+                    local_id
+                } else {
+                    let local_id = Self::allocate_p2p_stream_id_locked(&mut st);
+                    if local_id == 0 {
+                        return Err(TelemetryError::Io("p2p stream id exhausted"));
+                    }
+                    st.p2p_stream_sessions.insert(
+                        local_id,
+                        P2pStreamSession {
+                            peer_hostname: peer_hostname.clone(),
+                            peer_address: msg.source_address,
+                            local_port: msg.destination_port,
+                            peer_port: msg.source_port,
+                            peer_stream_id: frame.source_stream_id,
+                            next_sequence: 1,
+                            connected: true,
+                        },
+                    );
+                    let handlers = st
+                        .p2p_stream_handlers
+                        .get(&msg.destination_port)
+                        .cloned()
+                        .unwrap_or_default();
+                    events.push(PendingP2pStreamEvent {
+                        handlers,
+                        kind: P2pStreamEventKind::Accepted,
+                        stream_id: local_id,
+                        peer_stream_id: frame.source_stream_id,
+                        peer_hostname: peer_hostname.clone(),
+                        peer_address: msg.source_address,
+                        local_port: msg.destination_port,
+                        peer_port: msg.source_port,
+                    });
+                    local_id
+                };
+                let dst =
+                    st.address_book
+                        .get(msg.source_hostname)
+                        .cloned()
+                        .unwrap_or(AddressBookEntry {
+                            hostname: peer_hostname,
+                            address: msg.source_address,
+                            requested_address: msg.source_address,
+                            mode: AddressAssignmentMode::Dynamic,
+                            birth_ms: self.clock.now_ms(),
+                            owner_hash: Self::sender_hash(msg.source_hostname),
+                            last_seen_ms: self.clock.now_ms(),
+                        });
+                let payload = Self::encode_p2p_stream_payload(
+                    P2P_STREAM_SYN | P2P_STREAM_ACK,
+                    local_id,
+                    frame.source_stream_id,
+                    0,
+                    &[],
+                )?;
+                reply = Some((dst, msg.source_port, msg.destination_port, payload));
+            } else if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK != 0 {
+                if let Some(session) = st.p2p_stream_sessions.get_mut(&frame.destination_stream_id)
+                {
+                    session.peer_stream_id = frame.source_stream_id;
+                    session.connected = true;
+                    let peer_hostname = session.peer_hostname.clone();
+                    let peer_address = session.peer_address;
+                    let local_port = session.local_port;
+                    let peer_port = session.peer_port;
+                    let handlers = st
+                        .p2p_stream_handlers
+                        .get(&local_port)
+                        .cloned()
+                        .unwrap_or_default();
+                    events.push(PendingP2pStreamEvent {
+                        handlers,
+                        kind: P2pStreamEventKind::Connected,
+                        stream_id: frame.destination_stream_id,
+                        peer_stream_id: frame.source_stream_id,
+                        peer_hostname,
+                        peer_address,
+                        local_port,
+                        peer_port,
+                    });
+                }
+            } else if frame.flags & (P2P_STREAM_FIN | P2P_STREAM_RST | P2P_STREAM_DATA) != 0 {
+                let kind = if frame.flags & P2P_STREAM_RST != 0 {
+                    P2pStreamEventKind::Reset
+                } else if frame.flags & P2P_STREAM_FIN != 0 {
+                    P2pStreamEventKind::Closed
+                } else {
+                    P2pStreamEventKind::Data
+                };
+                let session_id = if frame.destination_stream_id != 0 {
+                    Some(frame.destination_stream_id)
+                } else {
+                    st.p2p_stream_sessions.iter().find_map(|(id, session)| {
+                        (session.peer_stream_id == frame.source_stream_id
+                            && session.local_port == msg.destination_port
+                            && session.peer_port == msg.source_port
+                            && session.peer_address == msg.source_address
+                            && session.peer_hostname.as_ref() == msg.source_hostname)
+                            .then_some(*id)
+                    })
+                };
+                if let Some(session_id) = session_id
+                    && let Some(session) = st.p2p_stream_sessions.get(&session_id)
+                {
+                    let handlers = st
+                        .p2p_stream_handlers
+                        .get(&session.local_port)
+                        .cloned()
+                        .unwrap_or_default();
+                    events.push(PendingP2pStreamEvent {
+                        handlers,
+                        kind,
+                        stream_id: session_id,
+                        peer_stream_id: frame.source_stream_id,
+                        peer_hostname: session.peer_hostname.clone(),
+                        peer_address: session.peer_address,
+                        local_port: session.local_port,
+                        peer_port: session.peer_port,
+                    });
+                    if matches!(kind, P2pStreamEventKind::Closed | P2pStreamEventKind::Reset) {
+                        st.p2p_stream_sessions.remove(&session_id);
+                    }
+                }
+            }
+        }
+        if let Some((dst, dst_port, src_port, payload)) = reply {
+            self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+        }
+        for pending in events {
+            for handler in pending.handlers {
+                (handler.handler)(P2pStreamEvent {
+                    kind: pending.kind,
+                    stream_id: pending.stream_id,
+                    peer_stream_id: pending.peer_stream_id,
+                    sequence: frame.sequence,
+                    peer_hostname: pending.peer_hostname.as_ref(),
+                    peer_address: pending.peer_address,
+                    local_port: pending.local_port,
+                    peer_port: pending.peer_port,
+                    payload: frame.payload,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the side that most recently led toward `packet_id`.
+    ///
+    /// End-to-end reliable acknowledgements should return only toward the
+    /// source-side that originated the data flow, not be flooded everywhere.
+    /// This helper stores that learned return path in a bounded LRU-like cache.
     fn note_reliable_return_route(&self, side: RouterSideId, packet_id: u64) {
         let mut st = self.state.lock();
         Self::remember_reliable_return_route_locked(&mut st, packet_id);
@@ -1498,6 +3333,11 @@ impl Router {
             .insert(packet_id, ReliableReturnRouteState { side });
     }
 
+    /// Ensure `packet_id` is retained in the bounded reliable return-route cache.
+    ///
+    /// Existing entries are refreshed to the back of the order list. When the
+    /// cache is full, the oldest learned route is evicted before inserting the
+    /// new one.
     fn remember_reliable_return_route_locked(st: &mut RouterInner, packet_id: u64) {
         let cap = RELIABLE_MAX_RETURN_ROUTES.max(1);
         st.reliable_return_route_order
@@ -1535,6 +3375,11 @@ impl Router {
         let (eps, ty) = self.item_route_info(data)?;
         let now_ms = self.clock.now_ms();
         let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
+        let prefer_best_overlap =
+            is_reliable_type(ty) && Self::reliable_control_target_packet_id(data)?.is_none();
+        let scoring_eps = self.preferred_scoring_endpoints(&eps, prefer_best_overlap);
+        let mut candidates: Vec<(u64, RouterSideId, usize)> = Vec::new();
+        let mut best_overlap = 0usize;
         let mut out = BTreeMap::new();
         for (&side, route) in st.discovery_routes.iter() {
             if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
@@ -1557,15 +3402,31 @@ impl Router {
                     if !Self::is_end_to_end_destination_sender(&board.sender_id) {
                         continue;
                     }
-                    if eps
-                        .iter()
-                        .copied()
-                        .any(|ep| board.reachable_endpoints.contains(&ep))
-                    {
-                        out.insert(Self::sender_hash(&board.sender_id), side);
-                        if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
-                            return Ok(out);
+                    let overlap = Self::endpoint_overlap_count(
+                        board.reachable_endpoints.iter().copied(),
+                        &scoring_eps,
+                    );
+                    if overlap > 0 {
+                        if prefer_best_overlap {
+                            best_overlap = best_overlap.max(overlap);
+                            candidates.push((Self::sender_hash(&board.sender_id), side, overlap));
+                        } else {
+                            out.insert(Self::sender_hash(&board.sender_id), side);
+                            if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                                return Ok(out);
+                            }
                         }
+                    }
+                }
+            }
+        }
+
+        if prefer_best_overlap {
+            for (sender_hash, side, overlap) in candidates {
+                if overlap == best_overlap {
+                    out.insert(sender_hash, side);
+                    if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                        return Ok(out);
                     }
                 }
             }
@@ -1573,14 +3434,122 @@ impl Router {
         Ok(out)
     }
 
+    #[cfg(feature = "discovery")]
+    #[allow(clippy::too_many_arguments)]
+    fn discovered_route_candidates_locked(
+        &self,
+        st: &RouterInner,
+        exclude: Option<RouterSideId>,
+        ty: DataType,
+        eps: &[DataEndpoint],
+        target_senders: &[u64],
+        prefer_nonlocal: bool,
+        preferred_timesync_source: Option<&str>,
+    ) -> Vec<DiscoveryCandidateMatch> {
+        let restrict_link_local = Self::endpoints_are_link_local_only(eps);
+        let now_ms = self.clock.now_ms();
+        let scoring_eps = self.preferred_scoring_endpoints(eps, prefer_nonlocal);
+        let mut out = Vec::new();
+
+        for (&side, route) in st.discovery_routes.iter() {
+            if exclude == Some(side)
+                || now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
+            {
+                continue;
+            }
+            if restrict_link_local
+                && st
+                    .sides
+                    .get(side)
+                    .and_then(|s| s.as_ref())
+                    .map(|s| !s.opts.link_local_enabled)
+                    .unwrap_or(true)
+            {
+                continue;
+            }
+            if !self.route_allowed_locked(st, exclude, Some(ty), side) {
+                continue;
+            }
+            if !target_senders.is_empty()
+                && !Self::side_matches_target_senders_locked(st, side, target_senders, now_ms)
+            {
+                continue;
+            }
+            if !target_senders.is_empty() {
+                out.push(DiscoveryCandidateMatch {
+                    side,
+                    overlap: usize::MAX,
+                });
+                continue;
+            }
+            if preferred_timesync_source
+                .is_some_and(|source| route.reachable_timesync_sources.iter().any(|s| s == source))
+            {
+                out.push(DiscoveryCandidateMatch {
+                    side,
+                    overlap: usize::MAX,
+                });
+                continue;
+            }
+            let overlap =
+                Self::endpoint_overlap_count(route.reachable.iter().copied(), &scoring_eps);
+            if overlap > 0 {
+                out.push(DiscoveryCandidateMatch { side, overlap });
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "discovery")]
+    fn select_discovered_candidate_sides_locked(
+        &self,
+        st: &mut RouterInner,
+        exclude: Option<RouterSideId>,
+        ty: DataType,
+        target_senders: &[u64],
+        prefer_best_overlap: bool,
+        matches: Vec<DiscoveryCandidateMatch>,
+    ) -> Vec<RouterSideId> {
+        let discovered_origin = if Self::has_typed_route_overrides_locked(st, exclude, ty)
+            || !target_senders.is_empty()
+        {
+            RouteSelectionOrigin::Flood
+        } else {
+            RouteSelectionOrigin::Discovered
+        };
+
+        let mut matches = matches;
+        if matches.iter().any(|m| m.overlap == usize::MAX) {
+            matches.retain(|m| m.overlap == usize::MAX);
+        }
+
+        let selected: Vec<RouterSideId> = if prefer_best_overlap {
+            let best_overlap = matches.iter().map(|m| m.overlap).max().unwrap_or(0);
+            matches
+                .into_iter()
+                .filter(|m| m.overlap == best_overlap)
+                .map(|m| m.side)
+                .collect()
+        } else {
+            matches.into_iter().map(|m| m.side).collect()
+        };
+
+        self.apply_route_selection_locked(st, exclude, selected, discovered_origin)
+    }
+
     fn register_end_to_end_reliable_tx(&self, data: &RouterItem) -> TelemetryResult<()> {
         let packet_id = Self::get_hash(data);
         let now_ms = self.clock.now_ms();
+        let ty = match data {
+            RouterItem::Packet(pkt) => pkt.data_type(),
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
+        };
         let mut st = self.state.lock();
         #[cfg(feature = "discovery")]
-        let pending_destinations = self.expected_end_to_end_destinations_locked(&st, data)?;
+        let mut pending_destinations = self.expected_end_to_end_destinations_locked(&st, data)?;
         #[cfg(not(feature = "discovery"))]
-        let pending_destinations = BTreeMap::new();
+        let mut pending_destinations = BTreeMap::new();
+        self.filter_trackable_end_to_end_destinations_locked(&st, ty, &mut pending_destinations);
         let tracked_destinations = !pending_destinations.is_empty();
         Self::remember_end_to_end_reliable_tx_locked(&mut st, packet_id);
         st.end_to_end_reliable_tx.insert(
@@ -1602,6 +3571,7 @@ impl Router {
         &self,
         st: &mut RouterInner,
     ) -> TelemetryResult<()> {
+        let active_destinations = self.active_end_to_end_destinations_locked(st);
         let packet_ids: Vec<u64> = st.end_to_end_reliable_tx.keys().copied().collect();
         let mut completed = Vec::new();
 
@@ -1620,14 +3590,18 @@ impl Router {
             if !sent.tracked_destinations {
                 continue;
             }
-            sent.pending_destinations
-                .retain(|sender_hash, side| match expected.get(sender_hash) {
-                    Some(next_side) => {
+            sent.pending_destinations.retain(|sender_hash, side| {
+                match (
+                    expected.get(sender_hash),
+                    active_destinations.get(sender_hash),
+                ) {
+                    (Some(next_side), _) | (None, Some(next_side)) => {
                         *side = *next_side;
                         true
                     }
-                    None => false,
-                });
+                    (None, None) => false,
+                }
+            });
             if sent.pending_destinations.is_empty() {
                 completed.push(packet_id);
             }
@@ -1640,12 +3614,57 @@ impl Router {
         Ok(())
     }
 
-    fn side_supports_end_to_end_reliable_locked(st: &RouterInner, side: RouterSideId) -> bool {
-        let Some(side_ref) = st.sides.get(side).and_then(Option::as_ref) else {
-            return false;
-        };
-        side_ref.opts.reliable_enabled
-            && matches!(side_ref.tx_handler, RouterTxHandlerFn::Serialized(_))
+    #[cfg(feature = "discovery")]
+    fn active_end_to_end_destinations_locked(
+        &self,
+        st: &RouterInner,
+    ) -> BTreeMap<u64, RouterSideId> {
+        let now_ms = self.clock.now_ms();
+        let mut out = BTreeMap::new();
+        for (&side, route) in st.discovery_routes.iter() {
+            if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                continue;
+            }
+            for sender_state in route.announcers.values() {
+                if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                    continue;
+                }
+                for board in sender_state.topology_boards.iter() {
+                    if !Self::is_end_to_end_destination_sender(&board.sender_id) {
+                        continue;
+                    }
+                    out.insert(Self::sender_hash(&board.sender_id), side);
+                    if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn side_supports_end_to_end_tracking_locked(st: &RouterInner, side: RouterSideId) -> bool {
+        matches!(
+            st.sides
+                .get(side)
+                .and_then(Option::as_ref)
+                .map(|side| &side.tx_handler),
+            Some(RouterTxHandlerFn::Packed(_))
+        )
+    }
+
+    fn filter_trackable_end_to_end_destinations_locked(
+        &self,
+        st: &RouterInner,
+        ty: DataType,
+        pending: &mut BTreeMap<u64, RouterSideId>,
+    ) {
+        let now_ms = self.clock.now_ms();
+        pending.retain(|_, side| {
+            Self::side_supports_end_to_end_tracking_locked(st, *side)
+                && (is_reliable_type(ty)
+                    || !self.side_has_multiple_announcers_locked(st, *side, now_ms))
+        });
     }
 
     #[cfg(feature = "discovery")]
@@ -1681,16 +3700,59 @@ impl Router {
         false
     }
 
-    fn queue_end_to_end_reliable_ack(&self, pkt: &Packet) -> TelemetryResult<()> {
+    fn queue_end_to_end_reliable_ack(
+        &self,
+        pkt: &Packet,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
+        self.queue_end_to_end_reliable_ack_for_packet_id(pkt.packet_id(), called_from_queue)
+    }
+
+    fn queue_end_to_end_reliable_ack_for_packet_id(
+        &self,
+        packet_id: u64,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
         let ack_sender = self.encode_end_to_end_ack_sender();
         let ack = Packet::new(
             DataType::ReliableAck,
             message_meta(DataType::ReliableAck).endpoints,
             ack_sender.as_str(),
             self.packet_timestamp_ms(),
-            Self::encode_end_to_end_reliable_ack(pkt.packet_id()),
+            Self::encode_end_to_end_reliable_ack(packet_id),
         )?;
-        self.tx_queue_item_with_flags(RouterTxItem::Broadcast(RouterItem::Packet(ack)), true)
+        self.emit_internal_tx(
+            RouterTxItem::Broadcast(RouterItem::Packet(ack)),
+            true,
+            called_from_queue,
+        )
+    }
+
+    fn emit_internal_tx(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
+        if called_from_queue {
+            self.tx_queue_item_with_flags(item, ignore_local)
+        } else {
+            self.tx_item_impl(item, ignore_local, false)
+        }
+    }
+
+    fn emit_internal_tx_with_priority(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        priority: u8,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
+        if called_from_queue {
+            self.tx_queue_item_with_priority(item, ignore_local, priority)
+        } else {
+            self.tx_item_impl(item, ignore_local, false)
+        }
     }
 
     fn queue_end_to_end_reliable_retransmit(&self, packet_id: u64) -> TelemetryResult<()> {
@@ -1737,7 +3799,7 @@ impl Router {
     fn router_item_priority(data: &RouterItem) -> TelemetryResult<u8> {
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
         Ok(message_priority(ty))
     }
@@ -1829,6 +3891,7 @@ impl Router {
                     data: data.clone(),
                 },
                 true,
+                false,
             )?;
         }
 
@@ -1844,13 +3907,206 @@ impl Router {
                 eps.dedup();
                 Ok((eps, pkt.data_type()))
             }
-            RouterItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 let mut eps: Vec<DataEndpoint> = env.endpoints.iter().copied().collect();
                 eps.sort_unstable();
                 eps.dedup();
                 Ok((eps, env.ty))
             }
+        }
+    }
+
+    fn item_data_type(data: &RouterItem) -> TelemetryResult<DataType> {
+        match data {
+            RouterItem::Packet(pkt) => Ok(pkt.data_type()),
+            RouterItem::Packed(bytes) => Ok(wire_format::peek_envelope(bytes.as_ref())?.ty),
+        }
+    }
+
+    fn e2e_crypto_supported(&self) -> bool {
+        #[cfg(feature = "cryptography")]
+        {
+            self.cfg.e2e_encryption() != RouterE2eEncryptionMode::Disabled
+                && crate::crypto::registered_crypto_available()
+        }
+        #[cfg(not(feature = "cryptography"))]
+        {
+            false
+        }
+    }
+
+    fn should_require_e2e_for_type(&self, ty: DataType) -> bool {
+        if is_internal_control_type(ty) {
+            return false;
+        }
+        match self.cfg.e2e_encryption() {
+            RouterE2eEncryptionMode::Disabled => {
+                message_e2e_encryption_policy(ty) == E2eEncryptionPolicy::RequireOn
+            }
+            RouterE2eEncryptionMode::RequiredOnly => {
+                message_e2e_encryption_policy(ty) == E2eEncryptionPolicy::RequireOn
+            }
+            RouterE2eEncryptionMode::Preferred => matches!(
+                message_e2e_encryption_policy(ty),
+                E2eEncryptionPolicy::PreferOn | E2eEncryptionPolicy::RequireOn
+            ),
+            RouterE2eEncryptionMode::ForceAll => true,
+        }
+    }
+
+    fn ensure_e2e_policy_supported_for_type(&self, ty: DataType) -> TelemetryResult<()> {
+        if self.should_require_e2e_for_type(ty) && !self.e2e_crypto_supported() {
+            return Err(TelemetryError::BadArg);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cryptography")]
+    fn e2e_seal_config_for_type(&self, ty: DataType) -> Option<wire_format::E2eSealConfig> {
+        if self.should_require_e2e_for_type(ty) && self.e2e_crypto_supported() {
+            Some(wire_format::E2eSealConfig {
+                key_id: self.cfg.e2e_key_id(),
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn pack_packet_for_router(
+        &self,
+        pkt: &Packet,
+        reliable: Option<wire_format::ReliableHeader>,
+    ) -> TelemetryResult<Arc<[u8]>> {
+        #[cfg(feature = "cryptography")]
+        if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
+            return wire_format::pack_packet_with_wire_contract_e2e(
+                pkt,
+                reliable,
+                pkt.wire_shape(),
+                pkt.wire_target_senders(),
+                e2e,
+            );
+        }
+        Ok(match reliable {
+            Some(hdr) => wire_format::pack_packet_with_reliable(pkt, hdr),
+            None => wire_format::pack_packet(pkt),
+        })
+    }
+
+    #[inline]
+    fn pack_packet_for_contract(
+        &self,
+        pkt: &Packet,
+        reliable: Option<wire_format::ReliableHeader>,
+        shape: Option<MessageElement>,
+        target_senders: &[u64],
+    ) -> TelemetryResult<Arc<[u8]>> {
+        #[cfg(feature = "cryptography")]
+        if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
+            return wire_format::pack_packet_with_wire_contract_e2e(
+                pkt,
+                reliable,
+                shape,
+                target_senders,
+                e2e,
+            );
+        }
+        wire_format::pack_packet_with_wire_contract(pkt, reliable, shape, target_senders)
+    }
+
+    #[cfg(feature = "cryptography")]
+    #[inline]
+    fn prepare_packed_for_remote(
+        &self,
+        bytes: Arc<[u8]>,
+        reliable_override: Option<Option<wire_format::ReliableHeader>>,
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
+        if frame.ack_only() || self.e2e_seal_config_for_type(frame.envelope.ty).is_none() {
+            return Ok(bytes);
+        }
+        let reliable = reliable_override.unwrap_or(frame.reliable);
+        let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+        self.pack_packet_for_contract(
+            &pkt,
+            reliable,
+            frame.envelope.wire_shape,
+            &frame.envelope.target_senders,
+        )
+    }
+
+    fn item_target_senders(&self, data: &RouterItem) -> TelemetryResult<Arc<[u64]>> {
+        match data {
+            RouterItem::Packet(pkt) => Ok(Arc::from(pkt.wire_target_senders())),
+            RouterItem::Packed(bytes) => {
+                Ok(wire_format::peek_envelope(bytes.as_ref())?.target_senders)
+            }
+        }
+    }
+
+    fn item_targets_local_sender(&self, data: &RouterItem) -> TelemetryResult<bool> {
+        let targets = self.item_target_senders(data)?;
+        if targets.is_empty() {
+            return Ok(true);
+        }
+        let local_sender = self.sender_arc();
+        let local_hash = Self::sender_hash(local_sender.as_ref());
+        Ok(targets.contains(&local_hash))
+    }
+
+    #[cfg(feature = "discovery")]
+    fn side_matches_target_senders_locked(
+        st: &RouterInner,
+        side: RouterSideId,
+        target_senders: &[u64],
+        now_ms: u64,
+    ) -> bool {
+        st.discovery_routes
+            .get(&side)
+            .map(|route| {
+                if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                    return false;
+                }
+                route.announcers.values().any(|sender_state| {
+                    if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                        return false;
+                    }
+                    sender_state
+                        .topology_boards
+                        .iter()
+                        .any(|board| target_senders.contains(&Self::sender_hash(&board.sender_id)))
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn attach_wire_contract_to_item(
+        &self,
+        data: RouterItem,
+        target_senders: &[u64],
+    ) -> TelemetryResult<RouterItem> {
+        match data {
+            RouterItem::Packet(pkt) => {
+                let reliable = if is_reliable_type(pkt.data_type()) {
+                    Some(wire_format::ReliableHeader {
+                        flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                        seq: 0,
+                        ack: 0,
+                    })
+                } else {
+                    None
+                };
+                let bytes = self.pack_packet_for_contract(
+                    &pkt,
+                    reliable,
+                    Some(message_meta(pkt.data_type()).element),
+                    target_senders,
+                )?;
+                Ok(RouterItem::Packed(bytes))
+            }
+            RouterItem::Packed(bytes) => Ok(RouterItem::Packed(bytes)),
         }
     }
 
@@ -1887,6 +4143,18 @@ impl Router {
         }
     }
 
+    #[cfg(feature = "discovery")]
+    fn has_explicit_route_policy_locked(
+        st: &RouterInner,
+        src: Option<RouterSideId>,
+        ty: DataType,
+    ) -> bool {
+        st.route_overrides
+            .keys()
+            .any(|(route_src, _)| *route_src == src)
+            || Self::has_typed_route_overrides_locked(st, src, ty)
+    }
+
     fn remote_side_plan(
         &self,
         data: &RouterItem,
@@ -1895,6 +4163,7 @@ impl Router {
         #[cfg(feature = "discovery")]
         {
             let (eps, ty) = self.item_route_info(data)?;
+            let target_senders = self.item_target_senders(data)?;
             let preferred_packet_id = Self::reliable_control_target_packet_id(data)?;
             if discovery::is_discovery_type(ty) {
                 let mut st = self.state.lock();
@@ -1906,14 +4175,9 @@ impl Router {
                     RouteSelectionOrigin::Flood,
                 )));
             }
-
-            #[cfg(feature = "timesync")]
-            let bootstrap_timesync = matches!(
-                ty,
-                DataType::TimeSyncAnnounce | DataType::TimeSyncRequest | DataType::TimeSyncResponse
-            );
-            #[cfg(not(feature = "timesync"))]
-            let bootstrap_timesync = false;
+            if !(has_nonlocal_endpoint(&eps, &self.cfg) || force_remote_for_type(ty)) {
+                return Ok(RemoteSidePlan::Target(Vec::new()));
+            }
 
             #[cfg(feature = "timesync")]
             let preferred_timesync_source = self.preferred_timesync_route_source(data, ty)?;
@@ -1929,109 +4193,90 @@ impl Router {
                 if let Some(side) = target_side
                     .filter(|side| self.route_allowed_locked(&st, exclude, Some(ty), *side))
                 {
+                    #[cfg(feature = "timesync")]
+                    if !Self::timesync_allowed_for_side_locked(
+                        &mut st,
+                        side,
+                        ty,
+                        self.clock.now_ms(),
+                    ) {
+                        return Ok(RemoteSidePlan::Target(Vec::new()));
+                    }
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
                 return Ok(RemoteSidePlan::Target(Vec::new()));
             }
-            let has_nonlocal = has_nonlocal_endpoint(&eps, &self.cfg);
             let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
-            let discovered_origin = if is_reliable_type(ty) {
-                RouteSelectionOrigin::Flood
-            } else {
-                RouteSelectionOrigin::Discovered
-            };
+            let prefer_best_overlap =
+                is_reliable_type(ty) && target_senders.is_empty() && preferred_packet_id.is_none();
             if st.discovery_routes.is_empty() {
-                if restrict_link_local {
-                    let targets = self.eligible_side_ids_locked(&st, exclude, Some(ty), true);
-                    return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
+                let mut fallback =
+                    self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
+                #[cfg(feature = "timesync")]
+                {
+                    fallback = Self::filter_timesync_sides_locked(
+                        &mut st,
+                        ty,
+                        self.clock.now_ms(),
+                        fallback,
+                    );
+                }
+                return Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
+                    fallback
+                } else {
+                    Vec::new()
+                }));
+            }
+            let mut matches = self.discovered_route_candidates_locked(
+                &st,
+                exclude,
+                ty,
+                &eps,
+                &target_senders,
+                prefer_best_overlap,
+                preferred_timesync_source.as_deref(),
+            );
+            #[cfg(feature = "timesync")]
+            {
+                matches =
+                    Self::filter_timesync_matches_locked(&mut st, ty, self.clock.now_ms(), matches);
+            }
+
+            if !matches.is_empty() {
+                Ok(RemoteSidePlan::Target(
+                    self.select_discovered_candidate_sides_locked(
                         &mut st,
                         exclude,
-                        targets,
-                        RouteSelectionOrigin::Flood,
-                    )));
-                }
-                return if has_nonlocal || bootstrap_timesync {
-                    let targets = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
+                        ty,
+                        &target_senders,
+                        prefer_best_overlap,
+                        matches,
+                    ),
+                ))
+            } else if prefer_best_overlap {
+                Ok(RemoteSidePlan::Target(Vec::new()))
+            } else {
+                if Self::has_explicit_route_policy_locked(&st, exclude, ty) {
+                    let mut sides =
+                        self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
+                    #[cfg(feature = "timesync")]
+                    {
+                        sides = Self::filter_timesync_sides_locked(
+                            &mut st,
+                            ty,
+                            self.clock.now_ms(),
+                            sides,
+                        );
+                    }
                     Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
                         &mut st,
                         exclude,
-                        targets,
+                        sides,
                         RouteSelectionOrigin::Flood,
                     )))
                 } else {
                     Ok(RemoteSidePlan::Target(Vec::new()))
-                };
-            }
-            let now_ms = self.clock.now_ms();
-            let mut had_exact = false;
-            let mut exact_targets = Vec::new();
-            let mut had_known = false;
-            let mut generic_targets = Vec::new();
-
-            for (&side, route) in st.discovery_routes.iter() {
-                if exclude == Some(side)
-                    || now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
-                {
-                    continue;
                 }
-                if restrict_link_local
-                    && st
-                        .sides
-                        .get(side)
-                        .and_then(|s| s.as_ref())
-                        .map(|s| !s.opts.link_local_enabled)
-                        .unwrap_or(true)
-                {
-                    continue;
-                }
-                if !self.route_allowed_locked(&st, exclude, Some(ty), side) {
-                    continue;
-                }
-                if preferred_timesync_source.as_deref().is_some_and(|source| {
-                    route.reachable_timesync_sources.iter().any(|s| s == source)
-                }) {
-                    had_exact = true;
-                    exact_targets.push(side);
-                    continue;
-                }
-                if eps.iter().copied().any(|ep| route.reachable.contains(&ep)) {
-                    had_known = true;
-                    generic_targets.push(side);
-                }
-            }
-
-            if had_exact {
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    exclude,
-                    exact_targets,
-                    discovered_origin,
-                )))
-            } else if had_known {
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    exclude,
-                    generic_targets,
-                    discovered_origin,
-                )))
-            } else if restrict_link_local {
-                let targets = self.eligible_side_ids_locked(&st, exclude, Some(ty), true);
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    exclude,
-                    targets,
-                    RouteSelectionOrigin::Flood,
-                )))
-            } else if has_nonlocal || bootstrap_timesync {
-                let targets = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
-                Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
-                    &mut st,
-                    exclude,
-                    targets,
-                    RouteSelectionOrigin::Flood,
-                )))
-            } else {
-                Ok(RemoteSidePlan::Target(Vec::new()))
             }
         }
         #[cfg(not(feature = "discovery"))]
@@ -2084,7 +4329,7 @@ impl Router {
                     Self::timesync_has_usable_time_locked(&st, self.monotonic_now_ns()),
                 )
             {
-                return vec![self.sender.to_owned()];
+                return vec![self.sender_arc().to_string()];
             }
         }
         Vec::new()
@@ -2105,19 +4350,23 @@ impl Router {
 
         match data {
             RouterItem::Packet(pkt) => match ty {
-                DataType::TimeSyncRequest if pkt.sender() == self.sender => Ok(self
-                    .timesync
-                    .lock()
-                    .tracker
-                    .as_ref()
-                    .and_then(|tracker| tracker.current_source().map(|src| src.sender.clone()))),
+                DataType::TimeSyncRequest => {
+                    let local_sender = self.sender_arc();
+                    if pkt.sender() == local_sender.as_ref() {
+                        Ok(self.timesync.lock().tracker.as_ref().and_then(|tracker| {
+                            tracker.current_source().map(|src| src.sender.clone())
+                        }))
+                    } else {
+                        Ok(None)
+                    }
+                }
                 DataType::TimeSyncAnnounce | DataType::TimeSyncResponse => {
                     Ok(Some(pkt.sender().to_owned()))
                 }
                 _ => Ok(None),
             },
-            RouterItem::Serialized(bytes) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                 self.preferred_timesync_route_source(&RouterItem::Packet(pkt), ty)
             }
         }
@@ -2204,8 +4453,9 @@ impl Router {
         }
         connections.sort_unstable();
         connections.dedup();
+        let sender = self.sender_arc();
         TopologyBoardNode {
-            sender_id: self.sender.to_string(),
+            sender_id: sender.to_string(),
             reachable_endpoints,
             reachable_timesync_sources: self.local_discovery_timesync_sources(now_ms),
             connections,
@@ -2230,17 +4480,18 @@ impl Router {
                 }
                 let mut sender_boards = sender_state.topology_boards.clone();
                 if sender_boards.is_empty() {
+                    let sender = self.sender_arc();
                     sender_boards.push(TopologyBoardNode {
                         sender_id: announcer.clone(),
                         reachable_endpoints: sender_state.reachable.clone(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
-                        connections: vec![self.sender.to_string()],
+                        connections: vec![sender.to_string()],
                     });
                 } else if let Some(board) = sender_boards
                     .iter_mut()
                     .find(|board| board.sender_id == *announcer)
                 {
-                    board.connections.push(self.sender.to_string());
+                    board.connections.push(self.sender_arc().to_string());
                 }
                 if !link_local_enabled {
                     for board in sender_boards.iter_mut() {
@@ -2301,9 +4552,274 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn queue_discovery_announce(&self) -> TelemetryResult<()> {
+    fn discovery_master_sender_locked(&self, st: &RouterInner, now_ms: u64) -> String {
+        let boards = self.advertised_discovery_topology_for_link_locked(st, now_ms, true);
+        discovery::elect_discovery_master(self.sender_arc().as_ref(), &boards)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn should_answer_discovery_request_locked(
+        &self,
+        st: &RouterInner,
+        requester: &str,
+        now_ms: u64,
+    ) -> bool {
+        if requester == self.sender_arc().as_ref() {
+            return false;
+        }
+        self.discovery_master_sender_locked(st, now_ms) == self.sender_arc().as_ref()
+    }
+
+    #[cfg(feature = "discovery")]
+    #[inline]
+    fn side_is_slow_control_link_locked(
+        st: &RouterInner,
+        side_id: RouterSideId,
+        now_ms: u64,
+    ) -> bool {
+        st.adaptive_route_stats.get(&side_id).is_some_and(|stats| {
+            let recent_slow = stats.last_slow_observed_ms > 0
+                && now_ms.saturating_sub(stats.last_slow_observed_ms)
+                    <= DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS;
+            stats.sample_count > 0
+                && ((stats.estimated_bandwidth_bps > 0
+                    && stats.estimated_bandwidth_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS)
+                    || recent_slow)
+        })
+    }
+
+    #[cfg(feature = "discovery")]
+    fn discovery_level_for_side_locked(
+        st: &mut RouterInner,
+        side_id: RouterSideId,
+        now_ms: u64,
+    ) -> Option<DiscoveryAdvertiseLevel> {
+        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
+            st.discovery_side_throttle.remove(&side_id);
+            return Some(DiscoveryAdvertiseLevel::Full);
+        }
+
+        let throttle = st.discovery_side_throttle.entry(side_id).or_default();
+        if now_ms >= throttle.next_full_ms {
+            throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
+            throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+            return Some(DiscoveryAdvertiseLevel::Full);
+        }
+        if now_ms >= throttle.next_ping_ms {
+            throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+            return Some(DiscoveryAdvertiseLevel::MinimalPing);
+        }
+        None
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[inline]
+    fn is_timesync_type(ty: DataType) -> bool {
+        matches!(
+            ty,
+            DataType::TimeSyncAnnounce | DataType::TimeSyncRequest | DataType::TimeSyncResponse
+        )
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn timesync_allowed_for_side_locked(
+        st: &mut RouterInner,
+        side_id: RouterSideId,
+        ty: DataType,
+        now_ms: u64,
+    ) -> bool {
+        if !Self::is_timesync_type(ty) {
+            return true;
+        }
+        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
+            st.timesync_side_throttle.remove(&side_id);
+            return true;
+        }
+
+        let throttle = st.timesync_side_throttle.entry(side_id).or_default();
+        if now_ms >= throttle.next_allowed_ms {
+            throttle.next_allowed_ms = now_ms.saturating_add(TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn filter_timesync_sides_locked(
+        st: &mut RouterInner,
+        ty: DataType,
+        now_ms: u64,
+        sides: Vec<RouterSideId>,
+    ) -> Vec<RouterSideId> {
+        sides
+            .into_iter()
+            .filter(|side| Self::timesync_allowed_for_side_locked(st, *side, ty, now_ms))
+            .collect()
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    fn filter_timesync_matches_locked(
+        st: &mut RouterInner,
+        ty: DataType,
+        now_ms: u64,
+        matches: Vec<DiscoveryCandidateMatch>,
+    ) -> Vec<DiscoveryCandidateMatch> {
+        matches
+            .into_iter()
+            .filter(|m| Self::timesync_allowed_for_side_locked(st, m.side, ty, now_ms))
+            .collect()
+    }
+
+    #[cfg(feature = "discovery")]
+    fn emit_discovery_snapshot(
+        &self,
+        called_from_queue: bool,
+        include_schema: bool,
+        include_topology: bool,
+    ) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         let per_side = {
+            let mut st = self.state.lock();
+            if Self::prune_discovery_routes_locked(&mut st, now_ms) {
+                self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+                Self::note_discovery_topology_change_locked(&mut st, now_ms);
+            }
+            st.fit_discovery_budget();
+            let side_entries = st
+                .sides
+                .iter()
+                .enumerate()
+                .filter_map(|(side_id, side)| {
+                    side.as_ref()
+                        .map(|side| (side_id, side.opts.link_local_enabled, side.opts))
+                })
+                .collect::<Vec<_>>();
+            let local_is_master =
+                self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
+            let mut per_side = Vec::new();
+            for (side_id, link_local_enabled, opts) in side_entries {
+                if !self.route_allowed_locked(&st, None, Some(DataType::DiscoveryAnnounce), side_id)
+                {
+                    continue;
+                }
+                let Some(level) = Self::discovery_level_for_side_locked(&mut st, side_id, now_ms)
+                else {
+                    continue;
+                };
+                let capabilities = opts.link_capabilities();
+                if level == DiscoveryAdvertiseLevel::MinimalPing {
+                    per_side.push((
+                        side_id,
+                        level,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        capabilities,
+                        local_is_master,
+                    ));
+                    continue;
+                }
+                per_side.push((
+                    side_id,
+                    level,
+                    self.advertised_discovery_endpoints_for_link_locked(
+                        &st,
+                        now_ms,
+                        link_local_enabled,
+                    ),
+                    self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms),
+                    self.advertised_discovery_topology_for_link_locked(
+                        &st,
+                        now_ms,
+                        link_local_enabled,
+                    ),
+                    capabilities,
+                    local_is_master,
+                ));
+            }
+            per_side
+        };
+        for (
+            side_id,
+            level,
+            endpoints,
+            timesync_sources,
+            topology,
+            capabilities,
+            local_is_master,
+        ) in per_side
+        {
+            let sender = self.sender_arc();
+            if include_schema && level == DiscoveryAdvertiseLevel::Full {
+                let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side_id,
+                        data: RouterItem::Packet(pkt),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+            if level == DiscoveryAdvertiseLevel::Full {
+                let address = self.local_address_advertisement(
+                    endpoints.clone(),
+                    timesync_sources.clone(),
+                    capabilities,
+                    if local_is_master {
+                        discovery::ADDRESS_STATE_APPROVED
+                    } else {
+                        discovery::ADDRESS_STATE_REQUEST
+                    },
+                );
+                let pkt = discovery::build_discovery_address(sender.as_ref(), now_ms, &address)?;
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side_id,
+                        data: RouterItem::Packet(pkt),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+            if level == DiscoveryAdvertiseLevel::MinimalPing {
+                let pkt = discovery::build_discovery_announce(
+                    sender.as_ref(),
+                    now_ms,
+                    endpoints.as_slice(),
+                )?;
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side_id,
+                        data: RouterItem::Packet(pkt),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+            if include_topology && level == DiscoveryAdvertiseLevel::Full && !topology.is_empty() {
+                let pkt = discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?;
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side_id,
+                        data: RouterItem::Packet(pkt),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn queue_discovery_announce(&self) -> TelemetryResult<()> {
+        let now_ms = self.clock.now_ms();
+        {
             let mut st = self.state.lock();
             if Self::prune_discovery_routes_locked(&mut st, now_ms) {
                 self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
@@ -2314,76 +4830,8 @@ impl Router {
                 return Ok(());
             }
             st.discovery_cadence.on_announce_sent(now_ms);
-            st.sides
-                .iter()
-                .enumerate()
-                .filter_map(|(side_id, side)| {
-                    let side = side.as_ref()?;
-                    if !self.route_allowed_locked(
-                        &st,
-                        None,
-                        Some(DataType::DiscoveryAnnounce),
-                        side_id,
-                    ) {
-                        return None;
-                    }
-                    let endpoints = self.advertised_discovery_endpoints_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    );
-                    let timesync_sources =
-                        self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
-                    let topology = self.advertised_discovery_topology_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    );
-                    Some((side_id, endpoints, timesync_sources, topology))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (side_id, endpoints, timesync_sources, topology) in per_side {
-            if !endpoints.is_empty() {
-                let pkt =
-                    discovery::build_discovery_announce(self.sender, now_ms, endpoints.as_slice())?;
-                self.tx_queue_item_with_flags(
-                    RouterTxItem::ToSide {
-                        src: None,
-                        dst: side_id,
-                        data: RouterItem::Packet(pkt),
-                    },
-                    true,
-                )?;
-            }
-            if !timesync_sources.is_empty() {
-                let pkt = discovery::build_discovery_timesync_sources(
-                    self.sender,
-                    now_ms,
-                    timesync_sources.as_slice(),
-                )?;
-                self.tx_queue_item_with_flags(
-                    RouterTxItem::ToSide {
-                        src: None,
-                        dst: side_id,
-                        data: RouterItem::Packet(pkt),
-                    },
-                    true,
-                )?;
-            }
-            if !topology.is_empty() {
-                let pkt = discovery::build_discovery_topology(self.sender, now_ms, &topology)?;
-                self.tx_queue_item_with_flags(
-                    RouterTxItem::ToSide {
-                        src: None,
-                        dst: side_id,
-                        data: RouterItem::Packet(pkt),
-                    },
-                    true,
-                )?;
-            }
         }
-        Ok(())
+        self.emit_discovery_snapshot(true, true, true)
     }
 
     #[cfg(feature = "discovery")]
@@ -2405,23 +4853,8 @@ impl Router {
                 {
                     return false;
                 }
-                !self
-                    .advertised_discovery_endpoints_for_link_locked(
-                        &st,
-                        now_ms,
-                        side.opts.link_local_enabled,
-                    )
-                    .is_empty()
-                    || !self
-                        .advertised_discovery_timesync_sources_for_link_locked(&st, now_ms)
-                        .is_empty()
-                    || !self
-                        .advertised_discovery_topology_for_link_locked(
-                            &st,
-                            now_ms,
-                            side.opts.link_local_enabled,
-                        )
-                        .is_empty()
+                let _ = side;
+                true
             });
             if st.sides.is_empty() || !has_any {
                 return Ok(false);
@@ -2440,6 +4873,7 @@ impl Router {
         &self,
         pkt: &Packet,
         src: Option<RouterSideId>,
+        called_from_queue: bool,
     ) -> TelemetryResult<bool> {
         if !discovery::is_discovery_type(pkt.data_type()) {
             return Ok(false);
@@ -2447,11 +4881,163 @@ impl Router {
         let Some(side) = src else {
             return Ok(true);
         };
-        if pkt.sender() == self.sender {
+        if pkt.data_type() == DataType::DiscoveryAddress {
+            let mut ad = discovery::decode_discovery_address(pkt)?;
+            let mut changed = self.ingest_address_advertisement(ad.clone())?;
+            let now_ms = self.clock.now_ms();
+            let mut st = self.state.lock();
+            let side_link_local_enabled = st
+                .sides
+                .get(side)
+                .and_then(|entry| entry.as_ref())
+                .map(|side_ref| side_ref.opts.link_local_enabled)
+                .unwrap_or(false);
+            if !side_link_local_enabled {
+                ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
+            }
+            let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+            let mut sender_state = route
+                .announcers
+                .get(pkt.sender())
+                .cloned()
+                .unwrap_or_default();
+            let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+            if board.reachable_endpoints != ad.reachable_endpoints {
+                board.reachable_endpoints = ad.reachable_endpoints;
+                changed = true;
+            }
+            if board.reachable_timesync_sources != ad.reachable_timesync_sources {
+                board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                changed = true;
+            }
+            Self::refresh_sender_topology_state(&mut sender_state);
+            sender_state.last_seen_ms = now_ms;
+            route
+                .announcers
+                .insert(pkt.sender().to_string(), sender_state);
+            Self::recompute_discovery_side_state(&mut route);
+            st.discovery_routes.insert(side, route);
+            st.fit_discovery_budget();
+            self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+            if changed {
+                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+            }
+            return Ok(true);
+        }
+        let local_sender = self.sender_arc();
+        if pkt.sender() == local_sender.as_ref() {
+            return Ok(true);
+        }
+        if pkt.data_type() == DataType::DiscoveryTopologyRequest {
+            let now_ms = self.clock.now_ms();
+            let should_answer = {
+                let mut st = self.state.lock();
+                if Self::prune_discovery_routes_locked(&mut st, now_ms) {
+                    self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+                    Self::note_discovery_topology_change_locked(&mut st, now_ms);
+                }
+                self.should_answer_discovery_request_locked(&st, pkt.sender(), now_ms)
+            };
+            if should_answer {
+                self.emit_discovery_snapshot(called_from_queue, false, true)?;
+            }
+            return Ok(true);
+        }
+        if pkt.data_type() == DataType::DiscoverySchemaRequest {
+            let now_ms = self.clock.now_ms();
+            let should_answer = {
+                let mut st = self.state.lock();
+                if Self::prune_discovery_routes_locked(&mut st, now_ms) {
+                    self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+                    Self::note_discovery_topology_change_locked(&mut st, now_ms);
+                }
+                self.should_answer_discovery_request_locked(&st, pkt.sender(), now_ms)
+            };
+            if should_answer {
+                self.emit_discovery_snapshot(called_from_queue, true, true)?;
+            }
+            return Ok(true);
+        }
+        if pkt.data_type() == DataType::ManagedVariableRequest {
+            let ty = discovery::decode_managed_variable_request(pkt)?;
+            if !self.can_read_managed_variable(ty) {
+                let payload = make_error_payload("managed variable permission denied");
+                let err = Packet::new(
+                    DataType::TelemetryError,
+                    message_meta(DataType::TelemetryError).endpoints,
+                    self.sender_arc().as_ref(),
+                    self.clock.now_ms(),
+                    payload,
+                )?;
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side,
+                        data: RouterItem::Packet(err),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+                return Ok(true);
+            }
+            if let Some(value) = self.managed_variable_latest(ty) {
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side,
+                        data: RouterItem::Packet(value),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+            return Ok(true);
+        }
+        if pkt.data_type() == DataType::DiscoverySchema {
+            let snapshot = discovery::decode_discovery_schema(pkt)?;
+            let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
+            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
+            drop(st);
+            let report =
+                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, MAX_QUEUE_BUDGET)?;
+            if report.changed() {
+                let mut st = self.state.lock();
+                st.fit_discovery_budget();
+                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+            }
+            return Ok(true);
+        }
+        if pkt.data_type() == DataType::DiscoveryLinkCapabilities {
+            let _ = discovery::decode_discovery_link_capabilities(pkt)?;
             return Ok(true);
         }
         let mut st = self.state.lock();
         let now_ms = self.clock.now_ms();
+        if pkt.data_type() == DataType::DiscoveryLeave {
+            let leaving = pkt.sender();
+            let before = st.discovery_routes.clone();
+            for route in st.discovery_routes.values_mut() {
+                route.announcers.remove(leaving);
+                for sender_state in route.announcers.values_mut() {
+                    sender_state
+                        .topology_boards
+                        .retain(|board| board.sender_id != leaving);
+                    for board in sender_state.topology_boards.iter_mut() {
+                        board.connections.retain(|peer| peer != leaving);
+                    }
+                    Self::refresh_sender_topology_state(sender_state);
+                }
+                Self::recompute_discovery_side_state(route);
+            }
+            st.discovery_routes
+                .retain(|_, route| !route.announcers.is_empty());
+            if st.discovery_routes != before {
+                Self::note_discovery_topology_change_locked(&mut st, now_ms);
+                self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+            }
+            return Ok(true);
+        }
         let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
         let side_link_local_enabled = st
             .sides
@@ -2498,6 +5084,7 @@ impl Router {
                 Self::refresh_sender_topology_state(&mut sender_state);
                 changed
             }
+            DataType::DiscoverySchema => false,
             _ => false,
         };
         sender_state.last_seen_ms = now_ms;
@@ -2529,13 +5116,14 @@ impl Router {
         &self,
         _pkt: &Packet,
         _src: Option<RouterSideId>,
+        _called_from_queue: bool,
     ) -> TelemetryResult<bool> {
         Ok(false)
     }
 
     #[inline]
     fn reliable_key(side: RouterSideId, ty: DataType) -> (RouterSideId, u32) {
-        (side, ty as u32)
+        (side, ty.as_u32())
     }
 
     fn reliable_tx_state_mut<'a>(
@@ -2575,12 +5163,13 @@ impl Router {
         ty: DataType,
         seq: u32,
     ) -> TelemetryResult<Packet> {
+        let sender = self.sender_arc();
         Packet::new(
             control_ty,
             message_meta(control_ty).endpoints,
-            self.sender,
+            sender.as_ref(),
             self.packet_timestamp_ms(),
-            encode_slice_le(&[ty as u32, seq]),
+            encode_slice_le(&[ty.as_u32(), seq]),
         )
     }
 
@@ -2589,9 +5178,10 @@ impl Router {
         side: RouterSideId,
         ty: DataType,
         seq: u32,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let pkt = self.reliable_control_packet(DataType::ReliableAck, ty, seq)?;
-        self.tx_queue_item_with_priority(
+        self.emit_internal_tx_with_priority(
             RouterTxItem::ToSide {
                 src: None,
                 dst: side,
@@ -2599,6 +5189,7 @@ impl Router {
             },
             true,
             message_priority(DataType::ReliableAck),
+            called_from_queue,
         )
     }
 
@@ -2607,9 +5198,10 @@ impl Router {
         side: RouterSideId,
         ty: DataType,
         seq: u32,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let pkt = self.reliable_control_packet(DataType::ReliablePacketRequest, ty, seq)?;
-        self.tx_queue_item_with_priority(
+        self.emit_internal_tx_with_priority(
             RouterTxItem::ToSide {
                 src: None,
                 dst: side,
@@ -2617,6 +5209,7 @@ impl Router {
             },
             true,
             message_priority(DataType::ReliablePacketRequest),
+            called_from_queue,
         )
     }
 
@@ -2625,9 +5218,10 @@ impl Router {
         side: RouterSideId,
         ty: DataType,
         seq: u32,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let pkt = self.reliable_control_packet(DataType::ReliablePartialAck, ty, seq)?;
-        self.tx_queue_item_with_priority(
+        self.emit_internal_tx_with_priority(
             RouterTxItem::ToSide {
                 src: None,
                 dst: side,
@@ -2635,6 +5229,7 @@ impl Router {
             },
             true,
             message_priority(DataType::ReliablePartialAck),
+            called_from_queue,
         )
     }
 
@@ -2669,6 +5264,7 @@ impl Router {
         side: RouterSideId,
         ty: DataType,
         seq: u32,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let mut queued = None;
         {
@@ -2684,11 +5280,19 @@ impl Router {
         }
 
         if let Some(bytes) = queued {
-            self.tx_queue_item_with_priority(
-                RouterTxItem::ReliableReplay { dst: side, bytes },
-                true,
-                Self::router_item_priority_bumped(ty),
-            )?;
+            if called_from_queue {
+                self.tx_queue_item_with_priority(
+                    RouterTxItem::ReliableReplay { dst: side, bytes },
+                    true,
+                    Self::router_item_priority_bumped(ty),
+                )?;
+            } else {
+                self.tx_item_impl(
+                    RouterTxItem::ReliableReplay { dst: side, bytes },
+                    true,
+                    false,
+                )?;
+            }
         }
 
         Ok(())
@@ -2698,6 +5302,7 @@ impl Router {
         &self,
         side: RouterSideId,
         bytes: Arc<[u8]>,
+        relayed: bool,
     ) -> TelemetryResult<()> {
         let handler = {
             let st = self.state.lock();
@@ -2705,30 +5310,67 @@ impl Router {
             if !side_ref.opts.egress_enabled {
                 return Ok(());
             }
-            side_ref.tx_handler.clone()
+            (side_ref.tx_handler.clone(), side_ref.opts)
         };
+
+        let (handler, opts) = handler;
 
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
+        let ty = wire_format::peek_envelope(bytes.as_ref())
+            .map(|env| env.ty)
+            .unwrap_or(DataType::ReliableAck);
         let result = match handler {
-            RouterTxHandlerFn::Serialized(f) => self
-                .retry(MAX_HANDLER_RETRIES, || f(bytes.as_ref()))
-                .map_err(|_| TelemetryError::Io("reliable retransmit failed")),
+            RouterTxHandlerFn::Packed(f) => {
+                let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                let mut attempts_total = 0usize;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                        Ok((_, attempts)) => {
+                            attempts_total = attempts_total.saturating_add(attempts);
+                            sent_bytes = sent_bytes.saturating_add(frame.len());
+                        }
+                        Err((err, attempts)) => {
+                            self.note_side_tx_failure(
+                                side,
+                                ty,
+                                attempts_total.saturating_add(attempts),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                return Ok(());
+            }
             RouterTxHandlerFn::Packet(f) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
-                self.retry(MAX_HANDLER_RETRIES, || f(&pkt))
-                    .map_err(|_| TelemetryError::Io("reliable retransmit failed"))
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
             }
         };
-        if result.is_ok() {
-            self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
+        match result {
+            Ok((_, attempts)) => {
+                self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, bytes.len(), relayed, attempts);
+                Ok(())
+            }
+            Err((err, attempts)) => {
+                self.note_side_tx_failure(side, ty, attempts);
+                Err(err)
+            }
         }
-        result
     }
 
-    fn send_reliable_to_side(&self, side: RouterSideId, data: RouterItem) -> TelemetryResult<()> {
+    fn send_reliable_to_side(
+        &self,
+        side: RouterSideId,
+        data: RouterItem,
+        relayed: bool,
+    ) -> TelemetryResult<()> {
         let (handler, opts, hop_reliable_enabled) = {
             let st = self.state.lock();
             let side_ref = Self::side_ref(&st, side)?;
@@ -2739,29 +5381,30 @@ impl Router {
             (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
         };
 
-        let RouterTxHandlerFn::Serialized(f) = &handler else {
-            return self.call_side_tx_handler(side, &handler, &data);
+        let RouterTxHandlerFn::Packed(f) = &handler else {
+            return self.call_side_tx_handler(side, &handler, &data, relayed);
         };
 
         if !hop_reliable_enabled {
             let mut adjusted_opts = opts;
             adjusted_opts.reliable_enabled = false;
-            if let Some(adjusted) = self.adjust_reliable_for_side(adjusted_opts, data)? {
-                return self.call_side_tx_handler(side, &handler, &adjusted);
+            let preserve_end_to_end_ack = opts.reliable_enabled && self.cfg.reliable_enabled();
+            if let Some(adjusted) =
+                self.adjust_reliable_for_side(adjusted_opts, data, preserve_end_to_end_ack)?
+            {
+                return self.call_side_tx_handler(side, &handler, &adjusted, relayed);
             }
             return Ok(());
         }
 
         let ty = match &data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Serialized(bytes) => {
-                serialize::peek_frame_info(bytes.as_ref())?.envelope.ty
-            }
+            RouterItem::Packed(bytes) => wire_format::peek_frame_info(bytes.as_ref())?.envelope.ty,
         };
 
         if !is_reliable_type(ty) {
-            if let Some(adjusted) = self.adjust_reliable_for_side(opts, data)? {
-                self.call_side_tx_handler(side, &handler, &adjusted)?;
+            if let Some(adjusted) = self.adjust_reliable_for_side(opts, data, true)? {
+                self.call_side_tx_handler(side, &handler, &adjusted, relayed)?;
             }
             return Ok(());
         }
@@ -2778,36 +5421,107 @@ impl Router {
             let next = tx_state.next_seq.wrapping_add(1);
             tx_state.next_seq = if next == 0 { 1 } else { next };
             let flags = match reliable_mode(ty) {
-                crate::ReliableMode::Unordered => serialize::RELIABLE_FLAG_UNORDERED,
+                crate::ReliableMode::Unordered => wire_format::RELIABLE_FLAG_UNORDERED,
                 _ => 0,
             };
             (seq, flags)
         };
 
         let bytes: Arc<[u8]> = match data {
-            RouterItem::Packet(pkt) => serialize::serialize_packet_with_reliable(
+            RouterItem::Packet(pkt) => self.pack_packet_for_router(
                 &pkt,
-                serialize::ReliableHeader { flags, seq, ack: 0 },
-            ),
-            RouterItem::Serialized(bytes) => {
-                let mut v = bytes.to_vec();
-                if !serialize::rewrite_reliable_header(&mut v, flags, seq, 0)? {
-                    let Some(_side_tx_guard) = self.try_enter_side_tx() else {
-                        return Err(TelemetryError::Io("side tx busy"));
-                    };
-                    let started_ms = self.clock.now_ms();
-                    let result = self.retry(MAX_HANDLER_RETRIES, || f(bytes.as_ref()));
-                    if result.is_ok() {
+                Some(wire_format::ReliableHeader { flags, seq, ack: 0 }),
+            )?,
+            RouterItem::Packed(bytes) => {
+                #[cfg(feature = "cryptography")]
+                if self.e2e_seal_config_for_type(ty).is_some() {
+                    self.prepare_packed_for_remote(
+                        bytes,
+                        Some(Some(wire_format::ReliableHeader { flags, seq, ack: 0 })),
+                    )?
+                } else {
+                    let Some(rewritten) =
+                        wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
+                    else {
+                        let Some(_side_tx_guard) = self.try_enter_side_tx() else {
+                            return Err(TelemetryError::Io("side tx busy"));
+                        };
+                        let started_ms = self.clock.now_ms();
+                        let frames =
+                            self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                        let mut attempts_total = 0usize;
+                        let mut sent_bytes = 0usize;
+                        for frame in frames {
+                            match self
+                                .retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref()))
+                            {
+                                Ok((_, attempts)) => {
+                                    attempts_total = attempts_total.saturating_add(attempts);
+                                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                                }
+                                Err((err, attempts)) => {
+                                    self.note_side_tx_failure(
+                                        side,
+                                        ty,
+                                        attempts_total.saturating_add(attempts),
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                        }
                         self.record_side_tx_sample(
                             side,
-                            bytes.len(),
+                            sent_bytes,
                             started_ms,
                             self.clock.now_ms(),
                         );
-                    }
-                    return result;
+                        self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                        return Ok(());
+                    };
+                    rewritten
                 }
-                Arc::from(v)
+                #[cfg(not(feature = "cryptography"))]
+                {
+                    let Some(rewritten) =
+                        wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
+                    else {
+                        let Some(_side_tx_guard) = self.try_enter_side_tx() else {
+                            return Err(TelemetryError::Io("side tx busy"));
+                        };
+                        let started_ms = self.clock.now_ms();
+                        let frames =
+                            self.encode_side_transport_frames(side, opts, bytes.clone())?;
+                        let mut attempts_total = 0usize;
+                        let mut sent_bytes = 0usize;
+                        for frame in frames {
+                            match self
+                                .retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref()))
+                            {
+                                Ok((_, attempts)) => {
+                                    attempts_total = attempts_total.saturating_add(attempts);
+                                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                                }
+                                Err((err, attempts)) => {
+                                    self.note_side_tx_failure(
+                                        side,
+                                        ty,
+                                        attempts_total.saturating_add(attempts),
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        self.record_side_tx_sample(
+                            side,
+                            sent_bytes,
+                            started_ms,
+                            self.clock.now_ms(),
+                        );
+                        self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                        return Ok(());
+                    };
+                    rewritten
+                }
             }
         };
 
@@ -2815,11 +5529,23 @@ impl Router {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        let result = self.retry(MAX_HANDLER_RETRIES, || f(bytes.as_ref()));
-        if result.is_ok() {
-            self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
+        let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
+        let mut attempts_total = 0usize;
+        let mut sent_bytes = 0usize;
+        for frame in frames {
+            match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                Ok((_, attempts)) => {
+                    attempts_total = attempts_total.saturating_add(attempts);
+                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                }
+                Err((err, attempts)) => {
+                    self.note_side_tx_failure(side, ty, attempts_total.saturating_add(attempts));
+                    return Err(err);
+                }
+            }
         }
-        result?;
+        self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+        self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
 
         {
             let mut st = self.state.lock();
@@ -2840,66 +5566,709 @@ impl Router {
         Ok(())
     }
 
+    #[inline]
+    fn crc32_bytes(data: &[u8]) -> u32 {
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        for _ in 0..10 {
+            let byte = *buf.get(*off).ok_or(TelemetryError::Unpack("short read"))?;
+            *off += 1;
+            result |= u64::from(byte & 0x7F) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+        Err(TelemetryError::Unpack("uleb128 too long"))
+    }
+
+    fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn uleb128_len_local(mut value: u64) -> usize {
+        let mut len = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
+        let mut out = Vec::with_capacity(
+            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES,
+        );
+        out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
+        out.push(kind);
+        out.extend_from_slice(body);
+        let crc = Self::crc32_bytes(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        Arc::from(out)
+    }
+
+    fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
+        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES {
+            return Ok(None);
+        }
+        if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
+            return Ok(None);
+        }
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
+        let expected = u32::from_le_bytes([
+            bytes[data_len],
+            bytes[data_len + 1],
+            bytes[data_len + 2],
+            bytes[data_len + 3],
+        ]);
+        let data = &bytes[..data_len];
+        if Self::crc32_bytes(data) != expected {
+            return Err(TelemetryError::Unpack("side transport crc32 mismatch"));
+        }
+        let kind = data[SIDE_TRANSPORT_MAGIC.len()];
+        Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
+    }
+
+    fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
+        if bytes.len() < wire_format::CRC32_BYTES + 4 {
+            return Err(TelemetryError::Unpack("short buffer"));
+        }
+        let data_len = bytes.len() - wire_format::CRC32_BYTES;
+        let data = &bytes[..data_len];
+        let mut off = 0usize;
+        let flags = *data
+            .get(off)
+            .ok_or(TelemetryError::Unpack("short prelude"))?;
+        off += 1;
+        off += 1; // NEP
+        let ty_end_start = off;
+        let ty_u64 = Self::read_uleb128_local(data, &mut off)?;
+        let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
+        if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
+            return Err(TelemetryError::Unpack("bad data type"));
+        }
+        let ty = DataType(ty_u32);
+        let data_size_off = off;
+        let data_size = Self::read_uleb128_local(data, &mut off)?;
+        let _timestamp_off = off;
+        let timestamp = Self::read_uleb128_local(data, &mut off)?;
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            u16::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
+        } else {
+            0
+        };
+        let between_start = off;
+        let _source_address = u32::try_from(Self::read_uleb128_local(data, &mut off)?)
+            .map_err(|_| TelemetryError::Unpack("source address too large"))?;
+        let endpoint_bitmap_bytes = if (flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT) != 0 {
+            SIDE_TRANSPORT_EP_BITMAP_BYTES
+        } else {
+            0
+        };
+        if data.len() < off + endpoint_bitmap_bytes {
+            return Err(TelemetryError::Unpack("short buffer"));
+        }
+        off += endpoint_bitmap_bytes;
+        if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
+            let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
+            if data.len() < off + contract_len {
+                return Err(TelemetryError::Unpack("short buffer"));
+            }
+            off += contract_len;
+        }
+        let reliable_span = wire_format::reliable_header_span(bytes)?;
+        let (reliable_flags, reliable_seq_ack, reliable_compact, payload_off) =
+            if let Some((rel_off, rel_len, hdr)) = reliable_span {
+                if data.len() < rel_off + rel_len {
+                    return Err(TelemetryError::Unpack("short buffer"));
+                }
+                (
+                    Some(hdr.flags),
+                    Some((hdr.seq, hdr.ack)),
+                    (flags & SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER) != 0,
+                    rel_off + rel_len,
+                )
+            } else {
+                (None, None, false, off)
+            };
+        if payload_off > data.len() {
+            return Err(TelemetryError::Unpack("short buffer"));
+        }
+        let payload = &data[payload_off..];
+        let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
+        let between_end = reliable_span
+            .map(|(rel_off, _, _)| rel_off)
+            .unwrap_or(payload_off);
+        let between = Arc::<[u8]>::from(&data[between_start..between_end]);
+        let base_flags =
+            flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
+        let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
+        hash = hash_bytes_u64(hash, &[base_flags]);
+        hash = hash_bytes_u64(hash, &prefix);
+        hash = hash_bytes_u64(hash, &between);
+        if let Some(rel_flags) = reliable_flags {
+            hash = hash_bytes_u64(hash, &[rel_flags]);
+        }
+        let template = SideHeaderTemplate {
+            hash,
+            base_flags,
+            prefix,
+            between,
+            reliable_flags,
+            reliable_compact,
+        };
+        let _ = ty_end_start;
+        Ok((
+            template,
+            ty,
+            flags,
+            data_size,
+            timestamp,
+            nonce,
+            reliable_seq_ack,
+            payload,
+        ))
+    }
+
+    fn reconstruct_side_compact_frame(
+        template: &SideHeaderTemplate,
+        body: &[u8],
+        timestamp_mode: SideCompactTimestampMode,
+        timestamp_base: Option<u64>,
+    ) -> TelemetryResult<(Arc<[u8]>, u64)> {
+        if body.is_empty() {
+            return Err(TelemetryError::Unpack("short side compact frame"));
+        }
+        let mut off = 0usize;
+        let flags = body[off];
+        off += 1;
+        if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
+            != template.base_flags
+        {
+            return Err(TelemetryError::Unpack("side compact flags mismatch"));
+        }
+        let data_size = Self::read_uleb128_local(body, &mut off)?;
+        let timestamp = match timestamp_mode {
+            SideCompactTimestampMode::Absolute => Self::read_uleb128_local(body, &mut off)?,
+            SideCompactTimestampMode::Delta => {
+                let timestamp_field = Self::read_uleb128_local(body, &mut off)?;
+                let base = timestamp_base.ok_or(TelemetryError::Unpack(
+                    "missing side compact timestamp context",
+                ))?;
+                base.checked_add(timestamp_field)
+                    .ok_or(TelemetryError::Unpack(
+                        "side compact timestamp delta overflow",
+                    ))?
+            }
+            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(TelemetryError::Unpack(
+                "missing side compact timestamp context",
+            ))?,
+        };
+        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+            Some(Self::read_uleb128_local(body, &mut off)?)
+        } else {
+            None
+        };
+        let reliable_seq_ack = if template.reliable_flags.is_some() {
+            let seq = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("side compact reliable seq too large"))?;
+            let ack = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("side compact reliable ack too large"))?;
+            Some((seq, ack))
+        } else {
+            None
+        };
+        let payload = &body[off..];
+        let mut raw = Vec::with_capacity(
+            1 + template.prefix.len() + template.between.len() + payload.len() + 32,
+        );
+        raw.push(flags);
+        raw.extend_from_slice(&template.prefix);
+        Self::write_uleb128_local(data_size, &mut raw);
+        Self::write_uleb128_local(timestamp, &mut raw);
+        if let Some(nonce) = nonce {
+            Self::write_uleb128_local(nonce, &mut raw);
+        }
+        raw.extend_from_slice(&template.between);
+        if let Some(rel_flags) = template.reliable_flags {
+            let (seq, ack) =
+                reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
+            wire_format::write_reliable_header_encoded(
+                wire_format::ReliableHeader {
+                    flags: rel_flags,
+                    seq,
+                    ack,
+                },
+                template.reliable_compact,
+                &mut raw,
+            );
+        }
+        raw.extend_from_slice(payload);
+        let crc = Self::crc32_bytes(&raw);
+        raw.extend_from_slice(&crc.to_le_bytes());
+        Ok((Arc::from(raw), timestamp))
+    }
+    fn split_side_transport_frame(
+        &self,
+        side: RouterSideId,
+        frame: Arc<[u8]>,
+        max_frame_bytes: usize,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
+            return Err(TelemetryError::BadArg);
+        }
+        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
+        let mut st = self.state.lock();
+        let side_state = st
+            .side_transport
+            .get_mut(&side)
+            .ok_or(TelemetryError::BadArg)?;
+        let transfer_id = side_state.next_chunk_id.wrapping_add(1).max(1);
+        side_state.next_chunk_id = transfer_id;
+        drop(st);
+
+        let total = frame.len().div_ceil(payload_budget);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let mut frames = Vec::with_capacity(total);
+        for (idx, chunk) in frame.chunks(payload_budget).enumerate() {
+            let mut body = Vec::with_capacity(8 + chunk.len());
+            body.extend_from_slice(&transfer_id.to_le_bytes());
+            body.extend_from_slice(&(idx as u16).to_le_bytes());
+            body.extend_from_slice(&total_u16.to_le_bytes());
+            body.extend_from_slice(chunk);
+            frames.push(Self::wrap_side_transport_frame(
+                SIDE_TRANSPORT_KIND_CHUNK,
+                &body,
+            ));
+        }
+        Ok(frames)
+    }
+
+    fn encode_side_transport_frames(
+        &self,
+        side: RouterSideId,
+        opts: RouterSideOptions,
+        raw: Arc<[u8]>,
+    ) -> TelemetryResult<Vec<Arc<[u8]>>> {
+        if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
+            return Ok(vec![raw]);
+        }
+
+        let raw_len = raw.len();
+        let mut compact_payload_len = None;
+        let mut used_compact = false;
+        let mut used_timestamp_delta = false;
+        let mut omitted_timestamp = false;
+        let wrapped = if opts.header_template_enabled {
+            let (template, ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+                Self::extract_side_header_template(raw.as_ref())?;
+            let (template_id, use_compact, previous_timestamp) = {
+                let mut st = self.state.lock();
+                let side_state = st
+                    .side_transport
+                    .get_mut(&side)
+                    .ok_or(TelemetryError::BadArg)?;
+                if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
+                    let previous = side_state.tx_last_timestamps.get(&id).copied();
+                    (id, true, previous)
+                } else {
+                    let next = side_state.next_template_id.wrapping_add(1).max(1);
+                    side_state.next_template_id = next;
+                    let evicted = side_state.insert_tx_template(
+                        template.clone(),
+                        next,
+                        opts.max_side_transport_templates,
+                    );
+                    if evicted {
+                        st.side_runtime_stats
+                            .entry(side)
+                            .or_default()
+                            .note_side_transport_template_eviction();
+                    }
+                    if let Some(side_state) = st.side_transport.get_mut(&side) {
+                        side_state.tx_last_timestamps.insert(next, timestamp);
+                    }
+                    (next, false, None)
+                }
+            };
+            if use_compact {
+                used_compact = true;
+                compact_payload_len = Some(payload.len());
+                let timestamp_field = if let Some(previous) = previous_timestamp {
+                    let delta = timestamp.saturating_sub(previous);
+                    let omit_timestamp = opts.omit_unchanged_compact_timestamps
+                        || opts.compact_timestamp_omission_types.contains(ty);
+                    if omit_timestamp && timestamp == previous {
+                        omitted_timestamp = true;
+                        None
+                    } else if timestamp >= previous
+                        && Self::uleb128_len_local(delta) < Self::uleb128_len_local(timestamp)
+                    {
+                        used_timestamp_delta = true;
+                        Some(delta)
+                    } else {
+                        Some(timestamp)
+                    }
+                } else {
+                    Some(timestamp)
+                };
+                let mut body = Vec::with_capacity(payload.len() + 32);
+                body.push(flags);
+                Self::write_uleb128_local(u64::from(template_id), &mut body);
+                Self::write_uleb128_local(data_size, &mut body);
+                if let Some(timestamp_field) = timestamp_field {
+                    Self::write_uleb128_local(timestamp_field, &mut body);
+                }
+                if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+                    Self::write_uleb128_local(u64::from(nonce), &mut body);
+                }
+                if let Some((seq, ack)) = reliable_seq_ack {
+                    Self::write_uleb128_local(u64::from(seq), &mut body);
+                    Self::write_uleb128_local(u64::from(ack), &mut body);
+                }
+                body.extend_from_slice(payload);
+                {
+                    let mut st = self.state.lock();
+                    if let Some(side_state) = st.side_transport.get_mut(&side) {
+                        side_state.tx_last_timestamps.insert(template_id, timestamp);
+                    }
+                }
+                let kind = if omitted_timestamp {
+                    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+                } else if used_timestamp_delta {
+                    SIDE_TRANSPORT_KIND_COMPACT_DELTA
+                } else {
+                    SIDE_TRANSPORT_KIND_COMPACT
+                };
+                Self::wrap_side_transport_frame(kind, &body)
+            } else {
+                let mut body = Vec::with_capacity(raw.len() + 4);
+                Self::write_uleb128_local(u64::from(template_id), &mut body);
+                body.extend_from_slice(raw.as_ref());
+                Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
+            }
+        } else {
+            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref())
+        };
+
+        let frames = if opts.max_frame_bytes != 0 && wrapped.len() > opts.max_frame_bytes {
+            self.split_side_transport_frame(side, wrapped, opts.max_frame_bytes)
+        } else {
+            Ok(vec![wrapped])
+        }?;
+        let wire_len = frames.iter().map(|frame| frame.len()).sum::<usize>();
+        let mut st = self.state.lock();
+        let stats = st.side_runtime_stats.entry(side).or_default();
+        if used_compact {
+            let overhead = compact_payload_len
+                .map(|payload_len| wire_len.saturating_sub(payload_len))
+                .unwrap_or(wire_len);
+            stats.note_side_transport_compact(
+                raw_len,
+                wire_len,
+                overhead,
+                used_timestamp_delta,
+                omitted_timestamp,
+            );
+            if opts.compact_header_target_bytes != 0 && overhead > opts.compact_header_target_bytes
+            {
+                stats.note_side_transport_compact_target_miss();
+            }
+        } else {
+            stats.note_side_transport_full(raw_len, wire_len);
+        }
+        if frames.len() > 1 {
+            stats.note_side_transport_chunks(frames.len());
+        }
+        Ok(frames)
+    }
+
+    fn decode_side_transport_frame(
+        &self,
+        side: RouterSideId,
+        bytes: &[u8],
+    ) -> TelemetryResult<Option<Arc<[u8]>>> {
+        let Some((kind, body)) = Self::parse_side_transport_wrapper(bytes)? else {
+            return Ok(Some(Arc::from(bytes)));
+        };
+        match kind {
+            SIDE_TRANSPORT_KIND_FULL => {
+                let mut off = 0usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                let raw = Arc::<[u8]>::from(&body[off..]);
+                if let Ok((template, _, _, _, timestamp, _, _, _)) =
+                    Self::extract_side_header_template(raw.as_ref())
+                {
+                    let mut st = self.state.lock();
+                    let max_templates = st
+                        .sides
+                        .get(side)
+                        .and_then(|side| side.as_ref())
+                        .map(|side| side.opts.max_side_transport_templates)
+                        .unwrap_or(DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT);
+                    let evicted = st.side_transport.get_mut(&side).is_some_and(|side_state| {
+                        let evicted =
+                            side_state.insert_rx_template(template_id, template, max_templates);
+                        side_state.rx_last_timestamps.insert(template_id, timestamp);
+                        evicted
+                    });
+                    if evicted {
+                        st.side_runtime_stats
+                            .entry(side)
+                            .or_default()
+                            .note_side_transport_template_eviction();
+                    }
+                }
+                Ok(Some(raw))
+            }
+            SIDE_TRANSPORT_KIND_COMPACT
+            | SIDE_TRANSPORT_KIND_COMPACT_DELTA
+            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
+                if body.is_empty() {
+                    return Err(TelemetryError::Unpack("short side compact frame"));
+                }
+                let mut off = 1usize;
+                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
+                compact_body.push(body[0]);
+                compact_body.extend_from_slice(&body[off..]);
+                let (template, timestamp_base) = {
+                    let st = self.state.lock();
+                    let state = st.side_transport.get(&side);
+                    let template = state
+                        .and_then(|state| state.rx_templates_by_id.get(&template_id))
+                        .cloned();
+                    let timestamp_base = if matches!(
+                        kind,
+                        SIDE_TRANSPORT_KIND_COMPACT_DELTA
+                            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+                    ) {
+                        state
+                            .and_then(|state| state.rx_last_timestamps.get(&template_id))
+                            .copied()
+                    } else {
+                        None
+                    };
+                    (template, timestamp_base)
+                };
+                let template =
+                    template.ok_or(TelemetryError::Unpack("unknown side compact template"))?;
+                let timestamp_mode = match kind {
+                    SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
+                    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
+                    _ => SideCompactTimestampMode::Absolute,
+                };
+                let (frame, timestamp) = Self::reconstruct_side_compact_frame(
+                    &template,
+                    &compact_body,
+                    timestamp_mode,
+                    timestamp_base,
+                )?;
+                let mut st = self.state.lock();
+                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                    side_state.rx_last_timestamps.insert(template_id, timestamp);
+                }
+                Ok(Some(frame))
+            }
+            SIDE_TRANSPORT_KIND_CHUNK => {
+                if body.len() < 8 {
+                    return Err(TelemetryError::Unpack("short side chunk frame"));
+                }
+                let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let index = u16::from_le_bytes([body[4], body[5]]);
+                let total = u16::from_le_bytes([body[6], body[7]]);
+                let payload = Arc::<[u8]>::from(&body[8..]);
+                let assembled = {
+                    let mut st = self.state.lock();
+                    let side_state = st
+                        .side_transport
+                        .get_mut(&side)
+                        .ok_or(TelemetryError::BadArg)?;
+                    let entry = side_state.rx_chunks.entry(transfer_id).or_default();
+                    if entry.total == 0 {
+                        entry.total = total;
+                    } else if entry.total != total {
+                        side_state.rx_chunks.remove(&transfer_id);
+                        return Err(TelemetryError::Unpack("side chunk total mismatch"));
+                    }
+                    entry.received.entry(index).or_insert(payload);
+                    if entry.received.len() == usize::from(total) {
+                        let entry = side_state
+                            .rx_chunks
+                            .remove(&transfer_id)
+                            .ok_or(TelemetryError::Unpack("side chunk missing"))?;
+                        let mut out = Vec::new();
+                        for idx in 0..entry.total {
+                            let chunk = entry
+                                .received
+                                .get(&idx)
+                                .ok_or(TelemetryError::Unpack("side chunk gap"))?;
+                            out.extend_from_slice(chunk);
+                        }
+                        Some(Arc::<[u8]>::from(out))
+                    } else {
+                        None
+                    }
+                };
+                match assembled {
+                    Some(frame) => self.decode_side_transport_frame(side, frame.as_ref()),
+                    None => Ok(None),
+                }
+            }
+            _ => Err(TelemetryError::Unpack("unknown side transport frame")),
+        }
+    }
+
     fn call_side_tx_handler(
         &self,
         side: RouterSideId,
         handler: &RouterTxHandlerFn,
         data: &RouterItem,
+        relayed: bool,
     ) -> TelemetryResult<()> {
+        let opts = {
+            let st = self.state.lock();
+            Self::side_ref(&st, side)?.opts
+        };
         let Some(_side_tx_guard) = self.try_enter_side_tx() else {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        let result = self.retry(MAX_HANDLER_RETRIES, || match (handler, data) {
-            (RouterTxHandlerFn::Serialized(f), RouterItem::Serialized(bytes)) => f(bytes.as_ref()),
-            (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => f(pkt),
-            (RouterTxHandlerFn::Serialized(f), RouterItem::Packet(pkt)) => {
-                let owned = serialize::serialize_packet(pkt);
-                f(owned.as_ref())
+        let ty = match data {
+            RouterItem::Packet(pkt) => pkt.data_type(),
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
+        };
+        let result = match (handler, data) {
+            (RouterTxHandlerFn::Packed(f), RouterItem::Packed(bytes)) => {
+                #[cfg(feature = "cryptography")]
+                let send_bytes = self.prepare_packed_for_remote(bytes.clone(), None)?;
+                #[cfg(not(feature = "cryptography"))]
+                let send_bytes = bytes.clone();
+                let frames = self.encode_side_transport_frames(side, opts, send_bytes)?;
+                let mut attempts_total = 0usize;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                        Ok((_, attempts)) => {
+                            attempts_total = attempts_total.saturating_add(attempts);
+                            sent_bytes = sent_bytes.saturating_add(frame.len());
+                        }
+                        Err((err, attempts)) => {
+                            self.note_side_tx_failure(
+                                side,
+                                ty,
+                                attempts_total.saturating_add(attempts),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                return Ok(());
             }
-            (RouterTxHandlerFn::Packet(f), RouterItem::Serialized(bytes)) => {
-                let pkt = serialize::deserialize_packet(bytes.as_ref())?;
-                f(&pkt)
+            (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => {
+                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(pkt))
             }
-        });
-        if result.is_ok()
-            && let Ok(bytes) = Self::router_item_wire_len(data)
-        {
-            self.record_side_tx_sample(side, bytes, started_ms, self.clock.now_ms());
+            (RouterTxHandlerFn::Packed(f), RouterItem::Packet(pkt)) => {
+                let owned = self.pack_packet_for_router(pkt, None)?;
+                let frames = self.encode_side_transport_frames(side, opts, owned)?;
+                let mut attempts_total = 0usize;
+                let mut sent_bytes = 0usize;
+                for frame in frames {
+                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                        Ok((_, attempts)) => {
+                            attempts_total = attempts_total.saturating_add(attempts);
+                            sent_bytes = sent_bytes.saturating_add(frame.len());
+                        }
+                        Err((err, attempts)) => {
+                            self.note_side_tx_failure(
+                                side,
+                                ty,
+                                attempts_total.saturating_add(attempts),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
+                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                return Ok(());
+            }
+            (RouterTxHandlerFn::Packet(f), RouterItem::Packed(bytes)) => {
+                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
+            }
+        };
+        match result {
+            Ok((_, attempts)) => {
+                if let Ok(bytes) = Self::router_item_wire_len(data) {
+                    self.record_side_tx_sample(side, bytes, started_ms, self.clock.now_ms());
+                    self.note_side_tx_success(side, ty, bytes, relayed, attempts);
+                }
+                Ok(())
+            }
+            Err((err, attempts)) => {
+                self.note_side_tx_failure(side, ty, attempts);
+                Err(err)
+            }
         }
-        result
     }
 
     fn adjust_reliable_for_side(
         &self,
         opts: RouterSideOptions,
         data: RouterItem,
+        preserve_end_to_end_ack: bool,
     ) -> TelemetryResult<Option<RouterItem>> {
         if opts.reliable_enabled {
             return Ok(Some(data));
         }
 
         match data {
-            RouterItem::Serialized(bytes) => {
-                let frame = serialize::peek_frame_info(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let frame = wire_format::peek_frame_info(bytes.as_ref())?;
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
-                    if (hdr.flags & serialize::RELIABLE_FLAG_ACK_ONLY) != 0 {
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) != 0 {
                         return Ok(None);
                     }
-                    if (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) == 0 {
-                        let mut v = bytes.to_vec();
-                        let _ = serialize::rewrite_reliable_header(
-                            &mut v,
-                            serialize::RELIABLE_FLAG_UNSEQUENCED,
+                    if (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) == 0 {
+                        let Some(rewritten) = wire_format::rewrite_reliable_header_owned(
+                            bytes.as_ref(),
+                            wire_format::RELIABLE_FLAG_UNSEQUENCED,
                             hdr.seq,
                             0,
-                        )?;
-                        return Ok(Some(RouterItem::Serialized(Arc::from(v))));
+                        )?
+                        else {
+                            return Ok(Some(RouterItem::Packed(bytes)));
+                        };
+                        return Ok(Some(RouterItem::Packed(rewritten)));
                     }
                 }
-                Ok(Some(RouterItem::Serialized(bytes)))
+                Ok(Some(RouterItem::Packed(bytes)))
             }
             RouterItem::Packet(pkt) => {
                 if matches!(
@@ -2908,6 +6277,12 @@ impl Router {
                         | DataType::ReliablePartialAck
                         | DataType::ReliablePacketRequest
                 ) {
+                    if preserve_end_to_end_ack
+                        && pkt.data_type() == DataType::ReliableAck
+                        && Self::is_end_to_end_ack_sender(pkt.sender())
+                    {
+                        return Ok(Some(RouterItem::Packet(pkt)));
+                    }
                     return Ok(None);
                 }
                 Ok(Some(RouterItem::Packet(pkt)))
@@ -2952,7 +6327,7 @@ impl Router {
         }
 
         for (side, ty, seq) in requeue {
-            self.queue_reliable_retransmit(side, ty, seq)?;
+            self.queue_reliable_retransmit(side, ty, seq, true)?;
         }
 
         Ok(())
@@ -3370,9 +6745,18 @@ impl Router {
     }
 
     #[cfg(feature = "timesync")]
-    fn queue_internal_timesync_request(&self, seq: u64, t1_mono_ms: u64) -> TelemetryResult<()> {
+    fn queue_internal_timesync_request(
+        &self,
+        seq: u64,
+        t1_mono_ms: u64,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
         let pkt_ts = self.packet_timestamp_ms();
-        self.log_queue_ts(DataType::TimeSyncRequest, pkt_ts, &[seq, t1_mono_ms])
+        if called_from_queue {
+            self.log_queue_ts(DataType::TimeSyncRequest, pkt_ts, &[seq, t1_mono_ms])
+        } else {
+            self.log_ts(DataType::TimeSyncRequest, pkt_ts, &[seq, t1_mono_ms])
+        }
     }
 
     #[cfg(feature = "timesync")]
@@ -3383,27 +6767,33 @@ impl Router {
         t2_network_ms: u64,
         t3_network_ms: u64,
         dst: Option<RouterSideId>,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let pkt_ts = self.packet_timestamp_ms();
         let payload = encode_slice_le(&[seq, t1_mono_ms, t2_network_ms, t3_network_ms]);
+        let sender = self.sender_arc();
         let pkt = Packet::new(
             DataType::TimeSyncResponse,
             &[DataEndpoint::TimeSync],
-            self.sender,
+            sender.as_ref(),
             pkt_ts,
             payload,
         )?;
         match dst {
-            Some(dst) => self.tx_queue_item_with_flags(
+            Some(dst) => self.emit_internal_tx(
                 RouterTxItem::ToSide {
                     src: None,
                     dst,
                     data: RouterItem::Packet(pkt),
                 },
                 true,
+                called_from_queue,
             ),
-            None => self
-                .tx_queue_item_with_flags(RouterTxItem::Broadcast(RouterItem::Packet(pkt)), true),
+            None => self.emit_internal_tx(
+                RouterTxItem::Broadcast(RouterItem::Packet(pkt)),
+                true,
+                called_from_queue,
+            ),
         }
     }
 
@@ -3478,7 +6868,7 @@ impl Router {
             queued_any = true;
         }
         if let Some((seq, t1_mono_ms)) = request {
-            self.queue_internal_timesync_request(seq, t1_mono_ms)?;
+            self.queue_internal_timesync_request(seq, t1_mono_ms, true)?;
             queued_any = true;
         }
 
@@ -3614,7 +7004,7 @@ impl Router {
         }
 
         if let Some((seq, t1, t2, t3, dst)) = response {
-            self.queue_internal_timesync_response(seq, t1, t2, t3, dst)?;
+            self.queue_internal_timesync_response(seq, t1, t2, t3, dst, called_from_queue)?;
         }
         if poll_after {
             let _ = self.poll_timesync()?;
@@ -3637,8 +7027,31 @@ impl Router {
     pub fn new_with_clock(cfg: RouterConfig, clock: Box<dyn Clock + Send + Sync>) -> Self {
         #[cfg(feature = "timesync")]
         let timesync_cfg = cfg.timesync_config();
+        let hostname: Arc<str> = Arc::from(cfg.sender());
+        let address_mode = cfg.address_mode();
+        let instance_seq = u64::from(ROUTER_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed));
+        let owner_hash = Self::sender_hash(hostname.as_ref()) ^ instance_seq;
+        let fallback = Self::fallback_address_for_hostname(hostname.as_ref());
+        let requested = address_mode.requested_address();
+        let address = if requested == 0 { fallback } else { requested };
+        let local_address = AddressBookEntry {
+            hostname: hostname.clone(),
+            address,
+            requested_address: requested,
+            mode: address_mode,
+            birth_ms: clock
+                .now_ms()
+                .saturating_mul(1_000_000)
+                .saturating_add(instance_seq),
+            owner_hash,
+            last_seen_ms: clock.now_ms(),
+        };
+        let mut address_book = BTreeMap::new();
+        address_book.insert(hostname.to_string(), local_address.clone());
+        let mut address_by_value = BTreeMap::new();
+        address_by_value.insert(address, hostname.to_string());
         Self {
-            sender: Box::leak(cfg.sender().to_string().into_boxed_str()),
+            sender: RouterMutex::new(hostname),
             cfg,
             state: RouterMutex::new(RouterInner {
                 sides: Vec::new(),
@@ -3649,6 +7062,19 @@ impl Router {
                 source_route_modes: BTreeMap::new(),
                 route_selection_cursors: BTreeMap::new(),
                 adaptive_route_stats: BTreeMap::new(),
+                side_runtime_stats: BTreeMap::new(),
+                side_transport: BTreeMap::new(),
+                managed_variable_types: BTreeSet::new(),
+                managed_variable_permissions: BTreeMap::new(),
+                managed_variable_latest: BTreeMap::new(),
+                network_variable_update_handlers: BTreeMap::new(),
+                local_address,
+                address_book,
+                address_by_value,
+                p2p_port_handlers: BTreeMap::new(),
+                p2p_stream_handlers: BTreeMap::new(),
+                p2p_stream_sessions: BTreeMap::new(),
+                next_p2p_stream_id: 1,
                 received_queue: BoundedDeque::new(
                     MAX_QUEUE_BUDGET,
                     STARTING_QUEUE_SIZE,
@@ -3670,10 +7096,16 @@ impl Router {
                 reliable_return_route_order: VecDeque::new(),
                 end_to_end_reliable_tx: BTreeMap::new(),
                 end_to_end_reliable_tx_order: VecDeque::new(),
+                total_handler_failures: 0,
+                total_handler_retries: 0,
                 #[cfg(feature = "discovery")]
                 discovery_routes: BTreeMap::new(),
                 #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
+                #[cfg(feature = "discovery")]
+                discovery_side_throttle: BTreeMap::new(),
+                #[cfg(all(feature = "discovery", feature = "timesync"))]
+                timesync_side_throttle: BTreeMap::new(),
             }),
             isr_rx_queue: IsrRxQueue::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
             side_tx_gate: ReentryGate::new(),
@@ -3683,22 +7115,317 @@ impl Router {
         }
     }
 
-    /// Register a side whose TX callback consumes serialized packet bytes.
+    #[inline]
+    fn sender_arc(&self) -> Arc<str> {
+        self.sender.lock().clone()
+    }
+
+    #[inline]
+    pub fn sender(&self) -> Arc<str> {
+        self.sender_arc()
+    }
+
+    pub fn current_address(&self) -> NodeAddress {
+        self.state.lock().local_address.address
+    }
+
+    pub fn hostname(&self) -> Arc<str> {
+        self.sender_arc()
+    }
+
+    pub fn address_book(&self) -> Vec<AddressBookEntry> {
+        self.state.lock().address_book.values().cloned().collect()
+    }
+
+    pub fn resolve_hostname(&self, hostname: &str) -> Option<AddressBookEntry> {
+        self.state.lock().address_book.get(hostname).cloned()
+    }
+
+    pub fn resolve_address(&self, address: NodeAddress) -> Option<AddressBookEntry> {
+        let st = self.state.lock();
+        st.address_by_value
+            .get(&address)
+            .and_then(|hostname| st.address_book.get(hostname))
+            .cloned()
+    }
+
+    pub fn bind_p2p_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>
+    where
+        F: Fn(P2pMessage<'_>) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        if port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let mut st = self.state.lock();
+        st.p2p_port_handlers
+            .entry(port)
+            .or_default()
+            .push(P2pPortHandler {
+                handler: Arc::new(f),
+            });
+        Ok(())
+    }
+
+    pub fn clear_p2p_port(&self, port: P2pPort) {
+        self.state.lock().p2p_port_handlers.remove(&port);
+    }
+
+    pub fn bind_p2p_stream_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>
+    where
+        F: Fn(P2pStreamEvent<'_>) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        if port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let mut st = self.state.lock();
+        st.p2p_stream_handlers
+            .entry(port)
+            .or_default()
+            .push(P2pStreamHandler {
+                handler: Arc::new(f),
+            });
+        Ok(())
+    }
+
+    pub fn clear_p2p_stream_port(&self, port: P2pPort) {
+        self.state.lock().p2p_stream_handlers.remove(&port);
+    }
+
+    fn send_p2p_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        if dst_port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let local = self.state.lock().local_address.clone();
+        let payload = Self::encode_p2p_payload(
+            local.hostname.as_ref(),
+            local.address,
+            src_port,
+            dst_port,
+            payload,
+        )?;
+        let pkt = Packet::new(
+            DataType::P2pMessage,
+            &[DataEndpoint::Discovery],
+            local.hostname.as_ref(),
+            self.packet_timestamp_ms(),
+            payload,
+        )?;
+        let target = Self::sender_hash(dst.hostname.as_ref());
+        let item = self.attach_wire_contract_to_item(RouterItem::Packet(pkt.clone()), &[target])?;
+        if target == Self::sender_hash(self.sender_arc().as_ref()) {
+            self.dispatch_p2p_packet(&pkt)?;
+            return Ok(());
+        }
+        self.tx_item_impl(RouterTxItem::Broadcast(item), true, false)
+    }
+
+    pub fn send_p2p_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        let dst = self
+            .resolve_hostname(hostname)
+            .ok_or(TelemetryError::BadArg)?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, payload)
+    }
+
+    pub fn send_p2p_to_address(
+        &self,
+        address: NodeAddress,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        let dst = self
+            .resolve_address(address)
+            .ok_or(TelemetryError::BadArg)?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, payload)
+    }
+
+    fn open_p2p_stream_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+    ) -> TelemetryResult<P2pStreamId> {
+        if dst_port == 0 || src_port == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        let stream_id = {
+            let mut st = self.state.lock();
+            let stream_id = Self::allocate_p2p_stream_id_locked(&mut st);
+            if stream_id == 0 {
+                return Err(TelemetryError::Io("p2p stream id exhausted"));
+            }
+            st.p2p_stream_sessions.insert(
+                stream_id,
+                P2pStreamSession {
+                    peer_hostname: dst.hostname.clone(),
+                    peer_address: dst.address,
+                    local_port: src_port,
+                    peer_port: dst_port,
+                    peer_stream_id: 0,
+                    next_sequence: 1,
+                    connected: false,
+                },
+            );
+            stream_id
+        };
+        let payload = Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+        Ok(stream_id)
+    }
+
+    pub fn open_p2p_stream_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+    ) -> TelemetryResult<P2pStreamId> {
+        let dst = self
+            .resolve_hostname(hostname)
+            .ok_or(TelemetryError::BadArg)?;
+        self.open_p2p_stream_to_entry(dst, dst_port, src_port)
+    }
+
+    pub fn open_p2p_stream_to_address(
+        &self,
+        address: NodeAddress,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+    ) -> TelemetryResult<P2pStreamId> {
+        let dst = self
+            .resolve_address(address)
+            .ok_or(TelemetryError::BadArg)?;
+        self.open_p2p_stream_to_entry(dst, dst_port, src_port)
+    }
+
+    fn send_p2p_stream_control(
+        &self,
+        stream_id: P2pStreamId,
+        flags: u8,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        let (dst, dst_port, src_port, peer_stream_id, seq, refresh_syn) = {
+            let mut st = self.state.lock();
+            let Some(session) = st.p2p_stream_sessions.get_mut(&stream_id) else {
+                return Err(TelemetryError::BadArg);
+            };
+            let peer_hostname = session.peer_hostname.clone();
+            let peer_address = session.peer_address;
+            let peer_port = session.peer_port;
+            let local_port = session.local_port;
+            let peer_stream_id = session.peer_stream_id;
+            let refresh_syn = peer_stream_id == 0 && flags & P2P_STREAM_SYN == 0;
+            let seq = session.next_sequence;
+            session.next_sequence = session.next_sequence.wrapping_add(1).max(1);
+            let dst = st
+                .address_book
+                .get(peer_hostname.as_ref())
+                .cloned()
+                .unwrap_or(AddressBookEntry {
+                    hostname: peer_hostname.clone(),
+                    address: peer_address,
+                    requested_address: peer_address,
+                    mode: AddressAssignmentMode::Dynamic,
+                    birth_ms: self.clock.now_ms(),
+                    owner_hash: Self::sender_hash(peer_hostname.as_ref()),
+                    last_seen_ms: self.clock.now_ms(),
+                });
+            (dst, peer_port, local_port, peer_stream_id, seq, refresh_syn)
+        };
+        if refresh_syn {
+            let syn_payload =
+                Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
+            self.send_p2p_to_entry(dst.clone(), dst_port, src_port, &syn_payload)?;
+        }
+        let stream_payload =
+            Self::encode_p2p_stream_payload(flags, stream_id, peer_stream_id, seq, payload)?;
+        self.send_p2p_to_entry(dst, dst_port, src_port, &stream_payload)?;
+        if flags & (P2P_STREAM_FIN | P2P_STREAM_RST) != 0 {
+            self.state.lock().p2p_stream_sessions.remove(&stream_id);
+        }
+        Ok(())
+    }
+
+    pub fn send_p2p_stream(&self, stream_id: P2pStreamId, payload: &[u8]) -> TelemetryResult<()> {
+        self.send_p2p_stream_control(stream_id, P2P_STREAM_DATA, payload)
+    }
+
+    pub fn close_p2p_stream(&self, stream_id: P2pStreamId) -> TelemetryResult<()> {
+        self.send_p2p_stream_control(stream_id, P2P_STREAM_FIN, &[])
+    }
+
+    pub fn reset_p2p_stream(&self, stream_id: P2pStreamId) -> TelemetryResult<()> {
+        self.send_p2p_stream_control(stream_id, P2P_STREAM_RST, &[])
+    }
+
+    pub fn set_sender<S: AsRef<str>>(&self, sender: S) {
+        let hostname: Arc<str> = Arc::from(sender.as_ref());
+        *self.sender.lock() = hostname.clone();
+        let mut st = self.state.lock();
+        let mut local = st.local_address.clone();
+        st.address_book.remove(local.hostname.as_ref());
+        st.address_by_value.remove(&local.address);
+        local.hostname = hostname.clone();
+        local.owner_hash = Self::sender_hash(hostname.as_ref());
+        if matches!(local.mode, AddressAssignmentMode::Dynamic) {
+            local.address = Self::fallback_address_for_hostname(hostname.as_ref());
+            local.requested_address = 0;
+        }
+        local.last_seen_ms = self.clock.now_ms();
+        st.address_by_value
+            .insert(local.address, hostname.to_string());
+        st.address_book.insert(hostname.to_string(), local.clone());
+        st.local_address = local;
+        #[cfg(feature = "discovery")]
+        Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+    }
+
+    /// Register a side whose TX callback consumes packed packet bytes.
     ///
     /// `name` is exported in topology/debug views and does not affect routing semantics.
     /// `tx` is called whenever the router decides to send a packet toward this side.
     ///
     /// The default options disable the router's per-link reliable framing on this side. Use
-    /// [`Router::add_side_serialized_with_options`] when this hop should participate in router
+    /// [`Router::add_side_packed_with_options`] when this hop should participate in router
     /// reliable ACK/retransmit behavior.
-    pub fn add_side_serialized<F>(&self, name: &'static str, tx: F) -> RouterSideId
+    pub fn add_side_packed<F>(&self, name: &'static str, tx: F) -> RouterSideId
     where
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
-        self.add_side_serialized_with_options(name, tx, RouterSideOptions::default())
+        self.add_side_packed_with_options(name, tx, RouterSideOptions::default())
     }
 
-    /// Register a serialized-output side with explicit side options.
+    /// Register a packed side with the compact small-packet transport preset enabled.
+    ///
+    /// `max_frame_bytes == 0` keeps header-template reuse enabled without chunking.
+    pub fn add_side_packed_small_packets<F>(
+        &self,
+        name: &'static str,
+        tx: F,
+        max_frame_bytes: usize,
+    ) -> RouterSideId
+    where
+        F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        self.add_side_packed_with_options(
+            name,
+            tx,
+            RouterSideOptions::default().with_small_packet_transport(max_frame_bytes),
+        )
+    }
+
+    /// Register a packed-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` enables the router's per-hop reliable framing on this side only.
     /// That means reliable schema traffic on this side uses router-managed ACKs, packet requests,
@@ -3706,7 +7433,7 @@ impl Router {
     ///
     /// `opts.link_local_enabled` allows link-local-only endpoints and discovery routes to use this
     /// side. `ingress_enabled` and `egress_enabled` set the initial directional policy.
-    pub fn add_side_serialized_with_options<F>(
+    pub fn add_side_packed_with_options<F>(
         &self,
         name: &'static str,
         tx: F,
@@ -3719,9 +7446,12 @@ impl Router {
         let id = st.sides.len();
         st.sides.push(Some(RouterSide {
             name,
-            tx_handler: RouterTxHandlerFn::Serialized(Arc::new(tx)),
+            tx_handler: RouterTxHandlerFn::Packed(Arc::new(tx)),
             opts,
         }));
+        st.side_runtime_stats
+            .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -3729,8 +7459,8 @@ impl Router {
 
     /// Register a side whose TX callback receives decoded [`Packet`] values.
     ///
-    /// Packet-output sides do not preserve the serialized reliable hop framing, so
-    /// `RouterSideOptions::reliable_enabled` only has effect for serialized sides.
+    /// Packet-output sides do not preserve the packed reliable hop framing, so
+    /// `RouterSideOptions::reliable_enabled` only has effect for packed sides.
     pub fn add_side_packet<F>(&self, name: &'static str, tx: F) -> RouterSideId
     where
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
@@ -3741,8 +7471,8 @@ impl Router {
     /// Register a packet-output side with explicit side options.
     ///
     /// `opts.reliable_enabled` still records the operator's intent for this side, but packet-based
-    /// callbacks receive decoded packets rather than the router's serialized reliable hop framing.
-    /// For router-managed per-link reliable sequencing and ACKs, use a serialized side instead.
+    /// callbacks receive decoded packets rather than the router's packed reliable hop framing.
+    /// For router-managed per-link reliable sequencing and ACKs, use a packed side instead.
     pub fn add_side_packet_with_options<F>(
         &self,
         name: &'static str,
@@ -3759,6 +7489,9 @@ impl Router {
             tx_handler: RouterTxHandlerFn::Packet(Arc::new(tx)),
             opts,
         }));
+        st.side_runtime_stats
+            .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         id
@@ -3788,6 +7521,12 @@ impl Router {
             st.source_route_modes.remove(&Some(side));
             st.route_selection_cursors.remove(&Some(side));
             st.adaptive_route_stats.remove(&side);
+            #[cfg(feature = "discovery")]
+            st.discovery_side_throttle.remove(&side);
+            #[cfg(all(feature = "discovery", feature = "timesync"))]
+            st.timesync_side_throttle.remove(&side);
+            st.side_runtime_stats.remove(&side);
+            st.side_transport.remove(&side);
             st.reliable_return_routes
                 .retain(|_, route| route.side != side);
             st.transmit_queue.retain(
@@ -4014,7 +7753,7 @@ impl Router {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.typed_route_overrides
-            .insert((src, ty as u32, dst), enabled);
+            .insert((src, ty.as_u32(), dst), enabled);
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
@@ -4033,7 +7772,7 @@ impl Router {
         if let Some(src) = src {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
-        st.typed_route_overrides.remove(&(src, ty as u32, dst));
+        st.typed_route_overrides.remove(&(src, ty.as_u32(), dst));
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
@@ -4059,10 +7798,198 @@ impl Router {
         self.queue_discovery_announce()
     }
 
+    /// Broadcast that this router is leaving so peers can prune topology immediately.
+    #[cfg(feature = "discovery")]
+    pub fn announce_leave(&self) -> TelemetryResult<()> {
+        let sender = self.sender_arc();
+        let pkt = discovery::build_discovery_leave(sender.as_ref(), self.clock.now_ms())?;
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
     /// Queue a discovery advertisement if the adaptive cadence says one is due.
     #[cfg(feature = "discovery")]
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
         self.poll_discovery_announce()
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn request_topology(&self) -> TelemetryResult<()> {
+        let sender = self.sender_arc();
+        let pkt =
+            discovery::build_discovery_topology_request(sender.as_ref(), self.clock.now_ms())?;
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn request_schema(&self) -> TelemetryResult<()> {
+        let sender = self.sender_arc();
+        let pkt = discovery::build_discovery_schema_request(sender.as_ref(), self.clock.now_ms())?;
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    /// Mark a data type as a network-managed variable.
+    ///
+    /// The router caches the latest packet for this type when it is locally transmitted or
+    /// received from the network. Peers can request the latest cached value and the router will
+    /// replay the original value packet, so user endpoint handlers see the same API shape as a
+    /// normal update.
+    pub fn enable_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
+        self.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+    }
+
+    /// Mark a data type as a network variable with local read/write permissions.
+    ///
+    /// Users do not register a separate endpoint for network variables. Values are cached by
+    /// data type and refreshed through SEDSnet's internal managed-variable control packets.
+    pub fn enable_network_variable(
+        &self,
+        ty: DataType,
+        permissions: NetworkVariablePermissions,
+    ) -> TelemetryResult<()> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        let mut st = self.state.lock();
+        st.managed_variable_types.insert(ty.as_u32());
+        st.managed_variable_permissions
+            .insert(ty.as_u32(), permissions);
+        Ok(())
+    }
+
+    /// Register a callback that runs when an inbound network update changes this variable cache.
+    ///
+    /// The callback is invoked after the router state lock is released, so it may call back into
+    /// the router. Local `set_network_variable` and `seed_managed_variable` calls update the cache
+    /// without invoking this network-update callback.
+    pub fn on_network_variable_update<F>(&self, ty: DataType, f: F) -> TelemetryResult<()>
+    where
+        F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        let mut st = self.state.lock();
+        st.managed_variable_types.insert(ty.as_u32());
+        st.network_variable_update_handlers
+            .entry(ty.as_u32())
+            .or_default()
+            .push(NetworkVariableUpdateHandler {
+                handler: Arc::new(f),
+            });
+        Ok(())
+    }
+
+    pub fn disable_managed_variable(&self, ty: DataType) {
+        let mut st = self.state.lock();
+        st.managed_variable_types.remove(&ty.as_u32());
+        st.managed_variable_permissions.remove(&ty.as_u32());
+        st.managed_variable_latest.remove(&ty.as_u32());
+        st.network_variable_update_handlers.remove(&ty.as_u32());
+    }
+
+    pub fn seed_managed_variable(&self, pkt: Packet) -> TelemetryResult<()> {
+        if is_internal_control_type(pkt.data_type()) {
+            return Err(TelemetryError::InvalidType);
+        }
+        pkt.validate()?;
+        {
+            let mut st = self.state.lock();
+            st.managed_variable_types.insert(pkt.data_type().as_u32());
+        }
+        self.cache_managed_variable_packet(&pkt, false)
+    }
+
+    pub fn cached_managed_variable(&self, ty: DataType) -> Option<Packet> {
+        self.managed_variable_latest(ty)
+    }
+
+    /// Set a network variable for the whole network, permission policy allowing.
+    ///
+    /// The packet is cached locally and sent as normal user data. Routers that have seen or enabled
+    /// this variable update their local cache internally; applications do not need to register a
+    /// managed-variable endpoint.
+    pub fn set_network_variable(&self, pkt: Packet) -> TelemetryResult<()> {
+        if is_internal_control_type(pkt.data_type()) {
+            return Err(TelemetryError::InvalidType);
+        }
+        pkt.validate()?;
+        let ty = pkt.data_type();
+        {
+            let mut st = self.state.lock();
+            st.managed_variable_types.insert(ty.as_u32());
+            let perms = Self::managed_variable_permissions_locked(&st, ty);
+            if !perms.write {
+                return Err(TelemetryError::PermissionDenied);
+            }
+        }
+        self.cache_managed_variable_packet(&pkt, false)?;
+        self.tx(pkt)
+    }
+
+    /// Read a cached network variable, requesting a refresh if missing or stale.
+    ///
+    /// Returns the cached value when present. If the value is missing, this queues an internal
+    /// managed-variable request and returns `Ok(None)`. If the value is stale, this queues a refresh
+    /// request and returns the stale cached value so callers can continue operating while the network
+    /// catches up.
+    #[cfg(feature = "discovery")]
+    pub fn get_network_variable(
+        &self,
+        ty: DataType,
+        stale_after_ms: Option<u64>,
+    ) -> TelemetryResult<Option<Packet>> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        {
+            let mut st = self.state.lock();
+            st.managed_variable_types.insert(ty.as_u32());
+            let perms = Self::managed_variable_permissions_locked(&st, ty);
+            if !perms.read {
+                return Err(TelemetryError::PermissionDenied);
+            }
+        }
+        let cached = self.managed_variable_latest_with_age(ty);
+        let needs_refresh = match (cached.as_ref(), stale_after_ms) {
+            (None, _) => true,
+            (Some((_pkt, age_ms)), Some(max_age_ms)) => *age_ms > max_age_ms,
+            (Some(_), None) => false,
+        };
+        if needs_refresh {
+            self.request_managed_variable(ty)?;
+        }
+        Ok(cached.map(|(pkt, _age_ms)| pkt))
+    }
+
+    /// Read a cached network variable without issuing a network refresh.
+    pub fn get_cached_network_variable(&self, ty: DataType) -> TelemetryResult<Option<Packet>> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        if !self.can_read_managed_variable(ty) {
+            return Err(TelemetryError::PermissionDenied);
+        }
+        Ok(self.managed_variable_latest(ty))
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn request_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
+        if is_internal_control_type(ty) {
+            return Err(TelemetryError::InvalidType);
+        }
+        if !self.can_read_managed_variable(ty) {
+            return Err(TelemetryError::PermissionDenied);
+        }
+        let sender = self.sender_arc();
+        let pkt =
+            discovery::build_managed_variable_request(sender.as_ref(), self.clock.now_ms(), ty)?;
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn request_managed_variable_by_name(&self, ty_name: &str) -> TelemetryResult<()> {
+        let ty = DataType::try_named(ty_name).ok_or(TelemetryError::InvalidType)?;
+        self.request_managed_variable(ty)
     }
 
     /// Export the current discovery-driven network topology view.
@@ -4083,7 +8010,12 @@ impl Router {
                     .iter()
                     .map(|(sender_id, sender_state)| TopologyAnnouncerRoute {
                         sender_id: sender_id.clone(),
-                        reachable_endpoints: sender_state.reachable.clone(),
+                        reachable_endpoints: sender_state
+                            .reachable
+                            .iter()
+                            .copied()
+                            .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                            .collect(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
                         routers: sender_state.topology_boards.clone(),
                         last_seen_ms: sender_state.last_seen_ms,
@@ -4093,7 +8025,12 @@ impl Router {
                 Some(TopologySideRoute {
                     side_id,
                     side_name: side.name,
-                    reachable_endpoints: route.reachable.clone(),
+                    reachable_endpoints: route
+                        .reachable
+                        .iter()
+                        .copied()
+                        .filter(|ep| !discovery::is_router_control_endpoint(*ep))
+                        .collect(),
                     reachable_timesync_sources: route.reachable_timesync_sources.clone(),
                     announcers,
                     last_seen_ms: route.last_seen_ms,
@@ -4106,14 +8043,362 @@ impl Router {
             self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true);
         let advertised_timesync_sources =
             self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+        let links = discovery::topology_links_from_boards(&routers);
         TopologySnapshot {
             advertised_endpoints,
             advertised_timesync_sources,
             routers,
+            links,
             routes,
             current_announce_interval_ms: st.discovery_cadence.current_interval_ms,
             next_announce_ms: st.discovery_cadence.next_announce_ms,
         }
+    }
+
+    #[cfg(feature = "discovery")]
+    pub fn client_stats(&self, sender_id: &str) -> Option<ClientStatsSnapshot> {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        let mut side_ids = Vec::new();
+        let mut side_names = Vec::new();
+        let mut last_seen_ms = None::<u64>;
+        let mut reachable_endpoints = Vec::new();
+        let mut reachable_timesync_sources = Vec::new();
+        let mut packets_sent = 0u64;
+        let mut packets_received = 0u64;
+        let mut bytes_sent = 0u64;
+        let mut bytes_received = 0u64;
+
+        for (side_id, route) in &st.discovery_routes {
+            let Some(sender_state) = route.announcers.get(sender_id) else {
+                continue;
+            };
+            side_ids.push(*side_id);
+            if let Some(side_name) = st
+                .sides
+                .get(*side_id)
+                .and_then(|side| side.as_ref())
+                .map(|side| side.name)
+            {
+                side_names.push(side_name);
+            }
+            last_seen_ms = Some(last_seen_ms.unwrap_or(0).max(sender_state.last_seen_ms));
+            reachable_endpoints.extend(sender_state.reachable.iter().copied());
+            reachable_timesync_sources
+                .extend(sender_state.reachable_timesync_sources.iter().cloned());
+            if let Some(stats) = st.side_runtime_stats.get(side_id) {
+                packets_sent = packets_sent.saturating_add(stats.tx_packets);
+                packets_received = packets_received.saturating_add(stats.rx_packets);
+                bytes_sent = bytes_sent.saturating_add(stats.tx_bytes);
+                bytes_received = bytes_received.saturating_add(stats.rx_bytes);
+            }
+        }
+
+        if side_ids.is_empty() {
+            return None;
+        }
+        reachable_endpoints.retain(|ep| !discovery::is_router_control_endpoint(*ep));
+        reachable_endpoints.sort_unstable();
+        reachable_endpoints.dedup();
+        reachable_timesync_sources.sort_unstable();
+        reachable_timesync_sources.dedup();
+        side_ids.sort_unstable();
+        side_ids.dedup();
+        side_names.sort_unstable();
+        side_names.dedup();
+        let age_ms = last_seen_ms.map(|seen| now_ms.saturating_sub(seen));
+        Some(ClientStatsSnapshot {
+            sender_id: sender_id.to_string(),
+            connected: age_ms.is_some_and(|age| age <= DISCOVERY_ROUTE_TTL_MS),
+            side_ids,
+            side_names,
+            last_seen_ms,
+            age_ms,
+            reachable_endpoints,
+            reachable_timesync_sources,
+            packets_sent,
+            packets_received,
+            bytes_sent,
+            bytes_received,
+        })
+    }
+
+    pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
+        let now_ms = self.clock.now_ms();
+        let isr_rx = self.isr_rx_queue.snapshot().unwrap_or((0, 0));
+        let st = self.state.lock();
+
+        let mut sides = Vec::new();
+        for (side_id, side) in st.sides.iter().enumerate() {
+            let Some(side) = side.as_ref() else { continue };
+            let stats = st
+                .side_runtime_stats
+                .get(&side_id)
+                .cloned()
+                .unwrap_or_default();
+            let adaptive = st
+                .adaptive_route_stats
+                .get(&side_id)
+                .cloned()
+                .unwrap_or_default()
+                .snapshot(now_ms, true);
+            let (tx_template_count, rx_template_count) = st
+                .side_transport
+                .get(&side_id)
+                .map(|state| (state.tx_template_count(), state.rx_template_count()))
+                .unwrap_or((0, 0));
+            let mut data_types: Vec<RuntimeTypeStats> = stats
+                .data_types
+                .into_iter()
+                .map(|(ty, item)| RuntimeTypeStats {
+                    data_type: DataType(ty),
+                    tx_packets: item.tx_packets,
+                    tx_bytes: item.tx_bytes,
+                    rx_packets: item.rx_packets,
+                    rx_bytes: item.rx_bytes,
+                    relayed_tx_packets: item.relayed_tx_packets,
+                    relayed_tx_bytes: item.relayed_tx_bytes,
+                    relayed_rx_packets: item.relayed_rx_packets,
+                    relayed_rx_bytes: item.relayed_rx_bytes,
+                    tx_retries: item.tx_retries,
+                    handler_failures: item.handler_failures,
+                })
+                .collect();
+            data_types.sort_unstable_by_key(|item| item.data_type.as_u32());
+            sides.push(RuntimeSideStats {
+                side_id,
+                side_name: side.name,
+                reliable_enabled: side.opts.reliable_enabled,
+                link_local_enabled: side.opts.link_local_enabled,
+                header_template_enabled: side.opts.header_template_enabled,
+                max_frame_bytes: side.opts.max_frame_bytes,
+                compact_header_target_bytes: side.opts.compact_header_target_bytes,
+                side_transport_profile: side.opts.effective_transport_profile().as_str(),
+                ingress_enabled: side.opts.ingress_enabled,
+                egress_enabled: side.opts.egress_enabled,
+                tx_packets: stats.tx_packets,
+                tx_bytes: stats.tx_bytes,
+                rx_packets: stats.rx_packets,
+                rx_bytes: stats.rx_bytes,
+                relayed_tx_packets: stats.relayed_tx_packets,
+                relayed_tx_bytes: stats.relayed_tx_bytes,
+                relayed_rx_packets: stats.relayed_rx_packets,
+                relayed_rx_bytes: stats.relayed_rx_bytes,
+                local_delivery_packets: stats.local_delivery_packets,
+                tx_retries: stats.tx_retries,
+                tx_handler_failures: stats.tx_handler_failures,
+                local_handler_failures: stats.local_handler_failures,
+                total_handler_retries: stats.total_handler_retries,
+                side_transport_full_frames: stats.side_transport_full_frames,
+                side_transport_compact_frames: stats.side_transport_compact_frames,
+                side_transport_compact_delta_frames: stats.side_transport_compact_delta_frames,
+                side_transport_compact_omitted_timestamp_frames: stats
+                    .side_transport_compact_omitted_timestamp_frames,
+                side_transport_chunk_frames: stats.side_transport_chunk_frames,
+                side_transport_raw_bytes: stats.side_transport_raw_bytes,
+                side_transport_wire_bytes: stats.side_transport_wire_bytes,
+                side_transport_bytes_saved: stats.side_transport_bytes_saved,
+                side_transport_min_compact_overhead_bytes: stats
+                    .side_transport_min_compact_overhead_bytes,
+                side_transport_max_compact_overhead_bytes: stats
+                    .side_transport_max_compact_overhead_bytes,
+                side_transport_compact_target_misses: stats.side_transport_compact_target_misses,
+                side_transport_template_evictions: stats.side_transport_template_evictions,
+                side_transport_tx_template_count: tx_template_count,
+                side_transport_rx_template_count: rx_template_count,
+                max_side_transport_templates: side.opts.max_side_transport_templates,
+                adaptive,
+                data_types,
+            });
+        }
+
+        let mut route_modes: Vec<RouteModeStats> = st
+            .route_selection_cursors
+            .iter()
+            .map(|(src, cursor)| RouteModeStats {
+                src_side_id: *src,
+                selection_mode: st.source_route_modes.get(src).copied(),
+                cursor: *cursor,
+            })
+            .collect();
+        for src in st.source_route_modes.keys() {
+            if !route_modes.iter().any(|mode| mode.src_side_id == *src) {
+                route_modes.push(RouteModeStats {
+                    src_side_id: *src,
+                    selection_mode: st.source_route_modes.get(src).copied(),
+                    cursor: 0,
+                });
+            }
+        }
+        route_modes.sort_unstable_by_key(|mode| mode.src_side_id.unwrap_or(usize::MAX));
+
+        let mut route_overrides: Vec<RouteOverrideStats> = st
+            .route_overrides
+            .iter()
+            .map(|((src, dst), enabled)| RouteOverrideStats {
+                src_side_id: *src,
+                dst_side_id: *dst,
+                enabled: *enabled,
+            })
+            .collect();
+        route_overrides.sort_unstable_by_key(|item| {
+            (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
+        });
+
+        let mut typed_route_overrides: Vec<TypedRouteOverrideStats> = st
+            .typed_route_overrides
+            .iter()
+            .map(|((src, ty, dst), enabled)| TypedRouteOverrideStats {
+                src_side_id: *src,
+                data_type: DataType(*ty),
+                dst_side_id: *dst,
+                enabled: *enabled,
+            })
+            .collect();
+        typed_route_overrides.sort_unstable_by_key(|item| {
+            (
+                item.src_side_id.unwrap_or(usize::MAX),
+                item.data_type.as_u32(),
+                item.dst_side_id,
+            )
+        });
+
+        let mut route_weights: Vec<RouteWeightStats> = st
+            .route_weights
+            .iter()
+            .map(|((src, dst), weight)| RouteWeightStats {
+                src_side_id: *src,
+                dst_side_id: *dst,
+                weight: *weight,
+            })
+            .collect();
+        route_weights.sort_unstable_by_key(|item| {
+            (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
+        });
+
+        let mut route_priorities: Vec<RoutePriorityStats> = st
+            .route_priorities
+            .iter()
+            .map(|((src, dst), priority)| RoutePriorityStats {
+                src_side_id: *src,
+                dst_side_id: *dst,
+                priority: *priority,
+            })
+            .collect();
+        route_priorities.sort_unstable_by_key(|item| {
+            (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
+        });
+
+        #[cfg(feature = "discovery")]
+        let discovery = DiscoveryRuntimeStats {
+            route_count: st.discovery_routes.len(),
+            announcer_count: st
+                .discovery_routes
+                .values()
+                .map(|route| route.announcers.len())
+                .sum(),
+            current_announce_interval_ms: Some(st.discovery_cadence.current_interval_ms),
+            next_announce_ms: Some(st.discovery_cadence.next_announce_ms),
+        };
+        #[cfg(not(feature = "discovery"))]
+        let discovery = DiscoveryRuntimeStats {
+            route_count: 0,
+            announcer_count: 0,
+            current_announce_interval_ms: None,
+            next_announce_ms: None,
+        };
+
+        RuntimeStatsSnapshot {
+            sides,
+            route_modes,
+            route_overrides,
+            typed_route_overrides,
+            route_weights,
+            route_priorities,
+            queues: QueueRuntimeStats {
+                rx_len: isr_rx.0.saturating_add(st.received_queue.len()),
+                rx_bytes: isr_rx.1.saturating_add(st.received_queue.bytes_used()),
+                tx_len: st.transmit_queue.len(),
+                tx_bytes: st.transmit_queue.bytes_used(),
+                replay_len: 0,
+                replay_bytes: 0,
+                recent_rx_len: st.recent_rx.len(),
+                recent_rx_bytes: st.recent_rx.bytes_used(),
+                reliable_rx_buffered_len: st.reliable_rx_buffer_len(),
+                reliable_rx_buffered_bytes: st.reliable_rx_buffered_bytes(),
+                shared_queue_bytes_used: st.shared_queue_bytes_used(),
+            },
+            reliable: ReliableRuntimeStats {
+                reliable_return_route_count: st.reliable_return_routes.len(),
+                end_to_end_pending_count: st.end_to_end_reliable_tx.len(),
+                end_to_end_pending_destination_count: st
+                    .end_to_end_reliable_tx
+                    .values()
+                    .map(|sent| sent.pending_destinations.len())
+                    .sum(),
+                end_to_end_acked_cache_count: 0,
+            },
+            discovery,
+            total_handler_failures: st.total_handler_failures,
+            total_handler_retries: st.total_handler_retries,
+        }
+    }
+
+    /// Export current router memory usage/layout as JSON for profiling.
+    pub fn export_memory_layout_json(&self) -> String {
+        let isr_rx = self.isr_rx_queue.snapshot().unwrap_or((0, 0));
+        let st = self.state.lock();
+        #[cfg(feature = "discovery")]
+        let discovery_bytes = st.discovery_bytes_used();
+        #[cfg(not(feature = "discovery"))]
+        let discovery_bytes = 0usize;
+        let schema_bytes = crate::config::schema_bytes_used();
+        let network_variable_cache_bytes = st
+            .managed_variable_latest
+            .values()
+            .map(|entry| entry.packet.byte_cost())
+            .sum::<usize>();
+        let mut out = String::new();
+        let _ = fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"kind\":\"router\",\
+                 \"shared_queue_bytes_used\":{},\"shared_queue_bytes_allocated\":{},\
+                 \"rx_queue_bytes_used\":{},\"rx_queue_bytes_allocated\":{},\"rx_queue_len\":{},\
+                 \"isr_rx_queue_bytes_used\":{},\"isr_rx_queue_bytes_allocated\":{},\"isr_rx_queue_len\":{},\
+                 \"tx_queue_bytes_used\":{},\"tx_queue_bytes_allocated\":{},\"tx_queue_len\":{},\
+                 \"recent_rx_bytes_used\":{},\"recent_rx_bytes_allocated\":{},\"recent_rx_len\":{},\
+                 \"reliable_rx_buffer_bytes_used\":{},\"reliable_rx_buffer_bytes_allocated\":{},\"reliable_rx_buffer_len\":{},\
+                 \"discovery_bytes_used\":{},\"discovery_bytes_allocated\":{},\
+                 \"schema_bytes_used\":{},\"schema_bytes_allocated\":{},\
+                 \"network_variable_cache_bytes_used\":{},\"network_variable_cache_bytes_allocated\":{},\"network_variable_cache_len\":{}}}",
+                st.shared_queue_bytes_used(),
+                MAX_QUEUE_BUDGET,
+                st.received_queue.bytes_used(),
+                st.received_queue.max_bytes(),
+                st.received_queue.len(),
+                isr_rx.1,
+                MAX_QUEUE_BUDGET,
+                isr_rx.0,
+                st.transmit_queue.bytes_used(),
+                st.transmit_queue.max_bytes(),
+                st.transmit_queue.len(),
+                st.recent_rx.bytes_used(),
+                st.recent_rx.max_bytes(),
+                st.recent_rx.len(),
+                st.reliable_rx_buffered_bytes(),
+                MAX_QUEUE_BUDGET,
+                st.reliable_rx_buffer_len(),
+                discovery_bytes,
+                MAX_QUEUE_BUDGET,
+                schema_bytes,
+                MAX_QUEUE_BUDGET,
+                network_variable_cache_bytes,
+                MAX_QUEUE_BUDGET,
+                st.managed_variable_latest.len(),
+            ),
+        );
+        out
     }
 
     #[cfg(test)]
@@ -4163,12 +8448,12 @@ impl Router {
 
     /// Compute a de-dupe hash for a RouterItem.
     /// Uses packet ID for Packet items, and attempts to extract packet ID from
-    /// serialized bytes. If extraction fails, hashes raw bytes as a fallback.
+    /// packed bytes. If extraction fails, hashes raw bytes as a fallback.
     fn get_hash(item: &RouterItem) -> u64 {
         match item {
             RouterItem::Packet(pkt) => pkt.packet_id(),
-            RouterItem::Serialized(bytes) => {
-                match serialize::packet_id_from_wire(bytes.as_ref()) {
+            RouterItem::Packed(bytes) => {
+                match wire_format::packet_id_from_wire(bytes.as_ref()) {
                     Ok(id) => id,
                     Err(_e) => {
                         // Fallback: if bytes are malformed (or compression feature mismatch),
@@ -4210,6 +8495,7 @@ impl Router {
         pkt: &Packet,
         dest: Option<DataEndpoint>,
         e: TelemetryError,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let error_msg = match dest {
             Some(failed_local) => format!(
@@ -4253,15 +8539,20 @@ impl Router {
 
         let payload = make_error_payload(&error_msg);
 
+        let sender = self.sender_arc();
         let error_pkt = Packet::new(
             DataType::TelemetryError,
             &recipients,
-            self.sender,
+            sender.as_ref(),
             self.packet_timestamp_ms(),
             payload,
         )?;
 
-        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(error_pkt)))
+        self.emit_internal_tx(
+            RouterTxItem::Broadcast(RouterItem::Packet(error_pkt)),
+            false,
+            called_from_queue,
+        )
     }
 
     // ---------- PUBLIC API: queues ----------
@@ -4311,12 +8602,14 @@ impl Router {
         loop {
             self.process_reliable_timeouts()?;
             self.process_end_to_end_reliable_timeouts()?;
+            #[cfg(feature = "discovery")]
+            let _ = self.drain_queued_discovery_rx_before_tx()?;
             let pkt_opt = {
                 let mut st = self.state.lock();
                 st.transmit_queue.pop_front()
             };
             let Some(pkt) = pkt_opt else { break };
-            self.tx_item_impl(pkt.item, pkt.ignore_local)?;
+            self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
             if timeout_ms != 0 && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
                 break;
             }
@@ -4329,6 +8622,8 @@ impl Router {
     pub fn process_tx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         #[cfg(feature = "timesync")]
         let _ = self.poll_timesync()?;
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         self.process_tx_queue_with_timeout_impl(timeout_ms)
     }
 
@@ -4361,6 +8656,8 @@ impl Router {
     pub fn process_rx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         #[cfg(feature = "timesync")]
         let _ = self.poll_timesync()?;
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         self.process_rx_queue_with_timeout_impl(timeout_ms)
     }
 
@@ -4372,12 +8669,16 @@ impl Router {
                 let mut did_any = false;
                 self.process_reliable_timeouts()?;
                 self.process_end_to_end_reliable_timeouts()?;
+                #[cfg(feature = "discovery")]
+                if self.drain_queued_discovery_rx_before_tx()? {
+                    did_any = true;
+                }
 
                 if let Some(pkt) = {
                     let mut st = self.state.lock();
                     st.transmit_queue.pop_front()
                 } {
-                    self.tx_item_impl(pkt.item, pkt.ignore_local)?;
+                    self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
                     did_any = true;
                 }
 
@@ -4403,12 +8704,14 @@ impl Router {
         loop {
             self.process_reliable_timeouts()?;
             self.process_end_to_end_reliable_timeouts()?;
+            #[cfg(feature = "discovery")]
+            let _ = self.drain_queued_discovery_rx_before_tx()?;
             let pkt_opt = {
                 let mut st = self.state.lock();
                 st.transmit_queue.pop_front()
             };
             let Some(pkt) = pkt_opt else { break };
-            self.tx_item_impl(pkt.item, pkt.ignore_local)?;
+            self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
             if self.clock.now_ms().wrapping_sub(tx_start) >= tx_budget_ms {
                 break;
             }
@@ -4435,6 +8738,8 @@ impl Router {
     pub fn process_all_queues_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         #[cfg(feature = "timesync")]
         let _ = self.poll_timesync()?;
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         self.process_all_queues_with_timeout_impl(timeout_ms)
     }
 
@@ -4481,7 +8786,7 @@ impl Router {
             }
             RouterTxItem::ToSide { data, .. } => Self::router_item_priority(data)?,
             RouterTxItem::ReliableReplay { bytes, .. } => {
-                let ty = serialize::peek_envelope(bytes.as_ref())?.ty;
+                let ty = wire_format::peek_envelope(bytes.as_ref())?.ty;
                 Self::router_item_priority_bumped(ty)
             }
         };
@@ -4528,10 +8833,10 @@ impl Router {
         self.process_rx_queue_with_timeout(0)
     }
 
-    /// Enqueue serialized bytes for RX processing as locally-originated input.
+    /// Enqueue packed bytes for RX processing as locally-originated input.
     #[inline]
-    pub fn rx_serialized_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
-        let data = RouterItem::Serialized(Arc::from(bytes));
+    pub fn rx_packed_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
+        let data = RouterItem::Packed(Arc::from(bytes));
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -4542,13 +8847,13 @@ impl Router {
         Ok(())
     }
 
-    /// ISR-safe, non-blocking enqueue of serialized bytes for RX processing.
+    /// ISR-safe, non-blocking enqueue of packed bytes for RX processing.
     ///
     /// Returns `TelemetryError::Io("rx queue busy")` if another context is
     /// currently mutating the ISR RX queue.
     #[inline]
-    pub fn rx_serialized_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
-        let data = RouterItem::Serialized(Arc::from(bytes));
+    pub fn rx_packed_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
+        let data = RouterItem::Packed(Arc::from(bytes));
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: None,
@@ -4621,15 +8926,18 @@ impl Router {
         })
     }
 
-    /// Enqueue serialized bytes for RX processing with an explicit ingress side.
+    /// Enqueue packed bytes for RX processing with an explicit ingress side.
     #[inline]
-    pub fn rx_serialized_queue_from_side(
+    pub fn rx_packed_queue_from_side(
         &self,
         bytes: &[u8],
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
+            return Ok(());
+        };
+        let data = RouterItem::Packed(decoded);
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -4640,18 +8948,18 @@ impl Router {
         Ok(())
     }
 
-    /// ISR-safe, non-blocking enqueue of serialized bytes with source side.
+    /// ISR-safe, non-blocking enqueue of packed bytes with source side.
     ///
     /// Returns `TelemetryError::Io("rx queue busy")` if another context is
     /// currently mutating the ISR RX queue.
     #[inline]
-    pub fn rx_serialized_queue_from_side_isr(
+    pub fn rx_packed_queue_from_side_isr(
         &self,
         bytes: &[u8],
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let data = RouterItem::Packed(Arc::from(bytes));
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: Some(side),
@@ -4660,16 +8968,15 @@ impl Router {
         })
     }
 
-    /// Retry helper function to attempt a closure multiple times.
-    fn retry<F, T, E>(&self, times: usize, f: F) -> Result<T, E>
+    fn retry_with_attempts<F, T, E>(&self, times: usize, f: F) -> Result<(T, usize), (E, usize)>
     where
         F: Fn() -> Result<T, E>,
     {
         let mut last_err = None;
-        for _ in 0..times {
+        for attempt in 0..times {
             match f() {
-                Ok(v) => return Ok(v),
-                Err(e) => last_err = Some(e),
+                Ok(v) => return Ok((v, attempt + 1)),
+                Err(e) => last_err = Some((e, attempt + 1)),
             }
         }
         Err(last_err.expect("times > 0"))
@@ -4684,39 +8991,41 @@ impl Router {
             .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Packet(_)))
     }
 
-    /// Check if the specified endpoint has a serialized handler registered.
+    /// Check if the specified endpoint has a packed handler registered.
     #[inline]
-    fn endpoint_has_serialized_handler(&self, ep: DataEndpoint) -> bool {
+    fn endpoint_has_packed_handler(&self, ep: DataEndpoint) -> bool {
         self.cfg
             .handlers
             .iter()
-            .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Serialized(_)))
+            .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Packed(_)))
     }
 
     fn packet_has_local_handler(&self, pkt: &Packet) -> bool {
-        pkt.endpoints().iter().copied().any(|ep| {
-            self.endpoint_has_packet_handler(ep) || self.endpoint_has_serialized_handler(ep)
-        })
+        pkt.endpoints()
+            .iter()
+            .copied()
+            .any(|ep| self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep))
     }
 
     /// Call the specified endpoint handler with retries on failure.
     ///
     /// - `data` is present when called from RX processing (queue or immediate).
     /// - `pkt_for_ctx` is required for Packet handlers.
-    /// - `env_for_ctx` provides header-only context when we haven't deserialized.
+    /// - `env_for_ctx` provides header-only context when we haven't unpacked.
     fn call_handler_with_retries(
         &self,
         dest: DataEndpoint,
         handler: &EndpointHandler,
         data: Option<&[u8]>,
         pkt_for_ctx: Option<&Packet>,
-        env_for_ctx: Option<&serialize::TelemetryEnvelope>,
+        env_for_ctx: Option<&wire_format::TelemetryEnvelope>,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let owned_tmp: Option<RouterItem>;
 
         let item_for_ctx: &RouterItem = match (data, pkt_for_ctx) {
             (Some(d), _) => {
-                owned_tmp = Some(RouterItem::Serialized(Arc::from(d)));
+                owned_tmp = Some(RouterItem::Packed(Arc::from(d)));
                 owned_tmp.as_ref().unwrap()
             }
             (None, Some(pkt)) => {
@@ -4735,18 +9044,28 @@ impl Router {
         match (&handler.handler, data) {
             (EndpointHandlerFn::Packet(f), _) => {
                 let pkt = pkt_for_ctx.expect("Packet handler requires Packet context");
-                with_retries(self, dest, item_for_ctx, pkt_for_ctx, env_for_ctx, || {
-                    f(pkt)
-                })
+                with_retries(
+                    self,
+                    dest,
+                    item_for_ctx,
+                    pkt_for_ctx,
+                    env_for_ctx,
+                    called_from_queue,
+                    || f(pkt),
+                )
             }
 
-            (EndpointHandlerFn::Serialized(f), Some(bytes)) => {
-                with_retries(self, dest, item_for_ctx, pkt_for_ctx, env_for_ctx, || {
-                    f(bytes)
-                })
-            }
+            (EndpointHandlerFn::Packed(f), Some(bytes)) => with_retries(
+                self,
+                dest,
+                item_for_ctx,
+                pkt_for_ctx,
+                env_for_ctx,
+                called_from_queue,
+                || f(bytes),
+            ),
 
-            (EndpointHandlerFn::Serialized(_), None) => Ok(()),
+            (EndpointHandlerFn::Packed(_), None) => Ok(()),
         }
     }
 
@@ -4756,9 +9075,10 @@ impl Router {
     /// If no local endpoints remain, falls back to `fallback_stdout`.
     fn handle_callback_error_from_env(
         &self,
-        env: &serialize::TelemetryEnvelope,
+        env: &wire_format::TelemetryEnvelope,
         dest: Option<DataEndpoint>,
         e: TelemetryError,
+        called_from_queue: bool,
     ) -> TelemetryResult<()> {
         let mut recipients: Vec<DataEndpoint> = env
             .endpoints
@@ -4799,13 +9119,18 @@ impl Router {
             env.timestamp_ms,
             payload,
         )?;
-        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(error_pkt)))
+        self.emit_internal_tx(
+            RouterTxItem::Broadcast(RouterItem::Packet(error_pkt)),
+            false,
+            called_from_queue,
+        )
     }
 
     fn handle_internal_reliable_packet(
         &self,
         pkt: &Packet,
         src: Option<RouterSideId>,
+        called_from_queue: bool,
     ) -> TelemetryResult<bool> {
         if !matches!(
             pkt.data_type(),
@@ -4839,7 +9164,7 @@ impl Router {
 
         let vals = pkt.data_as_u32()?;
         if vals.len() != 2 {
-            return Err(TelemetryError::Deserialize("bad reliable control payload"));
+            return Err(TelemetryError::Unpack("bad reliable control payload"));
         }
         let ty = DataType::try_from_u32(vals[0]).ok_or(TelemetryError::InvalidType)?;
         let seq = vals[1];
@@ -4854,14 +9179,14 @@ impl Router {
                 Ok(true)
             }
             DataType::ReliablePacketRequest => {
-                self.queue_reliable_retransmit(src, ty, seq)?;
+                self.queue_reliable_retransmit(src, ty, seq, called_from_queue)?;
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
-    /// Core receive function handling both Packet and Serialized items.
+    /// Core receive function handling both Packet and Packed items.
     ///
     /// Relay mode: if a destination endpoint has no matching local handler and the packet has
     /// any remotely-forwardable endpoints, the router will rebroadcast the packet ONCE, excluding
@@ -4871,52 +9196,80 @@ impl Router {
             self.ensure_side_ingress_enabled(src)?;
             match &item.data {
                 RouterItem::Packet(pkt) => {
+                    let bytes = wire_format::pack_packet(pkt).len();
+                    self.note_side_rx(src, pkt.data_type(), bytes, true);
+                }
+                RouterItem::Packed(bytes) => {
+                    if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                        self.note_side_rx(src, env.ty, bytes.len(), true);
+                    }
+                }
+            }
+            match &item.data {
+                RouterItem::Packet(pkt) => {
                     if is_reliable_type(pkt.data_type())
                         && !is_internal_control_type(pkt.data_type())
                     {
                         self.note_reliable_return_route(src, pkt.packet_id());
                     }
                 }
-                RouterItem::Serialized(bytes) => {
-                    if let Ok(env) = serialize::peek_envelope(bytes.as_ref())
+                RouterItem::Packed(bytes) => {
+                    if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
                         && is_reliable_type(env.ty)
                         && !is_internal_control_type(env.ty)
-                        && let Ok(packet_id) = serialize::packet_id_from_wire(bytes.as_ref())
+                        && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
                     {
                         self.note_reliable_return_route(src, packet_id);
                     }
                 }
             }
         }
+        match &item.data {
+            RouterItem::Packet(pkt) => {
+                if !is_internal_control_type(pkt.data_type()) {
+                    self.remember_managed_variable_packet(pkt)?;
+                }
+            }
+            RouterItem::Packed(bytes) => {
+                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
+                    && !is_internal_control_type(env.ty)
+                    && self.is_managed_variable_type(env.ty)
+                {
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    pkt.validate()?;
+                    self.remember_managed_variable_packet(&pkt)?;
+                }
+            }
+        }
         let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
-        if let (Some(src), RouterItem::Serialized(bytes)) = (item.src, &item.data) {
-            let (_opts, handler_is_serialized, hop_reliable_enabled) = {
+        if let (Some(src), RouterItem::Packed(bytes)) = (item.src, &item.data) {
+            let (_opts, handler_is_packed, hop_reliable_enabled) = {
                 let st = self.state.lock();
                 let side_ref = Self::side_ref(&st, src)?;
                 let opts = side_ref.opts;
                 (
                     opts,
-                    matches!(side_ref.tx_handler, RouterTxHandlerFn::Serialized(_)),
+                    matches!(side_ref.tx_handler, RouterTxHandlerFn::Packed(_)),
                     opts.reliable_enabled
                         && self.cfg.reliable_enabled()
                         && !self.side_has_multiple_announcers_locked(&st, src, self.clock.now_ms()),
                 )
             };
 
-            if hop_reliable_enabled && handler_is_serialized {
-                let frame = match serialize::peek_frame_info(bytes.as_ref()) {
+            if hop_reliable_enabled && handler_is_packed {
+                let frame = match wire_format::peek_frame_info(bytes.as_ref()) {
                     Ok(frame) => frame,
                     Err(e) => {
-                        if matches!(e, TelemetryError::Deserialize(msg) if msg == "crc32 mismatch")
-                        {
-                            if let Ok(frame) = serialize::peek_frame_info_unchecked(bytes.as_ref())
+                        if matches!(e, TelemetryError::Unpack(msg) if msg == "crc32 mismatch") {
+                            if let Ok(frame) =
+                                wire_format::peek_frame_info_unchecked(bytes.as_ref())
                                 && is_reliable_type(frame.envelope.ty)
                                 && let Some(hdr) = frame.reliable
                             {
                                 let unordered =
-                                    (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
+                                    (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
                                 let unsequenced =
-                                    (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                                    (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                                 if !unsequenced {
                                     let requested = if unordered {
@@ -4934,6 +9287,7 @@ impl Router {
                                         src,
                                         frame.envelope.ty,
                                         requested,
+                                        called_from_queue,
                                     )?;
                                 }
                             }
@@ -4945,12 +9299,21 @@ impl Router {
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
-                    let unordered = (hdr.flags & serialize::RELIABLE_FLAG_UNORDERED) != 0;
-                    let unsequenced = (hdr.flags & serialize::RELIABLE_FLAG_UNSEQUENCED) != 0;
+                    if frame.ack_only() {
+                        self.handle_reliable_ack(src, frame.envelope.ty, hdr.ack);
+                        return Ok(());
+                    }
+                    let unordered = (hdr.flags & wire_format::RELIABLE_FLAG_UNORDERED) != 0;
+                    let unsequenced = (hdr.flags & wire_format::RELIABLE_FLAG_UNSEQUENCED) != 0;
 
                     if !unsequenced {
                         if unordered {
-                            self.queue_reliable_ack(src, frame.envelope.ty, hdr.seq)?;
+                            self.queue_reliable_ack(
+                                src,
+                                frame.envelope.ty,
+                                hdr.seq,
+                                called_from_queue,
+                            )?;
                         } else {
                             let mut release: Vec<Arc<[u8]>> = Vec::new();
                             let mut last_delivered = None;
@@ -4988,7 +9351,12 @@ impl Router {
                             }
 
                             if let Some(ack_seq) = ack_old {
-                                self.queue_reliable_ack(src, frame.envelope.ty, ack_seq)?;
+                                self.queue_reliable_ack(
+                                    src,
+                                    frame.envelope.ty,
+                                    ack_seq,
+                                    called_from_queue,
+                                )?;
                                 return Ok(());
                             }
                             if let Some(request_seq) = request_missing {
@@ -4997,18 +9365,25 @@ impl Router {
                                         src,
                                         frame.envelope.ty,
                                         partial_seq,
+                                        called_from_queue,
                                     )?;
                                 }
                                 self.queue_reliable_packet_request(
                                     src,
                                     frame.envelope.ty,
                                     request_seq,
+                                    called_from_queue,
                                 )?;
                                 return Ok(());
                             }
 
                             if let Some(ack_seq) = last_delivered {
-                                self.queue_reliable_ack(src, frame.envelope.ty, ack_seq)?;
+                                self.queue_reliable_ack(
+                                    src,
+                                    frame.envelope.ty,
+                                    ack_seq,
+                                    called_from_queue,
+                                )?;
                             }
 
                             released_buffered.extend(release.into_iter().skip(1));
@@ -5016,15 +9391,14 @@ impl Router {
                     }
                 }
             } else {
-                match serialize::peek_frame_info(bytes.as_ref()) {
+                match wire_format::peek_frame_info(bytes.as_ref()) {
                     Ok(frame) => {
                         if frame.ack_only() {
                             return Ok(());
                         }
                     }
                     Err(e) => {
-                        if matches!(e, TelemetryError::Deserialize(msg) if msg == "crc32 mismatch")
-                        {
+                        if matches!(e, TelemetryError::Unpack(msg) if msg == "crc32 mismatch") {
                             return Ok(());
                         }
                         return Err(e);
@@ -5035,21 +9409,31 @@ impl Router {
 
         if self.is_duplicate_pkt(&item.data)? {
             if item.src.is_some() {
+                let local_sender = self.sender_arc();
                 match &item.data {
                     RouterItem::Packet(pkt)
-                        if is_reliable_type(pkt.data_type())
-                            && pkt.sender() != self.sender
+                        if (is_reliable_type(pkt.data_type())
+                            || !pkt.wire_target_senders().is_empty())
+                            && pkt.sender() != local_sender.as_ref()
+                            && self.item_targets_local_sender(&item.data)?
                             && self.packet_has_local_handler(pkt) =>
                     {
-                        self.queue_end_to_end_reliable_ack(pkt)?;
+                        self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
                     }
-                    RouterItem::Serialized(bytes) => {
-                        if let Ok(pkt) = serialize::deserialize_packet(bytes.as_ref())
-                            && is_reliable_type(pkt.data_type())
-                            && pkt.sender() != self.sender
+                    RouterItem::Packed(bytes) => {
+                        if let Ok(pkt) = wire_format::unpack_packet(bytes.as_ref())
+                            && (is_reliable_type(pkt.data_type())
+                                || !pkt.wire_target_senders().is_empty())
+                            && pkt.sender() != local_sender.as_ref()
+                            && self.item_targets_local_sender(&item.data)?
                             && self.packet_has_local_handler(&pkt)
                         {
-                            self.queue_end_to_end_reliable_ack(&pkt)?;
+                            let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                                .unwrap_or_else(|_| pkt.packet_id());
+                            self.queue_end_to_end_reliable_ack_for_packet_id(
+                                packet_id,
+                                called_from_queue,
+                            )?;
                         }
                     }
                     _ => {}
@@ -5061,7 +9445,7 @@ impl Router {
         self.dispatch_rx_data(item, called_from_queue)?;
 
         for release_bytes in released_buffered {
-            let release_data = RouterItem::Serialized(release_bytes.clone());
+            let release_data = RouterItem::Packed(release_bytes.clone());
             if self.is_duplicate_pkt(&release_data)? {
                 continue;
             }
@@ -5085,7 +9469,24 @@ impl Router {
             RouterItem::Packet(pkt) => {
                 pkt.validate()?;
 
-                if self.handle_internal_reliable_packet(pkt, item.src)? {
+                if self.handle_internal_reliable_packet(pkt, item.src, called_from_queue)? {
+                    return Ok(());
+                }
+
+                if pkt.data_type() == DataType::P2pMessage {
+                    if self.item_targets_local_sender(&item.data)? {
+                        self.dispatch_p2p_packet(pkt)?;
+                        if item.src.is_some() {
+                            self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
+                        }
+                    }
+                    if self.should_route_remote(&item.data, item.src)? {
+                        self.relay_send(
+                            RouterItem::Packet(pkt.to_owned()),
+                            item.src,
+                            called_from_queue,
+                        )?;
+                    }
                     return Ok(());
                 }
 
@@ -5100,7 +9501,7 @@ impl Router {
                     return Ok(());
                 }
 
-                if self.learn_discovery_packet(pkt, item.src)? {
+                if self.learn_discovery_packet(pkt, item.src, called_from_queue)? {
                     if self.should_route_remote(&item.data, item.src)? {
                         self.relay_send(
                             RouterItem::Packet(pkt.to_owned()),
@@ -5115,53 +9516,82 @@ impl Router {
                 eps.sort_unstable();
                 eps.dedup();
                 let had_local_handler = eps.iter().copied().any(|ep| {
-                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_serialized_handler(ep)
+                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
                 });
 
                 let has_remote = self.should_route_remote(&item.data, item.src)?;
+                let targets_local = self.item_targets_local_sender(&item.data)?;
 
-                let has_serialized_local = eps
+                let has_packed_local = eps
                     .iter()
                     .copied()
-                    .any(|ep| self.endpoint_has_serialized_handler(ep));
-                let bytes_opt = if has_serialized_local {
-                    Some(serialize::serialize_packet(pkt))
+                    .any(|ep| self.endpoint_has_packed_handler(ep));
+                let bytes_opt = if has_packed_local {
+                    Some(wire_format::pack_packet(pkt))
                 } else {
                     None
                 };
 
-                for dest in eps {
-                    for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
-                        match (&h.handler, &bytes_opt) {
-                            (EndpointHandlerFn::Serialized(_), Some(bytes)) => {
-                                let _ = self.call_handler_with_retries(
-                                    dest,
-                                    h,
-                                    Some(bytes.as_ref()),
-                                    Some(pkt),
-                                    None,
+                if targets_local {
+                    for dest in eps {
+                        for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
+                            let result = match (&h.handler, &bytes_opt) {
+                                (EndpointHandlerFn::Packed(_), Some(bytes)) => self
+                                    .call_handler_with_retries(
+                                        dest,
+                                        h,
+                                        Some(bytes.as_ref()),
+                                        Some(pkt),
+                                        None,
+                                        called_from_queue,
+                                    ),
+                                (EndpointHandlerFn::Packed(_), None) => {
+                                    let bytes = wire_format::pack_packet(pkt);
+                                    self.call_handler_with_retries(
+                                        dest,
+                                        h,
+                                        Some(bytes.as_ref()),
+                                        Some(pkt),
+                                        None,
+                                        called_from_queue,
+                                    )
+                                }
+                                (EndpointHandlerFn::Packet(_), _) => self
+                                    .call_handler_with_retries(
+                                        dest,
+                                        h,
+                                        None,
+                                        Some(pkt),
+                                        None,
+                                        called_from_queue,
+                                    ),
+                            };
+                            if result.is_err()
+                                && let Some(src) = item.src
+                            {
+                                self.note_side_local_handler_failure(
+                                    src,
+                                    pkt.data_type(),
+                                    MAX_HANDLER_RETRIES,
                                 );
-                            }
-                            (EndpointHandlerFn::Serialized(_), None) => {
-                                let bytes = serialize::serialize_packet(pkt);
-                                let _ = self.call_handler_with_retries(
-                                    dest,
-                                    h,
-                                    Some(bytes.as_ref()),
-                                    Some(pkt),
-                                    None,
-                                );
-                            }
-                            (EndpointHandlerFn::Packet(_), _) => {
-                                let _ =
-                                    self.call_handler_with_retries(dest, h, None, Some(pkt), None);
                             }
                         }
                     }
                 }
 
-                if item.src.is_some() && had_local_handler && is_reliable_type(pkt.data_type()) {
-                    self.queue_end_to_end_reliable_ack(pkt)?;
+                if let Some(src) = item.src
+                    && had_local_handler
+                    && targets_local
+                {
+                    self.note_side_local_delivery(src, pkt.data_type());
+                }
+
+                if item.src.is_some()
+                    && had_local_handler
+                    && targets_local
+                    && (is_reliable_type(pkt.data_type()) || !pkt.wire_target_senders().is_empty())
+                {
+                    self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
                 }
 
                 if has_remote {
@@ -5171,8 +9601,8 @@ impl Router {
 
                 Ok(())
             }
-            RouterItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
 
                 if matches!(
                     env.ty,
@@ -5180,9 +9610,30 @@ impl Router {
                         | DataType::ReliablePartialAck
                         | DataType::ReliablePacketRequest
                 ) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
-                    let _ = self.handle_internal_reliable_packet(&pkt, item.src)?;
+                    let _ =
+                        self.handle_internal_reliable_packet(&pkt, item.src, called_from_queue)?;
+                    return Ok(());
+                }
+
+                if env.ty == DataType::P2pMessage {
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    pkt.validate()?;
+                    if self.item_targets_local_sender(&item.data)? {
+                        self.dispatch_p2p_packet(&pkt)?;
+                        if item.src.is_some() {
+                            let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                                .unwrap_or_else(|_| pkt.packet_id());
+                            self.queue_end_to_end_reliable_ack_for_packet_id(
+                                packet_id,
+                                called_from_queue,
+                            )?;
+                        }
+                    }
+                    if self.should_route_remote(&item.data, item.src)? {
+                        self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
+                    }
                     return Ok(());
                 }
 
@@ -5193,7 +9644,7 @@ impl Router {
                         | DataType::TimeSyncRequest
                         | DataType::TimeSyncResponse
                 ) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     self.handle_internal_timesync_packet(&pkt, item.src, called_from_queue)?;
                     return Ok(());
@@ -5201,9 +9652,9 @@ impl Router {
 
                 #[cfg(feature = "discovery")]
                 if discovery::is_discovery_type(env.ty) {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
-                    let _ = self.learn_discovery_packet(&pkt, item.src)?;
+                    let _ = self.learn_discovery_packet(&pkt, item.src, called_from_queue)?;
                     if self.should_route_remote(&item.data, item.src)? {
                         self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
                     }
@@ -5217,7 +9668,7 @@ impl Router {
                     .any(|ep| self.endpoint_has_packet_handler(ep));
 
                 let mut pkt_opt = if any_packet_needed {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     Some(pkt)
                 } else {
@@ -5228,36 +9679,48 @@ impl Router {
                 eps.sort_unstable();
                 eps.dedup();
                 let had_local_handler = eps.iter().copied().any(|ep| {
-                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_serialized_handler(ep)
+                    self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
                 });
 
                 let has_remote = self.should_route_remote(&item.data, item.src)?;
+                let targets_local = self.item_targets_local_sender(&item.data)?;
 
-                for dest in eps {
-                    for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
-                        match &h.handler {
-                            EndpointHandlerFn::Serialized(_) => {
-                                let _ = self.call_handler_with_retries(
+                if targets_local {
+                    for dest in eps {
+                        for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
+                            let result = match &h.handler {
+                                EndpointHandlerFn::Packed(_) => self.call_handler_with_retries(
                                     dest,
                                     h,
                                     Some(bytes.as_ref()),
                                     pkt_opt.as_ref(),
                                     Some(&env),
-                                );
-                            }
-                            EndpointHandlerFn::Packet(_) => {
-                                if pkt_opt.is_none() {
-                                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
-                                    pkt.validate()?;
-                                    pkt_opt = Some(pkt);
+                                    called_from_queue,
+                                ),
+                                EndpointHandlerFn::Packet(_) => {
+                                    if pkt_opt.is_none() {
+                                        let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                                        pkt.validate()?;
+                                        pkt_opt = Some(pkt);
+                                    }
+                                    let pkt_ref = pkt_opt.as_ref().expect("just set");
+                                    self.call_handler_with_retries(
+                                        dest,
+                                        h,
+                                        None,
+                                        Some(pkt_ref),
+                                        Some(&env),
+                                        called_from_queue,
+                                    )
                                 }
-                                let pkt_ref = pkt_opt.as_ref().expect("just set");
-                                let _ = self.call_handler_with_retries(
-                                    dest,
-                                    h,
-                                    None,
-                                    Some(pkt_ref),
-                                    Some(&env),
+                            };
+                            if result.is_err()
+                                && let Some(src) = item.src
+                            {
+                                self.note_side_local_handler_failure(
+                                    src,
+                                    env.ty,
+                                    MAX_HANDLER_RETRIES,
                                 );
                             }
                         }
@@ -5266,16 +9729,19 @@ impl Router {
 
                 if item.src.is_some()
                     && had_local_handler
-                    && is_reliable_type(env.ty)
+                    && targets_local
+                    && (is_reliable_type(env.ty) || !env.target_senders.is_empty())
                     && let Some(pkt) = pkt_opt.as_ref()
                 {
-                    self.queue_end_to_end_reliable_ack(pkt)?;
+                    let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                        .unwrap_or_else(|_| pkt.packet_id());
+                    self.queue_end_to_end_reliable_ack_for_packet_id(packet_id, called_from_queue)?;
                 }
 
                 if has_remote {
                     let relay_item = match pkt_opt {
                         Some(ref p) => RouterItem::Packet(p.clone()),
-                        None => RouterItem::Serialized(bytes.clone()),
+                        None => RouterItem::Packed(bytes.clone()),
                     };
                     self.relay_send(relay_item, item.src, called_from_queue)?;
                 }
@@ -5285,11 +9751,19 @@ impl Router {
         }
     }
 
-    fn dispatch_local_for_item(&self, item: &RouterItem) -> TelemetryResult<()> {
+    fn dispatch_local_for_item(
+        &self,
+        item: &RouterItem,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
         match item {
             RouterItem::Packet(pkt) => {
                 pkt.validate()?;
                 if is_internal_control_type(pkt.data_type()) {
+                    return Ok(());
+                }
+                self.ensure_e2e_policy_supported_for_type(pkt.data_type())?;
+                if !self.item_targets_local_sender(item)? {
                     return Ok(());
                 }
 
@@ -5297,12 +9771,12 @@ impl Router {
                 eps.sort_unstable();
                 eps.dedup();
 
-                let has_serialized_local = eps
+                let has_packed_local = eps
                     .iter()
                     .copied()
-                    .any(|ep| self.endpoint_has_serialized_handler(ep));
-                let bytes_opt = if has_serialized_local {
-                    Some(serialize::serialize_packet(pkt))
+                    .any(|ep| self.endpoint_has_packed_handler(ep));
+                let bytes_opt = if has_packed_local {
+                    Some(wire_format::pack_packet(pkt))
                 } else {
                     None
                 };
@@ -5310,35 +9784,48 @@ impl Router {
                 for dest in eps {
                     for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
                         match (&h.handler, &bytes_opt) {
-                            (EndpointHandlerFn::Serialized(_), Some(bytes)) => {
+                            (EndpointHandlerFn::Packed(_), Some(bytes)) => {
                                 self.call_handler_with_retries(
                                     dest,
                                     h,
                                     Some(bytes.as_ref()),
                                     Some(pkt),
                                     None,
+                                    called_from_queue,
                                 )?;
                             }
-                            (EndpointHandlerFn::Serialized(_), None) => {
-                                let bytes = serialize::serialize_packet(pkt);
+                            (EndpointHandlerFn::Packed(_), None) => {
+                                let bytes = wire_format::pack_packet(pkt);
                                 self.call_handler_with_retries(
                                     dest,
                                     h,
                                     Some(bytes.as_ref()),
                                     Some(pkt),
                                     None,
+                                    called_from_queue,
                                 )?;
                             }
                             (EndpointHandlerFn::Packet(_), _) => {
-                                self.call_handler_with_retries(dest, h, None, Some(pkt), None)?;
+                                self.call_handler_with_retries(
+                                    dest,
+                                    h,
+                                    None,
+                                    Some(pkt),
+                                    None,
+                                    called_from_queue,
+                                )?;
                             }
                         }
                     }
                 }
             }
-            RouterItem::Serialized(bytes) => {
-                let env = serialize::peek_envelope(bytes.as_ref())?;
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_envelope(bytes.as_ref())?;
                 if is_internal_control_type(env.ty) {
+                    return Ok(());
+                }
+                self.ensure_e2e_policy_supported_for_type(env.ty)?;
+                if !self.item_targets_local_sender(item)? {
                     return Ok(());
                 }
 
@@ -5349,7 +9836,7 @@ impl Router {
                     .any(|ep| self.endpoint_has_packet_handler(ep));
 
                 let mut pkt_opt = if any_packet_needed {
-                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     Some(pkt)
                 } else {
@@ -5363,18 +9850,19 @@ impl Router {
                 for dest in eps {
                     for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
                         match &h.handler {
-                            EndpointHandlerFn::Serialized(_) => {
+                            EndpointHandlerFn::Packed(_) => {
                                 self.call_handler_with_retries(
                                     dest,
                                     h,
                                     Some(bytes.as_ref()),
                                     pkt_opt.as_ref(),
                                     Some(&env),
+                                    called_from_queue,
                                 )?;
                             }
                             EndpointHandlerFn::Packet(_) => {
                                 if pkt_opt.is_none() {
-                                    let pkt = serialize::deserialize_packet(bytes.as_ref())?;
+                                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                                     pkt.validate()?;
                                     pkt_opt = Some(pkt);
                                 }
@@ -5385,6 +9873,7 @@ impl Router {
                                     None,
                                     Some(pkt_ref),
                                     Some(&env),
+                                    called_from_queue,
                                 )?;
                             }
                         }
@@ -5401,13 +9890,24 @@ impl Router {
     /// - Broadcast items are sent to all sides when remote forwarding is required.
     /// - ToSide items are sent only to the specified side.
     /// - If `ignore_local` is false, local handlers are invoked once.
-    fn tx_item_impl(&self, item: RouterTxItem, ignore_local: bool) -> TelemetryResult<()> {
+    fn tx_item_impl(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
         match item {
             RouterTxItem::Broadcast(data) => {
+                self.ensure_e2e_policy_supported_for_type(Self::item_data_type(&data)?)?;
+                if let RouterItem::Packet(pkt) = &data
+                    && !is_internal_control_type(pkt.data_type())
+                {
+                    self.remember_managed_variable_packet(pkt)?;
+                }
                 #[cfg(feature = "discovery")]
                 let is_discovery = matches!(&data, RouterItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()))
-                    || matches!(&data, RouterItem::Serialized(bytes)
-                        if serialize::peek_envelope(bytes.as_ref())
+                    || matches!(&data, RouterItem::Packed(bytes)
+                        if wire_format::peek_envelope(bytes.as_ref())
                             .map(|env| discovery::is_discovery_type(env.ty))
                             .unwrap_or(false));
                 if !ignore_local {
@@ -5417,21 +9917,21 @@ impl Router {
                     #[cfg(feature = "discovery")]
                     if !is_discovery
                         && !matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        && !matches!(&data, RouterItem::Serialized(bytes)
-                            if serialize::peek_envelope(bytes.as_ref())
+                        && !matches!(&data, RouterItem::Packed(bytes)
+                            if wire_format::peek_envelope(bytes.as_ref())
                                 .map(|env| is_internal_control_type(env.ty))
                                 .unwrap_or(false))
                     {
-                        self.dispatch_local_for_item(&data)?;
+                        self.dispatch_local_for_item(&data, called_from_queue)?;
                     }
                     #[cfg(not(feature = "discovery"))]
                     if !matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        && !matches!(&data, RouterItem::Serialized(bytes)
-                            if serialize::peek_envelope(bytes.as_ref())
+                        && !matches!(&data, RouterItem::Packed(bytes)
+                            if wire_format::peek_envelope(bytes.as_ref())
                                 .map(|env| is_internal_control_type(env.ty))
                                 .unwrap_or(false))
                     {
-                        self.dispatch_local_for_item(&data)?;
+                        self.dispatch_local_for_item(&data, called_from_queue)?;
                     }
                 }
 
@@ -5440,8 +9940,8 @@ impl Router {
                         pkt.validate()?;
                         self.should_route_remote(&data, None)?
                     }
-                    RouterItem::Serialized(bytes) => {
-                        let _ = serialize::peek_envelope(bytes.as_ref())?;
+                    RouterItem::Packed(bytes) => {
+                        let _ = wire_format::peek_envelope(bytes.as_ref())?;
                         self.should_route_remote(&data, None)?
                     }
                 };
@@ -5449,25 +9949,37 @@ impl Router {
                 if !send_remote {
                     return Ok(());
                 }
+                let mut data = data;
                 let ty = match &data {
                     RouterItem::Packet(pkt) => pkt.data_type(),
-                    RouterItem::Serialized(bytes) => serialize::peek_envelope(bytes.as_ref())?.ty,
+                    RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
                 };
-                let RemoteSidePlan::Target(sides) = self.remote_side_plan(&data, None)?;
-                if !ignore_local && is_reliable_type(ty) && !is_internal_control_type(ty) {
-                    let should_track_end_to_end = {
-                        let st = self.state.lock();
-                        sides
-                            .iter()
-                            .copied()
-                            .any(|side| Self::side_supports_end_to_end_reliable_locked(&st, side))
-                    };
-                    if should_track_end_to_end {
-                        self.register_end_to_end_reliable_tx(&data)?;
+                if !ignore_local && !is_internal_control_type(ty) {
+                    #[cfg(feature = "discovery")]
+                    {
+                        let pending = {
+                            let st = self.state.lock();
+                            let mut pending =
+                                self.expected_end_to_end_destinations_locked(&st, &data)?;
+                            self.filter_trackable_end_to_end_destinations_locked(
+                                &st,
+                                ty,
+                                &mut pending,
+                            );
+                            pending
+                        };
+                        if !pending.is_empty() {
+                            let mut targets: Vec<u64> = pending.keys().copied().collect();
+                            targets.sort_unstable();
+                            targets.dedup();
+                            data = self.attach_wire_contract_to_item(data, &targets)?;
+                            self.register_end_to_end_reliable_tx(&data)?;
+                        }
                     }
                 }
+                let RemoteSidePlan::Target(sides) = self.remote_side_plan(&data, None)?;
                 for (idx, side) in sides.iter().copied().enumerate() {
-                    if let Err(e) = self.send_reliable_to_side(side, data.clone()) {
+                    if let Err(e) = self.send_reliable_to_side(side, data.clone(), false) {
                         if Self::is_side_tx_busy(&e) {
                             for retry_side in sides[idx..].iter().copied() {
                                 self.tx_queue_item_with_flags(
@@ -5483,11 +9995,16 @@ impl Router {
                         }
                         match &data {
                             RouterItem::Packet(pkt) => {
-                                let _ = self.handle_callback_error(pkt, None, e);
+                                let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                             }
-                            RouterItem::Serialized(bytes) => {
-                                if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
-                                    let _ = self.handle_callback_error_from_env(&env, None, e);
+                            RouterItem::Packed(bytes) => {
+                                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                                    let _ = self.handle_callback_error_from_env(
+                                        &env,
+                                        None,
+                                        e,
+                                        called_from_queue,
+                                    );
                                 }
                             }
                         }
@@ -5496,33 +10013,53 @@ impl Router {
                 }
             }
             RouterTxItem::ToSide { src, dst, data } => {
+                self.ensure_e2e_policy_supported_for_type(Self::item_data_type(&data)?)?;
+                if let RouterItem::Packet(pkt) = &data
+                    && !is_internal_control_type(pkt.data_type())
+                {
+                    self.remember_managed_variable_packet(pkt)?;
+                }
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {
                         return Ok(());
                     }
                     let suppress_local = matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        || matches!(&data, RouterItem::Serialized(bytes)
-                            if serialize::peek_envelope(bytes.as_ref())
+                        || matches!(&data, RouterItem::Packed(bytes)
+                            if wire_format::peek_envelope(bytes.as_ref())
                                 .map(|env| is_internal_control_type(env.ty))
                                 .unwrap_or(false));
                     if !suppress_local {
-                        self.dispatch_local_for_item(&data)?;
+                        self.dispatch_local_for_item(&data, called_from_queue)?;
                     }
                 }
                 let allowed = {
-                    let st = self.state.lock();
+                    let mut st = self.state.lock();
                     let ty = match &data {
                         RouterItem::Packet(pkt) => Some(pkt.data_type()),
-                        RouterItem::Serialized(bytes) => {
-                            Some(serialize::peek_envelope(bytes.as_ref())?.ty)
+                        RouterItem::Packed(bytes) => {
+                            Some(wire_format::peek_envelope(bytes.as_ref())?.ty)
                         }
                     };
-                    self.route_allowed_locked(&st, src, ty, dst)
+                    let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
+                    #[cfg(all(feature = "discovery", feature = "timesync"))]
+                    let timesync_allowed = ty
+                        .map(|ty| {
+                            Self::timesync_allowed_for_side_locked(
+                                &mut st,
+                                dst,
+                                ty,
+                                self.clock.now_ms(),
+                            )
+                        })
+                        .unwrap_or(true);
+                    #[cfg(not(all(feature = "discovery", feature = "timesync")))]
+                    let timesync_allowed = true;
+                    route_allowed && timesync_allowed
                 };
                 if !allowed {
                     return Ok(());
                 }
-                if let Err(e) = self.send_reliable_to_side(dst, data.clone()) {
+                if let Err(e) = self.send_reliable_to_side(dst, data.clone(), src.is_some()) {
                     if Self::is_side_tx_busy(&e) {
                         self.tx_queue_item_with_flags(
                             RouterTxItem::ToSide { src, dst, data },
@@ -5532,11 +10069,16 @@ impl Router {
                     }
                     match &data {
                         RouterItem::Packet(pkt) => {
-                            let _ = self.handle_callback_error(pkt, None, e);
+                            let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                         }
-                        RouterItem::Serialized(bytes) => {
-                            if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
-                                let _ = self.handle_callback_error_from_env(&env, None, e);
+                        RouterItem::Packed(bytes) => {
+                            if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                                let _ = self.handle_callback_error_from_env(
+                                    &env,
+                                    None,
+                                    e,
+                                    called_from_queue,
+                                );
                             }
                         }
                     }
@@ -5553,7 +10095,7 @@ impl Router {
                     sides = fallback_sides;
                 }
                 for (idx, side) in sides.iter().copied().enumerate() {
-                    if let Err(e) = self.send_reliable_to_side(side, data.clone()) {
+                    if let Err(e) = self.send_reliable_to_side(side, data.clone(), false) {
                         if Self::is_side_tx_busy(&e) {
                             for retry_side in sides[idx..].iter().copied() {
                                 self.tx_queue_item_with_flags(
@@ -5569,11 +10111,16 @@ impl Router {
                         }
                         match &data {
                             RouterItem::Packet(pkt) => {
-                                let _ = self.handle_callback_error(pkt, None, e);
+                                let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                             }
-                            RouterItem::Serialized(bytes) => {
-                                if let Ok(env) = serialize::peek_envelope(bytes.as_ref()) {
-                                    let _ = self.handle_callback_error_from_env(&env, None, e);
+                            RouterItem::Packed(bytes) => {
+                                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                                    let _ = self.handle_callback_error_from_env(
+                                        &env,
+                                        None,
+                                        e,
+                                        called_from_queue,
+                                    );
                                 }
                             }
                         }
@@ -5582,7 +10129,7 @@ impl Router {
                 }
             }
             RouterTxItem::ReliableReplay { dst, bytes } => {
-                let frame = serialize::peek_frame_info(bytes.as_ref())?;
+                let frame = wire_format::peek_frame_info(bytes.as_ref())?;
                 let ty = frame.envelope.ty;
                 let Some(hdr) = frame.reliable else {
                     return Ok(());
@@ -5594,7 +10141,7 @@ impl Router {
                         return Ok(());
                     }
                 }
-                if let Err(e) = self.send_reliable_raw_to_side(dst, bytes.clone()) {
+                if let Err(e) = self.send_reliable_raw_to_side(dst, bytes.clone(), false) {
                     if Self::is_side_tx_busy(&e) {
                         self.tx_queue_item_with_flags(
                             RouterTxItem::ReliableReplay { dst, bytes },
@@ -5619,21 +10166,21 @@ impl Router {
     /// Transmit a telemetry item immediately (remote + local).
     #[inline]
     fn tx_item(&self, item: RouterTxItem) -> TelemetryResult<()> {
-        self.tx_item_impl(item, false)
+        self.tx_item_impl(item, false, false)
     }
 
     // ---------- PUBLIC API: RX immediate ----------
 
-    /// Process serialized bytes immediately as locally-originated input.
+    /// Process packed bytes immediately as locally-originated input.
     ///
     /// If this call occurs while a side TX callback is already on the stack, the bytes are queued
     /// instead of being processed re-entrantly.
     #[inline]
-    pub fn rx_serialized(&self, bytes: &[u8]) -> TelemetryResult<()> {
+    pub fn rx_packed(&self, bytes: &[u8]) -> TelemetryResult<()> {
         if self.side_tx_active() {
-            return self.rx_serialized_queue(bytes);
+            return self.rx_packed_queue(bytes);
         }
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let data = RouterItem::Packed(Arc::from(bytes));
         let item = RouterRxItem {
             src: None,
             priority: Self::router_item_priority(&data)?,
@@ -5679,17 +10226,20 @@ impl Router {
         self.rx_item(&item, false)
     }
 
-    /// Process serialized bytes immediately with an explicit ingress side id.
+    /// Process packed bytes immediately with an explicit ingress side id.
     ///
     /// If this call occurs while a side TX callback is already on the stack, the bytes are queued
     /// instead of being processed re-entrantly.
     #[inline]
-    pub fn rx_serialized_from_side(&self, bytes: &[u8], side: RouterSideId) -> TelemetryResult<()> {
+    pub fn rx_packed_from_side(&self, bytes: &[u8], side: RouterSideId) -> TelemetryResult<()> {
         if self.side_tx_active() {
-            return self.rx_serialized_queue_from_side(bytes, side);
+            return self.rx_packed_queue_from_side(bytes, side);
         }
         self.ensure_side_ingress_enabled(side)?;
-        let data = RouterItem::Serialized(Arc::from(bytes));
+        let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
+            return Ok(());
+        };
+        let data = RouterItem::Packed(decoded);
         let item = RouterRxItem {
             src: Some(side),
             priority: Self::router_item_priority(&data)?,
@@ -5706,22 +10256,26 @@ impl Router {
     /// from inside a side TX callback, the packet is queued instead of being sent re-entrantly.
     #[inline]
     pub fn tx(&self, pkt: Packet) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         if self.side_tx_active() {
             return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)));
         }
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
-    /// Transmit serialized bytes immediately.
+    /// Transmit packed bytes immediately.
     ///
     /// If called from inside a side TX callback, the bytes are queued instead of being sent
     /// re-entrantly.
     #[inline]
-    pub fn tx_serialized(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
+    pub fn tx_packed(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         if self.side_tx_active() {
-            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Serialized(pkt)));
+            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(pkt)));
         }
-        self.tx_item(RouterTxItem::Broadcast(RouterItem::Serialized(pkt)))
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packed(pkt)))
     }
 
     // ---------- PUBLIC API: TX queue ----------
@@ -5729,13 +10283,17 @@ impl Router {
     /// Queue a decoded packet for later transmission.
     #[inline]
     pub fn tx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
-    /// Queue serialized bytes for later transmission.
+    /// Queue packed bytes for later transmission.
     #[inline]
-    pub fn tx_serialized_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
-        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Serialized(data)))
+    pub fn tx_packed_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
+        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(data)))
     }
 
     // ---------- PUBLIC API: logging ----------
@@ -5746,20 +10304,34 @@ impl Router {
     /// width and count. If called from inside a side TX callback, the built packet is queued.
     #[inline]
     pub fn log<T: LeBytes>(&self, ty: DataType, data: &[T]) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         if self.side_tx_active() {
             return self.log_queue(ty, data);
         }
-        log_raw(self.sender, ty, data, self.packet_timestamp_ms(), |pkt| {
-            self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
-        })
+        let sender = self.sender_arc();
+        log_raw(
+            sender.as_ref(),
+            ty,
+            data,
+            self.packet_timestamp_ms(),
+            |pkt| self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt))),
+        )
     }
 
     /// Build a packet from typed elements and queue it for later transmission.
     #[inline]
     pub fn log_queue<T: LeBytes>(&self, ty: DataType, data: &[T]) -> TelemetryResult<()> {
-        log_raw(self.sender, ty, data, self.packet_timestamp_ms(), |pkt| {
-            self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
-        })
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
+        let sender = self.sender_arc();
+        log_raw(
+            sender.as_ref(),
+            ty,
+            data,
+            self.packet_timestamp_ms(),
+            |pkt| self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt))),
+        )
     }
 
     /// Build a packet with an explicit timestamp and send it immediately.
@@ -5770,10 +10342,13 @@ impl Router {
         timestamp: u64,
         data: &[T],
     ) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
         if self.side_tx_active() {
             return self.log_queue_ts(ty, timestamp, data);
         }
-        log_raw(self.sender, ty, data, timestamp, |pkt| {
+        let sender = self.sender_arc();
+        log_raw(sender.as_ref(), ty, data, timestamp, |pkt| {
             self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
         })
     }
@@ -5786,7 +10361,10 @@ impl Router {
         timestamp: u64,
         data: &[T],
     ) -> TelemetryResult<()> {
-        log_raw(self.sender, ty, data, timestamp, |pkt| {
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
+        let sender = self.sender_arc();
+        log_raw(sender.as_ref(), ty, data, timestamp, |pkt| {
             self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
         })
     }

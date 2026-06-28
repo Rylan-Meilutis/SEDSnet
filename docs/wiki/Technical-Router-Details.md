@@ -1,7 +1,7 @@
 # Router Details (Technical)
 
 This page dives into the Router internals in
-src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/router.rs))
+src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/router.rs))
 and how routing decisions are made.
 
 ## Router configuration
@@ -16,18 +16,18 @@ and how routing decisions are made.
 Handlers are typed:
 
 - `EndpointHandlerFn::Packet`: receives `Packet`.
-- `EndpointHandlerFn::Serialized`: receives raw bytes (already on wire).
+- `EndpointHandlerFn::Packed`: receives raw bytes (already on wire).
 
 ## Side model
 
 The router uses **named sides** (UART/CAN/RADIO/etc.) instead of LinkId.
 
-- You register sides with `add_side_serialized(...)` or `add_side_packet(...)`.
+- You register sides with `add_side_packed(...)` or `add_side_packet(...)`.
 - Side IDs remain stable after registration; removed sides become inactive tombstones.
-- As of v3.0.0, side tracking is internal. Most apps use `rx_serialized` / `rx` without
+- As of v3.0.0, side tracking is internal. Most apps use `rx_packed` / `rx` without
   threading side IDs through their handlers.
 - Side-aware RX functions can still tag an ingress side when you must override it:
-  `rx_serialized_from_side` / `rx_from_side`.
+  `rx_packed_from_side` / `rx_from_side`.
 - `Router` now starts from the same full-mesh forwarding model as `Relay`.
 - Runtime controls then shape the graph with per-side ingress/egress policy and per-path route
   overrides for `(local TX or source side) -> destination side`.
@@ -52,7 +52,7 @@ Reliable delivery (`reliable: true` / `reliable_mode` in the schema) is only app
 
 - the router config enables reliable (`RouterConfig::with_reliable_enabled(true)`), and
 - the side is marked reliable (`RouterSideOptions { reliable_enabled: true }`), and
-- the side handler is **serialized** (internal reliable control packets travel on the wire).
+- the side handler is **packed** (internal reliable control packets travel on the wire).
 
 `RouterSideOptions` defaults to `reliable_enabled: false`, so reliability is opt-in per side.
 
@@ -62,14 +62,18 @@ If a side is already reliable (e.g., TCP), disable reliability on that side to a
 
 With the `discovery` feature enabled, the router has a built-in internal control path:
 
-- `DISCOVERY` endpoint and `DISCOVERY_ANNOUNCE` type are built in.
-- When `timesync` is also enabled, `DISCOVERY_TIMESYNC_SOURCES` is also built in.
-- `DISCOVERY_TOPOLOGY` is also built in and carries the transitive router graph.
+- `SEDSNET_DISCOVERY` endpoint and `SEDSNET_DISCOVERY_ANNOUNCE` type are built in.
+- When `timesync` is also enabled, `SEDSNET_DISCOVERY_TIMESYNC_SOURCES` is also built in.
+- `SEDSNET_DISCOVERY_TOPOLOGY` is also built in and carries the transitive router graph.
+- `SEDSNET_DISCOVERY_ADDRESS` carries hostname/address ownership for P2P service routing.
+- `SEDSNET_DISCOVERY_LEAVE` lets a planned shutdown prune topology immediately.
 - Discovery packets are handled internally, not through user endpoint handlers.
 - The router keeps soft-state reachability data per side:
   reachable endpoints, reachable time source sender IDs, per-announcer router graphs, and
   last-seen timestamps.
-- Unknown or expired routes fall back to ordinary flood behavior.
+- Once discovery topology exists, unknown user-data routes are not blindly flooded. Discovery and
+  other control traffic still propagate so routes can be learned after startup, partition, or
+  reconnect.
 
 Discovery advertisements are adaptive:
 
@@ -80,19 +84,23 @@ Discovery advertisements are adaptive:
   immediate advertise.
 - Apps can inspect the current learned topology with `export_topology()`.
 
+The concrete discovery and router-internal payload layouts are documented in
+[Technical-Discovery-and-Internal-Formats](Technical-Discovery-and-Internal-Formats).
+
 ## Receive pipeline (rx*)
 
 1) Bytes or packets are accepted immediately or queued.
 2) For reliable types, sequence headers are processed first and internal `RELIABLE_ACK` /
    `RELIABLE_PARTIAL_ACK` / `RELIABLE_PACKET_REQUEST` control packets are consumed here.
 3) Packet ID is computed for dedupe (unreliable / unsequenced frames).
-   - Serialized bytes use `packet_id_from_wire` when possible.
-   - If wire parsing fails, raw bytes are hashed as fallback.
+    - Packed bytes use `packet_id_from_wire` when possible.
+    - If wire parsing fails, raw bytes are hashed as fallback.
 4) Recent‑ID cache drops duplicates.
 5) Local handlers are invoked with retries.
 6) Built-in discovery packets are learned internally when enabled.
-7) Packets that require remote forwarding are forwarded according to the active route rules and the
-   discovery/path-selection state.
+7) Packets that require remote forwarding are forwarded according to the active route rules, the
+   discovery/path-selection state, and any frozen wire-contract destination holder set carried by
+   that packet.
 
 ## Forwarding rules
 
@@ -102,22 +110,29 @@ locally and the active side policy still leaves an eligible remote path.
 With discovery enabled, forwarding also consults the learned side map:
 
 - If candidate sides are known for one or more packet endpoints, the router forwards only to those sides.
-- If no side is known yet, the router falls back to flooding.
+- If the packet carries frozen destination sender hashes from its wire contract, local delivery and remote forwarding are further narrowed to only those intended holders.
+- Once discovery topology exists, user data with no matching known side is not forwarded by
+  fallback. Discovery/control traffic still propagates so routes can be learned, and explicit route
+  policy can still intentionally select a side. Before any discovery topology has been learned,
+  legacy single-side fallback remains available for simple non-discovery deployments.
 - Link-local-only endpoints are only forwarded to sides marked `link_local_enabled: true`.
+- P2P service frames (`SEDSNET_P2P_MESSAGE`) use frozen target-sender hashes and service ports
+  instead of endpoint overlap, so a bound service can receive byte payloads by hostname/address
+  while broadcast telemetry keeps using endpoint subscriptions.
 - If typed route overrides exist for `(source side or local TX, packet type)`, only those enabled
   destination sides remain eligible before path selection and discovery matching are applied.
 - Reliable packets are sent to all known candidate sides for their endpoints.
 - Non-reliable discovered traffic defaults to adaptive one-path load balancing derived from recent
   measured side transmit bandwidth.
-- For time sync traffic, exact discovered source IDs win over generic `TIME_SYNC` endpoint matches
+- For time sync traffic, exact discovered source IDs win over generic `SEDSNET_TIME_SYNC` endpoint matches
   when the router knows which source it currently wants to talk to.
-- Source-side `TIME_SYNC_RESPONSE` traffic is returned to the requesting ingress side rather than
+- Source-side `SEDSNET_TIME_SYNC_RESPONSE` traffic is returned to the requesting ingress side rather than
   broadcast.
 
 ## Transmit pipeline (log*, tx*)
 
-- `log*` builds a packet from typed data, validates it, and serializes it.
-- `tx*` accepts a packet or serialized bytes and forwards them.
+- `log*` builds a packet from typed data, validates it, and packs it.
+- `tx*` accepts a packet or packed bytes and forwards them.
 - Queue variants defer the work until `process_tx_queue()` or `process_all_queues()`.
 - `periodic()` bundles the built-in maintenance polling with queue draining.
 - `periodic_no_timesync()` skips the time-sync maintenance phase while still running discovery and
@@ -126,13 +141,15 @@ With discovery enabled, forwarding also consults the learned side map:
 - `poll_discovery()` queues one only when the adaptive cadence says it is due.
 - `export_topology()` snapshots the current learned route map and announce cadence, including
   discovered time source IDs, the top-level `routers` graph, and per-side announcer detail.
+- `note_side_link_probe_sample()` seeds adaptive path selection from a transport-measured bring-up
+  or runtime probe without emitting synthetic library probe frames.
 
 ## Queue variants and processing
 
 The router exposes immediate and queued APIs for both RX and TX:
 
-- Immediate: `rx*`, `rx_serialized*`, `log*`, `tx*`.
-- Queued: `rx_*_queue`, `rx_serialized_queue`, `log_queue*`, `tx_queue*`.
+- Immediate: `rx*`, `rx_packed*`, `log*`, `tx*`.
+- Queued: `rx_*_queue`, `rx_packed_queue`, `log_queue*`, `tx_queue*`.
 
 Queues are processed using:
 
@@ -214,3 +231,9 @@ When discovery reports multiple eligible paths for the same endpoint set:
 Failover health is driven by the existing discovery reachability TTL plus explicit side removal or
 ingress/egress disable state. When a preferred path expires or is removed, routing automatically
 uses the next eligible path.
+
+For time-sliced radios, return `TelemetryError::Io("side tx busy")` from the side TX callback while
+the radio is in an RX window or otherwise unable to accept a frame. The router/relay keeps the work
+queued and retries during later queue processing. If the radio driver measures a bring-up probe or
+slot throughput, feed that sample into `note_side_link_probe_sample()` so adaptive routing learns
+that the radio has less headroom than Ethernet or other high-rate links.

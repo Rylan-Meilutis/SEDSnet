@@ -5,84 +5,72 @@ look the way they do. It assumes no prior knowledge of the codebase.
 
 ## Goals and constraints
 
-- **Schema-first**: a shared schema defines endpoints, message types, and payload layouts for every language binding.
+- **Runtime schema**: endpoints, message types, and payload layouts live in a runtime registry that can be seeded,
+  queried, exported, and synced between nodes.
 - **Compact on-the-wire representation**: a small header, endpoint bitmaps, and optional compression minimize bandwidth.
 - **Embedded-friendly**: no_std support, bounded queues, and stack/heap tradeoffs.
-- **Multi-language**: C and Python bindings are generated from the same schema.
+- **Multi-language**: Rust, C, and Python expose the same runtime schema and packet APIs.
 - **Deterministic behavior**: validation and dedupe rules are consistent across languages.
 
 ## Module map (what lives where)
 
 -
 
-src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/config.rs)):
-compile-time configuration values plus generated `DataType`/`DataEndpoint` enums.
+src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)):
+compile-time configuration values plus the runtime schema registry for `DataType` and `DataEndpoint` metadata.
 
 -
 
-src/lib.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/lib.rs)):
+src/lib.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/lib.rs)):
 schema metadata (`MessageMeta`, `MessageElement`, `MessageDataType`, `MessageClass`).
 
 -
 
-src/telemetry_packet.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/telemetry_packet.rs)):
-`Packet` validation, formatting, and packet IDs.
+src/packet.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/packet.rs)):
+`Packet` validation, formatting, packet IDs, and migration-safe wire-contract state.
 
 -
 
-src/small_payload.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/small_payload.rs)):
+src/small_payload.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/small_payload.rs)):
 inline-optimized payload storage (`SmallPayload`).
 
 -
 
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/serialize.rs)):
+src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)):
 compact wire format, ULEB128 helpers, envelope peek, packet IDs from wire.
 
 -
 
-src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/router.rs)):
+src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/router.rs)):
 router core, queues, endpoint handlers, side-based routing.
 
 -
 
-src/relay.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/relay.rs)):
+src/relay.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/relay.rs)):
 schema-agnostic fanout relay between sides.
 
 -
 
-src/queue.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/queue.rs)):
+src/queue.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/queue.rs)):
 bounded deque used by router and relay.
 
 -
 
-src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/c_api.rs))
+src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/c_api.rs))
 and
-src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/python_api.rs)):
+src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/python_api.rs)):
 FFI bindings (C ABI and pyo3).
 
-## Schema and metadata pipeline
+## Runtime schema and metadata pipeline
 
-The schema is defined in
-telemetry_config.json ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/telemetry_config.json)) (
-plus built-in `TelemetryError` endpoint/type). At build time:
-
-1)
-
-build.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/build.rs))
-reads the schema to generate C headers and Python `.pyi` stubs.
-
-2) `define_telemetry_schema!` in
-   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/config.rs))
-   expands into Rust enums and metadata tables.
+The registry starts with built-in internal endpoints/types for telemetry errors, reliable control,
+discovery, and time sync. User endpoints and data types are added at runtime through direct APIs,
+optional JSON seeding, handler registration, or discovery schema sync.
 
 Core schema types:
 
-- `DataEndpoint`: enum generated from the `endpoints` list in
-  telemetry_config.json ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/telemetry_config.json))
-  plus built-ins.
-- `DataType`: enum generated from the `types` list in
-  telemetry_config.json ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/telemetry_config.json))
-  plus built-ins.
+- `DataEndpoint`: transparent runtime ID (`u32`) for logical destinations.
+- `DataType`: transparent runtime ID (`u32`) for message types.
 - `MessageMeta`: per-`DataType` metadata (name, element layout, allowed endpoints).
 - `MessageElement`: `Static(count, MessageDataType, MessageClass)` or `Dynamic(MessageDataType, MessageClass)`.
 - `MessageDataType`: primitive element type (Float32, UInt16, String, Binary, etc.).
@@ -90,10 +78,14 @@ Core schema types:
 
 Why these structures exist:
 
-- **MessageMeta is static** so it can be used in `const fn` lookups (`message_meta`, `get_data_type`).
+- **MessageMeta is registry-backed** so it can change as peers add or announce schema over time.
+- **String lookup APIs** (`DataEndpoint::named`, `DataType::named`) keep application code readable while the wire format
+  remains numeric.
 - **MessageElement separates shape from data type** so the same primitive type can be used for static and dynamic
   payloads.
 - **MessageClass is tied to element layout** so formatting and error generation know the intent of the message.
+- **Discovery schema sync** exports endpoint/type definitions, merges compatible remote schema, and resolves conflicts
+  deterministically.
 
 ## Packet (the core runtime type)
 
@@ -105,6 +97,8 @@ Why these structures exist:
 - `endpoints: Arc<[DataEndpoint]>` (destinations; must be non-empty).
 - `timestamp: u64` (ms; treated as uptime below 1e12, or epoch ms otherwise).
 - `payload: StandardSmallPayload` (inline optimized; see below).
+- `wire_shape: Option<MessageElement>` when the frame carried inline decode metadata.
+- `wire_target_senders: Arc<[u64]>` when the frame carried a frozen destination-holder set.
 
 Validation rules enforced by `Packet::new` and `Packet::validate`:
 
@@ -115,9 +109,9 @@ Validation rules enforced by `Packet::new` and `Packet::validate`:
     - String types: trailing NULs are ignored and remaining bytes must be valid UTF-8.
     - Binary types: no UTF-8 requirement (raw bytes).
 
-Packet IDs are **not** serialized. `Packet::packet_id` hashes:
+Packet IDs are **not** packed. `Packet::packet_id` hashes:
 
-- sender bytes
+- compact source address derived from the sender/discovery mapping
 - message name (`DataType` as string)
 - endpoint names (in order)
 - timestamp + data_size (little-endian)
@@ -138,29 +132,17 @@ Why this matters:
 ## Serialization and wire format
 
 The compact v2 wire format is implemented in
-src/serialize.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/src/serialize.rs)).
-A packet is encoded as:
-
-```
-[FLAGS: u8]
-    bit0: payload compressed
-    bit1: sender compressed
-[NEP: u8]                      // number of endpoints (bits set)
-VARINT(ty: u32 as u64)          // ULEB128
-VARINT(data_size: u64)          // logical (uncompressed) payload size
-VARINT(timestamp_ms: u64)
-VARINT(sender_len: u64)         // logical sender length
-[VARINT(sender_wire_len: u64)]  // only if sender compressed
-ENDPOINTS_BITMAP               // 1 bit per DataEndpoint discriminant
-SENDER BYTES                   // raw or compressed
-PAYLOAD BYTES                  // raw or compressed
-```
+src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)).
+A packet is encoded as a compact v2 frame with schema-derived endpoints or an explicit endpoint bitmap, optional wire contract, optional reliable header, payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
 
 Design choices:
 
 - **ULEB128 varints** minimize size for small values.
-- **Endpoint bitmap** avoids repeated endpoint IDs; size is based on `MAX_VALUE_DATA_ENDPOINT`.
-- **Sender/payload compression** uses `zstd` (`zstd-safe`) and is applied only when it makes the payload smaller.
+- **Schema-derived endpoints** omit endpoint bytes when a packet uses the data type's default endpoint set.
+- **Endpoint bitmap** represents custom endpoint sets; width is fixed from `MAX_VALUE_DATA_ENDPOINT`, not from the current runtime registry contents.
+- **Wire contract** carries inline payload shape and frozen destination-holder sender hashes so in-flight packets stay decodable and correctly targeted across topology/schema churn.
+- **Sender/payload compression** is applied independently only when it reduces the wire size.
+- **CRC32 trailer** validates the entire frame before normal decode.
 
 `packet_id_from_wire` parses only as much as needed to compute the same packet ID as `Packet::packet_id`. It
 always hashes **decompressed** sender/payload bytes, so dedupe works across compressed and uncompressed links.
@@ -177,11 +159,11 @@ Router and relay queue storage is built on `BoundedDeque<T>`:
 - Growth policy: multiplicative growth controlled by `QUEUE_GROW_STEP`.
 
 The public `MAX_QUEUE_BUDGET` is shared dynamically across router/relay RX queues, TX queues,
-recent-ID caches, reliable replay/out-of-order buffers, and discovery topology state. Recent-ID
-caches preallocate their final storage at construction and reserve that amount from the shared
-budget immediately. This design keeps memory use bounded and avoids unbounded `VecDeque` growth in
-embedded targets while letting the active part of the system use available queue budget when other
-internal queues are quiet.
+recent-ID caches, reliable replay/out-of-order buffers, discovery topology state, and runtime
+schema registry memory. Recent-ID caches preallocate their final storage at construction and
+reserve that amount from the shared budget immediately. This design keeps memory use bounded and
+avoids unbounded `VecDeque` growth in embedded targets while letting the active part of the system
+use available queue budget when other internal queues are quiet.
 
 ## Router architecture
 
@@ -190,19 +172,19 @@ The router is the main API for logging, receiving, dispatching, and (optionally)
 Key structures:
 
 - `RouterConfig`: holds local `EndpointHandler` definitions in an `Arc<[EndpointHandler]>`.
-- `EndpointHandler`: packet or serialized handler for a specific `DataEndpoint`.
+- `EndpointHandler`: packet or packed handler for a specific `DataEndpoint`.
 - `RouterSideId`: identifies a named side (UART/CAN/RADIO/etc.).
-- `RouterItem`: either `Packet` or serialized bytes.
+- `RouterItem`: either `Packet` or packed bytes.
 
 Receive flow:
 
 1) RX bytes or packet are processed immediately or queued (`rx_*` vs `rx_*_queue`).
 2) Reliable side headers are handled first when the ingress side has reliable delivery enabled.
-3) Packet ID is computed. For serialized bytes, the router tries `packet_id_from_wire` and falls back to hashing raw
+3) Packet ID is computed. For packed bytes, the router tries `packet_id_from_wire` and falls back to hashing raw
    bytes if needed.
 4) If the packet ID is already in the recent cache, it is dropped.
 5) Local endpoint handlers are invoked.
-6) The router forwards the packet according to the current route rules and discovery/path-selection state.
+6) The router forwards the packet according to the current route rules, discovery/path-selection state, and any frozen destination-holder contract attached to the packet.
 
 Forwarding is driven by:
 
@@ -214,8 +196,8 @@ Forwarding is driven by:
 
 Transmit flow:
 
-- `log*` builds a new `Packet` from typed data, validates sizes, and serializes it.
-- `tx*` sends a pre-built `Packet` (validated) or serialized bytes.
+- `log*` builds a new `Packet` from typed data, validates sizes, and packs it.
+- `tx*` sends a pre-built `Packet` (validated) or packed bytes.
 - Queue variants (`*_queue`) defer the work until `process_*_queue`.
 
 Error handling:
@@ -228,7 +210,7 @@ Error handling:
 
 `Relay` is schema-agnostic and purely forwards packets between named sides (UART/CAN/RADIO/etc.).
 
-- Each side registers a TX handler for serialized bytes or full packets.
+- Each side registers a TX handler for packed bytes or full packets.
 - Each side can opt out of reliable sequencing/ACKs (useful for TCP links).
 - The relay maintains RX/TX queues and a recent-ID cache like the router.
 - Fanout clones the `Arc` for payload sharing; it does not decode unless needed for a handler.
@@ -244,8 +226,8 @@ The clock source is injected via the `Clock` trait so embedded builds can supply
 ```
 Producer                      Router/Relay                         Consumer
 --------                      -------------                         --------
-log()/tx()  -> validate -> serialize -> tx(bytes, link) -> transport -> rx_serialized()
-rx(bytes)   -> deserialize -> dedupe -> handlers -> (optional) relay forward
+log()/tx()  -> validate -> pack -> tx(bytes, link) -> transport -> rx_packed()
+rx(bytes)   -> unpack -> dedupe -> handlers -> (optional) relay forward
 ```
 
 If you need build-time or schema details, see [Build-and-Configure](Build-and-Configure) and

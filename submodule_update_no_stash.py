@@ -101,12 +101,12 @@ def is_git_repo(path: Path) -> bool:
 
 
 def main() -> None:
-    # Script lives in <repo_root>/sedsprintf_rs/update_submodule.py
+    # Script lives in <repo_root>/sedsnet/update_submodule.py
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent
     os.chdir(repo_root)
 
-    prefix = "sedsprintf_rs"
+    prefix = "sedsnet"
     submodule_path = repo_root / prefix
 
     # --- Safety checks -----------------------------------------------------

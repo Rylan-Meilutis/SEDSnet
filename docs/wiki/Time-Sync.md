@@ -6,9 +6,9 @@ This page explains the built-in time sync support that ships with the `timesync`
 
 - Enable the `timesync` Cargo feature.
 - Python builds in this repo enable it by default (
-  pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/pyproject.toml))).
+  pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/pyproject.toml))).
 
-When enabled, the build adds the `TIME_SYNC` endpoint (broadcast mode `Always`) plus built-in
+When enabled, the build adds the `SEDSNET_TIME_SYNC` endpoint (broadcast mode `Always`) plus built-in
 time sync packet types in code.
 
 The current model is router-owned:
@@ -18,7 +18,7 @@ The current model is router-owned:
   provide a custom clock).
 - The monotonic clock drives scheduling, request timestamps, holdover, and slew; it is not treated
   as UTC.
-- `TIME_SYNC` traffic is consumed internally by the router. It does not dispatch to normal local
+- `SEDSNET_TIME_SYNC` traffic is consumed internally by the router. It does not dispatch to normal local
   endpoint handlers.
 - Packet timestamps prefer the internal network clock when one is available.
 - The internal clock can merge partial sources, for example date from one source and time-of-day
@@ -36,8 +36,8 @@ All payload fields are `u64` values in little-endian order. Timestamps are in mi
 - `TimeSyncResponse`: `[seq, t1_ms, t2_ms, t3_ms]`
 
 With the `discovery` feature enabled, discovery also adds a built-in
-`DISCOVERY_TIMESYNC_SOURCES` control packet that advertises concrete time source sender IDs.
-The richer `DISCOVERY_TOPOLOGY` packet then attributes those source IDs to specific remote routers
+`SEDSNET_DISCOVERY_TIMESYNC_SOURCES` control packet that advertises concrete time source sender IDs.
+The richer `SEDSNET_DISCOVERY_TOPOLOGY` packet then attributes those source IDs to specific remote routers
 and carries their inter-router connections.
 
 `t4_ms` is captured locally when the response is received; it is not part of the packet payload.
@@ -52,8 +52,8 @@ The router handles the built-in time sync packet types internally:
   source.
 - `TimeSyncResponse` updates the leader's remote sample and steers the local network clock using
   the local monotonic receive time.
-- When discovery is enabled, outbound `TIME_SYNC` traffic prefers exact discovered source paths
-  over generic `TIME_SYNC` endpoint reachability.
+- When discovery is enabled, outbound `SEDSNET_TIME_SYNC` traffic prefers exact discovered source paths
+  over generic `SEDSNET_TIME_SYNC` endpoint reachability.
 - Internally generated `TimeSyncResponse` packets are returned to the requesting ingress side
   instead of being broadcast to every side.
 
@@ -99,13 +99,13 @@ When a complete date+time base exists, the router advances it forward using the 
 
 With both `timesync` and `discovery` enabled:
 
-- discovery advertisements include `TIME_SYNC` endpoint reachability
+- discovery advertisements include `SEDSNET_TIME_SYNC` endpoint reachability
 - routers and relays also advertise reachable time source sender IDs
 - `export_topology()` includes both reachable endpoints and reachable time source IDs per side,
   plus a top-level `routers` graph showing which router owns each source ID and how routers are
   connected
 - a consumer can route requests toward the exact side that leads to its selected source instead of
-  sending requests to every side that merely exposes `TIME_SYNC`
+  sending requests to every side that merely exposes `SEDSNET_TIME_SYNC`
 
 If no exact source route is known yet, routing still falls back to ordinary endpoint-based
 discovery or flooding.
@@ -129,6 +129,11 @@ discovery, and queue draining together. If you need to skip time sync for a cycl
 feature enabled, use `periodic_no_timesync(timeout_ms)`.
 `poll_timesync()` remains available as a lower-level hook when you want to queue only due
 announce/request traffic and manage the surrounding queue processing yourself.
+
+When discovery has measured a side as slow through link-probe or driver timing samples,
+router-managed time sync throttles only that slow egress. Local high-speed segments keep the
+configured normal sync cadence while slow bridge links carry only occasional master-to-master timing
+traffic.
 
 If you want a producer to advertise real UTC, inject that absolute time through the local network
 time setters. The router's timing callback remains monotonic-only.
@@ -174,13 +179,13 @@ Python APIs:
 - `router.set_local_network_datetime_nanos(...)`
 
 These setters are safe to call from multiple threads because the internal clock update is
-serialized by the router. For complete date+time values, the implementation re-samples the
+packed by the router. For complete date+time values, the implementation re-samples the
 monotonic clock at commit so short context switches during the call do not leave the stored time
 stale.
 
 ## API entry points
 
-Rust helpers live in `sedsprintf_rs::timesync`:
+Rust helpers live in `sedsnet::timesync`:
 
 - `TimeSyncConfig`, `TimeSyncRole`, `TimeSyncTracker`
 - `send_timesync_announce`, `send_timesync_request`, `send_timesync_response`
@@ -192,12 +197,12 @@ Example implementations:
 
 -
 
-rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rust-example-code/timesync_example.rs))
+rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs))
 -
-c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/c-example-code/src/timesync_example.c))
+c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c))
 -
-python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/python-example/timesync_example.py))
+python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py))
 -
-rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rtos-example-code/freertos_timesync.c))
+rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c))
 -
-rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsprintf_rs/blob/main/rtos-example-code/threadx_timesync.c))
+rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c))

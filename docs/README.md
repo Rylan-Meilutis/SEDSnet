@@ -11,10 +11,12 @@ Start here:
 - docs/wiki/Overview.md
 - docs/wiki/Concepts.md
 - docs/wiki/Examples.md
+- docs/wiki/Glossary-and-Abbreviations.md
 
 ## How-to guides
 
 - docs/wiki/Build-and-Configure.md
+- docs/wiki/Release-Checklist.md
 - docs/wiki/Usage-Rust.md
 - docs/wiki/Usage-C-Cpp.md
 - docs/wiki/Usage-Python.md
@@ -22,11 +24,12 @@ Start here:
 
 ## Technical reference
 
-- docs/wiki/technical/Index.md
-- docs/wiki/technical/Architecture.md
-- docs/wiki/technical/Telemetry-Schema.md
-- docs/wiki/technical/Wire-Format.md
-- docs/wiki/technical/Router-Details.md
-- docs/wiki/technical/Queues-and-Memory.md
-- docs/wiki/technical/Packet-Details.md
-- docs/wiki/technical/Bindings-and-FFI.md
+- docs/wiki/Technical-Index.md
+- docs/wiki/Technical-Architecture.md
+- docs/wiki/Technical-Telemetry-Schema.md
+- docs/wiki/Technical-Wire-Format.md
+- docs/wiki/Technical-Discovery-and-Internal-Formats.md
+- docs/wiki/Technical-Router-Details.md
+- docs/wiki/Technical-Queues-and-Memory.md
+- docs/wiki/Technical-Packet-Details.md
+- docs/wiki/Technical-Bindings-and-FFI.md

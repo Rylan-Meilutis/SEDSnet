@@ -5,15 +5,24 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import ssl
+from base64 import b64encode
+from getpass import getpass
 from pathlib import Path
 
 # The line pattern in .gitignore we want to temporarily comment out.
 # This is treated as a literal and turned into a whole-line regex.
-PYI_IGNORE_LINE = "python-files/sedsprintf_rs/sedsprintf_rs.pyi"
+PYI_IGNORE_LINE = "python-files/sedsnet/sedsnet.pyi"
 PYI_IGNORE_REGEX = re.compile(rf"^{re.escape(PYI_IGNORE_LINE)}$")
+RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
+PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
 def print_help(error: str | None = None) -> None:
@@ -28,18 +37,21 @@ def print_help(error: str | None = None) -> None:
 Options (can be combined where it makes sense):
   release                 Build in release mode.
   check                   Run `cargo clippy` for default, python, and embedded feature variants with `-D warnings`.
-  test                    Run `cargo test`, a short Criterion benchmark smoke pass, and also validate python + 
+  test                    Run Rust tests, a stable Criterion benchmark smoke pass, and validate python +
   embedded build if cross C toolchain exists.
+  full                    With `test`, also run long-duration Rust tests marked `#[ignore]`.
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
+  cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
   maturin-build           Run `maturin build` with the .pyi .gitignore hack.
   maturin-develop         Run `maturin develop` with the .pyi .gitignore hack.
   maturin-install         Build wheel and install it with `uv pip install`.
+  maturin-login           Validate and store PyPI upload credentials in .sedsnet-release.toml.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
-  schema_path=<path>      Set SEDSPRINTF_RS_SCHEMA_PATH for the build.
-  ipc_schema_path=<path>  Set SEDSPRINTF_RS_IPC_SCHEMA_PATH for a board-local IPC overlay.
+  static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
+  static_ipc_schema_path=<path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for runtime IPC overlay seeding.
   max_queue_budget=<n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
   max_recent_rx_ids=<n>   Set MAX_RECENT_RX_IDS for the preallocated recent-ID cache.
 
@@ -47,10 +59,14 @@ New (compile-time env vars):
   max_stack_payload=<n>   Set MAX_STACK_PAYLOAD for define_stack_payload!(env="MAX_STACK_PAYLOAD", ...).
   env:KEY=VALUE           Set arbitrary environment variable(s) for the build (repeatable).
                           Example: env:MAX_QUEUE_BUDGET=65536 env:QUEUE_GROW_STEP=2.0
-  env:SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD="..."  Optional command used to auto-install
+  env:SEDSNET_INSTALL_C_TOOLCHAIN_CMD="..."  Optional command used to auto-install
                           cross C toolchain when embedded checks need it.
-  env:SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO=0         Disable automatic size-oriented CFLAGS/defines
+  env:SEDSNET_EMBEDDED_CFLAGS_AUTO=0         Disable automatic size-oriented CFLAGS/defines
                           injection for embedded C dependencies.
+  env:SEDSNET_TEST_RUNNER=auto|nextest|cargo Select Rust test runner for `build.py test`.
+                          `auto` uses cargo-nextest when installed and falls back to cargo test.
+                          `build.py test full` includes Rust tests marked `#[ignore]`, so future
+                          soak tests are included automatically.
 
 Special:
   -h, --help, help        Show this help message and exit.
@@ -63,8 +79,10 @@ Examples:
   build.py check
   build.py check release
   build.py test
+  build.py test full
   build.py test release
   build.py maturin-build max_stack_payload=256
+  build.py maturin-login
   build.py maturin-install max_recent_rx_ids=256 env:MAX_STACK_PAYLOAD=128
 """,
         file=out,
@@ -122,19 +140,107 @@ def _fmt_bytes(n: int) -> str:
     return f"{x:.2f} {units[u]}"
 
 
+def _toml_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+def validate_pypi_credentials(username: str, token: str) -> None:
+    auth = b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    body = urllib.parse.urlencode(
+        {
+            ":action": "file_upload",
+            "protocol_version": "1",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        PYPI_LEGACY_UPLOAD_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "SEDSnet-release-helper",
+        },
+    )
+    context = None
+    try:
+        import certifi  # type: ignore[import-not-found]
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = None
+
+    try:
+        urllib.request.urlopen(req, timeout=20, context=context).close()
+    except urllib.error.HTTPError as e:
+        response_body = e.read().decode("utf-8", "replace").lower()
+        if e.code in (401, 403) or "invalid or non-existent authentication" in response_body:
+            raise SystemExit("PyPI rejected the credentials; config was not written.") from e
+        # Valid credentials should get a non-auth upload/form error because this validation
+        # deliberately does not include a distribution file.
+        return
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Could not validate PyPI credentials: {e}") from e
+
+
+def write_maturin_login_config(repo_root: Path) -> None:
+    config_path = repo_root / RELEASE_CONFIG_FILE
+    print(f"Writing PyPI credentials to ignored config: {config_path}")
+    print("Use a PyPI API token. Username defaults to __token__.")
+
+    username = os.environ.get("MATURIN_PYPI_USERNAME", "").strip()
+    token = os.environ.get("MATURIN_PYPI_TOKEN", "").strip()
+
+    if not username and sys.stdin.isatty():
+        entered = input("PyPI username [__token__]: ").strip()
+        username = entered or "__token__"
+    elif not username:
+        username = "__token__"
+
+    if not token and sys.stdin.isatty():
+        token = getpass("PyPI API token: ").strip()
+
+    if not token:
+        raise SystemExit(
+            "No PyPI token provided. Set MATURIN_PYPI_TOKEN or run interactively."
+        )
+
+    print("Validating PyPI credentials before saving...")
+    validate_pypi_credentials(username, token)
+
+    body = "\n".join(
+        [
+            "# Local release credentials. This file is ignored by git.",
+            "[pypi]",
+            f"username = {_toml_string(username)}",
+            f"token = {_toml_string(token)}",
+            "",
+        ]
+    )
+    config_path.write_text(body, encoding="utf-8")
+    config_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    _success(f"Saved PyPI credentials to {config_path}")
+
+
 def shared_lib_name() -> str:
     if sys.platform == "darwin":
-        return "libsedsprintf_rs.dylib"
+        return "libsedsnet.dylib"
     if os.name == "nt":
-        return "sedsprintf_rs.dll"
-    return "libsedsprintf_rs.so"
+        return "sedsnet.dll"
+    return "libsedsnet.so"
 
 
 def print_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> None:
     out_dir = repo_root / "target" / target / profile if target else repo_root / "target" / profile
-    staticlib = out_dir / "libsedsprintf_rs.a"
+    staticlib = out_dir / "libsedsnet.a"
     sharedlib = out_dir / shared_lib_name()
-    rlib = out_dir / "libsedsprintf_rs.rlib"
+    rlib = out_dir / "libsedsnet.rlib"
 
     printed = False
     for p, label in ((staticlib, "staticlib"), (sharedlib, "sharedlib"), (rlib, "rlib")):
@@ -148,9 +254,9 @@ def print_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> None:
 
 def collect_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> dict[str, int]:
     out_dir = repo_root / "target" / target / profile if target else repo_root / "target" / profile
-    staticlib = out_dir / "libsedsprintf_rs.a"
+    staticlib = out_dir / "libsedsnet.a"
     sharedlib = out_dir / shared_lib_name()
-    rlib = out_dir / "libsedsprintf_rs.rlib"
+    rlib = out_dir / "libsedsnet.rlib"
     out: dict[str, int] = {}
     if staticlib.exists():
         out["staticlib"] = staticlib.stat().st_size
@@ -204,7 +310,7 @@ def output_hint_for_cmd(
     if not cmd:
         return None
 
-    if cmd[:2] == ["cargo", "test"]:
+    if cmd[:2] == ["cargo", "test"] or cmd[:3] == ["cargo", "nextest", "run"]:
         # cargo test builds test artifacts (and deps) under target/...
         return f"Build artifacts: {repo_root / 'target'}"
 
@@ -269,6 +375,61 @@ def cargo_lib_build_cmd(
         crate_types.append("cdylib")
     cmd.extend(["--crate-type", ",".join(crate_types)])
     return cmd
+
+
+def cargo_nextest_available(env: dict[str, str]) -> bool:
+    try:
+        subprocess.run(
+            ["cargo", "nextest", "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            env=env,
+        )
+        return True
+    except (FileNotFoundError, PermissionError, OSError, subprocess.CalledProcessError):
+        return False
+
+
+def test_runner_cmds(
+        *,
+        env: dict[str, str],
+        features: list[str],
+        include_ignored: bool = False,
+) -> tuple[str, list[list[str]]]:
+    feature_arg = ",".join(features)
+    runner = env.get("SEDSNET_TEST_RUNNER", "auto").strip().lower()
+    if runner not in ("auto", "nextest", "cargo"):
+        raise SystemExit(
+            "SEDSNET_TEST_RUNNER must be one of: auto, nextest, cargo "
+            f"(got {runner!r})"
+        )
+
+    has_nextest = cargo_nextest_available(env)
+    if runner == "nextest" and not has_nextest:
+        raise SystemExit(
+            "SEDSNET_TEST_RUNNER=nextest was requested, but `cargo nextest` is not installed. "
+            "Install it with `cargo install cargo-nextest --locked` or use SEDSNET_TEST_RUNNER=cargo."
+        )
+
+    if runner == "nextest" or (runner == "auto" and has_nextest):
+        nextest_cmd = ["cargo", "nextest", "run", "--features", feature_arg]
+        if include_ignored:
+            nextest_cmd.extend(["--run-ignored", "all"])
+        return (
+            "cargo nextest",
+            [
+                nextest_cmd,
+                ["cargo", "test", "--doc", "--features", feature_arg],
+            ],
+        )
+
+    if runner == "auto":
+        print("info: cargo-nextest not found; falling back to `cargo test`.")
+    cargo_cmd = ["cargo", "test", "--features", feature_arg]
+    if include_ignored:
+        cargo_cmd.extend(["--", "--include-ignored"])
+    return "cargo test", [cargo_cmd]
 
 
 def run_cmd(
@@ -449,7 +610,7 @@ def try_install_embedded_c_toolchain(target: str, env: dict[str, str]) -> bool:
         return True
 
     # Allow caller/CI to provide an explicit install command.
-    override = env.get("SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD", "").strip()
+    override = env.get("SEDSNET_INSTALL_C_TOOLCHAIN_CMD", "").strip()
     if override:
         cmd = shlex.split(override)
         if not cmd:
@@ -510,8 +671,8 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
     if not target:
         return
 
-    if env.get("SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO", "1") in ("0", "false", "False"):
-        print("info: embedded CFLAGS auto-tuning disabled by SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO.")
+    if env.get("SEDSNET_EMBEDDED_CFLAGS_AUTO", "1") in ("0", "false", "False"):
+        print("info: embedded CFLAGS auto-tuning disabled by SEDSNET_EMBEDDED_CFLAGS_AUTO.")
         return
 
     defaults = [
@@ -540,7 +701,7 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
 
     print(
         "info: applied embedded CFLAGS defaults for size (override with env:CFLAGS... "
-        "or disable via env:SEDSPRINTF_RS_EMBEDDED_CFLAGS_AUTO=0)."
+        "or disable via env:SEDSNET_EMBEDDED_CFLAGS_AUTO=0)."
     )
 
 
@@ -635,7 +796,7 @@ def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root:
     )
 
     wheels_dir = repo_root / "target" / "wheels"
-    wheels = sorted(wheels_dir.glob("sedsprintf_rs-*.whl"))
+    wheels = sorted(wheels_dir.glob("sedsnet-*.whl"))
     if not wheels:
         raise SystemExit(f"No wheels found in {wheels_dir}")
     wheel = wheels[-1]
@@ -671,12 +832,17 @@ def cargo_bench_smoke_cmd() -> list[str]:
     ]
     cmd.extend([
         "--",
+        "--save-baseline",
+        "sedsnet_smoke",
+        "--noplot",
         "--sample-size",
-        "10",
+        "30",
         "--warm-up-time",
-        "0.1",
+        "1",
         "--measurement-time",
-        "0.1",
+        "2",
+        "--noise-threshold",
+        "0.15",
     ])
     return cmd
 
@@ -705,19 +871,19 @@ def run_clippy_checks(
         repo_root: Path,
         build_mode: list[str],
         release_build: bool,
-        build_timesync: bool,
+        feature_parts: list[str],
         target: str,
         start_step: int | None = None,
         total_steps_override: int | None = None,
 ) -> None:
-    feature_suffix = ",timesync" if build_timesync else ""
+    feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
     embedded_target = target or "thumbv7em-none-eabihf"
     can_check_embedded = has_embedded_c_toolchain(embedded_target, env)
     if not can_check_embedded:
         expected = ", ".join(preferred_cross_compilers(embedded_target)) or "CC_<target>/TARGET_CC"
         print(
             "info: embedded cross C toolchain missing; attempting auto-install "
-            "(set SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD to override)."
+            "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
         )
         can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
 
@@ -727,7 +893,7 @@ def run_clippy_checks(
     embedded_step = python_step + 1
 
     run_cmd(
-        cargo_clippy_cmd(build_mode=build_mode, build_args=(["--features", "timesync"] if build_timesync else [])),
+        cargo_clippy_cmd(build_mode=build_mode, build_args=(["--features", ",".join(feature_parts)] if feature_parts else [])),
         env=env,
         repo_root=repo_root,
         title=f"{default_step}/{total_steps} cargo clippy (default)",
@@ -792,13 +958,16 @@ def main(argv: list[str]) -> None:
     build_mode: list[str] = []
     checks = False
     tests = False
+    test_full = False
     build_embedded = False
     build_python = False
     build_timesync = False
+    build_cryptography = False
     build_wheel = False
     develop_wheel = False
     release_build = False
     install_wheel = False
+    maturin_login = False
     target = ""
     device_id = ""
     schema_path = ""
@@ -817,6 +986,9 @@ def main(argv: list[str]) -> None:
         elif arg == "test":
             tests = True
 
+        elif arg == "full":
+            test_full = True
+
         elif arg == "check":
             checks = True
 
@@ -832,6 +1004,10 @@ def main(argv: list[str]) -> None:
             print("Building with time sync helpers.")
             build_timesync = True
 
+        elif arg == "cryptography":
+            print("Building with cryptography provider APIs.")
+            build_cryptography = True
+
         elif arg == "maturin-build":
             print("Building Python wheel.")
             build_wheel = True
@@ -844,6 +1020,9 @@ def main(argv: list[str]) -> None:
             print("Installing Python wheel.")
             install_wheel = True
 
+        elif arg == "maturin-login":
+            maturin_login = True
+
         elif arg.startswith("target="):
             target = arg.split("=", 1)[1]
             print(f"Target set to: {target}")
@@ -852,17 +1031,17 @@ def main(argv: list[str]) -> None:
             device_id = arg.split("=", 1)[1]
             print(f"Device identifier set to: {device_id}")
 
-        elif arg.startswith("schema_path="):
+        elif arg.startswith("static_schema_path=") or arg.startswith("schema_path="):
             schema_path = arg.split("=", 1)[1]
             if not schema_path:
-                print_help("schema_path requires a value")
-            env_overrides["SEDSPRINTF_RS_SCHEMA_PATH"] = schema_path
+                print_help("static_schema_path requires a value")
+            env_overrides["SEDSNET_STATIC_SCHEMA_PATH"] = schema_path
 
-        elif arg.startswith("ipc_schema_path="):
+        elif arg.startswith("static_ipc_schema_path=") or arg.startswith("ipc_schema_path="):
             ipc_schema_path = arg.split("=", 1)[1]
             if not ipc_schema_path:
-                print_help("ipc_schema_path requires a value")
-            env_overrides["SEDSPRINTF_RS_IPC_SCHEMA_PATH"] = ipc_schema_path
+                print_help("static_ipc_schema_path requires a value")
+            env_overrides["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = ipc_schema_path
 
         elif arg.startswith("max_stack_payload="):
             v = arg.split("=", 1)[1].strip()
@@ -902,22 +1081,27 @@ def main(argv: list[str]) -> None:
         else:
             print_help(f"Unknown option: {arg}")
 
+    if test_full and not tests:
+        print_help("full is only valid with test, e.g. `build.py test full`")
+
     env = os.environ.copy()
     if device_id:
         env["DEVICE_IDENTIFIER"] = device_id
-    if tests:
-        if "SEDSPRINTF_RS_SCHEMA_PATH" not in env_overrides and "SEDSPRINTF_RS_SCHEMA_PATH" not in env:
-            env_overrides["SEDSPRINTF_RS_SCHEMA_PATH"] = str(
-                (repo_root / "telemetry_config.test.json").resolve()
-            )
-        if (
-                "SEDSPRINTF_RS_IPC_SCHEMA_PATH" not in env_overrides
-                and "SEDSPRINTF_RS_IPC_SCHEMA_PATH" not in env
-        ):
-            test_ipc_schema = (repo_root / "telemetry_config.ipc.test.json").resolve()
-            if test_ipc_schema.exists():
-                env_overrides["SEDSPRINTF_RS_IPC_SCHEMA_PATH"] = str(test_ipc_schema)
+    if (tests and "SEDSNET_STATIC_SCHEMA_PATH" not in env_overrides and "SEDSNET_STATIC_SCHEMA_PATH" not
+            in env):
+        env_overrides["SEDSNET_STATIC_SCHEMA_PATH"] = str(
+            (repo_root / "telemetry_config.test.json").resolve()
+        )
+    if (tests and "SEDSNET_STATIC_IPC_SCHEMA_PATH" not in env_overrides and
+            "SEDSNET_STATIC_IPC_SCHEMA_PATH" not in env):
+        test_ipc_schema = (repo_root / "telemetry_config.ipc.test.json").resolve()
+        if test_ipc_schema.exists():
+            env_overrides["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = str(test_ipc_schema)
     _apply_env_overrides(env, env_overrides)
+
+    if maturin_login:
+        write_maturin_login_config(repo_root)
+        return
 
     if release_build:
         build_mode = ["--release"]
@@ -925,12 +1109,17 @@ def main(argv: list[str]) -> None:
     # ---- CHECK MODE: lint default + python + embedded variants ----
     if checks:
         _banner("CHECK MODE")
+        feature_parts = []
+        if build_timesync:
+            feature_parts.append("timesync")
+        if build_cryptography:
+            feature_parts.append("cryptography")
         run_clippy_checks(
             env=env,
             repo_root=repo_root,
             build_mode=build_mode,
             release_build=release_build,
-            build_timesync=build_timesync,
+            feature_parts=feature_parts,
             target=target,
         )
         _success("All clippy checks passed.")
@@ -939,14 +1128,17 @@ def main(argv: list[str]) -> None:
     # ---- TEST MODE: also validate embedded + python builds ----
     if tests:
         _banner("TEST MODE")
-        feature_suffix = ",timesync" if build_timesync else ""
+        feature_parts = ["timesync"]
+        if build_cryptography:
+            feature_parts.append("cryptography")
+        feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
         embedded_target = target or "thumbv7em-none-eabihf"
         can_check_embedded = has_embedded_c_toolchain(embedded_target, env)
         if not can_check_embedded:
             expected = ", ".join(preferred_cross_compilers(embedded_target)) or "CC_<target>/TARGET_CC"
             print(
                 "info: embedded cross C toolchain missing; attempting auto-install "
-                "(set SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD to override)."
+                "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
         total_steps = 7 if can_check_embedded else 6
@@ -956,36 +1148,46 @@ def main(argv: list[str]) -> None:
             repo_root=repo_root,
             build_mode=build_mode,
             release_build=release_build,
-            build_timesync=build_timesync,
+            feature_parts=feature_parts,
             target=target,
             start_step=1,
             total_steps_override=total_steps,
         )
         _success("Clippy checks passed.")
 
-        run_cmd(
-            ["cargo", "test", "--features", "timesync"],
+        runner_name, test_cmds = test_runner_cmds(
             env=env,
-            repo_root=repo_root,
-            title=f"4/{total_steps} cargo test",
-            release_build=release_build,
+            features=feature_parts,
+            include_ignored=test_full,
         )
+        for idx, cmd in enumerate(test_cmds):
+            title_suffix = runner_name if idx == 0 else "cargo test (doctests)"
+            run_cmd(
+                cmd,
+                env=env,
+                repo_root=repo_root,
+                title=f"4/{total_steps} {title_suffix}",
+                release_build=release_build,
+            )
         _success("Tests passed.")
+
+        next_step = 5
 
         run_cmd(
             cargo_bench_smoke_cmd(),
             env=env,
             repo_root=repo_root,
-            title=f"5/{total_steps} cargo bench (smoke)",
+            title=f"{next_step}/{total_steps} cargo bench (smoke)",
             release_build=True,
         )
         _success("Benchmark smoke pass finished.")
+        next_step += 1
 
         run_cmd(
             ["cargo", "build", "--features", f"python{feature_suffix}", *build_mode],
             env=env,
             repo_root=repo_root,
-            title=f"6/{total_steps} cargo build (python feature)",
+            title=f"{next_step}/{total_steps} cargo build (python feature)",
             release_build=release_build,
         )
         _success(f"Python-feature build finished. Output is under: {repo_root / 'target'}")
@@ -994,6 +1196,7 @@ def main(argv: list[str]) -> None:
             target=target,
             profile="release" if release_build else "debug",
         )
+        next_step += 1
 
         if can_check_embedded:
             ensure_rust_target_installed(embedded_target)
@@ -1026,7 +1229,7 @@ def main(argv: list[str]) -> None:
                 ],
                 env=env,
                 repo_root=repo_root,
-                title=f"7/{total_steps} cargo build (embedded feature)",
+                title=f"{next_step}/{total_steps} cargo build (embedded feature)",
                 target=embedded_target,
                 release_build=release_build,
                 embedded_profile=uses_custom_profile,
@@ -1050,7 +1253,12 @@ def main(argv: list[str]) -> None:
 
     build_args: list[str] = []
     embedded_profile = False
-    feature_suffix = ",timesync" if build_timesync else ""
+    feature_parts = []
+    if build_timesync:
+        feature_parts.append("timesync")
+    if build_cryptography:
+        feature_parts.append("cryptography")
+    feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
     build_shared = not build_embedded and not build_python
 
     if build_embedded:
@@ -1062,7 +1270,7 @@ def main(argv: list[str]) -> None:
             expected = ", ".join(preferred_cross_compilers(target)) or "CC_<target>/TARGET_CC"
             print(
                 "info: embedded cross C toolchain missing; attempting auto-install "
-                "(set SEDSPRINTF_RS_INSTALL_C_TOOLCHAIN_CMD to override)."
+                "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             if not try_install_embedded_c_toolchain(target, env):
                 print(
@@ -1143,8 +1351,8 @@ def main(argv: list[str]) -> None:
     # default: plain cargo build
     if target:
         build_args = ["--target", target]
-    if build_timesync:
-        build_args.extend(["--features", "timesync"])
+    if feature_parts:
+        build_args.extend(["--features", ",".join(feature_parts)])
 
     run_cmd(
         cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=build_shared),

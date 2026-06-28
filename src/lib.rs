@@ -6,33 +6,30 @@
 // Therefore, if you are trying to optimize
 // this routine, and it fails (it most surely will),
 // please increase this counter as a warning for the next person:
-// total hours wasted on this project = 1582
+// total hours wasted on this project = 3154
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unused_doc_comments)]
-//! Crate root: common telemetry types, error codes, and feature-gated glue.
+//! SEDSnet is a compact networking stack for embedded and host telemetry systems.
 //!
-//! This module:
-//! - Sets up `no_std` vs `std` behavior.
-//! - Provides an embedded allocator / panic handler when targeting bare metal.
-//! - Re-exports core telemetry configuration and metadata helpers
-//!   (`MessageElementCount`, `MessageMeta`, `TelemetryError`, etc.).
-//! - Wires in the C and Python FFI layers (`c_api`, `python_api`).
+//! It provides runtime schema registration, compact packet packing, discovery-driven routing,
+//! reliable delivery, managed state synchronization, time synchronization, P2P service ports and
+//! streams, optional E2E payload cryptography, and C/Python bindings.
 //!
 //! Most user-facing APIs live in:
 //! - [`config`]: schema + data type/endpoint configuration.
-//! - [`router`]: the core Router abstraction.
+//! - [`router`]: routers, relays, sides, discovery, routing policy, P2P, and managed variables.
 //! - [`packet`]: `Packet` and friends.
-//! - [`serialize`]: wire serialization helpers.
+//! - [`wire_format`]: packet packing, unpacking, and wire inspection helpers.
 //!
-//! Version 3.3.0 highlights:
-//! - Optional built-in discovery control traffic for routers and relays, with learned reachability,
-//!   adaptive discovery cadence, and topology export.
-//! - Selective forwarding informed by discovered routes, with flood fallback when topology is incomplete.
-//! - Link-local/software-bus endpoint support for IPC, including per-side discovery filtering and routing isolation.
-//! - Board-local IPC schema overlays via `SEDSPRINTF_RS_IPC_SCHEMA_PATH` so shared schemas can remain constant across
-//!   boards while local IPC endpoints/types vary.
-//! - Split-file telemetry schema editing in the GUI editor for shared base schemas and per-board IPC overlays.
+//! Version 4.0.0 highlights:
+//! - Telemetry endpoints and data types are runtime IDs with process-local registry metadata.
+//! - The build no longer reads `telemetry_config.json` or generates schema-specific Rust enums.
+//! - A JSON schema can still seed the runtime registry with `SEDSNET_STATIC_SCHEMA_PATH`.
+//! - Nodes can export known endpoints/types, sync schemas through discovery, and register new
+//!   schema entries over time.
+//! - Discovery assigns compact node addresses and hostnames for P2P service traffic while
+//!   broadcast endpoint telemetry continues to use endpoint subscriptions.
 
 extern crate alloc;
 extern crate core;
@@ -42,8 +39,8 @@ extern crate std;
 use std::io::Error;
 
 use crate::config::{
-    get_endpoint_meta, get_message_meta, DataEndpoint, DataType, STATIC_HEX_LENGTH,
-    STATIC_STRING_LENGTH,
+    DataEndpoint, DataType, STATIC_HEX_LENGTH, STATIC_STRING_LENGTH, get_endpoint_meta,
+    get_message_meta, max_data_type_id, max_endpoint_id,
 };
 use crate::macros::{ReprI32Enum, ReprU32Enum};
 use alloc::string::ToString;
@@ -51,7 +48,6 @@ use alloc::sync::Arc;
 use core::fmt::Formatter;
 use core::mem::size_of;
 use core::ops::Mul;
-use strum::EnumCount;
 
 // ============================================================================
 //  Test / Python FFI modules (std-only)
@@ -169,6 +165,9 @@ mod embedded_alloc {
 
 mod c_api;
 pub mod config;
+#[cfg(feature = "cryptography")]
+pub mod crypto;
+pub mod diagnostics;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 mod lock;
@@ -177,28 +176,50 @@ pub mod packet;
 mod queue;
 pub mod relay;
 pub mod router;
-pub mod serialize;
 mod small_payload;
 #[cfg(feature = "timesync")]
 pub mod timesync;
+pub mod wire_format;
 // ============================================================================
 //  Schema-derived global constants
 // ============================================================================
 
 /// Maximum enum value for `DataEndpoint` (inclusive), derived from the schema.
-pub const MAX_VALUE_DATA_ENDPOINT: u32 = (DataEndpoint::COUNT - 1) as u32;
+pub const MAX_VALUE_DATA_ENDPOINT: u32 = 255;
 
 /// Maximum enum value for `DataType` (inclusive), derived from the schema.
-pub const MAX_VALUE_DATA_TYPE: u32 = (DataType::COUNT - 1) as u32;
+pub const MAX_VALUE_DATA_TYPE: u32 = 4095;
 
 /// Maximum enum value for `RouteSelectionMode` (inclusive).
 pub const MAX_VALUE_ROUTE_SELECTION_MODE: i32 = 2;
 
-/// Implement `ReprU32Enum` helpers for `DataType`.
-impl_repr_u32_enum!(DataType, MAX_VALUE_DATA_TYPE);
+impl ReprU32Enum for DataType {
+    const MAX: u32 = MAX_VALUE_DATA_TYPE;
 
-/// Implement `ReprU32Enum` helpers for `DataEndpoint`.
-impl_repr_u32_enum!(DataEndpoint, MAX_VALUE_DATA_ENDPOINT);
+    #[inline]
+    fn from_u32(x: u32) -> Option<Self> {
+        DataType::try_from_u32(x)
+    }
+}
+
+impl ReprU32Enum for DataEndpoint {
+    const MAX: u32 = MAX_VALUE_DATA_ENDPOINT;
+
+    #[inline]
+    fn from_u32(x: u32) -> Option<Self> {
+        DataEndpoint::try_from_u32(x)
+    }
+}
+
+#[inline]
+pub fn current_max_endpoint_id() -> u32 {
+    max_endpoint_id()
+}
+
+#[inline]
+pub fn current_max_data_type_id() -> u32 {
+    max_data_type_id()
+}
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -345,9 +366,12 @@ pub const fn parse_u128(s: &str) -> u128 {
 // ============================================================================
 //  Message metadata (element counts, data types, sizes)
 // ============================================================================
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct EndpointMeta {
     /// Static name of the endpoint
     name: &'static str,
+    /// Human-readable description used by schema lookup APIs.
+    description: &'static str,
     /// Restrict remote forwarding to link-local/software-bus sides only.
     link_local_only: bool,
 }
@@ -360,6 +384,12 @@ impl EndpointMeta {
     /// external tooling.
     pub fn as_str(&self) -> &'static str {
         self.name
+    }
+
+    /// Return the human-readable endpoint description.
+    #[inline]
+    pub fn description(&self) -> &'static str {
+        self.description
     }
 
     /// Return whether this endpoint is restricted to link-local/software-bus sides.
@@ -377,6 +407,11 @@ impl DataEndpoint {
     /// external tooling.
     pub fn as_str(&self) -> &'static str {
         get_endpoint_meta(*self).name
+    }
+
+    /// Return the human-readable endpoint description.
+    pub fn description(&self) -> &'static str {
+        get_endpoint_meta(*self).description
     }
 
     /// Return whether this endpoint is restricted to link-local/software-bus sides.
@@ -430,10 +465,23 @@ pub enum ReliableMode {
     Unordered,
 }
 
+/// End-to-end cryptography preference for a data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub enum E2eEncryptionPolicy {
+    /// Send unencrypted unless a router-level policy forces cryptography.
+    PreferOff,
+    /// Encrypt when the local router supports E2E cryptography, but allow plaintext fallback.
+    PreferOn,
+    /// Require E2E cryptography support before sending or locally consuming this type.
+    RequireOn,
+}
+
 /// Static metadata for a message type: element count and valid endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct MessageMeta {
     name: &'static str,
+    /// Human-readable description used by schema lookup APIs.
+    description: &'static str,
     /// How many elements are present (fixed vs dynamic).
     element: MessageElement,
     /// Allowed endpoints for this message type.
@@ -442,12 +490,19 @@ pub struct MessageMeta {
     reliable: ReliableMode,
     /// Queue priority for this type. Higher values are serviced first.
     priority: u8,
+    /// End-to-end cryptography policy for this type.
+    e2e_encryption: E2eEncryptionPolicy,
 }
 
 impl DataType {
     /// Get the string representation of the DataType
-    pub const fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         get_message_meta(*self).name
+    }
+
+    /// Return the human-readable data type description.
+    pub fn description(&self) -> &'static str {
+        get_message_meta(*self).description
     }
 }
 /// Lookup `MessageMeta` for a given [`DataType`] using the generated config.
@@ -462,20 +517,26 @@ pub fn message_meta(ty: DataType) -> MessageMeta {
 
 /// Return whether the given [`DataType`] is configured for reliable delivery.
 #[inline]
-pub const fn is_reliable_type(ty: DataType) -> bool {
+pub fn is_reliable_type(ty: DataType) -> bool {
     !matches!(get_message_meta(ty).reliable, ReliableMode::None)
 }
 
 /// Return the reliable delivery mode for the given [`DataType`].
 #[inline]
-pub const fn reliable_mode(ty: DataType) -> ReliableMode {
+pub fn reliable_mode(ty: DataType) -> ReliableMode {
     get_message_meta(ty).reliable
 }
 
 /// Return the queue priority for the given [`DataType`].
 #[inline]
-pub const fn message_priority(ty: DataType) -> u8 {
+pub fn message_priority(ty: DataType) -> u8 {
     get_message_meta(ty).priority
+}
+
+/// Return the end-to-end cryptography policy for a data type.
+#[inline]
+pub fn message_e2e_encryption_policy(ty: DataType) -> E2eEncryptionPolicy {
+    get_message_meta(ty).e2e_encryption
 }
 
 // ---- Convenience multiplication helpers ----
@@ -532,7 +593,7 @@ pub fn get_needed_message_size(ty: DataType) -> usize {
 /// # Returns
 /// - `MessageType` enum value.
 #[inline]
-pub const fn get_info_type(ty: DataType) -> MessageClass {
+pub fn get_info_type(ty: DataType) -> MessageClass {
     get_message_meta(ty).element.message_type()
 }
 
@@ -543,7 +604,7 @@ pub const fn get_info_type(ty: DataType) -> MessageClass {
 /// # Returns
 /// - `MessageDataType` enum value.
 #[inline]
-pub const fn get_data_type(ty: DataType) -> MessageDataType {
+pub fn get_data_type(ty: DataType) -> MessageDataType {
     get_message_meta(ty).element.data_type()
 }
 
@@ -553,7 +614,7 @@ pub const fn get_data_type(ty: DataType) -> MessageDataType {
 /// # Returns
 /// - Static string name of the message type.
 #[inline]
-pub const fn get_message_name(ty: DataType) -> &'static str {
+pub fn get_message_name(ty: DataType) -> &'static str {
     get_message_meta(ty).name
 }
 
@@ -563,7 +624,7 @@ pub const fn get_message_name(ty: DataType) -> &'static str {
 /// # Returns
 /// - Slice of allowed `DataEndpoint` values.
 #[inline]
-pub const fn endpoints_from_datatype(ty: DataType) -> &'static [DataEndpoint] {
+pub fn endpoints_from_datatype(ty: DataType) -> &'static [DataEndpoint] {
     get_message_meta(ty).endpoints
 }
 
@@ -671,11 +732,14 @@ pub enum TelemetryError {
     /// Generic invalid argument from caller.
     BadArg,
 
-    /// Serialization error.
-    Serialize(&'static str),
+    /// Operation is not permitted for the current router/device policy.
+    PermissionDenied,
 
-    /// Deserialization error.
-    Deserialize(&'static str),
+    /// Packing error.
+    Pack(&'static str),
+
+    /// Unpacking error.
+    Unpack(&'static str),
 
     /// IO / transport error.
     Io(&'static str),
@@ -707,8 +771,9 @@ impl TelemetryError {
             TelemetryError::MissingPayload => TelemetryErrorCode::MissingPayload,
             TelemetryError::HandlerError(_) => TelemetryErrorCode::HandlerError,
             TelemetryError::BadArg => TelemetryErrorCode::BadArg,
-            TelemetryError::Serialize(_) => TelemetryErrorCode::Serialize,
-            TelemetryError::Deserialize(_) => TelemetryErrorCode::Deserialize,
+            TelemetryError::PermissionDenied => TelemetryErrorCode::PermissionDenied,
+            TelemetryError::Pack(_) => TelemetryErrorCode::Pack,
+            TelemetryError::Unpack(_) => TelemetryErrorCode::Unpack,
             TelemetryError::Io(_) => TelemetryErrorCode::Io,
             TelemetryError::InvalidUtf8 => TelemetryErrorCode::InvalidUtf8,
             TelemetryError::TypeMismatch { .. } => TelemetryErrorCode::TypeMismatch,
@@ -769,13 +834,14 @@ pub enum TelemetryErrorCode {
     MissingPayload = -8,
     HandlerError = -9,
     BadArg = -10,
-    Serialize = -11,
-    Deserialize = -12,
-    Io = -13,
-    InvalidUtf8 = -14,
-    TypeMismatch = -15,
-    InvalidLinkId = -16,
-    PacketTooLarge = -17,
+    PermissionDenied = -11,
+    Pack = -12,
+    Unpack = -13,
+    Io = -14,
+    InvalidUtf8 = -15,
+    TypeMismatch = -16,
+    InvalidLinkId = -17,
+    PacketTooLarge = -18,
 }
 
 // Generate ReprI32Enum helpers for TelemetryErrorCode
@@ -790,7 +856,7 @@ impl TelemetryErrorCode {
     pub const MAX: i32 = TelemetryErrorCode::InvalidType as i32;
 
     /// Minimum valid numeric error code value.
-    pub const MIN: i32 = TelemetryErrorCode::Io as i32;
+    pub const MIN: i32 = TelemetryErrorCode::PacketTooLarge as i32;
 
     /// Human-readable string for logging / debugging.
     /// # Returns
@@ -807,8 +873,9 @@ impl TelemetryErrorCode {
             TelemetryErrorCode::MissingPayload => "{Missing Payload}",
             TelemetryErrorCode::HandlerError => "{Handler Error}",
             TelemetryErrorCode::BadArg => "{Bad Arg}",
-            TelemetryErrorCode::Serialize => "{Serialize Error}",
-            TelemetryErrorCode::Deserialize => "{Deserialize Error}",
+            TelemetryErrorCode::PermissionDenied => "{Permission Denied}",
+            TelemetryErrorCode::Pack => "{Pack Error}",
+            TelemetryErrorCode::Unpack => "{Unpack Error}",
             TelemetryErrorCode::Io => "{IO Error}",
             TelemetryErrorCode::InvalidUtf8 => "{Invalid UTF-8}",
             TelemetryErrorCode::TypeMismatch => "{Type Mismatch}",
@@ -849,10 +916,7 @@ pub fn try_enum_from_u32<E: ReprU32Enum>(x: u32) -> Option<E> {
     if x > E::MAX {
         return None;
     }
-
-    // SAFETY: `E` is promised to be a fieldless #[repr(u32)] enum (thus 4 bytes, Copy).
-    let e = unsafe { (&x as *const u32 as *const E).read() };
-    Some(e)
+    E::from_u32(x)
 }
 
 /// Try to convert an `i32` into a `#[repr(i32)]` enum `E`.

@@ -1,6 +1,12 @@
-# SEDSPRINTF_RS
+# SEDSnet
 
-An implementation of the `sedsprintf` telemetry protocol in Rust.
+A Rust networking stack with compact packets, runtime schema, discovery, routing, reliability,
+managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
+bindings for distributed embedded and host systems.
+
+Crate API docs are published on [docs.rs](https://docs.rs/SEDSnet). The implementation-level wiki,
+including wire/discovery formats and binding guides, is mirrored in
+[docs/wiki](./docs/wiki/Home.md) and on the project wiki.
 
 ---
 
@@ -14,8 +20,7 @@ An implementation of the `sedsprintf` telemetry protocol in Rust.
 
 ## About
 
-This library started out as a rewrite of the original sedsprintf C++ library
-found [here](https://github.com/University-at-Buffalo-SEDS/sedsprintf).
+This library started out as a Rust rewrite of the earlier SEDS telemetry C++ implementation.
 
 After the initial rewrite, many improvements were made to the rust implementation including better safety, easier
 extension, and improved performance.
@@ -25,7 +30,7 @@ archived and is no longer being maintained.
 With the Rust version being the sole implementation, we have continued to improve it and add new features like python
 bindings, packet compression, and a bitmap for endpoints to further reduce packet size.
 This library is now being used in multiple projects including embedded code on the rocket and on the rust based ground
-station. Sedsprintf_rs is now capable of acting as a new network, passing telemetry data to endpoints across hardware
+station. SEDSnet is now capable of acting as a new network, passing telemetry data to endpoints across hardware
 and software networks (uart, can ethernet, etc.) and across differing platforms and protocols (tcp, udp, etc.).
 
 ---
@@ -45,22 +50,37 @@ The core functions are as follows:
 - A function to handle local data endpoints (e.g. logging to console, writing to file, sending over radio, etc.)
   (Note: each local endpoint needs its own function)
 
-Sedsprintf_rs also provides helpers to convert the telemetry data into strings for logging purposes.
-The library also handles the serialization and deserialization of the telemetry data.
+SEDSnet also provides helpers to convert the telemetry data into strings for logging purposes.
+The library also handles packing telemetry packets to wire frames and unpacking received frames.
 
-Sedsprintf_rs is platform-agnostic and can be used on any platform that supports Rust. The library is primarily designed
+SEDSnet is platform-agnostic and can be used on any platform that supports Rust. The library is primarily designed
 to be used in embedded systems and used by a C program, but can also be used in desktop applications and other rust
 codebases.
 
-Sedsprintf_rs also supports python bindings via pyo3. to use you need maturin installed to build the python package.
+SEDSnet also supports python bindings via pyo3. to use you need maturin installed to build the python package.
 
 With the optional `discovery` feature, routers and relays can exchange built-in discovery packets, learn which
 endpoints are reachable through which sides, adapt the announce rate as the topology changes, and export a live topology
 snapshot for inspection. When `timesync` is also enabled, discovery can advertise concrete time source sender IDs so
-`TIME_SYNC` requests prefer exact source paths instead of generic endpoint flooding. When a route is known, forwarding
-becomes more selective; when it is not known, the system falls back to ordinary flooding. `DISCOVERY` and `TIME_SYNC`
-are reserved internal router endpoints: applications can use the discovery and time-sync APIs, but must not register
-local endpoint handlers for those endpoints or try to override their built-in handling.
+`SEDSNET_TIME_SYNC` requests prefer exact source paths instead of generic endpoint flooding. Once discovery topology exists,
+unknown user-data routes are not blindly flooded across low-bandwidth links; discovery/control traffic still propagates,
+and explicit route policy can intentionally select a side. `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` are reserved internal router
+endpoints: applications can use the discovery and time-sync APIs, but must not register local endpoint handlers for
+those endpoints or try to override their built-in handling.
+
+Discovery and time-sync maintenance also throttle themselves across measured slow links. Link-probe
+or driver timing samples mark constrained sides, after which routers and relays send mostly minimal
+reachability pings across those sides and reserve full schema/topology/time-source refreshes for a
+much slower cadence. Router-managed time sync keeps its normal cadence on fast sides while each
+measured slow side independently receives sparse time-sync traffic, keeping asymmetric or
+time-sliced radio links available for user payloads.
+
+Discovery also assigns and advertises compact node addresses and hostnames for point-to-point
+service traffic. A router can bind a SEDSnet service port and receive opaque byte payloads targeted
+by hostname or address, or open a P2P stream with connect/accept/data/close events. Protocols such
+as HTTP can be carried over SEDSnet links without IP being the underlying transport. Broadcast
+endpoint delivery remains available for telemetry data types; P2P service frames use discovery
+identity and ports for board-to-board traffic.
 
 Queue memory is bounded by the compile-time `MAX_QUEUE_BUDGET`. Router and relay internals share that budget
 dynamically across RX work, TX work, reliable replay/out-of-order buffers, recent packet ID tracking, and learned
@@ -74,14 +94,63 @@ partial-ACK packets that arrived after a gap, request the missing sequence, and 
 the gap is filled. A partial ACK suppresses timeout retransmission for that exact packet, but an explicit packet request
 can still retransmit it later.
 
-The size of the header in a serialized packet is around 20 bytes (the size will change based on the total number of
-endpoints in your system and the length of the sender string), plus a 4-byte CRC32 trailer. As a rough example, a packet
-containing three floats is on the order of mid-30s bytes total. This small size makes it ideal for use in low bandwidth
-environments.
+Routers can also cache selected data types as managed network variables. A board that restarts can request the current
+cached value and receive it through the normal endpoint handler path instead of waiting for the next publisher update.
+For sensitive state or commands, the default `cryptography` feature lets data types prefer or require end-to-end payload
+cryptography while the application supplies a C provider, Rust provider, OS/hardware crypto wrapper, or registered software key.
+
+When topology or schema changes are propagating, packets already on the wire now carry a compact frozen delivery and
+decode contract. New packets immediately use the latest schema-default endpoint view, while in-flight packets continue to
+route only to their original intended holders and remain decodable against the shape they were packed with. The
+contract is encoded compactly with bitmap-oriented metadata and sender hashes so header growth stays small.
+
+Packed packets use compact varint fields, schema-derived endpoints, a compact source address instead of a repeated
+sender hostname, and optional per-side header templates. Hostnames and endpoint holders are learned through discovery
+and network configuration; the packet header carries only the source address needed for identity/routing. Per-side
+templates can then replace repeated header fields with a compact template ID on small-packet transports, keeping the
+header-to-payload ratio reasonable for small payloads such as three floats or a few `u8` values.
 
 ---
 
 ## Recent changelog milestones
+
+## Version 4.0.0 highlights
+
+- User telemetry schema is now runtime-only. `build.rs` no longer generates Rust enum variants or
+  binding constants from `telemetry_config.json`.
+- Endpoints and data types can be registered, looked up by name, exported, synced through
+  discovery, and removed at runtime.
+- Rust code can use readable runtime references such as `DataEndpoint::named("RADIO")` and
+  `DataType::named("GPS_DATA")` instead of raw numeric IDs.
+- C and Python expose matching schema register/info/info-by-name/remove APIs.
+- Managed network variables let restarted boards request the latest cached state through normal
+  endpoint handlers, and update callbacks can run when an inbound network update changes the cache.
+- Discovery-backed P2P service ports support datagrams and lightweight stream sessions with
+  connect/accept/data/close/reset events for byte protocols that need board-to-board sessions.
+- End-to-end payload cryptography is enabled by default and can be preferred or required per data type;
+  routers choose whether to encrypt required, preferred, or all user data.
+- Crypto providers can be supplied as C callbacks, Rust providers, or registered software fallback
+  keys, and compact managed credentials support master-root deployments without user-managed cert
+  files.
+- Fixed-size packed sides transparently split/reassemble packets for CAN, I2C, and fixed-frame
+  radios, while link-probe samples seed adaptive routing for asymmetric or time-sliced links.
+- Discovery-aware forwarding avoids blind unknown-route user-data flooding once topology exists,
+  protecting low-bandwidth sides unless explicit route policy selects them.
+- Discovery and time-sync control traffic is dynamically throttled per measured slow link, using
+  minimal reachability pings between infrequent full topology/schema refreshes.
+- Routers and relays export topology as a board graph with named endpoint fields, side names,
+  deduplicated `links`, and filtered SEDSnet control endpoints. They also expose memory-layout and
+  per-client stats snapshots for profiling and diagnostics.
+- Routers and relays announce `SEDSNET_DISCOVERY_LEAVE` during explicit leave/shutdown so peers can
+  prune topology immediately instead of waiting for expiry.
+- Optional JSON config is applied at runtime through env/path/bytes APIs. The repo does not carry a
+  default user schema. Embedded users that want compiled-in seed bytes must provide their own local
+  `telemetry_config.json` before building.
+- Schema registry memory counts against the same shared `MAX_QUEUE_BUDGET` as other router/relay
+  queue-backed state.
+- Optional C and C++ convenience wrappers can be enabled from CMake, while raw-ABI users can keep
+  the static runtime-schema header only.
+- Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
 ## Version 3.12.0 highlights
 
@@ -99,7 +168,7 @@ environments.
 
 ## Version 3.11.1 highlights
 
-- Discovery now propagates a full router graph with `DISCOVERY_TOPOLOGY`, so routers and relays
+- Discovery now propagates a full router graph with `SEDSNET_DISCOVERY_TOPOLOGY`, so routers and relays
   keep track of which sender IDs own which endpoints and how remote routers connect to each other.
 - `export_topology()` now includes router-level topology plus per-side announcer detail instead of
   only aggregated reachable endpoint lists.
@@ -139,7 +208,7 @@ environments.
 
 ## Version 3.9.1 highlights
 
-- Reserved the built-in `DISCOVERY` and `TIME_SYNC` endpoints for router-owned control traffic.
+- Reserved the built-in `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` endpoints for router-owned control traffic.
 - User handlers can no longer shadow internal discovery or time-sync behavior through Rust or C
   configuration APIs.
 - Queue timeout handling was tightened so TX/RX work shares nonzero budgets more predictably.
@@ -152,11 +221,11 @@ environments.
 - Added TCP-like reliable delivery for schema types marked `reliable` or `reliable_mode`, with
   ACKs, retransmits, and optional ordering.
 - This established the modern router/reliability model that later releases expanded.
-- Full changelog: [v2.4.0...v3.0.0](https://github.com/Rylan-Meilutis/sedsprintf_rs/compare/v2.4.0...v3.0.0)
+- Full changelog: [v2.4.0...v3.0.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.4.0...v3.0.0)
 
 ## Version 1.0.0 highlights
 
-- First stable release with routing, serialization, and packet creation across Rust, C, and Python.
+- First stable release with routing, packet packing, and packet creation across Rust, C, and Python.
 - Marked the API as stable and established the base wire-format and packet model the later versions
   built on.
 
@@ -177,7 +246,23 @@ Building with python bindings can be done with the build script on posix systems
 
 When building in an embedded environment the library will compile to a static library that can be linked to your C code.
 this library takes up about 100kb of flash and does require heap allocation to be available through either freertos, or
-by creating shims that expose pvPortMalloc and vPortFree.
+by creating providers that expose pvPortMalloc and vPortFree.
+
+
+## Embedded hooks
+
+For embedded integrations, treat the router or relay as a single owner context. The normal application loop should call
+`periodic(...)` and feed ingress bytes into the queued RX APIs.
+
+Rules that matter in practice:
+
+- Do not call router, relay, or packet-to-string APIs from an ISR. Queue the bytes and hand them to a task or worker.
+- If you wrap router calls with a lock, that lock must be recursive-safe because side TX callbacks can trigger deferred
+  queue work in the same logical call chain.
+- `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` are reserved internal endpoints. Do not register local handlers for them and do not emit
+  those packets manually from application code. Use the time-sync and discovery APIs instead.
+- When the `timesync` feature is enabled, `periodic(...)` is the expected maintenance entry point. Only use
+  `poll_timesync(...)` / `poll_discovery(...)` directly when you intentionally need manual phase control.
 
 ### build.py usage
 
@@ -187,7 +272,7 @@ by creating shims that expose pvPortMalloc and vPortFree.
 Options:
   release                 Build in release mode.
   check                   Run cargo clippy with -D warnings for default, python, and embedded builds.
-  test                    Run the clippy checks, cargo tests, a short Criterion benchmark smoke pass, and also validate python plus embedded builds when the cross C toolchain exists.
+  test                    Run the clippy checks, nextest/cargo tests, a stable Criterion benchmark smoke pass, and also validate python plus embedded builds when the cross C toolchain exists.
   embedded                Build for the embedded target (enables embedded feature).
   python                  Build with Python bindings (enables python feature).
   timesync                Build with time sync helpers (enables timesync feature).
@@ -196,8 +281,8 @@ Options:
   maturin-install         Build wheel and install it with uv pip install.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
-  schema_path=<path>      Set SEDSPRINTF_RS_SCHEMA_PATH for the build.
-  ipc_schema_path=<path>  Set SEDSPRINTF_RS_IPC_SCHEMA_PATH for a board-local IPC overlay.
+  static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
+  static_ipc_schema_path=<path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for a runtime IPC/link-local seed.
   max_queue_budget=<n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
   max_recent_rx_ids=<n>   Set MAX_RECENT_RX_IDS for the preallocated recent-ID cache.
   max_stack_payload=<n>   Set MAX_STACK_PAYLOAD for define_stack_payload!(env="MAX_STACK_PAYLOAD", ...).
@@ -226,7 +311,7 @@ Examples:
 ## Performance benchmarking
 
 Criterion benchmarks are available through Cargo benches. The current benchmark targets exercise packet construction,
-serialization, header peeking, deserialization, and router/relay flows that mirror the Rust system-test path under the
+packing, header peeking, unpacking, and router/relay flows that mirror the Rust system-test path under the
 default host feature set.
 
 Run:
@@ -244,14 +329,18 @@ cargo bench --bench packet_paths -- --profile-time=5
 
 `./build.py test` now starts with the same strict clippy checks as `./build.py check`, then runs:
 
-- `cargo test --features timesync`, which includes the unit tests in `src/tests.rs`, the Rust system tests under
+- `cargo nextest run --features timesync` when `cargo-nextest` is installed, otherwise
+  `cargo test --features timesync`, covering the unit tests in `src/tests.rs`, the Rust system tests under
   `tests/rust-system-test/`, and the C integration tests under `tests/c-system-test/`
-- a short Criterion smoke pass for `packet_paths` and `router_system_paths`
+- `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
+- a stable Criterion smoke pass for `packet_paths` and `router_system_paths`
 - a `cargo build` validation for the `python` feature
 - a `cargo build` validation for the `embedded` feature when a matching cross C toolchain is available
 
-The benchmark smoke pass uses Cargo `--profile release`. The C system-test harness waits for all asserted endpoint hits
-before exiting, so it does not fail early while one side is still draining forwarded traffic.
+The benchmark smoke pass uses Cargo `--profile release`, saves into a dedicated `sedsnet_smoke` baseline, disables
+plot generation, and uses a longer timing window plus a wider smoke-test noise threshold so host variance does not print
+alternating regression/improvement noise. The C system-test harness waits for all asserted endpoint hits before exiting,
+so it does not fail early while one side is still draining forwarded traffic.
 
 Coverage is regression-oriented rather than percentage-gated in CI today. If you want a local line/branch coverage
 number, the supported path is:
@@ -271,49 +360,59 @@ More detail on the test layers, what each suite covers, and the intended command
 
 ```
 # Example: building for an embedded target
-set(SEDSPRINTF_RS_TARGET "thumbv7m-none-eabi" CACHE STRING "" FORCE)
-set(SEDSPRINTF_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_TARGET "thumbv7m-none-eabi" CACHE STRING "" FORCE)
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
 
 # Optional: always build the Rust crate in release mode, even if the parent CMake
 # configuration is Debug. Useful when your top-level project stays Debug but you
 # want an optimized telemetry library.
-# set(SEDSPRINTF_RS_FORCE_RELEASE ON CACHE BOOL "" FORCE)
+# set(SEDSNET_FORCE_RELEASE ON CACHE BOOL "" FORCE)
 
 # set the sender name
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 
 # optional compile-time env overrides
-set(SEDSPRINTF_RS_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
+set(SEDSNET_ENABLE_CRYPTOGRAPHY ON CACHE BOOL "" FORCE)
+
+# optional wrapper targets; leave both OFF to use only the raw static ABI header
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+set(SEDSNET_ENABLE_CPP_WRAPPER OFF CACHE BOOL "" FORCE)
 
 # Use the provided CMake glue
-add_subdirectory(${CMAKE_SOURCE_DIR}/sedsprintf_rs sedsprintf_rs_build)
+add_subdirectory(${CMAKE_SOURCE_DIR}/sedsnet sedsnet_build)
 
 # Optional: prefer static linking even on host builds
-# set(SEDSPRINTF_RS_PREFER_DYNAMIC OFF CACHE BOOL "" FORCE)
+# set(SEDSNET_PREFER_DYNAMIC OFF CACHE BOOL "" FORCE)
 
 # Link against the imported target
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsprintf_rs::sedsprintf_rs)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
+
+# Optional convenience wrappers when enabled above:
+# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::c_wrapper)
+# target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::cpp_wrapper)
 ```
 
 Host CMake builds now prefer the shared Rust library when supported. Embedded builds still use the static library.
 If you want the Rust crate to use the release profile regardless of the parent CMake config,
-set `SEDSPRINTF_RS_FORCE_RELEASE=ON` before `add_subdirectory(...)`. Otherwise the wrapper follows
+set `SEDSNET_FORCE_RELEASE=ON` before `add_subdirectory(...)`. Otherwise the wrapper follows
 `CMAKE_BUILD_TYPE` for single-config generators and defaults to debug for Debug builds.
 
-- Configure telemetry schema via `telemetry_config.json` (endpoints + message types). The Rust enum metadata is
-  generated
-  from this JSON by `define_telemetry_schema!` in `src/config.rs`.
-  NOTE: (ON EVERY SYSTEM THIS LIBRARY IS USED, THE CONFIG ENUMS MUST BE THE SAME OR UNDEFINED BEHAVIOR MAY OCCUR). So
-  for
-  most applications I would recommend making a fork and setting the config values you need for your application.
+- Configure telemetry schema at runtime. The default build contains only built-in internal
+  endpoints/types for telemetry errors, reliable control, discovery, and time sync. Applications
+  add user endpoints/types through the runtime APIs, by passing a JSON schema path/bytes to the
+  registry, or by letting discovery sync schema entries from peers.
+- The raw C ABI is always available through the static runtime-schema header. The C and C++
+  convenience wrappers are opt-in CMake targets for projects that want global router/relay helper
+  APIs without passing raw handles through every application function.
 
 ---
 
 ## Setting the device / platform name
 
-Each build of `sedsprintf_rs` embeds a **device identifier** which appears in every telemetry packet header.
+Each build of `sedsnet` embeds a **device identifier** which appears in every telemetry packet header.
 
 Rust resolves it using:
 
@@ -343,30 +442,30 @@ No build script changes required.
 ### Setting the name from CMake
 
 ```
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 ```
 
-Note: This must be set **before** including the sedsprintf_rs CMake as a subdirectory.
+Note: This must be set **before** including the sedsnet CMake as a subdirectory.
 
 Typical examples:
 
 ```cmake
 # Flight computer firmware
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
-set(SEDSPRINTF_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
-set(SEDSPRINTF_RS_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
 # or
 
 # Ground station app
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "GS26" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_TARGET "" CACHE STRING "" FORCE)
-set(SEDSPRINTF_EMBEDDED_BUILD OFF CACHE BOOL "" FORCE)
-set(SEDSPRINTF_RS_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "GS26" CACHE STRING "" FORCE)
+set(SEDSNET_TARGET "" CACHE STRING "" FORCE)
+set(SEDSNET_EMBEDDED_BUILD OFF CACHE BOOL "" FORCE)
+set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 ```
 
 ### Manually via build.py
@@ -380,30 +479,124 @@ set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
 ---
 
-## Telemetry config (JSON + GUI editor)
+## Runtime telemetry schema
 
-The telemetry schema lives in `telemetry_config.json` and drives the generated `DataEndpoint` and `DataType` enums.
-You can edit it directly or use the GUI editor:
+In v4, user telemetry schema is runtime state. `DataEndpoint` and `DataType` are stable numeric IDs
+on the wire, but applications should normally look them up by string:
+
+```rust
+use sedsnet::{DataEndpoint, DataType};
+
+let radio = DataEndpoint::named("RADIO");
+let gps = DataType::named("GPS_DATA");
+```
+
+You can add schema entries directly:
+
+```rust
+use sedsnet::{
+    config::{register_data_type_id_with_description, register_endpoint_id_with_description},
+    DataEndpoint, DataType, MessageClass, MessageDataType, MessageElement, ReliableMode,
+};
+
+let radio = register_endpoint_id_with_description(
+    DataEndpoint(100),
+    "RADIO",
+    "Downlink radio",
+    false,
+)?;
+
+register_data_type_id_with_description(
+    DataType(100),
+    "GPS_DATA",
+    "Latitude, longitude, altitude",
+    MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+    &[radio],
+    ReliableMode::Ordered,
+    80,
+)?;
+```
+
+Or seed from JSON at runtime. Host builds can use:
+
+- `SEDSNET_STATIC_SCHEMA_PATH=/path/to/telemetry_config.json`
+- `SEDSNET_STATIC_IPC_SCHEMA_PATH=/path/to/ipc_config.json`
+- Rust `register_schema_json_path(...)` / `register_schema_json_bytes(...)`
+- C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
+- Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
+
+Default builds do not compile application JSON into the crate. Embedded builds can include
+`telemetry_config.json` bytes only when the application provides that file locally before building;
+those bytes are decoded through the normal runtime JSON parser.
+
+The GUI editor still edits JSON schema files:
 
 ```bash
 ./telemetry_config_editor.py
 ```
 
-The editor auto-discovers the base JSON path from `src/config.rs` (or `SEDSPRINTF_RS_SCHEMA_PATH`) and the IPC overlay
-path from `SEDSPRINTF_RS_IPC_SCHEMA_PATH`. It can switch between the shared base schema and the board-local IPC overlay
-and edit/save them independently.
+For board-local IPC/software-bus endpoints, seed a second JSON file with
+`SEDSNET_STATIC_IPC_SCHEMA_PATH` or the explicit JSON registration API. IPC seed entries are
+applied at runtime and treated as link-local when loaded through the IPC path.
 
-For board-local IPC/software-bus endpoints, keep the shared schema fixed and provide a second JSON file through
-`SEDSPRINTF_RS_IPC_SCHEMA_PATH` (or `./build.py ipc_schema_path=path/to/ipc_config.json`). That overlay is merged at
-build time. Endpoints from the IPC overlay are treated as link-local automatically; endpoints from the base schema are
-treated as non-link-local automatically.
+Built-in internal endpoint/type names for telemetry errors, reliable control, discovery, and time
+sync are reserved. Do not register user handlers for `SEDSNET_DISCOVERY` or `SEDSNET_TIME_SYNC`.
 
-Note: `TelemetryError` (data type and endpoint) is built-in and must not appear in the JSON schema.
+### Network variables and E2E payloads
+
+Network variables are latest-value caches keyed by data type. After registering or seeding schema,
+enable a type on the router and use the getter/setter pair:
+
+```rust
+let flight_state = DataType::named("FLIGHT_STATE");
+router.enable_network_variable(flight_state, NetworkVariablePermissions::READ_WRITE)?;
+router.set_network_variable(pkt)?;
+let cached = router.get_network_variable(flight_state, Some(1_000))?;
+```
+
+The setter commits the value to the network when permissions allow. The getter reads the cached copy
+and internally requests the value if the cache has never seen it or is stale; user code does not
+register a separate endpoint for network variables. Caches are tiered: any router that has enabled
+or seen the variable can answer the refresh from its local cache, so reconnecting boards can resync
+from a nearby node instead of always reaching the original producer/master. If a peer has the value,
+the current packet is replayed through the normal endpoint handler so resync still looks like an
+ordinary update. Register `on_network_variable_update(...)` when code needs a callback whenever an
+inbound network update changes a variable cache.
+
+Data types can also choose an E2E payload cryptography policy:
+
+- `PreferOff`: plaintext unless the router forces cryptography
+- `PreferOn`: encrypt when router crypto support is available
+- `RequireOn`: reject send/subscribe paths unless cryptography support is available
+
+Router E2E modes are `Disabled`, `RequiredOnly`, `Preferred`, and `ForceAll`. With the default
+`cryptography` feature, the default is `Preferred`; minimal builds that explicitly omit it default
+to `Disabled`. Crypto providers are tried in this order: registered C provider, registered Rust provider, then
+registered software fallback key. The provider path is intended for OS crypto, hardware accelerators,
+secure elements, and Rust-only embedded projects. Compact managed credential helpers are available
+for deployments where a master/root node issues short-lived board credentials instead of users
+managing certificate files.
+
+Routers and relays can export JSON memory-layout snapshots to profile queue pressure at runtime,
+including shared allocation, per-queue used/allocated bytes, reliable buffers, schema/discovery
+state, and network-variable cache bytes.
+
+Topology exports describe the board graph directly: `routers` contains each discovered board and
+its connected peers, while `links` contains deduplicated `{source, target}` edges for visual graph
+rendering. SEDSnet-owned control endpoints such as `SEDSNET_TIME_SYNC`, `SEDSNET_DISCOVERY`, and
+`SEDSNET_ERROR` are filtered out of user endpoint reachability fields.
+
+Routers and relays can also export per-client stats by sender ID. The snapshot reports whether the
+client is still connected, which sides currently reach it, last-seen/age timing, named reachable
+endpoints, and packet/byte counters aggregated from the side(s) used to reach that client.
+Explicit `announce_leave(...)` calls, and best-effort C `free` paths, send a
+`SEDSNET_DISCOVERY_LEAVE` control packet so peers can remove a departing sender from topology right
+away.
 
 Note: The editor uses Tkinter. On some Linux distros you may need to install it
 (e.g. `sudo apt install python3-tk`).
 
-Example `telemetry_config.json`:
+Example application schema JSON:
 
 ```json
 {
@@ -451,18 +644,18 @@ add_executable(my_app
     src/main.c
 )
 
-# ---- sedsprintf_rs configuration ----
-set(SEDSPRINTF_RS_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
-set(SEDSPRINTF_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
-set(SEDSPRINTF_RS_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
-set(SEDSPRINTF_RS_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
+# ---- sedsnet configuration ----
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
 # Add the submodule/subtree root (adjust path as needed)
-add_subdirectory(${CMAKE_SOURCE_DIR}/sedsprintf_rs sedsprintf_rs_build)
+add_subdirectory(${CMAKE_SOURCE_DIR}/sedsnet sedsnet_build)
 
-target_link_libraries(my_app PRIVATE sedsprintf_rs::sedsprintf_rs)
+target_link_libraries(my_app PRIVATE sedsnet::sedsnet)
 ```
 
 ---
@@ -470,26 +663,26 @@ target_link_libraries(my_app PRIVATE sedsprintf_rs::sedsprintf_rs)
 ## Using this repo as a subtree
 
 ```
-git remote add sedsprintf-upstream https://github.com/Rylan-Meilutis/sedsprintf_rs.git
-git fetch sedsprintf-upstream
+git remote add sedsnet-upstream https://github.com/Rylan-Meilutis/sedsnet.git
+git fetch sedsnet-upstream
 
-git config subtree.sedsprintf_rs.remote sedsprintf-upstream
-git config subtree.sedsprintf_rs.branch main
+git config subtree.sedsnet.remote sedsnet-upstream
+git config subtree.sedsnet.branch main
 
-git subtree add --prefix=sedsprintf_rs sedsprintf-upstream main
+git subtree add --prefix=sedsnet sedsnet-upstream main
 ```
 
 To Switch branches:
 
 ```bash
-git config subtree.sedsprintf_rs.branch <the-new-branch>
+git config subtree.sedsnet.branch <the-new-branch>
 ```
 
 Update:
 
 ```bash
-git subtree pull --prefix=sedsprintf_rs sedsprintf-upstream main \
-    -m "Merge sedsprintf_rs upstream main"
+git subtree pull --prefix=sedsnet sedsnet-upstream main \
+    -m "Merge sedsnet upstream main"
 ```
 
 Helper scripts:
@@ -506,9 +699,9 @@ Helper scripts:
 If you prefer a **submodule** instead of a subtree:
 
 ```bash
-git submodule add -b main https://github.com/Rylan-Meilutis/sedsprintf_rs.git sedsprintf_rs
+git submodule add -b main https://github.com/Rylan-Meilutis/sedsnet.git sedsnet
 
-git config submodule.sedsprintf_rs.branch main   # (or dev, etc.)
+git config submodule.sedsnet.branch main   # (or dev, etc.)
 ```
 
 Initialize:
@@ -521,7 +714,7 @@ Update using helper scripts:
 
 The scripts:
 
-- read `submodule.sedsprintf_rs.branch`
+- read `submodule.sedsnet.branch`
 - fetch `origin/<branch>`
 - fast-forward the submodule repo
 - stage & commit the updated submodule pointer in the parent repo

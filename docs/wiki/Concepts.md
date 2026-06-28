@@ -11,7 +11,8 @@ Why this matters:
 
 - It prevents mismatched enum values between devices.
 - It ensures each packet is interpreted the same way everywhere.
-- It lets you generate bindings for multiple languages from one source of truth.
+- It gives every language binding the same runtime names, IDs, and payload shapes without requiring
+  crate-specific generated application constants.
 
 ## Endpoints
 
@@ -70,7 +71,8 @@ avoiding duplicates. It is useful when you want to bridge links without decoding
 
 With the optional `discovery` feature, routers and relays can also exchange built-in discovery packets and learn which
 endpoints are reachable through which sides. When they know a route, they can forward only toward matching sides instead
-of flooding every side. When they do not know a route yet, they fall back to the normal flood behavior.
+of flooding every side. Once topology exists, unknown user-data routes are not blindly flooded; discovery/control
+traffic still propagates and explicit route policy can still select a side.
 
 ## Discovery
 
@@ -79,11 +81,15 @@ Discovery is an optional built-in control plane, similar in spirit to time sync:
 - Routers and relays exchange internal `DISCOVERY_ANNOUNCE` packets.
 - They learn reachable endpoints per side and keep that information as soft state with expiry.
 - Discovery traffic is adaptive: it is sent more often when topology changes and less often when the network is stable.
+- Measured slow sides are throttled automatically. After a slow link-probe or driver timing sample,
+  routers and relays send mostly minimal reachability pings across that side and only send full
+  schema/topology/time-source refreshes on a much slower cadence.
 - Apps can export the current discovered topology for inspection.
 - Link-local-only endpoints stay on software-bus / IPC links and are not advertised onto normal network links.
 
-Discovery is an optimization, not a correctness requirement. Unknown or expired routes fall back to normal forwarding so
-packets are still delivered while the network converges.
+Discovery is both a routing optimization and the guardrail that keeps normal user data off low-bandwidth links when no
+matching route is known. Control traffic continues to propagate so the network can converge after startup or a
+partition, and simple non-discovery deployments can still use explicit route rules.
 
 ## Time sync
 

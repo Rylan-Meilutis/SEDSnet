@@ -5,45 +5,58 @@
 //! - `Packet`
 //!   - Immutable view of a `Packet`
 //!   - Header fields + payload access
-//!   - Serialization to bytes
+//!   - Packing to wire bytes
 //!
 //! - `Router`
 //!   - Logging (bytes, f32, generic typed)
 //!   - RX/TX queue processing (with optional timeouts)
-//!   - Python callbacks for TX, packet handlers, and serialized handlers
+//!   - Python callbacks for TX, packet handlers, and packed handlers
 //!   - New link-aware APIs (`*_from`, RX queueing variants)
 //!
 //! - `Relay`
 //!   - unchanged (fans out between sides)
 //!
 //! - Top-level helpers
-//!   - `deserialize_packet_py(data)` → `Packet`
+//!   - `unpack_packet_py(data)` → `Packet`
 //!   - `peek_header_py(data)` → dict with header fields
 //!   - `make_packet(...)` → `Packet`
 //!
 //! - Dynamic enums
 //!   - `DataType`, `DataEndpoint`, `ElemKind`
 //!
-//! The Python module name is `sedsprintf_rs`.
+//! The Python module name is `sedsnet`.
 
 use alloc::{boxed::Box, string::String, sync::Arc as AArc, vec::Vec};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
+use std::collections::BTreeMap;
 use std::sync::{Arc as SArc, Mutex, OnceLock};
 
 #[cfg(feature = "timesync")]
 use crate::timesync::TimeSyncConfig;
 use crate::{
-    config::{DataEndpoint, DataType}, get_message_name, get_needed_message_size, message_meta,
-    packet::Packet, relay::{Relay, RelaySideOptions}, router::{Clock, EndpointHandler, LeBytes, Router, RouterConfig, RouterSideOptions},
-    serialize::{deserialize_packet, packet_wire_size, peek_envelope, serialize_packet},
-    try_enum_from_i32, try_enum_from_u32, MessageElement,
-    RouteSelectionMode,
-    TelemetryError,
-    TelemetryResult,
-    MAX_VALUE_DATA_ENDPOINT,
-    MAX_VALUE_DATA_TYPE, MAX_VALUE_ROUTE_SELECTION_MODE,
+    MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, MAX_VALUE_ROUTE_SELECTION_MODE, MessageElement,
+    RouteSelectionMode, TelemetryError, TelemetryResult,
+    config::{
+        DataEndpoint, DataType, data_type_definition, data_type_definition_by_name,
+        data_type_exists, e2e_encryption_policy_from_code, endpoint_definition,
+        endpoint_definition_by_name, endpoint_exists, known_endpoints, message_class_code,
+        message_class_from_code, message_data_type_code, message_data_type_from_code,
+        register_data_type_id_with_description_and_e2e_encryption,
+        register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
+        reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
+        remove_endpoint_by_name,
+    },
+    get_message_name, get_needed_message_size, message_meta,
+    packet::Packet,
+    relay::{Relay, RelaySideOptions},
+    router::{
+        Clock, EndpointHandler, LeBytes, NetworkVariablePermissions, Router, RouterConfig,
+        RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
+    },
+    try_enum_from_i32, try_enum_from_u32,
+    wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
 };
 
 static GLOBAL_ROUTER_SINGLETON: OnceLock<SArc<Mutex<Router>>> = OnceLock::new();
@@ -91,18 +104,38 @@ fn dtype_from_u32(x: u32) -> TelemetryResult<DataType> {
 
 /// Convert Python-side `int` → `DataEndpoint`, with range/validity checks.
 fn endpoint_from_u32(x: u32) -> TelemetryResult<DataEndpoint> {
-    DataEndpoint::try_from_u32(x).ok_or(TelemetryError::Deserialize("bad endpoint"))
+    DataEndpoint::try_from_u32(x).ok_or(TelemetryError::Unpack("bad endpoint"))
 }
 
-fn build_router_config(handlers: Vec<EndpointHandler>, timesync_enabled: bool) -> RouterConfig {
-    let cfg = RouterConfig::new(handlers);
+fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
+    match code {
+        0 => Some(RouterE2eEncryptionMode::Disabled),
+        1 => Some(RouterE2eEncryptionMode::RequiredOnly),
+        2 => Some(RouterE2eEncryptionMode::Preferred),
+        3 => Some(RouterE2eEncryptionMode::ForceAll),
+        255 => Some(RouterConfig::default_e2e_encryption_mode()),
+        _ => None,
+    }
+}
+
+fn build_router_config(
+    handlers: Vec<EndpointHandler>,
+    timesync_enabled: bool,
+    e2e_mode: u8,
+    e2e_key_id: u32,
+) -> PyResult<RouterConfig> {
+    let e2e_mode =
+        router_e2e_mode_from_code(e2e_mode).ok_or_else(|| PyValueError::new_err("bad e2e_mode"))?;
+    let cfg = RouterConfig::new(handlers)
+        .with_e2e_encryption(e2e_mode)
+        .with_e2e_key_id(e2e_key_id);
     #[cfg(feature = "timesync")]
     let cfg = if timesync_enabled {
         cfg.with_timesync(TimeSyncConfig::default())
     } else {
         cfg
     };
-    cfg
+    Ok(cfg)
 }
 
 fn build_router_with_optional_clock(
@@ -144,7 +177,7 @@ fn build_endpoint_handlers(
             }
 
             let ep_u32: u32 = tup.get_item(0)?.extract()?;
-            let endpoint = endpoint_from_u32(ep_u32).map_err(py_err_from)?;
+            let endpoint = DataEndpoint(ep_u32);
 
             if !tup.get_item(1)?.is_none() {
                 let cb: Py<PyAny> = tup.get_item(1)?.extract()?;
@@ -177,14 +210,14 @@ fn build_endpoint_handlers(
                 let cb_for_closure = cb.clone_ref(py);
                 keep_ser.push(cb);
 
-                let eh = EndpointHandler::new_serialized_handler(endpoint, move |bytes| {
+                let eh = EndpointHandler::new_packed_handler(endpoint, move |bytes| {
                     Python::attach(|py| {
                         let arg = PyBytes::new(py, bytes).into_any();
                         match cb_for_closure.call1(py, (arg,)) {
                             Ok(_cb) => Ok(()),
                             Err(err) => {
                                 err.restore(py);
-                                Err(TelemetryError::Io("serialized handler error"))
+                                Err(TelemetryError::Io("packed handler error"))
                             }
                         }
                     })
@@ -293,13 +326,40 @@ fn topology_snapshot_to_pydict(
     py: Python<'_>,
     snap: crate::discovery::TopologySnapshot,
 ) -> PyResult<Py<PyDict>> {
+    fn endpoint_name(names: &BTreeMap<DataEndpoint, &'static str>, ep: DataEndpoint) -> String {
+        names
+            .get(&ep)
+            .map(|name| (*name).to_string())
+            .unwrap_or_else(|| format!("endpoint_{}", ep.as_u32()))
+    }
+
+    fn endpoint_names(
+        names: &BTreeMap<DataEndpoint, &'static str>,
+        endpoints: &[DataEndpoint],
+    ) -> Vec<String> {
+        endpoints
+            .iter()
+            .copied()
+            .map(|ep| endpoint_name(names, ep))
+            .collect()
+    }
+
+    fn endpoint_ids(endpoints: &[DataEndpoint]) -> Vec<u32> {
+        endpoints.iter().map(|ep| ep.as_u32()).collect()
+    }
+
+    let endpoint_name_map = known_endpoints()
+        .into_iter()
+        .map(|def| (def.id, def.name))
+        .collect::<BTreeMap<_, _>>();
     let out = PyDict::new(py);
     out.set_item(
         "advertised_endpoints",
-        snap.advertised_endpoints
-            .iter()
-            .map(|ep| *ep as u32)
-            .collect::<Vec<u32>>(),
+        endpoint_names(&endpoint_name_map, &snap.advertised_endpoints),
+    )?;
+    out.set_item(
+        "advertised_endpoint_ids",
+        endpoint_ids(&snap.advertised_endpoints),
     )?;
     out.set_item(
         "advertised_timesync_sources",
@@ -312,11 +372,11 @@ fn topology_snapshot_to_pydict(
         item.set_item("sender_id", board.sender_id)?;
         item.set_item(
             "reachable_endpoints",
-            board
-                .reachable_endpoints
-                .iter()
-                .map(|ep| *ep as u32)
-                .collect::<Vec<u32>>(),
+            endpoint_names(&endpoint_name_map, &board.reachable_endpoints),
+        )?;
+        item.set_item(
+            "reachable_endpoint_ids",
+            endpoint_ids(&board.reachable_endpoints),
         )?;
         item.set_item(
             "reachable_timesync_sources",
@@ -327,6 +387,15 @@ fn topology_snapshot_to_pydict(
     }
     out.set_item("routers", routers)?;
 
+    let links = PyList::empty(py);
+    for link in snap.links {
+        let item = PyDict::new(py);
+        item.set_item("source", link.source)?;
+        item.set_item("target", link.target)?;
+        links.append(item)?;
+    }
+    out.set_item("links", links)?;
+
     let routes = PyList::empty(py);
     for route in snap.routes {
         let route_dict = PyDict::new(py);
@@ -334,11 +403,11 @@ fn topology_snapshot_to_pydict(
         route_dict.set_item("side_name", route.side_name)?;
         route_dict.set_item(
             "reachable_endpoints",
-            route
-                .reachable_endpoints
-                .iter()
-                .map(|ep| *ep as u32)
-                .collect::<Vec<u32>>(),
+            endpoint_names(&endpoint_name_map, &route.reachable_endpoints),
+        )?;
+        route_dict.set_item(
+            "reachable_endpoint_ids",
+            endpoint_ids(&route.reachable_endpoints),
         )?;
         route_dict.set_item(
             "reachable_timesync_sources",
@@ -350,11 +419,11 @@ fn topology_snapshot_to_pydict(
             announcer_dict.set_item("sender_id", announcer.sender_id)?;
             announcer_dict.set_item(
                 "reachable_endpoints",
-                announcer
-                    .reachable_endpoints
-                    .iter()
-                    .map(|ep| *ep as u32)
-                    .collect::<Vec<u32>>(),
+                endpoint_names(&endpoint_name_map, &announcer.reachable_endpoints),
+            )?;
+            announcer_dict.set_item(
+                "reachable_endpoint_ids",
+                endpoint_ids(&announcer.reachable_endpoints),
             )?;
             announcer_dict.set_item(
                 "reachable_timesync_sources",
@@ -366,11 +435,11 @@ fn topology_snapshot_to_pydict(
                 board_dict.set_item("sender_id", board.sender_id)?;
                 board_dict.set_item(
                     "reachable_endpoints",
-                    board
-                        .reachable_endpoints
-                        .iter()
-                        .map(|ep| *ep as u32)
-                        .collect::<Vec<u32>>(),
+                    endpoint_names(&endpoint_name_map, &board.reachable_endpoints),
+                )?;
+                board_dict.set_item(
+                    "reachable_endpoint_ids",
+                    endpoint_ids(&board.reachable_endpoints),
                 )?;
                 board_dict.set_item(
                     "reachable_timesync_sources",
@@ -398,6 +467,399 @@ fn topology_snapshot_to_pydict(
     Ok(out.unbind())
 }
 
+#[cfg(feature = "discovery")]
+fn client_stats_snapshot_to_pydict(
+    py: Python<'_>,
+    stats: crate::discovery::ClientStatsSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let endpoint_name_map = known_endpoints()
+        .into_iter()
+        .map(|def| (def.id, def.name))
+        .collect::<BTreeMap<_, _>>();
+    let out = PyDict::new(py);
+    out.set_item("sender_id", stats.sender_id)?;
+    out.set_item("connected", stats.connected)?;
+    out.set_item("side_ids", stats.side_ids)?;
+    out.set_item("side_names", stats.side_names)?;
+    out.set_item("last_seen_ms", stats.last_seen_ms)?;
+    out.set_item("age_ms", stats.age_ms)?;
+    out.set_item(
+        "reachable_endpoints",
+        stats
+            .reachable_endpoints
+            .iter()
+            .map(|ep| {
+                endpoint_name_map
+                    .get(ep)
+                    .map(|name| (*name).to_string())
+                    .unwrap_or_else(|| format!("endpoint_{}", ep.as_u32()))
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "reachable_endpoint_ids",
+        stats
+            .reachable_endpoints
+            .iter()
+            .map(|ep| ep.as_u32())
+            .collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "reachable_timesync_sources",
+        stats.reachable_timesync_sources,
+    )?;
+    out.set_item("packets_sent", stats.packets_sent)?;
+    out.set_item("packets_received", stats.packets_received)?;
+    out.set_item("bytes_sent", stats.bytes_sent)?;
+    out.set_item("bytes_received", stats.bytes_received)?;
+    Ok(out.unbind())
+}
+
+#[cfg(feature = "discovery")]
+fn route_selection_mode_name(mode: RouteSelectionMode) -> &'static str {
+    match mode {
+        RouteSelectionMode::Fanout => "Fanout",
+        RouteSelectionMode::Weighted => "Weighted",
+        RouteSelectionMode::Failover => "Failover",
+    }
+}
+
+fn side_transport_profile_from_name(profile: &str) -> PyResult<SideTransportProfile> {
+    match profile {
+        "canonical" => Ok(SideTransportProfile::Canonical),
+        "template" => Ok(SideTransportProfile::Template),
+        "ipv6_like" => Ok(SideTransportProfile::Ipv6Like),
+        "ipv4_like" => Ok(SideTransportProfile::Ipv4Like),
+        _ => Err(PyValueError::new_err(
+            "profile must be canonical, template, ipv6_like, or ipv4_like",
+        )),
+    }
+}
+
+fn router_side_options_for_profile(
+    reliable_enabled: bool,
+    profile: SideTransportProfile,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> RouterSideOptions {
+    let mut opts = RouterSideOptions {
+        reliable_enabled,
+        max_frame_bytes,
+        max_side_transport_templates,
+        side_transport_profile: profile,
+        ..RouterSideOptions::default()
+    };
+    match profile {
+        SideTransportProfile::Canonical => {}
+        SideTransportProfile::Template => {
+            opts.header_template_enabled = true;
+        }
+        SideTransportProfile::Ipv6Like => {
+            opts.header_template_enabled = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+        SideTransportProfile::Ipv4Like => {
+            opts.header_template_enabled = true;
+            opts.omit_unchanged_compact_timestamps = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+    }
+    opts
+}
+
+fn relay_side_options_for_profile(
+    reliable_enabled: bool,
+    profile: SideTransportProfile,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> RelaySideOptions {
+    let mut opts = RelaySideOptions {
+        reliable_enabled,
+        max_frame_bytes,
+        max_side_transport_templates,
+        side_transport_profile: profile,
+        ..RelaySideOptions::default()
+    };
+    match profile {
+        SideTransportProfile::Canonical => {}
+        SideTransportProfile::Template => {
+            opts.header_template_enabled = true;
+        }
+        SideTransportProfile::Ipv6Like => {
+            opts.header_template_enabled = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::relay::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+        SideTransportProfile::Ipv4Like => {
+            opts.header_template_enabled = true;
+            opts.omit_unchanged_compact_timestamps = true;
+            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
+                crate::relay::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
+            } else {
+                compact_header_target_bytes
+            };
+        }
+    }
+    opts
+}
+
+#[cfg(feature = "discovery")]
+fn runtime_stats_snapshot_to_pydict(
+    py: Python<'_>,
+    snap: crate::diagnostics::RuntimeStatsSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+
+    let sides = PyList::empty(py);
+    for side in snap.sides {
+        let side_dict = PyDict::new(py);
+        side_dict.set_item("side_id", side.side_id)?;
+        side_dict.set_item("side_name", side.side_name)?;
+        side_dict.set_item("reliable_enabled", side.reliable_enabled)?;
+        side_dict.set_item("link_local_enabled", side.link_local_enabled)?;
+        side_dict.set_item("header_template_enabled", side.header_template_enabled)?;
+        side_dict.set_item("max_frame_bytes", side.max_frame_bytes)?;
+        side_dict.set_item(
+            "compact_header_target_bytes",
+            side.compact_header_target_bytes,
+        )?;
+        side_dict.set_item("side_transport_profile", side.side_transport_profile)?;
+        side_dict.set_item("ingress_enabled", side.ingress_enabled)?;
+        side_dict.set_item("egress_enabled", side.egress_enabled)?;
+        side_dict.set_item("tx_packets", side.tx_packets)?;
+        side_dict.set_item("tx_bytes", side.tx_bytes)?;
+        side_dict.set_item("rx_packets", side.rx_packets)?;
+        side_dict.set_item("rx_bytes", side.rx_bytes)?;
+        side_dict.set_item("relayed_tx_packets", side.relayed_tx_packets)?;
+        side_dict.set_item("relayed_tx_bytes", side.relayed_tx_bytes)?;
+        side_dict.set_item("relayed_rx_packets", side.relayed_rx_packets)?;
+        side_dict.set_item("relayed_rx_bytes", side.relayed_rx_bytes)?;
+        side_dict.set_item("local_delivery_packets", side.local_delivery_packets)?;
+        side_dict.set_item("tx_retries", side.tx_retries)?;
+        side_dict.set_item("tx_handler_failures", side.tx_handler_failures)?;
+        side_dict.set_item("local_handler_failures", side.local_handler_failures)?;
+        side_dict.set_item("total_handler_retries", side.total_handler_retries)?;
+        side_dict.set_item(
+            "side_transport_full_frames",
+            side.side_transport_full_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_frames",
+            side.side_transport_compact_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_delta_frames",
+            side.side_transport_compact_delta_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_omitted_timestamp_frames",
+            side.side_transport_compact_omitted_timestamp_frames,
+        )?;
+        side_dict.set_item(
+            "side_transport_chunk_frames",
+            side.side_transport_chunk_frames,
+        )?;
+        side_dict.set_item("side_transport_raw_bytes", side.side_transport_raw_bytes)?;
+        side_dict.set_item("side_transport_wire_bytes", side.side_transport_wire_bytes)?;
+        side_dict.set_item(
+            "side_transport_bytes_saved",
+            side.side_transport_bytes_saved,
+        )?;
+        side_dict.set_item(
+            "side_transport_min_compact_overhead_bytes",
+            side.side_transport_min_compact_overhead_bytes,
+        )?;
+        side_dict.set_item(
+            "side_transport_max_compact_overhead_bytes",
+            side.side_transport_max_compact_overhead_bytes,
+        )?;
+        side_dict.set_item(
+            "side_transport_compact_target_misses",
+            side.side_transport_compact_target_misses,
+        )?;
+        side_dict.set_item(
+            "side_transport_template_evictions",
+            side.side_transport_template_evictions,
+        )?;
+        side_dict.set_item(
+            "side_transport_tx_template_count",
+            side.side_transport_tx_template_count,
+        )?;
+        side_dict.set_item(
+            "side_transport_rx_template_count",
+            side.side_transport_rx_template_count,
+        )?;
+        side_dict.set_item(
+            "max_side_transport_templates",
+            side.max_side_transport_templates,
+        )?;
+
+        let adaptive = PyDict::new(py);
+        adaptive.set_item(
+            "auto_balancing_enabled",
+            side.adaptive.auto_balancing_enabled,
+        )?;
+        adaptive.set_item(
+            "estimated_capacity_bps",
+            side.adaptive.estimated_capacity_bps,
+        )?;
+        adaptive.set_item("peak_capacity_bps", side.adaptive.peak_capacity_bps)?;
+        adaptive.set_item("current_usage_bps", side.adaptive.current_usage_bps)?;
+        adaptive.set_item("peak_usage_bps", side.adaptive.peak_usage_bps)?;
+        adaptive.set_item(
+            "available_headroom_bps",
+            side.adaptive.available_headroom_bps,
+        )?;
+        adaptive.set_item("effective_weight", side.adaptive.effective_weight)?;
+        adaptive.set_item("last_observed_ms", side.adaptive.last_observed_ms)?;
+        adaptive.set_item("sample_count", side.adaptive.sample_count)?;
+        side_dict.set_item("adaptive", adaptive)?;
+
+        let data_types = PyList::empty(py);
+        for data_type in side.data_types {
+            let item = PyDict::new(py);
+            item.set_item("data_type", data_type.data_type.as_u32())?;
+            item.set_item("tx_packets", data_type.tx_packets)?;
+            item.set_item("tx_bytes", data_type.tx_bytes)?;
+            item.set_item("rx_packets", data_type.rx_packets)?;
+            item.set_item("rx_bytes", data_type.rx_bytes)?;
+            item.set_item("relayed_tx_packets", data_type.relayed_tx_packets)?;
+            item.set_item("relayed_tx_bytes", data_type.relayed_tx_bytes)?;
+            item.set_item("relayed_rx_packets", data_type.relayed_rx_packets)?;
+            item.set_item("relayed_rx_bytes", data_type.relayed_rx_bytes)?;
+            item.set_item("tx_retries", data_type.tx_retries)?;
+            item.set_item("handler_failures", data_type.handler_failures)?;
+            data_types.append(item)?;
+        }
+        side_dict.set_item("data_types", data_types)?;
+        sides.append(side_dict)?;
+    }
+    out.set_item("sides", sides)?;
+
+    let route_modes = PyList::empty(py);
+    for mode in snap.route_modes {
+        let item = PyDict::new(py);
+        item.set_item("src_side_id", mode.src_side_id)?;
+        item.set_item(
+            "selection_mode",
+            mode.selection_mode.map(route_selection_mode_name),
+        )?;
+        item.set_item("cursor", mode.cursor)?;
+        route_modes.append(item)?;
+    }
+    out.set_item("route_modes", route_modes)?;
+
+    let route_overrides = PyList::empty(py);
+    for route in snap.route_overrides {
+        let item = PyDict::new(py);
+        item.set_item("src_side_id", route.src_side_id)?;
+        item.set_item("dst_side_id", route.dst_side_id)?;
+        item.set_item("enabled", route.enabled)?;
+        route_overrides.append(item)?;
+    }
+    out.set_item("route_overrides", route_overrides)?;
+
+    let typed_route_overrides = PyList::empty(py);
+    for route in snap.typed_route_overrides {
+        let item = PyDict::new(py);
+        item.set_item("src_side_id", route.src_side_id)?;
+        item.set_item("data_type", route.data_type.as_u32())?;
+        item.set_item("dst_side_id", route.dst_side_id)?;
+        item.set_item("enabled", route.enabled)?;
+        typed_route_overrides.append(item)?;
+    }
+    out.set_item("typed_route_overrides", typed_route_overrides)?;
+
+    let route_weights = PyList::empty(py);
+    for weight in snap.route_weights {
+        let item = PyDict::new(py);
+        item.set_item("src_side_id", weight.src_side_id)?;
+        item.set_item("dst_side_id", weight.dst_side_id)?;
+        item.set_item("weight", weight.weight)?;
+        route_weights.append(item)?;
+    }
+    out.set_item("route_weights", route_weights)?;
+
+    let route_priorities = PyList::empty(py);
+    for priority in snap.route_priorities {
+        let item = PyDict::new(py);
+        item.set_item("src_side_id", priority.src_side_id)?;
+        item.set_item("dst_side_id", priority.dst_side_id)?;
+        item.set_item("priority", priority.priority)?;
+        route_priorities.append(item)?;
+    }
+    out.set_item("route_priorities", route_priorities)?;
+
+    let queues = PyDict::new(py);
+    queues.set_item("rx_len", snap.queues.rx_len)?;
+    queues.set_item("rx_bytes", snap.queues.rx_bytes)?;
+    queues.set_item("tx_len", snap.queues.tx_len)?;
+    queues.set_item("tx_bytes", snap.queues.tx_bytes)?;
+    queues.set_item("replay_len", snap.queues.replay_len)?;
+    queues.set_item("replay_bytes", snap.queues.replay_bytes)?;
+    queues.set_item("recent_rx_len", snap.queues.recent_rx_len)?;
+    queues.set_item("recent_rx_bytes", snap.queues.recent_rx_bytes)?;
+    queues.set_item(
+        "reliable_rx_buffered_len",
+        snap.queues.reliable_rx_buffered_len,
+    )?;
+    queues.set_item(
+        "reliable_rx_buffered_bytes",
+        snap.queues.reliable_rx_buffered_bytes,
+    )?;
+    queues.set_item(
+        "shared_queue_bytes_used",
+        snap.queues.shared_queue_bytes_used,
+    )?;
+    out.set_item("queues", queues)?;
+
+    let reliable = PyDict::new(py);
+    reliable.set_item(
+        "reliable_return_route_count",
+        snap.reliable.reliable_return_route_count,
+    )?;
+    reliable.set_item(
+        "end_to_end_pending_count",
+        snap.reliable.end_to_end_pending_count,
+    )?;
+    reliable.set_item(
+        "end_to_end_pending_destination_count",
+        snap.reliable.end_to_end_pending_destination_count,
+    )?;
+    reliable.set_item(
+        "end_to_end_acked_cache_count",
+        snap.reliable.end_to_end_acked_cache_count,
+    )?;
+    out.set_item("reliable", reliable)?;
+
+    let discovery = PyDict::new(py);
+    discovery.set_item("route_count", snap.discovery.route_count)?;
+    discovery.set_item("announcer_count", snap.discovery.announcer_count)?;
+    discovery.set_item(
+        "current_announce_interval_ms",
+        snap.discovery.current_announce_interval_ms,
+    )?;
+    discovery.set_item("next_announce_ms", snap.discovery.next_announce_ms)?;
+    out.set_item("discovery", discovery)?;
+
+    out.set_item("total_handler_failures", snap.total_handler_failures)?;
+    out.set_item("total_handler_retries", snap.total_handler_retries)?;
+    Ok(out.unbind())
+}
+
 // ============================================================================
 //  Packet (PyPacket)
 // ============================================================================
@@ -405,7 +867,7 @@ fn topology_snapshot_to_pydict(
 /// Python-visible wrapper around `Packet`.
 ///
 /// Constructed indirectly via:
-/// - `deserialize_packet_py`
+/// - `unpack_packet_py`
 /// - `make_packet`
 /// - callbacks (router handlers)
 #[pyclass(name = "Packet")]
@@ -435,7 +897,7 @@ impl PyPacket {
     /// DataType as an integer (see `DataType` IntEnum).
     #[getter]
     fn ty(&self) -> u32 {
-        self.inner.data_type() as u32
+        self.inner.data_type().as_u32()
     }
 
     /// Declared data size for the packet payload, in bytes.
@@ -453,7 +915,7 @@ impl PyPacket {
     /// Endpoints as integer IDs (see `DataEndpoint` IntEnum).
     #[getter]
     fn endpoints(&self) -> Vec<u32> {
-        self.inner.endpoints().iter().map(|e| *e as u32).collect()
+        self.inner.endpoints().iter().map(|e| e.as_u32()).collect()
     }
 
     /// Packet timestamp in milliseconds (source-defined semantics).
@@ -483,14 +945,14 @@ impl PyPacket {
         self.inner.to_string()
     }
 
-    /// Wire size in bytes when serialized.
+    /// Wire size in bytes when packed.
     fn wire_size(&self) -> usize {
         packet_wire_size(&self.inner)
     }
 
-    /// Serialize to wire format bytes.
-    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = serialize_packet(&self.inner);
+    /// Pack to wire format bytes.
+    fn pack<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = pack_packet(&self.inner);
         Ok(PyBytes::new(py, &bytes))
     }
 }
@@ -528,7 +990,7 @@ impl Clock for PyClock {
 ///
 /// The underlying `Router` is protected by a `Mutex` for host-side
 /// concurrency. Python callbacks for TX, packet handlers, and
-/// serialized handlers are kept alive in this object.
+/// packed handlers are kept alive in this object.
 #[pyclass(name = "Router")]
 pub struct PyRouter {
     // Host-side concurrency: protect the Router with a Mutex and share via Arc.
@@ -536,6 +998,8 @@ pub struct PyRouter {
     _pkt_cbs: Vec<Py<PyAny>>,
     _ser_cbs: Vec<Py<PyAny>>,
     _side_cbs: Vec<Option<Py<PyAny>>>,
+    _netvar_cbs: Vec<Py<PyAny>>,
+    _p2p_cbs: Vec<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -546,17 +1010,24 @@ impl PyRouter {
 
     /// Create or retrieve a per-process singleton Router.
     #[staticmethod]
-    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled = true))]
+    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled = true, e2e_mode = 255, e2e_key_id = 0))]
     fn new_singleton(
         py: Python<'_>,
         now_ms: Option<Py<PyAny>>,
         handlers: Option<&Bound<'_, PyAny>>,
         timesync_enabled: bool,
+        e2e_mode: u8,
+        e2e_key_id: u32,
     ) -> PyResult<Self> {
         if let Some(existing) = GLOBAL_ROUTER_SINGLETON.get() {
-            if now_ms.is_some() || handlers.is_some() || !timesync_enabled {
+            if now_ms.is_some()
+                || handlers.is_some()
+                || !timesync_enabled
+                || e2e_mode != 255
+                || e2e_key_id != 0
+            {
                 return Err(PyRuntimeError::new_err(
-                    "Router singleton already exists; cannot modify now_ms/handlers/timesync_enabled",
+                    "Router singleton already exists; cannot modify constructor options",
                 ));
             }
 
@@ -565,6 +1036,8 @@ impl PyRouter {
                 _pkt_cbs: Vec::new(),
                 _ser_cbs: Vec::new(),
                 _side_cbs: Vec::new(),
+                _netvar_cbs: Vec::new(),
+                _p2p_cbs: Vec::new(),
             });
         }
 
@@ -572,7 +1045,7 @@ impl PyRouter {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let (handlers_vec, keep_pkt, keep_ser) = build_endpoint_handlers(py, handlers)?;
-        let cfg = build_router_config(handlers_vec, timesync_enabled);
+        let cfg = build_router_config(handlers_vec, timesync_enabled, e2e_mode, e2e_key_id)?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
         let arc = SArc::new(Mutex::new(router));
 
@@ -585,22 +1058,26 @@ impl PyRouter {
             _pkt_cbs: keep_pkt,
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
+            _netvar_cbs: Vec::new(),
+            _p2p_cbs: Vec::new(),
         })
     }
 
     /// Create a new router.
     #[new]
-    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled=true))]
+    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled=true, e2e_mode=255, e2e_key_id=0))]
     fn new(
         py: Python<'_>,
         now_ms: Option<Py<PyAny>>,
         handlers: Option<&Bound<'_, PyAny>>,
         timesync_enabled: bool,
+        e2e_mode: u8,
+        e2e_key_id: u32,
     ) -> PyResult<Self> {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let (handlers_vec, keep_pkt, keep_ser) = build_endpoint_handlers(py, handlers)?;
-        let cfg = build_router_config(handlers_vec, timesync_enabled);
+        let cfg = build_router_config(handlers_vec, timesync_enabled, e2e_mode, e2e_key_id)?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
 
         Ok(Self {
@@ -608,7 +1085,235 @@ impl PyRouter {
             _pkt_cbs: keep_pkt,
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
+            _netvar_cbs: Vec::new(),
+            _p2p_cbs: Vec::new(),
         })
+    }
+
+    #[getter]
+    fn sender_id(&self) -> PyResult<String> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr.sender().to_string())
+    }
+
+    fn set_sender_id(&self, sender_id: &str) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.set_sender(sender_id);
+        Ok(())
+    }
+
+    #[getter]
+    fn current_address(&self) -> PyResult<u32> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr.current_address())
+    }
+
+    fn resolve_hostname(&self, py: Python<'_>, hostname: &str) -> PyResult<Option<Py<PyAny>>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let Some(entry) = rtr.resolve_hostname(hostname) else {
+            return Ok(None);
+        };
+        let out = PyDict::new(py);
+        out.set_item("hostname", entry.hostname.as_ref())?;
+        out.set_item("address", entry.address)?;
+        out.set_item("requested_address", entry.requested_address)?;
+        out.set_item("birth_ms", entry.birth_ms)?;
+        out.set_item("owner_hash", entry.owner_hash)?;
+        Ok(Some(out.into()))
+    }
+
+    fn send_p2p_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: u16,
+        src_port: u16,
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bytes: &[u8] = payload.extract()?;
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.send_p2p_to_hostname(hostname, dst_port, src_port, bytes)
+            .map_err(py_err_from)
+    }
+
+    fn send_p2p_to_address(
+        &self,
+        address: u32,
+        dst_port: u16,
+        src_port: u16,
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bytes: &[u8] = payload.extract()?;
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.send_p2p_to_address(address, dst_port, src_port, bytes)
+            .map_err(py_err_from)
+    }
+
+    fn bind_p2p_port(&mut self, py: Python<'_>, port: u16, callback: Py<PyAny>) -> PyResult<()> {
+        let cb_keep = callback.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.bind_p2p_port(port, move |msg| {
+            Python::attach(|py| {
+                let meta = PyDict::new(py);
+                meta.set_item("source_hostname", msg.source_hostname)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                meta.set_item("source_address", msg.source_address)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                meta.set_item("source_port", msg.source_port)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                meta.set_item("destination_port", msg.destination_port)
+                    .map_err(|_| TelemetryError::Io("p2p metadata"))?;
+                let payload = PyBytes::new(py, msg.payload);
+                match cb_for_closure.call1(py, (&meta, &payload)) {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        err.restore(py);
+                        Err(TelemetryError::Io("p2p handler error"))
+                    }
+                }
+            })
+        })
+        .map_err(py_err_from)?;
+        self._p2p_cbs.push(cb_keep);
+        Ok(())
+    }
+
+    fn clear_p2p_port(&self, port: u16) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.clear_p2p_port(port);
+        Ok(())
+    }
+
+    fn bind_p2p_stream_port(
+        &mut self,
+        py: Python<'_>,
+        port: u16,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        let cb_keep = callback.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.bind_p2p_stream_port(port, move |event| {
+            Python::attach(|py| {
+                let meta = PyDict::new(py);
+                meta.set_item("kind", format!("{:?}", event.kind))
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("stream_id", event.stream_id)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_stream_id", event.peer_stream_id)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("sequence", event.sequence)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_hostname", event.peer_hostname)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_address", event.peer_address)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("local_port", event.local_port)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                meta.set_item("peer_port", event.peer_port)
+                    .map_err(|_| TelemetryError::Io("p2p stream metadata"))?;
+                let payload = PyBytes::new(py, event.payload);
+                match cb_for_closure.call1(py, (&meta, &payload)) {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        err.restore(py);
+                        Err(TelemetryError::Io("p2p stream handler error"))
+                    }
+                }
+            })
+        })
+        .map_err(py_err_from)?;
+        self._p2p_cbs.push(cb_keep);
+        Ok(())
+    }
+
+    fn clear_p2p_stream_port(&self, port: u16) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.clear_p2p_stream_port(port);
+        Ok(())
+    }
+
+    fn open_p2p_stream_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: u16,
+        src_port: u16,
+    ) -> PyResult<u32> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.open_p2p_stream_to_hostname(hostname, dst_port, src_port)
+            .map_err(py_err_from)
+    }
+
+    fn open_p2p_stream_to_address(
+        &self,
+        address: u32,
+        dst_port: u16,
+        src_port: u16,
+    ) -> PyResult<u32> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.open_p2p_stream_to_address(address, dst_port, src_port)
+            .map_err(py_err_from)
+    }
+
+    fn send_p2p_stream(&self, stream_id: u32, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes: &[u8] = payload.extract()?;
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.send_p2p_stream(stream_id, bytes).map_err(py_err_from)
+    }
+
+    fn close_p2p_stream(&self, stream_id: u32) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.close_p2p_stream(stream_id).map_err(py_err_from)
+    }
+
+    fn reset_p2p_stream(&self, stream_id: u32) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.reset_p2p_stream(stream_id).map_err(py_err_from)
     }
 
     // ------------------------------------------------------------------------
@@ -616,7 +1321,7 @@ impl PyRouter {
     // ------------------------------------------------------------------------
 
     #[pyo3(signature = (name, tx, reliable_enabled=false))]
-    fn add_side_serialized(
+    fn add_side_packed(
         &mut self,
         py: Python<'_>,
         name: &str,
@@ -639,7 +1344,7 @@ impl PyRouter {
             ..RouterSideOptions::default()
         };
 
-        let id = rtr.add_side_serialized_with_options(
+        let id = rtr.add_side_packed_with_options(
             name_static,
             move |bytes| {
                 Python::attach(|py| {
@@ -661,6 +1366,57 @@ impl PyRouter {
         }
         self._side_cbs[id] = Some(cb_keep);
 
+        Ok(id as u32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, tx, reliable_enabled=false, profile="ipv6_like", max_frame_bytes=0, compact_header_target_bytes=0, max_side_transport_templates=64))]
+    fn add_side_packed_profile(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        tx: Py<PyAny>,
+        reliable_enabled: bool,
+        profile: &str,
+        max_frame_bytes: usize,
+        compact_header_target_bytes: usize,
+        max_side_transport_templates: usize,
+    ) -> PyResult<u32> {
+        let cb_keep = tx.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        let profile = side_transport_profile_from_name(profile)?;
+        let opts = router_side_options_for_profile(
+            reliable_enabled,
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        );
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let id = rtr.add_side_packed_with_options(
+            name_static,
+            move |bytes| {
+                Python::attach(|py| {
+                    let arg = PyBytes::new(py, bytes);
+                    match cb_for_closure.call1(py, (&arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("router side tx error"))
+                        }
+                    }
+                })
+            },
+            opts,
+        );
+        if self._side_cbs.len() <= id {
+            self._side_cbs.resize_with(id + 1, || None);
+        }
+        self._side_cbs[id] = Some(cb_keep);
         Ok(id as u32)
     }
 
@@ -909,7 +1665,19 @@ impl PyRouter {
         rtr.tx_queue(pkt_ref.inner.clone()).map_err(py_err_from)
     }
 
-    fn transmit_serialized_message(
+    fn transmit_packed_message(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes: &[u8] = data.extract()?;
+        let arc: AArc<[u8]> = AArc::from(bytes);
+
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+
+        rtr.tx_packed(arc).map_err(py_err_from)
+    }
+
+    fn transmit_packed_message_queue(
         &self,
         _py: Python<'_>,
         data: &Bound<'_, PyAny>,
@@ -922,32 +1690,16 @@ impl PyRouter {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
 
-        rtr.tx_serialized(arc).map_err(py_err_from)
+        rtr.tx_packed_queue(arc).map_err(py_err_from)
     }
 
-    fn transmit_serialized_message_queue(
-        &self,
-        _py: Python<'_>,
-        data: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let bytes: &[u8] = data.extract()?;
-        let arc: AArc<[u8]> = AArc::from(bytes);
-
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-
-        rtr.tx_serialized_queue(arc).map_err(py_err_from)
-    }
-
-    fn receive_serialized(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn receive_packed(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
         let rtr = self
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized(bytes).map_err(py_err_from)
+        rtr.rx_packed(bytes).map_err(py_err_from)
     }
 
     fn receive_packet(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -963,7 +1715,7 @@ impl PyRouter {
     //  Side-aware RX (explicit ingress side)
     // ------------------------------------------------------------------------
 
-    fn receive_serialized_from_side(
+    fn receive_packed_from_side(
         &self,
         _py: Python<'_>,
         side_id: u32,
@@ -974,17 +1726,17 @@ impl PyRouter {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized_from_side(bytes, side_id as usize)
+        rtr.rx_packed_from_side(bytes, side_id as usize)
             .map_err(py_err_from)
     }
 
-    fn receive_serialized_queue(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn receive_packed_queue(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
         let rtr = self
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized_queue(bytes).map_err(py_err_from)
+        rtr.rx_packed_queue(bytes).map_err(py_err_from)
     }
 
     fn receive_packet_queue(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -996,7 +1748,7 @@ impl PyRouter {
         rtr.rx_queue(pkt_ref.inner.clone()).map_err(py_err_from)
     }
 
-    fn receive_serialized_queue_from_side(
+    fn receive_packed_queue_from_side(
         &self,
         _py: Python<'_>,
         side_id: u32,
@@ -1007,7 +1759,7 @@ impl PyRouter {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-        rtr.rx_serialized_queue_from_side(bytes, side_id as usize)
+        rtr.rx_packed_queue_from_side(bytes, side_id as usize)
             .map_err(py_err_from)
     }
 
@@ -1101,7 +1853,7 @@ impl PyRouter {
         let mut bytes: Vec<u8> = if let Ok(b) = data.extract::<&[u8]>() {
             b.to_vec()
         } else if let Ok(py_str) = data.cast::<pyo3::types::PyString>() {
-            py_str.to_str()?.as_bytes().to_vec()
+            py_str.extract::<String>()?.into_bytes()
         } else {
             let builtins = PyModule::import(py, "builtins")?;
             match builtins.call_method1("bytes", (data.clone(),)) {
@@ -1185,6 +1937,15 @@ impl PyRouter {
     }
 
     #[cfg(feature = "discovery")]
+    fn announce_leave(&self) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.announce_leave().map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
         let rtr = self
             .inner
@@ -1200,6 +1961,127 @@ impl PyRouter {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
         topology_snapshot_to_pydict(py, rtr.export_topology())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.client_stats(sender_id)
+            .map(|stats| client_stats_snapshot_to_pydict(py, stats))
+            .transpose()
+    }
+
+    #[cfg(feature = "discovery")]
+    fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        runtime_stats_snapshot_to_pydict(py, rtr.export_runtime_stats())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn enable_network_variable(&self, ty: u32, can_read: bool, can_write: bool) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.enable_network_variable(
+            DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+            NetworkVariablePermissions {
+                read: can_read,
+                write: can_write,
+            },
+        )
+        .map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn on_network_variable_update(
+        &mut self,
+        py: Python<'_>,
+        ty: u32,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        let cb_keep = callback.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.on_network_variable_update(
+            DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+            move |pkt: &Packet| {
+                Python::attach(|py| {
+                    let arg = Py::new(py, PyPacket { inner: pkt.clone() })
+                        .map_err(|_| TelemetryError::Io("network variable update callback"))?;
+                    match cb_for_closure.call1(py, (arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("network variable update callback"))
+                        }
+                    }
+                })
+            },
+        )
+        .map_err(py_err_from)?;
+        self._netvar_cbs.push(cb_keep);
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn set_network_variable(&self, pkt: &PyPacket) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.set_network_variable(pkt.inner.clone())
+            .map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn get_network_variable(
+        &self,
+        ty: u32,
+        stale_after_ms: Option<u64>,
+    ) -> PyResult<Option<PyPacket>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr
+            .get_network_variable(
+                DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+                stale_after_ms,
+            )
+            .map_err(py_err_from)?
+            .map(|inner| PyPacket { inner }))
+    }
+
+    #[cfg(feature = "discovery")]
+    fn cached_network_variable(&self, ty: u32) -> PyResult<Option<PyPacket>> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr
+            .get_cached_network_variable(
+                DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+            )
+            .map_err(py_err_from)?
+            .map(|inner| PyPacket { inner }))
+    }
+
+    fn export_memory_layout_json(&self) -> PyResult<String> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        Ok(rtr.export_memory_layout_json())
     }
 
     #[cfg(feature = "timesync")]
@@ -1503,7 +2385,7 @@ impl PyRouter {
 /// Python-visible relay wrapper.
 ///
 /// The Relay:
-///   - fans out serialized packets from one side to all others
+///   - fans out packed packets from one side to all others
 ///   - has RX/TX queues and time-budgeted processing
 ///   - uses the same Clock abstraction as Router.
 #[pyclass(name = "Relay")]
@@ -1533,8 +2415,17 @@ impl PyRelay {
         })
     }
 
+    #[getter]
+    fn sender_id(&self) -> String {
+        self.inner.sender().to_string()
+    }
+
+    fn set_sender_id(&self, sender_id: &str) {
+        self.inner.set_sender(sender_id);
+    }
+
     #[pyo3(signature = (name, tx, reliable_enabled=false))]
-    fn add_side_serialized(
+    fn add_side_packed(
         &mut self,
         py: Python<'_>,
         name: &str,
@@ -1552,7 +2443,7 @@ impl PyRelay {
             ..RelaySideOptions::default()
         };
 
-        let id = self.inner.add_side_serialized_with_options(
+        let id = self.inner.add_side_packed_with_options(
             name_static,
             move |bytes| {
                 Python::attach(|py| {
@@ -1574,6 +2465,53 @@ impl PyRelay {
         }
         self._tx_cbs[id] = Some(cb_keep);
 
+        Ok(id as u32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, tx, reliable_enabled=false, profile="ipv6_like", max_frame_bytes=0, compact_header_target_bytes=0, max_side_transport_templates=64))]
+    fn add_side_packed_profile(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        tx: Py<PyAny>,
+        reliable_enabled: bool,
+        profile: &str,
+        max_frame_bytes: usize,
+        compact_header_target_bytes: usize,
+        max_side_transport_templates: usize,
+    ) -> PyResult<u32> {
+        let cb_keep = tx.clone_ref(py);
+        let cb_for_closure = cb_keep.clone_ref(py);
+        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        let profile = side_transport_profile_from_name(profile)?;
+        let opts = relay_side_options_for_profile(
+            reliable_enabled,
+            profile,
+            max_frame_bytes,
+            compact_header_target_bytes,
+            max_side_transport_templates,
+        );
+        let id = self.inner.add_side_packed_with_options(
+            name_static,
+            move |bytes| {
+                Python::attach(|py| {
+                    let arg = PyBytes::new(py, bytes);
+                    match cb_for_closure.call1(py, (&arg,)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            err.restore(py);
+                            Err(TelemetryError::Io("relay tx error"))
+                        }
+                    }
+                })
+            },
+            opts,
+        );
+        if self._tx_cbs.len() <= id {
+            self._tx_cbs.resize_with(id + 1, || None);
+        }
+        self._tx_cbs[id] = Some(cb_keep);
         Ok(id as u32)
     }
 
@@ -1753,7 +2691,7 @@ impl PyRelay {
             .map_err(py_err_from)
     }
 
-    fn rx_serialized_from_side(
+    fn rx_packed_from_side(
         &self,
         _py: Python<'_>,
         side_id: u32,
@@ -1761,7 +2699,7 @@ impl PyRelay {
     ) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
         self.inner
-            .rx_serialized_from_side(side_id as usize, bytes)
+            .rx_packed_from_side(side_id as usize, bytes)
             .map_err(py_err_from)
     }
 
@@ -1829,6 +2767,11 @@ impl PyRelay {
     }
 
     #[cfg(feature = "discovery")]
+    fn announce_leave(&self) -> PyResult<()> {
+        self.inner.announce_leave().map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
         self.inner.poll_discovery().map_err(py_err_from)
     }
@@ -1837,6 +2780,23 @@ impl PyRelay {
     fn export_topology(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         topology_snapshot_to_pydict(py, self.inner.export_topology())
     }
+
+    #[cfg(feature = "discovery")]
+    fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
+        self.inner
+            .client_stats(sender_id)
+            .map(|stats| client_stats_snapshot_to_pydict(py, stats))
+            .transpose()
+    }
+
+    #[cfg(feature = "discovery")]
+    fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        runtime_stats_snapshot_to_pydict(py, self.inner.export_runtime_stats())
+    }
+
+    fn export_memory_layout_json(&self) -> String {
+        self.inner.export_memory_layout_json()
+    }
 }
 
 // ============================================================================
@@ -1844,10 +2804,10 @@ impl PyRelay {
 // ============================================================================
 
 #[pyfunction]
-/// Deserializes wire bytes into a `PyPacket` instance.
-pub fn deserialize_packet_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+/// Unpacks wire bytes into a `PyPacket` instance.
+pub fn unpack_packet_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let bytes: &[u8] = data.extract()?;
-    let pkt = deserialize_packet(bytes).map_err(py_err_from)?;
+    let pkt = unpack_packet(bytes).map_err(py_err_from)?;
     if let Err(e) = pkt.validate() {
         return Err(py_err_from(e));
     }
@@ -1861,13 +2821,13 @@ pub fn peek_header_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<Py
     let env = peek_envelope(bytes).map_err(py_err_from)?;
 
     let out = PyDict::new(py);
-    out.set_item("ty", env.ty as u32)?;
+    out.set_item("ty", env.ty.as_u32())?;
     out.set_item("sender", env.sender.as_ref())?;
     out.set_item(
         "endpoints",
         env.endpoints
             .iter()
-            .map(|e| *e as u32)
+            .map(|e| e.as_u32())
             .collect::<Vec<u32>>(),
     )?;
     out.set_item("timestamp_ms", env.timestamp_ms)?;
@@ -1903,20 +2863,255 @@ pub fn make_packet(
     Ok(Py::new(py, PyPacket { inner: pkt })?.into_any())
 }
 
+#[pyfunction(name = "endpoint_exists")]
+pub fn endpoint_exists_py(endpoint: u32) -> bool {
+    endpoint_exists(DataEndpoint(endpoint))
+}
+
+#[pyfunction(name = "data_type_exists")]
+pub fn data_type_exists_py(ty: u32) -> bool {
+    data_type_exists(DataType(ty))
+}
+
+#[pyfunction(name = "register_endpoint")]
+#[pyo3(signature = (endpoint, name, link_local_only=false, description=""))]
+pub fn register_endpoint_py(
+    endpoint: u32,
+    name: &str,
+    link_local_only: bool,
+    description: &str,
+) -> PyResult<u32> {
+    register_endpoint_id_with_description(
+        DataEndpoint(endpoint),
+        name,
+        description,
+        link_local_only,
+    )
+    .map(|ep| ep.as_u32())
+    .map_err(py_err_from)
+}
+
+#[pyfunction(name = "register_data_type")]
+#[pyo3(signature = (ty, name, is_static, element_count, message_data_type, message_class, endpoints, reliable=0, priority=0, description="", e2e_encryption=0)
+)]
+#[allow(clippy::too_many_arguments)]
+pub fn register_data_type_py(
+    ty: u32,
+    name: &str,
+    is_static: bool,
+    element_count: usize,
+    message_data_type: u8,
+    message_class: u8,
+    endpoints: Vec<u32>,
+    reliable: u8,
+    priority: u8,
+    description: &str,
+    e2e_encryption: u8,
+) -> PyResult<u32> {
+    let data_type = message_data_type_from_code(message_data_type)
+        .ok_or_else(|| PyValueError::new_err("bad message_data_type"))?;
+    let class = message_class_from_code(message_class)
+        .ok_or_else(|| PyValueError::new_err("bad message_class"))?;
+    let reliable =
+        reliable_from_code(reliable).ok_or_else(|| PyValueError::new_err("bad reliable"))?;
+    let e2e_encryption = e2e_encryption_policy_from_code(e2e_encryption)
+        .ok_or_else(|| PyValueError::new_err("bad e2e_encryption"))?;
+    let element = if is_static {
+        MessageElement::Static(element_count, data_type, class)
+    } else {
+        MessageElement::Dynamic(data_type, class)
+    };
+    let eps = endpoints.into_iter().map(DataEndpoint).collect::<Vec<_>>();
+    register_data_type_id_with_description_and_e2e_encryption(
+        DataType(ty),
+        name,
+        description,
+        element,
+        &eps,
+        reliable,
+        priority,
+        e2e_encryption,
+    )
+    .map(|dt| dt.as_u32())
+    .map_err(py_err_from)
+}
+
+#[pyfunction(name = "endpoint_info")]
+pub fn endpoint_info_py(py: Python<'_>, endpoint: u32) -> PyResult<Py<PyAny>> {
+    let out = PyDict::new(py);
+    if let Some(def) = endpoint_definition(DataEndpoint(endpoint)) {
+        out.set_item("exists", true)?;
+        out.set_item("id", def.id.as_u32())?;
+        out.set_item("name", def.name)?;
+        out.set_item("description", def.description)?;
+        out.set_item("link_local_only", def.link_local_only)?;
+    } else {
+        out.set_item("exists", false)?;
+        out.set_item("id", endpoint)?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+#[pyfunction(name = "data_type_info")]
+pub fn data_type_info_py(py: Python<'_>, ty: u32) -> PyResult<Py<PyAny>> {
+    let out = PyDict::new(py);
+    if let Some(def) = data_type_definition(DataType(ty)) {
+        let (is_static, count, data_type, class) = match def.element {
+            MessageElement::Static(count, data_type, class) => (true, count, data_type, class),
+            MessageElement::Dynamic(data_type, class) => (false, 0, data_type, class),
+        };
+        out.set_item("exists", true)?;
+        out.set_item("id", def.id.as_u32())?;
+        out.set_item("name", def.name)?;
+        out.set_item("description", def.description)?;
+        out.set_item("is_static", is_static)?;
+        out.set_item("element_count", count)?;
+        out.set_item("message_data_type", message_data_type_code(data_type))?;
+        out.set_item("message_class", message_class_code(class))?;
+        out.set_item("reliable", reliable_code(def.reliable))?;
+        out.set_item("priority", def.priority)?;
+        out.set_item(
+            "e2e_encryption",
+            crate::config::e2e_encryption_policy_code(def.e2e_encryption),
+        )?;
+        out.set_item("fixed_size", get_needed_message_size(def.id))?;
+        out.set_item(
+            "endpoints",
+            def.endpoints
+                .iter()
+                .map(|ep| ep.as_u32())
+                .collect::<Vec<_>>(),
+        )?;
+    } else {
+        out.set_item("exists", false)?;
+        out.set_item("id", ty)?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+#[pyfunction(name = "endpoint_info_by_name")]
+pub fn endpoint_info_by_name_py(py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+    let out = PyDict::new(py);
+    if let Some(def) = endpoint_definition_by_name(name) {
+        out.set_item("exists", true)?;
+        out.set_item("id", def.id.as_u32())?;
+        out.set_item("name", def.name)?;
+        out.set_item("description", def.description)?;
+        out.set_item("link_local_only", def.link_local_only)?;
+    } else {
+        out.set_item("exists", false)?;
+        out.set_item("name", name)?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+#[pyfunction(name = "data_type_info_by_name")]
+pub fn data_type_info_by_name_py(py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+    let out = PyDict::new(py);
+    if let Some(def) = data_type_definition_by_name(name) {
+        let (is_static, count, data_type, class) = match def.element {
+            MessageElement::Static(count, data_type, class) => (true, count, data_type, class),
+            MessageElement::Dynamic(data_type, class) => (false, 0, data_type, class),
+        };
+        out.set_item("exists", true)?;
+        out.set_item("id", def.id.as_u32())?;
+        out.set_item("name", def.name)?;
+        out.set_item("description", def.description)?;
+        out.set_item("is_static", is_static)?;
+        out.set_item("element_count", count)?;
+        out.set_item("message_data_type", message_data_type_code(data_type))?;
+        out.set_item("message_class", message_class_code(class))?;
+        out.set_item("reliable", reliable_code(def.reliable))?;
+        out.set_item("priority", def.priority)?;
+        out.set_item(
+            "e2e_encryption",
+            crate::config::e2e_encryption_policy_code(def.e2e_encryption),
+        )?;
+        out.set_item("fixed_size", get_needed_message_size(def.id))?;
+        out.set_item(
+            "endpoints",
+            def.endpoints
+                .iter()
+                .map(|ep| ep.as_u32())
+                .collect::<Vec<_>>(),
+        )?;
+    } else {
+        out.set_item("exists", false)?;
+        out.set_item("name", name)?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+#[pyfunction(name = "remove_endpoint")]
+pub fn remove_endpoint_py(endpoint: u32) -> PyResult<bool> {
+    remove_endpoint(DataEndpoint(endpoint)).map_err(py_err_from)
+}
+
+#[pyfunction(name = "remove_endpoint_by_name")]
+pub fn remove_endpoint_by_name_py(name: &str) -> PyResult<bool> {
+    remove_endpoint_by_name(name).map_err(py_err_from)
+}
+
+#[pyfunction(name = "remove_data_type")]
+pub fn remove_data_type_py(ty: u32) -> PyResult<bool> {
+    remove_data_type(DataType(ty)).map_err(py_err_from)
+}
+
+#[pyfunction(name = "remove_data_type_by_name")]
+pub fn remove_data_type_by_name_py(name: &str) -> PyResult<bool> {
+    remove_data_type_by_name(name).map_err(py_err_from)
+}
+
+#[pyfunction(name = "register_schema_json_bytes")]
+pub fn register_schema_json_bytes_py(data: &Bound<'_, PyAny>) -> PyResult<()> {
+    let bytes: &[u8] = data.extract()?;
+    register_schema_json_bytes(bytes).map_err(py_err_from)
+}
+
+#[pyfunction(name = "register_schema_json_file")]
+pub fn register_schema_json_file_py(path: &str) -> PyResult<()> {
+    #[cfg(feature = "std")]
+    let result = crate::config::register_schema_json_path(path).map_err(py_err_from);
+
+    #[cfg(not(feature = "std"))]
+    let result = {
+        let _ = path;
+        Err(PyRuntimeError::new_err(
+            "schema JSON file loading requires std",
+        ))
+    };
+
+    result
+}
+
 // ============================================================================
 //  Module init: classes, functions, dynamic enums
 // ============================================================================
 
 #[pymodule]
-/// Initializes the `sedsprintf_rs` Python extension module.
-pub fn sedsprintf_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Initializes the `sedsnet` Python extension module.
+pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRouter>()?;
     m.add_class::<PyPacket>()?;
     m.add_class::<PyRelay>()?;
 
-    m.add_function(wrap_pyfunction!(deserialize_packet_py, m)?)?;
+    m.add_function(wrap_pyfunction!(unpack_packet_py, m)?)?;
     m.add_function(wrap_pyfunction!(peek_header_py, m)?)?;
     m.add_function(wrap_pyfunction!(make_packet, m)?)?;
+    m.add_function(wrap_pyfunction!(endpoint_exists_py, m)?)?;
+    m.add_function(wrap_pyfunction!(data_type_exists_py, m)?)?;
+    m.add_function(wrap_pyfunction!(register_endpoint_py, m)?)?;
+    m.add_function(wrap_pyfunction!(register_data_type_py, m)?)?;
+    m.add_function(wrap_pyfunction!(register_schema_json_bytes_py, m)?)?;
+    m.add_function(wrap_pyfunction!(register_schema_json_file_py, m)?)?;
+    m.add_function(wrap_pyfunction!(endpoint_info_py, m)?)?;
+    m.add_function(wrap_pyfunction!(data_type_info_py, m)?)?;
+    m.add_function(wrap_pyfunction!(endpoint_info_by_name_py, m)?)?;
+    m.add_function(wrap_pyfunction!(data_type_info_by_name_py, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_endpoint_py, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_endpoint_by_name_py, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_data_type_py, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_data_type_by_name_py, m)?)?;
 
     let enum_mod = PyModule::import(py, "enum")?;
     let int_enum = enum_mod.getattr("IntEnum")?;

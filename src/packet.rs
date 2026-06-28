@@ -6,18 +6,19 @@
 //! - supports pretty printing (header + decoded values) for debugging/logging,
 //! - uses [`SmallPayload`] internally to keep small messages on the stack.
 
-use crate::config::{StandardSmallPayload, DEVICE_IDENTIFIER, STRING_PRECISION};
+use crate::config::{DEVICE_IDENTIFIER, STRING_PRECISION, StandardSmallPayload};
 use crate::queue::ByteCost;
 use crate::{
-    config::{DataEndpoint, DataType}, data_type_size, get_data_type, get_info_type, get_message_name,
-    message_meta,
-    router::LeBytes, MessageClass, MessageDataType, MessageElement, TelemetryError,
-    TelemetryResult,
+    MessageClass, MessageDataType, MessageElement, TelemetryError, TelemetryResult,
+    config::{DataEndpoint, DataType},
+    data_type_size, get_data_type, get_message_name, message_meta,
+    router::LeBytes,
 };
 use crate::{impl_data_as_prim, impl_from_prim_slices, impl_ledecode_auto};
 use alloc::{string::String, string::ToString, sync::Arc, vec, vec::Vec};
 use core::any::TypeId;
 use core::fmt::{Formatter, Write};
+use core::sync::atomic::{AtomicU32, Ordering};
 // ============================================================================
 // Constants
 // ============================================================================
@@ -31,6 +32,19 @@ const EPOCH_MS_THRESHOLD: u64 = 1_000_000_000_000; // clearly not an uptime coun
 
 /// Default starting capacity for human-readable strings.
 const DEFAULT_STRING_CAPACITY: usize = 96;
+
+/// Process-local packet nonce generator used to keep same-timestamp packets
+/// distinct for recent-ID dedupe even when their logical payload matches.
+static PACKET_NONCE_COUNTER: AtomicU32 = AtomicU32::new(0xA5C3_1F27);
+
+#[inline]
+fn next_packet_nonce() -> u16 {
+    let mut x = PACKET_NONCE_COUNTER.fetch_add(0x9E37_79B9, Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    (x as u16) | 1
+}
 
 // ============================================================================
 // Packet
@@ -65,8 +79,19 @@ pub struct Packet {
     ///   as `YYYY-MM-DD HH:MM:SS.mmmZ`.
     timestamp: u64,
 
+    /// Small per-packet nonce carried on the wire and folded into packet ID
+    /// calculation so otherwise-identical packets emitted in the same
+    /// millisecond do not collapse in recent-ID dedupe.
+    nonce: u16,
+
     /// Raw payload bytes, stored via [`SmallPayload`] for small/large optimization.
     payload: StandardSmallPayload,
+
+    /// Inline wire-format shape used when this packet came from a migration-safe frame.
+    wire_shape: Option<MessageElement>,
+
+    /// Explicit destination sender hashes frozen into the wire-format contract.
+    wire_target_senders: Arc<[u64]>,
 }
 
 // ============================================================================
@@ -108,34 +133,41 @@ pub fn hash_bytes_u64(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+/// Stable compact source address derived from a logical sender name.
+///
+/// Network-master address assignment can override the discovery mapping at the
+/// routing layer, but standalone packets need a deterministic address so the
+/// canonical wire header never has to carry the sender string.
+#[inline]
+pub(crate) fn sender_address_u32(sender: &str) -> u32 {
+    let raw = hash_bytes_u64(0xA6D3_8C21_4B7F_19E5, sender.as_bytes()) as u32;
+    if raw == 0 { 1 } else { raw }
+}
+
 /// Validate the payload of a dynamic-length message.
 ///
 /// - For `String`: trims trailing NULs for validation and ensures UTF-8 (if non-empty).
 /// - For `Hex`: no additional validation.
 /// - For numerics/bool: ensures the length is a multiple of the element width.
 #[inline]
-fn validate_dynamic_len_and_content(ty: DataType, bytes: &[u8]) -> TelemetryResult<()> {
-    let dt = get_data_type(ty);
-    match dt {
+fn validate_dynamic_len_and_content_for_element(
+    element: MessageElement,
+    bytes: &[u8],
+) -> TelemetryResult<()> {
+    match element.data_type() {
         MessageDataType::String => {
-            // Trim trailing NULs for validation, but do not copy.
             let end = bytes
                 .iter()
                 .rposition(|&b| b != 0)
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            // Empty string is OK; otherwise ensure valid UTF-8.
             if end > 0 {
                 core::str::from_utf8(&bytes[..end]).map_err(|_| TelemetryError::InvalidUtf8)?;
             }
             Ok(())
         }
-        MessageDataType::Binary => {
-            // No UTF-8 requirement for hex blobs.
-            Ok(())
-        }
-        _ => {
-            // Numeric / bool: length must be a multiple of the element width.
+        MessageDataType::Binary => Ok(()),
+        dt => {
             let w = element_width(dt);
             if w == 0 || !bytes.len().is_multiple_of(w) {
                 return Err(TelemetryError::SizeMismatch {
@@ -179,6 +211,104 @@ impl_ledecode_auto!(i8);
 // ============================================================================
 
 impl Packet {
+    /// Validate `payload` against the provided schema element.
+    ///
+    /// This helper is shared by normal packet construction and by
+    /// `new_with_wire_contract(...)`. The latter matters because a packet that
+    /// was already packed may need to keep using the element shape it was
+    /// written with even if the local runtime registry has since changed.
+    ///
+    /// # Parameters
+    /// - `element`: Effective schema element to validate against. This may come
+    ///   from the current runtime registry or from the inline wire contract.
+    /// - `payload`: Raw payload bytes to validate.
+    ///
+    /// # Returns
+    /// - `Ok(())` when the payload is compatible with `element`.
+    /// - `Err(TelemetryError)` when the payload length or encoding does not
+    ///   match the required shape.
+    #[inline]
+    fn validate_payload_against_element(
+        element: MessageElement,
+        payload: &[u8],
+    ) -> TelemetryResult<()> {
+        match element {
+            MessageElement::Static(need, dt, _) => {
+                let need = need * data_type_size(dt);
+                if payload.len() != need {
+                    return Err(TelemetryError::SizeMismatch {
+                        expected: need,
+                        got: payload.len(),
+                    });
+                }
+                Ok(())
+            }
+            MessageElement::Dynamic(_, _) => {
+                validate_dynamic_len_and_content_for_element(element, payload)
+            }
+        }
+    }
+
+    /// Create a packet while preserving wire-contract metadata from a decoded frame.
+    ///
+    /// This constructor is used by unpacking paths that may carry a
+    /// migration-safe wire contract. The contract can supply:
+    ///
+    /// - `wire_shape`: an inline `MessageElement` that keeps payload decoding
+    ///   stable even if the local runtime schema changed after the packet was
+    ///   packed.
+    /// - `wire_target_senders`: a frozen list of destination-holder sender
+    ///   hashes that routers and relays use to keep in-flight forwarding bound
+    ///   to the originally intended remote holders.
+    ///
+    /// # Parameters
+    /// - `ty`: Logical message type ID carried by the frame.
+    /// - `endpoints`: Logical destination endpoints from the endpoint bitmap.
+    /// - `sender`: Logical sender string decoded from the frame.
+    /// - `timestamp`: Wire timestamp in milliseconds.
+    /// - `payload`: Payload bytes after any decompression.
+    /// - `wire_shape`: Optional inline payload shape carried by the wire
+    ///   contract. When present, validation uses this value instead of the
+    ///   current runtime schema entry.
+    /// - `wire_target_senders`: Frozen destination-holder hashes carried by the
+    ///   wire contract. These are routing metadata, not application payload.
+    ///
+    /// # Returns
+    /// - `Ok(Packet)` when all packet invariants and payload validation pass.
+    /// - `Err(TelemetryError)` when endpoints are empty or the payload is
+    ///   incompatible with the effective schema element.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_wire_contract(
+        ty: DataType,
+        endpoints: &[DataEndpoint],
+        sender: &str,
+        timestamp: u64,
+        nonce: u16,
+        payload: Arc<[u8]>,
+        wire_shape: Option<MessageElement>,
+        wire_target_senders: Arc<[u64]>,
+    ) -> TelemetryResult<Self> {
+        if endpoints.is_empty() {
+            return Err(TelemetryError::EmptyEndpoints);
+        }
+
+        let element = wire_shape.unwrap_or(message_meta(ty).element);
+        Self::validate_payload_against_element(element, &payload)?;
+
+        Ok(Self {
+            ty,
+            data_size: payload.len(),
+            sender: sender.into(),
+            endpoints: Arc::<[DataEndpoint]>::from(endpoints),
+            timestamp,
+            nonce,
+            payload: StandardSmallPayload::new(&payload),
+            wire_shape,
+            wire_target_senders,
+        })
+    }
+
     /// Create a packet from a raw payload, validating against `message_meta(ty)`.
     ///
     /// Checks:
@@ -210,39 +340,75 @@ impl Packet {
         timestamp: u64,
         payload: Arc<[u8]>,
     ) -> TelemetryResult<Self> {
-        if endpoints.is_empty() {
-            return Err(TelemetryError::EmptyEndpoints);
-        }
-
-        let meta = message_meta(ty);
-        match meta.element {
-            MessageElement::Static(need, _, _) => {
-                let need = need * data_type_size(get_data_type(ty));
-                if payload.len() != need {
-                    return Err(TelemetryError::SizeMismatch {
-                        expected: need,
-                        got: payload.len(),
-                    });
-                }
-            }
-            MessageElement::Dynamic(_, _) => {
-                validate_dynamic_len_and_content(ty, &payload)?;
-            }
-        }
-
-        Ok(Self {
+        Self::new_with_nonce(
             ty,
-            data_size: payload.len(),
-            sender: sender.into(),
-            endpoints: Arc::<[DataEndpoint]>::from(endpoints),
+            endpoints,
+            sender,
             timestamp,
-            payload: StandardSmallPayload::new(&payload),
-        })
+            next_packet_nonce(),
+            payload,
+        )
+    }
+
+    /// Create a packet with an explicit nonce value.
+    ///
+    /// This is mainly useful when callers need stable byte-for-byte wire output
+    /// across repeated constructions, such as deterministic tests or
+    /// precomputed fixtures.
+    pub fn new_with_nonce(
+        ty: DataType,
+        endpoints: &[DataEndpoint],
+        sender: &str,
+        timestamp: u64,
+        nonce: u16,
+        payload: Arc<[u8]>,
+    ) -> TelemetryResult<Self> {
+        Self::new_with_wire_contract(
+            ty,
+            endpoints,
+            sender,
+            timestamp,
+            nonce,
+            payload,
+            None,
+            Arc::<[u64]>::from([]),
+        )
+    }
+
+    /// Resolve the schema element this packet should use for validation,
+    /// formatting, and typed payload access.
+    ///
+    /// Normal locally-built packets use the current runtime schema entry for
+    /// `self.ty`. Packets decoded from migration-safe frames may instead carry
+    /// `self.wire_shape`, which takes precedence so an in-flight payload can
+    /// still be interpreted after runtime schema churn.
+    #[inline]
+    fn effective_element(&self) -> MessageElement {
+        self.wire_shape.unwrap_or(message_meta(self.ty).element)
+    }
+
+    /// Return the effective primitive payload kind for this packet.
+    ///
+    /// This is derived from `effective_element()` so typed decode helpers keep
+    /// following any inline wire shape when one is present.
+    #[inline]
+    fn effective_data_type(&self) -> MessageDataType {
+        self.effective_element().data_type()
+    }
+
+    /// Return the effective message class for this packet.
+    ///
+    /// Like `effective_data_type()`, this honors inline wire-shape metadata so
+    /// formatting remains consistent for in-flight packets across schema
+    /// changes.
+    #[inline]
+    fn effective_message_class(&self) -> MessageClass {
+        self.effective_element().message_type()
     }
 
     /// Compute a stable 64-bit identifier for this packet.
     ///
-    /// This is *not* serialized – it is derived locally from:
+    /// This is *not* packed – it is derived locally from:
     /// - sender
     /// - logical type (DataType)
     /// - endpoints
@@ -256,8 +422,9 @@ impl Packet {
         // Seed with an arbitrary non-zero constant.
         let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
 
-        // Sender (string)
-        h = hash_bytes_u64(h, self.sender.as_bytes());
+        // Compact source address. Sender names are discovery/config metadata,
+        // not packet-header identity.
+        h = hash_bytes_u64(h, &sender_address_u32(self.sender.as_ref()).to_le_bytes());
 
         // Logical type as string
         h = hash_bytes_u64(h, get_message_name(self.ty).as_bytes());
@@ -269,6 +436,7 @@ impl Packet {
 
         // Timestamp + data_size as bytes
         h = hash_bytes_u64(h, &self.timestamp.to_le_bytes());
+        h = hash_bytes_u64(h, &self.nonce.to_le_bytes());
         h = hash_bytes_u64(h, &self.data_size.to_le_bytes());
 
         // Payload bytes
@@ -329,22 +497,7 @@ impl Packet {
             });
         }
 
-        let meta = message_meta(self.ty);
-        match meta.element {
-            MessageElement::Static(need, _, _) => {
-                let need = need * data_type_size(get_data_type(self.ty));
-                if self.data_size != need {
-                    return Err(TelemetryError::SizeMismatch {
-                        expected: need,
-                        got: self.data_size,
-                    });
-                }
-            }
-            MessageElement::Dynamic(_, _) => {
-                validate_dynamic_len_and_content(self.ty, &self.payload)?;
-            }
-        }
-        Ok(())
+        Self::validate_payload_against_element(self.effective_element(), &self.payload)
     }
 
     /* ---- Getters ---- */
@@ -374,6 +527,12 @@ impl Packet {
         self.timestamp
     }
 
+    /// Get the packet nonce.
+    #[inline]
+    pub fn nonce(&self) -> u16 {
+        self.nonce
+    }
+
     /// Get the payload size in bytes.
     #[inline]
     pub fn data_size(&self) -> usize {
@@ -384,6 +543,32 @@ impl Packet {
     #[inline]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Return the optional inline wire shape preserved from unpacking.
+    ///
+    /// This is crate-visible because packing and routing need to keep the
+    /// contract intact when a packet is forwarded again.
+    #[inline]
+    pub(crate) fn wire_shape(&self) -> Option<MessageElement> {
+        self.wire_shape
+    }
+
+    /// Return the frozen destination-holder hashes preserved from the wire contract.
+    ///
+    /// Routers and relays use this list to avoid delivering an in-flight packet
+    /// to newly-learned holders that were not part of the original delivery
+    /// contract when the packet was packed.
+    #[inline]
+    pub(crate) fn wire_target_senders(&self) -> &[u64] {
+        &self.wire_target_senders
+    }
+
+    /// Override the packet nonce while keeping the rest of the packet intact.
+    #[inline]
+    pub fn with_nonce(mut self, nonce: u16) -> Self {
+        self.nonce = nonce;
+        self
     }
 
     /// Header-only string (no decoded data).
@@ -426,7 +611,7 @@ impl Packet {
     /// - `None` otherwise.
     #[inline]
     pub fn data_as_utf8_ref(&self) -> Option<&str> {
-        if get_data_type(self.ty) != MessageDataType::String {
+        if self.effective_data_type() != MessageDataType::String {
             return None;
         }
         let bytes = &self.payload;
@@ -482,7 +667,7 @@ impl Packet {
             return s;
         }
 
-        match get_info_type(self.ty) {
+        match self.effective_message_class() {
             MessageClass::Data => {
                 s.push_str(", Data: (");
             }
@@ -501,7 +686,7 @@ impl Packet {
             return s;
         }
 
-        match get_data_type(self.ty) {
+        match self.effective_data_type() {
             MessageDataType::Float64 => {
                 self.data_to_string::<f64>(&mut s);
             }
@@ -590,7 +775,7 @@ impl Packet {
     /// Ensure this packet's element type matches `expected`.
     #[inline]
     fn ensure_kind(&self, expected: MessageDataType) -> TelemetryResult<()> {
-        let dt = get_data_type(self.ty);
+        let dt = self.effective_data_type();
         if dt != expected {
             return Err(TelemetryError::TypeMismatch {
                 expected: data_type_size(expected),

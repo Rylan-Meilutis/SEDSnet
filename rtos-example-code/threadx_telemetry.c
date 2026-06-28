@@ -3,7 +3,7 @@
 
 #include "app_threadx.h"
 #include "can_bus.h"
-#include "sedsprintf.h"
+#include "sedsnet.h"
 #include "stm32g4xx_hal.h"
 
 #include <stdarg.h>
@@ -240,10 +240,10 @@ void rx_asynchronous(const uint8_t *bytes, size_t len) {
   }
 
   if (g_can_side_id >= 0) {
-    (void)seds_router_rx_serialized_packet_to_queue_from_side(
+    (void)seds_router_rx_packed_packet_to_queue_from_side(
         g_router.r, (uint32_t)g_can_side_id, bytes, len);
   } else {
-    (void)seds_router_rx_serialized_packet_to_queue(g_router.r, bytes, len);
+    (void)seds_router_rx_packed_packet_to_queue(g_router.r, bytes, len);
   }
 #endif
 }
@@ -263,10 +263,10 @@ static UNUSED_FUNCTION void rx_synchronous(const uint8_t *bytes, size_t len) {
   }
 
   if (g_can_side_id >= 0) {
-    (void)seds_router_receive_serialized_from_side(g_router.r, (uint32_t)g_can_side_id, bytes,
+    (void)seds_router_receive_packed_from_side(g_router.r, (uint32_t)g_can_side_id, bytes,
                                                    len);
   } else {
-    (void)seds_router_receive_serialized(g_router.r, bytes, len);
+    (void)seds_router_receive_packed(g_router.r, bytes, len);
   }
 #endif
 }
@@ -335,7 +335,7 @@ SedsResult init_telemetry_router(void) {
     return SEDS_ERR;
   }
 
-  g_can_side_id = seds_router_add_side_serialized(r, "can", 3U, tx_send, NULL, false);
+  g_can_side_id = seds_router_add_side_packed(r, "can", 3U, tx_send, NULL, false);
   if (g_can_side_id < 0) {
     printf("Error: failed to add CAN side: %ld\r\n", (long)g_can_side_id);
     g_can_side_id = -1;
