@@ -12,6 +12,11 @@ stages:
   - wheels
   - publish
 
+variables:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse"
+
 rust-tests:
   stage: test
   image:

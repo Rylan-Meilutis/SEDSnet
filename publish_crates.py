@@ -45,6 +45,12 @@ MACOS_DOCKER_IMAGES = {
     "aarch64-apple-darwin": "registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin",
 }
 
+CARGO_NETWORK_ENV = {
+    "CARGO_HTTP_MULTIPLEXING": "false",
+    "CARGO_NET_RETRY": "10",
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse",
+}
+
 
 def run(
     cmd: list[str],
@@ -57,20 +63,39 @@ def run(
     subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
 
 
-def run_optional(cmd: list[str], *, display_cmd: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+def cargo_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(CARGO_NETWORK_ENV)
+    return env
+
+
+def docker_cargo_env_args() -> list[str]:
+    args: list[str] = []
+    for key, value in CARGO_NETWORK_ENV.items():
+        args.extend(["-e", f"{key}={value}"])
+    return args
+
+
+def run_optional(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    display_cmd: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     shown = display_cmd if display_cmd is not None else cmd
     print(f"\n$ {' '.join(shown)}", flush=True)
     return subprocess.run(
         cmd,
         cwd=REPO_ROOT,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
 
 
-def capture(cmd: list[str]) -> str:
-    return subprocess.check_output(cmd, cwd=REPO_ROOT, text=True).strip()
+def capture(cmd: list[str], *, env: dict[str, str] | None = None) -> str:
+    return subprocess.check_output(cmd, cwd=REPO_ROOT, env=env, text=True).strip()
 
 
 def manifest_package(manifest: Path) -> tuple[str, str]:
@@ -132,7 +157,7 @@ def cargo_package(manifest: Path, *, allow_dirty: bool) -> None:
     cmd = ["cargo", "package", "--manifest-path", str(manifest)]
     if allow_dirty:
         cmd.append("--allow-dirty")
-    run(cmd)
+    run(cmd, env=cargo_env())
 
 
 def require_tool(name: str) -> None:
@@ -177,10 +202,10 @@ def cargo_publish(
     if token:
         cmd.extend(["--token", token])
     if not publish:
-        run(cmd)
+        run(cmd, env=cargo_env())
         return
 
-    result = run_optional(cmd)
+    result = run_optional(cmd, env=cargo_env())
     print(result.stdout, end="")
     if result.returncode == 0:
         return
@@ -192,7 +217,7 @@ def cargo_publish(
 
 def maturin_build() -> None:
     require_tool("maturin")
-    run(["maturin", "build", "--release", "--compatibility", "pypi"])
+    run(["maturin", "build", "--release", "--compatibility", "pypi"], env=cargo_env())
 
 
 def docker_maturin_build(
@@ -228,6 +253,7 @@ def docker_maturin_build(
             "docker",
             "run",
             "--rm",
+            *docker_cargo_env_args(),
             "-v",
             f"{REPO_ROOT}:/io",
             "--entrypoint",
@@ -246,6 +272,7 @@ def docker_maturin_sdist(*, image: str, out_dir: str) -> None:
             "docker",
             "run",
             "--rm",
+            *docker_cargo_env_args(),
             "-v",
             f"{REPO_ROOT}:/io",
             image,
@@ -291,6 +318,7 @@ def docker_maturin_windows_build(
                 "docker",
                 "run",
                 "--rm",
+                *docker_cargo_env_args(),
                 "-v",
                 f"{REPO_ROOT}:/io",
                 image,
@@ -317,7 +345,8 @@ def local_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
                 out_dir,
                 "--target",
                 target,
-            ]
+            ],
+            env=cargo_env(),
         )
 
 
@@ -364,6 +393,7 @@ def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
                     "docker",
                     "run",
                     "--rm",
+                    *docker_cargo_env_args(),
                     "-v",
                     f"{REPO_ROOT}:/io",
                     image,
@@ -422,13 +452,16 @@ def twine_upload(
 
 def build_local_pypi_artifacts(out_dir: str) -> list[Path]:
     require_tool("maturin")
-    run(["maturin", "build", "--release", "--compatibility", "pypi", "--out", out_dir])
-    run(["maturin", "sdist", "--out", out_dir])
+    run(
+        ["maturin", "build", "--release", "--compatibility", "pypi", "--out", out_dir],
+        env=cargo_env(),
+    )
+    run(["maturin", "sdist", "--out", out_dir], env=cargo_env())
     return pypi_artifacts_from_dir(out_dir)
 
 
 def cargo_search_output(crate_name: str) -> str:
-    return capture(["cargo", "search", crate_name, "--limit", "10"])
+    return capture(["cargo", "search", crate_name, "--limit", "10"], env=cargo_env())
 
 
 def cargo_search(crate_name: str) -> bool:
