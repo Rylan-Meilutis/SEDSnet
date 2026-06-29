@@ -44,8 +44,8 @@ Options (can be combined where it makes sense):
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
   cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
-  maturin-build           Run `maturin build` with the .pyi .gitignore hack.
-  maturin-develop         Run `maturin develop` with the .pyi .gitignore hack.
+  maturin-build           Run `maturin build` while including the static .pyi stub.
+  maturin-develop         Run `maturin develop` while including the static .pyi stub.
   maturin-install         Build wheel and install it with `uv pip install`.
   maturin-login           Validate and store PyPI upload credentials in .sedsnet-release.toml.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).

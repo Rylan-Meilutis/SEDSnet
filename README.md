@@ -287,8 +287,8 @@ Options:
   embedded                Build for the embedded target (enables embedded feature).
   python                  Build with Python bindings (enables python feature).
   timesync                Build with time sync helpers (enables timesync feature).
-  maturin-build           Run maturin build with the .pyi .gitignore hack.
-  maturin-develop         Run maturin develop with the .pyi .gitignore hack.
+  maturin-build           Run maturin build while including the static .pyi stub.
+  maturin-develop         Run maturin develop while including the static .pyi stub.
   maturin-install         Build wheel and install it with uv pip install.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set the packaged DEVICE_IDENTIFIER default for the build.
