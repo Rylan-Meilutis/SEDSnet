@@ -74,6 +74,12 @@
     - Runtime sender IDs and packed header templates reduce repeated header overhead after
       initial contact. Canonical packet frames now carry a compact source address instead of
       repeating sender hostnames; sender names are learned through discovery/config state.
+- Runtime configuration:
+    - Time-sync source/grandmaster role selection is runtime configuration, not a compile-time board
+      role. Rust, C, and Python can configure consumer/source/auto behavior and update router time
+      sync settings after construction.
+    - Router and relay memory limits are runtime constructor options across Rust, C, and Python, so
+      prebuilt Python wheels are no longer locked to the packaged queue-budget defaults.
 - Topology and diagnostics:
     - Topology exports now include named endpoint fields, side names, filtered SEDSnet control
       endpoints, and a top-level `links` list for graph rendering.

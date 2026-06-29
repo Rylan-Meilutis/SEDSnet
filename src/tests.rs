@@ -10831,13 +10831,17 @@ mod router_tests {
         fn router_and_relay_memory_layout_exports_queue_breakdown() {
             crate::tests::ensure_common_test_schema();
             let ep = DataEndpoint::named("RADIO");
+            let memory = crate::config::RuntimeMemoryConfig::new(4096, 8, 512, 2.0).unwrap();
             let router = Router::new_with_clock(
-                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))]),
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_memory_config(memory)
+                    .unwrap(),
                 zero_clock(),
             );
             let router_json: serde_json::Value =
                 serde_json::from_str(&router.export_memory_layout_json()).unwrap();
             assert_eq!(router_json["kind"], "router");
+            assert_eq!(router_json["shared_queue_bytes_allocated"], 4096);
             assert!(
                 router_json["shared_queue_bytes_allocated"]
                     .as_u64()
@@ -10847,14 +10851,20 @@ mod router_tests {
             assert!(router_json["rx_queue_bytes_used"].is_u64());
             assert!(router_json["tx_queue_bytes_allocated"].as_u64().unwrap() > 0);
             assert!(router_json["network_variable_cache_bytes_used"].is_u64());
+            assert_eq!(router_json["recent_rx_bytes_allocated"], 64);
 
-            let relay = Relay::new(zero_clock());
+            let relay_cfg = crate::relay::RelayConfig::default()
+                .with_memory_config(memory)
+                .unwrap();
+            let relay = Relay::new_with_config(relay_cfg, zero_clock());
             let relay_json: serde_json::Value =
                 serde_json::from_str(&relay.export_memory_layout_json()).unwrap();
             assert_eq!(relay_json["kind"], "relay");
+            assert_eq!(relay_json["shared_queue_bytes_allocated"], 4096);
             assert!(relay_json["shared_queue_bytes_allocated"].as_u64().unwrap() > 0);
             assert!(relay_json["rx_queue_bytes_used"].is_u64());
             assert!(relay_json["replay_queue_bytes_allocated"].as_u64().unwrap() > 0);
+            assert_eq!(relay_json["recent_rx_bytes_allocated"], 64);
         }
 
         #[test]

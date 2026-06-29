@@ -81,6 +81,21 @@ priority for as long as it remains leader so the tie resolves consistently witho
 standby producers' configured priorities. If no announce is seen within `source_timeout_ms`, a
 source is considered inactive.
 
+These roles are runtime configuration, not compile-time board roles. Use `Source` for a
+grandmaster/source node, `Consumer` for a follower, and `Auto` for a node that should become a
+source only when no better source is active and it already has usable time.
+
+Runtime configuration entry points:
+
+- Rust: `RouterConfig::with_timesync(TimeSyncConfig { ... })` at construction, or
+  `router.set_timesync_config(Some(...))` / `None` after construction.
+- C: `seds_router_configure_timesync(router, enabled, role, priority, source_timeout_ms,
+  announce_interval_ms, request_interval_ms)`, where role `0` is consumer, `1` is source, and `2`
+  is auto.
+- Python: pass `timesync_role`, `timesync_priority`, interval, timeout, promotion, and slew keyword
+  arguments to `Router(...)`, or call `router.configure_timesync(...)` later. Python uses the same
+  role codes as C.
+
 Failover uses holdover plus slew:
 
 - the network clock keeps running monotonically during producer loss or producer change

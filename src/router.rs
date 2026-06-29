@@ -8,10 +8,7 @@
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
 
-use crate::config::{
-    MAX_QUEUE_BUDGET, MAX_RECENT_RX_IDS, QUEUE_GROW_STEP, RECENT_RX_QUEUE_BYTES,
-    STARTING_QUEUE_SIZE,
-};
+use crate::config::RuntimeMemoryConfig;
 use crate::diagnostics::{
     AdaptiveLinkStats, DiscoveryRuntimeStats, QueueRuntimeStats, ReliableRuntimeStats,
     RouteModeStats, RouteOverrideStats, RoutePriorityStats, RouteWeightStats, RuntimeSideStats,
@@ -1319,6 +1316,7 @@ pub struct RouterConfig {
     /// Application-defined key id passed to the cryptography provider.
     #[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
     e2e_key_id: u32,
+    memory: RuntimeMemoryConfig,
     #[cfg(feature = "timesync")]
     timesync: Option<TimeSyncConfig>,
 }
@@ -1359,6 +1357,7 @@ impl RouterConfig {
             address_change_handlers: Arc::from([]),
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
+            memory: RuntimeMemoryConfig::default(),
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -1424,6 +1423,13 @@ impl RouterConfig {
         self
     }
 
+    /// Override per-router queue and dedupe memory limits.
+    pub fn with_memory_config(mut self, memory: RuntimeMemoryConfig) -> TelemetryResult<Self> {
+        memory.validate()?;
+        self.memory = memory;
+        Ok(self)
+    }
+
     #[cfg(feature = "timesync")]
     /// Enables and configures built-in time synchronization for this router.
     pub fn with_timesync(mut self, cfg: TimeSyncConfig) -> Self {
@@ -1471,6 +1477,11 @@ impl RouterConfig {
     fn timesync_config(&self) -> Option<TimeSyncConfig> {
         self.timesync
     }
+
+    #[inline]
+    fn memory_config(&self) -> RuntimeMemoryConfig {
+        self.memory
+    }
 }
 
 impl Default for RouterConfig {
@@ -1483,6 +1494,7 @@ impl Default for RouterConfig {
             address_change_handlers: Arc::from([]),
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
+            memory: RuntimeMemoryConfig::default(),
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -1607,6 +1619,7 @@ fn fallback_stdout(msg: &str) {
 /// Holds the RX/TX queues and the recent-RX de-duplication set.
 #[derive(Debug, Clone)]
 struct RouterInner {
+    memory: RuntimeMemoryConfig,
     sides: Vec<Option<RouterSide>>,
     route_overrides: BTreeMap<(Option<RouterSideId>, RouterSideId), bool>,
     typed_route_overrides: BTreeMap<(Option<RouterSideId>, u32, RouterSideId), bool>,
@@ -1842,7 +1855,7 @@ impl RouterInner {
             return false;
         };
         self.discovery_routes.remove(&side);
-        Self::queue_budget_warning("topology route evicted because MAX_QUEUE_BUDGET is full");
+        Self::queue_budget_warning("topology route evicted because shared queue budget is full");
         true
     }
 
@@ -1892,13 +1905,15 @@ impl RouterInner {
         incoming_cost: usize,
         preferred: RouterQueueKind,
     ) -> TelemetryResult<()> {
-        if incoming_cost > MAX_QUEUE_BUDGET {
+        if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
                 "Item exceeds maximum shared queue budget",
             ));
         }
 
-        while self.shared_queue_bytes_used().saturating_add(incoming_cost) > MAX_QUEUE_BUDGET {
+        while self.shared_queue_bytes_used().saturating_add(incoming_cost)
+            > self.memory.max_queue_budget
+        {
             let victim = self.largest_shared_queue().unwrap_or(preferred);
             if victim == RouterQueueKind::Discovery {
                 Self::queue_budget_warning("topology data is using the largest queue budget share");
@@ -1922,7 +1937,7 @@ impl RouterInner {
 
     #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
-        while self.shared_queue_bytes_used() > MAX_QUEUE_BUDGET {
+        while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
             if !self.pop_discovery_route() {
                 break;
             }
@@ -1942,7 +1957,7 @@ impl RouterInner {
     }
 
     fn push_recent_rx(&mut self, id: u64) -> TelemetryResult<()> {
-        while self.recent_rx.len() >= MAX_RECENT_RX_IDS {
+        while self.recent_rx.len() >= self.memory.max_recent_rx_ids {
             let _ = self.recent_rx.pop_front();
         }
         self.make_shared_queue_room(0, RouterQueueKind::Recent)?;
@@ -4998,9 +5013,9 @@ impl Router {
             let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
             let mut st = self.state.lock();
             st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
+            let budget = st.memory.max_queue_budget;
             drop(st);
-            let report =
-                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, MAX_QUEUE_BUDGET)?;
+            let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
             if report.changed() {
                 let mut st = self.state.lock();
                 st.fit_discovery_budget();
@@ -7027,6 +7042,7 @@ impl Router {
     pub fn new_with_clock(cfg: RouterConfig, clock: Box<dyn Clock + Send + Sync>) -> Self {
         #[cfg(feature = "timesync")]
         let timesync_cfg = cfg.timesync_config();
+        let memory = cfg.memory_config();
         let hostname: Arc<str> = Arc::from(cfg.sender());
         let address_mode = cfg.address_mode();
         let instance_seq = u64::from(ROUTER_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -7054,6 +7070,7 @@ impl Router {
             sender: RouterMutex::new(hostname),
             cfg,
             state: RouterMutex::new(RouterInner {
+                memory,
                 sides: Vec::new(),
                 route_overrides: BTreeMap::new(),
                 typed_route_overrides: BTreeMap::new(),
@@ -7076,19 +7093,19 @@ impl Router {
                 p2p_stream_sessions: BTreeMap::new(),
                 next_p2p_stream_id: 1,
                 received_queue: BoundedDeque::new(
-                    MAX_QUEUE_BUDGET,
-                    STARTING_QUEUE_SIZE,
-                    QUEUE_GROW_STEP,
+                    memory.max_queue_budget,
+                    memory.starting_queue_size,
+                    memory.queue_grow_step,
                 ),
                 transmit_queue: BoundedDeque::new(
-                    MAX_QUEUE_BUDGET,
-                    STARTING_QUEUE_SIZE,
-                    QUEUE_GROW_STEP,
+                    memory.max_queue_budget,
+                    memory.starting_queue_size,
+                    memory.queue_grow_step,
                 ),
                 recent_rx: BoundedDeque::new(
-                    RECENT_RX_QUEUE_BYTES.max(1),
-                    RECENT_RX_QUEUE_BYTES.max(1),
-                    QUEUE_GROW_STEP,
+                    memory.recent_rx_queue_bytes(),
+                    memory.recent_rx_queue_bytes(),
+                    memory.queue_grow_step,
                 ),
                 reliable_tx: BTreeMap::new(),
                 reliable_rx: BTreeMap::new(),
@@ -7107,7 +7124,11 @@ impl Router {
                 #[cfg(all(feature = "discovery", feature = "timesync"))]
                 timesync_side_throttle: BTreeMap::new(),
             }),
-            isr_rx_queue: IsrRxQueue::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
+            isr_rx_queue: IsrRxQueue::new(
+                memory.max_queue_budget,
+                memory.starting_queue_size,
+                memory.queue_grow_step,
+            ),
             side_tx_gate: ReentryGate::new(),
             clock,
             #[cfg(feature = "timesync")]
@@ -8359,6 +8380,7 @@ impl Router {
             .map(|entry| entry.packet.byte_cost())
             .sum::<usize>();
         let mut out = String::new();
+        let memory = st.memory;
         let _ = fmt::Write::write_fmt(
             &mut out,
             format_args!(
@@ -8373,12 +8395,12 @@ impl Router {
                  \"schema_bytes_used\":{},\"schema_bytes_allocated\":{},\
                  \"network_variable_cache_bytes_used\":{},\"network_variable_cache_bytes_allocated\":{},\"network_variable_cache_len\":{}}}",
                 st.shared_queue_bytes_used(),
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 st.received_queue.bytes_used(),
                 st.received_queue.max_bytes(),
                 st.received_queue.len(),
                 isr_rx.1,
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 isr_rx.0,
                 st.transmit_queue.bytes_used(),
                 st.transmit_queue.max_bytes(),
@@ -8387,14 +8409,14 @@ impl Router {
                 st.recent_rx.max_bytes(),
                 st.recent_rx.len(),
                 st.reliable_rx_buffered_bytes(),
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 st.reliable_rx_buffer_len(),
                 discovery_bytes,
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 schema_bytes,
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 network_variable_cache_bytes,
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 st.managed_variable_latest.len(),
             ),
         );

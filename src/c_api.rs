@@ -17,14 +17,14 @@ use crate::{
     DataType, MessageElement, RouteSelectionMode, TelemetryError, TelemetryErrorCode,
     TelemetryResult,
     config::{
-        DataEndpoint, data_type_definition, data_type_definition_by_name, data_type_exists,
-        e2e_encryption_policy_code, e2e_encryption_policy_from_code, endpoint_definition,
-        endpoint_definition_by_name, endpoint_exists, known_endpoints, message_class_code,
-        message_class_from_code, message_data_type_code, message_data_type_from_code,
-        register_data_type_id_with_description_and_e2e_encryption, register_endpoint_id,
-        register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
-        reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
-        remove_endpoint_by_name, set_data_type_e2e_encryption_policy,
+        DataEndpoint, RuntimeMemoryConfig, data_type_definition, data_type_definition_by_name,
+        data_type_exists, e2e_encryption_policy_code, e2e_encryption_policy_from_code,
+        endpoint_definition, endpoint_definition_by_name, endpoint_exists, known_endpoints,
+        message_class_code, message_class_from_code, message_data_type_code,
+        message_data_type_from_code, register_data_type_id_with_description_and_e2e_encryption,
+        register_endpoint_id, register_endpoint_id_with_description, register_schema_json_bytes,
+        reliable_code, reliable_from_code, remove_data_type, remove_data_type_by_name,
+        remove_endpoint, remove_endpoint_by_name, set_data_type_e2e_encryption_policy,
     },
     do_vec_log_typed, get_needed_message_size, message_meta,
     packet::Packet,
@@ -46,7 +46,7 @@ use crate::crypto::{
     open_with_registered_crypto, register_c_cryptography_provider, register_software_key,
     seal_with_registered_crypto, verify_managed_credential,
 };
-use crate::relay::{Relay, RelaySideId, RelaySideOptions};
+use crate::relay::{Relay, RelayConfig, RelaySideId, RelaySideOptions};
 // ============================================================================
 //  Constants / basic types shared with the C side
 // ============================================================================
@@ -93,6 +93,30 @@ pub struct SedsOwnedHeader {
 #[repr(C)]
 pub struct SedsRelay {
     inner: Arc<Relay>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SedsRuntimeMemoryConfig {
+    pub max_queue_budget: usize,
+    pub max_recent_rx_ids: usize,
+    pub starting_queue_size: usize,
+    pub queue_grow_step: f64,
+}
+
+fn runtime_memory_from_ffi(
+    ptr: *const SedsRuntimeMemoryConfig,
+) -> Result<RuntimeMemoryConfig, TelemetryError> {
+    if ptr.is_null() {
+        return Ok(RuntimeMemoryConfig::default());
+    }
+    let cfg = unsafe { *ptr };
+    RuntimeMemoryConfig::new(
+        cfg.max_queue_budget,
+        cfg.max_recent_rx_ids,
+        cfg.starting_queue_size,
+        cfg.queue_grow_step,
+    )
 }
 
 #[cfg(feature = "timesync")]
@@ -1253,15 +1277,16 @@ pub extern "C" fn seds_router_new(
     handlers: *const SedsLocalEndpointDesc,
     n_handlers: usize,
 ) -> *mut SedsRouter {
-    seds_router_new_impl(
+    seds_router_new_impl(SedsRouterNewOptions {
         mode,
         now_ms_cb,
         user,
         handlers,
         n_handlers,
-        RouterConfig::default_e2e_encryption_mode(),
-        0,
-    )
+        e2e_mode: RouterConfig::default_e2e_encryption_mode(),
+        e2e_key_id: 0,
+        memory: RuntimeMemoryConfig::default(),
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1277,9 +1302,45 @@ pub extern "C" fn seds_router_new_ex(
     let Some(e2e_mode) = router_e2e_mode_from_code(e2e_mode) else {
         return ptr::null_mut();
     };
-    seds_router_new_impl(
-        mode, now_ms_cb, user, handlers, n_handlers, e2e_mode, e2e_key_id,
-    )
+    seds_router_new_impl(SedsRouterNewOptions {
+        mode,
+        now_ms_cb,
+        user,
+        handlers,
+        n_handlers,
+        e2e_mode,
+        e2e_key_id,
+        memory: RuntimeMemoryConfig::default(),
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_new_with_memory(
+    mode: u8,
+    now_ms_cb: CNowMs,
+    user: *mut c_void,
+    handlers: *const SedsLocalEndpointDesc,
+    n_handlers: usize,
+    e2e_mode: u8,
+    e2e_key_id: u32,
+    memory: *const SedsRuntimeMemoryConfig,
+) -> *mut SedsRouter {
+    let Some(e2e_mode) = router_e2e_mode_from_code(e2e_mode) else {
+        return ptr::null_mut();
+    };
+    let Ok(memory) = runtime_memory_from_ffi(memory) else {
+        return ptr::null_mut();
+    };
+    seds_router_new_impl(SedsRouterNewOptions {
+        mode,
+        now_ms_cb,
+        user,
+        handlers,
+        n_handlers,
+        e2e_mode,
+        e2e_key_id,
+        memory,
+    })
 }
 
 fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
@@ -1292,7 +1353,7 @@ fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
     }
 }
 
-fn seds_router_new_impl(
+struct SedsRouterNewOptions {
     mode: u8,
     now_ms_cb: CNowMs,
     user: *mut c_void,
@@ -1300,12 +1361,15 @@ fn seds_router_new_impl(
     n_handlers: usize,
     e2e_mode: RouterE2eEncryptionMode,
     e2e_key_id: u32,
-) -> *mut SedsRouter {
+    memory: RuntimeMemoryConfig,
+}
+
+fn seds_router_new_impl(opts: SedsRouterNewOptions) -> *mut SedsRouter {
     // Build handler vector
     let mut v: Vec<EndpointHandler> = Vec::new();
-    if n_handlers > 0 && !handlers.is_null() {
-        v.reserve(n_handlers.saturating_mul(2));
-        let slice = unsafe { slice::from_raw_parts(handlers, n_handlers) };
+    if opts.n_handlers > 0 && !opts.handlers.is_null() {
+        v.reserve(opts.n_handlers.saturating_mul(2));
+        let slice = unsafe { slice::from_raw_parts(opts.handlers, opts.n_handlers) };
         for desc in slice {
             let endpoint = DataEndpoint(desc.endpoint);
             if endpoint_is_router_internal(endpoint) {
@@ -1382,21 +1446,24 @@ fn seds_router_new_impl(
 
     let cfg = {
         let cfg = RouterConfig::new(v)
-            .with_e2e_encryption(e2e_mode)
-            .with_e2e_key_id(e2e_key_id);
+            .with_e2e_encryption(opts.e2e_mode)
+            .with_e2e_key_id(opts.e2e_key_id);
+        let Ok(cfg) = cfg.with_memory_config(opts.memory) else {
+            return ptr::null_mut();
+        };
         #[cfg(feature = "timesync")]
         let cfg = cfg.with_timesync(TimeSyncConfig::default());
         cfg
     };
-    let _ = mode;
+    let _ = opts.mode;
 
     #[cfg(feature = "std")]
-    let router = if now_ms_cb.is_some() {
+    let router = if opts.now_ms_cb.is_some() {
         Router::new_with_clock(
             cfg,
             Box::new(FfiClock {
-                cb: now_ms_cb,
-                user_addr: user as usize,
+                cb: opts.now_ms_cb,
+                user_addr: opts.user as usize,
             }),
         )
     } else {
@@ -1407,8 +1474,8 @@ fn seds_router_new_impl(
     let router = Router::new_with_clock(
         cfg,
         Box::new(FfiClock {
-            cb: now_ms_cb,
-            user_addr: user as usize,
+            cb: opts.now_ms_cb,
+            user_addr: opts.user as usize,
         }),
     );
 
@@ -3279,12 +3346,27 @@ pub extern "C" fn seds_dtype_remove_by_name(name: *const c_char, name_len: usize
 
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_new(now_ms_cb: CNowMs, user: *mut c_void) -> *mut SedsRelay {
+    seds_relay_new_with_memory(now_ms_cb, user, ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_new_with_memory(
+    now_ms_cb: CNowMs,
+    user: *mut c_void,
+    memory: *const SedsRuntimeMemoryConfig,
+) -> *mut SedsRelay {
     let clock = FfiClock {
         cb: now_ms_cb,
         user_addr: user as usize,
     };
+    let Ok(memory) = runtime_memory_from_ffi(memory) else {
+        return ptr::null_mut();
+    };
 
-    let relay = Relay::new(Box::new(clock));
+    let Ok(cfg) = RelayConfig::default().with_memory_config(memory) else {
+        return ptr::null_mut();
+    };
+    let relay = Relay::new_with_config(cfg, Box::new(clock));
     Box::into_raw(Box::new(SedsRelay {
         inner: Arc::new(relay),
     }))
@@ -5887,6 +5969,50 @@ mod tests {
 
         let router = seds_router_new(0, None, ptr::null_mut(), &desc, 1);
         assert!(router.is_null());
+    }
+
+    #[test]
+    fn c_abi_router_and_relay_accept_runtime_memory_limits() {
+        let memory = SedsRuntimeMemoryConfig {
+            max_queue_budget: 4096,
+            max_recent_rx_ids: 8,
+            starting_queue_size: 512,
+            queue_grow_step: 2.0,
+        };
+        let router =
+            seds_router_new_with_memory(0, None, ptr::null_mut(), ptr::null(), 0, 2, 0, &memory);
+        assert!(!router.is_null());
+        let router_json: Value = serde_json::from_str(&export_router_json(
+            router,
+            seds_router_export_memory_layout_len,
+            seds_router_export_memory_layout,
+        ))
+        .unwrap();
+        assert_eq!(router_json["shared_queue_bytes_allocated"], 4096);
+        assert_eq!(router_json["recent_rx_bytes_allocated"], 64);
+        seds_router_free(router);
+
+        let relay = seds_relay_new_with_memory(None, ptr::null_mut(), &memory);
+        assert!(!relay.is_null());
+        let relay_json: Value = serde_json::from_str(&export_relay_json(
+            relay,
+            seds_relay_export_memory_layout_len,
+            seds_relay_export_memory_layout,
+        ))
+        .unwrap();
+        assert_eq!(relay_json["shared_queue_bytes_allocated"], 4096);
+        assert_eq!(relay_json["recent_rx_bytes_allocated"], 64);
+        seds_relay_free(relay);
+
+        let bad = SedsRuntimeMemoryConfig {
+            max_queue_budget: 0,
+            ..memory
+        };
+        assert!(seds_relay_new_with_memory(None, ptr::null_mut(), &bad).is_null());
+        assert!(
+            seds_router_new_with_memory(0, None, ptr::null_mut(), ptr::null(), 0, 2, 0, &bad)
+                .is_null()
+        );
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use crate::config::{
-    MAX_QUEUE_BUDGET, MAX_RECENT_RX_IDS, QUEUE_GROW_STEP, RECENT_RX_QUEUE_BYTES,
     RELIABLE_MAX_END_TO_END_ACK_CACHE, RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_PENDING,
-    RELIABLE_MAX_RETRIES, RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS, STARTING_QUEUE_SIZE,
+    RELIABLE_MAX_RETRIES, RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS, RuntimeMemoryConfig,
 };
 use crate::diagnostics::{
     AdaptiveLinkStats, DiscoveryRuntimeStats, QueueRuntimeStats, ReliableRuntimeStats,
@@ -725,6 +724,46 @@ impl SideRuntimeStatsInner {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RelayConfig {
+    sender: Arc<str>,
+    memory: RuntimeMemoryConfig,
+}
+
+impl RelayConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_sender<S: AsRef<str>>(mut self, sender: S) -> Self {
+        self.sender = Arc::from(sender.as_ref());
+        self
+    }
+
+    pub fn with_memory_config(mut self, memory: RuntimeMemoryConfig) -> TelemetryResult<Self> {
+        memory.validate()?;
+        self.memory = memory;
+        Ok(self)
+    }
+
+    fn sender(&self) -> Arc<str> {
+        self.sender.clone()
+    }
+
+    fn memory_config(&self) -> RuntimeMemoryConfig {
+        self.memory
+    }
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            sender: Arc::from("RELAY"),
+            memory: RuntimeMemoryConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RouteSelectionOrigin {
     Flood,
@@ -733,6 +772,7 @@ enum RouteSelectionOrigin {
 
 /// Internal state, protected by RouterMutex so all public methods can take &self.
 struct RelayInner {
+    memory: RuntimeMemoryConfig,
     sides: Vec<Option<RelaySide>>,
     route_overrides: BTreeMap<(Option<RelaySideId>, RelaySideId), bool>,
     typed_route_overrides: BTreeMap<(Option<RelaySideId>, u32, RelaySideId), bool>,
@@ -914,7 +954,7 @@ impl RelayInner {
             return false;
         };
         self.discovery_routes.remove(&side);
-        Self::queue_budget_warning("topology route evicted because MAX_QUEUE_BUDGET is full");
+        Self::queue_budget_warning("topology route evicted because shared queue budget is full");
         true
     }
 
@@ -969,13 +1009,15 @@ impl RelayInner {
         incoming_cost: usize,
         preferred: RelayQueueKind,
     ) -> TelemetryResult<()> {
-        if incoming_cost > MAX_QUEUE_BUDGET {
+        if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
                 "Item exceeds maximum shared queue budget",
             ));
         }
 
-        while self.shared_queue_bytes_used().saturating_add(incoming_cost) > MAX_QUEUE_BUDGET {
+        while self.shared_queue_bytes_used().saturating_add(incoming_cost)
+            > self.memory.max_queue_budget
+        {
             let victim = self.largest_shared_queue().unwrap_or(preferred);
             if victim == RelayQueueKind::Discovery {
                 Self::queue_budget_warning("topology data is using the largest queue budget share");
@@ -999,7 +1041,7 @@ impl RelayInner {
 
     #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
-        while self.shared_queue_bytes_used() > MAX_QUEUE_BUDGET {
+        while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
             if !self.pop_discovery_route() {
                 break;
             }
@@ -1025,7 +1067,7 @@ impl RelayInner {
     }
 
     fn push_recent_rx(&mut self, id: u64) -> TelemetryResult<()> {
-        while self.recent_rx.len() >= MAX_RECENT_RX_IDS {
+        while self.recent_rx.len() >= self.memory.max_recent_rx_ids {
             let _ = self.recent_rx.pop_front();
         }
         self.make_shared_queue_room(0, RelayQueueKind::Recent)?;
@@ -1191,9 +1233,16 @@ impl Relay {
 
     /// Create a new relay with the given clock.
     pub fn new(clock: Box<dyn Clock + Send + Sync>) -> Self {
+        Self::new_with_config(RelayConfig::default(), clock)
+    }
+
+    /// Create a new relay with explicit runtime configuration and clock.
+    pub fn new_with_config(cfg: RelayConfig, clock: Box<dyn Clock + Send + Sync>) -> Self {
+        let memory = cfg.memory_config();
         Self {
-            sender: RouterMutex::new(Arc::from("RELAY")),
+            sender: RouterMutex::new(cfg.sender()),
             state: RouterMutex::new(RelayInner {
+                memory,
                 sides: Vec::new(),
                 route_overrides: BTreeMap::new(),
                 typed_route_overrides: BTreeMap::new(),
@@ -1204,17 +1253,25 @@ impl Relay {
                 adaptive_route_stats: BTreeMap::new(),
                 side_runtime_stats: BTreeMap::new(),
                 side_transport: BTreeMap::new(),
-                rx_queue: BoundedDeque::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
-                tx_queue: BoundedDeque::new(MAX_QUEUE_BUDGET, STARTING_QUEUE_SIZE, QUEUE_GROW_STEP),
+                rx_queue: BoundedDeque::new(
+                    memory.max_queue_budget,
+                    memory.starting_queue_size,
+                    memory.queue_grow_step,
+                ),
+                tx_queue: BoundedDeque::new(
+                    memory.max_queue_budget,
+                    memory.starting_queue_size,
+                    memory.queue_grow_step,
+                ),
                 replay_queue: BoundedDeque::new(
-                    MAX_QUEUE_BUDGET,
-                    STARTING_QUEUE_SIZE,
-                    QUEUE_GROW_STEP,
+                    memory.max_queue_budget,
+                    memory.starting_queue_size,
+                    memory.queue_grow_step,
                 ),
                 recent_rx: BoundedDeque::new(
-                    RECENT_RX_QUEUE_BYTES.max(1),
-                    RECENT_RX_QUEUE_BYTES.max(1),
-                    QUEUE_GROW_STEP,
+                    memory.recent_rx_queue_bytes(),
+                    memory.recent_rx_queue_bytes(),
+                    memory.queue_grow_step,
                 ),
                 reliable_tx: BTreeMap::new(),
                 reliable_rx: BTreeMap::new(),
@@ -2919,9 +2976,9 @@ impl Relay {
             let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
             let mut st = self.state.lock();
             st.make_shared_queue_room(incoming_cost, RelayQueueKind::Discovery)?;
+            let budget = st.memory.max_queue_budget;
             drop(st);
-            let report =
-                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, MAX_QUEUE_BUDGET)?;
+            let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
             if report.changed() {
                 let mut st = self.state.lock();
                 st.fit_discovery_budget();
@@ -3921,6 +3978,7 @@ impl Relay {
         #[cfg(not(feature = "discovery"))]
         let discovery_bytes = 0usize;
         let schema_bytes = crate::config::schema_bytes_used();
+        let memory = st.memory;
         let mut out = String::new();
         let _ = core::fmt::Write::write_fmt(
             &mut out,
@@ -3935,7 +3993,7 @@ impl Relay {
                  \"discovery_bytes_used\":{},\"discovery_bytes_allocated\":{},\
                  \"schema_bytes_used\":{},\"schema_bytes_allocated\":{}}}",
                 st.shared_queue_bytes_used(),
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 st.rx_queue.bytes_used(),
                 st.rx_queue.max_bytes(),
                 st.rx_queue.len(),
@@ -3949,12 +4007,12 @@ impl Relay {
                 st.recent_rx.max_bytes(),
                 st.recent_rx.len(),
                 st.reliable_rx_buffered_bytes(),
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 st.reliable_rx_buffer_len(),
                 discovery_bytes,
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
                 schema_bytes,
-                MAX_QUEUE_BUDGET,
+                memory.max_queue_budget,
             ),
         );
         out

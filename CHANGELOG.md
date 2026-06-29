@@ -59,6 +59,14 @@
   link-probe or driver timing samples to send minimal discovery reachability pings across slow
   sides between infrequent full schema/topology/time-source refreshes, and router-managed time sync
   throttles only the measured slow egress while fast sides keep the configured normal cadence.
+- Time-sync source/grandmaster role selection is runtime configuration across bindings. Rust can
+  set `TimeSyncConfig` at construction or later, C can call `seds_router_configure_timesync(...)`,
+  and Python can pass time-sync role/priority/interval keywords or call
+  `router.configure_timesync(...)`.
+- Router and relay memory limits are now runtime constructor options as well as compile-time
+  defaults. Rust exposes `RuntimeMemoryConfig` through router/relay configs, C exposes
+  `seds_router_new_with_memory(...)` and `seds_relay_new_with_memory(...)`, and Python `Router`/
+  `Relay` constructors accept queue budget, recent-ID, starting-size, and growth overrides.
 - Topology exports now include a deduplicated `links` graph, named endpoint fields, side names, and
   filtered SEDSnet control endpoints so graphing tools see user-facing network structure instead of
   router-only internals.

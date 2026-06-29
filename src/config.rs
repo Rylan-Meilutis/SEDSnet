@@ -117,6 +117,74 @@ pub const RELIABLE_MAX_END_TO_END_ACK_CACHE: usize =
         None => MAX_RECENT_RX_IDS,
     };
 
+/// Runtime memory limits for router/relay queue-backed state.
+///
+/// Compile-time environment values remain the defaults for embedded builds, but applications using
+/// prebuilt binaries can now choose per-instance budgets at construction time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeMemoryConfig {
+    pub max_queue_budget: usize,
+    pub max_recent_rx_ids: usize,
+    pub starting_queue_size: usize,
+    pub queue_grow_step: f64,
+}
+
+impl RuntimeMemoryConfig {
+    pub const fn default_const() -> Self {
+        Self {
+            max_queue_budget: MAX_QUEUE_BUDGET,
+            max_recent_rx_ids: MAX_RECENT_RX_IDS,
+            starting_queue_size: STARTING_QUEUE_SIZE,
+            queue_grow_step: QUEUE_GROW_STEP,
+        }
+    }
+
+    pub fn new(
+        max_queue_budget: usize,
+        max_recent_rx_ids: usize,
+        starting_queue_size: usize,
+        queue_grow_step: f64,
+    ) -> TelemetryResult<Self> {
+        let cfg = Self {
+            max_queue_budget,
+            max_recent_rx_ids,
+            starting_queue_size,
+            queue_grow_step,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(self) -> TelemetryResult<()> {
+        if self.max_queue_budget == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        if self.max_recent_rx_ids == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        if self.starting_queue_size == 0 || self.starting_queue_size > self.max_queue_budget {
+            return Err(TelemetryError::BadArg);
+        }
+        if !self.queue_grow_step.is_finite() || self.queue_grow_step <= 1.0 {
+            return Err(TelemetryError::BadArg);
+        }
+        Ok(())
+    }
+
+    pub fn recent_rx_queue_bytes(self) -> usize {
+        self.max_recent_rx_ids
+            .saturating_mul(size_of::<u64>())
+            .min(self.max_queue_budget)
+            .max(1)
+    }
+}
+
+impl Default for RuntimeMemoryConfig {
+    fn default() -> Self {
+        Self::default_const()
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Runtime IDs
 // -----------------------------------------------------------------------------

@@ -165,15 +165,22 @@ Supported keys (defaults shown):
 - `MAX_STACK_PAYLOAD` (64, via `define_stack_payload!`)
 - `MAX_HANDLER_RETRIES` (3)
 
-`MAX_QUEUE_BUDGET` is the shared queue-owned memory budget for each router or relay. RX queues, TX
-queues, reliable replay/out-of-order buffers, and discovery topology state draw from this budget
+`MAX_QUEUE_BUDGET`, `MAX_RECENT_RX_IDS`, `STARTING_QUEUE_SIZE`, and `QUEUE_GROW_STEP` are defaults,
+not the only way to size a node. Rust can pass `RuntimeMemoryConfig` through
+`RouterConfig::with_memory_config(...)` or `RelayConfig::with_memory_config(...)`. C can use
+`seds_router_new_with_memory(...)` and `seds_relay_new_with_memory(...)`. Python can pass
+`max_queue_budget`, `max_recent_rx_ids`, `starting_queue_size`, and `queue_grow_step` to
+`Router(...)` or `Relay(...)`.
+
+The active queue budget is the shared queue-owned memory budget for each router or relay. RX queues,
+TX queues, reliable replay/out-of-order buffers, and discovery topology state draw from this budget
 dynamically. The recent packet ID cache preallocates
-`min(MAX_RECENT_RX_IDS * sizeof(u64), MAX_QUEUE_BUDGET)` bytes at construction and reserves that
+`min(max_recent_rx_ids * sizeof(u64), max_queue_budget)` bytes at construction and reserves that
 amount from the same budget.
 
-`MAX_QUEUE_SIZE` is still accepted as a legacy environment alias, but new builds should use
-`MAX_QUEUE_BUDGET`, `build.py max_queue_budget=<n>`, or CMake
-`SEDSNET_MAX_QUEUE_BUDGET`.
+`MAX_QUEUE_SIZE` is still accepted as a legacy environment alias for the default budget, but new
+builds should use `MAX_QUEUE_BUDGET`, `build.py max_queue_budget=<n>`, or CMake
+`SEDSNET_MAX_QUEUE_BUDGET` only when they want to change the packaged default.
 
 ## Runtime telemetry schema
 

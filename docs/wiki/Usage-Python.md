@@ -213,11 +213,18 @@ Useful maintenance calls:
 - `periodic(timeout_ms)`
 - `periodic_no_timesync(timeout_ms)` when time sync is enabled but should be skipped for one loop
 
-Router and relay queue-backed state shares one dynamic `MAX_QUEUE_BUDGET`. RX work, TX work,
-recent packet IDs, reliable buffers/replay state, discovery topology, and runtime schema registry
-memory all count against it.
-Recent packet ID caches preallocate their final storage and reserve that byte cost immediately.
-Discovery topology eviction emits a warning in `std` builds.
+Router and relay queue-backed state shares one dynamic budget. Prebuilt Python wheels use the
+packaged defaults unless you pass constructor overrides:
+
+```python
+router = sedsnet.Router(max_queue_budget=262144, max_recent_rx_ids=512)
+relay = sedsnet.Relay(max_queue_budget=131072, starting_queue_size=4096)
+```
+
+RX work, TX work, recent packet IDs, reliable buffers/replay state, discovery topology, and runtime
+schema registry memory all count against the active budget. Recent packet ID caches preallocate
+their final storage and reserve that byte cost immediately. Discovery topology eviction emits a
+warning in `std` builds.
 
 Use `export_memory_layout_json()` on a router or relay to profile queue pressure. The JSON includes
 shared allocated/used bytes plus per-area queue, reliable-buffer, schema, discovery, and

@@ -82,12 +82,14 @@ as HTTP can be carried over SEDSnet links without IP being the underlying transp
 endpoint delivery remains available for telemetry data types; P2P service frames use discovery
 identity and ports for board-to-board traffic.
 
-Queue memory is bounded by the compile-time `MAX_QUEUE_BUDGET`. Router and relay internals share that budget
-dynamically across RX work, TX work, reliable replay/out-of-order buffers, recent packet ID tracking, and learned
-discovery topology state. The recent packet ID cache preallocates its final storage because it is expected to fill
-during normal operation, so its reserved bytes come out of the shared budget immediately. If one active queue area is
-idle, another can use more of the remaining budget; if several areas fill at once, older queued state is evicted so
-total queue-owned memory stays bounded.
+Queue memory is bounded per router/relay instance. Compile-time values such as `MAX_QUEUE_BUDGET`
+provide defaults, and Rust, C, and Python constructors can override the active budget at runtime.
+Router and relay internals share that budget dynamically across RX work, TX work, reliable
+replay/out-of-order buffers, recent packet ID tracking, and learned discovery topology state. The
+recent packet ID cache preallocates its final storage because it is expected to fill during normal
+operation, so its reserved bytes come out of the shared budget immediately. If one active queue area
+is idle, another can use more of the remaining budget; if several areas fill at once, older queued
+state is evicted so total queue-owned memory stays bounded.
 
 Reliable delivery uses internal ACK/request control packets. Ordered reliable receivers buffer out-of-order packets,
 partial-ACK packets that arrived after a gap, request the missing sequence, and then release the buffered run as soon as

@@ -34,23 +34,23 @@ use std::collections::BTreeMap;
 use std::sync::{Arc as SArc, Mutex, OnceLock};
 
 #[cfg(feature = "timesync")]
-use crate::timesync::TimeSyncConfig;
+use crate::timesync::{TimeSyncConfig, TimeSyncRole};
 use crate::{
     MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, MAX_VALUE_ROUTE_SELECTION_MODE, MessageElement,
     RouteSelectionMode, TelemetryError, TelemetryResult,
     config::{
-        DataEndpoint, DataType, data_type_definition, data_type_definition_by_name,
-        data_type_exists, e2e_encryption_policy_from_code, endpoint_definition,
-        endpoint_definition_by_name, endpoint_exists, known_endpoints, message_class_code,
-        message_class_from_code, message_data_type_code, message_data_type_from_code,
-        register_data_type_id_with_description_and_e2e_encryption,
+        DataEndpoint, DataType, RuntimeMemoryConfig, data_type_definition,
+        data_type_definition_by_name, data_type_exists, e2e_encryption_policy_from_code,
+        endpoint_definition, endpoint_definition_by_name, endpoint_exists, known_endpoints,
+        message_class_code, message_class_from_code, message_data_type_code,
+        message_data_type_from_code, register_data_type_id_with_description_and_e2e_encryption,
         register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
         reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
         remove_endpoint_by_name,
     },
     get_message_name, get_needed_message_size, message_meta,
     packet::Packet,
-    relay::{Relay, RelaySideOptions},
+    relay::{Relay, RelayConfig, RelaySideOptions},
     router::{
         Clock, EndpointHandler, LeBytes, NetworkVariablePermissions, Router, RouterConfig,
         RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
@@ -118,20 +118,55 @@ fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_router_config(
     handlers: Vec<EndpointHandler>,
     timesync_enabled: bool,
+    timesync_role: u8,
+    timesync_priority: u64,
+    timesync_source_timeout_ms: u64,
+    timesync_announce_interval_ms: u64,
+    timesync_request_interval_ms: u64,
+    timesync_consumer_promotion_enabled: bool,
+    timesync_max_slew_ppm: u32,
     e2e_mode: u8,
     e2e_key_id: u32,
+    max_queue_budget: Option<usize>,
+    max_recent_rx_ids: Option<usize>,
+    starting_queue_size: Option<usize>,
+    queue_grow_step: Option<f64>,
 ) -> PyResult<RouterConfig> {
     let e2e_mode =
         router_e2e_mode_from_code(e2e_mode).ok_or_else(|| PyValueError::new_err("bad e2e_mode"))?;
+    let default_memory = RuntimeMemoryConfig::default();
+    let memory = RuntimeMemoryConfig {
+        max_queue_budget: max_queue_budget.unwrap_or(default_memory.max_queue_budget),
+        max_recent_rx_ids: max_recent_rx_ids.unwrap_or(default_memory.max_recent_rx_ids),
+        starting_queue_size: starting_queue_size.unwrap_or(default_memory.starting_queue_size),
+        queue_grow_step: queue_grow_step.unwrap_or(default_memory.queue_grow_step),
+    };
     let cfg = RouterConfig::new(handlers)
         .with_e2e_encryption(e2e_mode)
-        .with_e2e_key_id(e2e_key_id);
+        .with_e2e_key_id(e2e_key_id)
+        .with_memory_config(memory)
+        .map_err(|_| PyValueError::new_err("bad memory limits"))?;
     #[cfg(feature = "timesync")]
     let cfg = if timesync_enabled {
-        cfg.with_timesync(TimeSyncConfig::default())
+        let role = match timesync_role {
+            0 => TimeSyncRole::Consumer,
+            1 => TimeSyncRole::Source,
+            2 => TimeSyncRole::Auto,
+            _ => return Err(PyValueError::new_err("bad timesync_role")),
+        };
+        cfg.with_timesync(TimeSyncConfig {
+            role,
+            priority: timesync_priority,
+            source_timeout_ms: timesync_source_timeout_ms,
+            announce_interval_ms: timesync_announce_interval_ms,
+            request_interval_ms: timesync_request_interval_ms,
+            consumer_promotion_enabled: timesync_consumer_promotion_enabled,
+            max_slew_ppm: timesync_max_slew_ppm,
+        })
     } else {
         cfg
     };
@@ -1010,21 +1045,61 @@ impl PyRouter {
 
     /// Create or retrieve a per-process singleton Router.
     #[staticmethod]
-    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled = true, e2e_mode = 255, e2e_key_id = 0))]
+    #[pyo3(signature = (
+        now_ms=None,
+        handlers=None,
+        timesync_enabled=true,
+        timesync_role=0,
+        timesync_priority=100,
+        timesync_source_timeout_ms=5000,
+        timesync_announce_interval_ms=1000,
+        timesync_request_interval_ms=1000,
+        timesync_consumer_promotion_enabled=true,
+        timesync_max_slew_ppm=50000,
+        e2e_mode=255,
+        e2e_key_id=0,
+        max_queue_budget=None,
+        max_recent_rx_ids=None,
+        starting_queue_size=None,
+        queue_grow_step=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new_singleton(
         py: Python<'_>,
         now_ms: Option<Py<PyAny>>,
         handlers: Option<&Bound<'_, PyAny>>,
         timesync_enabled: bool,
+        timesync_role: u8,
+        timesync_priority: u64,
+        timesync_source_timeout_ms: u64,
+        timesync_announce_interval_ms: u64,
+        timesync_request_interval_ms: u64,
+        timesync_consumer_promotion_enabled: bool,
+        timesync_max_slew_ppm: u32,
         e2e_mode: u8,
         e2e_key_id: u32,
+        max_queue_budget: Option<usize>,
+        max_recent_rx_ids: Option<usize>,
+        starting_queue_size: Option<usize>,
+        queue_grow_step: Option<f64>,
     ) -> PyResult<Self> {
         if let Some(existing) = GLOBAL_ROUTER_SINGLETON.get() {
             if now_ms.is_some()
                 || handlers.is_some()
                 || !timesync_enabled
+                || timesync_role != 0
+                || timesync_priority != 100
+                || timesync_source_timeout_ms != 5000
+                || timesync_announce_interval_ms != 1000
+                || timesync_request_interval_ms != 1000
+                || !timesync_consumer_promotion_enabled
+                || timesync_max_slew_ppm != 50000
                 || e2e_mode != 255
                 || e2e_key_id != 0
+                || max_queue_budget.is_some()
+                || max_recent_rx_ids.is_some()
+                || starting_queue_size.is_some()
+                || queue_grow_step.is_some()
             {
                 return Err(PyRuntimeError::new_err(
                     "Router singleton already exists; cannot modify constructor options",
@@ -1045,7 +1120,23 @@ impl PyRouter {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let (handlers_vec, keep_pkt, keep_ser) = build_endpoint_handlers(py, handlers)?;
-        let cfg = build_router_config(handlers_vec, timesync_enabled, e2e_mode, e2e_key_id)?;
+        let cfg = build_router_config(
+            handlers_vec,
+            timesync_enabled,
+            timesync_role,
+            timesync_priority,
+            timesync_source_timeout_ms,
+            timesync_announce_interval_ms,
+            timesync_request_interval_ms,
+            timesync_consumer_promotion_enabled,
+            timesync_max_slew_ppm,
+            e2e_mode,
+            e2e_key_id,
+            max_queue_budget,
+            max_recent_rx_ids,
+            starting_queue_size,
+            queue_grow_step,
+        )?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
         let arc = SArc::new(Mutex::new(router));
 
@@ -1065,19 +1156,64 @@ impl PyRouter {
 
     /// Create a new router.
     #[new]
-    #[pyo3(signature = (now_ms=None, handlers=None, timesync_enabled=true, e2e_mode=255, e2e_key_id=0))]
+    #[pyo3(signature = (
+        now_ms=None,
+        handlers=None,
+        timesync_enabled=true,
+        timesync_role=0,
+        timesync_priority=100,
+        timesync_source_timeout_ms=5000,
+        timesync_announce_interval_ms=1000,
+        timesync_request_interval_ms=1000,
+        timesync_consumer_promotion_enabled=true,
+        timesync_max_slew_ppm=50000,
+        e2e_mode=255,
+        e2e_key_id=0,
+        max_queue_budget=None,
+        max_recent_rx_ids=None,
+        starting_queue_size=None,
+        queue_grow_step=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         now_ms: Option<Py<PyAny>>,
         handlers: Option<&Bound<'_, PyAny>>,
         timesync_enabled: bool,
+        timesync_role: u8,
+        timesync_priority: u64,
+        timesync_source_timeout_ms: u64,
+        timesync_announce_interval_ms: u64,
+        timesync_request_interval_ms: u64,
+        timesync_consumer_promotion_enabled: bool,
+        timesync_max_slew_ppm: u32,
         e2e_mode: u8,
         e2e_key_id: u32,
+        max_queue_budget: Option<usize>,
+        max_recent_rx_ids: Option<usize>,
+        starting_queue_size: Option<usize>,
+        queue_grow_step: Option<f64>,
     ) -> PyResult<Self> {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let (handlers_vec, keep_pkt, keep_ser) = build_endpoint_handlers(py, handlers)?;
-        let cfg = build_router_config(handlers_vec, timesync_enabled, e2e_mode, e2e_key_id)?;
+        let cfg = build_router_config(
+            handlers_vec,
+            timesync_enabled,
+            timesync_role,
+            timesync_priority,
+            timesync_source_timeout_ms,
+            timesync_announce_interval_ms,
+            timesync_request_interval_ms,
+            timesync_consumer_promotion_enabled,
+            timesync_max_slew_ppm,
+            e2e_mode,
+            e2e_key_id,
+            max_queue_budget,
+            max_recent_rx_ids,
+            starting_queue_size,
+            queue_grow_step,
+        )?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
 
         Ok(Self {
@@ -1927,6 +2063,55 @@ impl PyRouter {
         rtr.poll_timesync().map_err(py_err_from)
     }
 
+    #[cfg(feature = "timesync")]
+    #[pyo3(signature = (
+        enabled=true,
+        role=0,
+        priority=100,
+        source_timeout_ms=5000,
+        announce_interval_ms=1000,
+        request_interval_ms=1000,
+        consumer_promotion_enabled=true,
+        max_slew_ppm=50000
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn configure_timesync(
+        &self,
+        enabled: bool,
+        role: u8,
+        priority: u64,
+        source_timeout_ms: u64,
+        announce_interval_ms: u64,
+        request_interval_ms: u64,
+        consumer_promotion_enabled: bool,
+        max_slew_ppm: u32,
+    ) -> PyResult<()> {
+        let role = match role {
+            0 => TimeSyncRole::Consumer,
+            1 => TimeSyncRole::Source,
+            2 => TimeSyncRole::Auto,
+            _ => return Err(PyValueError::new_err("bad timesync role")),
+        };
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        if enabled {
+            rtr.set_timesync_config(Some(TimeSyncConfig {
+                role,
+                priority,
+                source_timeout_ms,
+                announce_interval_ms,
+                request_interval_ms,
+                consumer_promotion_enabled,
+                max_slew_ppm,
+            }));
+        } else {
+            rtr.set_timesync_config(None);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "discovery")]
     fn announce_discovery(&self) -> PyResult<()> {
         let rtr = self
@@ -2398,15 +2583,38 @@ pub struct PyRelay {
 #[pymethods]
 impl PyRelay {
     #[new]
-    #[pyo3(signature = (now_ms=None))]
-    fn new(py: Python<'_>, now_ms: Option<Py<PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (
+        now_ms=None,
+        max_queue_budget=None,
+        max_recent_rx_ids=None,
+        starting_queue_size=None,
+        queue_grow_step=None
+    ))]
+    fn new(
+        py: Python<'_>,
+        now_ms: Option<Py<PyAny>>,
+        max_queue_budget: Option<usize>,
+        max_recent_rx_ids: Option<usize>,
+        starting_queue_size: Option<usize>,
+        queue_grow_step: Option<f64>,
+    ) -> PyResult<Self> {
         let now_keep = now_ms.as_ref().map(|p| p.clone_ref(py));
 
         let clock = PyClock {
             cb: now_keep.as_ref().map(|p| p.clone_ref(py)),
         };
 
-        let relay = Relay::new(Box::new(clock));
+        let default_memory = RuntimeMemoryConfig::default();
+        let memory = RuntimeMemoryConfig {
+            max_queue_budget: max_queue_budget.unwrap_or(default_memory.max_queue_budget),
+            max_recent_rx_ids: max_recent_rx_ids.unwrap_or(default_memory.max_recent_rx_ids),
+            starting_queue_size: starting_queue_size.unwrap_or(default_memory.starting_queue_size),
+            queue_grow_step: queue_grow_step.unwrap_or(default_memory.queue_grow_step),
+        };
+        let cfg = RelayConfig::default()
+            .with_memory_config(memory)
+            .map_err(|_| PyValueError::new_err("bad memory limits"))?;
+        let relay = Relay::new_with_config(cfg, Box::new(clock));
 
         Ok(PyRelay {
             inner: SArc::new(relay),
