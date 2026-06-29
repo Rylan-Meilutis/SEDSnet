@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.0.2
+
+- Made `pyproject.toml` use maturin's dynamic version metadata so the Python package version is
+  derived from the root Cargo package version instead of being edited separately.
+- Hardened `publish_crates.py` for crates.io release retries: an already-published macro crate no
+  longer waits for delayed index propagation, and index lag after a successful macro upload can be
+  treated as a non-fatal publish warning when `--ignore-publish-errors` is used.
+
 ## 4.0.1
 
 - Made the remaining prebuilt/host tuning knobs runtime configurable across Rust, C, and Python:

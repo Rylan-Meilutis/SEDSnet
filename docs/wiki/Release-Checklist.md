@@ -142,10 +142,12 @@ Update these files together:
 
 - `Cargo.toml`
 - `sedsnet_macros/Cargo.toml`
-- `pyproject.toml`
 - `README.md`
 - `CHANGELOG.md`
 - `docs/wiki/Changelogs.md`
+
+`pyproject.toml` declares `dynamic = ["version"]`; maturin and the release script read the Python
+package version from the root Cargo package version.
 
 ## Final Sanity
 
