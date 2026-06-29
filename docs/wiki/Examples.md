@@ -24,6 +24,8 @@ What it demonstrates:
 - Receiving and dispatching to handlers.
 - Time sync announce/request/response and offset math.
 - Managed-variable latest-value resync, bounded packed sides, and E2E policy configuration.
+- Runtime memory, tuning, device identity, time-sync role, and address configuration through the C
+  ABI.
 
 Suggested first steps:
 
@@ -55,6 +57,7 @@ What it demonstrates:
 - Type-specific routing to two dedicated command links without weighted or failover path selection.
 - Time sync announce/request/response and offset math.
 - Managed-variable latest-value resync and E2E router/type policy settings.
+- Runtime tuning, device identifier, memory budget, time-sync role, and address configuration.
 
 Suggested first steps:
 
@@ -68,6 +71,9 @@ Suggested first steps:
 If you want a minimal Rust example, start with [Usage-Rust](Usage-Rust) and build a small router with one endpoint
 handler. For a runnable example, see:
 
+-
+
+rust-example-code/runtime_config_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/runtime_config_example.rs))
 -
 
 rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs))
@@ -86,10 +92,12 @@ rust-example-code/typed_routing_example.rs ([source](https://github.com/Rylan-Me
 -
 rust-example-code/managed_variables_e2e_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/managed_variables_e2e_example.rs))
 
-The typed-routing example shows one practical pattern: ordinary telemetry stays on its normal
-link, while a command-like packet type is manually fanned out to two dedicated sides that both
-reach the same remote destination. It uses `set_typed_route(...)` only, so there is no load
-balancing or failover policy involved.
+The runtime-config example shows how to configure active device identity, process-wide tuning,
+router/relay memory budgets, time-sync roles, and address assignment without rebuilding the crate.
+The typed-routing example shows one practical pattern: ordinary telemetry stays on its normal link,
+while a command-like packet type is manually fanned out to two dedicated sides that both reach the
+same remote destination. It uses `set_typed_route(...)` only, so there is no load balancing or
+failover policy involved.
 
 ## RTOS time sync examples
 
