@@ -78,6 +78,11 @@
     - Time-sync source/grandmaster role selection is runtime configuration, not a compile-time board
       role. Rust, C, and Python can configure consumer/source/auto behavior and update router time
       sync settings after construction.
+    - Host/prebuilt defaults for device identity, compression threshold, static string/binary
+      sizing, float string precision, handler retries, reliable retransmit timing, and reliable
+      cache limits are runtime configurable across Rust, C, and Python.
+    - Router hostname/address assignment is runtime configurable across bindings, including
+      dynamic, requested, and static address modes.
     - Router and relay memory limits are runtime constructor options across Rust, C, and Python, so
       prebuilt Python wheels are no longer locked to the packaged queue-budget defaults.
 - Topology and diagnostics:

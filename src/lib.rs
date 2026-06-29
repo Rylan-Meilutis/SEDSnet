@@ -39,8 +39,8 @@ extern crate std;
 use std::io::Error;
 
 use crate::config::{
-    DataEndpoint, DataType, STATIC_HEX_LENGTH, STATIC_STRING_LENGTH, get_endpoint_meta,
-    get_message_meta, max_data_type_id, max_endpoint_id,
+    DataEndpoint, DataType, get_endpoint_meta, get_message_meta, max_data_type_id, max_endpoint_id,
+    runtime_static_hex_length, runtime_static_string_length,
 };
 use crate::macros::{ReprI32Enum, ReprU32Enum};
 use alloc::string::ToString;
@@ -662,7 +662,7 @@ pub enum MessageDataType {
 /// # Returns
 /// - Size in bytes of a single element of that type.
 #[inline]
-pub const fn data_type_size(dt: MessageDataType) -> usize {
+pub fn data_type_size(dt: MessageDataType) -> usize {
     match dt {
         MessageDataType::Float64 => size_of::<f64>(),
         MessageDataType::Float32 => size_of::<f32>(),
@@ -677,8 +677,8 @@ pub const fn data_type_size(dt: MessageDataType) -> usize {
         MessageDataType::Int64 => size_of::<i64>(),
         MessageDataType::Int128 => size_of::<i128>(),
         MessageDataType::Bool => size_of::<bool>(),
-        MessageDataType::String => STATIC_STRING_LENGTH,
-        MessageDataType::Binary => STATIC_HEX_LENGTH,
+        MessageDataType::String => runtime_static_string_length(),
+        MessageDataType::Binary => runtime_static_hex_length(),
         MessageDataType::NoData => 0,
     }
 }

@@ -67,6 +67,16 @@
   defaults. Rust exposes `RuntimeMemoryConfig` through router/relay configs, C exposes
   `seds_router_new_with_memory(...)` and `seds_relay_new_with_memory(...)`, and Python `Router`/
   `Relay` constructors accept queue budget, recent-ID, starting-size, and growth overrides.
+- The remaining host/prebuilt tuning defaults are runtime configurable. Rust exposes
+  `RuntimeTuningConfig`, `runtime_tuning_config(...)`, `set_runtime_tuning_config(...)`, and
+  `set_runtime_device_identifier(...)`; C exposes `SedsRuntimeTuningConfig` plus matching get/set
+  functions; Python exposes `runtime_tuning_config(...)`, `set_runtime_tuning_config(...)`, and
+  runtime device identifier helpers. These cover compression threshold, static string/binary
+  sizing, float string precision, handler retries, reliable retransmit timing, and reliable cache
+  limits.
+- Router identity/address assignment can be configured at runtime across bindings. Python
+  constructors accept `hostname`, `address_mode`, and `requested_address`, and C exposes
+  `seds_router_configure_address(...)` for dynamic/requested/static address mode changes.
 - Topology exports now include a deduplicated `links` graph, named endpoint fields, side names, and
   filtered SEDSnet control endpoints so graphing tools see user-facing network structure instead of
   router-only internals.

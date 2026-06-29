@@ -82,7 +82,7 @@ as HTTP can be carried over SEDSnet links without IP being the underlying transp
 endpoint delivery remains available for telemetry data types; P2P service frames use discovery
 identity and ports for board-to-board traffic.
 
-Queue memory is bounded per router/relay instance. Compile-time values such as `MAX_QUEUE_BUDGET`
+Queue memory is bounded per router/relay instance. Packaged values such as `MAX_QUEUE_BUDGET`
 provide defaults, and Rust, C, and Python constructors can override the active budget at runtime.
 Router and relay internals share that budget dynamically across RX work, TX work, reliable
 replay/out-of-order buffers, recent packet ID tracking, and learned discovery topology state. The
@@ -282,7 +282,7 @@ Options:
   maturin-develop         Run maturin develop with the .pyi .gitignore hack.
   maturin-install         Build wheel and install it with uv pip install.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
-  device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
+  device_id=<id>          Set the packaged DEVICE_IDENTIFIER default for the build.
   static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
   static_ipc_schema_path=<path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for a runtime IPC/link-local seed.
   max_queue_budget=<n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
@@ -370,7 +370,7 @@ set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
 # want an optimized telemetry library.
 # set(SEDSNET_FORCE_RELEASE ON CACHE BOOL "" FORCE)
 
-# set the sender name
+# set the packaged default sender name
 set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 
 # optional compile-time env overrides
@@ -414,7 +414,9 @@ set `SEDSNET_FORCE_RELEASE=ON` before `add_subdirectory(...)`. Otherwise the wra
 
 ## Setting the device / platform name
 
-Each build of `sedsnet` embeds a **device identifier** which appears in every telemetry packet header.
+Each build of `sedsnet` embeds a **default device identifier**. In v4 packet routing uses compact
+addresses on the wire; hostnames/sender names are discovery/config metadata instead of repeated in
+every packed frame. Applications can still override the active identifier at runtime.
 
 Rust resolves it using:
 
@@ -435,7 +437,7 @@ Create:
 DEVICE_IDENTIFIER = "GROUND_STATION_26"
 ```
 
-After this, any `cargo build`, `cargo run`, or CI build will embed `"GROUND_STATION_26"` automatically.
+After this, any `cargo build`, `cargo run`, or CI build will package `"GROUND_STATION_26"` as the default.
 
 No build script changes required.
 
@@ -448,6 +450,32 @@ set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 ```
 
 Note: This must be set **before** including the sedsnet CMake as a subdirectory.
+
+Runtime overrides are available in every host binding:
+
+```rust
+use sedsnet::config::set_runtime_device_identifier;
+
+set_runtime_device_identifier("GROUND_STATION_26")?;
+let router = sedsnet::router::Router::new_with_config(
+    sedsnet::router::RouterConfig::new().with_sender("FC26_MAIN"),
+    Box::new(clock),
+);
+```
+
+```c
+seds_set_runtime_device_identifier("GROUND_STATION_26", 17);
+seds_router_set_sender_id(router, "FC26_MAIN", 9);
+seds_router_configure_address(router, 2, 0x10203040); /* 0=dynamic, 1=requested, 2=static */
+```
+
+```python
+import sedsnet as seds
+
+seds.set_runtime_device_identifier("GROUND_STATION_26")
+router = seds.Router(hostname="FC26_MAIN", address_mode=2, requested_address=0x10203040)
+router.configure_address(address_mode=1, requested_address=0x10203041)
+```
 
 Typical examples:
 

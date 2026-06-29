@@ -36,9 +36,10 @@ use crate::timesync::{
 use crate::{
     E2eEncryptionPolicy, MessageElement, RouteSelectionMode, TelemetryError, TelemetryResult,
     config::{
-        DEVICE_IDENTIFIER, DataEndpoint, DataType, MAX_HANDLER_RETRIES,
-        RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_PENDING, RELIABLE_MAX_RETRIES,
-        RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS,
+        DataEndpoint, DataType, runtime_device_identifier, runtime_max_handler_retries,
+        runtime_reliable_max_end_to_end_pending, runtime_reliable_max_pending,
+        runtime_reliable_max_retries, runtime_reliable_max_return_routes,
+        runtime_reliable_retransmit_ms,
     },
     get_needed_message_size, impl_letype_num, is_reliable_type,
     lock::{ReentryGate, RouterMutex},
@@ -1165,6 +1166,7 @@ impl AddressAssignmentMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressChangeReason {
+    Configured,
     DynamicConflict,
     RequestedConflict,
     StaticConflict,
@@ -1452,8 +1454,11 @@ impl RouterConfig {
     }
 
     #[inline]
-    fn sender(&self) -> &str {
-        self.sender.as_deref().unwrap_or(DEVICE_IDENTIFIER)
+    fn sender(&self) -> String {
+        self.sender
+            .as_deref()
+            .map(ToString::to_string)
+            .unwrap_or_else(runtime_device_identifier)
     }
 
     #[inline]
@@ -1988,7 +1993,7 @@ impl RouterInner {
                 expected_seq: 1,
                 buffered: BTreeMap::new(),
             });
-        if rx_state.buffered.len() >= RELIABLE_MAX_PENDING {
+        if rx_state.buffered.len() >= runtime_reliable_max_pending() {
             let _ = rx_state.buffered.pop_first();
         }
         rx_state.buffered.insert(seq, bytes);
@@ -2247,7 +2252,7 @@ fn with_retries<F>(
 where
     F: Fn() -> TelemetryResult<()>,
 {
-    match this.retry_with_attempts(MAX_HANDLER_RETRIES, run) {
+    match this.retry_with_attempts(runtime_max_handler_retries(), run) {
         Ok(((), attempts)) => {
             if attempts > 1 {
                 let mut st = this.state.lock();
@@ -3354,7 +3359,7 @@ impl Router {
     /// cache is full, the oldest learned route is evicted before inserting the
     /// new one.
     fn remember_reliable_return_route_locked(st: &mut RouterInner, packet_id: u64) {
-        let cap = RELIABLE_MAX_RETURN_ROUTES.max(1);
+        let cap = runtime_reliable_max_return_routes().max(1);
         st.reliable_return_route_order
             .retain(|id| st.reliable_return_routes.contains_key(id) && *id != packet_id);
         while st.reliable_return_route_order.len() >= cap {
@@ -3368,7 +3373,7 @@ impl Router {
     }
 
     fn remember_end_to_end_reliable_tx_locked(st: &mut RouterInner, packet_id: u64) {
-        let cap = RELIABLE_MAX_END_TO_END_PENDING.max(1);
+        let cap = runtime_reliable_max_end_to_end_pending().max(1);
         st.end_to_end_reliable_tx_order
             .retain(|id| st.end_to_end_reliable_tx.contains_key(id) && *id != packet_id);
         while st.end_to_end_reliable_tx_order.len() >= cap {
@@ -3427,7 +3432,7 @@ impl Router {
                             candidates.push((Self::sender_hash(&board.sender_id), side, overlap));
                         } else {
                             out.insert(Self::sender_hash(&board.sender_id), side);
-                            if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                            if out.len() >= runtime_reliable_max_end_to_end_pending().max(1) {
                                 return Ok(out);
                             }
                         }
@@ -3440,7 +3445,7 @@ impl Router {
             for (sender_hash, side, overlap) in candidates {
                 if overlap == best_overlap {
                     out.insert(sender_hash, side);
-                    if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                    if out.len() >= runtime_reliable_max_end_to_end_pending().max(1) {
                         return Ok(out);
                     }
                 }
@@ -3649,7 +3654,7 @@ impl Router {
                         continue;
                     }
                     out.insert(Self::sender_hash(&board.sender_id), side);
-                    if out.len() >= RELIABLE_MAX_END_TO_END_PENDING.max(1) {
+                    if out.len() >= runtime_reliable_max_end_to_end_pending().max(1) {
                         return out;
                     }
                 }
@@ -5343,7 +5348,9 @@ impl Router {
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
-                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                    match self
+                        .retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref()))
+                    {
                         Ok((_, attempts)) => {
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -5364,7 +5371,7 @@ impl Router {
             }
             RouterTxHandlerFn::Packet(f) => {
                 let pkt = wire_format::unpack_packet(bytes.as_ref())?;
-                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
+                self.retry_with_attempts(runtime_max_handler_retries(), || f(&pkt))
             }
         };
         match result {
@@ -5427,7 +5434,7 @@ impl Router {
         let (seq, flags) = {
             let mut st = self.state.lock();
             let tx_state = self.reliable_tx_state_mut(&mut st, side, ty);
-            if tx_state.sent.len() >= RELIABLE_MAX_PENDING {
+            if tx_state.sent.len() >= runtime_reliable_max_pending() {
                 return Err(TelemetryError::PacketTooLarge(
                     "router reliable history full",
                 ));
@@ -5467,9 +5474,9 @@ impl Router {
                         let mut attempts_total = 0usize;
                         let mut sent_bytes = 0usize;
                         for frame in frames {
-                            match self
-                                .retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref()))
-                            {
+                            match self.retry_with_attempts(runtime_max_handler_retries(), || {
+                                f(frame.as_ref())
+                            }) {
                                 Ok((_, attempts)) => {
                                     attempts_total = attempts_total.saturating_add(attempts);
                                     sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -5509,9 +5516,9 @@ impl Router {
                         let mut attempts_total = 0usize;
                         let mut sent_bytes = 0usize;
                         for frame in frames {
-                            match self
-                                .retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref()))
-                            {
+                            match self.retry_with_attempts(runtime_max_handler_retries(), || {
+                                f(frame.as_ref())
+                            }) {
                                 Ok((_, attempts)) => {
                                     attempts_total = attempts_total.saturating_add(attempts);
                                     sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -5548,7 +5555,7 @@ impl Router {
         let mut attempts_total = 0usize;
         let mut sent_bytes = 0usize;
         for frame in frames {
-            match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+            match self.retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref())) {
                 Ok((_, attempts)) => {
                     attempts_total = attempts_total.saturating_add(attempts);
                     sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -6184,7 +6191,9 @@ impl Router {
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
-                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                    match self
+                        .retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref()))
+                    {
                         Ok((_, attempts)) => {
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -6204,7 +6213,7 @@ impl Router {
                 return Ok(());
             }
             (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => {
-                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(pkt))
+                self.retry_with_attempts(runtime_max_handler_retries(), || f(pkt))
             }
             (RouterTxHandlerFn::Packed(f), RouterItem::Packet(pkt)) => {
                 let owned = self.pack_packet_for_router(pkt, None)?;
@@ -6212,7 +6221,9 @@ impl Router {
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
-                    match self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(frame.as_ref())) {
+                    match self
+                        .retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref()))
+                    {
                         Ok((_, attempts)) => {
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -6233,7 +6244,7 @@ impl Router {
             }
             (RouterTxHandlerFn::Packet(f), RouterItem::Packed(bytes)) => {
                 let pkt = wire_format::unpack_packet(bytes.as_ref())?;
-                self.retry_with_attempts(MAX_HANDLER_RETRIES, || f(&pkt))
+                self.retry_with_attempts(runtime_max_handler_retries(), || f(&pkt))
             }
         };
         match result {
@@ -6324,13 +6335,15 @@ impl Router {
                     let Some(sent) = tx_state.sent.get_mut(&seq) else {
                         continue;
                     };
-                    if sent.queued || now.wrapping_sub(sent.last_send_ms) < RELIABLE_RETRANSMIT_MS {
+                    if sent.queued
+                        || now.wrapping_sub(sent.last_send_ms) < runtime_reliable_retransmit_ms()
+                    {
                         continue;
                     }
                     if sent.partial_acked {
                         continue;
                     }
-                    if sent.retries >= RELIABLE_MAX_RETRIES {
+                    if sent.retries >= runtime_reliable_max_retries() {
                         tx_state.sent.remove(&seq);
                         tx_state.sent_order.retain(|existing| *existing != seq);
                         continue;
@@ -6366,10 +6379,12 @@ impl Router {
                 let Some(sent) = st.end_to_end_reliable_tx.get_mut(&packet_id) else {
                     continue;
                 };
-                if sent.queued || now.wrapping_sub(sent.last_send_ms) < RELIABLE_RETRANSMIT_MS {
+                if sent.queued
+                    || now.wrapping_sub(sent.last_send_ms) < runtime_reliable_retransmit_ms()
+                {
                     continue;
                 }
-                if sent.retries >= RELIABLE_MAX_RETRIES {
+                if sent.retries >= runtime_reliable_max_retries() {
                     st.end_to_end_reliable_tx.remove(&packet_id);
                     continue;
                 }
@@ -7392,24 +7407,45 @@ impl Router {
 
     pub fn set_sender<S: AsRef<str>>(&self, sender: S) {
         let hostname: Arc<str> = Arc::from(sender.as_ref());
-        *self.sender.lock() = hostname.clone();
         let mut st = self.state.lock();
         let mut local = st.local_address.clone();
-        st.address_book.remove(local.hostname.as_ref());
-        st.address_by_value.remove(&local.address);
         local.hostname = hostname.clone();
         local.owner_hash = Self::sender_hash(hostname.as_ref());
         if matches!(local.mode, AddressAssignmentMode::Dynamic) {
             local.address = Self::fallback_address_for_hostname(hostname.as_ref());
             local.requested_address = 0;
         }
-        local.last_seen_ms = self.clock.now_ms();
-        st.address_by_value
-            .insert(local.address, hostname.to_string());
-        st.address_book.insert(hostname.to_string(), local.clone());
-        st.local_address = local;
-        #[cfg(feature = "discovery")]
-        Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        let change =
+            self.update_local_identity_locked(&mut st, local, AddressChangeReason::Configured);
+        drop(st);
+        let _ = self.notify_address_change(change);
+    }
+
+    pub fn set_address_assignment(
+        &self,
+        mode: AddressAssignmentMode,
+    ) -> TelemetryResult<AddressChange> {
+        let mut st = self.state.lock();
+        let mut local = st.local_address.clone();
+        local.mode = mode;
+        local.requested_address = mode.requested_address();
+        local.address = match mode {
+            AddressAssignmentMode::Dynamic => {
+                Self::fallback_address_for_hostname(local.hostname.as_ref())
+            }
+            AddressAssignmentMode::Requested(address) | AddressAssignmentMode::Static(address) => {
+                if address == 0 {
+                    1
+                } else {
+                    address
+                }
+            }
+        };
+        let change =
+            self.update_local_identity_locked(&mut st, local, AddressChangeReason::Configured);
+        drop(st);
+        self.notify_address_change(change.clone())?;
+        Ok(change)
     }
 
     /// Register a side whose TX callback consumes packed packet bytes.
@@ -8519,15 +8555,13 @@ impl Router {
         e: TelemetryError,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
+        let device = self.sender_arc();
         let error_msg = match dest {
             Some(failed_local) => format!(
                 "Handler for endpoint {:?} failed on device {:?}: {:?}",
-                failed_local, DEVICE_IDENTIFIER, e
+                failed_local, device, e
             ),
-            None => format!(
-                "TX Handler failed on device {:?}: {:?}",
-                DEVICE_IDENTIFIER, e
-            ),
+            None => format!("TX Handler failed on device {:?}: {:?}", device, e),
         };
 
         let mut recipients: Vec<DataEndpoint> = pkt
@@ -9123,9 +9157,10 @@ impl Router {
             }
         }
 
+        let device = self.sender_arc();
         let error_msg = format!(
             "Handler for endpoint {:?} failed on device {:?}: {:?}",
-            dest, DEVICE_IDENTIFIER, e
+            dest, device, e
         );
         if recipients.is_empty() {
             fallback_stdout(&error_msg);
@@ -9594,7 +9629,7 @@ impl Router {
                                 self.note_side_local_handler_failure(
                                     src,
                                     pkt.data_type(),
-                                    MAX_HANDLER_RETRIES,
+                                    runtime_max_handler_retries(),
                                 );
                             }
                         }
@@ -9742,7 +9777,7 @@ impl Router {
                                 self.note_side_local_handler_failure(
                                     src,
                                     env.ty,
-                                    MAX_HANDLER_RETRIES,
+                                    runtime_max_handler_retries(),
                                 );
                             }
                         }

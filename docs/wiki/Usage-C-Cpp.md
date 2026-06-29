@@ -6,8 +6,10 @@ and a static library built by Cargo.
 
 `C-Headers/sedsnet.h` is a static checked-in ABI header. Runtime data types and endpoints are
 registered at runtime, so the header no longer needs to be generated for each schema. Build-time
-payload storage settings such as `SEDSNET_MAX_STACK_PAYLOAD` / `MAX_STACK_PAYLOAD` are still
-preserved and forwarded into the Rust build.
+payload storage settings such as `SEDSNET_MAX_STACK_PAYLOAD` / `MAX_STACK_PAYLOAD` are packaged
+defaults or compiled capacities; active identity, memory pools, reliable limits, string sizing,
+precision, compression threshold, address assignment, and time-sync behavior can be configured at
+runtime.
 
 ## CMake integration (recommended)
 
@@ -71,6 +73,48 @@ DEVICE_IDENTIFIER=FC26_MAIN cargo build --release
 ```
 
 The static library will be under `target/release/` (or under `target/<triple>/release` for embedded targets).
+
+## Runtime configuration
+
+The build-time values above are defaults. C/C++ applications can configure the active runtime even
+when using a prebuilt library:
+
+```c
+SedsRuntimeTuningConfig tuning;
+seds_get_runtime_tuning_config(&tuning);
+tuning.payload_compress_threshold = 24;
+tuning.static_string_length = 512;
+tuning.static_hex_length = 512;
+tuning.string_precision = 6;
+tuning.max_handler_retries = 4;
+tuning.reliable_retransmit_ms = 300;
+tuning.reliable_max_retries = 10;
+tuning.reliable_max_pending = 96;
+tuning.reliable_max_return_routes = 96;
+tuning.reliable_max_end_to_end_pending = 96;
+tuning.reliable_max_end_to_end_ack_cache = 256;
+seds_set_runtime_tuning_config(&tuning);
+
+seds_set_runtime_device_identifier("GROUND_STATION", 14);
+
+SedsRuntimeMemoryConfig memory = {
+    .max_queue_budget = 65536,
+    .max_recent_rx_ids = 256,
+    .starting_queue_size = 256,
+    .queue_grow_step = 2.0,
+};
+SedsRouter * router = seds_router_new_with_memory(
+    0, now_ms, user, handlers, n_handlers,
+    SEDS_ROUTER_E2E_PREFERRED, 7, &memory
+);
+seds_router_set_sender_id(router, "FC26_MAIN", 9);
+seds_router_configure_address(router, 2, 0x10203040); /* 0=dynamic, 1=requested, 2=static */
+seds_router_configure_timesync(router, true, 2, 100, 5000, 2000, 2000);
+```
+
+`MAX_STACK_PAYLOAD` is the remaining compile-time capacity limit because it changes the inline
+payload type layout. Runtime tuning can reduce active static string/binary sizes and other limits,
+but it cannot enlarge that compiled inline capacity after the library is built.
 
 ## Header Choices
 
@@ -600,7 +644,7 @@ partial-ACKed. Partial ACKs suppress timeout retransmit for packets already rece
 explicit packet requests can still replay them. Once the missing sequence arrives, the buffered
 packets are dispatched immediately in order.
 
-Router and relay queue-backed state shares one active memory budget. The compile-time
+Router and relay queue-backed state shares one active memory budget. The packaged
 `MAX_QUEUE_BUDGET` is only the default; C callers can pass `SedsRuntimeMemoryConfig` to
 `seds_router_new_with_memory(...)` or `seds_relay_new_with_memory(...)` to choose per-instance
 limits at runtime. RX work, TX work, recent packet IDs, reliable buffers/replay state, and discovery
@@ -772,7 +816,8 @@ The routing parameters mean:
 Payloads are little-endian. The schema defines element type and count. For dynamic payloads, sizes must be a multiple of
 element width.
 
-Strings must be valid UTF-8. For static strings, the payload is padded or truncated to `STATIC_STRING_LENGTH`.
+Strings must be valid UTF-8. For static strings, the payload is padded or truncated to the active
+runtime `static_string_length` value.
 
 ## Embedded allocator hooks
 

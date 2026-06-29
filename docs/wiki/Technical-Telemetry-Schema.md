@@ -189,8 +189,8 @@ Schema shape still controls packet validation:
 
 For static `String` or `Binary` payloads, the configured limits are:
 
-- `STATIC_STRING_LENGTH`
-- `STATIC_HEX_LENGTH`
+- runtime `static_string_length`, defaulting to the packaged `STATIC_STRING_LENGTH`
+- runtime `static_hex_length`, defaulting to the packaged `STATIC_HEX_LENGTH`
 
 ## Compatibility Checklist
 

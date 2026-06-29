@@ -1,6 +1,8 @@
 use crate::config::{
-    RELIABLE_MAX_END_TO_END_ACK_CACHE, RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_PENDING,
-    RELIABLE_MAX_RETRIES, RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS, RuntimeMemoryConfig,
+    RuntimeMemoryConfig, runtime_reliable_max_end_to_end_ack_cache,
+    runtime_reliable_max_end_to_end_pending, runtime_reliable_max_pending,
+    runtime_reliable_max_retries, runtime_reliable_max_return_routes,
+    runtime_reliable_retransmit_ms,
 };
 use crate::diagnostics::{
     AdaptiveLinkStats, DiscoveryRuntimeStats, QueueRuntimeStats, ReliableRuntimeStats,
@@ -1098,7 +1100,7 @@ impl RelayInner {
                 expected_seq: 1,
                 buffered: BTreeMap::new(),
             });
-        if rx_state.buffered.len() >= RELIABLE_MAX_PENDING {
+        if rx_state.buffered.len() >= runtime_reliable_max_pending() {
             let _ = rx_state.buffered.pop_first();
         }
         rx_state.buffered.insert(seq, bytes);
@@ -1669,7 +1671,7 @@ impl Relay {
     /// toward the source side that most recently forwarded the corresponding
     /// reliable data packet.
     fn remember_reliable_return_route_locked(st: &mut RelayInner, packet_id: u64) {
-        let cap = RELIABLE_MAX_RETURN_ROUTES.max(1);
+        let cap = runtime_reliable_max_return_routes().max(1);
         st.reliable_return_route_order
             .retain(|id| st.reliable_return_routes.contains_key(id) && *id != packet_id);
         while st.reliable_return_route_order.len() >= cap {
@@ -1687,7 +1689,7 @@ impl Relay {
         packet_id: u64,
         sender_hash: u64,
     ) {
-        let entry_cap = RELIABLE_MAX_END_TO_END_ACK_CACHE.max(1);
+        let entry_cap = runtime_reliable_max_end_to_end_ack_cache().max(1);
         st.end_to_end_acked_destination_order
             .retain(|id| st.end_to_end_acked_destinations.contains_key(id) && *id != packet_id);
         while st.end_to_end_acked_destination_order.len() >= entry_cap {
@@ -1703,7 +1705,7 @@ impl Relay {
             .end_to_end_acked_destinations
             .entry(packet_id)
             .or_default();
-        let sender_cap = RELIABLE_MAX_END_TO_END_PENDING.max(1);
+        let sender_cap = runtime_reliable_max_end_to_end_pending().max(1);
         if acked.len() < sender_cap || acked.contains(&sender_hash) {
             acked.insert(sender_hash);
         }
@@ -1970,7 +1972,7 @@ impl Relay {
         let (seq, flags) = {
             let mut st = self.state.lock();
             let tx_state = self.reliable_tx_state_mut(&mut st, side, ty);
-            if tx_state.sent.len() >= RELIABLE_MAX_PENDING {
+            if tx_state.sent.len() >= runtime_reliable_max_pending() {
                 return Err(TelemetryError::PacketTooLarge(
                     "relay reliable history full",
                 ));
@@ -3135,13 +3137,15 @@ impl Relay {
                     let Some(sent) = tx_state.sent.get_mut(&seq) else {
                         continue;
                     };
-                    if sent.queued || now.wrapping_sub(sent.last_send_ms) < RELIABLE_RETRANSMIT_MS {
+                    if sent.queued
+                        || now.wrapping_sub(sent.last_send_ms) < runtime_reliable_retransmit_ms()
+                    {
                         continue;
                     }
                     if sent.partial_acked {
                         continue;
                     }
-                    if sent.retries >= RELIABLE_MAX_RETRIES {
+                    if sent.retries >= runtime_reliable_max_retries() {
                         tx_state.sent.remove(&seq);
                         tx_state.sent_order.retain(|existing| *existing != seq);
                         continue;

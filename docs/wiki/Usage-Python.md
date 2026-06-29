@@ -64,6 +64,45 @@ router.process_all_queues()
 
 If you need a custom monotonic source for tests or simulation, pass `now_ms=...`.
 
+## Runtime configuration
+
+Prebuilt wheels are not locked to their packaged defaults. Configure the active node at runtime:
+
+```python
+import sedsnet as seds
+
+seds.set_runtime_device_identifier("GROUND_STATION")
+seds.set_runtime_tuning_config(
+    payload_compress_threshold=24,
+    static_string_length=512,
+    static_hex_length=512,
+    string_precision=6,
+    max_handler_retries=4,
+    reliable_retransmit_ms=300,
+    reliable_max_retries=10,
+    reliable_max_pending=96,
+    reliable_max_return_routes=96,
+    reliable_max_end_to_end_pending=96,
+    reliable_max_end_to_end_ack_cache=256,
+)
+
+router = seds.Router(
+    hostname="FC26_MAIN",
+    address_mode=2,          # 0=dynamic, 1=requested, 2=static
+    requested_address=0x10203040,
+    timesync_enabled=True,
+    timesync_role=2,         # 0=consumer, 1=source, 2=auto
+    max_queue_budget=65536,
+    max_recent_rx_ids=256,
+)
+router.configure_timesync(enabled=True, role=1, priority=10)
+router.configure_address(address_mode=1, requested_address=0x10203041)
+```
+
+`runtime_tuning_config()` returns the active process-wide values. Router/relay memory limits are per
+instance, while identity/address and time-sync settings are per router except for the process-wide
+default device identifier used by packet helper constructors.
+
 ## Runtime schema
 
 Python exposes the same runtime registry as Rust and C:

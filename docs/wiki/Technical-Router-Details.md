@@ -172,7 +172,7 @@ eviction emits a warning in `std` builds.
 
 Local handlers are invoked via `with_retries`:
 
-- Retries up to `MAX_HANDLER_RETRIES`.
+- Retries up to the active runtime `max_handler_retries` value.
 - On permanent failure, the packet ID is removed from the dedupe cache.
 - If a `Packet` or envelope is available, the router emits a `TelemetryError` packet to local handlers.
 
