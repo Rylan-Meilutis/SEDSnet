@@ -46,6 +46,44 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
 # target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::cpp_wrapper)
 ```
 
+## CMake integration without a submodule
+
+C projects can pull SEDSnet directly from GitHub at configure time with CMake
+`FetchContent`. This keeps the parent project free of a submodule while still building the Rust
+crate and exposing the same C ABI target.
+
+Set SEDSnet cache variables before `FetchContent_MakeAvailable(...)`:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(my_board C)
+
+include(FetchContent)
+
+# Configure SEDSnet before it is added.
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
+set(SEDSNET_FORCE_RELEASE ON CACHE BOOL "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    sedsnet
+    GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
+    GIT_TAG v4.0.2
+)
+FetchContent_MakeAvailable(sedsnet)
+
+add_executable(my_board src/main.c)
+target_link_libraries(my_board PRIVATE sedsnet::sedsnet)
+
+# Optional wrapper target when SEDSNET_ENABLE_C_WRAPPER is ON:
+# target_link_libraries(my_board PRIVATE sedsnet::c_wrapper)
+```
+
+Prefer pinning `GIT_TAG` to a release tag or commit SHA for reproducible firmware builds. Use a
+branch name only when you intentionally want each configure step to follow that branch.
+
 Important CMake variables:
 
 - `SEDSNET_EMBEDDED_BUILD` (ON/OFF)

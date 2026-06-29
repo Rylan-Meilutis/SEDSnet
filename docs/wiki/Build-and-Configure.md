@@ -268,6 +268,30 @@ After `add_subdirectory`, link the target:
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
 ```
 
+Projects that do not want a git submodule can fetch SEDSnet directly from GitHub with CMake
+`FetchContent`:
+
+```cmake
+include(FetchContent)
+
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
+set(SEDSNET_FORCE_RELEASE ON CACHE BOOL "" FORCE)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    sedsnet
+    GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
+    GIT_TAG v4.0.2
+)
+FetchContent_MakeAvailable(sedsnet)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
+```
+
+Set all `SEDSNET_*` cache variables before `FetchContent_MakeAvailable(sedsnet)`. Pin
+`GIT_TAG` to a release tag or commit SHA for repeatable builds.
+
 ## Python builds
 
 Python bindings are built with `maturin`.

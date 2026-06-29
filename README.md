@@ -287,8 +287,8 @@ Options:
   embedded                Build for the embedded target (enables embedded feature).
   python                  Build with Python bindings (enables python feature).
   timesync                Build with time sync helpers (enables timesync feature).
-  maturin-build           Run maturin build with the .pyi .gitignore hack.
-  maturin-develop         Run maturin develop with the .pyi .gitignore hack.
+  maturin-build           Run maturin build while including the static .pyi stub.
+  maturin-develop         Run maturin develop while including the static .pyi stub.
   maturin-install         Build wheel and install it with uv pip install.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set the packaged DEVICE_IDENTIFIER default for the build.
@@ -405,6 +405,42 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::sedsnet)
 # target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::c_wrapper)
 # target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sedsnet::cpp_wrapper)
 ```
+
+### Pulling SEDSnet from GitHub without a submodule
+
+CMake projects can use `FetchContent` to download SEDSnet during configure instead of storing it
+as a submodule or subtree. Set SEDSnet options before `FetchContent_MakeAvailable(...)`; they are
+CMake cache variables consumed by the fetched project.
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(my_board C)
+
+include(FetchContent)
+
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+set(SEDSNET_TARGET "thumbv7em-none-eabihf" CACHE STRING "" FORCE)
+set(SEDSNET_FORCE_RELEASE ON CACHE BOOL "" FORCE)
+set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
+set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    sedsnet
+    GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
+    GIT_TAG v4.0.2
+)
+FetchContent_MakeAvailable(sedsnet)
+
+add_executable(my_board src/main.c)
+target_link_libraries(my_board PRIVATE sedsnet::sedsnet)
+
+# Optional when SEDSNET_ENABLE_C_WRAPPER is ON:
+# target_link_libraries(my_board PRIVATE sedsnet::c_wrapper)
+```
+
+Pin `GIT_TAG` to a release tag or commit SHA for reproducible builds. Use `main` or `dev` only
+when you intentionally want the parent project to track a moving branch.
 
 Host CMake builds now prefer the shared Rust library when supported. Embedded builds still use the static library.
 If you want the Rust crate to use the release profile regardless of the parent CMake config,

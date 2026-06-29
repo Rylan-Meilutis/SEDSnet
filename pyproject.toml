@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sedsnet"
-version = "4.0.1"
+dynamic = ["version"]
 description = "Embedded networking stack with routing, discovery, reliability, P2P streams, and Rust/C/Python bindings"
 authors = [{ name = "Rylan Meilutis", email = "rylan@rylanswebsite.com" }]
 readme = "README.md"

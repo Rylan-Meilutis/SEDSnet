@@ -51,6 +51,11 @@ CARGO_NETWORK_ENV = {
     "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse",
 }
 
+PUBLISH_DRY_RUN_OK = "dry_run_ok"
+PUBLISH_PUBLISHED = "published"
+PUBLISH_ALREADY_EXISTS = "already_exists"
+PUBLISH_FAILED = "failed"
+
 
 def run(
     cmd: list[str],
@@ -116,7 +121,16 @@ def manifest_package(manifest: Path) -> tuple[str, str]:
 def pyproject_package(pyproject: Path) -> tuple[str, str]:
     data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     project = data["project"]
-    return str(project["name"]), str(project["version"])
+    if "version" in project:
+        return str(project["name"]), str(project["version"])
+    if "version" in project.get("dynamic", []):
+        _, cargo_version = manifest_package(MAIN_MANIFEST)
+        return str(project["name"]), cargo_version
+    print(
+        "error: pyproject.toml must declare project.version or dynamic = [\"version\"].",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def load_pypi_credentials(token_env: str) -> tuple[str | None, str | None]:
@@ -199,11 +213,11 @@ def cargo_publish(
     token: str | None,
     ignore_errors: bool,
     timeout_s: int,
-) -> bool:
+) -> str:
     crate_name, crate_version = manifest_package(manifest)
     if publish and crate_version_exists(crate_name, crate_version):
         print(f"\n{crate_name} v{crate_version} is already on crates.io; skipping upload.")
-        return True
+        return PUBLISH_ALREADY_EXISTS
 
     cmd = ["cargo", "publish", "--manifest-path", str(manifest)]
     if not publish:
@@ -214,22 +228,22 @@ def cargo_publish(
         cmd.extend(["--token", token])
     if not publish:
         run(cmd, env=cargo_env())
-        return True
+        return PUBLISH_DRY_RUN_OK
 
     result = run_optional(cmd, env=cargo_env(), timeout_s=timeout_s)
     print(result.stdout, end="")
     if result.returncode == 0:
-        return True
+        return PUBLISH_PUBLISHED
     if is_already_published_output(result.stdout):
         print(f"\n{crate_name} v{crate_version} was already published; continuing.")
-        return True
+        return PUBLISH_ALREADY_EXISTS
     if ignore_errors:
         print(
             f"\nwarning: cargo publish failed for {crate_name} v{crate_version}; "
             "continuing because --ignore-publish-errors was passed.",
             file=sys.stderr,
         )
-        return False
+        return PUBLISH_FAILED
     raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
 
 
@@ -511,13 +525,13 @@ def is_already_published_output(output: str) -> bool:
     )
 
 
-def wait_for_index(crate_name: str, version: str, timeout_s: int, interval_s: int) -> None:
+def wait_for_index(crate_name: str, version: str, timeout_s: int, interval_s: int) -> bool:
     deadline = time.monotonic() + timeout_s
     print(f"\nWaiting for crates.io index to expose {crate_name} v{version}...")
     while time.monotonic() < deadline:
         if crate_version_exists(crate_name, version):
             print(f"crates.io index can see {crate_name} v{version}; continuing.")
-            return
+            return True
         print(f"{crate_name} not visible yet; sleeping {interval_s}s...")
         time.sleep(interval_s)
     print(
@@ -525,7 +539,7 @@ def wait_for_index(crate_name: str, version: str, timeout_s: int, interval_s: in
         "Retry the main crate publish after the index catches up.",
         file=sys.stderr,
     )
-    sys.exit(1)
+    return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -739,7 +753,7 @@ def main() -> int:
         if not args.skip_package:
             cargo_package(MACROS_MANIFEST, allow_dirty=args.allow_dirty)
 
-        macro_publish_ok = cargo_publish(
+        macro_publish_status = cargo_publish(
             MACROS_MANIFEST,
             publish=args.publish,
             allow_dirty=args.allow_dirty,
@@ -748,12 +762,26 @@ def main() -> int:
             timeout_s=args.publish_timeout,
         )
 
-        if args.publish and macro_publish_ok:
-            wait_for_index(
+        if args.publish and macro_publish_status == PUBLISH_PUBLISHED:
+            index_ready = wait_for_index(
                 macro_name,
                 macro_version,
                 timeout_s=args.index_timeout,
                 interval_s=args.index_interval,
+            )
+            if not index_ready:
+                if args.ignore_publish_errors:
+                    print(
+                        f"\nwarning: skipping {main_name} publish because {macro_name} "
+                        "is not visible in the crates.io index yet.",
+                        file=sys.stderr,
+                    )
+                    return 0
+                return 1
+        elif args.publish and macro_publish_status == PUBLISH_ALREADY_EXISTS:
+            print(
+                f"\n{macro_name} v{macro_version} is already published; "
+                "skipping crates.io index wait."
             )
         elif args.publish:
             print(
@@ -776,7 +804,7 @@ def main() -> int:
             if not args.skip_package:
                 cargo_package(MAIN_MANIFEST, allow_dirty=args.allow_dirty)
 
-            cargo_publish(
+            main_publish_status = cargo_publish(
                 MAIN_MANIFEST,
                 publish=args.publish,
                 allow_dirty=args.allow_dirty,
@@ -786,9 +814,18 @@ def main() -> int:
             )
 
             if args.publish:
-                print(
-                    f"\nPublished {macro_name} v{macro_version} and {main_name} v{main_version}."
-                )
+                if main_publish_status == PUBLISH_PUBLISHED:
+                    print(
+                        f"\nPublished {macro_name} v{macro_version} and "
+                        f"{main_name} v{main_version}."
+                    )
+                elif main_publish_status == PUBLISH_ALREADY_EXISTS:
+                    print(f"\n{main_name} v{main_version} is already published.")
+                else:
+                    print(
+                        f"\n{main_name} v{main_version} was not uploaded; "
+                        "continuing because --ignore-publish-errors was passed."
+                    )
 
     if args.docker_all_wheels:
         args.docker_wheels = True

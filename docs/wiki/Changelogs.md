@@ -1,5 +1,17 @@
 # Changelogs
 
+## Version 4.0.2 highlights
+
+- Release metadata:
+    - `pyproject.toml` now uses maturin dynamic version metadata, so the Python package version is
+      read from the root Cargo package version.
+- Release automation:
+    - `publish_crates.py` now distinguishes newly-published crates from already-existing crates.
+    - Already-published macro crate versions skip the crates.io index wait path, avoiding release
+      job failures when a retry sees `sedsnet_macros` already uploaded.
+    - When `--ignore-publish-errors` is passed, crates.io index lag after a successful macro upload
+      is reported as a warning instead of failing the release pipeline.
+
 ## Version 4.0.1 highlights
 
 - Runtime configurability:
