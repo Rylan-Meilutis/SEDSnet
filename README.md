@@ -116,6 +116,15 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
 
 ## Recent changelog milestones
 
+## Version 4.0.1 highlights
+
+- Prebuilt/host packages can configure active device identity, runtime tuning, time sync, address
+  assignment, and memory budgets without rebuilding the crate.
+- C and Python bindings now expose the runtime tuning, default device identifier, memory, and
+  router address APIs documented for v4.
+- Added router and relay regression tests that stress small runtime memory budgets and assert
+  memory-layout exports stay within the configured shared queue budget.
+
 ## Version 4.0.0 highlights
 
 - User telemetry schema is now runtime-only. `build.rs` no longer generates Rust enum variants or

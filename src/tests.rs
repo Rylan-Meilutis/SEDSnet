@@ -10868,6 +10868,91 @@ mod router_tests {
         }
 
         #[test]
+        fn router_runtime_memory_budget_caps_queued_state() {
+            crate::tests::ensure_common_test_schema();
+            let ep = DataEndpoint::named("RADIO");
+            let memory = crate::config::RuntimeMemoryConfig::new(8192, 8, 512, 1.5).unwrap();
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                    .with_memory_config(memory)
+                    .unwrap(),
+                zero_clock(),
+            );
+            router.add_side_packed("budget-link", |_bytes| Ok(()));
+
+            for idx in 0..300u64 {
+                router
+                    .log_queue_ts(
+                        DataType::named("GPS_DATA"),
+                        idx,
+                        &[idx as f32, 2.0_f32, 3.0_f32],
+                    )
+                    .unwrap();
+                let pkt = Packet::from_f32_slice(
+                    DataType::named("GPS_DATA"),
+                    &[9.0_f32, 8.0_f32, idx as f32],
+                    &[DataEndpoint::named("SD_CARD")],
+                    idx + 10_000,
+                )
+                .unwrap();
+                router.rx_queue(pkt).unwrap();
+            }
+
+            let json: serde_json::Value =
+                serde_json::from_str(&router.export_memory_layout_json()).unwrap();
+            let used = json["shared_queue_bytes_used"].as_u64().unwrap();
+            let allocated = json["shared_queue_bytes_allocated"].as_u64().unwrap();
+            assert_eq!(allocated, 8192);
+            assert!(
+                used <= allocated,
+                "router queued state exceeded runtime memory budget: used={used} allocated={allocated}"
+            );
+            assert!(router.debug_shared_queue_bytes_used() <= 8192);
+            assert!(
+                json["rx_queue_len"].as_u64().unwrap() + json["tx_queue_len"].as_u64().unwrap()
+                    < 600,
+                "low budget should evict older queued work instead of growing without bound"
+            );
+        }
+
+        #[test]
+        fn relay_runtime_memory_budget_caps_queued_state() {
+            crate::tests::ensure_common_test_schema();
+            let memory = crate::config::RuntimeMemoryConfig::new(8192, 8, 512, 1.5).unwrap();
+            let relay_cfg = crate::relay::RelayConfig::default()
+                .with_memory_config(memory)
+                .unwrap();
+            let relay = Relay::new_with_config(relay_cfg, zero_clock());
+            let side_a = relay.add_side_packet("A", |_pkt| Ok(()));
+            relay.add_side_packet("B", |_pkt| Ok(()));
+
+            for idx in 0..400u64 {
+                let pkt = Packet::from_f32_slice(
+                    DataType::named("GPS_DATA"),
+                    &[idx as f32, 4.0_f32, 5.0_f32],
+                    &[DataEndpoint::named("RADIO")],
+                    idx,
+                )
+                .unwrap();
+                relay.rx_from_side(side_a, pkt).unwrap();
+            }
+
+            let json: serde_json::Value =
+                serde_json::from_str(&relay.export_memory_layout_json()).unwrap();
+            let used = json["shared_queue_bytes_used"].as_u64().unwrap();
+            let allocated = json["shared_queue_bytes_allocated"].as_u64().unwrap();
+            assert_eq!(allocated, 8192);
+            assert!(
+                used <= allocated,
+                "relay queued state exceeded runtime memory budget: used={used} allocated={allocated}"
+            );
+            assert!(
+                json["rx_queue_len"].as_u64().unwrap() < 400,
+                "low budget should evict older relay RX work instead of growing without bound"
+            );
+        }
+
+        #[test]
         fn required_e2e_type_rejects_tx_without_crypto_support() {
             #[cfg(feature = "cryptography")]
             let _crypto_guard = crypto_test_guard();

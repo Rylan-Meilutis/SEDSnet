@@ -1,5 +1,24 @@
 # Changelogs
 
+## Version 4.0.1 highlights
+
+- Runtime configurability:
+    - Device identity, compression threshold, static string/binary sizing, float string precision,
+      handler retries, reliable retransmit timing, and reliable cache limits can be changed through
+      Rust, C, and Python APIs after using a prebuilt package.
+    - Router address assignment can be changed at runtime across bindings with dynamic, requested,
+      and static address modes.
+    - Build-time values are now documented as packaged defaults. `MAX_STACK_PAYLOAD` remains the
+      compile-time inline payload capacity because it changes type layout.
+- Binding and release polish:
+    - The checked-in C ABI header and Python `.pyi` include the runtime memory, tuning, default
+      device identifier, and router address APIs.
+    - README and wiki usage pages were updated for the v4.0.1 release path.
+- Memory-budget validation:
+    - Added router and relay regression tests that use small runtime memory budgets, queue enough
+      work to force eviction, and assert exported memory usage stays within the configured shared
+      queue budget.
+
 ## Version 4.0.0 highlights
 
 - Migration-safe wire contract:

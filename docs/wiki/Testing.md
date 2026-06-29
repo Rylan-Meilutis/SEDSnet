@@ -64,6 +64,8 @@ They exercise multi-node flows that are awkward to validate in a single unit tes
   that each modeled board converges to an accurate clock and that slow links are not monopolized by
   time-sync traffic
 - compression and memory-pool behavior
+- runtime router/relay memory-budget enforcement, including exported memory-layout checks that
+  queued state stays within the configured shared queue budget under pressure
 
 These tests validate behavior closer to how the crate is actually embedded into larger systems.
 

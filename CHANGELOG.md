@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.0.1
+
+- Made the remaining prebuilt/host tuning knobs runtime configurable across Rust, C, and Python:
+  device identifier, compression threshold, static string/binary sizing, float string precision,
+  handler retries, reliable retransmit timing, and reliable cache limits.
+- Added runtime router address configuration across bindings, including dynamic, requested, and
+  static address modes for discovery-backed P2P routing.
+- Updated the checked-in C ABI header and Python type stub so packaged users see the new runtime
+  memory, tuning, device identity, and address APIs.
+- Added router and relay regression tests that stress small runtime memory budgets and assert the
+  exported memory-layout usage never exceeds the configured shared queue budget.
+- Updated README and wiki docs for the v4.0.1 release, clarifying that build-time values are
+  packaged defaults while runtime APIs configure active nodes. `MAX_STACK_PAYLOAD` remains the
+  compile-time inline payload capacity because it changes type layout.
+
 ## 4.0.0
 
 - Removed compile-time user schema generation. `build.rs` no longer turns
