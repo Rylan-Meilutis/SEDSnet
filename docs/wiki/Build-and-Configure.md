@@ -108,6 +108,11 @@ regressions:
 - end-to-end reliable verification and directed ACK return-path routing
 - time-sync election, failover, and multi-node convergence
 
+`src/tests.rs` also includes a combined multi-node memory exhaustion regression. It constructs
+multiple routers with small `RuntimeMemoryConfig` pools, injects large discovery topology updates,
+queues telemetry RX/TX work, and asserts each router's exported memory layout remains within its
+configured shared queue budget throughout the pressure run.
+
 This repo does not currently publish or gate on a single required coverage percentage in `build.py test`. Coverage is
 tracked primarily through regression tests across unit, Rust system, and C system layers. If you want a local
 percentage/HTML report, use `cargo-llvm-cov`:

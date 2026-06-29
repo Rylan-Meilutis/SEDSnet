@@ -38,6 +38,8 @@ They cover:
 - network-variable getter/setter permissions, tiered cache refresh, and update callbacks
 - topology graph export, control-endpoint filtering, leave-announcement pruning, client stats, and
   memory-layout snapshots
+- combined multi-node memory exhaustion with small runtime pools, heavy discovery topology updates,
+  and telemetry RX/TX pressure, asserting exported memory usage stays within each configured pool
 - fixed-size packed side splitting/reassembly and side-local header-template compaction
 - E2E payload cryptography policies, software fallback crypto, multi-holder encrypted fanout, and
   tamper rejection
