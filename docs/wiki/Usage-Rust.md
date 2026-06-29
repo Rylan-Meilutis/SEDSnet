@@ -73,7 +73,7 @@ On `std` builds, `Router::new(...)` uses an internal monotonic clock. For tests,
 ## Runtime schema
 
 User endpoints and data types are registered at runtime. There are no generated Rust variants for
-application schema entries in v4.0.0.
+application schema entries in v4.
 
 Common options:
 
@@ -88,6 +88,85 @@ Common options:
 Registering an endpoint handler for a missing endpoint auto-creates that endpoint in `std` builds
 and broadcasts the new schema through discovery. Registering a data type or endpoint with the same
 name/ID and a different shape returns an error.
+
+## Runtime Configuration
+
+Build-time environment values are packaged defaults. Host applications and prebuilt deployments can
+change the active device identity, tuning limits, router/relay memory budgets, address assignment,
+and time-sync role at runtime.
+
+Process-wide defaults:
+
+```rust
+use sedsnet::config::{
+    runtime_tuning_config, set_runtime_device_identifier, set_runtime_tuning_config,
+};
+
+set_runtime_device_identifier("GROUND_STATION")?;
+
+let mut tuning = runtime_tuning_config();
+tuning.payload_compress_threshold = 24;
+tuning.static_string_length = 512;
+tuning.static_hex_length = 512;
+tuning.string_precision = 6;
+tuning.max_handler_retries = 4;
+tuning.reliable_retransmit_ms = 300;
+tuning.reliable_max_retries = 10;
+tuning.reliable_max_pending = 96;
+tuning.reliable_max_return_routes = 96;
+tuning.reliable_max_end_to_end_pending = 96;
+tuning.reliable_max_end_to_end_ack_cache = 256;
+set_runtime_tuning_config(tuning)?;
+```
+
+Per-router and per-relay memory/identity settings:
+
+```rust
+use sedsnet::config::{DataEndpoint, RuntimeMemoryConfig};
+use sedsnet::relay::{Relay, RelayConfig};
+use sedsnet::router::{AddressAssignmentMode, EndpointHandler, Router, RouterConfig};
+use sedsnet::timesync::{TimeSyncConfig, TimeSyncRole};
+use sedsnet::TelemetryResult;
+
+fn build_node() -> TelemetryResult<()> {
+    let memory = RuntimeMemoryConfig::new(
+        65_536, // shared queue budget
+        256,    // recent packet IDs
+        512,    // starting queue allocation
+        2.0,    // growth step
+    )?;
+
+    let handler = EndpointHandler::new_packet_handler(DataEndpoint::named("RADIO"), |_pkt| Ok(()));
+    let router_cfg = RouterConfig::new([handler])
+        .with_hostname("FC26_MAIN")
+        .with_static_address(0x1020_3040)
+        .with_timesync(TimeSyncConfig {
+            role: TimeSyncRole::Auto,
+            priority: 100,
+            ..TimeSyncConfig::default()
+        })
+        .with_memory_config(memory)?;
+    let router = Router::new(router_cfg);
+
+    router.set_timesync_config(Some(TimeSyncConfig {
+        role: TimeSyncRole::Source,
+        priority: 10,
+        ..TimeSyncConfig::default()
+    }));
+    router.set_address_assignment(AddressAssignmentMode::Requested(0x1020_3041))?;
+
+    let relay_cfg = RelayConfig::default()
+        .with_sender("RF_RELAY")
+        .with_memory_config(memory)?;
+    let relay = Relay::new_with_config(relay_cfg, Box::new(|| 0));
+    let _ = (router, relay);
+    Ok(())
+}
+```
+
+`MAX_STACK_PAYLOAD` is the exception: it is a compiled inline payload capacity because it changes a
+type layout. Runtime tuning can reduce active static string/binary sizes and reliability limits, but
+it cannot enlarge that inline stack capacity after compilation.
 
 ## Network Variables and E2E Payloads
 
@@ -390,11 +469,13 @@ For relays, nested `process_tx_queue*` / `process_all_queues*` calls made from i
 callback are intentionally turned into no-ops so a side callback cannot recursively drive relay TX
 on the same stack.
 
-Router and relay queue-backed state shares the compile-time `MAX_QUEUE_BUDGET` dynamically.
-That includes RX work, TX work, recent packet IDs, reliable buffers/replay state, and discovery
-topology. Recent packet ID caches preallocate their final storage and reserve that byte cost
-immediately. If the remaining budget is exhausted, older queued state is evicted; discovery
-topology eviction emits a warning in `std` builds.
+Router and relay queue-backed state shares one active memory budget per instance. The packaged
+`MAX_QUEUE_BUDGET` is only the default; use `RuntimeMemoryConfig` with
+`RouterConfig::with_memory_config(...)` or `RelayConfig::with_memory_config(...)` to set the active
+budget at runtime. RX work, TX work, recent packet IDs, reliable buffers/replay state, and discovery
+topology all draw from that budget. Recent packet ID caches preallocate their final storage and
+reserve that byte cost immediately. If the remaining budget is exhausted, older queued state is
+evicted; discovery topology eviction emits a warning in `std` builds.
 
 Use `router.export_memory_layout_json()` or `relay.export_memory_layout_json()` when profiling a
 running node. The JSON reports shared allocated/used bytes plus per-area used/allocated bytes for

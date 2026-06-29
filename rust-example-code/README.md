@@ -10,6 +10,8 @@ or copy the snippets as needed.
 
 Additional example files in this folder:
 
+- `runtime_config_example.rs`: runtime device identity, tuning, memory budget, time-sync role,
+  address assignment, and relay/router config.
 - `load_balancing_example.rs`: weighted split and failover route selection.
 - `typed_routing_example.rs`: route one packet type through two dedicated sides without load balancing.
 - `relay_example.rs`: basic relay side wiring.
