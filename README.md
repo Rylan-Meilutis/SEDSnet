@@ -287,8 +287,8 @@ Options:
   embedded                Build for the embedded target (enables embedded feature).
   python                  Build with Python bindings (enables python feature).
   timesync                Build with time sync helpers (enables timesync feature).
-  maturin-build           Run maturin build while including the static .pyi stub.
-  maturin-develop         Run maturin develop while including the static .pyi stub.
+  maturin-build           Run maturin build.
+  maturin-develop         Run maturin develop.
   maturin-install         Build wheel and install it with uv pip install.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
   device_id=<id>          Set the packaged DEVICE_IDENTIFIER default for the build.
@@ -346,6 +346,8 @@ cargo bench --bench packet_paths -- --profile-time=5
 - `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
 - a stable Criterion smoke pass for `packet_paths` and `router_system_paths`
 - a `cargo build` validation for the `python` feature
+- Python unittest coverage for the current bindings, topology export, config editor, and manual
+  system-suite scenario
 - a `cargo build` validation for the `embedded` feature when a matching cross C toolchain is available
 
 The benchmark smoke pass uses Cargo `--profile release`, saves into a dedicated `sedsnet_smoke` baseline, disables

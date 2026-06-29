@@ -55,8 +55,8 @@ and testing rules, and how to submit changes.
 
 - Primary route: `python3 build.py test`.
   This runs strict clippy checks, Rust unit/integration tests, C system tests through the Rust
-  harness, doctests, benchmark smoke tests, the Python feature build, and embedded build validation
-  when the cross target/toolchain is available.
+  harness, doctests, benchmark smoke tests, the Python feature build, Python unittest coverage,
+  and embedded build validation when the cross target/toolchain is available.
 - Full long-duration route: `python3 build.py test full`.
   Use this before releases or when changing routing, time sync, reliability, memory budgeting, or
   scheduler behavior.
@@ -64,6 +64,8 @@ and testing rules, and how to submit changes.
     - Build/check the Python feature with `python3 build.py python` or `cargo build --features python,timesync`.
     - For local Python package testing, use `python3 build.py maturin-develop` inside a virtualenv,
       then run relevant scripts/tests under `python-example/` or Python-specific tests.
+    - `python-example/test.py` runs the manual Python system suite that exercises runtime schema,
+      discovery, P2P, routing, side replacement, network variables, and memory-budget reporting.
     - For wheel checks, use `python3 build.py maturin-build` or the release helper documented in
       `docs/wiki/Release-Checklist.md`.
 - C ABI and C wrapper tests:

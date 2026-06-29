@@ -7,7 +7,7 @@ from queue import Empty
 
 import sedsnet as seds
 
-DT = seds.DataType
+from schema_helpers import ensure_example_schema
 
 
 def _now_ms() -> int:
@@ -27,15 +27,18 @@ def _on_packed(data: bytes):
 
 
 def router_server(cmd_q: mp.Queue, pump_period_ms: int = 2, max_total_seconds: float = 10.0):
-    radio = seds.endpoint_info_by_name("RADIO")["id"]
-    sd_card = seds.endpoint_info_by_name("SD_CARD")["id"]
+    ids = ensure_example_schema()
     router = seds.Router(
         now_ms=_now_ms,
         handlers=[
-            (sd_card, _on_packet, None),
-            (radio, None, _on_packed),
+            (ids["SD_CARD"], _on_packet, None),
+            (ids["RADIO"], None, _on_packed),
         ],
+        hostname="python-router-server",
+        address_mode=1,
+        requested_address=0x10203040,
         timesync_enabled=True,
+        max_queue_budget=65536,
     )
     router.add_side_packed("TX", _tx, reliable_enabled=True)
     router.set_local_network_datetime_millis(2025, 1, 1, 12, 0, 0, 0)
@@ -67,12 +70,13 @@ def router_server(cmd_q: mp.Queue, pump_period_ms: int = 2, max_total_seconds: f
 
 
 def producer_proc(name: str, cmd_q: mp.Queue, n_iters: int, seed: int):
+    ids = ensure_example_schema()
     random.seed(seed)
     for i in range(n_iters):
         if random.randint(0, 1) == 0:
-            cmd_q.put(("log_f32", {"ty": int(DT.GPS_DATA), "values": [float(i), 10.0, 20.0]}))
+            cmd_q.put(("log_f32", {"ty": ids["GPS_DATA"], "values": [float(i), 10.0, 20.0]}))
         else:
-            cmd_q.put(("log_bytes", {"ty": int(DT.MESSAGE_DATA), "data": f"{name} iteration {i}".encode()}))
+            cmd_q.put(("log_bytes", {"ty": ids["MESSAGE_DATA"], "data": f"{name} iteration {i}".encode()}))
         time.sleep(random.random() * 0.01)
 
 

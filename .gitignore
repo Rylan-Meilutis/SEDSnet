@@ -14,10 +14,8 @@ c-system-test/build/
 
 c-example-code/build/
 
-python-files/sedsnet/sedsnet.pyi
-
 *.so
-*.pyi
+python-files/sedsnet/sedsprintf_rs.pyi
 /sedsnet_macros/target/
 /sedsnet_macros/Cargo.lock
 

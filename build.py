@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import shutil
 import stat
 import subprocess
 import sys
@@ -17,10 +16,6 @@ from base64 import b64encode
 from getpass import getpass
 from pathlib import Path
 
-# The line pattern in .gitignore we want to temporarily comment out.
-# This is treated as a literal and turned into a whole-line regex.
-PYI_IGNORE_LINE = "python-files/sedsnet/sedsnet.pyi"
-PYI_IGNORE_REGEX = re.compile(rf"^{re.escape(PYI_IGNORE_LINE)}$")
 RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
@@ -37,15 +32,15 @@ def print_help(error: str | None = None) -> None:
 Options (can be combined where it makes sense):
   release                 Build in release mode.
   check                   Run `cargo clippy` for default, python, and embedded feature variants with `-D warnings`.
-  test                    Run Rust tests, a stable Criterion benchmark smoke pass, and validate python +
-  embedded build if cross C toolchain exists.
+  test                    Run Rust tests, benchmark smoke, Python unittests, and validate python +
+  embedded builds when the cross C toolchain exists.
   full                    With `test`, also run long-duration Rust tests marked `#[ignore]`.
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
   cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
-  maturin-build           Run `maturin build` while including the static .pyi stub.
-  maturin-develop         Run `maturin develop` while including the static .pyi stub.
+  maturin-build           Run `maturin build`.
+  maturin-develop         Run `maturin develop`.
   maturin-install         Build wheel and install it with `uv pip install`.
   maturin-login           Validate and store PyPI upload credentials in .sedsnet-release.toml.
   target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
@@ -705,90 +700,8 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
     )
 
 
-def _comment_out_pyi_ignore(gitignore: Path) -> None:
-    if not gitignore.exists():
-        return
-
-    text = gitignore.read_text(encoding="utf-8").splitlines(keepends=True)
-    new_lines = []
-    changed = False
-    matched_lines = []
-
-    for line in text:
-        stripped = line.strip()
-
-        if stripped.startswith("#"):
-            new_lines.append(line)
-            continue
-
-        if PYI_IGNORE_REGEX.fullmatch(stripped):
-            commented = "# " + line.lstrip()
-            new_lines.append(commented)
-            matched_lines.append(stripped)
-            changed = True
-        else:
-            new_lines.append(line)
-
-    if changed:
-        print(f"info: Commented out in .gitignore: {matched_lines}")
-        gitignore.write_text("".join(new_lines), encoding="utf-8")
-
-
-def run_with_pyi_unignored(
-        cmd: list[str],
-        *,
-        env: dict[str, str],
-        repo_root: Path,
-        title: str | None = None,
-) -> None:
-    gitignore = Path(".gitignore")
-    backup = None
-
-    if title:
-        _banner(title)
-    else:
-        _banner("Running: " + " ".join(cmd))
-
-    hint = output_hint_for_cmd(cmd, repo_root=repo_root)
-    if hint:
-        print(f"info: {hint}")
-
-    t0 = time.monotonic()
-    try:
-        if gitignore.exists():
-            backup = gitignore.with_name(".gitignore.maturin-backup")
-            shutil.copy2(gitignore, backup)
-
-            print(f"info: Temporarily commenting out pattern '{PYI_IGNORE_LINE}' in .gitignore")
-            _comment_out_pyi_ignore(gitignore)
-
-        print("Running:", " ".join(cmd))
-        subprocess.run(cmd, check=True, env=env)
-    except FileNotFoundError as e:
-        _fail(f"Command not found: {e.filename}")
-        _fail(f"While running: {_format_cmd(cmd)}")
-        raise SystemExit(127) from e
-    except PermissionError as e:
-        _fail(f"Permission denied when running command: {e}")
-        _fail(f"While running: {_format_cmd(cmd)}")
-        raise SystemExit(1) from e
-
-    except subprocess.CalledProcessError as e:
-        dt = time.monotonic() - t0
-        _fail(f"FAILED ({_fmt_secs(dt)}): {' '.join(cmd)}")
-        raise SystemExit(e.returncode) from e
-
-    finally:
-        if backup and backup.exists():
-            print("info: Restoring original .gitignore")
-            shutil.move(backup, gitignore)
-
-    dt = time.monotonic() - t0
-    _success(f"OK ({_fmt_secs(dt)}): {' '.join(cmd)}")
-
-
 def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root: Path) -> None:
-    run_with_pyi_unignored(
+    run_cmd(
         ["maturin", "build", *build_mode],
         env=env,
         repo_root=repo_root,
@@ -1141,7 +1054,7 @@ def main(argv: list[str]) -> None:
                 "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
-        total_steps = 7 if can_check_embedded else 6
+        total_steps = 8 if can_check_embedded else 7
 
         run_clippy_checks(
             env=env,
@@ -1196,6 +1109,23 @@ def main(argv: list[str]) -> None:
             target=target,
             profile="release" if release_build else "debug",
         )
+        next_step += 1
+
+        run_cmd(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "tests/test_python_current_api.py",
+                "tests/test_python_topology_export.py",
+                "tests/test_python_system_suite.py",
+                "tests/test_telemetry_config_editor.py",
+            ],
+            env=env,
+            repo_root=repo_root,
+            title=f"{next_step}/{total_steps} python unittest",
+        )
+        _success("Python unittest checks finished.")
         next_step += 1
 
         if can_check_embedded:
@@ -1325,7 +1255,7 @@ def main(argv: list[str]) -> None:
         return
 
     if build_wheel:
-        run_with_pyi_unignored(
+        run_cmd(
             ["maturin", "build", *build_mode],
             env=env,
             repo_root=repo_root,
@@ -1335,7 +1265,7 @@ def main(argv: list[str]) -> None:
         return
 
     if develop_wheel:
-        run_with_pyi_unignored(
+        run_cmd(
             ["maturin", "develop", *build_mode],
             env=env,
             repo_root=repo_root,
