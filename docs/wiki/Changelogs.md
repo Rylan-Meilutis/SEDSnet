@@ -11,6 +11,10 @@
       job failures when a retry sees `sedsnet_macros` already uploaded.
     - When `--ignore-publish-errors` is passed, crates.io index lag after a successful macro upload
       is reported as a warning instead of failing the release pipeline.
+- Test coverage:
+    - Added a combined multi-node memory exhaustion regression that gives each router a small
+      runtime pool, injects large discovery topology updates, queues heavy telemetry RX/TX work, and
+      asserts exported memory usage remains within the configured pool throughout the pressure run.
 
 ## Version 4.0.1 highlights
 

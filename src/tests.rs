@@ -6138,7 +6138,7 @@ mod router_tests {
 
         use crate::config::{
             MAX_HANDLER_RETRIES, RELIABLE_MAX_END_TO_END_ACK_CACHE,
-            RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_RETURN_ROUTES,
+            RELIABLE_MAX_END_TO_END_PENDING, RELIABLE_MAX_RETURN_ROUTES, RuntimeMemoryConfig,
             register_data_type_id_with_description_and_e2e_encryption,
             register_data_type_with_description, register_endpoint_with_description,
             remove_data_type, remove_data_type_by_name, remove_endpoint_by_name,
@@ -7341,6 +7341,122 @@ mod router_tests {
                 router.debug_shared_queue_bytes_used() <= crate::config::MAX_QUEUE_BUDGET,
                 "discovery topology state must be part of the shared queue budget"
             );
+        }
+
+        #[test]
+        fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
+            ensure_topology_test_schema();
+            let budget = 24 * 1024usize;
+            let memory = RuntimeMemoryConfig::new(budget, 16, 512, 1.5).unwrap();
+            let ep = DataEndpoint::named("RADIO");
+            let mut nodes = Vec::new();
+            let mut max_discovery_seen = Vec::new();
+
+            for idx in 0..6usize {
+                let cfg =
+                    RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
+                        .with_hostname(format!("MEM_NODE_{idx}"))
+                        .with_memory_config(memory)
+                        .unwrap();
+                let router = Router::new_with_clock(cfg, zero_clock());
+                let side = router.add_side_packed("mesh", |_bytes| Ok(()));
+                nodes.push((format!("node-{idx}"), router, side));
+                max_discovery_seen.push(0u64);
+            }
+
+            fn assert_pool(label: &str, router: &Router, budget: usize, queued_inputs: u64) {
+                let json: serde_json::Value =
+                    serde_json::from_str(&router.export_memory_layout_json()).unwrap();
+                let used = json["shared_queue_bytes_used"].as_u64().unwrap();
+                let allocated = json["shared_queue_bytes_allocated"].as_u64().unwrap();
+                assert_eq!(
+                    allocated, budget as u64,
+                    "{label}: runtime memory pool changed unexpectedly"
+                );
+                assert!(
+                    used <= allocated,
+                    "{label}: shared queue budget exceeded: used={used} allocated={allocated} layout={json}"
+                );
+                assert!(
+                    json["discovery_bytes_used"].as_u64().unwrap() <= allocated,
+                    "{label}: discovery state exceeded pool: layout={json}"
+                );
+                assert!(
+                    json["rx_queue_bytes_used"].as_u64().unwrap()
+                        + json["tx_queue_bytes_used"].as_u64().unwrap()
+                        <= allocated,
+                    "{label}: queued packet state exceeded pool: layout={json}"
+                );
+
+                if queued_inputs > 128 {
+                    let retained = json["rx_queue_len"].as_u64().unwrap()
+                        + json["tx_queue_len"].as_u64().unwrap();
+                    assert!(
+                        retained < queued_inputs,
+                        "{label}: low memory pool did not evict queued work: retained={retained} inputs={queued_inputs} layout={json}"
+                    );
+                }
+            }
+
+            fn discovery_bytes(router: &Router) -> u64 {
+                let json: serde_json::Value =
+                    serde_json::from_str(&router.export_memory_layout_json()).unwrap();
+                json["discovery_bytes_used"].as_u64().unwrap()
+            }
+
+            let mut queued_inputs = 0u64;
+            for round in 0..180u64 {
+                let topology = (0..4)
+                    .map(|slot| TopologyBoardNode {
+                        sender_id: format!(
+                            "REMOTE_{round}_{slot}_{}",
+                            "n".repeat(48 + (slot * 8) as usize)
+                        ),
+                        reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                        reachable_timesync_sources: vec![format!(
+                            "TIME_{round}_{slot}_{}",
+                            "t".repeat(32)
+                        )],
+                        connections: vec![format!("LINK_{round}_{slot}_{}", "c".repeat(64))],
+                    })
+                    .collect::<Vec<_>>();
+                let topology_pkt =
+                    build_discovery_topology(&format!("DISCOVERY_SRC_{round}"), round, &topology)
+                        .unwrap();
+
+                for (idx, (label, router, side)) in nodes.iter().enumerate() {
+                    router.rx_from_side(&topology_pkt, *side).unwrap();
+                    max_discovery_seen[idx] = max_discovery_seen[idx].max(discovery_bytes(router));
+                    router
+                        .log_queue_ts(
+                            DataType::named("GPS_DATA"),
+                            round * 10 + idx as u64,
+                            &[round as f32, idx as f32, (round + idx as u64) as f32],
+                        )
+                        .unwrap();
+                    let pkt = Packet::from_f32_slice(
+                        DataType::named("GPS_DATA"),
+                        &[idx as f32, round as f32, 42.0],
+                        &[DataEndpoint::named("RADIO")],
+                        10_000 + round * 10 + idx as u64,
+                    )
+                    .unwrap();
+                    router.rx_queue(pkt).unwrap();
+                    queued_inputs += 2;
+
+                    if round % 15 == 0 {
+                        assert_pool(label, router, budget, queued_inputs);
+                    }
+                }
+            }
+
+            for (idx, (label, router, _side)) in nodes.iter().enumerate() {
+                assert_pool(label, router, budget, queued_inputs);
+                assert!(
+                    max_discovery_seen[idx] > 0,
+                    "{label}: pressure test did not add any discovered node state"
+                );
+            }
         }
 
         #[test]

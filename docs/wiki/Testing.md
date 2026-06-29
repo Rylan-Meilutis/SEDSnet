@@ -38,6 +38,8 @@ They cover:
 - network-variable getter/setter permissions, tiered cache refresh, and update callbacks
 - topology graph export, control-endpoint filtering, leave-announcement pruning, client stats, and
   memory-layout snapshots
+- combined multi-node memory exhaustion with small runtime pools, heavy discovery topology updates,
+  and telemetry RX/TX pressure, asserting exported memory usage stays within each configured pool
 - fixed-size packed side splitting/reassembly and side-local header-template compaction
 - E2E payload cryptography policies, software fallback crypto, multi-holder encrypted fanout, and
   tamper rejection
@@ -96,6 +98,23 @@ regressions in hot paths while still keeping the test command practical for loca
 runner saves into a dedicated `sedsnet_smoke` baseline, disables plots, uses a longer measurement
 window than the old fast smoke path, and applies a wider noise threshold so normal host variance
 does not show up as alternating regression/improvement noise against the default benchmark baseline.
+
+### Python binding tests
+
+After the Python-feature build, `./build.py test` runs the Python unittest layer with the same
+Python interpreter that launched `build.py`. This covers the current binding API, topology/runtime
+exports, config editor helpers, and the shared Python system-suite scenario.
+
+Run the manual Python system suite directly after installing the package into a virtualenv:
+
+```bash
+python3 build.py maturin-develop
+python3 python-example/test.py
+```
+
+The manual suite exercises runtime schema registration, discovery/address resolution, P2P by
+hostname and address, weighted route setup, side removal/replacement, network variables, packed
+frame output, and queue memory-budget reporting.
 
 ## Reliability coverage
 

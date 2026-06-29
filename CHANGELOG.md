@@ -7,6 +7,9 @@
 - Hardened `publish_crates.py` for crates.io release retries: an already-published macro crate no
   longer waits for delayed index propagation, and index lag after a successful macro upload can be
   treated as a non-fatal publish warning when `--ignore-publish-errors` is used.
+- Added a combined multi-node memory exhaustion regression that gives each router a small runtime
+  memory pool, injects large discovery topology updates, queues heavy telemetry RX/TX work, and
+  asserts exported memory usage never exceeds the configured pool.
 
 ## 4.0.1
 

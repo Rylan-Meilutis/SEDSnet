@@ -48,6 +48,10 @@ python-example/load_balancing_example.py ([source](https://github.com/Rylan-Meil
 python-example/typed_routing_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/typed_routing_example.py))
 -
 python-example/managed_variables_e2e_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/managed_variables_e2e_example.py))
+-
+python-example/p2p_service_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/p2p_service_example.py))
+-
+python-example/test.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/test.py))
 
 What it demonstrates:
 
@@ -56,6 +60,9 @@ What it demonstrates:
 - Looking up runtime schema names and using the returned IDs.
 - Type-specific routing to two dedicated command links without weighted or failover path selection.
 - Time sync announce/request/response and offset math.
+- P2P service delivery by hostname and assigned address.
+- A manual Python system suite covering runtime schema, discovery, route weights, side replacement,
+  P2P, network variables, and memory-budget reporting.
 - Managed-variable latest-value resync and E2E router/type policy settings.
 - Runtime tuning, device identifier, memory budget, time-sync role, and address configuration.
 
