@@ -9,13 +9,19 @@ use crate::{
     E2eEncryptionPolicy, EndpointMeta, MessageClass, MessageDataType, MessageElement, MessageMeta,
     ReliableMode, TelemetryError, TelemetryResult, parse_f64, parse_strings, parse_usize,
 };
-#[cfg(feature = "std")]
-use alloc::string::ToString;
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
+#[cfg(feature = "std")]
+use std::sync::RwLock;
 
 // -----------------------------------------------------------------------------
 // Device-/build-time constants
@@ -25,6 +31,45 @@ pub const DEVICE_IDENTIFIER: &str = match option_env!("DEVICE_IDENTIFIER") {
     Some(val) => parse_strings(val),
     None => "TEST_PLATFORM",
 };
+
+#[cfg(feature = "std")]
+static RUNTIME_DEVICE_IDENTIFIER: OnceLock<RwLock<String>> = OnceLock::new();
+
+pub fn runtime_device_identifier() -> String {
+    #[cfg(feature = "std")]
+    {
+        RUNTIME_DEVICE_IDENTIFIER
+            .get_or_init(|| RwLock::new(DEVICE_IDENTIFIER.to_string()))
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| DEVICE_IDENTIFIER.to_string())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        DEVICE_IDENTIFIER.to_string()
+    }
+}
+
+pub fn set_runtime_device_identifier(value: &str) -> TelemetryResult<()> {
+    if value.is_empty() {
+        return Err(TelemetryError::BadArg);
+    }
+    #[cfg(feature = "std")]
+    {
+        let lock =
+            RUNTIME_DEVICE_IDENTIFIER.get_or_init(|| RwLock::new(DEVICE_IDENTIFIER.to_string()));
+        let mut guard = lock
+            .write()
+            .map_err(|_| TelemetryError::Io("device id lock"))?;
+        *guard = value.to_string();
+        Ok(())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = value;
+        Err(TelemetryError::BadArg)
+    }
+}
 
 pub const MAX_RECENT_RX_IDS: usize = match option_env!("MAX_RECENT_RX_IDS") {
     Some(val) => parse_usize(val),
@@ -116,6 +161,230 @@ pub const RELIABLE_MAX_END_TO_END_ACK_CACHE: usize =
         Some(val) => parse_usize(val),
         None => MAX_RECENT_RX_IDS,
     };
+
+static RUNTIME_PAYLOAD_COMPRESS_THRESHOLD: AtomicUsize =
+    AtomicUsize::new(PAYLOAD_COMPRESS_THRESHOLD);
+static RUNTIME_STATIC_STRING_LENGTH: AtomicUsize = AtomicUsize::new(STATIC_STRING_LENGTH);
+static RUNTIME_STATIC_HEX_LENGTH: AtomicUsize = AtomicUsize::new(STATIC_HEX_LENGTH);
+static RUNTIME_STRING_PRECISION: AtomicUsize = AtomicUsize::new(STRING_PRECISION);
+static RUNTIME_MAX_HANDLER_RETRIES: AtomicUsize = AtomicUsize::new(MAX_HANDLER_RETRIES);
+static RUNTIME_RELIABLE_RETRANSMIT_MS: AtomicU32 = AtomicU32::new(RELIABLE_RETRANSMIT_MS as u32);
+static RUNTIME_RELIABLE_MAX_RETRIES: AtomicU32 = AtomicU32::new(RELIABLE_MAX_RETRIES);
+static RUNTIME_RELIABLE_MAX_PENDING: AtomicUsize = AtomicUsize::new(RELIABLE_MAX_PENDING);
+static RUNTIME_RELIABLE_MAX_RETURN_ROUTES: AtomicUsize =
+    AtomicUsize::new(RELIABLE_MAX_RETURN_ROUTES);
+static RUNTIME_RELIABLE_MAX_END_TO_END_PENDING: AtomicUsize =
+    AtomicUsize::new(RELIABLE_MAX_END_TO_END_PENDING);
+static RUNTIME_RELIABLE_MAX_END_TO_END_ACK_CACHE: AtomicUsize =
+    AtomicUsize::new(RELIABLE_MAX_END_TO_END_ACK_CACHE);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeTuningConfig {
+    pub payload_compress_threshold: usize,
+    pub static_string_length: usize,
+    pub static_hex_length: usize,
+    pub string_precision: usize,
+    pub max_handler_retries: usize,
+    pub reliable_retransmit_ms: u32,
+    pub reliable_max_retries: u32,
+    pub reliable_max_pending: usize,
+    pub reliable_max_return_routes: usize,
+    pub reliable_max_end_to_end_pending: usize,
+    pub reliable_max_end_to_end_ack_cache: usize,
+}
+
+impl Default for RuntimeTuningConfig {
+    fn default() -> Self {
+        Self {
+            payload_compress_threshold: PAYLOAD_COMPRESS_THRESHOLD,
+            static_string_length: STATIC_STRING_LENGTH,
+            static_hex_length: STATIC_HEX_LENGTH,
+            string_precision: STRING_PRECISION,
+            max_handler_retries: MAX_HANDLER_RETRIES,
+            reliable_retransmit_ms: RELIABLE_RETRANSMIT_MS as u32,
+            reliable_max_retries: RELIABLE_MAX_RETRIES,
+            reliable_max_pending: RELIABLE_MAX_PENDING,
+            reliable_max_return_routes: RELIABLE_MAX_RETURN_ROUTES,
+            reliable_max_end_to_end_pending: RELIABLE_MAX_END_TO_END_PENDING,
+            reliable_max_end_to_end_ack_cache: RELIABLE_MAX_END_TO_END_ACK_CACHE,
+        }
+    }
+}
+
+impl RuntimeTuningConfig {
+    pub fn validate(self) -> TelemetryResult<()> {
+        if self.static_string_length == 0
+            || self.static_hex_length == 0
+            || self.max_handler_retries == 0
+            || self.reliable_retransmit_ms == 0
+            || self.reliable_max_retries == 0
+            || self.reliable_max_pending == 0
+            || self.reliable_max_return_routes == 0
+            || self.reliable_max_end_to_end_pending == 0
+            || self.reliable_max_end_to_end_ack_cache == 0
+        {
+            return Err(TelemetryError::BadArg);
+        }
+        Ok(())
+    }
+}
+
+pub fn set_runtime_tuning_config(cfg: RuntimeTuningConfig) -> TelemetryResult<()> {
+    cfg.validate()?;
+    RUNTIME_PAYLOAD_COMPRESS_THRESHOLD.store(cfg.payload_compress_threshold, Ordering::Relaxed);
+    RUNTIME_STATIC_STRING_LENGTH.store(cfg.static_string_length, Ordering::Relaxed);
+    RUNTIME_STATIC_HEX_LENGTH.store(cfg.static_hex_length, Ordering::Relaxed);
+    RUNTIME_STRING_PRECISION.store(cfg.string_precision, Ordering::Relaxed);
+    RUNTIME_MAX_HANDLER_RETRIES.store(cfg.max_handler_retries, Ordering::Relaxed);
+    RUNTIME_RELIABLE_RETRANSMIT_MS.store(cfg.reliable_retransmit_ms, Ordering::Relaxed);
+    RUNTIME_RELIABLE_MAX_RETRIES.store(cfg.reliable_max_retries, Ordering::Relaxed);
+    RUNTIME_RELIABLE_MAX_PENDING.store(cfg.reliable_max_pending, Ordering::Relaxed);
+    RUNTIME_RELIABLE_MAX_RETURN_ROUTES.store(cfg.reliable_max_return_routes, Ordering::Relaxed);
+    RUNTIME_RELIABLE_MAX_END_TO_END_PENDING
+        .store(cfg.reliable_max_end_to_end_pending, Ordering::Relaxed);
+    RUNTIME_RELIABLE_MAX_END_TO_END_ACK_CACHE
+        .store(cfg.reliable_max_end_to_end_ack_cache, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn runtime_tuning_config() -> RuntimeTuningConfig {
+    RuntimeTuningConfig {
+        payload_compress_threshold: runtime_payload_compress_threshold(),
+        static_string_length: runtime_static_string_length(),
+        static_hex_length: runtime_static_hex_length(),
+        string_precision: runtime_string_precision(),
+        max_handler_retries: runtime_max_handler_retries(),
+        reliable_retransmit_ms: runtime_reliable_retransmit_ms() as u32,
+        reliable_max_retries: runtime_reliable_max_retries(),
+        reliable_max_pending: runtime_reliable_max_pending(),
+        reliable_max_return_routes: runtime_reliable_max_return_routes(),
+        reliable_max_end_to_end_pending: runtime_reliable_max_end_to_end_pending(),
+        reliable_max_end_to_end_ack_cache: runtime_reliable_max_end_to_end_ack_cache(),
+    }
+}
+
+#[inline]
+pub fn runtime_payload_compress_threshold() -> usize {
+    RUNTIME_PAYLOAD_COMPRESS_THRESHOLD.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_static_string_length() -> usize {
+    RUNTIME_STATIC_STRING_LENGTH.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_static_hex_length() -> usize {
+    RUNTIME_STATIC_HEX_LENGTH.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_string_precision() -> usize {
+    RUNTIME_STRING_PRECISION.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_max_handler_retries() -> usize {
+    RUNTIME_MAX_HANDLER_RETRIES.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_reliable_retransmit_ms() -> u64 {
+    u64::from(RUNTIME_RELIABLE_RETRANSMIT_MS.load(Ordering::Relaxed))
+}
+
+#[inline]
+pub fn runtime_reliable_max_retries() -> u32 {
+    RUNTIME_RELIABLE_MAX_RETRIES.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_reliable_max_pending() -> usize {
+    RUNTIME_RELIABLE_MAX_PENDING.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_reliable_max_return_routes() -> usize {
+    RUNTIME_RELIABLE_MAX_RETURN_ROUTES.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_reliable_max_end_to_end_pending() -> usize {
+    RUNTIME_RELIABLE_MAX_END_TO_END_PENDING.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn runtime_reliable_max_end_to_end_ack_cache() -> usize {
+    RUNTIME_RELIABLE_MAX_END_TO_END_ACK_CACHE.load(Ordering::Relaxed)
+}
+
+/// Runtime memory limits for router/relay queue-backed state.
+///
+/// Compile-time environment values remain the defaults for embedded builds, but applications using
+/// prebuilt binaries can now choose per-instance budgets at construction time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeMemoryConfig {
+    pub max_queue_budget: usize,
+    pub max_recent_rx_ids: usize,
+    pub starting_queue_size: usize,
+    pub queue_grow_step: f64,
+}
+
+impl RuntimeMemoryConfig {
+    pub const fn default_const() -> Self {
+        Self {
+            max_queue_budget: MAX_QUEUE_BUDGET,
+            max_recent_rx_ids: MAX_RECENT_RX_IDS,
+            starting_queue_size: STARTING_QUEUE_SIZE,
+            queue_grow_step: QUEUE_GROW_STEP,
+        }
+    }
+
+    pub fn new(
+        max_queue_budget: usize,
+        max_recent_rx_ids: usize,
+        starting_queue_size: usize,
+        queue_grow_step: f64,
+    ) -> TelemetryResult<Self> {
+        let cfg = Self {
+            max_queue_budget,
+            max_recent_rx_ids,
+            starting_queue_size,
+            queue_grow_step,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(self) -> TelemetryResult<()> {
+        if self.max_queue_budget == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        if self.max_recent_rx_ids == 0 {
+            return Err(TelemetryError::BadArg);
+        }
+        if self.starting_queue_size == 0 || self.starting_queue_size > self.max_queue_budget {
+            return Err(TelemetryError::BadArg);
+        }
+        if !self.queue_grow_step.is_finite() || self.queue_grow_step <= 1.0 {
+            return Err(TelemetryError::BadArg);
+        }
+        Ok(())
+    }
+
+    pub fn recent_rx_queue_bytes(self) -> usize {
+        self.max_recent_rx_ids
+            .saturating_mul(size_of::<u64>())
+            .min(self.max_queue_budget)
+            .max(1)
+    }
+}
+
+impl Default for RuntimeMemoryConfig {
+    fn default() -> Self {
+        Self::default_const()
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Runtime IDs

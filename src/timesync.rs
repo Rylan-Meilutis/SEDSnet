@@ -14,7 +14,7 @@ use core::mem::size_of;
 
 use crate::router::{Router, encode_slice_le};
 use crate::{
-    DataEndpoint, DataType, TelemetryError, TelemetryResult, config::DEVICE_IDENTIFIER,
+    DataEndpoint, DataType, TelemetryError, TelemetryResult, config::runtime_device_identifier,
     message_meta, packet::Packet,
 };
 
@@ -576,7 +576,7 @@ fn civil_from_days(mut z: i64) -> (i32, u32, u32) {
 #[derive(Debug, Clone)]
 pub struct TimeSyncTracker {
     cfg: TimeSyncConfig,
-    local_id: &'static str,
+    local_id: String,
     sources: BTreeMap<String, TimeSyncSource>,
     current_source: Option<String>,
 }
@@ -586,7 +586,7 @@ impl TimeSyncTracker {
     pub fn new(cfg: TimeSyncConfig) -> Self {
         Self {
             cfg,
-            local_id: DEVICE_IDENTIFIER,
+            local_id: runtime_device_identifier(),
             sources: BTreeMap::new(),
             current_source: None,
         }
@@ -654,7 +654,8 @@ impl TimeSyncTracker {
         match (local_priority, remote) {
             (Some(priority), Some(remote)) => {
                 if priority < remote.priority
-                    || (priority == remote.priority && self.local_id < remote.sender.as_str())
+                    || (priority == remote.priority
+                        && self.local_id.as_str() < remote.sender.as_str())
                 {
                     Some(TimeSyncLeader::Local { priority })
                 } else {
@@ -702,7 +703,7 @@ impl TimeSyncTracker {
         recv_ms: u64,
     ) -> TelemetryResult<TimeSyncUpdate> {
         let ann = decode_timesync_announce(pkt)?;
-        if pkt.sender() == self.local_id {
+        if pkt.sender() == self.local_id.as_str() {
             return Ok(TimeSyncUpdate::NoChange);
         }
 

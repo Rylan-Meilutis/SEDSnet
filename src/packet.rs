@@ -6,7 +6,7 @@
 //! - supports pretty printing (header + decoded values) for debugging/logging,
 //! - uses [`SmallPayload`] internally to keep small messages on the stack.
 
-use crate::config::{DEVICE_IDENTIFIER, STRING_PRECISION, StandardSmallPayload};
+use crate::config::{StandardSmallPayload, runtime_device_identifier, runtime_string_precision};
 use crate::queue::ByteCost;
 use crate::{
     MessageClass, MessageDataType, MessageElement, TelemetryError, TelemetryResult,
@@ -623,7 +623,7 @@ impl Packet {
     ///
     /// - Uses `LeBytes::from_le_slice` with fixed-width chunks.
     /// - Floats (`f32`/`f64`) are formatted with a fixed precision
-    ///   [`STRING_PRECISION`].
+    ///   the current runtime string precision.
     #[inline]
     fn data_to_string<T>(&self, s: &mut String)
     where
@@ -644,7 +644,7 @@ impl Packet {
             if TypeId::of::<T>() == TypeId::of::<f32>() || TypeId::of::<T>() == TypeId::of::<f64>()
             {
                 // `{:.*}` = "use this precision argument"
-                let _ = write!(s, "{:.*}", STRING_PRECISION, v);
+                let _ = write!(s, "{:.*}", runtime_string_precision(), v);
             } else {
                 let _ = write!(s, "{v}");
             }
@@ -914,7 +914,7 @@ impl Packet {
         Self::new(ty, endpoints, sender, timestamp, Arc::<[u8]>::from(bytes))
     }
 
-    /// Same as `from_prim_le_slice_with_sender` but uses `DEVICE_IDENTIFIER`
+    /// Same as `from_prim_le_slice_with_sender` but uses the runtime device identifier.
     /// as the sender (mirrors `from_u8_slice`, `from_f32_slice`).
     #[inline]
     pub fn from_prim_le_slice<T>(
@@ -926,7 +926,8 @@ impl Packet {
     where
         T: Copy + 'static,
     {
-        Self::from_prim_le_slice_with_sender(ty, values, endpoints, DEVICE_IDENTIFIER, timestamp)
+        let sender = runtime_device_identifier();
+        Self::from_prim_le_slice_with_sender(ty, values, endpoints, &sender, timestamp)
     }
 
     // -------------------------------------------------------------------------
@@ -969,13 +970,8 @@ impl Packet {
             }
         }
 
-        Self::new(
-            ty,
-            endpoints,
-            DEVICE_IDENTIFIER,
-            timestamp,
-            Arc::<[u8]>::from([]),
-        )
+        let sender = runtime_device_identifier();
+        Self::new(ty, endpoints, &sender, timestamp, Arc::<[u8]>::from([]))
     }
 
     /// Bool constructor: encodes each bool as a single byte (0 / 1).
@@ -1006,13 +1002,8 @@ impl Packet {
         let mut bytes = Vec::with_capacity(total_bytes);
         bytes.extend(values.iter().map(|b| if *b { 1u8 } else { 0u8 }));
 
-        Self::new(
-            ty,
-            endpoints,
-            DEVICE_IDENTIFIER,
-            timestamp,
-            Arc::<[u8]>::from(bytes),
-        )
+        let sender = runtime_device_identifier();
+        Self::new(ty, endpoints, &sender, timestamp, Arc::<[u8]>::from(bytes))
     }
 
     /// String constructor (dynamic length). Trailing NULs are not added;
@@ -1032,7 +1023,8 @@ impl Packet {
         }
 
         let bytes: Arc<[u8]> = Arc::from(s.as_bytes());
-        Self::new(ty, endpoints, DEVICE_IDENTIFIER, timestamp, bytes)
+        let sender = runtime_device_identifier();
+        Self::new(ty, endpoints, &sender, timestamp, bytes)
     }
 }
 

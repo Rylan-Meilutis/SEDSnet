@@ -1,5 +1,24 @@
 # Changelogs
 
+## Version 4.0.1 highlights
+
+- Runtime configurability:
+    - Device identity, compression threshold, static string/binary sizing, float string precision,
+      handler retries, reliable retransmit timing, and reliable cache limits can be changed through
+      Rust, C, and Python APIs after using a prebuilt package.
+    - Router address assignment can be changed at runtime across bindings with dynamic, requested,
+      and static address modes.
+    - Build-time values are now documented as packaged defaults. `MAX_STACK_PAYLOAD` remains the
+      compile-time inline payload capacity because it changes type layout.
+- Binding and release polish:
+    - The checked-in C ABI header and Python `.pyi` include the runtime memory, tuning, default
+      device identifier, and router address APIs.
+    - README and wiki usage pages were updated for the v4.0.1 release path.
+- Memory-budget validation:
+    - Added router and relay regression tests that use small runtime memory budgets, queue enough
+      work to force eviction, and assert exported memory usage stays within the configured shared
+      queue budget.
+
 ## Version 4.0.0 highlights
 
 - Migration-safe wire contract:
@@ -74,6 +93,17 @@
     - Runtime sender IDs and packed header templates reduce repeated header overhead after
       initial contact. Canonical packet frames now carry a compact source address instead of
       repeating sender hostnames; sender names are learned through discovery/config state.
+- Runtime configuration:
+    - Time-sync source/grandmaster role selection is runtime configuration, not a compile-time board
+      role. Rust, C, and Python can configure consumer/source/auto behavior and update router time
+      sync settings after construction.
+    - Host/prebuilt defaults for device identity, compression threshold, static string/binary
+      sizing, float string precision, handler retries, reliable retransmit timing, and reliable
+      cache limits are runtime configurable across Rust, C, and Python.
+    - Router hostname/address assignment is runtime configurable across bindings, including
+      dynamic, requested, and static address modes.
+    - Router and relay memory limits are runtime constructor options across Rust, C, and Python, so
+      prebuilt Python wheels are no longer locked to the packaged queue-budget defaults.
 - Topology and diagnostics:
     - Topology exports now include named endpoint fields, side names, filtered SEDSnet control
       endpoints, and a top-level `links` list for graph rendering.

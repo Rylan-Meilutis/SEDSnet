@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.0.1
+
+- Made the remaining prebuilt/host tuning knobs runtime configurable across Rust, C, and Python:
+  device identifier, compression threshold, static string/binary sizing, float string precision,
+  handler retries, reliable retransmit timing, and reliable cache limits.
+- Added runtime router address configuration across bindings, including dynamic, requested, and
+  static address modes for discovery-backed P2P routing.
+- Updated the checked-in C ABI header and Python type stub so packaged users see the new runtime
+  memory, tuning, device identity, and address APIs.
+- Added router and relay regression tests that stress small runtime memory budgets and assert the
+  exported memory-layout usage never exceeds the configured shared queue budget.
+- Updated README and wiki docs for the v4.0.1 release, clarifying that build-time values are
+  packaged defaults while runtime APIs configure active nodes. `MAX_STACK_PAYLOAD` remains the
+  compile-time inline payload capacity because it changes type layout.
+
 ## 4.0.0
 
 - Removed compile-time user schema generation. `build.rs` no longer turns
@@ -59,6 +74,24 @@
   link-probe or driver timing samples to send minimal discovery reachability pings across slow
   sides between infrequent full schema/topology/time-source refreshes, and router-managed time sync
   throttles only the measured slow egress while fast sides keep the configured normal cadence.
+- Time-sync source/grandmaster role selection is runtime configuration across bindings. Rust can
+  set `TimeSyncConfig` at construction or later, C can call `seds_router_configure_timesync(...)`,
+  and Python can pass time-sync role/priority/interval keywords or call
+  `router.configure_timesync(...)`.
+- Router and relay memory limits are now runtime constructor options as well as compile-time
+  defaults. Rust exposes `RuntimeMemoryConfig` through router/relay configs, C exposes
+  `seds_router_new_with_memory(...)` and `seds_relay_new_with_memory(...)`, and Python `Router`/
+  `Relay` constructors accept queue budget, recent-ID, starting-size, and growth overrides.
+- The remaining host/prebuilt tuning defaults are runtime configurable. Rust exposes
+  `RuntimeTuningConfig`, `runtime_tuning_config(...)`, `set_runtime_tuning_config(...)`, and
+  `set_runtime_device_identifier(...)`; C exposes `SedsRuntimeTuningConfig` plus matching get/set
+  functions; Python exposes `runtime_tuning_config(...)`, `set_runtime_tuning_config(...)`, and
+  runtime device identifier helpers. These cover compression threshold, static string/binary
+  sizing, float string precision, handler retries, reliable retransmit timing, and reliable cache
+  limits.
+- Router identity/address assignment can be configured at runtime across bindings. Python
+  constructors accept `hostname`, `address_mode`, and `requested_address`, and C exposes
+  `seds_router_configure_address(...)` for dynamic/requested/static address mode changes.
 - Topology exports now include a deduplicated `links` graph, named endpoint fields, side names, and
   filtered SEDSnet control endpoints so graphing tools see user-facing network structure instead of
   router-only internals.

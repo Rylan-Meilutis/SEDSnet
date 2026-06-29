@@ -128,6 +128,29 @@ typedef struct SedsSideRef
     int32_t id;
 } SedsSideRef;
 
+typedef struct SedsRuntimeMemoryConfig
+{
+    size_t max_queue_budget;
+    size_t max_recent_rx_ids;
+    size_t starting_queue_size;
+    double queue_grow_step;
+} SedsRuntimeMemoryConfig;
+
+typedef struct SedsRuntimeTuningConfig
+{
+    size_t payload_compress_threshold;
+    size_t static_string_length;
+    size_t static_hex_length;
+    size_t string_precision;
+    size_t max_handler_retries;
+    uint32_t reliable_retransmit_ms;
+    uint32_t reliable_max_retries;
+    size_t reliable_max_pending;
+    size_t reliable_max_return_routes;
+    size_t reliable_max_end_to_end_pending;
+    size_t reliable_max_end_to_end_ack_cache;
+} SedsRuntimeTuningConfig;
+
 #define SEDS_NAME_LITERAL(s_) ((SedsName){ (s_), sizeof(s_) - 1U })
 #define SEDS_NAME_NULL ((SedsName){ NULL, 0U })
 #define SEDS_TYPE_REF(id_) ((SedsTypeRef){ (SedsDataType)(id_) })
@@ -356,6 +379,18 @@ SedsResult seds_pkt_to_string(const SedsPacketView * pkt, char * buf, size_t buf
 /** @brief Convert a SedsResult / TelemetryError code to text. */
 SedsResult seds_error_to_string(int32_t error_code, char * buf, size_t buf_len);
 
+/** @brief Read the process-wide default device identifier used by packet helpers. */
+SedsResult seds_runtime_device_identifier(char * buf, size_t buf_len);
+
+/** @brief Set the process-wide default device identifier used by packet helpers. */
+SedsResult seds_set_runtime_device_identifier(const char * sender, size_t sender_len);
+
+/** @brief Read process-wide runtime tuning values. */
+SedsResult seds_get_runtime_tuning_config(SedsRuntimeTuningConfig * out);
+
+/** @brief Replace process-wide runtime tuning values. */
+SedsResult seds_set_runtime_tuning_config(const SedsRuntimeTuningConfig * cfg);
+
 /* ==============================
    Router lifecycle
    ============================== */
@@ -393,10 +428,27 @@ SedsRouter * seds_router_new_ex(
                                 uint32_t e2e_key_id
                                 );
 
+/**
+ * @brief Create a router with explicit memory limits and end-to-end cryptography settings.
+ */
+SedsRouter * seds_router_new_with_memory(
+                                         SedsRouterMode mode,
+                                         SedsNowMsFn now_ms_cb,
+                                         void * user,
+                                         const SedsLocalEndpointDesc * handlers,
+                                         size_t n_handlers,
+                                         uint8_t e2e_mode,
+                                         uint32_t e2e_key_id,
+                                         const SedsRuntimeMemoryConfig * memory
+                                         );
+
 /** @brief Destroy a router created by seds_router_new(). */
 void seds_router_free(SedsRouter * r);
 SedsResult seds_router_set_sender_id(SedsRouter * r, const char * sender, size_t sender_len);
 SedsResult seds_router_current_address(SedsRouter * r, uint32_t * out_address);
+SedsResult seds_router_configure_address(SedsRouter * r,
+                                         uint8_t address_mode,
+                                         uint32_t requested_address);
 SedsResult seds_router_resolve_hostname_address(SedsRouter * r,
                                                 const char * hostname,
                                                 size_t hostname_len,
@@ -1230,6 +1282,9 @@ void seds_owned_header_free(SedsOwnedHeader * h);
  * @return Non-NULL relay handle on success; NULL on failure.
  */
 SedsRelay * seds_relay_new(SedsNowMsFn now_ms_cb, void * user);
+SedsRelay * seds_relay_new_with_memory(SedsNowMsFn now_ms_cb,
+                                       void * user,
+                                       const SedsRuntimeMemoryConfig * memory);
 
 /**
  * @brief Destroy a relay previously returned by seds_relay_new().

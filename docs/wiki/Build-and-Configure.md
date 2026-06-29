@@ -9,7 +9,7 @@ The repo includes
 build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)),
 a wrapper around Cargo and Maturin that:
 
-- Sets compile-time environment variables (e.g., `DEVICE_IDENTIFIER`).
+- Sets packaged default environment variables (e.g., `DEVICE_IDENTIFIER`).
 - Enables feature flags (`embedded`, `python`).
 - Optionally installs missing Rust targets via `rustup`.
 - Produces consistent output for CI and local builds.
@@ -37,7 +37,7 @@ Useful options:
     - `cargo build --features python`
     - `cargo build --no-default-features --target <embedded-target> --features embedded` when a matching cross C
       toolchain is available
-- `device_id=<id>` sets `DEVICE_IDENTIFIER` for the build.
+- `device_id=<id>` sets the packaged `DEVICE_IDENTIFIER` default for the build.
 - `static_schema_path=<path>` sets `SEDSNET_STATIC_SCHEMA_PATH` for runtime registry seeding.
 - `static_ipc_schema_path=<path>` sets `SEDSNET_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
 - `max_stack_payload=<n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
@@ -122,7 +122,9 @@ For a fuller description of the test layers and recommended commands, see [Testi
 
 ## Device identifier
 
-Every build embeds `DEVICE_IDENTIFIER` into telemetry packets.
+Every build embeds a default `DEVICE_IDENTIFIER`. In v4 that name is discovery/config metadata; packed frames route by
+compact address and do not repeat the hostname on every packet. Runtime APIs can override the active default or an
+individual router/relay identity.
 
 Recommended (Rust):
 
@@ -144,12 +146,27 @@ build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)
 ./build.py release device_id=GROUND_STATION
 ```
 
-## Compile-time configuration
+Runtime overrides:
+
+- Rust: `set_runtime_device_identifier("GROUND_STATION")`, `RouterConfig::with_sender(...)`, and
+  `RelayConfig::with_sender(...)`.
+- C: `seds_set_runtime_device_identifier(...)`, `seds_router_set_sender_id(...)`,
+  `seds_relay_set_sender_id(...)`, and `seds_router_configure_address(...)`.
+- Python: `sedsnet.set_runtime_device_identifier(...)`, `Router(hostname=..., address_mode=...,
+  requested_address=...)`, `router.set_sender_id(...)`, and `router.configure_address(...)`.
+
+## Runtime and compile-time configuration
 
 Configuration values are read via `option_env!` in
 src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 You can set them via `.cargo/config.toml`,
 `build.py env:KEY=VALUE`, or CMake `SEDSNET_ENV_<KEY>` variables.
+
+These values are packaged defaults, not fixed board behavior for host/prebuilt builds. The active node can change
+identity, time-sync role, memory pool limits, retry/reliable queue limits, string/binary static sizing, float string
+precision, and compression threshold at runtime. `MAX_STACK_PAYLOAD` is the exception: it defines the compiled inline
+payload capacity used by the stack-backed payload type, so runtime configuration can choose behavior up to that compiled
+capacity but cannot enlarge the type layout after compilation.
 
 Supported keys (defaults shown):
 
@@ -164,16 +181,35 @@ Supported keys (defaults shown):
 - `STRING_PRECISION` (8)
 - `MAX_STACK_PAYLOAD` (64, via `define_stack_payload!`)
 - `MAX_HANDLER_RETRIES` (3)
+- `RELIABLE_RETRANSMIT_MS` (250)
+- `RELIABLE_MAX_RETRIES` (8)
+- `RELIABLE_MAX_PENDING` (64)
+- `RELIABLE_MAX_RETURN_ROUTES` (64)
+- `RELIABLE_MAX_END_TO_END_PENDING` (`RELIABLE_MAX_PENDING`)
+- `RELIABLE_MAX_END_TO_END_ACK_CACHE` (`MAX_RECENT_RX_IDS`)
 
-`MAX_QUEUE_BUDGET` is the shared queue-owned memory budget for each router or relay. RX queues, TX
-queues, reliable replay/out-of-order buffers, and discovery topology state draw from this budget
+`MAX_QUEUE_BUDGET`, `MAX_RECENT_RX_IDS`, `STARTING_QUEUE_SIZE`, and `QUEUE_GROW_STEP` are defaults,
+not the only way to size a node. Rust can pass `RuntimeMemoryConfig` through
+`RouterConfig::with_memory_config(...)` or `RelayConfig::with_memory_config(...)`. C can use
+`seds_router_new_with_memory(...)` and `seds_relay_new_with_memory(...)`. Python can pass
+`max_queue_budget`, `max_recent_rx_ids`, `starting_queue_size`, and `queue_grow_step` to
+`Router(...)` or `Relay(...)`.
+
+The remaining active tuning values are process-wide runtime settings:
+
+- Rust: `runtime_tuning_config()` and `set_runtime_tuning_config(RuntimeTuningConfig { ... })`.
+- C: `seds_get_runtime_tuning_config(...)` and `seds_set_runtime_tuning_config(...)`.
+- Python: `sedsnet.runtime_tuning_config()` and `sedsnet.set_runtime_tuning_config(...)`.
+
+The active queue budget is the shared queue-owned memory budget for each router or relay. RX queues,
+TX queues, reliable replay/out-of-order buffers, and discovery topology state draw from this budget
 dynamically. The recent packet ID cache preallocates
-`min(MAX_RECENT_RX_IDS * sizeof(u64), MAX_QUEUE_BUDGET)` bytes at construction and reserves that
+`min(max_recent_rx_ids * sizeof(u64), max_queue_budget)` bytes at construction and reserves that
 amount from the same budget.
 
-`MAX_QUEUE_SIZE` is still accepted as a legacy environment alias, but new builds should use
-`MAX_QUEUE_BUDGET`, `build.py max_queue_budget=<n>`, or CMake
-`SEDSNET_MAX_QUEUE_BUDGET`.
+`MAX_QUEUE_SIZE` is still accepted as a legacy environment alias for the default budget, but new
+builds should use `MAX_QUEUE_BUDGET`, `build.py max_queue_budget=<n>`, or CMake
+`SEDSNET_MAX_QUEUE_BUDGET` only when they want to change the packaged default.
 
 ## Runtime telemetry schema
 

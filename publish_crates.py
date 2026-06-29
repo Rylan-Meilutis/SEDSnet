@@ -45,6 +45,12 @@ MACOS_DOCKER_IMAGES = {
     "aarch64-apple-darwin": "registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin",
 }
 
+CARGO_NETWORK_ENV = {
+    "CARGO_HTTP_MULTIPLEXING": "false",
+    "CARGO_NET_RETRY": "10",
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse",
+}
+
 
 def run(
     cmd: list[str],
@@ -57,20 +63,48 @@ def run(
     subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
 
 
-def run_optional(cmd: list[str], *, display_cmd: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+def cargo_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(CARGO_NETWORK_ENV)
+    return env
+
+
+def docker_cargo_env_args() -> list[str]:
+    args: list[str] = []
+    for key, value in CARGO_NETWORK_ENV.items():
+        args.extend(["-e", f"{key}={value}"])
+    return args
+
+
+def run_optional(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout_s: int | None = None,
+    display_cmd: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     shown = display_cmd if display_cmd is not None else cmd
     print(f"\n$ {' '.join(shown)}", flush=True)
-    return subprocess.run(
-        cmd,
-        cwd=REPO_ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as e:
+        output = e.output or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        output += f"\nerror: command timed out after {timeout_s}s\n"
+        return subprocess.CompletedProcess(cmd, 124, output)
 
 
-def capture(cmd: list[str]) -> str:
-    return subprocess.check_output(cmd, cwd=REPO_ROOT, text=True).strip()
+def capture(cmd: list[str], *, env: dict[str, str] | None = None) -> str:
+    return subprocess.check_output(cmd, cwd=REPO_ROOT, env=env, text=True).strip()
 
 
 def manifest_package(manifest: Path) -> tuple[str, str]:
@@ -132,7 +166,7 @@ def cargo_package(manifest: Path, *, allow_dirty: bool) -> None:
     cmd = ["cargo", "package", "--manifest-path", str(manifest)]
     if allow_dirty:
         cmd.append("--allow-dirty")
-    run(cmd)
+    run(cmd, env=cargo_env())
 
 
 def require_tool(name: str) -> None:
@@ -163,11 +197,13 @@ def cargo_publish(
     publish: bool,
     allow_dirty: bool,
     token: str | None,
-) -> None:
+    ignore_errors: bool,
+    timeout_s: int,
+) -> bool:
     crate_name, crate_version = manifest_package(manifest)
     if publish and crate_version_exists(crate_name, crate_version):
         print(f"\n{crate_name} v{crate_version} is already on crates.io; skipping upload.")
-        return
+        return True
 
     cmd = ["cargo", "publish", "--manifest-path", str(manifest)]
     if not publish:
@@ -177,22 +213,29 @@ def cargo_publish(
     if token:
         cmd.extend(["--token", token])
     if not publish:
-        run(cmd)
-        return
+        run(cmd, env=cargo_env())
+        return True
 
-    result = run_optional(cmd)
+    result = run_optional(cmd, env=cargo_env(), timeout_s=timeout_s)
     print(result.stdout, end="")
     if result.returncode == 0:
-        return
+        return True
     if is_already_published_output(result.stdout):
         print(f"\n{crate_name} v{crate_version} was already published; continuing.")
-        return
+        return True
+    if ignore_errors:
+        print(
+            f"\nwarning: cargo publish failed for {crate_name} v{crate_version}; "
+            "continuing because --ignore-publish-errors was passed.",
+            file=sys.stderr,
+        )
+        return False
     raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
 
 
 def maturin_build() -> None:
     require_tool("maturin")
-    run(["maturin", "build", "--release", "--compatibility", "pypi"])
+    run(["maturin", "build", "--release", "--compatibility", "pypi"], env=cargo_env())
 
 
 def docker_maturin_build(
@@ -228,6 +271,7 @@ def docker_maturin_build(
             "docker",
             "run",
             "--rm",
+            *docker_cargo_env_args(),
             "-v",
             f"{REPO_ROOT}:/io",
             "--entrypoint",
@@ -246,6 +290,7 @@ def docker_maturin_sdist(*, image: str, out_dir: str) -> None:
             "docker",
             "run",
             "--rm",
+            *docker_cargo_env_args(),
             "-v",
             f"{REPO_ROOT}:/io",
             image,
@@ -291,6 +336,7 @@ def docker_maturin_windows_build(
                 "docker",
                 "run",
                 "--rm",
+                *docker_cargo_env_args(),
                 "-v",
                 f"{REPO_ROOT}:/io",
                 image,
@@ -317,7 +363,8 @@ def local_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
                 out_dir,
                 "--target",
                 target,
-            ]
+            ],
+            env=cargo_env(),
         )
 
 
@@ -364,6 +411,7 @@ def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
                     "docker",
                     "run",
                     "--rm",
+                    *docker_cargo_env_args(),
                     "-v",
                     f"{REPO_ROOT}:/io",
                     image,
@@ -422,13 +470,16 @@ def twine_upload(
 
 def build_local_pypi_artifacts(out_dir: str) -> list[Path]:
     require_tool("maturin")
-    run(["maturin", "build", "--release", "--compatibility", "pypi", "--out", out_dir])
-    run(["maturin", "sdist", "--out", out_dir])
+    run(
+        ["maturin", "build", "--release", "--compatibility", "pypi", "--out", out_dir],
+        env=cargo_env(),
+    )
+    run(["maturin", "sdist", "--out", out_dir], env=cargo_env())
     return pypi_artifacts_from_dir(out_dir)
 
 
 def cargo_search_output(crate_name: str) -> str:
-    return capture(["cargo", "search", crate_name, "--limit", "10"])
+    return capture(["cargo", "search", crate_name, "--limit", "10"], env=cargo_env())
 
 
 def cargo_search(crate_name: str) -> bool:
@@ -617,6 +668,25 @@ def parse_args() -> argparse.Namespace:
         help="Environment variable containing the crates.io token. Defaults to CARGO_REGISTRY_TOKEN.",
     )
     parser.add_argument(
+        "--skip-publish-without-token",
+        action="store_true",
+        help=(
+            "When --publish is passed but the crates.io token env var is missing, run package "
+            "checks and skip crates.io uploads instead of relying on a local cargo login token."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-publish-errors",
+        action="store_true",
+        help="Treat crates.io upload failures as warnings after package checks have passed.",
+    )
+    parser.add_argument(
+        "--publish-timeout",
+        type=int,
+        default=180,
+        help="Seconds to allow each cargo publish upload attempt before timing out.",
+    )
+    parser.add_argument(
         "--index-timeout",
         type=int,
         default=300,
@@ -646,7 +716,13 @@ def main() -> int:
         print("Skipping crates.io steps.")
     elif args.publish:
         print("Publish mode: crates will be uploaded to crates.io.")
-        if not token:
+        if not token and args.skip_publish_without_token:
+            print(
+                f"warning: {args.token_env} is not set; package checks will run but crates.io "
+                "uploads will be skipped."
+            )
+            args.publish = False
+        elif not token:
             print(
                 f"info: {args.token_env} is not set; cargo will use your saved cargo login token."
             )
@@ -663,20 +739,27 @@ def main() -> int:
         if not args.skip_package:
             cargo_package(MACROS_MANIFEST, allow_dirty=args.allow_dirty)
 
-        cargo_publish(
+        macro_publish_ok = cargo_publish(
             MACROS_MANIFEST,
             publish=args.publish,
             allow_dirty=args.allow_dirty,
             token=token,
+            ignore_errors=args.ignore_publish_errors,
+            timeout_s=args.publish_timeout,
         )
 
-        if args.publish:
+        if args.publish and macro_publish_ok:
             wait_for_index(
                 macro_name,
                 macro_version,
                 timeout_s=args.index_timeout,
                 interval_s=args.index_interval,
             )
+        elif args.publish:
+            print(
+                f"\nSkipping {main_name} publish because {macro_name} upload did not complete."
+            )
+            return 0
         else:
             if not cargo_search(macro_name):
                 print(
@@ -698,6 +781,8 @@ def main() -> int:
                 publish=args.publish,
                 allow_dirty=args.allow_dirty,
                 token=token,
+                ignore_errors=args.ignore_publish_errors,
+                timeout_s=args.publish_timeout,
             )
 
             if args.publish:

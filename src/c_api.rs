@@ -17,20 +17,23 @@ use crate::{
     DataType, MessageElement, RouteSelectionMode, TelemetryError, TelemetryErrorCode,
     TelemetryResult,
     config::{
-        DataEndpoint, data_type_definition, data_type_definition_by_name, data_type_exists,
-        e2e_encryption_policy_code, e2e_encryption_policy_from_code, endpoint_definition,
-        endpoint_definition_by_name, endpoint_exists, known_endpoints, message_class_code,
-        message_class_from_code, message_data_type_code, message_data_type_from_code,
+        DataEndpoint, RuntimeMemoryConfig, RuntimeTuningConfig, data_type_definition,
+        data_type_definition_by_name, data_type_exists, e2e_encryption_policy_code,
+        e2e_encryption_policy_from_code, endpoint_definition, endpoint_definition_by_name,
+        endpoint_exists, known_endpoints, message_class_code, message_class_from_code,
+        message_data_type_code, message_data_type_from_code,
         register_data_type_id_with_description_and_e2e_encryption, register_endpoint_id,
         register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
         reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
-        remove_endpoint_by_name, set_data_type_e2e_encryption_policy,
+        remove_endpoint_by_name, runtime_device_identifier, runtime_tuning_config,
+        set_data_type_e2e_encryption_policy, set_runtime_device_identifier,
+        set_runtime_tuning_config,
     },
     do_vec_log_typed, get_needed_message_size, message_meta,
     packet::Packet,
     router::{
-        Clock, LeBytes, RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
-        endpoint_is_router_internal,
+        AddressAssignmentMode, Clock, LeBytes, RouterE2eEncryptionMode, RouterSideOptions,
+        SideTransportProfile, endpoint_is_router_internal,
     },
     router::{EndpointHandler, Router, RouterConfig},
     wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
@@ -46,7 +49,7 @@ use crate::crypto::{
     open_with_registered_crypto, register_c_cryptography_provider, register_software_key,
     seal_with_registered_crypto, verify_managed_credential,
 };
-use crate::relay::{Relay, RelaySideId, RelaySideOptions};
+use crate::relay::{Relay, RelayConfig, RelaySideId, RelaySideOptions};
 // ============================================================================
 //  Constants / basic types shared with the C side
 // ============================================================================
@@ -93,6 +96,82 @@ pub struct SedsOwnedHeader {
 #[repr(C)]
 pub struct SedsRelay {
     inner: Arc<Relay>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SedsRuntimeMemoryConfig {
+    pub max_queue_budget: usize,
+    pub max_recent_rx_ids: usize,
+    pub starting_queue_size: usize,
+    pub queue_grow_step: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SedsRuntimeTuningConfig {
+    pub payload_compress_threshold: usize,
+    pub static_string_length: usize,
+    pub static_hex_length: usize,
+    pub string_precision: usize,
+    pub max_handler_retries: usize,
+    pub reliable_retransmit_ms: u32,
+    pub reliable_max_retries: u32,
+    pub reliable_max_pending: usize,
+    pub reliable_max_return_routes: usize,
+    pub reliable_max_end_to_end_pending: usize,
+    pub reliable_max_end_to_end_ack_cache: usize,
+}
+
+impl From<RuntimeTuningConfig> for SedsRuntimeTuningConfig {
+    fn from(cfg: RuntimeTuningConfig) -> Self {
+        Self {
+            payload_compress_threshold: cfg.payload_compress_threshold,
+            static_string_length: cfg.static_string_length,
+            static_hex_length: cfg.static_hex_length,
+            string_precision: cfg.string_precision,
+            max_handler_retries: cfg.max_handler_retries,
+            reliable_retransmit_ms: cfg.reliable_retransmit_ms,
+            reliable_max_retries: cfg.reliable_max_retries,
+            reliable_max_pending: cfg.reliable_max_pending,
+            reliable_max_return_routes: cfg.reliable_max_return_routes,
+            reliable_max_end_to_end_pending: cfg.reliable_max_end_to_end_pending,
+            reliable_max_end_to_end_ack_cache: cfg.reliable_max_end_to_end_ack_cache,
+        }
+    }
+}
+
+impl From<SedsRuntimeTuningConfig> for RuntimeTuningConfig {
+    fn from(cfg: SedsRuntimeTuningConfig) -> Self {
+        Self {
+            payload_compress_threshold: cfg.payload_compress_threshold,
+            static_string_length: cfg.static_string_length,
+            static_hex_length: cfg.static_hex_length,
+            string_precision: cfg.string_precision,
+            max_handler_retries: cfg.max_handler_retries,
+            reliable_retransmit_ms: cfg.reliable_retransmit_ms,
+            reliable_max_retries: cfg.reliable_max_retries,
+            reliable_max_pending: cfg.reliable_max_pending,
+            reliable_max_return_routes: cfg.reliable_max_return_routes,
+            reliable_max_end_to_end_pending: cfg.reliable_max_end_to_end_pending,
+            reliable_max_end_to_end_ack_cache: cfg.reliable_max_end_to_end_ack_cache,
+        }
+    }
+}
+
+fn runtime_memory_from_ffi(
+    ptr: *const SedsRuntimeMemoryConfig,
+) -> Result<RuntimeMemoryConfig, TelemetryError> {
+    if ptr.is_null() {
+        return Ok(RuntimeMemoryConfig::default());
+    }
+    let cfg = unsafe { *ptr };
+    RuntimeMemoryConfig::new(
+        cfg.max_queue_budget,
+        cfg.max_recent_rx_ids,
+        cfg.starting_queue_size,
+        cfg.queue_grow_step,
+    )
 }
 
 #[cfg(feature = "timesync")]
@@ -1240,6 +1319,46 @@ pub extern "C" fn seds_error_to_string(error_code: i32, buf: *mut c_char, buf_le
     unsafe { write_str_to_buf(s, buf, buf_len) }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_runtime_device_identifier(buf: *mut c_char, buf_len: usize) -> i32 {
+    let value = runtime_device_identifier();
+    unsafe { write_str_to_buf(&value, buf, buf_len) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_runtime_device_identifier(
+    sender: *const c_char,
+    sender_len: usize,
+) -> i32 {
+    if sender_len == 0 || sender.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+    let sender_id = match from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return status_from_err(TelemetryError::BadArg),
+    };
+    ok_or_status(set_runtime_device_identifier(sender_id))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_get_runtime_tuning_config(out: *mut SedsRuntimeTuningConfig) -> i32 {
+    if out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    unsafe { *out = runtime_tuning_config().into() };
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_runtime_tuning_config(cfg: *const SedsRuntimeTuningConfig) -> i32 {
+    if cfg.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let cfg = unsafe { *cfg };
+    ok_or_status(set_runtime_tuning_config(cfg.into()))
+}
+
 // ============================================================================
 //  FFI: Router lifecycle (new / free)
 // ============================================================================
@@ -1253,15 +1372,16 @@ pub extern "C" fn seds_router_new(
     handlers: *const SedsLocalEndpointDesc,
     n_handlers: usize,
 ) -> *mut SedsRouter {
-    seds_router_new_impl(
+    seds_router_new_impl(SedsRouterNewOptions {
         mode,
         now_ms_cb,
         user,
         handlers,
         n_handlers,
-        RouterConfig::default_e2e_encryption_mode(),
-        0,
-    )
+        e2e_mode: RouterConfig::default_e2e_encryption_mode(),
+        e2e_key_id: 0,
+        memory: RuntimeMemoryConfig::default(),
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1277,9 +1397,45 @@ pub extern "C" fn seds_router_new_ex(
     let Some(e2e_mode) = router_e2e_mode_from_code(e2e_mode) else {
         return ptr::null_mut();
     };
-    seds_router_new_impl(
-        mode, now_ms_cb, user, handlers, n_handlers, e2e_mode, e2e_key_id,
-    )
+    seds_router_new_impl(SedsRouterNewOptions {
+        mode,
+        now_ms_cb,
+        user,
+        handlers,
+        n_handlers,
+        e2e_mode,
+        e2e_key_id,
+        memory: RuntimeMemoryConfig::default(),
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_new_with_memory(
+    mode: u8,
+    now_ms_cb: CNowMs,
+    user: *mut c_void,
+    handlers: *const SedsLocalEndpointDesc,
+    n_handlers: usize,
+    e2e_mode: u8,
+    e2e_key_id: u32,
+    memory: *const SedsRuntimeMemoryConfig,
+) -> *mut SedsRouter {
+    let Some(e2e_mode) = router_e2e_mode_from_code(e2e_mode) else {
+        return ptr::null_mut();
+    };
+    let Ok(memory) = runtime_memory_from_ffi(memory) else {
+        return ptr::null_mut();
+    };
+    seds_router_new_impl(SedsRouterNewOptions {
+        mode,
+        now_ms_cb,
+        user,
+        handlers,
+        n_handlers,
+        e2e_mode,
+        e2e_key_id,
+        memory,
+    })
 }
 
 fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
@@ -1292,7 +1448,7 @@ fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
     }
 }
 
-fn seds_router_new_impl(
+struct SedsRouterNewOptions {
     mode: u8,
     now_ms_cb: CNowMs,
     user: *mut c_void,
@@ -1300,12 +1456,15 @@ fn seds_router_new_impl(
     n_handlers: usize,
     e2e_mode: RouterE2eEncryptionMode,
     e2e_key_id: u32,
-) -> *mut SedsRouter {
+    memory: RuntimeMemoryConfig,
+}
+
+fn seds_router_new_impl(opts: SedsRouterNewOptions) -> *mut SedsRouter {
     // Build handler vector
     let mut v: Vec<EndpointHandler> = Vec::new();
-    if n_handlers > 0 && !handlers.is_null() {
-        v.reserve(n_handlers.saturating_mul(2));
-        let slice = unsafe { slice::from_raw_parts(handlers, n_handlers) };
+    if opts.n_handlers > 0 && !opts.handlers.is_null() {
+        v.reserve(opts.n_handlers.saturating_mul(2));
+        let slice = unsafe { slice::from_raw_parts(opts.handlers, opts.n_handlers) };
         for desc in slice {
             let endpoint = DataEndpoint(desc.endpoint);
             if endpoint_is_router_internal(endpoint) {
@@ -1382,21 +1541,24 @@ fn seds_router_new_impl(
 
     let cfg = {
         let cfg = RouterConfig::new(v)
-            .with_e2e_encryption(e2e_mode)
-            .with_e2e_key_id(e2e_key_id);
+            .with_e2e_encryption(opts.e2e_mode)
+            .with_e2e_key_id(opts.e2e_key_id);
+        let Ok(cfg) = cfg.with_memory_config(opts.memory) else {
+            return ptr::null_mut();
+        };
         #[cfg(feature = "timesync")]
         let cfg = cfg.with_timesync(TimeSyncConfig::default());
         cfg
     };
-    let _ = mode;
+    let _ = opts.mode;
 
     #[cfg(feature = "std")]
-    let router = if now_ms_cb.is_some() {
+    let router = if opts.now_ms_cb.is_some() {
         Router::new_with_clock(
             cfg,
             Box::new(FfiClock {
-                cb: now_ms_cb,
-                user_addr: user as usize,
+                cb: opts.now_ms_cb,
+                user_addr: opts.user as usize,
             }),
         )
     } else {
@@ -1407,8 +1569,8 @@ fn seds_router_new_impl(
     let router = Router::new_with_clock(
         cfg,
         Box::new(FfiClock {
-            cb: now_ms_cb,
-            user_addr: user as usize,
+            cb: opts.now_ms_cb,
+            user_addr: opts.user as usize,
         }),
     );
 
@@ -1464,6 +1626,30 @@ pub extern "C" fn seds_router_current_address(r: *mut SedsRouter, out_address: *
     let router = unsafe { &(*r).inner };
     unsafe { *out_address = router.current_address() };
     status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_configure_address(
+    r: *mut SedsRouter,
+    address_mode: u8,
+    requested_address: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let address = if requested_address == 0 {
+        1
+    } else {
+        requested_address
+    };
+    let mode = match address_mode {
+        0 => AddressAssignmentMode::Dynamic,
+        1 => AddressAssignmentMode::Requested(address),
+        2 => AddressAssignmentMode::Static(address),
+        _ => return status_from_err(TelemetryError::BadArg),
+    };
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.set_address_assignment(mode).map(|_| ()))
 }
 
 #[unsafe(no_mangle)]
@@ -3279,12 +3465,27 @@ pub extern "C" fn seds_dtype_remove_by_name(name: *const c_char, name_len: usize
 
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_new(now_ms_cb: CNowMs, user: *mut c_void) -> *mut SedsRelay {
+    seds_relay_new_with_memory(now_ms_cb, user, ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_new_with_memory(
+    now_ms_cb: CNowMs,
+    user: *mut c_void,
+    memory: *const SedsRuntimeMemoryConfig,
+) -> *mut SedsRelay {
     let clock = FfiClock {
         cb: now_ms_cb,
         user_addr: user as usize,
     };
+    let Ok(memory) = runtime_memory_from_ffi(memory) else {
+        return ptr::null_mut();
+    };
 
-    let relay = Relay::new(Box::new(clock));
+    let Ok(cfg) = RelayConfig::default().with_memory_config(memory) else {
+        return ptr::null_mut();
+    };
+    let relay = Relay::new_with_config(cfg, Box::new(clock));
     Box::into_raw(Box::new(SedsRelay {
         inner: Arc::new(relay),
     }))
@@ -5589,6 +5790,7 @@ mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use serde_json::Value;
+    use std::ffi::CStr;
     use std::sync::Mutex;
 
     struct TestClock {
@@ -5887,6 +6089,97 @@ mod tests {
 
         let router = seds_router_new(0, None, ptr::null_mut(), &desc, 1);
         assert!(router.is_null());
+    }
+
+    #[test]
+    fn c_abi_router_and_relay_accept_runtime_memory_limits() {
+        let memory = SedsRuntimeMemoryConfig {
+            max_queue_budget: 4096,
+            max_recent_rx_ids: 8,
+            starting_queue_size: 512,
+            queue_grow_step: 2.0,
+        };
+        let router =
+            seds_router_new_with_memory(0, None, ptr::null_mut(), ptr::null(), 0, 2, 0, &memory);
+        assert!(!router.is_null());
+        let router_json: Value = serde_json::from_str(&export_router_json(
+            router,
+            seds_router_export_memory_layout_len,
+            seds_router_export_memory_layout,
+        ))
+        .unwrap();
+        assert_eq!(router_json["shared_queue_bytes_allocated"], 4096);
+        assert_eq!(router_json["recent_rx_bytes_allocated"], 64);
+        seds_router_free(router);
+
+        let relay = seds_relay_new_with_memory(None, ptr::null_mut(), &memory);
+        assert!(!relay.is_null());
+        let relay_json: Value = serde_json::from_str(&export_relay_json(
+            relay,
+            seds_relay_export_memory_layout_len,
+            seds_relay_export_memory_layout,
+        ))
+        .unwrap();
+        assert_eq!(relay_json["shared_queue_bytes_allocated"], 4096);
+        assert_eq!(relay_json["recent_rx_bytes_allocated"], 64);
+        seds_relay_free(relay);
+
+        let bad = SedsRuntimeMemoryConfig {
+            max_queue_budget: 0,
+            ..memory
+        };
+        assert!(seds_relay_new_with_memory(None, ptr::null_mut(), &bad).is_null());
+        assert!(
+            seds_router_new_with_memory(0, None, ptr::null_mut(), ptr::null(), 0, 2, 0, &bad)
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn c_abi_runtime_tuning_config_roundtrips_current_values() {
+        let mut cfg = SedsRuntimeTuningConfig {
+            payload_compress_threshold: 0,
+            static_string_length: 0,
+            static_hex_length: 0,
+            string_precision: 0,
+            max_handler_retries: 0,
+            reliable_retransmit_ms: 0,
+            reliable_max_retries: 0,
+            reliable_max_pending: 0,
+            reliable_max_return_routes: 0,
+            reliable_max_end_to_end_pending: 0,
+            reliable_max_end_to_end_ack_cache: 0,
+        };
+        assert_eq!(seds_get_runtime_tuning_config(&mut cfg), 0);
+        assert!(cfg.static_string_length > 0);
+        assert!(cfg.reliable_max_pending > 0);
+        assert_eq!(seds_set_runtime_tuning_config(&cfg), 0);
+        assert_eq!(seds_get_runtime_tuning_config(ptr::null_mut()), -10);
+        assert_eq!(seds_set_runtime_tuning_config(ptr::null()), -10);
+    }
+
+    #[test]
+    fn c_abi_runtime_device_identifier_roundtrips() {
+        let before = runtime_device_identifier();
+        let value = b"C_ABI_RUNTIME_NODE";
+        assert_eq!(
+            seds_set_runtime_device_identifier(value.as_ptr() as *const c_char, value.len()),
+            0
+        );
+        let mut buf = [0 as c_char; 64];
+        assert_eq!(
+            seds_runtime_device_identifier(buf.as_mut_ptr(), buf.len()),
+            0
+        );
+        let got = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_str()
+            .expect("runtime device identifier is utf8");
+        assert_eq!(got, "C_ABI_RUNTIME_NODE");
+        assert_eq!(
+            seds_set_runtime_device_identifier(before.as_ptr() as *const c_char, before.len()),
+            0
+        );
+        assert_eq!(seds_set_runtime_device_identifier(ptr::null(), 0), -10);
     }
 
     #[test]
@@ -6839,6 +7132,11 @@ mod tests {
         ))
         .unwrap();
         assert_topology_json_shape(&router_topology, "ROUTER_RUNTIME");
+        assert_eq!(seds_router_configure_address(router, 2, 0x1020_3040), 0);
+        let mut address = 0;
+        assert_eq!(seds_router_current_address(router, &mut address), 0);
+        assert_eq!(address, 0x1020_3040);
+        assert_eq!(seds_router_configure_address(router, 9, 0), -10);
         seds_router_free(router);
 
         let relay = seds_relay_new(None, ptr::null_mut());

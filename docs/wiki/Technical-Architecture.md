@@ -17,7 +17,8 @@ look the way they do. It assumes no prior knowledge of the codebase.
 -
 
 src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)):
-compile-time configuration values plus the runtime schema registry for `DataType` and `DataEndpoint` metadata.
+packaged configuration defaults, runtime tuning state, and the runtime schema registry for `DataType` and
+`DataEndpoint` metadata.
 
 -
 
@@ -123,6 +124,9 @@ This produces the same ID across different links, which enables de-duplication.
 
 `SmallPayload<INLINE>` stores short payloads directly on the stack and spills to `Arc<[u8]>` when larger. The inline
 size is controlled by `MAX_STACK_PAYLOAD` via `define_stack_payload!`, and the default inline capacity is 64 bytes.
+That value is a compiled capacity because it affects the stack payload type layout; active static string/binary sizing,
+compression threshold, retry counts, reliable queue caps, node identity, memory budgets, and time-sync roles are runtime
+configuration.
 
 Why this matters:
 
@@ -202,7 +206,7 @@ Transmit flow:
 
 Error handling:
 
-- Local handler failures are retried (`MAX_HANDLER_RETRIES`).
+- Local handler failures are retried using the active runtime `max_handler_retries` value.
 - If a handler ultimately fails, the packet ID is removed from the dedupe cache so a resend can be processed later.
 - The router emits a `TelemetryError` packet for local handlers when possible.
 

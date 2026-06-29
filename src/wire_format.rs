@@ -1625,7 +1625,7 @@ mod payload_compression {
     use alloc::vec::Vec;
 
     #[cfg(feature = "compression")]
-    use crate::config::PAYLOAD_COMPRESS_THRESHOLD;
+    use crate::config::runtime_payload_compress_threshold;
     #[cfg(feature = "compression")]
     use zstd_safe::CompressionLevel;
 
@@ -1638,7 +1638,7 @@ mod payload_compression {
     ///   payload bytes (compressed or original).
     #[cfg(feature = "compression")]
     pub fn compress_if_beneficial(payload: &'_ [u8]) -> (bool, Cow<'_, [u8]>) {
-        if payload.len() < PAYLOAD_COMPRESS_THRESHOLD {
+        if payload.len() < runtime_payload_compress_threshold() {
             return (false, Cow::Borrowed(payload));
         }
 
