@@ -1,5 +1,16 @@
 # Changelogs
 
+## Version 4.0.3 highlights
+
+- CI validation:
+    - Ubuntu merge tests install the Tkinter system package required by the telemetry config editor
+      tests.
+    - Release publishing waits for the full test route and crate package dry-runs to pass.
+- Release artifact cleanup:
+    - `publish_crates.py` removes stale `sedsnet` wheels and source distributions before builds or
+      uploads while preserving current-version and unrelated artifacts.
+    - GitHub PyPI aggregation runs the same cleanup before trusted publishing.
+
 ## Version 4.0.2 highlights
 
 - Release metadata:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.3
+
+- Fixed the Ubuntu merge-test workflow by installing the Tkinter system package required by the
+  telemetry config editor tests.
+- Added a release gate that runs the full test route and crate package dry-runs before crates.io,
+  wheel, or source-distribution jobs can start.
+- Made the release helper and GitHub PyPI aggregation remove stale `sedsnet` wheels and source
+  distributions while preserving current-version and unrelated artifacts.
+
 ## 4.0.2
 
 - Made `pyproject.toml` use maturin's dynamic version metadata so the Python package version is
