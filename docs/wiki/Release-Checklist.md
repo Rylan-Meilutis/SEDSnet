@@ -67,6 +67,11 @@ native C dependencies such as `zstd-sys`. macOS wheels use the same osxcross Doc
 SmartCopy when those images are reachable. On a macOS host, the helper falls back to local maturin
 macOS builds if the osxcross image cannot be pulled.
 
+Before building or uploading PyPI artifacts, the helper removes older `sedsnet` wheel and sdist
+versions from the selected artifact directory. The GitHub release workflow runs the same cleanup
+after combining its platform artifacts, preventing old versions from producing skip-existing
+warnings.
+
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin`
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin`
 

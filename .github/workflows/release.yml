@@ -172,11 +172,18 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Remove stale package artifacts
+        run: |
+          python3 publish_crates.py --skip-crates --skip-tests \
+            --prune-pypi-artifacts --wheel-out dist
 
       - name: Publish to PyPI
         continue-on-error: true
