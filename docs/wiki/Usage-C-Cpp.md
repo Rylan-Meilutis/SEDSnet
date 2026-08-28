@@ -70,7 +70,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.4
+    GIT_TAG v4.0.5
 )
 FetchContent_MakeAvailable(sedsnet)
 

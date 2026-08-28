@@ -1,5 +1,22 @@
 # Changelogs
 
+## Version 4.0.5 highlights
+
+- Embedded memory safety:
+    - Immutable `no_std` routers discard remote discovery schemas without allocating a decoded
+      snapshot that cannot be merged.
+    - Hosted `no_std` validation exercises the behavior with a 128 KiB remote schema packet as
+      part of the normal test route.
+- Allocation and leak regression coverage:
+    - An allocator-instrumented lifecycle test repeatedly churns schemas, packets, routers, relays,
+      queues, sides, and failed schema loads.
+    - Every completed cycle must return live heap allocation counts and bytes to a stable warmed
+      baseline, while transient heap use remains bounded.
+    - Single-byte JSON reader coverage validates schema streaming below the 512-byte default buffer.
+- Link-churn performance:
+    - Router and relay side-table capacity is reused across removal/re-addition cycles and remains
+      fully owned and reclaimable when the instance is dropped.
+
 ## Version 4.0.4 highlights
 
 - CI compatibility:

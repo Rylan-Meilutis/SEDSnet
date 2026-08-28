@@ -7612,7 +7612,10 @@ impl Router {
             while st.sides.last().is_some_and(Option::is_none) {
                 st.sides.pop();
             }
-            st.sides.shrink_to_fit();
+            // Keep the small side table allocation for reuse. Embedded links can
+            // disappear and return frequently; shrinking here turned every tail
+            // remove/add cycle into a free/allocation pair. The retained capacity
+            // remains owned by the router and is released when the router drops.
             st.route_overrides
                 .retain(|(src_side, dst_side), _| *src_side != Some(side) && *dst_side != side);
             st.typed_route_overrides

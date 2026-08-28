@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "4.0.4"
+version = "4.0.5"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -67,6 +67,16 @@ required-features = ["std", "compression", "timesync"]
 name = "compression_memory_pool_test"
 path = "tests/rust-system-test/compression_memory_pool_test.rs"
 required-features = ["std", "compression", "timesync"]
+
+[[test]]
+name = "memory_lifecycle_test"
+path = "tests/rust-system-test/memory_lifecycle_test.rs"
+required-features = ["std", "discovery"]
+
+[[test]]
+name = "embedded_memory_behavior_test"
+path = "tests/rust-system-test/embedded_memory_behavior_test.rs"
+required-features = ["embedded"]
 
 [[bench]]
 name = "packet_paths"

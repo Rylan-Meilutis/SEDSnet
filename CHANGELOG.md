@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.0.5
+
+- Avoid decoding remote discovery schemas on immutable `no_std` nodes. The previous no-op merge
+  path transiently allocated the complete remote schema and could exhaust embedded heaps when
+  boards connected.
+- Added allocator-instrumented lifecycle coverage that repeatedly creates, fills, clears, and drops
+  routers, relays, schemas, packets, and failure rollbacks, asserting that live allocation counts
+  and bytes return to a stable baseline after every cycle.
+- Added a hosted `no_std` regression to the merge/release test route that exercises a 128 KiB remote
+  schema packet without decoding or retaining another payload allocation.
+- Added single-byte schema streaming coverage to keep JSON loading valid with buffers smaller than
+  the 512-byte default on constrained `std` targets.
+- Reuse router and relay side-table capacity across link removal/re-addition cycles, avoiding
+  unnecessary allocator churn while still releasing all retained capacity when the instance drops.
+
 ## 4.0.4
 
 - Fixed Rust 1.98 Clippy compatibility in the default merge/release validation route by removing
@@ -10,9 +25,6 @@
 
 ## 4.0.3
 
-- Avoid decoding remote discovery schemas on immutable `no_std` nodes. The
-  previous no-op merge path transiently allocated the complete remote schema
-  and could exhaust embedded heaps when two boards connected.
 - Removed intentionally leaked runtime schema metadata and C/Python router/relay side names;
   removal and replacement now release owned strings and endpoint lists.
 - Made JSON schema files stream through a configurable 512-byte default buffer under a hard

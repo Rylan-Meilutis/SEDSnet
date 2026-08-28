@@ -3365,7 +3365,8 @@ impl Relay {
         while st.sides.last().is_some_and(Option::is_none) {
             st.sides.pop();
         }
-        st.sides.shrink_to_fit();
+        // Preserve capacity for link churn. It is bounded by the maximum number
+        // of sides seen by this relay and is reclaimed when the relay drops.
         st.route_overrides
             .retain(|(src_side, dst_side), _| *src_side != Some(side) && *dst_side != side);
         st.typed_route_overrides

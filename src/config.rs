@@ -3261,6 +3261,21 @@ pub(crate) fn seed_test_schema() {
 mod memory_regression_tests {
     use super::*;
 
+    struct OneByteReader<'a> {
+        remaining: &'a [u8],
+    }
+
+    impl std::io::Read for OneByteReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if out.is_empty() || self.remaining.is_empty() {
+                return Ok(0);
+            }
+            out[0] = self.remaining[0];
+            self.remaining = &self.remaining[1..];
+            Ok(1)
+        }
+    }
+
     #[test]
     fn runtime_schema_storage_is_owned_and_reclaimable() {
         let mut reg = Registry::new();
@@ -3343,5 +3358,45 @@ mod memory_regression_tests {
         assert_eq!(reg.schema_byte_cost(), baseline_cost);
         assert_eq!(reg.endpoints.len(), baseline_endpoints);
         assert_eq!(reg.next_endpoint_id, next_endpoint_id);
+    }
+
+    #[test]
+    fn streaming_schema_loads_through_single_byte_reads() {
+        let mut reg = Registry::new();
+        let baseline_cost = reg.schema_byte_cost();
+        let json = br#"{
+            "endpoints": [{
+                "rust": "SingleByteReaderEndpoint",
+                "name": "SINGLE_BYTE_READER_ENDPOINT",
+                "description": "streamed one byte at a time"
+            }],
+            "types": [{
+                "rust": "SingleByteReaderType",
+                "name": "SINGLE_BYTE_READER_TYPE",
+                "class": "Data",
+                "element": {"kind": "Dynamic", "data_type": "Binary"},
+                "endpoints": ["SingleByteReaderEndpoint"]
+            }]
+        }"#;
+
+        register_schema_json_reader_into(
+            &mut reg,
+            OneByteReader { remaining: json },
+            false,
+            baseline_cost + 16 * 1024,
+        )
+        .unwrap();
+
+        assert!(
+            reg.endpoints
+                .iter()
+                .any(|(_, meta)| meta.name.as_ref() == "SINGLE_BYTE_READER_ENDPOINT")
+        );
+        assert!(
+            reg.types
+                .iter()
+                .any(|(_, meta)| meta.name.as_ref() == "SINGLE_BYTE_READER_TYPE")
+        );
+        assert!(reg.schema_byte_cost() > baseline_cost);
     }
 }

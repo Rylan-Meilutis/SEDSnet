@@ -91,6 +91,13 @@ operation, so its reserved bytes come out of the shared budget immediately. If o
 is idle, another can use more of the remaining budget; if several areas fill at once, older queued
 state is evicted so total queue-owned memory stays bounded.
 
+The test route includes an allocator-instrumented lifecycle regression that repeatedly creates,
+fills, clears, and drops routers, relays, runtime schemas, and packets. Each cycle must return live
+allocation counts and bytes to the warmed baseline. A separate hosted `no_std` regression verifies
+that immutable embedded routers discard remote schema snapshots without decoding them into a second
+large allocation. Link side-table capacity is reused during remove/add churn and released when the
+owning router or relay is dropped.
+
 Reliable delivery uses internal ACK/request control packets. Ordered reliable receivers buffer out-of-order packets,
 partial-ACK packets that arrived after a gap, request the missing sequence, and then release the buffered run as soon as
 the gap is filled. A partial ACK suppresses timeout retransmission for that exact packet, but an explicit packet request
@@ -430,7 +437,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.4
+    GIT_TAG v4.0.5
 )
 FetchContent_MakeAvailable(sedsnet)
 

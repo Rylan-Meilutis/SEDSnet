@@ -115,6 +115,12 @@ multiple routers with small `RuntimeMemoryConfig` pools, injects large discovery
 queues telemetry RX/TX work, and asserts each router's exported memory layout remains within its
 configured shared queue budget throughout the pressure run.
 
+`memory_lifecycle_test` tracks the process allocator while schemas, packets, routers, relays, and
+failure rollbacks are repeatedly created and destroyed. Live allocation counts and bytes must
+return to the warmed baseline after every cycle. `embedded_memory_behavior_test` runs the library's
+`no_std` path on the host and verifies that immutable embedded routers discard large remote schema
+snapshots without decoding or retaining another payload allocation.
+
 This repo does not currently publish or gate on a single required coverage percentage in `build.py test`. Coverage is
 tracked primarily through regression tests across unit, Rust system, and C system layers. If you want a local
 percentage/HTML report, use `cargo-llvm-cov`:
@@ -295,7 +301,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.4
+    GIT_TAG v4.0.5
 )
 FetchContent_MakeAvailable(sedsnet)
 

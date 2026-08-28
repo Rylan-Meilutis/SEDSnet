@@ -771,22 +771,38 @@ fn helpers_packet_hex_to_string() {
 }
 
 #[test]
-fn router_and_relay_side_churn_reclaims_names_and_slots() {
+fn router_and_relay_side_churn_reclaims_names_and_reuses_slots() {
     let router = Router::new(RouterConfig::default());
     let relay = Relay::new(timeout_tests::StepClock::new_default_box());
+    let mut router_capacity = None;
+    let mut relay_capacity = None;
 
     for index in 0..256 {
         let router_side = router.add_side_packed(format!("router-side-{index}"), |_| Ok(()));
         assert_eq!(router_side, 0);
         router.remove_side(router_side).unwrap();
+        let router_storage = router.debug_side_storage();
+        assert_eq!(router_storage.0, 0);
+        if let Some(capacity) = router_capacity {
+            assert_eq!(router_storage.1, capacity);
+        } else {
+            router_capacity = Some(router_storage.1);
+        }
 
         let relay_side = relay.add_side_packed(format!("relay-side-{index}"), |_| Ok(()));
         assert_eq!(relay_side, 0);
         relay.remove_side(relay_side).unwrap();
+        let relay_storage = relay.debug_side_storage();
+        assert_eq!(relay_storage.0, 0);
+        if let Some(capacity) = relay_capacity {
+            assert_eq!(relay_storage.1, capacity);
+        } else {
+            relay_capacity = Some(relay_storage.1);
+        }
     }
 
-    assert_eq!(router.debug_side_storage(), (0, 0));
-    assert_eq!(relay.debug_side_storage(), (0, 0));
+    assert!(router_capacity.is_some_and(|capacity| capacity > 0 && capacity <= 4));
+    assert!(relay_capacity.is_some_and(|capacity| capacity > 0 && capacity <= 4));
 }
 
 /// Port of C++: TEST(Helpers, CopyPacket).
