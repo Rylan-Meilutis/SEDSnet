@@ -228,7 +228,7 @@ impl RelaySideOptions {
 /// One side of the relay – a name + TX handler.
 #[derive(Clone)]
 pub struct RelaySide {
-    pub name: &'static str,
+    pub name: Arc<str>,
     pub tx_handler: RelayTxHandlerFn,
     pub opts: RelaySideOptions,
 }
@@ -1782,7 +1782,7 @@ impl Relay {
         let sender = self.sender_arc();
         Packet::new(
             control_ty,
-            message_meta(control_ty).endpoints,
+            &message_meta(control_ty).endpoints,
             sender.as_ref(),
             self.clock.now_ms(),
             crate::router::encode_slice_le(&[ty.as_u32(), seq]),
@@ -3240,8 +3240,9 @@ impl Relay {
     ///
     /// Returns the side id later used for ingress APIs such as `rx_packed_from_side`.
     /// The default options disable the relay's per-link reliable framing on this side.
-    pub fn add_side_packed<F>(&self, name: &'static str, tx: F) -> RelaySideId
+    pub fn add_side_packed<N, F>(&self, name: N, tx: F) -> RelaySideId
     where
+        N: AsRef<str>,
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         self.add_side_packed_with_options(name, tx, RelaySideOptions::default())
@@ -3250,13 +3251,14 @@ impl Relay {
     /// Register a packed side with bounded-frame transport enabled.
     ///
     /// `max_frame_bytes == 0` leaves frames unbounded.
-    pub fn add_side_packed_small_packets<F>(
+    pub fn add_side_packed_small_packets<N, F>(
         &self,
-        name: &'static str,
+        name: N,
         tx: F,
         max_frame_bytes: usize,
     ) -> RelaySideId
     where
+        N: AsRef<str>,
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         self.add_side_packed_with_options(
@@ -3271,22 +3273,30 @@ impl Relay {
     /// `opts.reliable_enabled` enables relay-managed per-hop ACK/retransmit behavior on this side.
     /// `opts.link_local_enabled` gates link-local-only forwarding and discovery use of this side.
     /// `ingress_enabled` and `egress_enabled` set the initial directional policy.
-    pub fn add_side_packed_with_options<F>(
+    pub fn add_side_packed_with_options<N, F>(
         &self,
-        name: &'static str,
+        name: N,
         tx: F,
         opts: RelaySideOptions,
     ) -> RelaySideId
     where
+        N: AsRef<str>,
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         let mut st = self.state.lock();
-        let id = st.sides.len();
-        st.sides.push(Some(RelaySide {
-            name,
+        let side = Some(RelaySide {
+            name: Arc::from(name.as_ref()),
             tx_handler: RelayTxHandlerFn::Packed(Arc::new(tx)),
             opts,
-        }));
+        });
+        let id = if let Some(id) = st.sides.iter().position(Option::is_none) {
+            st.sides[id] = side;
+            id
+        } else {
+            let id = st.sides.len();
+            st.sides.push(side);
+            id
+        };
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
         st.side_transport.insert(id, SideTransportState::default());
@@ -3299,30 +3309,39 @@ impl Relay {
     ///
     /// Packet-output sides do not preserve the relay's packed reliable hop framing, so use a
     /// packed side when this hop should participate in relay-managed per-link reliability.
-    pub fn add_side_packet<F>(&self, name: &'static str, tx: F) -> RelaySideId
+    pub fn add_side_packet<N, F>(&self, name: N, tx: F) -> RelaySideId
     where
+        N: AsRef<str>,
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         self.add_side_packet_with_options(name, tx, RelaySideOptions::default())
     }
 
     /// Register a packet-output side with explicit side options.
-    pub fn add_side_packet_with_options<F>(
+    pub fn add_side_packet_with_options<N, F>(
         &self,
-        name: &'static str,
+        name: N,
         tx: F,
         opts: RelaySideOptions,
     ) -> RelaySideId
     where
+        N: AsRef<str>,
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         let mut st = self.state.lock();
-        let id = st.sides.len();
-        st.sides.push(Some(RelaySide {
-            name,
+        let side = Some(RelaySide {
+            name: Arc::from(name.as_ref()),
             tx_handler: RelayTxHandlerFn::Packet(Arc::new(tx)),
             opts,
-        }));
+        });
+        let id = if let Some(id) = st.sides.iter().position(Option::is_none) {
+            st.sides[id] = side;
+            id
+        } else {
+            let id = st.sides.len();
+            st.sides.push(side);
+            id
+        };
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
         st.side_transport.insert(id, SideTransportState::default());
@@ -3343,6 +3362,10 @@ impl Relay {
             return Err(TelemetryError::BadArg);
         }
         *slot = None;
+        while st.sides.last().is_some_and(Option::is_none) {
+            st.sides.pop();
+        }
+        st.sides.shrink_to_fit();
         st.route_overrides
             .retain(|(src_side, dst_side), _| *src_side != Some(side) && *dst_side != side);
         st.typed_route_overrides
@@ -3659,7 +3682,7 @@ impl Relay {
                     .collect();
                 Some(TopologySideRoute {
                     side_id,
-                    side_name: side.name,
+                    side_name: side.name.to_string(),
                     reachable_endpoints: route
                         .reachable
                         .iter()
@@ -3713,9 +3736,9 @@ impl Relay {
                 .sides
                 .get(*side_id)
                 .and_then(|side| side.as_ref())
-                .map(|side| side.name)
+                .map(|side| side.name.clone())
             {
-                side_names.push(side_name);
+                side_names.push(side_name.to_string());
             }
             last_seen_ms = Some(last_seen_ms.unwrap_or(0).max(sender_state.last_seen_ms));
             reachable_endpoints.extend(sender_state.reachable.iter().copied());
@@ -3801,7 +3824,7 @@ impl Relay {
             data_types.sort_unstable_by_key(|item| item.data_type.as_u32());
             sides.push(RuntimeSideStats {
                 side_id,
-                side_name: side.name,
+                side_name: side.name.to_string(),
                 reliable_enabled: side.opts.reliable_enabled,
                 link_local_enabled: side.opts.link_local_enabled,
                 header_template_enabled: side.opts.header_template_enabled,
@@ -4040,6 +4063,12 @@ impl Relay {
     pub(crate) fn debug_reliable_return_route_count(&self) -> usize {
         let st = self.state.lock();
         st.reliable_return_routes.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_side_storage(&self) -> (usize, usize) {
+        let st = self.state.lock();
+        (st.sides.len(), st.sides.capacity())
     }
 
     /// Enqueue packed bytes that originated from `src` into the relay RX queue.

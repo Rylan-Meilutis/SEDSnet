@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::{DataType, RouteSelectionMode};
 
@@ -33,7 +33,7 @@ pub struct AdaptiveLinkStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSideStats {
     pub side_id: usize,
-    pub side_name: &'static str,
+    pub side_name: String,
     pub reliable_enabled: bool,
     pub link_local_enabled: bool,
     pub header_template_enabled: bool,

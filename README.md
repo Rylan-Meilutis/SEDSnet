@@ -602,9 +602,20 @@ Or seed from JSON at runtime. Host builds can use:
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-Default builds do not compile application JSON into the crate. Embedded builds can include
-`telemetry_config.json` bytes only when the application provides that file locally before building;
-those bytes are decoded through the normal runtime JSON parser.
+File registration is streamed through a 512-byte buffer rather than reading the whole document into
+memory. Embedded `std` builds can override that buffer with the build-time
+`SCHEMA_JSON_CHUNK_BYTES` environment variable; `no_std` builds allocate no file-read buffer. JSON
+entries are retained only while they fit the schema budget (the packaged
+`MAX_QUEUE_BUDGET` by default); oversized input, an oversized resulting schema, or malformed data
+returns an error and atomically removes entries added earlier in that load. Rust callers that need
+an explicit limit can use `register_schema_json_file_with_budget(...)` or
+`register_schema_json_bytes_with_budget(...)`.
+
+Default builds do not compile application JSON into the crate. When an embedded application places
+`telemetry_config.json` in the fetched SEDSNet source directory, the build script converts it to
+static endpoint and data-type definitions. The metadata then stays in flash and requires no JSON
+parse or leaked allocations during startup. Embedded discovery retains names and routing metadata
+on the wire but omits documentation-only descriptions to keep the discovery snapshot bounded.
 
 The GUI editor still edits JSON schema files:
 

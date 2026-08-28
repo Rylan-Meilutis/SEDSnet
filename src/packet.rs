@@ -591,7 +591,7 @@ impl Packet {
             if i != 0 {
                 out.push_str(", ");
             }
-            out.push_str(ep.as_str());
+            out.push_str(&ep.as_str());
         }
         out.push_str("], Timestamp: ");
         let _ = write!(&mut out, "{}", self.timestamp);

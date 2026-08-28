@@ -945,7 +945,7 @@ impl RouterSideOptions {
 /// One side of the router – a name + TX handler.
 #[derive(Clone, Debug)]
 pub struct RouterSide {
-    pub name: &'static str,
+    pub name: Arc<str>,
     pub tx_handler: RouterTxHandlerFn,
     pub opts: RouterSideOptions,
 }
@@ -993,6 +993,17 @@ impl EndpointHandler {
     }
 
     /// Create a new packet handler from a runtime endpoint definition.
+    #[inline]
+    #[cfg(feature = "std")]
+    pub fn new_packet_handler_for<F>(endpoint: crate::config::OwnedEndpointDefinition, f: F) -> Self
+    where
+        F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        Self::new_packet_handler(endpoint.id, f)
+    }
+
+    /// Create a new packet handler from a static endpoint definition.
+    #[cfg(not(feature = "std"))]
     #[inline]
     pub fn new_packet_handler_for<F>(endpoint: crate::config::EndpointDefinition, f: F) -> Self
     where
@@ -1597,21 +1608,21 @@ where
     }
 
     let payload = encode_slice_le(data);
-    let pkt = Packet::new(ty, meta.endpoints, sender, timestamp, payload)?;
+    let pkt = Packet::new(ty, &meta.endpoints, sender, timestamp, payload)?;
     tx_function(pkt)
 }
 
 /// Fallback printing for error messages when no local endpoints exist.
 /// - With `std`: prints to stderr.
 /// - Without `std`: forwards to `seds_error_msg` (platform-provided).
-fn fallback_stdout(msg: &str) {
+fn fallback_stdout(_msg: &str) {
     #[cfg(feature = "std")]
     {
-        eprintln!("{}", msg);
+        eprintln!("{}", _msg);
     }
     #[cfg(all(not(feature = "std"), target_os = "none"))]
     {
-        let message = format!("{}\n", msg);
+        let message = format!("{}\n", _msg);
         unsafe {
             seds_error_msg(message.as_ptr(), message.len());
         }
@@ -3736,7 +3747,7 @@ impl Router {
         let ack_sender = self.encode_end_to_end_ack_sender();
         let ack = Packet::new(
             DataType::ReliableAck,
-            message_meta(DataType::ReliableAck).endpoints,
+            &message_meta(DataType::ReliableAck).endpoints,
             ack_sender.as_str(),
             self.packet_timestamp_ms(),
             Self::encode_end_to_end_reliable_ack(packet_id),
@@ -4984,7 +4995,7 @@ impl Router {
                 let payload = make_error_payload("managed variable permission denied");
                 let err = Packet::new(
                     DataType::TelemetryError,
-                    message_meta(DataType::TelemetryError).endpoints,
+                    &message_meta(DataType::TelemetryError).endpoints,
                     self.sender_arc().as_ref(),
                     self.clock.now_ms(),
                     payload,
@@ -5186,7 +5197,7 @@ impl Router {
         let sender = self.sender_arc();
         Packet::new(
             control_ty,
-            message_meta(control_ty).endpoints,
+            &message_meta(control_ty).endpoints,
             sender.as_ref(),
             self.packet_timestamp_ms(),
             encode_slice_le(&[ty.as_u32(), seq]),
@@ -7456,8 +7467,9 @@ impl Router {
     /// The default options disable the router's per-link reliable framing on this side. Use
     /// [`Router::add_side_packed_with_options`] when this hop should participate in router
     /// reliable ACK/retransmit behavior.
-    pub fn add_side_packed<F>(&self, name: &'static str, tx: F) -> RouterSideId
+    pub fn add_side_packed<N, F>(&self, name: N, tx: F) -> RouterSideId
     where
+        N: AsRef<str>,
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         self.add_side_packed_with_options(name, tx, RouterSideOptions::default())
@@ -7466,13 +7478,14 @@ impl Router {
     /// Register a packed side with the compact small-packet transport preset enabled.
     ///
     /// `max_frame_bytes == 0` keeps header-template reuse enabled without chunking.
-    pub fn add_side_packed_small_packets<F>(
+    pub fn add_side_packed_small_packets<N, F>(
         &self,
-        name: &'static str,
+        name: N,
         tx: F,
         max_frame_bytes: usize,
     ) -> RouterSideId
     where
+        N: AsRef<str>,
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         self.add_side_packed_with_options(
@@ -7490,22 +7503,30 @@ impl Router {
     ///
     /// `opts.link_local_enabled` allows link-local-only endpoints and discovery routes to use this
     /// side. `ingress_enabled` and `egress_enabled` set the initial directional policy.
-    pub fn add_side_packed_with_options<F>(
+    pub fn add_side_packed_with_options<N, F>(
         &self,
-        name: &'static str,
+        name: N,
         tx: F,
         opts: RouterSideOptions,
     ) -> RouterSideId
     where
+        N: AsRef<str>,
         F: Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         let mut st = self.state.lock();
-        let id = st.sides.len();
-        st.sides.push(Some(RouterSide {
-            name,
+        let side = Some(RouterSide {
+            name: Arc::from(name.as_ref()),
             tx_handler: RouterTxHandlerFn::Packed(Arc::new(tx)),
             opts,
-        }));
+        });
+        let id = if let Some(id) = st.sides.iter().position(Option::is_none) {
+            st.sides[id] = side;
+            id
+        } else {
+            let id = st.sides.len();
+            st.sides.push(side);
+            id
+        };
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
         st.side_transport.insert(id, SideTransportState::default());
@@ -7518,8 +7539,9 @@ impl Router {
     ///
     /// Packet-output sides do not preserve the packed reliable hop framing, so
     /// `RouterSideOptions::reliable_enabled` only has effect for packed sides.
-    pub fn add_side_packet<F>(&self, name: &'static str, tx: F) -> RouterSideId
+    pub fn add_side_packet<N, F>(&self, name: N, tx: F) -> RouterSideId
     where
+        N: AsRef<str>,
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         self.add_side_packet_with_options(name, tx, RouterSideOptions::default())
@@ -7530,22 +7552,30 @@ impl Router {
     /// `opts.reliable_enabled` still records the operator's intent for this side, but packet-based
     /// callbacks receive decoded packets rather than the router's packed reliable hop framing.
     /// For router-managed per-link reliable sequencing and ACKs, use a packed side instead.
-    pub fn add_side_packet_with_options<F>(
+    pub fn add_side_packet_with_options<N, F>(
         &self,
-        name: &'static str,
+        name: N,
         tx: F,
         opts: RouterSideOptions,
     ) -> RouterSideId
     where
+        N: AsRef<str>,
         F: Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static,
     {
         let mut st = self.state.lock();
-        let id = st.sides.len();
-        st.sides.push(Some(RouterSide {
-            name,
+        let side = Some(RouterSide {
+            name: Arc::from(name.as_ref()),
             tx_handler: RouterTxHandlerFn::Packet(Arc::new(tx)),
             opts,
-        }));
+        });
+        let id = if let Some(id) = st.sides.iter().position(Option::is_none) {
+            st.sides[id] = side;
+            id
+        } else {
+            let id = st.sides.len();
+            st.sides.push(side);
+            id
+        };
         st.side_runtime_stats
             .insert(id, SideRuntimeStatsInner::default());
         st.side_transport.insert(id, SideTransportState::default());
@@ -7567,6 +7597,10 @@ impl Router {
                 return Err(TelemetryError::BadArg);
             }
             *slot = None;
+            while st.sides.last().is_some_and(Option::is_none) {
+                st.sides.pop();
+            }
+            st.sides.shrink_to_fit();
             st.route_overrides
                 .retain(|(src_side, dst_side), _| *src_side != Some(side) && *dst_side != side);
             st.typed_route_overrides
@@ -8081,7 +8115,7 @@ impl Router {
                     .collect();
                 Some(TopologySideRoute {
                     side_id,
-                    side_name: side.name,
+                    side_name: side.name.to_string(),
                     reachable_endpoints: route
                         .reachable
                         .iter()
@@ -8135,9 +8169,9 @@ impl Router {
                 .sides
                 .get(*side_id)
                 .and_then(|side| side.as_ref())
-                .map(|side| side.name)
+                .map(|side| side.name.clone())
             {
-                side_names.push(side_name);
+                side_names.push(side_name.to_string());
             }
             last_seen_ms = Some(last_seen_ms.unwrap_or(0).max(sender_state.last_seen_ms));
             reachable_endpoints.extend(sender_state.reachable.iter().copied());
@@ -8224,7 +8258,7 @@ impl Router {
             data_types.sort_unstable_by_key(|item| item.data_type.as_u32());
             sides.push(RuntimeSideStats {
                 side_id,
-                side_name: side.name,
+                side_name: side.name.to_string(),
                 reliable_enabled: side.opts.reliable_enabled,
                 link_local_enabled: side.opts.link_local_enabled,
                 header_template_enabled: side.opts.header_template_enabled,
@@ -8480,6 +8514,12 @@ impl Router {
     pub(crate) fn debug_reliable_return_route_count(&self) -> usize {
         let st = self.state.lock();
         st.reliable_return_routes.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_side_storage(&self) -> (usize, usize) {
+        let st = self.state.lock();
+        (st.sides.len(), st.sides.capacity())
     }
 
     #[cfg(test)]

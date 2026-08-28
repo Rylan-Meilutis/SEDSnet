@@ -1,7 +1,8 @@
 use crate::config::{STATIC_HEX_LENGTH, STATIC_STRING_LENGTH, get_message_meta};
 use crate::get_needed_message_size;
 use crate::packet::Packet;
-use crate::router::{Clock, EndpointHandler};
+use crate::relay::Relay;
+use crate::router::{Clock, EndpointHandler, Router, RouterConfig};
 use crate::{DataEndpoint, DataType, MessageDataType, TelemetryError, get_data_type, message_meta};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -767,6 +768,25 @@ fn helpers_packet_hex_to_string() {
     let got = pkt.to_hex_string();
     let expect = "Type: GPS_DATA, Data Size: 12, Sender: TEST_PLATFORM, Endpoints: [SD_CARD, RADIO], Timestamp: 1123581321 (312h 06m 21s 321ms), Data (hex): 0x00 0x00 0x98 0x41 0x00 0x00 0x04 0x42 0x00 0x00 0x50 0x42";
     assert_eq!(got, expect);
+}
+
+#[test]
+fn router_and_relay_side_churn_reclaims_names_and_slots() {
+    let router = Router::new(RouterConfig::default());
+    let relay = Relay::new(timeout_tests::StepClock::new_default_box());
+
+    for index in 0..256 {
+        let router_side = router.add_side_packed(format!("router-side-{index}"), |_| Ok(()));
+        assert_eq!(router_side, 0);
+        router.remove_side(router_side).unwrap();
+
+        let relay_side = relay.add_side_packed(format!("relay-side-{index}"), |_| Ok(()));
+        assert_eq!(relay_side, 0);
+        relay.remove_side(relay_side).unwrap();
+    }
+
+    assert_eq!(router.debug_side_storage(), (0, 0));
+    assert_eq!(relay.debug_side_storage(), (0, 0));
 }
 
 /// Port of C++: TEST(Helpers, CopyPacket).
@@ -5693,7 +5713,7 @@ mod reliable_tests {
 
         let ack1 = Packet::new(
             DataType::ReliableAck,
-            crate::message_meta(DataType::ReliableAck).endpoints,
+            &crate::message_meta(DataType::ReliableAck).endpoints,
             "RX",
             0,
             crate::router::encode_slice_le(&[DataType::named("GPS_DATA").as_u32(), 1]),
@@ -5711,7 +5731,7 @@ mod reliable_tests {
         sent_frames.lock().unwrap().clear();
         let request2 = Packet::new(
             DataType::ReliablePacketRequest,
-            crate::message_meta(DataType::ReliablePacketRequest).endpoints,
+            &crate::message_meta(DataType::ReliablePacketRequest).endpoints,
             "RX",
             0,
             crate::router::encode_slice_le(&[DataType::named("GPS_DATA").as_u32(), 2]),
@@ -6321,7 +6341,7 @@ mod router_tests {
         fn endpoint_by_name(name: &str) -> Option<DataEndpoint> {
             for i in 0..=crate::MAX_VALUE_DATA_ENDPOINT {
                 if let Some(ep) = DataEndpoint::try_from_u32(i)
-                    && ep.as_str() == name
+                    && ep.as_str().as_ref() == name
                 {
                     return Some(ep);
                 }
@@ -6332,7 +6352,7 @@ mod router_tests {
         fn datatype_by_name(name: &str) -> Option<DataType> {
             for i in 0..=crate::MAX_VALUE_DATA_TYPE {
                 if let Some(ty) = DataType::try_from_u32(i)
-                    && crate::get_message_name(ty) == name
+                    && crate::get_message_name(ty).as_ref() == name
                 {
                     return Some(ty);
                 }
@@ -7074,7 +7094,7 @@ mod router_tests {
 
             let ack = Packet::new(
                 DataType::ReliableAck,
-                crate::message_meta(DataType::ReliableAck).endpoints,
+                &crate::message_meta(DataType::ReliableAck).endpoints,
                 "E2EACK:DEST_A",
                 0,
                 Arc::<[u8]>::from(packet_id.to_le_bytes().to_vec()),
@@ -10115,7 +10135,7 @@ mod router_tests {
             let packet_id = 77u64;
             let ack = Packet::new(
                 DataType::ReliableAck,
-                crate::message_meta(DataType::ReliableAck).endpoints,
+                &crate::message_meta(DataType::ReliableAck).endpoints,
                 "E2EACK:DEST_A",
                 0,
                 Arc::<[u8]>::from(packet_id.to_le_bytes().to_vec()),
@@ -10176,7 +10196,7 @@ mod router_tests {
 
             let ack = Packet::new(
                 DataType::ReliableAck,
-                crate::message_meta(DataType::ReliableAck).endpoints,
+                &crate::message_meta(DataType::ReliableAck).endpoints,
                 "E2EACK:DEST_A",
                 0,
                 Arc::<[u8]>::from(packet_id.to_le_bytes().to_vec()),
@@ -10226,7 +10246,7 @@ mod router_tests {
             for idx in 0..(RELIABLE_MAX_END_TO_END_PENDING.max(1) + 4) {
                 let ack = Packet::new(
                     DataType::ReliableAck,
-                    crate::message_meta(DataType::ReliableAck).endpoints,
+                    &crate::message_meta(DataType::ReliableAck).endpoints,
                     &format!("E2EACK:DEST_{idx}"),
                     idx as u64,
                     Arc::<[u8]>::from(packet_id.to_le_bytes().to_vec()),
@@ -10244,7 +10264,7 @@ mod router_tests {
             for idx in 0..(RELIABLE_MAX_END_TO_END_ACK_CACHE.max(1) + 4) {
                 let ack = Packet::new(
                     DataType::ReliableAck,
-                    crate::message_meta(DataType::ReliableAck).endpoints,
+                    &crate::message_meta(DataType::ReliableAck).endpoints,
                     "E2EACK:DEST_A",
                     idx as u64,
                     Arc::<[u8]>::from((10_000u64 + idx as u64).to_le_bytes().to_vec()),
@@ -10989,7 +11009,9 @@ mod router_tests {
         fn router_runtime_memory_budget_caps_queued_state() {
             crate::tests::ensure_common_test_schema();
             let ep = DataEndpoint::named("RADIO");
-            let memory = crate::config::RuntimeMemoryConfig::new(8192, 8, 512, 1.5).unwrap();
+            // Leave room for the initial discovery snapshot, then verify that
+            // sustained user traffic remains within the shared pool.
+            let memory = crate::config::RuntimeMemoryConfig::new(16_384, 8, 512, 1.5).unwrap();
             let router = Router::new_with_clock(
                 RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
                     .with_memory_config(memory)
@@ -11020,12 +11042,12 @@ mod router_tests {
                 serde_json::from_str(&router.export_memory_layout_json()).unwrap();
             let used = json["shared_queue_bytes_used"].as_u64().unwrap();
             let allocated = json["shared_queue_bytes_allocated"].as_u64().unwrap();
-            assert_eq!(allocated, 8192);
+            assert_eq!(allocated, 16_384);
             assert!(
                 used <= allocated,
                 "router queued state exceeded runtime memory budget: used={used} allocated={allocated}"
             );
-            assert!(router.debug_shared_queue_bytes_used() <= 8192);
+            assert!(router.debug_shared_queue_bytes_used() <= 16_384);
             assert!(
                 json["rx_queue_len"].as_u64().unwrap() + json["tx_queue_len"].as_u64().unwrap()
                     < 600,
@@ -11683,7 +11705,7 @@ mod router_tests {
             assert!(!endpoint_exists(endpoint));
             let _handler = EndpointHandler::new_packet_handler(endpoint, |_pkt: &Packet| Ok(()));
             assert!(endpoint_exists(endpoint));
-            assert_eq!(endpoint.as_str(), "ENDPOINT_249");
+            assert_eq!(endpoint.as_str().as_ref(), "ENDPOINT_249");
         }
 
         #[test]
