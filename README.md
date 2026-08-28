@@ -602,8 +602,10 @@ Or seed from JSON at runtime. Host builds can use:
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-File registration is streamed through an 8 KiB buffer rather than reading the whole document into
-memory. JSON entries are retained only while they fit the schema budget (the packaged
+File registration is streamed through a 512-byte buffer rather than reading the whole document into
+memory. Embedded `std` builds can override that buffer with the build-time
+`SCHEMA_JSON_CHUNK_BYTES` environment variable; `no_std` builds allocate no file-read buffer. JSON
+entries are retained only while they fit the schema budget (the packaged
 `MAX_QUEUE_BUDGET` by default); oversized input, an oversized resulting schema, or malformed data
 returns an error and atomically removes entries added earlier in that load. Rust callers that need
 an explicit limit can use `register_schema_json_file_with_budget(...)` or

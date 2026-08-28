@@ -89,9 +89,17 @@ pub const MAX_QUEUE_BUDGET: usize = match option_env!("MAX_QUEUE_BUDGET") {
     },
 };
 
-/// Read buffer used by bounded JSON schema loading.
+/// Read buffer used by bounded JSON schema loading. Embedded `std` builds can
+/// lower or raise it with `SCHEMA_JSON_CHUNK_BYTES`; `no_std` builds do not use
+/// a file-read buffer.
 #[cfg(feature = "std")]
-pub const SCHEMA_JSON_CHUNK_BYTES: usize = 8 * 1024;
+pub const SCHEMA_JSON_CHUNK_BYTES: usize = match option_env!("SCHEMA_JSON_CHUNK_BYTES") {
+    Some(value) => {
+        let parsed = parse_usize(value);
+        if parsed == 0 { 1 } else { parsed }
+    }
+    None => 512,
+};
 
 /// Maximum JSON input size relative to the retained schema budget. This permits
 /// normal formatting overhead without allowing an attacker-controlled document

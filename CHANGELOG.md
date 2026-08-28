@@ -4,8 +4,9 @@
 
 - Removed intentionally leaked runtime schema metadata and C/Python router/relay side names;
   removal and replacement now release owned strings and endpoint lists.
-- Made JSON schema files stream through an 8 KiB buffer under a hard input/schema memory limit,
-  with atomic rollback when parsing, validation, or budget enforcement fails.
+- Made JSON schema files stream through a configurable 512-byte default buffer under a hard
+  input/schema memory limit, with atomic rollback when parsing, validation, or budget enforcement
+  fails. `no_std` builds allocate no file-read buffer.
 - Generate embedded schema metadata as static flash-resident definitions instead of reparsing and
   leaking the bundled JSON at runtime. Embedded discovery omits documentation-only descriptions
   from the wire snapshot, keeping initialization within constrained shared pools.
