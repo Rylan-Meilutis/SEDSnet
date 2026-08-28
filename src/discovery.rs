@@ -88,7 +88,7 @@ pub struct TopologyAnnouncerRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologySideRoute {
     pub side_id: usize,
-    pub side_name: &'static str,
+    pub side_name: String,
     pub reachable_endpoints: Vec<DataEndpoint>,
     pub reachable_timesync_sources: Vec<String>,
     pub announcers: Vec<TopologyAnnouncerRoute>,
@@ -112,7 +112,7 @@ pub struct ClientStatsSnapshot {
     pub sender_id: String,
     pub connected: bool,
     pub side_ids: Vec<usize>,
-    pub side_names: Vec<&'static str>,
+    pub side_names: Vec<String>,
     pub last_seen_ms: Option<u64>,
     pub age_ms: Option<u64>,
     pub reachable_endpoints: Vec<DataEndpoint>,
@@ -871,7 +871,10 @@ fn read_u32(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telemetr
 
 /// Builds a discovery packet containing the complete runtime schema snapshot.
 pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
-    build_discovery_schema_from_snapshot(sender, timestamp_ms, export_schema())
+    #[cfg(feature = "std")]
+    return build_discovery_schema_from_owned_snapshot(sender, timestamp_ms, export_schema());
+    #[cfg(not(feature = "std"))]
+    return build_discovery_schema_from_snapshot(sender, timestamp_ms, export_schema());
 }
 
 /// Elects the authoritative discovery/schema master for the current topology view.
@@ -966,14 +969,86 @@ pub fn build_discovery_schema_from_snapshot(
         payload.extend_from_slice(&ep.id.as_u32().to_le_bytes());
         payload.push(ep.link_local_only as u8);
         encode_string(&mut payload, ep.name)?;
+        #[cfg(feature = "std")]
         encode_string(&mut payload, ep.description)?;
+        #[cfg(not(feature = "std"))]
+        encode_string(&mut payload, "")?;
     }
 
     payload.extend_from_slice(&(schema.types.len() as u32).to_le_bytes());
     for ty in schema.types {
         payload.extend_from_slice(&ty.id.as_u32().to_le_bytes());
         encode_string(&mut payload, ty.name)?;
+        #[cfg(feature = "std")]
         encode_string(&mut payload, ty.description)?;
+        #[cfg(not(feature = "std"))]
+        encode_string(&mut payload, "")?;
+        match ty.element {
+            MessageElement::Static(count, data_type, class) => {
+                payload.push(0);
+                payload.extend_from_slice(&(count as u32).to_le_bytes());
+                payload.push(message_data_type_code(data_type));
+                payload.push(message_class_code(class));
+            }
+            MessageElement::Dynamic(data_type, class) => {
+                payload.push(1);
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.push(message_data_type_code(data_type));
+                payload.push(message_class_code(class));
+            }
+        }
+        payload.push(reliable_code(ty.reliable));
+        payload.push(ty.priority);
+        payload.push(e2e_encryption_policy_code(ty.e2e_encryption));
+        payload.extend_from_slice(&(ty.endpoints.len() as u32).to_le_bytes());
+        for ep in ty.endpoints {
+            payload.extend_from_slice(&ep.as_u32().to_le_bytes());
+        }
+    }
+
+    Packet::new(
+        DataType::DiscoverySchema,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        payload.into(),
+    )
+}
+
+/// Builds a discovery schema packet from an owned snapshot.
+pub fn build_discovery_schema_from_owned_snapshot(
+    sender: &str,
+    timestamp_ms: u64,
+    mut schema: OwnedRuntimeSchemaSnapshot,
+) -> TelemetryResult<Packet> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+
+    schema.endpoints.sort_unstable_by_key(|def| def.id.as_u32());
+    schema.types.sort_unstable_by_key(|def| def.id.as_u32());
+
+    payload.extend_from_slice(&(schema.endpoints.len() as u32).to_le_bytes());
+    for ep in schema.endpoints {
+        payload.extend_from_slice(&ep.id.as_u32().to_le_bytes());
+        payload.push(ep.link_local_only as u8);
+        encode_string(&mut payload, &ep.name)?;
+        // Descriptions are documentation, not routing metadata. Embedded nodes
+        // retain them in flash for local introspection, but transmitting them
+        // duplicates several KiB into the constrained discovery queue.
+        #[cfg(feature = "std")]
+        encode_string(&mut payload, &ep.description)?;
+        #[cfg(not(feature = "std"))]
+        encode_string(&mut payload, "")?;
+    }
+
+    payload.extend_from_slice(&(schema.types.len() as u32).to_le_bytes());
+    for ty in schema.types {
+        payload.extend_from_slice(&ty.id.as_u32().to_le_bytes());
+        encode_string(&mut payload, &ty.name)?;
+        #[cfg(feature = "std")]
+        encode_string(&mut payload, &ty.description)?;
+        #[cfg(not(feature = "std"))]
+        encode_string(&mut payload, "")?;
         match ty.element {
             MessageElement::Static(count, data_type, class) => {
                 payload.push(0);

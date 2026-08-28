@@ -30,14 +30,17 @@ python3 publish_crates.py --publish
 CI release jobs use:
 
 ```sh
-python3 publish_crates.py --skip-tests --publish \
+python3 publish_crates.py
+python3 publish_crates.py --skip-tests --skip-package --publish \
   --ignore-publish-errors
 ```
 
-That still fails for package/build errors, attempts crates.io upload, times out a stuck upload, and
-treats upload-side failures as non-fatal after package checks have passed. GitHub PyPI trusted
-publishing uses the `pypi` environment claim; configure PyPI's trusted publisher to match the
-repository, `release.yml` workflow, tag refs, and that environment.
+The first command runs the full test route and package dry-runs. Crate publishing and all wheel and
+sdist jobs wait for those checks to pass. The publish job then reuses the helper without repeating
+the completed tests and package checks, times out a stuck crates.io upload, and treats upload-side
+failures as non-fatal. GitHub PyPI trusted publishing uses the `pypi` environment claim; configure
+PyPI's trusted publisher to match the repository, `release.yml` workflow, tag refs, and that
+environment.
 
 The same helper has explicit PyPI opt-ins:
 
@@ -63,6 +66,11 @@ setup because the generic maturin image does not include the MSVC-compatible too
 native C dependencies such as `zstd-sys`. macOS wheels use the same osxcross Docker images as
 SmartCopy when those images are reachable. On a macOS host, the helper falls back to local maturin
 macOS builds if the osxcross image cannot be pulled.
+
+Before building or uploading PyPI artifacts, the helper removes older `sedsnet` wheel and sdist
+versions from the selected artifact directory. The GitHub release workflow runs the same cleanup
+after combining its platform artifacts, preventing old versions from producing skip-existing
+warnings.
 
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/x86_64-apple-darwin:x86_64-apple-darwin`
 - `registry.gitlab.rylanswebsite.com/rylan-meilutis/macos-cargo-image/aarch64-apple-darwin:aarch64-apple-darwin`

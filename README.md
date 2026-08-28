@@ -341,7 +341,7 @@ cargo bench --bench packet_paths -- --profile-time=5
 `./build.py test` now starts with the same strict clippy checks as `./build.py check`, then runs:
 
 - `cargo nextest run --features timesync` when `cargo-nextest` is installed, otherwise
-  `cargo test --features timesync`, covering the unit tests in `src/tests.rs`, the Rust system tests under
+  `cargo test --features timesync -- --test-threads=1`, covering the unit tests in `src/tests.rs`, the Rust system tests under
   `tests/rust-system-test/`, and the C integration tests under `tests/c-system-test/`
 - `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
 - a stable Criterion smoke pass for `packet_paths` and `router_system_paths`
@@ -430,7 +430,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.2
+    GIT_TAG v4.0.3
 )
 FetchContent_MakeAvailable(sedsnet)
 
@@ -602,9 +602,20 @@ Or seed from JSON at runtime. Host builds can use:
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-Default builds do not compile application JSON into the crate. Embedded builds can include
-`telemetry_config.json` bytes only when the application provides that file locally before building;
-those bytes are decoded through the normal runtime JSON parser.
+File registration is streamed through a 512-byte buffer rather than reading the whole document into
+memory. Embedded `std` builds can override that buffer with the build-time
+`SCHEMA_JSON_CHUNK_BYTES` environment variable; `no_std` builds allocate no file-read buffer. JSON
+entries are retained only while they fit the schema budget (the packaged
+`MAX_QUEUE_BUDGET` by default); oversized input, an oversized resulting schema, or malformed data
+returns an error and atomically removes entries added earlier in that load. Rust callers that need
+an explicit limit can use `register_schema_json_file_with_budget(...)` or
+`register_schema_json_bytes_with_budget(...)`.
+
+Default builds do not compile application JSON into the crate. When an embedded application places
+`telemetry_config.json` in the fetched SEDSNet source directory, the build script converts it to
+static endpoint and data-type definitions. The metadata then stays in flash and requires no JSON
+parse or leaked allocations during startup. Embedded discovery retains names and routing metadata
+on the wire but omits documentation-only descriptions to keep the discovery snapshot bounded.
 
 The GUI editor still edits JSON schema files:
 

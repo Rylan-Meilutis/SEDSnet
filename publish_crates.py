@@ -450,6 +450,41 @@ def pypi_artifacts_from_dir(out_dir: str) -> list[Path]:
     return artifacts
 
 
+def prune_stale_pypi_artifacts(
+    out_dir: str,
+    *,
+    package_name: str,
+    expected_version: str,
+) -> None:
+    normalized_name = re.sub(r"[-_.]+", "_", package_name)
+    normalized_version = expected_version.replace("-", "_")
+    current_wheel_prefix = f"{normalized_name}-{normalized_version}-".lower()
+    current_sdist_names = {
+        f"{package_name}-{expected_version}.tar.gz".lower(),
+        f"{normalized_name}-{normalized_version}.tar.gz".lower(),
+    }
+    package_prefixes = {
+        f"{package_name}-".lower(),
+        f"{normalized_name}-".lower(),
+    }
+
+    removed: list[Path] = []
+    for artifact in pypi_artifacts_from_dir(out_dir):
+        filename = artifact.name.lower()
+        belongs_to_package = any(filename.startswith(prefix) for prefix in package_prefixes)
+        is_current = filename.startswith(current_wheel_prefix) or filename in current_sdist_names
+        if belongs_to_package and not is_current:
+            artifact.unlink()
+            removed.append(artifact)
+
+    if removed:
+        print(f"\nRemoved {len(removed)} stale {package_name} PyPI artifact(s):")
+        for artifact in removed:
+            print(f"  - {artifact.name}")
+    else:
+        print(f"\nNo stale {package_name} PyPI artifacts found in {out_dir}.")
+
+
 def twine_upload(
     *,
     token_env: str,
@@ -639,6 +674,11 @@ def parse_args() -> argparse.Namespace:
         help="Wheel/sdist output directory for Docker builds. Defaults to dist.",
     )
     parser.add_argument(
+        "--prune-pypi-artifacts",
+        action="store_true",
+        help="Remove wheel/sdist files for older package versions from --wheel-out.",
+    )
+    parser.add_argument(
         "--pypi-token-env",
         default="MATURIN_PYPI_TOKEN",
         help="Environment variable containing the PyPI API token. Defaults to MATURIN_PYPI_TOKEN.",
@@ -723,6 +763,13 @@ def main() -> int:
     token = os.environ.get(args.token_env)
 
     require_clean_tree(args.allow_dirty)
+
+    if args.prune_pypi_artifacts:
+        prune_stale_pypi_artifacts(
+            args.wheel_out,
+            package_name=py_name,
+            expected_version=py_version,
+        )
 
     print(f"Preparing {macro_name} v{macro_version} and {main_name} v{main_version}.")
     print(f"Python package metadata: {py_name} v{py_version}.")
@@ -832,6 +879,21 @@ def main() -> int:
         args.docker_windows_wheels = True
         args.docker_macos_wheels = True
 
+    if (
+        not args.prune_pypi_artifacts
+        and (
+            args.docker_wheels
+            or args.docker_windows_wheels
+            or args.docker_sdist
+            or args.docker_macos_wheels
+        )
+    ):
+        prune_stale_pypi_artifacts(
+            args.wheel_out,
+            package_name=py_name,
+            expected_version=py_version,
+        )
+
     built_pypi_artifacts = False
 
     if args.docker_wheels:
@@ -881,6 +943,11 @@ def main() -> int:
                     "No PyPI credentials available. Run `python3 build.py maturin-login` first."
                 )
             if built_pypi_artifacts:
+                prune_stale_pypi_artifacts(
+                    args.wheel_out,
+                    package_name=py_name,
+                    expected_version=py_version,
+                )
                 artifacts = pypi_artifacts_from_dir(args.wheel_out)
             else:
                 with tempfile.TemporaryDirectory(prefix="sedsnet-pypi-") as tmp:

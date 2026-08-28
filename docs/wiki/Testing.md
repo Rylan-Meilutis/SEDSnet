@@ -16,7 +16,7 @@ That runs:
 - strict `cargo clippy -D warnings` checks for the default host build, the `python` feature build,
   and the embedded-feature build when the matching cross toolchain exists
 - `cargo nextest run --features timesync` when cargo-nextest is installed, otherwise
-  `cargo test --features timesync`
+  `cargo test --features timesync -- --test-threads=1`
 - `cargo test --doc --features timesync` when nextest is used
 - a stable Criterion smoke pass for benchmark target validation
 - `cargo build --features python`

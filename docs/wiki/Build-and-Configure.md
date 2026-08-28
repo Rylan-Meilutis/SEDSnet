@@ -31,7 +31,7 @@ Useful options:
 - `check` runs `cargo clippy -D warnings` for the default, python, and embedded builds.
 - `test` runs the same clippy checks, then:
     - `cargo nextest run --features timesync` when cargo-nextest is installed, otherwise
-      `cargo test --features timesync`
+      `cargo test --features timesync -- --test-threads=1`
     - `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
     - a stable Criterion smoke pass for `packet_paths` and `router_system_paths`
     - `cargo build --features python`
@@ -287,7 +287,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.2
+    GIT_TAG v4.0.3
 )
 FetchContent_MakeAvailable(sedsnet)
 

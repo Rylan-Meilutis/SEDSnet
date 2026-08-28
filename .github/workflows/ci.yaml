@@ -19,7 +19,7 @@ jobs:
       - name: 'Install system packages'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi gnuplot
+          sudo apt-get install -y gcc-arm-none-eabi gnuplot python3-tk
 
       - name: 'Cache cargo-nextest'
         id: cache-cargo-nextest
