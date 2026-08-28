@@ -273,8 +273,8 @@ fn get_sd_card_handler(sd_seen_c: SeenType) -> EndpointHandler {
 
         // decode f32 little-endian
         let mut vals = Vec::with_capacity(pkt.payload().len() / 4);
-        for chunk in pkt.payload().chunks_exact(4) {
-            vals.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in pkt.payload().as_chunks::<4>().0 {
+            vals.push(f32::from_le_bytes(*chunk));
         }
 
         *sd_seen_c.lock().unwrap() = Some((pkt.data_type(), vals));
@@ -4397,8 +4397,8 @@ mod dedupe_tests {
                 DataEndpoint::named("SD_CARD"),
                 move |pkt: &Packet| {
                     let mut payload = Vec::with_capacity(pkt.payload().len() / 4);
-                    for chunk in pkt.payload().chunks_exact(4) {
-                        payload.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    for chunk in pkt.payload().as_chunks::<4>().0 {
+                        payload.push(f32::from_le_bytes(*chunk));
                     }
                     delivered_payloads_c.lock().unwrap().push(payload);
                     Ok(())

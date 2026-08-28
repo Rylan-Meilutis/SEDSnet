@@ -326,8 +326,8 @@ pub fn decode_discovery_payload(payload: &[u8]) -> TelemetryResult<Vec<DataEndpo
     }
 
     let mut endpoints = Vec::with_capacity(payload.len() / 4);
-    for chunk in payload.chunks_exact(4) {
-        let raw = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
+    for chunk in payload.as_chunks::<4>().0 {
+        let raw = u32::from_le_bytes(*chunk);
         let ep = try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
         if is_discovery_endpoint(ep) {
             continue;

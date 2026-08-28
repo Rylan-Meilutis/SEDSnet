@@ -629,10 +629,12 @@ impl Packet {
     where
         T: LeBytes + core::fmt::Display + 'static,
     {
-        let it = self.payload.chunks_exact(T::WIDTH);
         let mut first = true;
 
-        for chunk in it {
+        for chunk in self.payload.chunks(T::WIDTH) {
+            if chunk.len() != T::WIDTH {
+                break;
+            }
             if !first {
                 s.push_str(", ");
             }

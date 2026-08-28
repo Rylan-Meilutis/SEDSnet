@@ -663,7 +663,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
 
     let endpoint_names = known_endpoints()
         .into_iter()
-        .map(|def| (def.id, String::from(def.name)))
+        .map(|def| (def.id, def.name))
         .collect::<BTreeMap<_, _>>();
     let mut out = String::new();
     out.push('{');
@@ -824,7 +824,7 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
 
     let endpoint_names = known_endpoints()
         .into_iter()
-        .map(|def| (def.id, String::from(def.name)))
+        .map(|def| (def.id, def.name))
         .collect::<BTreeMap<_, _>>();
     let mut out = String::new();
     out.push('{');
