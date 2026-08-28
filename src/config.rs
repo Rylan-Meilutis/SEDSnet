@@ -457,8 +457,9 @@ impl core::fmt::Debug for DataEndpoint {
             Self::Discovery => "SEDSNET_DISCOVERY",
             _ => {
                 let meta = get_endpoint_meta(*self);
-                if &*meta.name != "UNKNOWN_ENDPOINT" {
-                    return f.write_str(&meta.name);
+                let meta_name = meta.name_ref();
+                if meta_name != "UNKNOWN_ENDPOINT" {
+                    return f.write_str(meta_name);
                 }
                 return write!(f, "DataEndpoint({})", self.0);
             }
@@ -580,8 +581,9 @@ impl core::fmt::Debug for DataType {
             Self::P2pMessage => "SedsnetP2pMessage",
             _ => {
                 let meta = get_message_meta(*self);
-                if &*meta.name != "UNKNOWN_TYPE" {
-                    return f.write_str(&meta.name);
+                let meta_name = meta.name_ref();
+                if meta_name != "UNKNOWN_TYPE" {
+                    return f.write_str(meta_name);
                 }
                 return write!(f, "DataType({})", self.0);
             }

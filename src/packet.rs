@@ -591,7 +591,13 @@ impl Packet {
             if i != 0 {
                 out.push_str(", ");
             }
-            out.push_str(&ep.as_str());
+            #[cfg(feature = "std")]
+            {
+                let endpoint_name = ep.as_str();
+                out.push_str(endpoint_name.as_ref());
+            }
+            #[cfg(not(feature = "std"))]
+            out.push_str(ep.as_str());
         }
         out.push_str("], Timestamp: ");
         let _ = write!(&mut out, "{}", self.timestamp);

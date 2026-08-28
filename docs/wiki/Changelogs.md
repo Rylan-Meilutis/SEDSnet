@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 4.0.4 highlights
+
+- CI compatibility:
+    - Rust 1.98's new Clippy diagnostics are handled without disabling the repository's
+      `-D warnings` policy.
+    - Fixed-width decoding remains compatible with the locally supported Rust 1.96 toolchain.
+
 ## Version 4.0.3 highlights
 
 - Bounded schema memory:

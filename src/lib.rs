@@ -384,6 +384,16 @@ pub struct EndpointMeta {
 }
 
 impl EndpointMeta {
+    #[cfg(feature = "std")]
+    pub(crate) fn name_ref(&self) -> &str {
+        self.name.as_ref()
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn name_ref(&self) -> &str {
+        self.name
+    }
+
     /// Return a stable string representation used in logs and in
     /// `Packet::to_string()` output.
     ///
@@ -532,6 +542,28 @@ pub struct MessageMeta {
     priority: u8,
     /// End-to-end cryptography policy for this type.
     e2e_encryption: E2eEncryptionPolicy,
+}
+
+impl MessageMeta {
+    #[cfg(feature = "std")]
+    pub(crate) fn name_ref(&self) -> &str {
+        self.name.as_ref()
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn name_ref(&self) -> &str {
+        self.name
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn endpoints_ref(&self) -> &[DataEndpoint] {
+        self.endpoints.as_ref()
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn endpoints_ref(&self) -> &[DataEndpoint] {
+        self.endpoints
+    }
 }
 
 impl DataType {

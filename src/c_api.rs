@@ -589,13 +589,13 @@ fn json_push_escaped(out: &mut String, s: &str) {
 
 #[cfg(feature = "discovery")]
 fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> String {
-    fn push_endpoint_name(
+    fn push_endpoint_name<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, String>,
+        names: &BTreeMap<DataEndpoint, S>,
         ep: DataEndpoint,
     ) {
         if let Some(name) = names.get(&ep) {
-            json_push_escaped(out, name);
+            json_push_escaped(out, name.as_ref());
         } else {
             json_push_escaped(out, &format!("endpoint_{}", ep.as_u32()));
         }
@@ -612,9 +612,9 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         out.push(']');
     }
 
-    fn push_endpoint_names_array(
+    fn push_endpoint_names_array<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, String>,
+        names: &BTreeMap<DataEndpoint, S>,
         vals: &[DataEndpoint],
     ) {
         out.push('[');
@@ -642,9 +642,9 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         out.push(']');
     }
 
-    fn push_board(
+    fn push_board<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, String>,
+        names: &BTreeMap<DataEndpoint, S>,
         board: &crate::discovery::TopologyBoardNode,
     ) {
         out.push('{');
@@ -804,9 +804,9 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
         out.push(']');
     }
 
-    fn push_endpoint_names_array(
+    fn push_endpoint_names_array<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, String>,
+        names: &BTreeMap<DataEndpoint, S>,
         vals: &[DataEndpoint],
     ) {
         out.push('[');
@@ -815,7 +815,7 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
                 out.push(',');
             }
             match names.get(val) {
-                Some(name) => json_push_escaped(out, name),
+                Some(name) => json_push_escaped(out, name.as_ref()),
                 None => json_push_escaped(out, &format!("endpoint_{}", val.as_u32())),
             }
         }

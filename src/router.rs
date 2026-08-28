@@ -1608,7 +1608,7 @@ where
     }
 
     let payload = encode_slice_le(data);
-    let pkt = Packet::new(ty, &meta.endpoints, sender, timestamp, payload)?;
+    let pkt = Packet::new(ty, meta.endpoints_ref(), sender, timestamp, payload)?;
     tx_function(pkt)
 }
 
@@ -3747,7 +3747,7 @@ impl Router {
         let ack_sender = self.encode_end_to_end_ack_sender();
         let ack = Packet::new(
             DataType::ReliableAck,
-            &message_meta(DataType::ReliableAck).endpoints,
+            message_meta(DataType::ReliableAck).endpoints_ref(),
             ack_sender.as_str(),
             self.packet_timestamp_ms(),
             Self::encode_end_to_end_reliable_ack(packet_id),
@@ -4995,7 +4995,7 @@ impl Router {
                 let payload = make_error_payload("managed variable permission denied");
                 let err = Packet::new(
                     DataType::TelemetryError,
-                    &message_meta(DataType::TelemetryError).endpoints,
+                    message_meta(DataType::TelemetryError).endpoints_ref(),
                     self.sender_arc().as_ref(),
                     self.clock.now_ms(),
                     payload,
@@ -5197,7 +5197,7 @@ impl Router {
         let sender = self.sender_arc();
         Packet::new(
             control_ty,
-            &message_meta(control_ty).endpoints,
+            message_meta(control_ty).endpoints_ref(),
             sender.as_ref(),
             self.packet_timestamp_ms(),
             encode_slice_le(&[ty.as_u32(), seq]),

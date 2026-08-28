@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.0.4
+
+- Fixed Rust 1.98 Clippy compatibility in the default merge/release validation route by removing
+  redundant owned-string conversions and updating fixed-width slice iteration without weakening
+  `-D warnings`.
+
 ## 4.0.3
 
 - Removed intentionally leaked runtime schema metadata and C/Python router/relay side names;

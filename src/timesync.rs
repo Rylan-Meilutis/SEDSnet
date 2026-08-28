@@ -781,7 +781,7 @@ pub fn build_timesync_announce(priority: u64, time_ms: u64) -> TelemetryResult<P
     Packet::from_u64_slice(
         DataType::TimeSyncAnnounce,
         &[priority, time_ms],
-        &meta.endpoints,
+        meta.endpoints_ref(),
         time_ms,
     )
 }
@@ -813,7 +813,7 @@ pub fn build_timesync_request(seq: u64, t1_ms: u64) -> TelemetryResult<Packet> {
     Packet::from_u64_slice(
         DataType::TimeSyncRequest,
         &[seq, t1_ms],
-        &meta.endpoints,
+        meta.endpoints_ref(),
         t1_ms,
     )
 }
@@ -834,7 +834,7 @@ pub fn build_timesync_response(
     Packet::from_u64_slice(
         DataType::TimeSyncResponse,
         &[seq, t1_ms, t2_ms, t3_ms],
-        &meta.endpoints,
+        meta.endpoints_ref(),
         t3_ms,
     )
 }

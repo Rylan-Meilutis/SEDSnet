@@ -1782,7 +1782,7 @@ impl Relay {
         let sender = self.sender_arc();
         Packet::new(
             control_ty,
-            &message_meta(control_ty).endpoints,
+            message_meta(control_ty).endpoints_ref(),
             sender.as_ref(),
             self.clock.now_ms(),
             crate::router::encode_slice_le(&[ty.as_u32(), seq]),
