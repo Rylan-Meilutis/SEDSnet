@@ -10,6 +10,9 @@
 
 ## 4.0.3
 
+- Avoid decoding remote discovery schemas on immutable `no_std` nodes. The
+  previous no-op merge path transiently allocated the complete remote schema
+  and could exhaust embedded heaps when two boards connected.
 - Removed intentionally leaked runtime schema metadata and C/Python router/relay side names;
   removal and replacement now release owned strings and endpoint lists.
 - Made JSON schema files stream through a configurable 512-byte default buffer under a hard

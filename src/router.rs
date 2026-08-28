@@ -5025,19 +5025,31 @@ impl Router {
             return Ok(true);
         }
         if pkt.data_type() == DataType::DiscoverySchema {
-            let snapshot = discovery::decode_discovery_schema(pkt)?;
-            let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
-            let mut st = self.state.lock();
-            st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
-            let budget = st.memory.max_queue_budget;
-            drop(st);
-            let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
-            if report.changed() {
-                let mut st = self.state.lock();
-                st.fit_discovery_budget();
-                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
-            }
+            // no_std schemas are generated into immutable flash tables. The
+            // no_std merge operation is intentionally a no-op, so decoding a
+            // remote schema here only creates a large transient allocation and
+            // then discards it. The packed packet has already passed framing
+            // and CRC validation; host/std routers still decode and merge it.
+            #[cfg(not(feature = "std"))]
             return Ok(true);
+
+            #[cfg(feature = "std")]
+            {
+                let snapshot = discovery::decode_discovery_schema(pkt)?;
+                let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
+                let mut st = self.state.lock();
+                st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
+                let budget = st.memory.max_queue_budget;
+                drop(st);
+                let report =
+                    crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
+                if report.changed() {
+                    let mut st = self.state.lock();
+                    st.fit_discovery_budget();
+                    Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+                }
+                return Ok(true);
+            }
         }
         if pkt.data_type() == DataType::DiscoveryLinkCapabilities {
             let _ = discovery::decode_discovery_link_capabilities(pkt)?;
