@@ -2,6 +2,13 @@
 
 ## 4.0.3
 
+- Removed intentionally leaked runtime schema metadata and C/Python router/relay side names;
+  removal and replacement now release owned strings and endpoint lists.
+- Made JSON schema files stream through an 8 KiB buffer under a hard input/schema memory limit,
+  with atomic rollback when parsing, validation, or budget enforcement fails.
+- Generate embedded schema metadata as static flash-resident definitions instead of reparsing and
+  leaking the bundled JSON at runtime. Embedded discovery omits documentation-only descriptions
+  from the wire snapshot, keeping initialization within constrained shared pools.
 - Made the built-in Cargo test-runner fallback serialize tests that share the runtime schema
   registry, and made compact-wire test fixtures independent of prior allocator state.
 - Fixed the Ubuntu merge-test workflow by installing the Tkinter system package required by the

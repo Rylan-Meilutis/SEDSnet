@@ -384,7 +384,7 @@ fn topology_snapshot_to_pydict(
     py: Python<'_>,
     snap: crate::discovery::TopologySnapshot,
 ) -> PyResult<Py<PyDict>> {
-    fn endpoint_name(names: &BTreeMap<DataEndpoint, &'static str>, ep: DataEndpoint) -> String {
+    fn endpoint_name(names: &BTreeMap<DataEndpoint, String>, ep: DataEndpoint) -> String {
         names
             .get(&ep)
             .map(|name| (*name).to_string())
@@ -392,7 +392,7 @@ fn topology_snapshot_to_pydict(
     }
 
     fn endpoint_names(
-        names: &BTreeMap<DataEndpoint, &'static str>,
+        names: &BTreeMap<DataEndpoint, String>,
         endpoints: &[DataEndpoint],
     ) -> Vec<String> {
         endpoints
@@ -1535,8 +1535,6 @@ impl PyRouter {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
 
-        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
-
         let rtr = self
             .inner
             .lock()
@@ -1549,7 +1547,7 @@ impl PyRouter {
         };
 
         let id = rtr.add_side_packed_with_options(
-            name_static,
+            name,
             move |bytes| {
                 Python::attach(|py| {
                     let arg = PyBytes::new(py, bytes);
@@ -1588,7 +1586,6 @@ impl PyRouter {
     ) -> PyResult<u32> {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
-        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
         let profile = side_transport_profile_from_name(profile)?;
         let opts = router_side_options_for_profile(
             reliable_enabled,
@@ -1602,7 +1599,7 @@ impl PyRouter {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
         let id = rtr.add_side_packed_with_options(
-            name_static,
+            name,
             move |bytes| {
                 Python::attach(|py| {
                     let arg = PyBytes::new(py, bytes);
@@ -1635,8 +1632,6 @@ impl PyRouter {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
 
-        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
-
         let rtr = self
             .inner
             .lock()
@@ -1649,7 +1644,7 @@ impl PyRouter {
         };
 
         let id = rtr.add_side_packet_with_options(
-            name_static,
+            name,
             move |pkt: &Packet| {
                 Python::attach(|py| {
                     let py_pkt = PyPacket { inner: pkt.clone() };
@@ -2711,8 +2706,6 @@ impl PyRelay {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
 
-        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
-
         let opts = RelaySideOptions {
             reliable_enabled,
             link_local_enabled: false,
@@ -2720,7 +2713,7 @@ impl PyRelay {
         };
 
         let id = self.inner.add_side_packed_with_options(
-            name_static,
+            name,
             move |bytes| {
                 Python::attach(|py| {
                     let arg = PyBytes::new(py, bytes);
@@ -2759,7 +2752,6 @@ impl PyRelay {
     ) -> PyResult<u32> {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
-        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
         let profile = side_transport_profile_from_name(profile)?;
         let opts = relay_side_options_for_profile(
             reliable_enabled,
@@ -2769,7 +2761,7 @@ impl PyRelay {
             max_side_transport_templates,
         );
         let id = self.inner.add_side_packed_with_options(
-            name_static,
+            name,
             move |bytes| {
                 Python::attach(|py| {
                     let arg = PyBytes::new(py, bytes);
@@ -2802,8 +2794,6 @@ impl PyRelay {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
 
-        let name_static: &'static str = Box::leak(name.to_owned().into_boxed_str());
-
         let opts = RelaySideOptions {
             reliable_enabled,
             link_local_enabled: false,
@@ -2811,7 +2801,7 @@ impl PyRelay {
         };
 
         let id = self.inner.add_side_packet_with_options(
-            name_static,
+            name,
             move |pkt: &Packet| {
                 Python::attach(|py| {
                     let py_pkt = PyPacket { inner: pkt.clone() };
@@ -3511,8 +3501,8 @@ pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         for v in 0..=MAX_VALUE_DATA_TYPE {
             if let Some(e) = try_enum_from_u32::<DataType>(v) {
                 let name = get_message_name(e);
-                dt_dict.set_item(name, v)?;
-                m.add(name, v)?;
+                dt_dict.set_item(name.as_ref(), v)?;
+                m.add(name.as_ref(), v)?;
             }
         }
         let dt_enum = int_enum.call1(("DataType", dt_dict))?;
@@ -3526,8 +3516,8 @@ pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         for v in 0..=MAX_VALUE_DATA_ENDPOINT {
             if let Some(e) = try_enum_from_u32::<DataEndpoint>(v) {
                 let name = e.as_str();
-                ep_dict.set_item(name, v)?;
-                m.add(name, v)?;
+                ep_dict.set_item(name.as_ref(), v)?;
+                m.add(name.as_ref(), v)?;
             }
         }
         let ep_enum = int_enum.call1(("DataEndpoint", ep_dict))?;

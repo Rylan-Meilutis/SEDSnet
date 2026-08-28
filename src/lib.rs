@@ -32,6 +32,7 @@
 //!   broadcast endpoint telemetry continues to use endpoint subscriptions.
 
 extern crate alloc;
+
 extern crate core;
 #[cfg(feature = "std")]
 extern crate std;
@@ -366,11 +367,17 @@ pub const fn parse_u128(s: &str) -> u128 {
 // ============================================================================
 //  Message metadata (element counts, data types, sizes)
 // ============================================================================
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct EndpointMeta {
     /// Static name of the endpoint
+    #[cfg(feature = "std")]
+    name: Arc<str>,
+    #[cfg(not(feature = "std"))]
     name: &'static str,
     /// Human-readable description used by schema lookup APIs.
+    #[cfg(feature = "std")]
+    description: Arc<str>,
+    #[cfg(not(feature = "std"))]
     description: &'static str,
     /// Restrict remote forwarding to link-local/software-bus sides only.
     link_local_only: bool,
@@ -382,12 +389,24 @@ impl EndpointMeta {
     ///
     /// This should remain stable over time for compatibility with tests and
     /// external tooling.
+    #[cfg(feature = "std")]
+    pub fn as_str(&self) -> Arc<str> {
+        self.name.clone()
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn as_str(&self) -> &'static str {
         self.name
     }
 
     /// Return the human-readable endpoint description.
     #[inline]
+    #[cfg(feature = "std")]
+    pub fn description(&self) -> Arc<str> {
+        self.description.clone()
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn description(&self) -> &'static str {
         self.description
     }
@@ -405,11 +424,23 @@ impl DataEndpoint {
     ///
     /// This should remain stable over time for compatibility with tests and
     /// external tooling.
+    #[cfg(feature = "std")]
+    pub fn as_str(&self) -> Arc<str> {
+        get_endpoint_meta(*self).name
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn as_str(&self) -> &'static str {
         get_endpoint_meta(*self).name
     }
 
     /// Return the human-readable endpoint description.
+    #[cfg(feature = "std")]
+    pub fn description(&self) -> Arc<str> {
+        get_endpoint_meta(*self).description
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn description(&self) -> &'static str {
         get_endpoint_meta(*self).description
     }
@@ -477,14 +508,23 @@ pub enum E2eEncryptionPolicy {
 }
 
 /// Static metadata for a message type: element count and valid endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct MessageMeta {
+    #[cfg(feature = "std")]
+    name: Arc<str>,
+    #[cfg(not(feature = "std"))]
     name: &'static str,
     /// Human-readable description used by schema lookup APIs.
+    #[cfg(feature = "std")]
+    description: Arc<str>,
+    #[cfg(not(feature = "std"))]
     description: &'static str,
     /// How many elements are present (fixed vs dynamic).
     element: MessageElement,
     /// Allowed endpoints for this message type.
+    #[cfg(feature = "std")]
+    endpoints: Arc<[DataEndpoint]>,
+    #[cfg(not(feature = "std"))]
     endpoints: &'static [DataEndpoint],
     /// Reliable delivery mode for this type.
     reliable: ReliableMode,
@@ -496,11 +536,23 @@ pub struct MessageMeta {
 
 impl DataType {
     /// Get the string representation of the DataType
+    #[cfg(feature = "std")]
+    pub fn as_str(&self) -> Arc<str> {
+        get_message_meta(*self).name
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn as_str(&self) -> &'static str {
         get_message_meta(*self).name
     }
 
     /// Return the human-readable data type description.
+    #[cfg(feature = "std")]
+    pub fn description(&self) -> Arc<str> {
+        get_message_meta(*self).description
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn description(&self) -> &'static str {
         get_message_meta(*self).description
     }
@@ -614,6 +666,12 @@ pub fn get_data_type(ty: DataType) -> MessageDataType {
 /// # Returns
 /// - Static string name of the message type.
 #[inline]
+#[cfg(feature = "std")]
+pub fn get_message_name(ty: DataType) -> Arc<str> {
+    get_message_meta(ty).name
+}
+
+#[cfg(not(feature = "std"))]
 pub fn get_message_name(ty: DataType) -> &'static str {
     get_message_meta(ty).name
 }
@@ -624,6 +682,12 @@ pub fn get_message_name(ty: DataType) -> &'static str {
 /// # Returns
 /// - Slice of allowed `DataEndpoint` values.
 #[inline]
+#[cfg(feature = "std")]
+pub fn endpoints_from_datatype(ty: DataType) -> Arc<[DataEndpoint]> {
+    get_message_meta(ty).endpoints
+}
+
+#[cfg(not(feature = "std"))]
 pub fn endpoints_from_datatype(ty: DataType) -> &'static [DataEndpoint] {
     get_message_meta(ty).endpoints
 }

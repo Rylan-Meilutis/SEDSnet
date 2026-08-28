@@ -591,7 +591,7 @@ fn json_push_escaped(out: &mut String, s: &str) {
 fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> String {
     fn push_endpoint_name(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, &'static str>,
+        names: &BTreeMap<DataEndpoint, String>,
         ep: DataEndpoint,
     ) {
         if let Some(name) = names.get(&ep) {
@@ -614,7 +614,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
 
     fn push_endpoint_names_array(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, &'static str>,
+        names: &BTreeMap<DataEndpoint, String>,
         vals: &[DataEndpoint],
     ) {
         out.push('[');
@@ -644,7 +644,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
 
     fn push_board(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, &'static str>,
+        names: &BTreeMap<DataEndpoint, String>,
         board: &crate::discovery::TopologyBoardNode,
     ) {
         out.push('{');
@@ -663,7 +663,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
 
     let endpoint_names = known_endpoints()
         .into_iter()
-        .map(|def| (def.id, def.name))
+        .map(|def| (def.id, String::from(def.name)))
         .collect::<BTreeMap<_, _>>();
     let mut out = String::new();
     out.push('{');
@@ -703,7 +703,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         let _ =
             core::fmt::Write::write_fmt(&mut out, format_args!("\"side_id\":{},", route.side_id));
         out.push_str("\"side_name\":");
-        json_push_escaped(&mut out, route.side_name);
+        json_push_escaped(&mut out, &route.side_name);
         out.push_str(",\"reachable_endpoints\":");
         push_endpoint_names_array(&mut out, &endpoint_names, &route.reachable_endpoints);
         out.push_str(",\"reachable_endpoint_ids\":");
@@ -806,7 +806,7 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
 
     fn push_endpoint_names_array(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, &'static str>,
+        names: &BTreeMap<DataEndpoint, String>,
         vals: &[DataEndpoint],
     ) {
         out.push('[');
@@ -824,7 +824,7 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
 
     let endpoint_names = known_endpoints()
         .into_iter()
-        .map(|def| (def.id, def.name))
+        .map(|def| (def.id, String::from(def.name)))
         .collect::<BTreeMap<_, _>>();
     let mut out = String::new();
     out.push('{');
@@ -917,7 +917,7 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
             &mut out,
             format_args!("\"side_id\":{},\"side_name\":", side.side_id,),
         );
-        json_push_escaped(&mut out, side.side_name);
+        json_push_escaped(&mut out, &side.side_name);
         out.push_str(",\"reliable_enabled\":");
         push_bool(&mut out, side.reliable_enabled);
         out.push_str(",\"link_local_enabled\":");
@@ -2589,16 +2589,13 @@ fn seds_router_add_side_packed_impl(
         return status_from_err(TelemetryError::BadArg);
     }
 
-    let side_name: &'static str = if name.is_null() || name_len == 0 {
-        ""
+    let side_name = if name.is_null() || name_len == 0 {
+        String::new()
     } else {
         let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
         match from_utf8(bytes) {
-            Ok(s) => {
-                let owned = String::from(s);
-                Box::leak(owned.into_boxed_str())
-            }
-            Err(_) => "",
+            Ok(s) => String::from(s),
+            Err(_) => String::new(),
         }
     };
 
@@ -2668,16 +2665,13 @@ pub extern "C" fn seds_router_add_side_packet(
         return status_from_err(TelemetryError::BadArg);
     }
 
-    let side_name: &'static str = if name.is_null() || name_len == 0 {
-        ""
+    let side_name = if name.is_null() || name_len == 0 {
+        String::new()
     } else {
         let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
         match from_utf8(bytes) {
-            Ok(s) => {
-                let owned = String::from(s);
-                Box::leak(owned.into_boxed_str())
-            }
-            Err(_) => "",
+            Ok(s) => String::from(s),
+            Err(_) => String::new(),
         }
     };
 
@@ -3934,16 +3928,13 @@ fn seds_relay_add_side_packed_impl(
         return status_from_err(TelemetryError::BadArg);
     }
 
-    let side_name: &'static str = if name.is_null() || name_len == 0 {
-        ""
+    let side_name = if name.is_null() || name_len == 0 {
+        String::new()
     } else {
         let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
         match from_utf8(bytes) {
-            Ok(s) => {
-                let owned = String::from(s);
-                Box::leak(owned.into_boxed_str())
-            }
-            Err(_) => "",
+            Ok(s) => String::from(s),
+            Err(_) => String::new(),
         }
     };
 
@@ -4012,16 +4003,13 @@ pub extern "C" fn seds_relay_add_side_packet(
         return status_from_err(TelemetryError::BadArg);
     }
 
-    let side_name: &'static str = if name.is_null() || name_len == 0 {
-        ""
+    let side_name = if name.is_null() || name_len == 0 {
+        String::new()
     } else {
         let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
         match from_utf8(bytes) {
-            Ok(s) => {
-                let owned = String::from(s);
-                Box::leak(owned.into_boxed_str())
-            }
-            Err(_) => "",
+            Ok(s) => String::from(s),
+            Err(_) => String::new(),
         }
     };
 

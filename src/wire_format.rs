@@ -672,13 +672,13 @@ fn endpoint_bitmap_and_count(eps: &[DataEndpoint]) -> ([u8; EP_BITMAP_BYTES], us
 #[inline]
 fn endpoints_match_schema(ty: DataType, eps: &[DataEndpoint]) -> bool {
     let (packet_bm, packet_count) = endpoint_bitmap_and_count(eps);
-    let (schema_bm, schema_count) = endpoint_bitmap_and_count(message_meta(ty).endpoints);
+    let (schema_bm, schema_count) = endpoint_bitmap_and_count(&message_meta(ty).endpoints);
     packet_count == schema_count && packet_bm == schema_bm
 }
 
 #[inline]
 fn schema_endpoints_from_type(ty: DataType, nep: usize) -> TelemetryResult<Arc<[DataEndpoint]>> {
-    let (bm, count) = endpoint_bitmap_and_count(message_meta(ty).endpoints);
+    let (bm, count) = endpoint_bitmap_and_count(&message_meta(ty).endpoints);
     let (ep_buf, ep_len) = expand_endpoint_bitmap(&bm)?;
     if count != nep || ep_len != nep {
         return Err(TelemetryError::Unpack("endpoint count mismatch"));

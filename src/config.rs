@@ -9,10 +9,10 @@ use crate::{
     E2eEncryptionPolicy, EndpointMeta, MessageClass, MessageDataType, MessageElement, MessageMeta,
     ReliableMode, TelemetryError, TelemetryResult, parse_f64, parse_strings, parse_usize,
 };
+#[cfg(feature = "std")]
+use alloc::sync::Arc;
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 use core::mem::size_of;
@@ -88,6 +88,16 @@ pub const MAX_QUEUE_BUDGET: usize = match option_env!("MAX_QUEUE_BUDGET") {
         None => 1024 * 100,
     },
 };
+
+/// Read buffer used by bounded JSON schema loading.
+#[cfg(feature = "std")]
+pub const SCHEMA_JSON_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Maximum JSON input size relative to the retained schema budget. This permits
+/// normal formatting overhead without allowing an attacker-controlled document
+/// to drive an unbounded parser allocation.
+#[cfg(feature = "std")]
+const SCHEMA_JSON_INPUT_MULTIPLIER: usize = 8;
 
 pub const RECENT_RX_QUEUE_BYTES: usize = {
     let requested = MAX_RECENT_RX_IDS.saturating_mul(size_of::<u64>());
@@ -439,8 +449,8 @@ impl core::fmt::Debug for DataEndpoint {
             Self::Discovery => "SEDSNET_DISCOVERY",
             _ => {
                 let meta = get_endpoint_meta(*self);
-                if meta.name != "UNKNOWN_ENDPOINT" {
-                    return f.write_str(meta.name);
+                if &*meta.name != "UNKNOWN_ENDPOINT" {
+                    return f.write_str(&meta.name);
                 }
                 return write!(f, "DataEndpoint({})", self.0);
             }
@@ -562,8 +572,8 @@ impl core::fmt::Debug for DataType {
             Self::P2pMessage => "SedsnetP2pMessage",
             _ => {
                 let meta = get_message_meta(*self);
-                if meta.name != "UNKNOWN_TYPE" {
-                    return f.write_str(meta.name);
+                if &*meta.name != "UNKNOWN_TYPE" {
+                    return f.write_str(&meta.name);
                 }
                 return write!(f, "DataType({})", self.0);
             }
@@ -596,13 +606,16 @@ pub struct DataTypeDefinition {
     pub e2e_encryption: E2eEncryptionPolicy,
 }
 
+#[cfg(not(feature = "std"))]
+include!(concat!(env!("OUT_DIR"), "/embedded_schema.rs"));
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSchemaSnapshot {
     pub endpoints: Vec<EndpointDefinition>,
     pub types: Vec<DataTypeDefinition>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedEndpointDefinition {
     pub id: DataEndpoint,
     pub name: String,
@@ -610,7 +623,7 @@ pub struct OwnedEndpointDefinition {
     pub link_local_only: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedDataTypeDefinition {
     pub id: DataType,
     pub name: String,
@@ -626,6 +639,15 @@ pub struct OwnedDataTypeDefinition {
 pub struct OwnedRuntimeSchemaSnapshot {
     pub endpoints: Vec<OwnedEndpointDefinition>,
     pub types: Vec<OwnedDataTypeDefinition>,
+}
+
+impl PartialEq<EndpointDefinition> for OwnedEndpointDefinition {
+    fn eq(&self, other: &EndpointDefinition) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.description == other.description
+            && self.link_local_only == other.link_local_only
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -701,7 +723,7 @@ impl Registry {
             name: "SEDSNET_ERROR",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
-            endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
+            endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 255,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -712,7 +734,7 @@ impl Registry {
             name: "SEDSNET_RELIABLE_ACK",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
+            endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 250,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -723,7 +745,7 @@ impl Registry {
             name: "SEDSNET_RELIABLE_PACKET_REQUEST",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
+            endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 250,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -734,7 +756,7 @@ impl Registry {
             name: "SEDSNET_RELIABLE_PARTIAL_ACK",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::TelemetryError]),
+            endpoints: &[DataEndpoint::TelemetryError],
             reliable: ReliableMode::None,
             priority: 250,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -745,7 +767,7 @@ impl Registry {
             name: "SEDSNET_TIME_SYNC_ANNOUNCE",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
+            endpoints: &[DataEndpoint::TimeSync],
             reliable: ReliableMode::None,
             priority: 245,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -756,7 +778,7 @@ impl Registry {
             name: "SEDSNET_TIME_SYNC_REQUEST",
             description: "",
             element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
+            endpoints: &[DataEndpoint::TimeSync],
             reliable: ReliableMode::None,
             priority: 245,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -767,7 +789,7 @@ impl Registry {
             name: "SEDSNET_TIME_SYNC_RESPONSE",
             description: "",
             element: MessageElement::Static(4, MessageDataType::UInt64, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::TimeSync]),
+            endpoints: &[DataEndpoint::TimeSync],
             reliable: ReliableMode::None,
             priority: 245,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -778,7 +800,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_ANNOUNCE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt32, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 240,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -789,7 +811,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 240,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -800,7 +822,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_TOPOLOGY",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 240,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -811,7 +833,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_SCHEMA",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 241,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -822,7 +844,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_TOPOLOGY_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 242,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -833,7 +855,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_SCHEMA_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 242,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -844,7 +866,7 @@ impl Registry {
             name: "SEDSNET_MANAGED_VARIABLE_REQUEST",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 243,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -855,7 +877,7 @@ impl Registry {
             name: "SEDSNET_MANAGED_VARIABLE_VALUE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 243,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -866,7 +888,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_LEAVE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 244,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -877,7 +899,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_LINK_CAPABILITIES",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::None,
             priority: 240,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -888,7 +910,7 @@ impl Registry {
             name: "SEDSNET_DISCOVERY_ADDRESS",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 244,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -899,7 +921,7 @@ impl Registry {
             name: "SEDSNET_P2P_MESSAGE",
             description: "",
             element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: leak_endpoints(vec![DataEndpoint::Discovery]),
+            endpoints: &[DataEndpoint::Discovery],
             reliable: ReliableMode::Ordered,
             priority: 246,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -907,36 +929,55 @@ impl Registry {
         .expect("built-in type");
         #[cfg(all(feature = "embedded", sedsnet_has_telemetry_config_json))]
         if let Ok(snapshot) = bundled_schema_snapshot() {
-            let _ = register_schema_snapshot_into(&mut reg, snapshot);
+            let _ = register_owned_schema_snapshot_into(&mut reg, snapshot);
         }
-        if let Some(cfg) = read_runtime_json_config("SEDSNET_STATIC_SCHEMA_PATH", &[]) {
-            let _ = register_json_config_into(&mut reg, cfg, false);
-        }
-        if let Some(cfg) = read_runtime_json_config("SEDSNET_STATIC_IPC_SCHEMA_PATH", &[]) {
-            let _ = register_json_config_into(&mut reg, cfg, true);
-        }
+        let _ = register_runtime_json_config(
+            &mut reg,
+            "SEDSNET_STATIC_SCHEMA_PATH",
+            false,
+            MAX_QUEUE_BUDGET,
+        );
+        let _ = register_runtime_json_config(
+            &mut reg,
+            "SEDSNET_STATIC_IPC_SCHEMA_PATH",
+            true,
+            MAX_QUEUE_BUDGET,
+        );
         reg
     }
 
     fn register_endpoint_definition(&mut self, def: EndpointDefinition) -> TelemetryResult<()> {
+        self.register_owned_endpoint(OwnedEndpointDefinition {
+            id: def.id,
+            name: def.name.to_string(),
+            description: def.description.to_string(),
+            link_local_only: def.link_local_only,
+        })
+    }
+
+    fn register_owned_endpoint(&mut self, def: OwnedEndpointDefinition) -> TelemetryResult<()> {
         if let Some((_, existing)) = self.endpoints.iter().find(|(id, _)| *id == def.id) {
-            if existing.name == def.name
-                && existing.description == def.description
+            if existing.name.as_ref() == def.name
+                && existing.description.as_ref() == def.description
                 && existing.link_local_only == def.link_local_only
             {
                 return Ok(());
             }
             return Err(TelemetryError::BadArg);
         }
-        if self.endpoints.iter().any(|(_, meta)| meta.name == def.name) {
+        if self
+            .endpoints
+            .iter()
+            .any(|(_, meta)| meta.name.as_ref() == def.name)
+        {
             return Err(TelemetryError::BadArg);
         }
         self.next_endpoint_id = self.next_endpoint_id.max(def.id.0.saturating_add(1));
         self.endpoints.push((
             def.id,
             EndpointMeta {
-                name: def.name,
-                description: def.description,
+                name: Arc::from(def.name),
+                description: Arc::from(def.description),
                 link_local_only: def.link_local_only,
             },
         ));
@@ -945,11 +986,24 @@ impl Registry {
     }
 
     fn register_type_definition(&mut self, def: DataTypeDefinition) -> TelemetryResult<()> {
+        self.register_owned_type(OwnedDataTypeDefinition {
+            id: def.id,
+            name: def.name.to_string(),
+            description: def.description.to_string(),
+            element: def.element,
+            endpoints: def.endpoints.to_vec(),
+            reliable: def.reliable,
+            priority: def.priority,
+            e2e_encryption: def.e2e_encryption,
+        })
+    }
+
+    fn register_owned_type(&mut self, def: OwnedDataTypeDefinition) -> TelemetryResult<()> {
         if let Some((_, existing)) = self.types.iter().find(|(id, _)| *id == def.id) {
-            if existing.name == def.name
-                && existing.description == def.description
+            if existing.name.as_ref() == def.name
+                && existing.description.as_ref() == def.description
                 && existing.element == def.element
-                && existing.endpoints == def.endpoints
+                && existing.endpoints.as_ref() == def.endpoints
                 && existing.reliable == def.reliable
                 && existing.priority == def.priority
                 && existing.e2e_encryption == def.e2e_encryption
@@ -958,10 +1012,14 @@ impl Registry {
             }
             return Err(TelemetryError::BadArg);
         }
-        if self.types.iter().any(|(_, meta)| meta.name == def.name) {
+        if self
+            .types
+            .iter()
+            .any(|(_, meta)| meta.name.as_ref() == def.name)
+        {
             return Err(TelemetryError::BadArg);
         }
-        for ep in def.endpoints {
+        for ep in &def.endpoints {
             if !self.endpoints.iter().any(|(id, _)| id == ep) {
                 return Err(TelemetryError::BadArg);
             }
@@ -970,10 +1028,10 @@ impl Registry {
         self.types.push((
             def.id,
             MessageMeta {
-                name: def.name,
-                description: def.description,
+                name: Arc::from(def.name),
+                description: Arc::from(def.description),
                 element: def.element,
-                endpoints: def.endpoints,
+                endpoints: Arc::from(def.endpoints),
                 reliable: def.reliable,
                 priority: def.priority,
                 e2e_encryption: def.e2e_encryption,
@@ -1002,12 +1060,12 @@ impl Registry {
             )
     }
 
-    fn merge_endpoint_definition(&mut self, def: EndpointDefinition) -> SchemaMergeDecision {
+    fn merge_endpoint_definition(&mut self, def: OwnedEndpointDefinition) -> SchemaMergeDecision {
         let id_match = self.endpoints.iter().position(|(id, _)| *id == def.id);
         let name_match = self
             .endpoints
             .iter()
-            .position(|(_, meta)| meta.name == def.name);
+            .position(|(_, meta)| meta.name.as_ref() == def.name);
         let conflict = match (id_match, name_match) {
             (Some(a), Some(b)) if a != b => Some(a.min(b)),
             (Some(a), _) | (_, Some(a)) => Some(a),
@@ -1019,8 +1077,8 @@ impl Registry {
             self.endpoints.push((
                 def.id,
                 EndpointMeta {
-                    name: def.name,
-                    description: def.description,
+                    name: Arc::from(def.name),
+                    description: Arc::from(def.description),
                     link_local_only: def.link_local_only,
                 },
             ));
@@ -1028,11 +1086,11 @@ impl Registry {
             return SchemaMergeDecision::Added;
         };
 
-        let existing = self.endpoints[idx];
-        let existing_def = EndpointDefinition {
+        let existing = self.endpoints[idx].clone();
+        let existing_def = OwnedEndpointDefinition {
             id: existing.0,
-            name: existing.1.name,
-            description: existing.1.description,
+            name: existing.1.name.to_string(),
+            description: existing.1.description.to_string(),
             link_local_only: existing.1.link_local_only,
         };
         if endpoint_def_equivalent(&existing_def, &def) {
@@ -1042,8 +1100,8 @@ impl Registry {
             self.endpoints[idx] = (
                 def.id,
                 EndpointMeta {
-                    name: def.name,
-                    description: def.description,
+                    name: Arc::from(def.name),
+                    description: Arc::from(def.description),
                     link_local_only: def.link_local_only,
                 },
             );
@@ -1055,12 +1113,12 @@ impl Registry {
         }
     }
 
-    fn merge_type_definition(&mut self, def: DataTypeDefinition) -> SchemaMergeDecision {
+    fn merge_type_definition(&mut self, def: OwnedDataTypeDefinition) -> SchemaMergeDecision {
         let id_match = self.types.iter().position(|(id, _)| *id == def.id);
         let name_match = self
             .types
             .iter()
-            .position(|(_, meta)| meta.name == def.name);
+            .position(|(_, meta)| meta.name.as_ref() == def.name);
         let conflict = match (id_match, name_match) {
             (Some(a), Some(b)) if a != b => Some(a.min(b)),
             (Some(a), _) | (_, Some(a)) => Some(a),
@@ -1072,10 +1130,10 @@ impl Registry {
             self.types.push((
                 def.id,
                 MessageMeta {
-                    name: def.name,
-                    description: def.description,
+                    name: Arc::from(def.name),
+                    description: Arc::from(def.description),
                     element: def.element,
-                    endpoints: def.endpoints,
+                    endpoints: Arc::from(def.endpoints),
                     reliable: def.reliable,
                     priority: def.priority,
                     e2e_encryption: def.e2e_encryption,
@@ -1085,13 +1143,13 @@ impl Registry {
             return SchemaMergeDecision::Added;
         };
 
-        let existing = self.types[idx];
-        let existing_def = DataTypeDefinition {
+        let existing = self.types[idx].clone();
+        let existing_def = OwnedDataTypeDefinition {
             id: existing.0,
-            name: existing.1.name,
-            description: existing.1.description,
+            name: existing.1.name.to_string(),
+            description: existing.1.description.to_string(),
             element: existing.1.element,
-            endpoints: existing.1.endpoints,
+            endpoints: existing.1.endpoints.to_vec(),
             reliable: existing.1.reliable,
             priority: existing.1.priority,
             e2e_encryption: existing.1.e2e_encryption,
@@ -1103,10 +1161,10 @@ impl Registry {
             self.types[idx] = (
                 def.id,
                 MessageMeta {
-                    name: def.name,
-                    description: def.description,
+                    name: Arc::from(def.name),
+                    description: Arc::from(def.description),
                     element: def.element,
-                    endpoints: def.endpoints,
+                    endpoints: Arc::from(def.endpoints),
                     reliable: def.reliable,
                     priority: def.priority,
                     e2e_encryption: def.e2e_encryption,
@@ -1164,38 +1222,30 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
 }
 
 #[cfg(all(
+    feature = "std",
     feature = "serde",
     feature = "embedded",
     sedsnet_has_telemetry_config_json
 ))]
-fn bundled_schema_snapshot() -> TelemetryResult<RuntimeSchemaSnapshot> {
+fn bundled_schema_snapshot() -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     schema_snapshot_from_json_bytes(include_bytes!("../telemetry_config.json"))
 }
 
-fn leak_str(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
-fn leak_endpoints(eps: Vec<DataEndpoint>) -> &'static [DataEndpoint] {
-    Box::leak(eps.into_boxed_slice())
-}
-
 #[cfg(feature = "std")]
-fn read_runtime_json_config(env_key: &str, fallback_paths: &[&str]) -> Option<JsonConfig> {
-    if let Ok(path) = std::env::var(env_key)
-        && let Ok(json) = std::fs::read_to_string(path)
-        && let Ok(cfg) = serde_json::from_str::<JsonConfig>(&json)
-    {
-        return Some(cfg);
-    }
-    for path in fallback_paths {
-        if let Ok(json) = std::fs::read_to_string(path)
-            && let Ok(cfg) = serde_json::from_str::<JsonConfig>(&json)
-        {
-            return Some(cfg);
-        }
-    }
-    None
+fn register_runtime_json_config(
+    reg: &mut Registry,
+    env_key: &str,
+    link_local_overlay: bool,
+    max_schema_bytes: usize,
+) -> TelemetryResult<()> {
+    let path = std::env::var(env_key).map_err(|_| TelemetryError::Io("schema json path"))?;
+    register_schema_json_file_into(
+        reg,
+        std::path::Path::new(&path),
+        link_local_overlay,
+        max_schema_bytes,
+        SCHEMA_JSON_CHUNK_BYTES,
+    )
 }
 
 #[cfg(feature = "std")]
@@ -1211,10 +1261,10 @@ pub fn register_endpoint_with_description(
 ) -> TelemetryResult<DataEndpoint> {
     let mut reg = registry().lock().expect("schema registry poisoned");
     let id = DataEndpoint(reg.next_endpoint_id);
-    reg.register_endpoint_definition(EndpointDefinition {
+    reg.register_owned_endpoint(OwnedEndpointDefinition {
         id,
-        name: leak_str(name.to_string()),
-        description: leak_str(description.to_string()),
+        name: name.to_string(),
+        description: description.to_string(),
         link_local_only,
     })?;
     Ok(id)
@@ -1239,10 +1289,10 @@ pub fn register_endpoint_id_with_description(
     registry()
         .lock()
         .expect("schema registry poisoned")
-        .register_endpoint_definition(EndpointDefinition {
+        .register_owned_endpoint(OwnedEndpointDefinition {
             id,
-            name: leak_str(name.to_string()),
-            description: leak_str(description.to_string()),
+            name: name.to_string(),
+            description: description.to_string(),
             link_local_only,
         })?;
     Ok(id)
@@ -1311,12 +1361,12 @@ pub fn register_data_type_with_description_and_e2e_encryption(
 ) -> TelemetryResult<DataType> {
     let mut reg = registry().lock().expect("schema registry poisoned");
     let id = DataType(reg.next_type_id);
-    reg.register_type_definition(DataTypeDefinition {
+    reg.register_owned_type(OwnedDataTypeDefinition {
         id,
-        name: leak_str(name.to_string()),
-        description: leak_str(description.to_string()),
+        name: name.to_string(),
+        description: description.to_string(),
         element,
-        endpoints: leak_endpoints(endpoints.to_vec()),
+        endpoints: endpoints.to_vec(),
         reliable,
         priority,
         e2e_encryption,
@@ -1394,12 +1444,12 @@ pub fn register_data_type_id_with_description_and_e2e_encryption(
     registry()
         .lock()
         .expect("schema registry poisoned")
-        .register_type_definition(DataTypeDefinition {
+        .register_owned_type(OwnedDataTypeDefinition {
             id,
-            name: leak_str(name.to_string()),
-            description: leak_str(description.to_string()),
+            name: name.to_string(),
+            description: description.to_string(),
             element,
-            endpoints: leak_endpoints(endpoints.to_vec()),
+            endpoints: endpoints.to_vec(),
             reliable,
             priority,
             e2e_encryption,
@@ -1409,8 +1459,32 @@ pub fn register_data_type_id_with_description_and_e2e_encryption(
 
 #[cfg(feature = "std")]
 pub fn merge_schema_snapshot(snapshot: RuntimeSchemaSnapshot) -> SchemaMergeReport {
-    let mut reg = registry().lock().expect("schema registry poisoned");
-    merge_schema_snapshot_locked(&mut reg, snapshot)
+    merge_owned_schema_snapshot(OwnedRuntimeSchemaSnapshot {
+        endpoints: snapshot
+            .endpoints
+            .into_iter()
+            .map(|def| OwnedEndpointDefinition {
+                id: def.id,
+                name: def.name.to_string(),
+                description: def.description.to_string(),
+                link_local_only: def.link_local_only,
+            })
+            .collect(),
+        types: snapshot
+            .types
+            .into_iter()
+            .map(|def| OwnedDataTypeDefinition {
+                id: def.id,
+                name: def.name.to_string(),
+                description: def.description.to_string(),
+                element: def.element,
+                endpoints: def.endpoints.to_vec(),
+                reliable: def.reliable,
+                priority: def.priority,
+                e2e_encryption: def.e2e_encryption,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(feature = "std")]
@@ -1441,34 +1515,9 @@ pub fn merge_owned_schema_snapshot_with_budget(
     }
     drop(reg);
 
-    let mut converted = RuntimeSchemaSnapshot {
-        endpoints: Vec::with_capacity(snapshot.endpoints.len()),
-        types: Vec::with_capacity(snapshot.types.len()),
-    };
-    for endpoint in snapshot.endpoints {
-        converted.endpoints.push(EndpointDefinition {
-            id: endpoint.id,
-            name: leak_str(endpoint.name),
-            description: leak_str(endpoint.description),
-            link_local_only: endpoint.link_local_only,
-        });
-    }
-    for ty in snapshot.types {
-        converted.types.push(DataTypeDefinition {
-            id: ty.id,
-            name: leak_str(ty.name),
-            description: leak_str(ty.description),
-            element: ty.element,
-            endpoints: leak_endpoints(ty.endpoints),
-            reliable: ty.reliable,
-            priority: ty.priority,
-            e2e_encryption: ty.e2e_encryption,
-        });
-    }
-
     let mut reg = registry().lock().expect("schema registry poisoned");
     let mut preview = reg.clone();
-    let report = merge_schema_snapshot_locked(&mut preview, converted.clone());
+    let report = merge_owned_schema_snapshot_locked(&mut preview, snapshot);
     if preview.schema_byte_cost() > max_schema_bytes {
         return Err(TelemetryError::PacketTooLarge(
             "Schema exceeds maximum shared queue budget",
@@ -1479,9 +1528,9 @@ pub fn merge_owned_schema_snapshot_with_budget(
 }
 
 #[cfg(feature = "std")]
-fn merge_schema_snapshot_locked(
+fn merge_owned_schema_snapshot_locked(
     reg: &mut Registry,
-    mut snapshot: RuntimeSchemaSnapshot,
+    mut snapshot: OwnedRuntimeSchemaSnapshot,
 ) -> SchemaMergeReport {
     snapshot.endpoints.sort_unstable_by_key(|def| def.id.0);
     snapshot.endpoints.dedup_by_key(|def| def.id.0);
@@ -1524,28 +1573,28 @@ fn merge_schema_snapshot_locked(
 }
 
 #[cfg(feature = "std")]
-pub fn export_schema() -> RuntimeSchemaSnapshot {
+pub fn export_schema() -> OwnedRuntimeSchemaSnapshot {
     let reg = registry().lock().expect("schema registry poisoned");
-    RuntimeSchemaSnapshot {
+    OwnedRuntimeSchemaSnapshot {
         endpoints: reg
             .endpoints
             .iter()
-            .map(|(id, meta)| EndpointDefinition {
+            .map(|(id, meta)| OwnedEndpointDefinition {
                 id: *id,
-                name: meta.name,
-                description: meta.description,
+                name: meta.name.to_string(),
+                description: meta.description.to_string(),
                 link_local_only: meta.link_local_only,
             })
             .collect(),
         types: reg
             .types
             .iter()
-            .map(|(id, meta)| DataTypeDefinition {
+            .map(|(id, meta)| OwnedDataTypeDefinition {
                 id: *id,
-                name: meta.name,
-                description: meta.description,
+                name: meta.name.to_string(),
+                description: meta.description.to_string(),
                 element: meta.element,
-                endpoints: meta.endpoints,
+                endpoints: meta.endpoints.to_vec(),
                 reliable: meta.reliable,
                 priority: meta.priority,
                 e2e_encryption: meta.e2e_encryption,
@@ -1555,12 +1604,12 @@ pub fn export_schema() -> RuntimeSchemaSnapshot {
 }
 
 #[cfg(feature = "std")]
-pub fn known_endpoints() -> Vec<EndpointDefinition> {
+pub fn known_endpoints() -> Vec<OwnedEndpointDefinition> {
     export_schema().endpoints
 }
 
 #[cfg(feature = "std")]
-pub fn known_data_types() -> Vec<DataTypeDefinition> {
+pub fn known_data_types() -> Vec<OwnedDataTypeDefinition> {
     export_schema().types
 }
 
@@ -1630,10 +1679,10 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
         .endpoints
         .iter()
         .find(|(id, _)| *id == endpoint_type)
-        .map(|(_, meta)| *meta)
+        .map(|(_, meta)| meta.clone())
         .unwrap_or(EndpointMeta {
-            name: "UNKNOWN_ENDPOINT",
-            description: "",
+            name: Arc::from("UNKNOWN_ENDPOINT"),
+            description: Arc::from(""),
             link_local_only: false,
         })
 }
@@ -1648,12 +1697,12 @@ pub fn get_message_meta(data_type: DataType) -> MessageMeta {
         .types
         .iter()
         .find(|(id, _)| *id == data_type)
-        .map(|(_, meta)| *meta)
+        .map(|(_, meta)| meta.clone())
         .unwrap_or(MessageMeta {
-            name: "UNKNOWN_TYPE",
-            description: "",
+            name: Arc::from("UNKNOWN_TYPE"),
+            description: Arc::from(""),
             element: MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
-            endpoints: &[],
+            endpoints: Arc::from([]),
             reliable: ReliableMode::None,
             priority: 0,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
@@ -1710,7 +1759,7 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
 }
 
 #[cfg(feature = "std")]
-fn endpoint_fingerprint(def: EndpointDefinition) -> u64 {
+fn endpoint_fingerprint(def: &OwnedEndpointDefinition) -> u64 {
     let mut h = 0x4550_4445_4600_0001;
     h = hash_u32(h, def.id.0);
     h = hash_bytes(h, def.name.as_bytes());
@@ -1719,7 +1768,7 @@ fn endpoint_fingerprint(def: EndpointDefinition) -> u64 {
 }
 
 #[cfg(feature = "std")]
-fn type_fingerprint(def: DataTypeDefinition) -> u64 {
+fn type_fingerprint(def: &OwnedDataTypeDefinition) -> u64 {
     let mut h = 0x5459_4445_4600_0001;
     h = hash_u32(h, def.id.0);
     h = hash_bytes(h, def.name.as_bytes());
@@ -1728,7 +1777,7 @@ fn type_fingerprint(def: DataTypeDefinition) -> u64 {
     h = hash_u8(h, reliable_code(def.reliable));
     h = hash_u8(h, def.priority);
     h = hash_u8(h, e2e_encryption_policy_code(def.e2e_encryption));
-    for ep in def.endpoints {
+    for ep in &def.endpoints {
         h = hash_u32(h, ep.0);
     }
     h
@@ -1752,35 +1801,35 @@ fn hash_message_element(mut h: u64, element: MessageElement) -> u64 {
 }
 
 #[cfg(feature = "std")]
-pub fn endpoint_definition(ep: DataEndpoint) -> Option<EndpointDefinition> {
+pub fn endpoint_definition(ep: DataEndpoint) -> Option<OwnedEndpointDefinition> {
     registry()
         .lock()
         .expect("schema registry poisoned")
         .endpoints
         .iter()
         .find(|(id, _)| *id == ep)
-        .map(|(id, meta)| EndpointDefinition {
+        .map(|(id, meta)| OwnedEndpointDefinition {
             id: *id,
-            name: meta.name,
-            description: meta.description,
+            name: meta.name.to_string(),
+            description: meta.description.to_string(),
             link_local_only: meta.link_local_only,
         })
 }
 
 #[cfg(feature = "std")]
-pub fn data_type_definition(ty: DataType) -> Option<DataTypeDefinition> {
+pub fn data_type_definition(ty: DataType) -> Option<OwnedDataTypeDefinition> {
     registry()
         .lock()
         .expect("schema registry poisoned")
         .types
         .iter()
         .find(|(id, _)| *id == ty)
-        .map(|(id, meta)| DataTypeDefinition {
+        .map(|(id, meta)| OwnedDataTypeDefinition {
             id: *id,
-            name: meta.name,
-            description: meta.description,
+            name: meta.name.to_string(),
+            description: meta.description.to_string(),
             element: meta.element,
-            endpoints: meta.endpoints,
+            endpoints: meta.endpoints.to_vec(),
             reliable: meta.reliable,
             priority: meta.priority,
             e2e_encryption: meta.e2e_encryption,
@@ -1788,35 +1837,35 @@ pub fn data_type_definition(ty: DataType) -> Option<DataTypeDefinition> {
 }
 
 #[cfg(feature = "std")]
-pub fn endpoint_definition_by_name(name: &str) -> Option<EndpointDefinition> {
+pub fn endpoint_definition_by_name(name: &str) -> Option<OwnedEndpointDefinition> {
     registry()
         .lock()
         .expect("schema registry poisoned")
         .endpoints
         .iter()
-        .find(|(_, meta)| meta.name == name)
-        .map(|(id, meta)| EndpointDefinition {
+        .find(|(_, meta)| meta.name.as_ref() == name)
+        .map(|(id, meta)| OwnedEndpointDefinition {
             id: *id,
-            name: meta.name,
-            description: meta.description,
+            name: meta.name.to_string(),
+            description: meta.description.to_string(),
             link_local_only: meta.link_local_only,
         })
 }
 
 #[cfg(feature = "std")]
-pub fn data_type_definition_by_name(name: &str) -> Option<DataTypeDefinition> {
+pub fn data_type_definition_by_name(name: &str) -> Option<OwnedDataTypeDefinition> {
     registry()
         .lock()
         .expect("schema registry poisoned")
         .types
         .iter()
-        .find(|(_, meta)| meta.name == name)
-        .map(|(id, meta)| DataTypeDefinition {
+        .find(|(_, meta)| meta.name.as_ref() == name)
+        .map(|(id, meta)| OwnedDataTypeDefinition {
             id: *id,
-            name: meta.name,
-            description: meta.description,
+            name: meta.name.to_string(),
+            description: meta.description.to_string(),
             element: meta.element,
-            endpoints: meta.endpoints,
+            endpoints: meta.endpoints.to_vec(),
             reliable: meta.reliable,
             priority: meta.priority,
             e2e_encryption: meta.e2e_encryption,
@@ -1902,7 +1951,7 @@ pub fn remove_data_type_by_name(name: &str) -> TelemetryResult<bool> {
 }
 
 #[cfg(feature = "std")]
-fn endpoint_def_equivalent(a: &EndpointDefinition, b: &EndpointDefinition) -> bool {
+fn endpoint_def_equivalent(a: &OwnedEndpointDefinition, b: &OwnedEndpointDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
         && a.description == b.description
@@ -1910,7 +1959,7 @@ fn endpoint_def_equivalent(a: &EndpointDefinition, b: &EndpointDefinition) -> bo
 }
 
 #[cfg(feature = "std")]
-fn type_def_equivalent(a: &DataTypeDefinition, b: &DataTypeDefinition) -> bool {
+fn type_def_equivalent(a: &OwnedDataTypeDefinition, b: &OwnedDataTypeDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
         && a.description == b.description
@@ -1921,17 +1970,23 @@ fn type_def_equivalent(a: &DataTypeDefinition, b: &DataTypeDefinition) -> bool {
 }
 
 #[cfg(feature = "std")]
-fn endpoint_winner(a: &EndpointDefinition, b: &EndpointDefinition) -> EndpointDefinition {
-    let a_key = (endpoint_fingerprint(*a), a.id.0, a.name);
-    let b_key = (endpoint_fingerprint(*b), b.id.0, b.name);
-    if a_key <= b_key { *a } else { *b }
+fn endpoint_winner(
+    a: &OwnedEndpointDefinition,
+    b: &OwnedEndpointDefinition,
+) -> OwnedEndpointDefinition {
+    let a_key = (endpoint_fingerprint(a), a.id.0, a.name.as_str());
+    let b_key = (endpoint_fingerprint(b), b.id.0, b.name.as_str());
+    if a_key <= b_key { a.clone() } else { b.clone() }
 }
 
 #[cfg(feature = "std")]
-fn type_winner(a: &DataTypeDefinition, b: &DataTypeDefinition) -> DataTypeDefinition {
-    let a_key = (type_fingerprint(*a), a.id.0, a.name);
-    let b_key = (type_fingerprint(*b), b.id.0, b.name);
-    if a_key <= b_key { *a } else { *b }
+fn type_winner(
+    a: &OwnedDataTypeDefinition,
+    b: &OwnedDataTypeDefinition,
+) -> OwnedDataTypeDefinition {
+    let a_key = (type_fingerprint(a), a.id.0, a.name.as_str());
+    let b_key = (type_fingerprint(b), b.id.0, b.name.as_str());
+    if a_key <= b_key { a.clone() } else { b.clone() }
 }
 
 pub(crate) fn message_data_type_code(dt: MessageDataType) -> u8 {
@@ -2164,11 +2219,8 @@ pub fn export_schema() -> RuntimeSchemaSnapshot {
 
 #[cfg(not(feature = "std"))]
 pub fn known_endpoints() -> Vec<EndpointDefinition> {
-    #[cfg_attr(
-        not(all(feature = "serde", sedsnet_has_telemetry_config_json)),
-        allow(unused_mut)
-    )]
-    let mut endpoints = vec![
+    let mut endpoints = Vec::with_capacity(3 + EMBEDDED_SCHEMA_ENDPOINTS.len());
+    endpoints.extend_from_slice(&[
         EndpointDefinition {
             id: DataEndpoint::TelemetryError,
             name: "SEDSNET_ERROR",
@@ -2187,28 +2239,15 @@ pub fn known_endpoints() -> Vec<EndpointDefinition> {
             description: "",
             link_local_only: false,
         },
-    ];
-    #[cfg(all(feature = "serde", sedsnet_has_telemetry_config_json))]
-    if let Ok(snapshot) = bundled_schema_snapshot() {
-        for endpoint in snapshot.endpoints {
-            if !endpoints
-                .iter()
-                .any(|known| known.id == endpoint.id || known.name == endpoint.name)
-            {
-                endpoints.push(endpoint);
-            }
-        }
-    }
+    ]);
+    endpoints.extend_from_slice(EMBEDDED_SCHEMA_ENDPOINTS);
     endpoints
 }
 
 #[cfg(not(feature = "std"))]
 pub fn known_data_types() -> Vec<DataTypeDefinition> {
-    #[cfg_attr(
-        not(all(feature = "serde", sedsnet_has_telemetry_config_json)),
-        allow(unused_mut)
-    )]
-    let mut types = vec![
+    let mut types = Vec::with_capacity(20 + EMBEDDED_SCHEMA_TYPES.len());
+    types.extend_from_slice(&[
         DataTypeDefinition {
             id: DataType::TelemetryError,
             name: "SEDSNET_ERROR",
@@ -2399,18 +2438,8 @@ pub fn known_data_types() -> Vec<DataTypeDefinition> {
             priority: 246,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         },
-    ];
-    #[cfg(all(feature = "serde", sedsnet_has_telemetry_config_json))]
-    if let Ok(snapshot) = bundled_schema_snapshot() {
-        for ty in snapshot.types {
-            if !types
-                .iter()
-                .any(|known| known.id == ty.id || known.name == ty.name)
-            {
-                types.push(ty);
-            }
-        }
-    }
+    ]);
+    types.extend_from_slice(EMBEDDED_SCHEMA_TYPES);
     types
 }
 
@@ -2594,15 +2623,48 @@ pub fn register_schema_json_str(json: &str) -> TelemetryResult<()> {
 
 #[cfg(feature = "std")]
 pub fn register_schema_json_bytes(json: &[u8]) -> TelemetryResult<()> {
-    let cfg: JsonConfig =
-        serde_json::from_slice(json).map_err(|_| TelemetryError::Unpack("schema json"))?;
-    register_json_config(cfg, false)
+    register_schema_json_bytes_with_budget(json, MAX_QUEUE_BUDGET)
+}
+
+/// Stream a schema document from an existing byte slice while limiting the
+/// total retained schema memory. The caller owns the input slice; this function
+/// never creates a second full-document allocation.
+#[cfg(feature = "std")]
+pub fn register_schema_json_bytes_with_budget(
+    json: &[u8],
+    max_schema_bytes: usize,
+) -> TelemetryResult<()> {
+    let max_input_bytes = schema_json_max_input_bytes(max_schema_bytes);
+    if json.len() > max_input_bytes {
+        return Err(TelemetryError::PacketTooLarge(
+            "Schema JSON exceeds bounded input size",
+        ));
+    }
+    let mut reg = registry().lock().expect("schema registry poisoned");
+    register_schema_json_reader_into(&mut reg, json, false, max_schema_bytes)
 }
 
 #[cfg(feature = "std")]
 pub fn register_schema_json_file(path: impl AsRef<std::path::Path>) -> TelemetryResult<()> {
-    let json = std::fs::read_to_string(path).map_err(|_| TelemetryError::Io("schema json file"))?;
-    register_schema_json_str(&json)
+    register_schema_json_file_with_budget(path, MAX_QUEUE_BUDGET)
+}
+
+/// Load a JSON schema using a fixed-size read buffer and a hard retained-memory
+/// budget. Entries are decoded and validated individually, and a failed load is
+/// rolled back completely.
+#[cfg(feature = "std")]
+pub fn register_schema_json_file_with_budget(
+    path: impl AsRef<std::path::Path>,
+    max_schema_bytes: usize,
+) -> TelemetryResult<()> {
+    let mut reg = registry().lock().expect("schema registry poisoned");
+    register_schema_json_file_into(
+        &mut reg,
+        path.as_ref(),
+        false,
+        max_schema_bytes,
+        SCHEMA_JSON_CHUNK_BYTES,
+    )
 }
 
 #[cfg(feature = "std")]
@@ -2677,13 +2739,344 @@ enum JsonElement {
     },
 }
 
+#[cfg(feature = "std")]
+fn schema_json_max_input_bytes(max_schema_bytes: usize) -> usize {
+    max_schema_bytes
+        .saturating_mul(SCHEMA_JSON_INPUT_MULTIPLIER)
+        .max(SCHEMA_JSON_CHUNK_BYTES)
+}
+
+#[cfg(feature = "std")]
+struct StreamingSchemaState<'a> {
+    reg: &'a mut Registry,
+    aliases: Vec<(String, DataEndpoint)>,
+    alias_bytes: usize,
+    added_endpoints: Vec<DataEndpoint>,
+    added_types: Vec<DataType>,
+    initial_next_endpoint_id: u32,
+    initial_next_type_id: u32,
+    link_local_overlay: bool,
+    max_schema_bytes: usize,
+    saw_endpoints: bool,
+    saw_types: bool,
+    error: Option<TelemetryError>,
+}
+
+#[cfg(feature = "std")]
+impl StreamingSchemaState<'_> {
+    fn ensure_budget(&self, additional: usize) -> TelemetryResult<()> {
+        if self
+            .reg
+            .schema_byte_cost()
+            .saturating_add(self.alias_bytes)
+            .saturating_add(additional)
+            > self.max_schema_bytes
+        {
+            Err(TelemetryError::PacketTooLarge(
+                "Schema exceeds maximum shared queue budget",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn add_endpoint(&mut self, ep: JsonEndpoint) -> TelemetryResult<()> {
+        let rust_name = ep.rust.unwrap_or_else(|| ep.name.clone());
+        let id =
+            known_endpoint_compat_id(&rust_name).unwrap_or(DataEndpoint(self.reg.next_endpoint_id));
+        let existed = self.reg.endpoints.iter().any(|(known, _)| *known == id);
+        let description = ep.description.unwrap_or_default();
+        let retained = if existed {
+            0
+        } else {
+            endpoint_schema_byte_cost(ep.name.len(), description.len())
+        };
+        self.ensure_budget(retained.saturating_add(rust_name.len()))?;
+        self.reg.register_owned_endpoint(OwnedEndpointDefinition {
+            id,
+            name: ep.name,
+            description,
+            link_local_only: self.link_local_overlay
+                || ep.link_local_only.unwrap_or(false)
+                || matches!(ep.broadcast_mode.as_deref(), Some("Never")),
+        })?;
+        if !existed {
+            self.added_endpoints.push(id);
+        }
+        self.alias_bytes = self.alias_bytes.saturating_add(rust_name.len());
+        self.aliases.push((rust_name, id));
+        Ok(())
+    }
+
+    fn add_type(&mut self, ty: JsonType) -> TelemetryResult<()> {
+        let rust_name = ty.rust.unwrap_or_else(|| ty.name.clone());
+        let endpoints = ty
+            .endpoints
+            .iter()
+            .map(|name| {
+                self.aliases
+                    .iter()
+                    .find(|(alias, _)| alias == name)
+                    .map(|(_, id)| *id)
+                    .or_else(|| {
+                        self.reg
+                            .endpoints
+                            .iter()
+                            .find(|(_, meta)| meta.name.as_ref() == name.as_str())
+                            .map(|(id, _)| *id)
+                    })
+                    .ok_or(TelemetryError::BadArg)
+            })
+            .collect::<TelemetryResult<Vec<_>>>()?;
+        let id = known_type_compat_id(&rust_name).unwrap_or(DataType(self.reg.next_type_id));
+        let existed = self.reg.types.iter().any(|(known, _)| *known == id);
+        let description = ty.description.unwrap_or_default();
+        if !existed {
+            self.ensure_budget(type_schema_byte_cost(
+                ty.name.len(),
+                description.len(),
+                endpoints.len(),
+            ))?;
+        }
+        let class = parse_message_class(&ty.class)?;
+        let element = match ty.element {
+            JsonElement::Static { data_type, count } => MessageElement::Static(
+                count.unwrap_or(1),
+                parse_message_data_type(&data_type)?,
+                class,
+            ),
+            JsonElement::Dynamic { data_type } => {
+                MessageElement::Dynamic(parse_message_data_type(&data_type)?, class)
+            }
+        };
+        let reliable = match ty.reliable_mode.as_deref() {
+            Some("Ordered") => ReliableMode::Ordered,
+            Some("Unordered") => ReliableMode::Unordered,
+            Some("None") | None if ty.reliable.unwrap_or(false) => ReliableMode::Ordered,
+            Some("None") | None => ReliableMode::None,
+            _ => return Err(TelemetryError::BadArg),
+        };
+        self.reg.register_owned_type(OwnedDataTypeDefinition {
+            id,
+            name: ty.name,
+            description,
+            element,
+            endpoints,
+            reliable,
+            priority: ty.priority.unwrap_or(0),
+            e2e_encryption: parse_e2e_encryption_policy(ty.e2e_encryption.as_deref())?,
+        })?;
+        if !existed {
+            self.added_types.push(id);
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        self.reg
+            .types
+            .retain(|(id, _)| !self.added_types.contains(id));
+        self.reg
+            .endpoints
+            .retain(|(id, _)| !self.added_endpoints.contains(id));
+        self.reg.next_endpoint_id = self.initial_next_endpoint_id;
+        self.reg.next_type_id = self.initial_next_type_id;
+    }
+}
+
+#[cfg(feature = "std")]
+struct StreamingSchemaSeed<'a, 'r>(&'a mut StreamingSchemaState<'r>);
+
+#[cfg(feature = "std")]
+impl<'de> serde::de::DeserializeSeed<'de> for StreamingSchemaSeed<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamingSchemaVisitor(self.0))
+    }
+}
+
+#[cfg(feature = "std")]
+struct StreamingSchemaVisitor<'a, 'r>(&'a mut StreamingSchemaState<'r>);
+
+#[cfg(feature = "std")]
+impl<'de> serde::de::Visitor<'de> for StreamingSchemaVisitor<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a schema object containing endpoints followed by types")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "endpoints" => {
+                    self.0.saw_endpoints = true;
+                    map.next_value_seed(JsonEndpointSequence(self.0))?;
+                }
+                "types" => {
+                    if !self.0.saw_endpoints {
+                        self.0.error = Some(TelemetryError::BadArg);
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "endpoints must precede types for bounded loading",
+                        ));
+                    }
+                    self.0.saw_types = true;
+                    map.next_value_seed(JsonTypeSequence(self.0))?;
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+struct JsonEndpointSequence<'a, 'r>(&'a mut StreamingSchemaState<'r>);
+
+#[cfg(feature = "std")]
+impl<'de> serde::de::DeserializeSeed<'de> for JsonEndpointSequence<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<'a, 'r>(&'a mut StreamingSchemaState<'r>);
+        impl<'de> serde::de::Visitor<'de> for Visitor<'_, '_> {
+            type Value = ();
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("an endpoint array")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while let Some(endpoint) = seq.next_element::<JsonEndpoint>()? {
+                    if let Err(err) = self.0.add_endpoint(endpoint) {
+                        self.0.error = Some(err);
+                        return Err(<A::Error as serde::de::Error>::custom("schema endpoint"));
+                    }
+                }
+                Ok(())
+            }
+        }
+        deserializer.deserialize_seq(Visitor(self.0))
+    }
+}
+
+#[cfg(feature = "std")]
+struct JsonTypeSequence<'a, 'r>(&'a mut StreamingSchemaState<'r>);
+
+#[cfg(feature = "std")]
+impl<'de> serde::de::DeserializeSeed<'de> for JsonTypeSequence<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<'a, 'r>(&'a mut StreamingSchemaState<'r>);
+        impl<'de> serde::de::Visitor<'de> for Visitor<'_, '_> {
+            type Value = ();
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a data type array")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while let Some(ty) = seq.next_element::<JsonType>()? {
+                    if let Err(err) = self.0.add_type(ty) {
+                        self.0.error = Some(err);
+                        return Err(<A::Error as serde::de::Error>::custom("schema type"));
+                    }
+                }
+                Ok(())
+            }
+        }
+        deserializer.deserialize_seq(Visitor(self.0))
+    }
+}
+
+#[cfg(feature = "std")]
+fn register_schema_json_reader_into<R: std::io::Read>(
+    reg: &mut Registry,
+    reader: R,
+    link_local_overlay: bool,
+    max_schema_bytes: usize,
+) -> TelemetryResult<()> {
+    let initial_next_endpoint_id = reg.next_endpoint_id;
+    let initial_next_type_id = reg.next_type_id;
+    let mut state = StreamingSchemaState {
+        reg,
+        aliases: Vec::new(),
+        alias_bytes: 0,
+        added_endpoints: Vec::new(),
+        added_types: Vec::new(),
+        initial_next_endpoint_id,
+        initial_next_type_id,
+        link_local_overlay,
+        max_schema_bytes,
+        saw_endpoints: false,
+        saw_types: false,
+        error: None,
+    };
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let parsed =
+        serde::de::DeserializeSeed::deserialize(StreamingSchemaSeed(&mut state), &mut deserializer)
+            .and_then(|()| deserializer.end());
+    if parsed.is_err() || !state.saw_endpoints || !state.saw_types {
+        let err = state
+            .error
+            .take()
+            .unwrap_or(TelemetryError::Unpack("schema json"));
+        state.rollback();
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+fn register_schema_json_file_into(
+    reg: &mut Registry,
+    path: &std::path::Path,
+    link_local_overlay: bool,
+    max_schema_bytes: usize,
+    chunk_bytes: usize,
+) -> TelemetryResult<()> {
+    let file = std::fs::File::open(path).map_err(|_| TelemetryError::Io("schema json file"))?;
+    let max_input_bytes = schema_json_max_input_bytes(max_schema_bytes);
+    if file
+        .metadata()
+        .map_err(|_| TelemetryError::Io("schema json metadata"))?
+        .len()
+        > max_input_bytes as u64
+    {
+        return Err(TelemetryError::PacketTooLarge(
+            "Schema JSON exceeds bounded input size",
+        ));
+    }
+    let bounded = std::io::Read::take(file, max_input_bytes.saturating_add(1) as u64);
+    let reader = std::io::BufReader::with_capacity(chunk_bytes.max(1), bounded);
+    register_schema_json_reader_into(reg, reader, link_local_overlay, max_schema_bytes)
+}
+
 #[cfg(feature = "serde")]
 fn json_config_to_snapshot(
     cfg: JsonConfig,
     link_local_overlay: bool,
     mut next_endpoint_id: u32,
     mut next_type_id: u32,
-) -> TelemetryResult<RuntimeSchemaSnapshot> {
+) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     let mut endpoint_ids: Vec<(String, DataEndpoint)> = Vec::new();
     let mut endpoints = Vec::with_capacity(cfg.endpoints.len());
     for ep in cfg.endpoints {
@@ -2697,10 +3090,10 @@ fn json_config_to_snapshot(
             id
         });
         next_endpoint_id = next_endpoint_id.max(id.0.saturating_add(1));
-        endpoints.push(EndpointDefinition {
+        endpoints.push(OwnedEndpointDefinition {
             id,
-            name: leak_str(ep.name),
-            description: leak_str(ep.description.unwrap_or_default()),
+            name: ep.name,
+            description: ep.description.unwrap_or_default(),
             link_local_only: link_local,
         });
         endpoint_ids.push((rust_name, id));
@@ -2749,58 +3142,38 @@ fn json_config_to_snapshot(
             }
             _ => return Err(TelemetryError::BadArg),
         };
-        types.push(DataTypeDefinition {
+        types.push(OwnedDataTypeDefinition {
             id,
-            name: leak_str(ty.name),
-            description: leak_str(ty.description.unwrap_or_default()),
+            name: ty.name,
+            description: ty.description.unwrap_or_default(),
             element,
-            endpoints: leak_endpoints(endpoints_for_type),
+            endpoints: endpoints_for_type,
             reliable,
             priority: ty.priority.unwrap_or(0),
             e2e_encryption: parse_e2e_encryption_policy(ty.e2e_encryption.as_deref())?,
         });
     }
-    Ok(RuntimeSchemaSnapshot { endpoints, types })
+    Ok(OwnedRuntimeSchemaSnapshot { endpoints, types })
 }
 
 #[cfg(feature = "serde")]
-pub fn schema_snapshot_from_json_bytes(json: &[u8]) -> TelemetryResult<RuntimeSchemaSnapshot> {
+pub fn schema_snapshot_from_json_bytes(json: &[u8]) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     let cfg: JsonConfig =
         serde_json::from_slice(json).map_err(|_| TelemetryError::Unpack("schema json"))?;
     json_config_to_snapshot(cfg, false, 100, 100)
 }
 
 #[cfg(feature = "std")]
-fn register_json_config(cfg: JsonConfig, link_local_overlay: bool) -> TelemetryResult<()> {
-    let mut reg = registry().lock().expect("schema registry poisoned");
-    register_json_config_into(&mut reg, cfg, link_local_overlay)
-}
-
-#[cfg(feature = "std")]
-fn register_json_config_into(
+#[allow(dead_code)]
+fn register_owned_schema_snapshot_into(
     reg: &mut Registry,
-    cfg: JsonConfig,
-    link_local_overlay: bool,
-) -> TelemetryResult<()> {
-    let snapshot = json_config_to_snapshot(
-        cfg,
-        link_local_overlay,
-        reg.next_endpoint_id,
-        reg.next_type_id,
-    )?;
-    register_schema_snapshot_into(reg, snapshot)
-}
-
-#[cfg(feature = "std")]
-fn register_schema_snapshot_into(
-    reg: &mut Registry,
-    snapshot: RuntimeSchemaSnapshot,
+    snapshot: OwnedRuntimeSchemaSnapshot,
 ) -> TelemetryResult<()> {
     for endpoint in snapshot.endpoints {
-        reg.register_endpoint_definition(endpoint)?;
+        reg.register_owned_endpoint(endpoint)?;
     }
     for ty in snapshot.types {
-        reg.register_type_definition(ty)?;
+        reg.register_owned_type(ty)?;
     }
     Ok(())
 }
@@ -2869,7 +3242,96 @@ pub(crate) fn seed_test_schema() {
     SEEDED.get_or_init(|| {
         let _ = register_schema_json_str(include_str!("../telemetry_config.test.json"));
         let ipc = include_str!("../telemetry_config.ipc.test.json");
-        let cfg: JsonConfig = serde_json::from_str(ipc).expect("test ipc schema json");
-        let _ = register_json_config(cfg, true);
+        let mut reg = registry().lock().expect("schema registry poisoned");
+        let _ = register_schema_json_reader_into(&mut reg, ipc.as_bytes(), true, MAX_QUEUE_BUDGET);
     });
+}
+
+#[cfg(all(test, feature = "std"))]
+mod memory_regression_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_schema_storage_is_owned_and_reclaimable() {
+        let mut reg = Registry::new();
+        let baseline_cost = reg.schema_byte_cost();
+        let baseline_count = reg.endpoints.len();
+
+        for index in 0..256u32 {
+            let id = DataEndpoint(50_000 + index);
+            reg.register_owned_endpoint(OwnedEndpointDefinition {
+                id,
+                name: format!("MEMORY_RECLAIM_ENDPOINT_{index}"),
+                description: "x".repeat(1024),
+                link_local_only: false,
+            })
+            .unwrap();
+            let name_handle = reg.endpoints.last().unwrap().1.name.clone();
+            assert_eq!(Arc::strong_count(&name_handle), 2);
+            drop(name_handle);
+            reg.endpoints.retain(|(known, _)| *known != id);
+        }
+
+        assert_eq!(reg.endpoints.len(), baseline_count);
+        assert_eq!(reg.schema_byte_cost(), baseline_cost);
+    }
+
+    #[test]
+    fn streaming_schema_budget_failure_rolls_back_every_entry() {
+        let mut reg = Registry::new();
+        let baseline_cost = reg.schema_byte_cost();
+        let baseline_endpoints = reg.endpoints.len();
+        let baseline_types = reg.types.len();
+        let next_endpoint_id = reg.next_endpoint_id;
+        let next_type_id = reg.next_type_id;
+        let json = br#"{
+            "endpoints": [{
+                "rust": "MemoryBudgetEndpoint",
+                "name": "MEMORY_BUDGET_ENDPOINT",
+                "description": "this entry must be rolled back"
+            }],
+            "types": []
+        }"#;
+
+        let err = register_schema_json_reader_into(&mut reg, &json[..], false, baseline_cost)
+            .expect_err("schema must exceed its unchanged baseline budget");
+        assert!(matches!(err, TelemetryError::PacketTooLarge(_)));
+        assert_eq!(reg.schema_byte_cost(), baseline_cost);
+        assert_eq!(reg.endpoints.len(), baseline_endpoints);
+        assert_eq!(reg.types.len(), baseline_types);
+        assert_eq!(reg.next_endpoint_id, next_endpoint_id);
+        assert_eq!(reg.next_type_id, next_type_id);
+    }
+
+    #[test]
+    fn streaming_schema_parse_failure_rolls_back_prior_chunks() {
+        let mut reg = Registry::new();
+        let baseline_cost = reg.schema_byte_cost();
+        let baseline_endpoints = reg.endpoints.len();
+        let next_endpoint_id = reg.next_endpoint_id;
+        let json = br#"{
+            "endpoints": [{
+                "rust": "MemoryRollbackEndpoint",
+                "name": "MEMORY_ROLLBACK_ENDPOINT"
+            }],
+            "types": [{
+                "rust": "MemoryRollbackType",
+                "name": "MEMORY_ROLLBACK_TYPE",
+                "class": "NotAClass",
+                "element": {"kind": "Dynamic", "data_type": "UInt8"},
+                "endpoints": ["MemoryRollbackEndpoint"]
+            }]
+        }"#;
+
+        assert!(register_schema_json_reader_into(
+            &mut reg,
+            &json[..],
+            false,
+            baseline_cost + 16 * 1024,
+        )
+        .is_err());
+        assert_eq!(reg.schema_byte_cost(), baseline_cost);
+        assert_eq!(reg.endpoints.len(), baseline_endpoints);
+        assert_eq!(reg.next_endpoint_id, next_endpoint_id);
+    }
 }
