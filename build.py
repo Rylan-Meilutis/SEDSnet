@@ -421,9 +421,16 @@ def test_runner_cmds(
 
     if runner == "auto":
         print("info: cargo-nextest not found; falling back to `cargo test`.")
-    cargo_cmd = ["cargo", "test", "--features", feature_arg]
+    cargo_cmd = [
+        "cargo",
+        "test",
+        "--features",
+        feature_arg,
+        "--",
+        "--test-threads=1",
+    ]
     if include_ignored:
-        cargo_cmd.extend(["--", "--include-ignored"])
+        cargo_cmd.append("--include-ignored")
     return "cargo test", [cargo_cmd]
 
 

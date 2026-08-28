@@ -341,7 +341,7 @@ cargo bench --bench packet_paths -- --profile-time=5
 `./build.py test` now starts with the same strict clippy checks as `./build.py check`, then runs:
 
 - `cargo nextest run --features timesync` when `cargo-nextest` is installed, otherwise
-  `cargo test --features timesync`, covering the unit tests in `src/tests.rs`, the Rust system tests under
+  `cargo test --features timesync -- --test-threads=1`, covering the unit tests in `src/tests.rs`, the Rust system tests under
   `tests/rust-system-test/`, and the C integration tests under `tests/c-system-test/`
 - `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
 - a stable Criterion smoke pass for `packet_paths` and `router_system_paths`

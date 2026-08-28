@@ -2434,7 +2434,8 @@ mod tests_more {
 
     fn ensure_compact_reliable_test_type() -> (DataType, DataEndpoint) {
         let ep = DataEndpoint::try_named("COMPACT_RELIABLE_EP").unwrap_or_else(|| {
-            crate::config::register_endpoint_with_description(
+            crate::config::register_endpoint_id_with_description(
+                DataEndpoint(199),
                 "COMPACT_RELIABLE_EP",
                 "compact reliable test endpoint",
                 false,
@@ -2442,7 +2443,8 @@ mod tests_more {
             .unwrap_or_else(|_| DataEndpoint::named("COMPACT_RELIABLE_EP"))
         });
         let ty = DataType::try_named("COMPACT_RELIABLE_TYPE").unwrap_or_else(|| {
-            crate::config::register_data_type_with_description(
+            crate::config::register_data_type_id_with_description(
+                DataType(4091),
                 "COMPACT_RELIABLE_TYPE",
                 "compact reliable test type",
                 MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
