@@ -6,6 +6,9 @@
     - Rust 1.98's new Clippy diagnostics are handled without disabling the repository's
       `-D warnings` policy.
     - Fixed-width decoding remains compatible with the locally supported Rust 1.96 toolchain.
+- C schema views:
+    - Endpoint and data-type info names/descriptions remain backed by registry storage after the C
+      query returns, until the corresponding entry is removed or replaced.
 
 ## Version 4.0.3 highlights
 

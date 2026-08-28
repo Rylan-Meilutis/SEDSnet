@@ -235,6 +235,9 @@ typedef struct SedsEndpointInfo
     size_t description_len;
 } SedsEndpointInfo;
 
+/* `name` and `description` are borrowed schema views. Do not free them. They remain valid until
+ * the corresponding schema entry is removed or replaced. */
+
 typedef struct SedsDataTypeInfo
 {
     bool exists;
@@ -254,6 +257,9 @@ typedef struct SedsDataTypeInfo
     const char * description;
     size_t description_len;
 } SedsDataTypeInfo;
+
+/* `name` and `description` are borrowed schema views. Do not free them. `endpoints` points to the
+ * caller-provided output buffer. Schema views remain valid until the entry is removed/replaced. */
 
 typedef struct SedsNetworkTime
 {

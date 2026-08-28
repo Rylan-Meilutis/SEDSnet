@@ -5,6 +5,8 @@
 - Fixed Rust 1.98 Clippy compatibility in the default merge/release validation route by removing
   redundant owned-string conversions and updating fixed-width slice iteration without weakening
   `-D warnings`.
+- Kept C endpoint/type info name and description views backed by live registry storage instead of
+  returning pointers into temporary owned snapshots.
 
 ## 4.0.3
 

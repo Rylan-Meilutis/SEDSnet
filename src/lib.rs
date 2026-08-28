@@ -394,6 +394,16 @@ impl EndpointMeta {
         self.name
     }
 
+    #[cfg(feature = "std")]
+    pub(crate) fn description_ref(&self) -> &str {
+        self.description.as_ref()
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn description_ref(&self) -> &str {
+        self.description
+    }
+
     /// Return a stable string representation used in logs and in
     /// `Packet::to_string()` output.
     ///
@@ -553,6 +563,16 @@ impl MessageMeta {
     #[cfg(not(feature = "std"))]
     pub(crate) fn name_ref(&self) -> &str {
         self.name
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn description_ref(&self) -> &str {
+        self.description.as_ref()
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn description_ref(&self) -> &str {
+        self.description
     }
 
     #[cfg(feature = "std")]

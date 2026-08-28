@@ -20,8 +20,8 @@ use crate::{
         DataEndpoint, RuntimeMemoryConfig, RuntimeTuningConfig, data_type_definition,
         data_type_definition_by_name, data_type_exists, e2e_encryption_policy_code,
         e2e_encryption_policy_from_code, endpoint_definition, endpoint_definition_by_name,
-        endpoint_exists, known_endpoints, message_class_code, message_class_from_code,
-        message_data_type_code, message_data_type_from_code,
+        endpoint_exists, get_endpoint_meta, known_endpoints, message_class_code,
+        message_class_from_code, message_data_type_code, message_data_type_from_code,
         register_data_type_id_with_description_and_e2e_encryption, register_endpoint_id,
         register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
         reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
@@ -3219,15 +3219,18 @@ pub extern "C" fn seds_endpoint_get_info(endpoint: u32, out: *mut SedsEndpointIn
         }
         return status_from_result_code(SedsResult::SedsOk);
     };
+    let meta = get_endpoint_meta(def.id);
+    let name = meta.name_ref();
+    let description = meta.description_ref();
     unsafe {
         *out = SedsEndpointInfo {
             exists: true,
             id: def.id.as_u32(),
             link_local_only: def.link_local_only,
-            name: def.name.as_ptr() as *const c_char,
-            name_len: def.name.len(),
-            description: def.description.as_ptr() as *const c_char,
-            description_len: def.description.len(),
+            name: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            description: description.as_ptr() as *const c_char,
+            description_len: description.len(),
         };
     }
     status_from_result_code(SedsResult::SedsOk)
@@ -3260,15 +3263,18 @@ pub extern "C" fn seds_endpoint_get_info_by_name(
         }
         return status_from_result_code(SedsResult::SedsOk);
     };
+    let meta = get_endpoint_meta(def.id);
+    let name = meta.name_ref();
+    let description = meta.description_ref();
     unsafe {
         *out = SedsEndpointInfo {
             exists: true,
             id: def.id.as_u32(),
             link_local_only: def.link_local_only,
-            name: def.name.as_ptr() as *const c_char,
-            name_len: def.name.len(),
-            description: def.description.as_ptr() as *const c_char,
-            description_len: def.description.len(),
+            name: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            description: description.as_ptr() as *const c_char,
+            description_len: description.len(),
         };
     }
     status_from_result_code(SedsResult::SedsOk)
@@ -3321,6 +3327,9 @@ pub extern "C" fn seds_dtype_get_info(
         MessageElement::Static(count, data_type, class) => (true, count, data_type, class),
         MessageElement::Dynamic(data_type, class) => (false, 0, data_type, class),
     };
+    let meta = message_meta(def.id);
+    let name = meta.name_ref();
+    let description = meta.description_ref();
     unsafe {
         *out = SedsDataTypeInfo {
             exists: true,
@@ -3335,10 +3344,10 @@ pub extern "C" fn seds_dtype_get_info(
             fixed_size: fixed_payload_size_if_static(def.id).unwrap_or(0),
             endpoints: endpoints_out,
             num_endpoints: def.endpoints.len(),
-            name: def.name.as_ptr() as *const c_char,
-            name_len: def.name.len(),
-            description: def.description.as_ptr() as *const c_char,
-            description_len: def.description.len(),
+            name: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            description: description.as_ptr() as *const c_char,
+            description_len: description.len(),
         };
     }
     status_from_result_code(SedsResult::SedsOk)
@@ -3396,6 +3405,9 @@ pub extern "C" fn seds_dtype_get_info_by_name(
         MessageElement::Static(count, data_type, class) => (true, count, data_type, class),
         MessageElement::Dynamic(data_type, class) => (false, 0, data_type, class),
     };
+    let meta = message_meta(def.id);
+    let name = meta.name_ref();
+    let description = meta.description_ref();
     unsafe {
         *out = SedsDataTypeInfo {
             exists: true,
@@ -3410,10 +3422,10 @@ pub extern "C" fn seds_dtype_get_info_by_name(
             fixed_size: fixed_payload_size_if_static(def.id).unwrap_or(0),
             endpoints: endpoints_out,
             num_endpoints: def.endpoints.len(),
-            name: def.name.as_ptr() as *const c_char,
-            name_len: def.name.len(),
-            description: def.description.as_ptr() as *const c_char,
-            description_len: def.description.len(),
+            name: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            description: description.as_ptr() as *const c_char,
+            description_len: description.len(),
         };
     }
     status_from_result_code(SedsResult::SedsOk)
