@@ -113,8 +113,18 @@ Host/std builds can seed from:
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-Embedded builds include `telemetry_config.json` bytes only if an application provides that file
-locally before building, then decode those bytes through the same runtime parser. The crate remains
+Host file registration decodes entries incrementally through a fixed-size 512-byte read buffer; it
+does not keep a second full copy of the document in memory. Set `SCHEMA_JSON_CHUNK_BYTES` at build
+time to use a smaller or larger buffer. Input size and retained schema memory are bounded, and a
+parse, validation, or budget failure atomically removes everything added by that load. Rust callers
+can select a tighter per-load retained-memory limit with
+`register_schema_json_file_with_budget(...)` or
+`register_schema_json_bytes_with_budget(...)`.
+
+For `no_std` embedded builds, an application-provided `telemetry_config.json` is converted at build
+time into static endpoint and data-type definitions. Those definitions stay in flash and require no
+runtime JSON parser, file-read buffer, or intentionally leaked metadata. Embedded discovery omits
+documentation-only descriptions to reduce its memory footprint. The crate remains
 buildable/publishable without an application JSON file.
 
 JSON shape:
@@ -176,6 +186,10 @@ recent packet ID caches, and discovery topology.
 
 If a received schema snapshot would exceed the budget, the merge is rejected and
 the current registry is left unchanged.
+
+Runtime-owned endpoint/type names, descriptions, endpoint lists, and C/Python side names are freed
+when their owning definitions or router/relay instances are removed or replaced. Failed JSON loads
+also roll back their allocations rather than leaving partially registered schema behind.
 
 ## Payload Layouts
 

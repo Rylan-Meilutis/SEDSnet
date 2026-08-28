@@ -41,6 +41,8 @@ Useful options:
 - `static_schema_path=<path>` sets `SEDSNET_STATIC_SCHEMA_PATH` for runtime registry seeding.
 - `static_ipc_schema_path=<path>` sets `SEDSNET_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
 - `max_stack_payload=<n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
+- `env:SCHEMA_JSON_CHUNK_BYTES=<n>` selects the fixed host/std JSON file read buffer (512 bytes by
+  default). It does not apply to `no_std` builds, which allocate no file-read buffer.
 - `cryptography` is enabled by default and provides the cryptography provider APIs.
 - `env:KEY=VALUE` passes any compile-time env var used by
   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
@@ -244,9 +246,15 @@ Runtime JSON seeding options:
 - C `seds_schema_register_json_file(...)` / `seds_schema_register_json_bytes(...)`
 - Python `register_schema_json_file(...)` / `register_schema_json_bytes(...)`
 
-Embedded builds include `telemetry_config.json` bytes only when an application provides that file
-locally before building, then parse those bytes at runtime. The default crate build does not require
-or include application JSON.
+Host/std builds stream JSON files through a fixed 512-byte default buffer and enforce both input
+and retained-schema limits. A failed load is rolled back atomically. Applications that need a
+different I/O tradeoff can set `SCHEMA_JSON_CHUNK_BYTES`, including values below 512 bytes for
+constrained std targets.
+
+For `no_std` embedded builds, an application-provided `telemetry_config.json` is converted into
+static endpoint and data-type definitions at build time. The generated metadata remains in flash
+and needs no runtime JSON parser or file-read buffer. The default crate build does not require or
+include application JSON.
 
 ## CMake integration
 

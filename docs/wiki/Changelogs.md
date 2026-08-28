@@ -2,6 +2,15 @@
 
 ## Version 4.0.3 highlights
 
+- Bounded schema memory:
+    - Runtime schema metadata and C/Python router and relay side names now have explicit ownership;
+      removing or replacing them releases their strings and endpoint lists.
+    - Host JSON files are decoded incrementally through a configurable 512-byte read buffer and
+      rejected when their input or retained schema exceeds the configured budget. A failed load is
+      rolled back atomically.
+    - `no_std` builds generate static endpoint and data-type definitions at build time. The
+      definitions remain in flash, require no JSON read buffer or startup parse, and omit
+      documentation-only descriptions from embedded discovery snapshots.
 - CI validation:
     - Ubuntu merge tests install the Tkinter system package required by the telemetry config editor
       tests.

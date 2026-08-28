@@ -32,6 +32,7 @@ The budget is shared dynamically across:
 - ordered reliable out-of-order receive buffers
 - reliable retransmit/replay state
 - learned discovery route and topology state
+- runtime schema names, descriptions, endpoint lists, and discovery snapshots
 
 If TX is busy and RX is quiet, TX can use most of the budget that is not already reserved by the
 recent-ID cache. If RX later becomes the pressure point, RX can take available budget back. When
@@ -41,6 +42,12 @@ total stays under `MAX_QUEUE_BUDGET`.
 Discovery topology also counts against this budget. In `std` builds, the router/relay emits a
 warning when discovery/topology entries have to be evicted because the shared queue budget is
 exhausted.
+
+Runtime JSON schema files are decoded incrementally through a 512-byte default read buffer. The
+buffer can be changed at build time with `SCHEMA_JSON_CHUNK_BYTES`; `no_std` builds use generated
+flash-resident schema definitions and allocate no JSON file buffer. JSON input and retained schema
+are both bounded, and failed loads roll back their additions. Owned schema metadata is freed when
+removed or replaced.
 
 ## Growth details
 
@@ -109,4 +116,6 @@ build.py: [source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)
 - If the shared queue budget is full, older queued state is evicted to make room.
 - If discovery topology consumes too much of the budget, older topology entries can be evicted and
   a warning is emitted in `std` builds.
+- If JSON input or its resulting schema exceeds its limit, registration fails and leaves the prior
+  registry unchanged.
 - If handlers are slow, RX queues may accumulate and evict earlier items.

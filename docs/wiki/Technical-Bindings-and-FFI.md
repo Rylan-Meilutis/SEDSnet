@@ -62,9 +62,11 @@ directly, seeded from JSON, or learned through discovery. Compatible definitions
 nodes. Conflicting definitions, such as the same type name/ID with a different payload size, are
 resolved deterministically by the discovery sync path and return errors when registered directly.
 
-Default crate builds do not compile an application JSON schema into the binary. Embedded builds may
-include JSON bytes when a static schema file is present, then decode those bytes through the same
-runtime registration path.
+Default crate builds do not compile an application JSON schema into the binary. Host file APIs
+decode JSON incrementally through a bounded read buffer and roll back the registration if parsing,
+validation, or memory enforcement fails. `no_std` embedded builds may convert an
+application-provided static schema into flash-resident definitions at build time; they do not keep
+the JSON or parse it during startup.
 
 ## Ownership and memory
 
@@ -72,6 +74,8 @@ runtime registration path.
 - Many APIs use `Arc` internally to allow cheap cloning across handlers.
 - C and Python bindings use the same runtime schema registry and packet layout, so the payload
   bytes are compatible across languages.
+- Runtime schema strings and endpoint lists are owned and released when entries are removed or
+  replaced. Router and relay side-name storage exposed through C/Python is released with its owner.
 
 ## Embedded hooks
 
