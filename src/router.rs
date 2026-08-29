@@ -4781,6 +4781,11 @@ impl Router {
         ) in per_side
         {
             let sender = self.sender_arc();
+            // Embedded schemas are immutable flash tables and embedded peers
+            // intentionally ignore remote schema packets. Avoid constructing
+            // and chunking a multi-kilobyte transient frame that no peer can
+            // consume; hosted routers retain dynamic schema discovery.
+            #[cfg(feature = "std")]
             if include_schema && level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
                 self.emit_internal_tx(
@@ -4793,6 +4798,8 @@ impl Router {
                     called_from_queue,
                 )?;
             }
+            #[cfg(not(feature = "std"))]
+            let _ = include_schema;
             if level == DiscoveryAdvertiseLevel::Full {
                 let address = self.local_address_advertisement(
                     endpoints.clone(),
