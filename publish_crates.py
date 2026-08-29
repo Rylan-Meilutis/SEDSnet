@@ -445,9 +445,15 @@ def docker_maturin_macos_build(*, targets: list[str], out_dir: str) -> None:
 
 
 def pypi_artifacts_from_dir(out_dir: str) -> list[Path]:
-    root = REPO_ROOT / out_dir
-    artifacts = sorted([*root.glob("*.whl"), *root.glob("*.tar.gz")])
-    return artifacts
+    root = Path(out_dir)
+    if not root.is_absolute():
+        root = REPO_ROOT / root
+    return sorted(
+        artifact
+        for pattern in ("*.whl", "*.tar.gz")
+        for artifact in root.rglob(pattern)
+        if artifact.is_file()
+    )
 
 
 def prune_stale_pypi_artifacts(
@@ -499,15 +505,12 @@ def twine_upload(
     cmd = [sys.executable, "-m", "twine", "upload"]
     if skip_existing:
         cmd.append("--skip-existing")
+    env = os.environ.copy()
     if token:
-        cmd.extend(["--username", username or "__token__", "--password", token])
+        env["TWINE_USERNAME"] = username or "__token__"
+        env["TWINE_PASSWORD"] = token
     cmd.extend(str(path) for path in artifacts)
-    display_cmd = list(cmd)
-    if token and "--password" in display_cmd:
-        idx = display_cmd.index("--password")
-        if idx + 1 < len(display_cmd):
-            display_cmd[idx + 1] = "<redacted>"
-    result = run_optional(cmd, display_cmd=display_cmd)
+    result = run_optional(cmd, env=env)
     print(result.stdout, end="")
     if result.returncode == 0:
         return
@@ -687,14 +690,14 @@ def parse_args() -> argparse.Namespace:
         "--pypi-skip-existing",
         dest="pypi_skip_existing",
         action="store_true",
-        default=True,
-        help="Pass --skip-existing to twine upload. This is the default.",
+        default=False,
+        help="Pass --skip-existing to twine upload. By default every artifact is uploaded.",
     )
     parser.add_argument(
         "--pypi-no-skip-existing",
         dest="pypi_skip_existing",
         action="store_false",
-        help="Fail PyPI publish when an artifact already exists.",
+        help="Upload every artifact and fail if one already exists. This is the default.",
     )
     parser.add_argument(
         "--skip-tests",
@@ -942,13 +945,18 @@ def main() -> int:
                 raise SystemExit(
                     "No PyPI credentials available. Run `python3 build.py maturin-login` first."
                 )
-            if built_pypi_artifacts:
+            existing_artifacts = pypi_artifacts_from_dir(args.wheel_out)
+            if built_pypi_artifacts or existing_artifacts:
                 prune_stale_pypi_artifacts(
                     args.wheel_out,
                     package_name=py_name,
                     expected_version=py_version,
                 )
                 artifacts = pypi_artifacts_from_dir(args.wheel_out)
+                print(
+                    f"\nUploading all {len(artifacts)} wheel/sdist artifact(s) found under "
+                    f"{args.wheel_out}."
+                )
             else:
                 with tempfile.TemporaryDirectory(prefix="sedsnet-pypi-") as tmp:
                     artifacts = build_local_pypi_artifacts(tmp)

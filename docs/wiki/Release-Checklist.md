@@ -91,8 +91,10 @@ python3 build.py maturin-login
 That command validates the PyPI token before saving it to `.sedsnet-release.toml`. The file is
 ignored by git and read automatically by `publish_crates.py --publish-pypi`. If no environment token
 or saved config exists, `publish_crates.py --publish-pypi` starts the login flow before upload.
-PyPI upload uses skip-existing behavior by default so rerunning a release does not fail only because
-the same wheel or sdist is already present.
+When `--wheel-out` already contains wheels or source distributions, `--publish-pypi` recursively
+uploads every artifact found there instead of building only the local platform. Uploads fail if any
+file already exists so a partial or duplicated release is visible; pass `--pypi-skip-existing`
+explicitly only when intentionally retrying a release.
 
 ## CI Releases
 
