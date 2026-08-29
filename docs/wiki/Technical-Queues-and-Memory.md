@@ -13,7 +13,9 @@ Key properties:
 - **Byte budget**: each item reports its `byte_cost` via the `ByteCost` trait.
 - **Hard element cap**: capacity never exceeds `max_elems`, derived from `size_of::<T>()`.
 - **Eviction policy**: evict from the front until a new item fits in the byte budget.
-- **Growth policy**: multiplicative growth using `QUEUE_GROW_STEP`.
+- **Growth policy**: multiplicative growth using `QUEUE_GROW_STEP`. Set it to
+  exactly `1.0` on fragmented embedded heaps to retain the startup capacity
+  and evict from a full bounded queue without reallocating under live traffic.
 
 This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded builds.
 

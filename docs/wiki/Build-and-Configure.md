@@ -201,6 +201,10 @@ Supported keys (defaults shown):
 - `RELIABLE_MAX_END_TO_END_PENDING` (`RELIABLE_MAX_PENDING`)
 - `RELIABLE_MAX_END_TO_END_ACK_CACHE` (`MAX_RECENT_RX_IDS`)
 
+`QUEUE_GROW_STEP=1.0` selects fixed-capacity queues: they allocate
+`STARTING_QUEUE_SIZE` at router construction and use their bounded eviction
+policy instead of growing the backing allocation while traffic is live.
+
 `MAX_QUEUE_BUDGET`, `MAX_RECENT_RX_IDS`, `STARTING_QUEUE_SIZE`, and `QUEUE_GROW_STEP` are defaults,
 not the only way to size a node. Rust can pass `RuntimeMemoryConfig` through
 `RouterConfig::with_memory_config(...)` or `RelayConfig::with_memory_config(...)`. C can use

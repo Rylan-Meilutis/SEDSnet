@@ -41,6 +41,7 @@ pub struct BoundedDeque<T> {
     max_elems: usize,
     grow_num: usize,
     grow_den: usize,
+    fixed_capacity: bool,
 }
 
 impl<T: ByteCost> BoundedDeque<T> {
@@ -82,8 +83,8 @@ impl<T: ByteCost> BoundedDeque<T> {
         if max_bytes == 0 {
             panic!("max_bytes must be greater than 0");
         }
-        if grow_mult <= 1.0 {
-            panic!("grow_mult must be greater than 1.0");
+        if grow_mult < 1.0 {
+            panic!("grow_mult must be at least 1.0");
         }
         let min_cost = size_of::<T>().max(1);
         let max_elems = (max_bytes / min_cost).max(1);
@@ -99,6 +100,7 @@ impl<T: ByteCost> BoundedDeque<T> {
             max_elems,
             grow_num,
             grow_den,
+            fixed_capacity: grow_mult == 1.0,
         }
     }
 
@@ -226,6 +228,14 @@ impl<T: ByteCost> BoundedDeque<T> {
             return;
         }
 
+        // A multiplier of exactly 1.0 deliberately disables live queue
+        // reallocations. The bounded queue retains its startup capacity and
+        // applies the existing priority/FIFO eviction policy when full.
+        if self.fixed_capacity {
+            let _ = self.pop_front();
+            return;
+        }
+
         // Hard length cap: ring eviction.
         if len >= self.max_elems {
             let _ = self.pop_front();
@@ -316,6 +326,14 @@ impl<T: ByteCost> BoundedDeque<T> {
             let _ = self.pop_back();
         }
 
+        if self.fixed_capacity && self.q.len() >= self.q.capacity() {
+            let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
+            if tail_priority > new_priority {
+                return Err(TelemetryError::Io("priority queue saturated"));
+            }
+            let _ = self.pop_back();
+        }
+
         self.ensure_room_for_one();
 
         let insert_at = self
@@ -383,6 +401,26 @@ mod tests {
         assert_eq!(q.pop_front().unwrap().id, 3);
         assert_eq!(q.pop_front().unwrap().id, 1);
         assert_eq!(q.pop_front().unwrap().id, 2);
+    }
+
+    #[test]
+    fn one_x_growth_keeps_startup_capacity_and_evicts() {
+        let item_size = size_of::<Item>();
+        let mut q = BoundedDeque::new(item_size * 8, item_size * 2, 1.0);
+        let startup_capacity = q.capacity();
+
+        for id in 0..(startup_capacity + 4) {
+            q.push_back(Item {
+                id: id as u8,
+                cost: 1,
+                priority: 0,
+            })
+            .unwrap();
+            assert_eq!(q.capacity(), startup_capacity);
+        }
+
+        assert_eq!(q.len(), startup_capacity);
+        assert_eq!(q.pop_front().unwrap().id, 4);
     }
 
     #[test]
