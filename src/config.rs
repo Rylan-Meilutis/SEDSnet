@@ -384,7 +384,7 @@ impl RuntimeMemoryConfig {
         if self.starting_queue_size == 0 || self.starting_queue_size > self.max_queue_budget {
             return Err(TelemetryError::BadArg);
         }
-        if !self.queue_grow_step.is_finite() || self.queue_grow_step <= 1.0 {
+        if !self.queue_grow_step.is_finite() || self.queue_grow_step < 1.0 {
             return Err(TelemetryError::BadArg);
         }
         Ok(())
