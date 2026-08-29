@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.6
+
+- Added a fixed-capacity queue mode for embedded targets. Configuring a queue growth multiplier of
+  `1.0` now preallocates the configured capacity and prevents later `VecDeque` reallocations.
+- Skip building schema advertisement payloads on immutable embedded routers and relays that cannot
+  use them, reducing unnecessary allocation and serialization work during discovery.
+- Added embedded-memory regression coverage for fixed queue capacity and omitted schema
+  advertisements.
+
 ## 4.0.5
 
 - Avoid decoding remote discovery schemas on immutable `no_std` nodes. The previous no-op merge

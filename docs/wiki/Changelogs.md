@@ -1,5 +1,17 @@
 # Changelogs
 
+## Version 4.0.6 highlights
+
+- Predictable embedded queue allocation:
+    - A queue growth multiplier of `1.0` selects fixed-capacity mode and preallocates the queue's
+      configured element capacity.
+    - Fixed-capacity queues do not reallocate as traffic fills them, keeping runtime heap behavior
+      predictable on constrained targets.
+- Leaner embedded discovery:
+    - Immutable embedded routers and relays skip schema advertisement generation when the schema
+      cannot be used by the peer.
+    - Regression coverage verifies fixed queue capacity and omitted schema advertisements.
+
 ## Version 4.0.5 highlights
 
 - Embedded memory safety:
