@@ -2839,6 +2839,9 @@ impl Relay {
         let mut st = self.state.lock();
         for (dst, level, endpoints, timesync_sources, topology, capabilities) in per_side {
             let sender = self.sender_arc();
+            // no_std schemas are immutable and no_std receivers discard
+            // remote schema packets, so only hosted relays advertise them.
+            #[cfg(feature = "std")]
             if level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
                 let data = RelayItem::Packet(Arc::new(pkt));

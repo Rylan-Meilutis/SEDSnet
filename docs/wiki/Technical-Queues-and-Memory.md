@@ -16,6 +16,9 @@ Key properties:
 - **Growth policy**: multiplicative growth using `QUEUE_GROW_STEP`. Set it to
   exactly `1.0` on fragmented embedded heaps to retain the startup capacity
   and evict from a full bounded queue without reallocating under live traffic.
+- **Embedded discovery**: no-std nodes use immutable flash schemas, so they do
+  not advertise or decode dynamic schema snapshots. This avoids multi-kilobyte
+  transient reassembly buffers on fragmented RTOS heaps.
 
 This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded builds.
 
