@@ -1,5 +1,19 @@
 # Changelogs
 
+## Version 4.0.7 highlights
+
+- Reliable discovered routing:
+    - Explicit router and relay `Fanout` overrides remain active after discovery rather than
+      reverting to adaptive single-path selection.
+    - Two-sided bridge nodes can forward discovery, network variables, and commands across every
+      intended transport while reliable point-to-point traffic still prefers the best discovered
+      endpoint holder.
+    - Regression tests cover router ingress fanout, relay fanout, network-variable propagation,
+      and reliable command route selection.
+- Complete local releases:
+    - The publishing helper prunes stale artifacts and uploads all Docker-built wheels plus the
+      source distribution as one version-consistent PyPI release.
+
 ## Version 4.0.6 highlights
 
 - Predictable embedded queue allocation:

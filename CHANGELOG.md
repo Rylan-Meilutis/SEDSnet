@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.0.7
+
+- Fixed explicit fanout routing after discovery. Router and relay source-route overrides now retain
+  `Fanout` instead of silently falling back to adaptive single-path routing, so bridge nodes can
+  reliably forward discovery, network variables, and commands across every configured side.
+- Added regressions for discovered endpoint fanout, two-sided ingress forwarding, reliable command
+  route selection, and relay fanout behavior.
+- Hardened the release helper so Docker-built wheel and source-distribution artifacts are pruned,
+  collected, and uploaded as one complete, version-consistent PyPI release.
+
 ## 4.0.6
 
 - Added a fixed-capacity queue mode for embedded targets. Configuring a queue growth multiplier of
