@@ -567,6 +567,75 @@ mod tests2 {
         assert_eq!(total, 1);
     }
 
+    #[test]
+    fn relay_explicit_fanout_overrides_adaptive_discovery_selection() {
+        crate::tests::ensure_common_test_schema();
+        use crate::RouteSelectionMode;
+        use crate::discovery::build_discovery_announce;
+        use crate::relay::Relay;
+
+        let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_a_cb = seen_a.clone();
+        let seen_b_cb = seen_b.clone();
+        let relay = Relay::new(StepClock::new_default_box());
+        let ingress = relay.add_side_packet("INGRESS", |_packet| Ok(()));
+        let side_a = relay.add_side_packet("A", move |packet| {
+            seen_a_cb.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+        let side_b = relay.add_side_packet("B", move |packet| {
+            seen_b_cb.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+        let endpoint = DataEndpoint::named("RADIO");
+        relay
+            .rx_from_side(
+                side_a,
+                build_discovery_announce("A", 1, &[endpoint]).unwrap(),
+            )
+            .unwrap();
+        relay
+            .rx_from_side(
+                side_b,
+                build_discovery_announce("B", 1, &[endpoint]).unwrap(),
+            )
+            .unwrap();
+        relay.process_all_queues().unwrap();
+        seen_a.lock().unwrap().clear();
+        seen_b.lock().unwrap().clear();
+        relay
+            .set_source_route_mode(Some(ingress), RouteSelectionMode::Fanout)
+            .unwrap();
+        relay
+            .rx_from_side(
+                ingress,
+                Packet::from_f32_slice(
+                    DataType::named("GPS_DATA"),
+                    &[1.0, 2.0, 3.0],
+                    &[endpoint],
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        relay.process_all_queues().unwrap();
+        assert_eq!(
+            crate::tests::count_packets_of_type(
+                &seen_a.lock().unwrap(),
+                DataType::named("GPS_DATA")
+            ),
+            1
+        );
+        assert_eq!(
+            crate::tests::count_packets_of_type(
+                &seen_b.lock().unwrap(),
+                DataType::named("GPS_DATA")
+            ),
+            1
+        );
+    }
+
     /// A small “bus” that records transmitted frames for TX/RX queue tests.
     struct TestBus {
         frames: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -8474,9 +8543,114 @@ mod router_tests {
                 count_packets_of_type(&seen_b.lock().unwrap(), DataType::named("GPS_DATA"));
             let total_c =
                 count_packets_of_type(&seen_c.lock().unwrap(), DataType::named("GPS_DATA"));
-            assert_eq!(total_b + total_c, 3);
+            assert_eq!(
+                total_b + total_c,
+                4,
+                "an explicit fanout policy remains active after typed routes are cleared"
+            );
 
             let _ = side_a;
+        }
+
+        #[test]
+        fn explicit_fanout_reaches_all_discovered_network_variable_routes() {
+            ensure_topology_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let endpoint = DataEndpoint::named("RADIO");
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_cb = seen_a.clone();
+            let seen_b_cb = seen_b.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_reliable_enabled(true),
+                zero_clock(),
+            );
+            let side_a = router.add_side_packet("rocket", move |packet| {
+                seen_a_cb.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            let side_b = router.add_side_packet("fill", move |packet| {
+                seen_b_cb.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            router
+                .rx_from_side(
+                    &build_discovery_announce("RF", 1, &[endpoint]).unwrap(),
+                    side_a,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("GATEWAY", 1, &[endpoint]).unwrap(),
+                    side_b,
+                )
+                .unwrap();
+            seen_a.lock().unwrap().clear();
+            seen_b.lock().unwrap().clear();
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+                .unwrap();
+            router
+                .set_source_route_mode(None, RouteSelectionMode::Fanout)
+                .unwrap();
+            let variable = Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[endpoint], 2).unwrap();
+            router.set_network_variable(variable).unwrap();
+            assert_eq!(count_packets_of_type(&seen_a.lock().unwrap(), ty), 1);
+            assert_eq!(count_packets_of_type(&seen_b.lock().unwrap(), ty), 1);
+
+            router.clear_source_route_mode(None).unwrap();
+            let adaptive = Packet::from_f32_slice(ty, &[4.0, 5.0, 6.0], &[endpoint], 3).unwrap();
+            router.set_network_variable(adaptive).unwrap();
+            let total = count_packets_of_type(&seen_a.lock().unwrap(), ty)
+                + count_packets_of_type(&seen_b.lock().unwrap(), ty);
+            assert_eq!(
+                total, 3,
+                "clearing explicit fanout restores one adaptive path"
+            );
+        }
+
+        #[test]
+        fn explicit_ingress_fanout_crosses_both_router_egress_sides() {
+            ensure_topology_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let endpoint = DataEndpoint::named("RADIO");
+            let seen_left = Arc::new(AtomicUsize::new(0));
+            let seen_right = Arc::new(AtomicUsize::new(0));
+            let left_cb = seen_left.clone();
+            let right_cb = seen_right.clone();
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let ingress = router.add_side_packet("can", |_packet| Ok(()));
+            let left = router.add_side_packet("radio-a", move |packet| {
+                if packet.data_type() == ty {
+                    left_cb.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            let right = router.add_side_packet("radio-b", move |packet| {
+                if packet.data_type() == ty {
+                    right_cb.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            router
+                .rx_from_side(
+                    &build_discovery_announce("LEFT", 1, &[endpoint]).unwrap(),
+                    left,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_announce("RIGHT", 1, &[endpoint]).unwrap(),
+                    right,
+                )
+                .unwrap();
+            router
+                .set_source_route_mode(Some(ingress), RouteSelectionMode::Fanout)
+                .unwrap();
+            let packet = Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[endpoint], 2).unwrap();
+            router.rx_from_side(&packet, ingress).unwrap();
+            assert_eq!(seen_left.load(Ordering::SeqCst), 1);
+            assert_eq!(seen_right.load(Ordering::SeqCst), 1);
         }
 
         #[test]

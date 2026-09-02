@@ -6718,7 +6718,7 @@ mod tests {
         assert_eq!(hits_a.hits.load(Ordering::SeqCst), 0);
         assert_eq!(
             hits_b.hits.load(Ordering::SeqCst) + hits_c.hits.load(Ordering::SeqCst),
-            3
+            4
         );
 
         seds_router_free(router);
