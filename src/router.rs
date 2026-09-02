@@ -7728,11 +7728,10 @@ impl Router {
         if let Some(src) = src {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
-        if mode == RouteSelectionMode::Fanout {
-            st.source_route_modes.remove(&src);
-        } else {
-            st.source_route_modes.insert(src, mode);
-        }
+        // Keep an explicitly selected Fanout mode distinct from the absence
+        // of a policy. With discovery enabled, no policy intentionally uses
+        // adaptive single-path selection; explicit Fanout must override that.
+        st.source_route_modes.insert(src, mode);
         st.route_selection_cursors.remove(&src);
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
@@ -7741,7 +7740,16 @@ impl Router {
 
     /// Clear any source-specific route-selection override for `src`.
     pub fn clear_source_route_mode(&self, src: Option<RouterSideId>) -> TelemetryResult<()> {
-        self.set_source_route_mode(src, RouteSelectionMode::Fanout)
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if let Some(src) = src {
+            let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
+        }
+        st.source_route_modes.remove(&src);
+        st.route_selection_cursors.remove(&src);
+        #[cfg(feature = "discovery")]
+        Self::note_discovery_topology_change_locked(&mut st, now_ms);
+        Ok(())
     }
 
     /// Set the weighted-routing weight from `src` toward `dst`.
