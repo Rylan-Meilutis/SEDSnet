@@ -1549,6 +1549,90 @@ impl Relay {
         Vec::new()
     }
 
+    /// Prefer the discovery side with the shortest advertised topology path
+    /// to the packet's destination. This prevents a route reflected through
+    /// another router from competing equally with the direct route.
+    #[cfg(feature = "discovery")]
+    fn retain_shortest_discovery_routes_locked(
+        st: &RelayInner,
+        sides: &mut Vec<RelaySideId>,
+        endpoints: &[crate::DataEndpoint],
+        now_ms: u64,
+    ) {
+        if sides.len() <= 1 || endpoints.is_empty() {
+            return;
+        }
+
+        let route_distance = |side: RelaySideId| -> Option<usize> {
+            let route = st.discovery_routes.get(&side)?;
+            route
+                .announcers
+                .iter()
+                .filter(|(_, state)| {
+                    now_ms.saturating_sub(state.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                })
+                .filter_map(|(announcer, state)| {
+                    let targets: BTreeSet<&str> = state
+                        .topology_boards
+                        .iter()
+                        .filter(|board| {
+                            endpoints
+                                .iter()
+                                .any(|endpoint| board.reachable_endpoints.contains(endpoint))
+                        })
+                        .map(|board| board.sender_id.as_str())
+                        .collect();
+                    if targets.is_empty() {
+                        return state
+                            .reachable
+                            .iter()
+                            .any(|endpoint| endpoints.contains(endpoint))
+                            .then_some(usize::MAX / 2);
+                    }
+
+                    let mut distances: BTreeMap<&str, usize> = BTreeMap::new();
+                    let mut pending = VecDeque::from([(announcer.as_str(), 0usize)]);
+                    while let Some((sender, distance)) = pending.pop_front() {
+                        if distances.contains_key(sender) {
+                            continue;
+                        }
+                        distances.insert(sender, distance);
+                        if targets.contains(sender) {
+                            return Some(distance);
+                        }
+                        for board in &state.topology_boards {
+                            if board.sender_id == sender {
+                                for peer in &board.connections {
+                                    if !distances.contains_key(peer.as_str()) {
+                                        pending.push_back((peer.as_str(), distance + 1));
+                                    }
+                                }
+                            } else if board.connections.iter().any(|peer| peer == sender)
+                                && !distances.contains_key(board.sender_id.as_str())
+                            {
+                                pending.push_back((board.sender_id.as_str(), distance + 1));
+                            }
+                        }
+                    }
+                    None
+                })
+                .min()
+        };
+
+        let distances: Vec<(RelaySideId, usize)> = sides
+            .iter()
+            .filter_map(|side| route_distance(*side).map(|distance| (*side, distance)))
+            .collect();
+        let Some(best) = distances.iter().map(|(_, distance)| *distance).min() else {
+            return;
+        };
+        sides.retain(|side| {
+            distances
+                .iter()
+                .any(|(candidate, distance)| candidate == side && *distance == best)
+        });
+    }
+
     fn record_side_tx_sample(
         &self,
         side: RelaySideId,
@@ -2266,6 +2350,12 @@ impl Relay {
                     discovered_origin,
                 )))
             } else if had_known {
+                Self::retain_shortest_discovery_routes_locked(
+                    &st,
+                    &mut generic_targets,
+                    &eps,
+                    now_ms,
+                );
                 #[cfg(feature = "timesync")]
                 {
                     generic_targets = Self::filter_timesync_sides_locked(

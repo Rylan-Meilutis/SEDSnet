@@ -568,6 +568,131 @@ mod tests2 {
     }
 
     #[test]
+    fn discovery_prefers_direct_topology_path_over_reflected_route() {
+        crate::tests::ensure_common_test_schema();
+        use crate::discovery::{
+            TopologyBoardNode, build_discovery_announce, build_discovery_topology,
+        };
+        use crate::relay::Relay;
+
+        let direct_seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        let reflected_seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        let direct_seen_cb = direct_seen.clone();
+        let reflected_seen_cb = reflected_seen.clone();
+        let relay = Relay::new(StepClock::new_default_box());
+        let endpoint = DataEndpoint::named("RADIO");
+        let ingress = relay.add_side_packet("INGRESS", |_packet| Ok(()));
+        let direct = relay.add_side_packet("DIRECT", move |packet| {
+            direct_seen_cb.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+        let reflected = relay.add_side_packet("REFLECTED", move |packet| {
+            reflected_seen_cb.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+
+        for (side, announcer, boards) in [
+            (
+                direct,
+                "GATEWAY",
+                vec![
+                    TopologyBoardNode {
+                        sender_id: "GATEWAY".into(),
+                        reachable_endpoints: vec![],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["VALVE".into()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "VALVE".into(),
+                        reachable_endpoints: vec![endpoint],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GATEWAY".into()],
+                    },
+                ],
+            ),
+            (
+                reflected,
+                "RF",
+                vec![
+                    TopologyBoardNode {
+                        sender_id: "RF".into(),
+                        reachable_endpoints: vec![],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GROUND".into()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "GROUND".into(),
+                        reachable_endpoints: vec![],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["RF".into(), "GATEWAY".into()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "GATEWAY".into(),
+                        reachable_endpoints: vec![],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GROUND".into(), "VALVE".into()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "VALVE".into(),
+                        reachable_endpoints: vec![endpoint],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GATEWAY".into()],
+                    },
+                ],
+            ),
+        ] {
+            relay
+                .rx_from_side(
+                    side,
+                    build_discovery_announce(announcer, 1, &[endpoint]).unwrap(),
+                )
+                .unwrap();
+            relay
+                .rx_from_side(
+                    side,
+                    build_discovery_topology(announcer, 2, &boards).unwrap(),
+                )
+                .unwrap();
+        }
+        relay.process_all_queues().unwrap();
+        direct_seen.lock().unwrap().clear();
+        reflected_seen.lock().unwrap().clear();
+
+        relay
+            .rx_from_side(
+                ingress,
+                Packet::from_f32_slice(
+                    DataType::named("GPS_DATA"),
+                    &[1.0, 2.0, 3.0],
+                    &[endpoint],
+                    3,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        relay.process_all_queues().unwrap();
+
+        assert_eq!(
+            direct_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|packet| packet.data_type() == DataType::named("GPS_DATA"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            reflected_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|packet| packet.data_type() == DataType::named("GPS_DATA"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn relay_explicit_fanout_overrides_adaptive_discovery_selection() {
         crate::tests::ensure_common_test_schema();
         use crate::RouteSelectionMode;
