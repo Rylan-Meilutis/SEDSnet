@@ -40,7 +40,10 @@ They cover:
   memory-layout snapshots
 - combined multi-node memory exhaustion with small runtime pools, heavy discovery topology updates,
   and telemetry RX/TX pressure, asserting exported memory usage stays within each configured pool
-- fixed-size packed side splitting/reassembly and side-local header-template compaction
+- fixed-size packed side splitting/reassembly, plus router-side synchronized bounded template
+  eviction, nonfatal unknown-template drops, and recovery through periodic full template refreshes
+- per-side suppression of detailed discovery topology without suppressing routable address
+  advertisements
 - E2E payload cryptography policies, software fallback crypto, multi-holder encrypted fanout, and
   tamper rejection
 - router and relay reliable-delivery internals
@@ -91,6 +94,7 @@ This is the compatibility net for the C interface, not just the Rust core.
 `./build.py test` also runs stable Criterion benchmark smoke passes for:
 
 - `benches/packet_paths.rs`
+- `benches/route_selection_paths.rs`
 - `benches/router_system_paths.rs`
 
 These are not pass/fail performance gates today. They are there to catch obvious pathological

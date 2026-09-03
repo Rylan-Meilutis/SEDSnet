@@ -4,32 +4,34 @@ This directory contains the in-repo wiki. Markdown renders in both GitHub and Gi
 
 Start here:
 
-- docs/wiki/Home.md
+- [Wiki home](wiki/Home.md)
 
 ## Easy overview
 
-- docs/wiki/Overview.md
-- docs/wiki/Concepts.md
-- docs/wiki/Examples.md
-- docs/wiki/Glossary-and-Abbreviations.md
+- [Overview](wiki/Overview.md)
+- [Concepts](wiki/Concepts.md)
+- [Examples](wiki/Examples.md)
+- [Glossary and abbreviations](wiki/Glossary-and-Abbreviations.md)
+- [Changelogs](wiki/Changelogs.md)
 
 ## How-to guides
 
-- docs/wiki/Build-and-Configure.md
-- docs/wiki/Release-Checklist.md
-- docs/wiki/Usage-Rust.md
-- docs/wiki/Usage-C-Cpp.md
-- docs/wiki/Usage-Python.md
-- docs/wiki/Troubleshooting.md
+- [Build and configure](wiki/Build-and-Configure.md)
+- [Release checklist](wiki/Release-Checklist.md)
+- [Time sync](wiki/Time-Sync.md)
+- [Rust usage](wiki/Usage-Rust.md)
+- [C/C++ usage](wiki/Usage-C-Cpp.md)
+- [Python usage](wiki/Usage-Python.md)
+- [Troubleshooting](wiki/Troubleshooting.md)
 
 ## Technical reference
 
-- docs/wiki/Technical-Index.md
-- docs/wiki/Technical-Architecture.md
-- docs/wiki/Technical-Telemetry-Schema.md
-- docs/wiki/Technical-Wire-Format.md
-- docs/wiki/Technical-Discovery-and-Internal-Formats.md
-- docs/wiki/Technical-Router-Details.md
-- docs/wiki/Technical-Queues-and-Memory.md
-- docs/wiki/Technical-Packet-Details.md
-- docs/wiki/Technical-Bindings-and-FFI.md
+- [Technical index](wiki/Technical-Index.md)
+- [Architecture](wiki/Technical-Architecture.md)
+- [Telemetry schema](wiki/Technical-Telemetry-Schema.md)
+- [Wire format](wiki/Technical-Wire-Format.md)
+- [Discovery and internal formats](wiki/Technical-Discovery-and-Internal-Formats.md)
+- [Router details](wiki/Technical-Router-Details.md)
+- [Queues and memory](wiki/Technical-Queues-and-Memory.md)
+- [Packet details](wiki/Technical-Packet-Details.md)
+- [Bindings and FFI](wiki/Technical-Bindings-and-FFI.md)

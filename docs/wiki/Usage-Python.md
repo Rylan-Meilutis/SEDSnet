@@ -288,6 +288,12 @@ target for the selected profile. The `ipv4_like` profile also omits unchanged co
 The same method is available on `Relay`. Per-data-type timestamp omission policy is currently a
 Rust-side option; Python callers use profile-wide timestamp omission through `ipv4_like`.
 
+On `Router`, compact template state is self-healing on lossy links. An unknown compact frame is
+dropped without raising a transport error, and the sender refreshes an active template in full
+after every eight compact uses. Router transmit and receive also share the same deterministic
+eviction rule when `max_side_transport_templates` is reached. `Relay` exposes the same profile
+configuration but does not currently perform this automatic recovery.
+
 ## P2P Service Ports
 
 Routers expose discovery-backed service ports for byte protocols that should run over SEDSnet

@@ -94,7 +94,7 @@ Relay:
 
 ## Configuration knobs
 
-These values are set at compile time via
+These values are packaged defaults selected at compile time via
 src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)):
 
 - `STARTING_QUEUE_SIZE`
@@ -102,10 +102,11 @@ src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/
 - `QUEUE_GROW_STEP`
 - `MAX_RECENT_RX_IDS`
 
-They can be overridden using `build.py env:KEY=VALUE` (
-build.py: [source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py))
-or `.cargo/config.toml`. (
-build.py: [source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py))
+They can be overridden using
+[build.py](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py) with `env:KEY=VALUE` or
+`.cargo/config.toml`. The active queue budget, starting size, recent-ID capacity, and growth policy
+can also be selected per router or relay with `RuntimeMemoryConfig` (or the matching C/Python
+constructor arguments); this does not require rebuilding a packaged host library.
 
 ## Tuning guidance
 

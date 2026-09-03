@@ -493,6 +493,13 @@ exposes the same profile selection with `add_side_packed_profile(..., profile="i
 callers use `seds_router_add_side_packed_profile(...)` or
 `seds_relay_add_side_packed_profile(...)` with `SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE`.
 
+Router template transport recovers automatically when a full template frame is lost: unknown
+compact frames are dropped nonfatally, and the router sender sends a full refresh after every eight
+compact uses of an active template. Router bounded template dictionaries also use identical
+lowest-hash eviction on transmit and receive. Applications do not need to reset or recreate a
+router side to trigger recovery. Relay packed sides support template profiles but do not currently
+perform this automatic refresh/nonfatal unknown-template recovery.
+
 For mixed links, keep absolute/delta timestamps for most traffic and omit unchanged timestamps only
 for selected data types:
 

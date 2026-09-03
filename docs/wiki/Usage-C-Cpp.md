@@ -70,7 +70,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.6
+    GIT_TAG v4.0.10
 )
 FetchContent_MakeAvailable(sedsnet)
 
@@ -617,10 +617,9 @@ Reserved internal endpoints:
 - Those endpoints are reserved for the router's built-in discovery and time-sync control traffic,
   and `seds_router_new(...)` rejects them.
 
-See c-example-code/
-([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code))
-for a more complete example. Time sync is demonstrated in c-example-code/src/timesync_example.c
-([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c)).
+See the [C example directory](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code)
+for a more complete example. Time sync is demonstrated in the
+[C time-sync example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c).
 See [Time-Sync](Time-Sync) for the time sync packet flow and roles.
 
 ## P2P Service Ports
@@ -710,6 +709,14 @@ Call `seds_router_announce_leave(...)` or `seds_relay_announce_leave(...)` befor
 disconnect so peers receive `SEDSNET_DISCOVERY_LEAVE` and prune topology immediately. The raw C free
 functions attempt a best-effort leave and queue flush, but explicit leave is preferred when shutdown
 order matters.
+
+For constrained packed links, `seds_router_add_side_packed_profile(...)` and
+`seds_relay_add_side_packed_profile(...)` select the canonical, template, IPv6-like, or IPv4-like
+side-transport profiles declared by `SedsSideTransportProfile`. On router packed sides, template
+state recovers without recreating the side: unknown compact frames are dropped nonfatally, bounded
+TX/RX dictionaries use the same lowest-hash eviction rule, and the sender emits a full refresh after
+every eight compact uses of an active template. Relay packed sides support the profiles but do not
+currently perform this automatic recovery.
 
 With `timesync` enabled, the router owns an internal network clock and handles `SEDSNET_TIME_SYNC`
 packets internally. Use `seds_router_get_network_time_ms` / `seds_router_get_network_time` to

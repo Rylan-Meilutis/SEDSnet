@@ -121,6 +121,9 @@ With discovery enabled, forwarding also consults the learned side map:
   while broadcast telemetry keeps using endpoint subscriptions.
 - If typed route overrides exist for `(source side or local TX, packet type)`, only those enabled
   destination sides remain eligible before path selection and discovery matching are applied.
+- The router applies that typed policy to `SEDSNET_DISCOVERY_TOPOLOGY` before cloning or encoding
+  the detailed graph for a side. Disabling the topology type on a constrained egress avoids that
+  transient allocation without disabling the smaller discovery address/reachability packets.
 - Reliable packets are sent to all known candidate sides for their endpoints.
 - Non-reliable discovered traffic defaults to adaptive one-path load balancing derived from recent
   measured side transmit bandwidth.

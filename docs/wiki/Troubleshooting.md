@@ -75,6 +75,19 @@ front, so a large
 - If you see topology eviction warnings, either increase `MAX_QUEUE_BUDGET`, reduce discovery churn,
   or process queues more often so topology/control traffic does not compete with backed-up data.
 
+## Compact side frames are dropped after link loss
+
+A compact frame can arrive before its full side-template frame on a lossy or reconnecting datagram
+link. Router packed sides treat an unknown template as a nonfatal dropped frame. The router sender
+refreshes each active template with a full frame after eight compact uses, so delivery should resume
+without recreating the router or side. Relay packed sides do not currently have this automatic
+refresh behavior. If router delivery does not recover:
+
+- Verify both peers use compatible side-transport profiles and template limits.
+- Check that full `SDT` frames are allowed by the underlying transport and frame-size configuration.
+- Inspect per-side runtime stats for full/compact counts, active TX/RX templates, and evictions.
+- Use the `canonical` profile while diagnosing a link that persistently drops template refreshes.
+
 ## Embedded build fails with missing symbols
 
 Bare-metal targets must provide `telemetryMalloc`, `telemetryFree`, and `seds_error_msg`.
@@ -89,8 +102,8 @@ If C system tests print warnings like "object file ... built for newer 'macOS' v
 
 ## Python import fails
 
-- Ensure you built the extension: `./build.py python` or `maturin develop`. (
-  build.py: [source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py))
+- Ensure you built the extension with `./build.py python` or `maturin develop`; see
+  [build.py](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py).
 - Verify you are using the same Python interpreter/venv used for the build.
 - If runtime schema names are missing, seed/register the schema in that process; rebuilding is only
   needed after Python API changes.

@@ -21,8 +21,8 @@ internal behavior.
 
 ## Security and state sync
 
-- Managed variables and E2E payload policy: [Usage-Rust](Usage-Rust#managed-variables-and-e2e-payloads),
-  [Usage-C-Cpp](Usage-C-Cpp#managed-variables), and [Usage-Python](Usage-Python#managed-variables-and-e2e-policy)
+- Managed variables and E2E payload policy: [Usage-Rust](Usage-Rust#network-variables-and-e2e-payloads),
+  [Usage-C-Cpp](Usage-C-Cpp#network-variables), and [Usage-Python](Usage-Python#network-variables-and-e2e-policy)
 - E2E wire wrapper details: [Technical-Wire-Format](Technical-Wire-Format)
 
 ## Bindings and interop

@@ -234,8 +234,11 @@ Router packed sides support header-template reuse with
 `RouterSideOptions::with_small_packet_transport(...)`. The first stable header shape is sent as a
 full `SDT` frame and assigns a compact side-local ULEB template id. Later packets with the same
 static header shape can use kind `0x02`, replacing repeated type/endpoint/sender/contract bytes with
-that template id plus the fields that still vary per packet. When the previous timestamp for that
-template is known and the nonnegative delta is smaller than the full timestamp varint, the sender
+that template id plus the fields that still vary per packet. On router packed sides, after eight
+compact uses of an active template, the next matching packet is emitted as another full `0x01`
+frame. This periodic refresh allows a router receiver that missed the initial full frame to relearn
+the template. When the previous timestamp for that template is known and the nonnegative delta is
+smaller than the full timestamp varint, the sender
 uses kind `0x04` and carries the timestamp delta instead. When unchanged-timestamp omission is
 enabled and the timestamp is identical to the previous frame for that template, the sender uses kind
 `0x05` and omits the timestamp field entirely. Omission can be enabled side-wide, by the IPv4-like
@@ -280,8 +283,13 @@ Runtime stats report:
 - active TX/RX template counts and template evictions
 
 Side-local template dictionaries are bounded by `max_side_transport_templates`, which defaults to
-64 entries per side. When the dictionary is full, the sender or receiver evicts a deterministic
-entry and later refreshes that shape with a full template frame.
+64 entries per side. On router packed sides, both sender and receiver evict the entry with the
+lowest template hash when the dictionary is full, keeping independently maintained dictionaries
+synchronized. If a valid router compact frame references a template the receiver does not know
+(for example, because its full frame was lost), that frame is dropped without returning a transport
+error. Delivery resumes when the router sender's periodic full refresh arrives. Relay packed sides
+support the same profiles and bounds, but do not currently perform this periodic refresh/nonfatal
+unknown-template recovery.
 
 ## Discovery and Internal Payloads
 

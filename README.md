@@ -75,6 +75,10 @@ much slower cadence. Router-managed time sync keeps its normal cadence on fast s
 measured slow side independently receives sparse time-sync traffic, keeping asymmetric or
 time-sliced radio links available for user payloads.
 
+Detailed topology advertisements also honor typed route policy before the graph is cloned or
+encoded. A bridge can disable `SEDSNET_DISCOVERY_TOPOLOGY` on a constrained side while continuing
+to send the smaller address/reachability advertisements required for hierarchical routing.
+
 Discovery also assigns and advertises compact node addresses and hostnames for point-to-point
 service traffic. A router can bind a SEDSnet service port and receive opaque byte payloads targeted
 by hostname or address, or open a P2P stream with connect/accept/data/close events. Protocols such
@@ -117,13 +121,26 @@ Packed packets use compact varint fields, schema-derived endpoints, a compact so
 sender hostname, and optional per-side header templates. Hostnames and endpoint holders are learned through discovery
 and network configuration; the packet header carries only the source address needed for identity/routing. Per-side
 templates can then replace repeated header fields with a compact template ID on small-packet transports, keeping the
-header-to-payload ratio reasonable for small payloads such as three floats or a few `u8` values.
+header-to-payload ratio reasonable for small payloads such as three floats or a few `u8` values. On router packed sides,
+template dictionaries use the same deterministic eviction rule at both ends. The router sender emits a full refresh
+after every eight compact uses, and the router receiver treats a compact frame whose template is unknown as a dropped
+frame rather than a fatal link error, so loss of the initial template frame heals automatically.
 
 ---
 
 ## Recent changelog milestones
 
-## Version 4.0.1 highlights
+### Versions 4.0.8–4.0.10 highlights
+
+- Router side-template dictionaries now evict the same lowest-hash entry on transmit and receive,
+  keeping bounded dictionaries synchronized as packet shapes cycle.
+- Router compact transport is self-healing after loss: unknown-template compact frames are dropped
+  nonfatally and an active router template is resent in full after every eight compact frames.
+- Per-side `DiscoveryTopology` route disables are checked before allocating or encoding a detailed
+  graph, while compact address/reachability discovery continues on that side.
+- Full changelog: [CHANGELOG.md](./CHANGELOG.md)
+
+### Version 4.0.1 highlights
 
 - Prebuilt/host packages can configure active device identity, runtime tuning, time sync, address
   assignment, and memory budgets without rebuilding the crate.
@@ -132,7 +149,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
 - Added router and relay regression tests that stress small runtime memory budgets and assert
   memory-layout exports stay within the configured shared queue budget.
 
-## Version 4.0.0 highlights
+### Version 4.0.0 highlights
 
 - User telemetry schema is now runtime-only. `build.rs` no longer generates Rust enum variants or
   binding constants from `telemetry_config.json`.
@@ -170,7 +187,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
   the static runtime-schema header only.
 - Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
-## Version 3.12.0 highlights
+### Version 3.12.0 highlights
 
 - Router and relay queue-backed state now shares one dynamic `MAX_QUEUE_BUDGET` instead of using
   isolated per-queue caps.
@@ -184,7 +201,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
   intermittent handler failures.
 - Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
-## Version 3.11.1 highlights
+### Version 3.11.1 highlights
 
 - Discovery now propagates a full router graph with `SEDSNET_DISCOVERY_TOPOLOGY`, so routers and relays
   keep track of which sender IDs own which endpoints and how remote routers connect to each other.
@@ -195,7 +212,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
   JSON exports via `seds_router_export_topology*` / `seds_relay_export_topology*`.
 - Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
-## Version 3.11.0 highlights
+### Version 3.11.0 highlights
 
 - Removed `RouterMode` from the active router model. Routers now use the same runtime routing-rule
   model as relays, and with no explicit route rules they default to a full forwarding mesh.
@@ -213,7 +230,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
   local coverage reporting, and the new end-to-end reliability regression tests.
 - Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
-## Version 3.10.0 highlights
+### Version 3.10.0 highlights
 
 - Reliable delivery in both `Router` and `Relay` now uses built-in internal
   `RELIABLE_ACK` and `RELIABLE_PACKET_REQUEST` packet types instead of wire-only ACK-only frames.
@@ -224,7 +241,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
   progress at different rates.
 - Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
-## Version 3.9.1 highlights
+### Version 3.9.1 highlights
 
 - Reserved the built-in `SEDSNET_DISCOVERY` and `SEDSNET_TIME_SYNC` endpoints for router-owned control traffic.
 - User handlers can no longer shadow internal discovery or time-sync behavior through Rust or C
@@ -232,7 +249,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
 - Queue timeout handling was tightened so TX/RX work shares nonzero budgets more predictably.
 - Full changelog: [CHANGELOG.md](./CHANGELOG.md)
 
-## Version 3.0.0 highlights
+### Version 3.0.0 highlights
 
 - Introduced internal router-side tracking so most applications can use the plain RX APIs and only
   opt into side-aware ingress when they actually need it.
@@ -241,7 +258,7 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
 - This established the modern router/reliability model that later releases expanded.
 - Full changelog: [v2.4.0...v3.0.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.4.0...v3.0.0)
 
-## Version 1.0.0 highlights
+### Version 1.0.0 highlights
 
 - First stable release with routing, packet packing, and packet creation across Rust, C, and Python.
 - Marked the API as stable and established the base wire-format and packet model the later versions
@@ -253,8 +270,8 @@ header-to-payload ratio reasonable for small payloads such as three floats or a 
 
 To build the library in a C project, just include the library as a submodule or subtree and link it in your
 cmakelists.txt as shown below.
-For other build systems, you can build the library as a static or dynamic library using cargo and link it to your
-project.
+For other build systems, `build.py` can produce the Rust `rlib` and static library, plus a host
+`cdylib` when Python bindings are enabled. Link the artifact appropriate for your project.
 
 Building with python bindings can be done with the build script on posix systems:
 
@@ -262,9 +279,10 @@ Building with python bindings can be done with the build script on posix systems
 ./build.py release maturin-develop
 ```
 
-When building in an embedded environment the library will compile to a static library that can be linked to your C code.
-this library takes up about 100kb of flash and does require heap allocation to be available through either freertos, or
-by creating providers that expose pvPortMalloc and vPortFree.
+Embedded builds produce a static library that can be linked to C code. Final flash use depends on
+the enabled features, target, linker, and application-level dead-code elimination, so measure the
+linked firmware image for the configuration you ship. Bare-metal integrations must provide the
+allocator hooks documented below.
 
 
 ## Embedded hooks
@@ -437,7 +455,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.7
+    GIT_TAG v4.0.10
 )
 FetchContent_MakeAvailable(sedsnet)
 
@@ -783,8 +801,8 @@ git subtree pull --prefix=sedsnet sedsnet-upstream main \
 Helper scripts:
 
 ```bash
-./scripts/subtree_update_no_stash.py
-./scripts/subtree_update.py            # stash → update → stash-pop
+./subtree_update_no_stash.py
+./subtree_update.py            # stash → update → stash-pop
 ```
 
 ---

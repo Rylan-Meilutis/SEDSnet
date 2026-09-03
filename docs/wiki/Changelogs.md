@@ -1,5 +1,28 @@
 # Changelogs
 
+## Version 4.0.10 highlights
+
+- Self-healing router compact side transport:
+    - A router receiver drops an unknown-template compact frame without treating the link as failed.
+    - After eight compact frames using one active template, the router sender emits the next frame in full
+      to restore receiver state if the original template frame was lost.
+    - A lossy-link regression verifies that delivery resumes at the periodic full refresh.
+
+## Version 4.0.9 highlights
+
+- Synchronized bounded router template dictionaries:
+    - Router transmit and receive dictionaries both evict the entry with the lowest template hash.
+    - Deterministic eviction prevents the peers from retaining different two-entry dictionaries
+      after several packet shapes cycle over a constrained link.
+
+## Version 4.0.8 highlights
+
+- Allocation-aware discovery routing:
+    - A disabled per-side `DiscoveryTopology` typed route is checked before the detailed router
+      graph is cloned or encoded.
+    - The same side can continue carrying the compact address and endpoint reachability summaries
+      needed for hierarchical routing.
+
 ## Version 4.0.7 highlights
 
 - Reliable discovered routing:

@@ -34,9 +34,9 @@ can substitute keys before packet authentication starts.
 
 Implementation details are documented in:
 
-- [Usage-Rust](docs/wiki/Usage-Rust.md#managed-variables-and-e2e-payloads)
-- [Usage-C-Cpp](docs/wiki/Usage-C-Cpp.md#security-and-cryptography)
-- [Usage-Python](docs/wiki/Usage-Python.md#managed-variables-and-e2e-policy)
+- [Usage-Rust](docs/wiki/Usage-Rust.md#network-variables-and-e2e-payloads)
+- [Usage-C-Cpp](docs/wiki/Usage-C-Cpp.md#optional-cryptography-provider)
+- [Usage-Python](docs/wiki/Usage-Python.md#network-variables-and-e2e-policy)
 - [Technical-Wire-Format](docs/wiki/Technical-Wire-Format.md)
 
 ## Reporting a Vulnerability

@@ -4,6 +4,9 @@ SEDSnet is a Rust telemetry transport and logging library with a shared schema, 
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 
+The current release is v4.0.10. Router compact side transport uses synchronized bounded template
+dictionaries and periodic full refreshes so lossy links recover when a template frame is missed.
+
 See [Changelogs](Changelogs) for version highlights and release notes.
 
 ## Start here (easy overview)
@@ -44,45 +47,24 @@ Detailed pages that describe internals, data structures, and formats.
 
 ## Repo layout (high level)
 
--
-
-src/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/src)):
-core Rust library (schema, packet types, packing, router/relay).
-
--
-
-sedsnet_macros/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/sedsnet_macros)):
-support macros for Rust integrations.
-
--
-
-application-owned schema JSON:
-optional runtime schema seed supplied through `SEDSNET_STATIC_SCHEMA_PATH`,
-`SEDSNET_STATIC_IPC_SCHEMA_PATH`, or explicit registration APIs. The crate does not ship a
-default user schema.
-
--
-
-build.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.rs)):
-tracks build metadata and optional embedded schema bytes; user schemas are not compiled into normal
-crate builds.
-
--
-
-C-Headers/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/C-Headers)):
-C ABI header (`sedsnet.h`).
-
--
-
-python-files/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-files)):
-Python package assets and type hints.
-
--
-
-c-example-code/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code))
-and
-python-example/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-example)):
-runnable examples.
+- [src/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/src): core Rust library (schema,
+  packet types, packing, router/relay).
+- [sedsnet_macros/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/sedsnet_macros): support
+  macros for Rust integrations.
+- Application-owned schema JSON: optional runtime schema seed supplied through
+  `SEDSNET_STATIC_SCHEMA_PATH`, `SEDSNET_STATIC_IPC_SCHEMA_PATH`, or explicit registration APIs.
+  The crate does not ship a default user schema.
+- [build.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.rs): tracks build metadata and
+  optional embedded schema bytes; user schemas are not compiled into normal crate builds.
+- [C-Headers/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/C-Headers): C ABI header
+  (`sedsnet.h`).
+- [python-files/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-files): Python package
+  assets and type hints.
+- [c-example-code/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code),
+  [python-example/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-example),
+  [rust-example-code/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/rust-example-code), and
+  [rtos-example-code/](https://github.com/Rylan-Meilutis/sedsnet/tree/main/rtos-example-code):
+  integration examples.
 
 ## Data flow at a glance
 

@@ -5,17 +5,12 @@ For protocol details and role behavior, see [Time-Sync](Time-Sync).
 
 ## C/C++ example
 
--
-
-c-example-code/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code))
--
-c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c))
--
-c-example-code/src/load_balancing_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/load_balancing_example.c))
--
-c-example-code/src/managed_variables_e2e_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/managed_variables_e2e_example.c))
--
-c-example-code/src/managed_variables_e2e_example.cpp ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/managed_variables_e2e_example.cpp))
+- [C example directory](https://github.com/Rylan-Meilutis/sedsnet/tree/main/c-example-code)
+- [Main router example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/main.c)
+- [Time-sync example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c)
+- [Load-balancing example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/load_balancing_example.c)
+- [Managed-variable and E2E C example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/managed_variables_e2e_example.c)
+- [Managed-variable and E2E C++ example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/managed_variables_e2e_example.cpp)
 
 What it demonstrates:
 
@@ -29,29 +24,23 @@ What it demonstrates:
 
 Suggested first steps:
 
-1) Build the library with
-   build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py))
+1. Build the library with [build.py](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)
    or CMake.
-2) Compile the example and run it locally.
-3) Watch the output to see packet creation and handling.
+2. Compile the example and run it locally.
+3. Watch the output to see packet creation and handling.
 
 ## Python example
 
--
-
-python-example/ ([source](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-example))
--
-python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py))
--
-python-example/load_balancing_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/load_balancing_example.py))
--
-python-example/typed_routing_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/typed_routing_example.py))
--
-python-example/managed_variables_e2e_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/managed_variables_e2e_example.py))
--
-python-example/p2p_service_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/p2p_service_example.py))
--
-python-example/test.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/test.py))
+- [Python example directory](https://github.com/Rylan-Meilutis/sedsnet/tree/main/python-example)
+- [Main example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/main.py)
+- [Time-sync example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py)
+- [Load-balancing example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/load_balancing_example.py)
+- [Typed-routing example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/typed_routing_example.py)
+- [Managed-variable and E2E example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/managed_variables_e2e_example.py)
+- [P2P service example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/p2p_service_example.py)
+- [Manual system-suite entry point](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/test.py)
+- [System-suite implementation](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/system_suite.py)
+- [Shared schema helpers](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/schema_helpers.py)
 
 What it demonstrates:
 
@@ -68,36 +57,17 @@ What it demonstrates:
 
 Suggested first steps:
 
-1) Build Python bindings with `build.py python` or `build.py maturin-install` (
-   build.py: [source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)).
-2) Run the example script.
-3) Inspect printed packets to see decoded values.
+1. Build Python bindings with `./build.py python` or `./build.py maturin-install`; see
+   [build.py](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py).
+2. Run the example script.
+3. Inspect printed packets to see decoded values.
 
 ## Rust example (minimal)
 
 If you want a minimal Rust example, start with [Usage-Rust](Usage-Rust) and build a small router with one endpoint
-handler. For a runnable example, see:
-
--
-
-rust-example-code/runtime_config_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/runtime_config_example.rs))
--
-
-rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs))
--
-rust-example-code/relay_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/relay_example.rs))
--
-rust-example-code/reliable_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/reliable_example.rs))
--
-rust-example-code/queue_timeout_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/queue_timeout_example.rs))
--
-rust-example-code/multinode_sim_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/multinode_sim_example.rs))
--
-rust-example-code/load_balancing_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/load_balancing_example.rs))
--
-rust-example-code/typed_routing_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/typed_routing_example.rs))
--
-rust-example-code/managed_variables_e2e_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/managed_variables_e2e_example.rs))
+handler. The files are standalone sources to copy or register as Cargo examples; see the
+[Rust example index](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/README.md)
+for the complete inventory and run instructions.
 
 The runtime-config example shows how to configure active device identity, process-wide tuning,
 router/relay memory budgets, time-sync roles, and address assignment without rebuilding the crate.
@@ -108,11 +78,9 @@ failover policy involved.
 
 ## RTOS time sync examples
 
--
-
-rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c))
--
-rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c))
+- [FreeRTOS time-sync example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c)
+- [ThreadX time-sync example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c)
+- [ThreadX telemetry example](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_telemetry.c)
 
 Recommended structure:
 
@@ -124,7 +92,7 @@ Recommended structure:
 
 ## Recommended path
 
-1) Read [Overview](Overview)
-2) Read [Concepts](Concepts)
-3) Try one example in your target language
-4) Read [Technical-Architecture](Technical-Architecture) for the implementation details
+1. Read [Overview](Overview).
+2. Read [Concepts](Concepts).
+3. Try one example in your target language.
+4. Read [Technical-Architecture](Technical-Architecture) for the implementation details.

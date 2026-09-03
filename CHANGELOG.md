@@ -2,18 +2,18 @@
 
 ## 4.0.10
 
-- Make compact side transport self-healing after packet loss: unknown compact-template frames are
-  dropped without tearing down the link, and each active template is refreshed with a full frame
-  after eight compact frames.
+- Make router compact side transport self-healing after packet loss: unknown compact-template
+  frames are dropped without tearing down the link, and each active router template is refreshed
+  with a full frame after eight compact frames.
 - Added a lossy-link regression that drops the initial full template, verifies compact misses stay
   nonfatal, and confirms delivery resumes at the periodic full refresh.
 
 ## 4.0.9
 
-- Keep bounded side-transport template dictionaries synchronized by applying the same
+- Keep bounded router side-transport template dictionaries synchronized by applying the same
   deterministic hash eviction rule on transmit and receive. This prevents compact radio frames
   from being rejected as an unknown template after several packet shapes cross a constrained
-  two-entry link.
+  two-entry router link.
 - Added a cycling multi-sender regression that exercises full frames, eviction, and later compact
   frames with a two-template dictionary.
 

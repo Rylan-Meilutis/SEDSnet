@@ -148,13 +148,15 @@ python3 docs/sync_wiki.py
 
 ## Version Metadata
 
-Update these files together:
+For every main-crate release, update or verify these files together:
 
 - `Cargo.toml`
-- `sedsnet_macros/Cargo.toml`
 - `README.md`
 - `CHANGELOG.md`
 - `docs/wiki/Changelogs.md`
+
+Update `sedsnet_macros/Cargo.toml` only when the macro crate itself changed and needs a new published
+version. The main crate can continue depending on an already-published macro-crate version.
 
 `pyproject.toml` declares `dynamic = ["version"]`; maturin and the release script read the Python
 package version from the root Cargo package version.

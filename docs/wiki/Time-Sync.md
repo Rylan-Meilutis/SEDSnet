@@ -5,8 +5,8 @@ This page explains the built-in time sync support that ships with the `timesync`
 ## Enabling time sync
 
 - Enable the `timesync` Cargo feature.
-- Python builds in this repo enable it by default (
-  pyproject.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/pyproject.toml))).
+- Python builds in this repo enable it by default; see
+  [pyproject.toml](https://github.com/Rylan-Meilutis/sedsnet/blob/main/pyproject.toml).
 
 When enabled, the build adds the `SEDSNET_TIME_SYNC` endpoint (broadcast mode `Always`) plus built-in
 time sync packet types in code.
@@ -210,14 +210,8 @@ Router-managed APIs live on `Router` and the C/Python FFI surfaces described abo
 
 Example implementations:
 
--
-
-rust-example-code/timesync_example.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs))
--
-c-example-code/src/timesync_example.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c))
--
-python-example/timesync_example.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py))
--
-rtos-example-code/freertos_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c))
--
-rtos-example-code/threadx_timesync.c ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c))
+- [Rust](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rust-example-code/timesync_example.rs)
+- [C](https://github.com/Rylan-Meilutis/sedsnet/blob/main/c-example-code/src/timesync_example.c)
+- [Python](https://github.com/Rylan-Meilutis/sedsnet/blob/main/python-example/timesync_example.py)
+- [FreeRTOS](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/freertos_timesync.c)
+- [ThreadX](https://github.com/Rylan-Meilutis/sedsnet/blob/main/rtos-example-code/threadx_timesync.c)

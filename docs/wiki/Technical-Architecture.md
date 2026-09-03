@@ -14,53 +14,26 @@ look the way they do. It assumes no prior knowledge of the codebase.
 
 ## Module map (what lives where)
 
--
-
-src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)):
-packaged configuration defaults, runtime tuning state, and the runtime schema registry for `DataType` and
-`DataEndpoint` metadata.
-
--
-
-src/lib.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/lib.rs)):
-schema metadata (`MessageMeta`, `MessageElement`, `MessageDataType`, `MessageClass`).
-
--
-
-src/packet.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/packet.rs)):
-`Packet` validation, formatting, packet IDs, and migration-safe wire-contract state.
-
--
-
-src/small_payload.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/small_payload.rs)):
-inline-optimized payload storage (`SmallPayload`).
-
--
-
-src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)):
-compact wire format, ULEB128 helpers, envelope peek, packet IDs from wire.
-
--
-
-src/router.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/router.rs)):
-router core, queues, endpoint handlers, side-based routing.
-
--
-
-src/relay.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/relay.rs)):
-schema-agnostic fanout relay between sides.
-
--
-
-src/queue.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/queue.rs)):
-bounded deque used by router and relay.
-
--
-
-src/c_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/c_api.rs))
-and
-src/python_api.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/python_api.rs)):
-FFI bindings (C ABI and pyo3).
+- [src/config.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs): packaged
+  configuration defaults, runtime tuning state, and the runtime schema registry for `DataType` and
+  `DataEndpoint` metadata.
+- [src/lib.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/lib.rs): schema metadata
+  (`MessageMeta`, `MessageElement`, `MessageDataType`, `MessageClass`).
+- [src/packet.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/packet.rs): `Packet`
+  validation, formatting, packet IDs, and migration-safe wire-contract state.
+- [src/small_payload.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/small_payload.rs):
+  inline-optimized payload storage (`SmallPayload`).
+- [src/wire_format.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs): compact
+  wire format, ULEB128 helpers, envelope peek, and packet IDs from wire.
+- [src/router.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/router.rs): router core,
+  queues, endpoint handlers, side-based routing, discovery, and compact side transport.
+- [src/relay.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/relay.rs): schema-agnostic
+  fanout relay between sides.
+- [src/queue.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/queue.rs): bounded deque used
+  by router and relay.
+- [src/c_api.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/c_api.rs) and
+  [src/python_api.rs](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/python_api.rs): FFI
+  bindings (C ABI and pyo3).
 
 ## Runtime schema and metadata pipeline
 
