@@ -8356,6 +8356,43 @@ mod router_tests {
         }
 
         #[test]
+        fn router_can_suppress_detailed_topology_on_a_constrained_side() {
+            ensure_topology_test_schema();
+            let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c = seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                    DataEndpoint::named("RADIO"),
+                    |_pkt| Ok(()),
+                )]),
+                zero_clock(),
+            );
+            let side =
+                router.add_side_packet("constrained", move |pkt: &Packet| -> TelemetryResult<()> {
+                    seen_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                });
+            router
+                .set_typed_route(None, DataType::DiscoveryTopology, side, false)
+                .unwrap();
+
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+
+            let packets = seen.lock().unwrap();
+            assert!(
+                packets
+                    .iter()
+                    .any(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
+            );
+            assert!(
+                !packets
+                    .iter()
+                    .any(|pkt| pkt.data_type() == DataType::DiscoveryTopology)
+            );
+        }
+
+        #[test]
         fn router_runtime_routes_support_asymmetric_and_ingress_only_links() {
             ensure_topology_test_schema();
             let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));

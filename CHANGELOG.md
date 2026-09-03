@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.0.8
+
+- Honor per-side `DiscoveryTopology` route disables before cloning or encoding the detailed graph.
+  Constrained embedded bridges can continue advertising the aggregated endpoint/address summary
+  needed for hierarchical routing without transient multi-kilobyte topology allocations.
+- Added regression coverage proving that disabling detailed topology preserves routable discovery
+  address advertisements on the same side.
+
 ## 4.0.7
 
 - Fixed explicit fanout routing after discovery. Router and relay source-route overrides now retain

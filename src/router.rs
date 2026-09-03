@@ -4737,6 +4737,13 @@ impl Router {
                 else {
                     continue;
                 };
+                let include_side_topology = include_topology
+                    && self.route_allowed_locked(
+                        &st,
+                        None,
+                        Some(DataType::DiscoveryTopology),
+                        side_id,
+                    );
                 let capabilities = opts.link_capabilities();
                 if level == DiscoveryAdvertiseLevel::MinimalPing {
                     per_side.push((
@@ -4759,11 +4766,15 @@ impl Router {
                         link_local_enabled,
                     ),
                     self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms),
-                    self.advertised_discovery_topology_for_link_locked(
-                        &st,
-                        now_ms,
-                        link_local_enabled,
-                    ),
+                    if include_side_topology {
+                        self.advertised_discovery_topology_for_link_locked(
+                            &st,
+                            now_ms,
+                            link_local_enabled,
+                        )
+                    } else {
+                        Vec::new()
+                    },
                     capabilities,
                     local_is_master,
                 ));
