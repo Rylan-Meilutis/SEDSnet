@@ -161,6 +161,10 @@ pub struct AddressAdvertisement {
     pub birth_ms: u64,
     pub owner_hash: u64,
     pub reachable_endpoints: Vec<DataEndpoint>,
+    /// Network-variable data types available through this sender and the
+    /// routers behind it. This lets routing distinguish variables that share
+    /// a broad schema endpoint without falling back to link fanout.
+    pub reachable_network_variables: Vec<DataType>,
     pub reachable_timesync_sources: Vec<String>,
     pub link_capabilities: LinkCapabilities,
 }
@@ -450,7 +454,7 @@ pub fn build_discovery_address(
     ad: &AddressAdvertisement,
 ) -> TelemetryResult<Packet> {
     let mut payload = Vec::new();
-    payload.push(1);
+    payload.push(2);
     payload.push(ad.mode);
     payload.push(ad.state);
     payload.extend_from_slice(&ad.address.to_le_bytes());
@@ -467,6 +471,15 @@ pub fn build_discovery_address(
     payload.extend_from_slice(&endpoint_count.to_le_bytes());
     for ep in endpoints {
         payload.extend_from_slice(&ep.as_u32().to_le_bytes());
+    }
+    let mut network_variables = ad.reachable_network_variables.clone();
+    network_variables.sort_unstable();
+    network_variables.dedup();
+    let network_variable_count = u32::try_from(network_variables.len())
+        .map_err(|_| TelemetryError::Pack("discovery address network variable count"))?;
+    payload.extend_from_slice(&network_variable_count.to_le_bytes());
+    for ty in network_variables {
+        payload.extend_from_slice(&ty.as_u32().to_le_bytes());
     }
     let mut sources = ad.reachable_timesync_sources.clone();
     sort_dedup_strings(&mut sources);
@@ -506,7 +519,7 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
     let payload = pkt.payload();
     let mut cursor = 0usize;
     let version = read_u8(payload, &mut cursor, "discovery address version")?;
-    if version != 1 {
+    if version != 1 && version != 2 {
         return Err(TelemetryError::Unpack("discovery address version"));
     }
     let mode = read_u8(payload, &mut cursor, "discovery address mode")?;
@@ -544,6 +557,25 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
     }
     reachable_endpoints.sort_unstable();
     reachable_endpoints.dedup();
+    let mut reachable_network_variables = Vec::new();
+    if version >= 2 {
+        let count = read_u32(
+            payload,
+            &mut cursor,
+            "discovery address network variable count",
+        )? as usize;
+        reachable_network_variables.reserve(count);
+        for _ in 0..count {
+            let raw = read_u32(payload, &mut cursor, "discovery address network variable")?;
+            let ty = DataType::try_from_u32(raw)
+                .ok_or(TelemetryError::Unpack("bad discovery network variable"))?;
+            if !is_discovery_type(ty) {
+                reachable_network_variables.push(ty);
+            }
+        }
+        reachable_network_variables.sort_unstable();
+        reachable_network_variables.dedup();
+    }
     let source_count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
     let mut reachable_timesync_sources = Vec::with_capacity(source_count);
     for _ in 0..source_count {
@@ -579,6 +611,7 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
         birth_ms,
         owner_hash,
         reachable_endpoints,
+        reachable_network_variables,
         reachable_timesync_sources,
         link_capabilities: LinkCapabilities {
             version,

@@ -194,11 +194,12 @@ Profile codes:
 ## Discovery Address
 
 `SEDSNET_DISCOVERY_ADDRESS` is the unified node identity and address advertisement. It carries the
-requested/current address, hostname, reachable endpoints, time-sync sources, and link capabilities
-as one packet.
+requested/current address, hostname, reachable endpoints, reachable network-variable types,
+time-sync sources, and link capabilities as one packet. Routers use split-horizon advertisements:
+reachability learned on one side is not reflected back onto that same side.
 
 ```text
-[version: u8]                     // current: 1
+[version: u8]                     // current: 2; version 1 remains accepted
 [mode: u8]                        // 0 dynamic, 1 requested, 2 static
 [state: u8]                       // 0 request, 1 approved
 [address: u32 LE]                 // current assigned node address
@@ -209,6 +210,9 @@ as one packet.
 [endpoint_count: u32 LE]
 repeat endpoint_count:
     [endpoint_id: u32 LE]
+[network_variable_count: u32 LE] // version 2+
+repeat network_variable_count:
+    [data_type_id: u32 LE]
 [timesync_source_count: u32 LE]
 repeat timesync_source_count:
     [source_id: string]

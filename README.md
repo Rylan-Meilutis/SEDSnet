@@ -109,6 +109,8 @@ can still retransmit it later.
 
 Routers can also cache selected data types as managed network variables. A board that restarts can request the current
 cached value and receive it through the normal endpoint handler path instead of waiting for the next publisher update.
+Discovery advertises enabled variable types with split-horizon propagation, allowing multi-link routers to select the
+learned owner path without static fanout or reflecting reachability back toward its source.
 For sensitive state or commands, the default `cryptography` feature lets data types prefer or require end-to-end payload
 cryptography while the application supplies a C provider, Rust provider, OS/hardware crypto wrapper, or registered software key.
 

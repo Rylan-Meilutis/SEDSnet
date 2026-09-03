@@ -1,5 +1,17 @@
 # Changelogs
 
+## Version 4.0.11 highlights
+
+- Discovery-routed bridges:
+    - Discovery advertisements use split horizon, so a router does not reflect learned endpoint,
+      time-source, or network-variable reachability back onto the link that supplied it.
+    - Address advertisements carry the enabled network-variable data types reachable through each
+      side. Variables sharing a broad endpoint therefore follow their discovered owners instead of
+      requiring static fanout rules.
+    - Version 2 discovery addresses remain compatible with received version 1 advertisements.
+- Regression coverage proves both split-horizon behavior and single-path network-variable routing
+  when the same schema endpoint exists on multiple links.
+
 ## Version 4.0.10 highlights
 
 - Self-healing router compact side transport:

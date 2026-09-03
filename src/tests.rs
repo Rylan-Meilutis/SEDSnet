@@ -7062,6 +7062,122 @@ mod router_tests {
         }
 
         #[test]
+        fn discovery_uses_split_horizon_for_reachable_endpoints() {
+            ensure_topology_test_schema();
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_c = seen_a.clone();
+            let seen_b_c = seen_b.clone();
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side_a = router.add_side_packet("A", move |pkt: &Packet| {
+                seen_a_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            router.add_side_packet("B", move |pkt: &Packet| {
+                seen_b_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            router
+                .rx_from_side(
+                    &build_discovery_announce("REMOTE_A", 0, &[DataEndpoint::named("RADIO")])
+                        .unwrap(),
+                    side_a,
+                )
+                .unwrap();
+            seen_a.lock().unwrap().clear();
+            seen_b.lock().unwrap().clear();
+            router.announce_discovery().unwrap();
+            router.process_all_queues().unwrap();
+
+            let decode_address = |packets: &Arc<Mutex<Vec<Packet>>>| {
+                let guard = packets.lock().unwrap();
+                let packet = guard
+                    .iter()
+                    .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
+                    .unwrap();
+                crate::discovery::decode_discovery_address(packet).unwrap()
+            };
+            assert!(
+                !decode_address(&seen_a)
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::named("RADIO"))
+            );
+            assert!(
+                decode_address(&seen_b)
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::named("RADIO"))
+            );
+        }
+
+        #[test]
+        fn discovered_network_variable_owner_avoids_endpoint_fanout() {
+            ensure_topology_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+
+            let owner_announcements: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let owner_announcements_c = owner_announcements.clone();
+            let owner = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_| Ok(()))])
+                    .with_sender("OWNER"),
+                zero_clock(),
+            );
+            owner.enable_managed_variable(ty).unwrap();
+            owner.add_side_packet("uplink", move |pkt: &Packet| {
+                owner_announcements_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            owner.announce_discovery().unwrap();
+            owner.process_all_queues().unwrap();
+
+            let non_owner_announcements: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let non_owner_announcements_c = non_owner_announcements.clone();
+            let non_owner = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_| Ok(()))])
+                    .with_sender("NON_OWNER"),
+                zero_clock(),
+            );
+            non_owner.add_side_packet("uplink", move |pkt: &Packet| {
+                non_owner_announcements_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            non_owner.announce_discovery().unwrap();
+            non_owner.process_all_queues().unwrap();
+
+            let owner_tx: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let other_tx: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let owner_tx_c = owner_tx.clone();
+            let other_tx_c = other_tx.clone();
+            let source = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let owner_side = source.add_side_packet("owner", move |pkt: &Packet| {
+                owner_tx_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            let other_side = source.add_side_packet("other", move |pkt: &Packet| {
+                other_tx_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            for packet in owner_announcements.lock().unwrap().iter() {
+                source.rx_from_side(packet, owner_side).unwrap();
+            }
+            for packet in non_owner_announcements.lock().unwrap().iter() {
+                source.rx_from_side(packet, other_side).unwrap();
+            }
+            owner_tx.lock().unwrap().clear();
+            other_tx.lock().unwrap().clear();
+
+            source.enable_managed_variable(ty).unwrap();
+            source
+                .set_network_variable(
+                    Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[ep], 1).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(count_packets_of_type(&owner_tx.lock().unwrap(), ty), 1);
+            assert_eq!(count_packets_of_type(&other_tx.lock().unwrap(), ty), 0);
+        }
+
+        #[test]
         fn queued_discovery_is_processed_before_queued_telemetry_routing() {
             ensure_topology_test_schema();
 

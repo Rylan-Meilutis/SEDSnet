@@ -428,6 +428,7 @@ struct ReliableReturnRouteState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySenderState {
     reachable: Vec<DataEndpoint>,
+    reachable_network_variables: Vec<DataType>,
     reachable_timesync_sources: Vec<String>,
     topology_boards: Vec<TopologyBoardNode>,
     last_seen_ms: u64,
@@ -437,6 +438,7 @@ struct DiscoverySenderState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySideState {
     reachable: Vec<DataEndpoint>,
+    reachable_network_variables: Vec<DataType>,
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
     announcers: BTreeMap<String, DiscoverySenderState>,
@@ -1765,6 +1767,7 @@ impl RouterInner {
         sender
             .len()
             .saturating_add(state.reachable.len() * size_of::<DataEndpoint>())
+            .saturating_add(state.reachable_network_variables.len() * size_of::<DataType>())
             .saturating_add(
                 state
                     .reachable_timesync_sources
@@ -1787,6 +1790,7 @@ impl RouterInner {
         size_of::<RouterSideId>()
             .saturating_add(size_of::<DiscoverySideState>())
             .saturating_add(route.reachable.len() * size_of::<DataEndpoint>())
+            .saturating_add(route.reachable_network_variables.len() * size_of::<DataType>())
             .saturating_add(
                 route
                     .reachable_timesync_sources
@@ -2913,6 +2917,7 @@ impl Router {
     fn local_address_advertisement(
         &self,
         reachable_endpoints: Vec<DataEndpoint>,
+        reachable_network_variables: Vec<DataType>,
         reachable_timesync_sources: Vec<String>,
         link_capabilities: discovery::LinkCapabilities,
         state: u8,
@@ -2927,6 +2932,7 @@ impl Router {
             birth_ms: st.local_address.birth_ms,
             owner_hash: st.local_address.owner_hash,
             reachable_endpoints,
+            reachable_network_variables,
             reachable_timesync_sources,
             link_capabilities,
         }
@@ -3490,6 +3496,11 @@ impl Router {
         let restrict_link_local = Self::endpoints_are_link_local_only(eps);
         let now_ms = self.clock.now_ms();
         let scoring_eps = self.preferred_scoring_endpoints(eps, prefer_nonlocal);
+        let has_variable_owner = st.discovery_routes.iter().any(|(&side, route)| {
+            exclude != Some(side)
+                && now_ms.saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                && route.reachable_network_variables.contains(&ty)
+        });
         let mut out = Vec::new();
 
         for (&side, route) in st.discovery_routes.iter() {
@@ -3521,6 +3532,15 @@ impl Router {
                     side,
                     overlap: usize::MAX,
                 });
+                continue;
+            }
+            if has_variable_owner {
+                if route.reachable_network_variables.contains(&ty) {
+                    out.push(DiscoveryCandidateMatch {
+                        side,
+                        overlap: usize::MAX,
+                    });
+                }
                 continue;
             }
             if preferred_timesync_source
@@ -4454,18 +4474,23 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn recompute_discovery_side_state(route: &mut DiscoverySideState) {
         let mut reachable = Vec::new();
+        let mut reachable_network_variables = Vec::new();
         let mut reachable_timesync_sources = Vec::new();
         let mut last_seen_ms = 0u64;
         for sender in route.announcers.values() {
             reachable.extend(sender.reachable.iter().copied());
+            reachable_network_variables.extend(sender.reachable_network_variables.iter().copied());
             reachable_timesync_sources.extend(sender.reachable_timesync_sources.iter().cloned());
             last_seen_ms = last_seen_ms.max(sender.last_seen_ms);
         }
         reachable.sort_unstable();
         reachable.dedup();
+        reachable_network_variables.sort_unstable();
+        reachable_network_variables.dedup();
         reachable_timesync_sources.sort_unstable();
         reachable_timesync_sources.dedup();
         route.reachable = reachable;
+        route.reachable_network_variables = reachable_network_variables;
         route.reachable_timesync_sources = reachable_timesync_sources;
         route.last_seen_ms = last_seen_ms;
     }
@@ -4509,9 +4534,13 @@ impl Router {
         st: &RouterInner,
         now_ms: u64,
         link_local_enabled: bool,
+        exclude_side: Option<RouterSideId>,
     ) -> Vec<TopologyBoardNode> {
         let mut boards = vec![self.local_discovery_topology_board(st, now_ms, link_local_enabled)];
-        for route in st.discovery_routes.values() {
+        for (&route_side, route) in st.discovery_routes.iter() {
+            if exclude_side == Some(route_side) {
+                continue;
+            }
             if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
                 continue;
             }
@@ -4567,9 +4596,15 @@ impl Router {
         st: &RouterInner,
         now_ms: u64,
         link_local_enabled: bool,
+        exclude_side: Option<RouterSideId>,
     ) -> Vec<DataEndpoint> {
         let (reachable_endpoints, _) = discovery::summarize_topology_boards(
-            &self.advertised_discovery_topology_for_link_locked(st, now_ms, link_local_enabled),
+            &self.advertised_discovery_topology_for_link_locked(
+                st,
+                now_ms,
+                link_local_enabled,
+                exclude_side,
+            ),
         );
         reachable_endpoints
             .into_iter()
@@ -4585,16 +4620,43 @@ impl Router {
         &self,
         st: &RouterInner,
         now_ms: u64,
+        exclude_side: Option<RouterSideId>,
     ) -> Vec<String> {
         let (_, sources) = discovery::summarize_topology_boards(
-            &self.advertised_discovery_topology_for_link_locked(st, now_ms, true),
+            &self.advertised_discovery_topology_for_link_locked(st, now_ms, true, exclude_side),
         );
         sources
     }
 
     #[cfg(feature = "discovery")]
+    fn advertised_network_variables_for_link_locked(
+        &self,
+        st: &RouterInner,
+        now_ms: u64,
+        exclude_side: Option<RouterSideId>,
+    ) -> Vec<DataType> {
+        let mut types: Vec<DataType> = st
+            .managed_variable_types
+            .iter()
+            .copied()
+            .map(DataType)
+            .collect();
+        for (&route_side, route) in st.discovery_routes.iter() {
+            if exclude_side == Some(route_side) {
+                continue;
+            }
+            if now_ms.saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS {
+                types.extend(route.reachable_network_variables.iter().copied());
+            }
+        }
+        types.sort_unstable();
+        types.dedup();
+        types
+    }
+
+    #[cfg(feature = "discovery")]
     fn discovery_master_sender_locked(&self, st: &RouterInner, now_ms: u64) -> String {
-        let boards = self.advertised_discovery_topology_for_link_locked(st, now_ms, true);
+        let boards = self.advertised_discovery_topology_for_link_locked(st, now_ms, true, None);
         discovery::elect_discovery_master(self.sender_arc().as_ref(), &boards)
     }
 
@@ -4762,6 +4824,7 @@ impl Router {
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
+                        Vec::new(),
                         capabilities,
                         local_is_master,
                     ));
@@ -4774,13 +4837,20 @@ impl Router {
                         &st,
                         now_ms,
                         link_local_enabled,
+                        Some(side_id),
                     ),
-                    self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms),
+                    self.advertised_network_variables_for_link_locked(&st, now_ms, Some(side_id)),
+                    self.advertised_discovery_timesync_sources_for_link_locked(
+                        &st,
+                        now_ms,
+                        Some(side_id),
+                    ),
                     if include_side_topology {
                         self.advertised_discovery_topology_for_link_locked(
                             &st,
                             now_ms,
                             link_local_enabled,
+                            Some(side_id),
                         )
                     } else {
                         Vec::new()
@@ -4795,6 +4865,7 @@ impl Router {
             side_id,
             level,
             endpoints,
+            network_variables,
             timesync_sources,
             topology,
             capabilities,
@@ -4824,6 +4895,7 @@ impl Router {
             if level == DiscoveryAdvertiseLevel::Full {
                 let address = self.local_address_advertisement(
                     endpoints.clone(),
+                    network_variables.clone(),
                     timesync_sources.clone(),
                     capabilities,
                     if local_is_master {
@@ -4967,6 +5039,10 @@ impl Router {
             }
             if board.reachable_timesync_sources != ad.reachable_timesync_sources {
                 board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                changed = true;
+            }
+            if sender_state.reachable_network_variables != ad.reachable_network_variables {
+                sender_state.reachable_network_variables = ad.reachable_network_variables;
                 changed = true;
             }
             Self::refresh_sender_topology_state(&mut sender_state);
@@ -8194,11 +8270,11 @@ impl Router {
                 })
             })
             .collect();
-        let routers = self.advertised_discovery_topology_for_link_locked(&st, now_ms, true);
+        let routers = self.advertised_discovery_topology_for_link_locked(&st, now_ms, true, None);
         let advertised_endpoints =
-            self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true);
+            self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true, None);
         let advertised_timesync_sources =
-            self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+            self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms, None);
         let links = discovery::topology_links_from_boards(&routers);
         TopologySnapshot {
             advertised_endpoints,
