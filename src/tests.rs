@@ -4736,6 +4736,93 @@ mod dedupe_tests {
     }
 
     #[test]
+    fn bounded_side_template_dictionaries_remain_synchronized() {
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_packed_with_options(
+            "bounded-link",
+            move |bytes: &[u8]| {
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_packed_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 2,
+                ..RouterSideOptions::default()
+            },
+        );
+        let rx_side = receiver.add_side_packed_with_options(
+            "bounded-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 2,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        let sources = ["SRC_A", "SRC_B", "SRC_C", "SRC_A", "SRC_B", "SRC_C"];
+        for (index, sender_id) in sources.into_iter().enumerate() {
+            let payload: Arc<[u8]> = [index as f32, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .into();
+            let pkt = Packet::new(
+                DataType::named("GPS_DATA"),
+                &[DataEndpoint::named("SD_CARD")],
+                sender_id,
+                index as u64,
+                payload,
+            )
+            .unwrap()
+            .with_nonce(index as u16 + 1);
+            sender.tx(pkt).unwrap();
+        }
+
+        assert_eq!(delivered.load(Ordering::SeqCst), sources.len());
+        let tx_stats = sender.export_runtime_stats();
+        let tx_side = tx_stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "bounded-link")
+            .expect("bounded sender side stats");
+        let rx_stats = receiver.export_runtime_stats();
+        let rx_side = rx_stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "bounded-link")
+            .expect("bounded receiver side stats");
+        assert_eq!(tx_side.side_transport_tx_template_count, 2);
+        assert_eq!(rx_side.side_transport_rx_template_count, 2);
+        assert!(tx_side.side_transport_template_evictions > 0);
+        assert_eq!(
+            tx_side.side_transport_template_evictions,
+            rx_side.side_transport_template_evictions
+        );
+    }
+
+    #[test]
     fn compact_header_target_misses_are_counted() {
         crate::tests::ensure_common_test_schema();
         let receiver = Arc::new(Router::new_with_clock(

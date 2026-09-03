@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.9
+
+- Keep bounded side-transport template dictionaries synchronized by applying the same
+  deterministic hash eviction rule on transmit and receive. This prevents compact radio frames
+  from being rejected as an unknown template after several packet shapes cross a constrained
+  two-entry link.
+- Added a cycling multi-sender regression that exercises full frames, eviction, and later compact
+  frames with a two-template dictionary.
+
 ## 4.0.8
 
 - Honor per-side `DiscoveryTopology` route disables before cloning or encoding the detailed graph.

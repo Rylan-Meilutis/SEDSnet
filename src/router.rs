@@ -197,7 +197,14 @@ impl SideTransportState {
         let mut evicted = false;
         if self.rx_templates_by_id.len() >= max_templates
             && !self.rx_templates_by_id.contains_key(&template_id)
-            && let Some(old_id) = self.rx_templates_by_id.keys().next().copied()
+            // TX evicts the deterministic lowest template hash.  RX must use
+            // the identical rule or a small dictionary can retain a compact
+            // template that its peer has already evicted, while discarding a
+            // template the peer still references.
+            && let Some(old_hash) = self.rx_templates.keys().next().copied()
+            && let Some(old_id) = self.rx_templates_by_id.iter().find_map(|(id, existing)| {
+                (existing.hash == old_hash).then_some(*id)
+            })
             && let Some(old_template) = self.rx_templates_by_id.remove(&old_id)
         {
             self.rx_templates.remove(&old_template.hash);
