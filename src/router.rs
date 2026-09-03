@@ -3561,6 +3561,120 @@ impl Router {
         out
     }
 
+    /// Remove reflected discovery routes when another side advertises a
+    /// shorter topology path to the destination endpoint. A multi-side Router
+    /// must make this choice before adaptive weighting; otherwise an endpoint
+    /// learned directly and through a remote bridge can be sent down either
+    /// side with equal probability.
+    #[cfg(feature = "discovery")]
+    fn retain_shortest_discovery_candidates_locked(
+        st: &RouterInner,
+        matches: &mut Vec<DiscoveryCandidateMatch>,
+        endpoints: &[DataEndpoint],
+        target_senders: &[u64],
+        now_ms: u64,
+    ) {
+        if matches.len() <= 1 || endpoints.is_empty() {
+            return;
+        }
+
+        let route_distance = |side: RouterSideId, target_sender: Option<u64>| -> Option<usize> {
+            let route = st.discovery_routes.get(&side)?;
+            route
+                .announcers
+                .iter()
+                .filter(|(_, state)| {
+                    now_ms.saturating_sub(state.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                })
+                .filter_map(|(announcer, state)| {
+                    let targets: BTreeSet<&str> = state
+                        .topology_boards
+                        .iter()
+                        .filter(|board| {
+                            target_sender
+                                .map(|target| Self::sender_hash(&board.sender_id) == target)
+                                .unwrap_or_else(|| {
+                                    endpoints.iter().any(|endpoint| {
+                                        board.reachable_endpoints.contains(endpoint)
+                                    })
+                                })
+                        })
+                        .map(|board| board.sender_id.as_str())
+                        .collect();
+                    if targets.is_empty() {
+                        return if let Some(target) = target_sender {
+                            state
+                                .topology_boards
+                                .iter()
+                                .any(|board| Self::sender_hash(&board.sender_id) == target)
+                                .then_some(usize::MAX / 2)
+                        } else {
+                            state
+                                .reachable
+                                .iter()
+                                .any(|endpoint| endpoints.contains(endpoint))
+                                .then_some(usize::MAX / 2)
+                        };
+                    }
+
+                    let mut distances: BTreeMap<&str, usize> = BTreeMap::new();
+                    let mut pending = VecDeque::from([(announcer.as_str(), 0usize)]);
+                    while let Some((sender, distance)) = pending.pop_front() {
+                        if distances.contains_key(sender) {
+                            continue;
+                        }
+                        distances.insert(sender, distance);
+                        if targets.contains(sender) {
+                            return Some(distance);
+                        }
+                        for board in &state.topology_boards {
+                            if board.sender_id == sender {
+                                for peer in &board.connections {
+                                    if !distances.contains_key(peer.as_str()) {
+                                        pending.push_back((peer.as_str(), distance + 1));
+                                    }
+                                }
+                            } else if board.connections.iter().any(|peer| peer == sender)
+                                && !distances.contains_key(board.sender_id.as_str())
+                            {
+                                pending.push_back((board.sender_id.as_str(), distance + 1));
+                            }
+                        }
+                    }
+                    None
+                })
+                .min()
+        };
+
+        let route_targets: Vec<Option<u64>> = if target_senders.is_empty() {
+            vec![None]
+        } else {
+            target_senders.iter().copied().map(Some).collect()
+        };
+        let mut selected = BTreeSet::new();
+        for target in route_targets {
+            let distances: Vec<(RouterSideId, usize)> = matches
+                .iter()
+                .filter_map(|candidate| {
+                    route_distance(candidate.side, target)
+                        .map(|distance| (candidate.side, distance))
+                })
+                .collect();
+            let Some(best) = distances.iter().map(|(_, distance)| *distance).min() else {
+                continue;
+            };
+            selected.extend(
+                distances
+                    .into_iter()
+                    .filter(|(_, distance)| *distance == best)
+                    .map(|(side, _)| side),
+            );
+        }
+        if !selected.is_empty() {
+            matches.retain(|candidate| selected.contains(&candidate.side));
+        }
+    }
+
     #[cfg(feature = "discovery")]
     fn select_discovered_candidate_sides_locked(
         &self,
@@ -4302,6 +4416,13 @@ impl Router {
                 matches =
                     Self::filter_timesync_matches_locked(&mut st, ty, self.clock.now_ms(), matches);
             }
+            Self::retain_shortest_discovery_candidates_locked(
+                &st,
+                &mut matches,
+                &eps,
+                &target_senders,
+                self.clock.now_ms(),
+            );
 
             if !matches.is_empty() {
                 Ok(RemoteSidePlan::Target(

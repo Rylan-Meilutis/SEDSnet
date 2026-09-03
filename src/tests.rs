@@ -7187,6 +7187,115 @@ mod router_tests {
         }
 
         #[test]
+        fn router_prefers_direct_topology_path_over_reflected_route() {
+            ensure_topology_test_schema();
+            let direct_seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let reflected_seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let direct_seen_c = direct_seen.clone();
+            let reflected_seen_c = reflected_seen.clone();
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let direct = router.add_side_packet("UMBILICAL", move |packet| {
+                direct_seen_c.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            let reflected = router.add_side_packet("ROCKET", move |packet| {
+                reflected_seen_c.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            let endpoint = DataEndpoint::named("RADIO");
+
+            for (side, announcer, boards) in [
+                (
+                    direct,
+                    "GATEWAY",
+                    vec![
+                        TopologyBoardNode {
+                            sender_id: "GATEWAY".into(),
+                            reachable_endpoints: vec![],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["VALVE".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "VALVE".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["GATEWAY".into()],
+                        },
+                    ],
+                ),
+                (
+                    reflected,
+                    "RF",
+                    vec![
+                        TopologyBoardNode {
+                            sender_id: "RF".into(),
+                            reachable_endpoints: vec![],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["GROUND".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "GROUND".into(),
+                            reachable_endpoints: vec![],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["RF".into(), "GATEWAY".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "GATEWAY".into(),
+                            reachable_endpoints: vec![],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["GROUND".into(), "VALVE".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "VALVE".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["GATEWAY".into()],
+                        },
+                    ],
+                ),
+            ] {
+                router
+                    .rx_from_side(
+                        &build_discovery_announce(announcer, 1, &[endpoint]).unwrap(),
+                        side,
+                    )
+                    .unwrap();
+                router
+                    .rx_from_side(
+                        &build_discovery_topology(announcer, 2, &boards).unwrap(),
+                        side,
+                    )
+                    .unwrap();
+            }
+            direct_seen.lock().unwrap().clear();
+            reflected_seen.lock().unwrap().clear();
+
+            let valve_hash = crate::packet::hash_bytes_u64(0x517C_C1B7_2722_0A95, b"VALVE");
+            router
+                .tx(Packet::new_with_wire_contract(
+                    DataType::named("GPS_DATA"),
+                    &[endpoint],
+                    "GROUND",
+                    3,
+                    0,
+                    Arc::from([0u8; 12]),
+                    None,
+                    Arc::from([valve_hash]),
+                )
+                .unwrap())
+                .unwrap();
+
+            assert_eq!(
+                count_packets_of_type(&direct_seen.lock().unwrap(), DataType::named("GPS_DATA")),
+                1
+            );
+            assert_eq!(
+                count_packets_of_type(&reflected_seen.lock().unwrap(), DataType::named("GPS_DATA")),
+                0
+            );
+        }
+
+        #[test]
         fn discovery_uses_split_horizon_for_reachable_endpoints() {
             ensure_topology_test_schema();
             let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
