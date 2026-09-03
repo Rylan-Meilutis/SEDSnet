@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.0.10
+
+- Make compact side transport self-healing after packet loss: unknown compact-template frames are
+  dropped without tearing down the link, and each active template is refreshed with a full frame
+  after eight compact frames.
+- Added a lossy-link regression that drops the initial full template, verifies compact misses stay
+  nonfatal, and confirms delivery resumes at the periodic full refresh.
+
 ## 4.0.9
 
 - Keep bounded side-transport template dictionaries synchronized by applying the same

@@ -4823,6 +4823,81 @@ mod dedupe_tests {
     }
 
     #[test]
+    fn compact_side_recovers_when_initial_full_template_is_lost() {
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+        let transmitted = Arc::new(AtomicUsize::new(0));
+        let transmitted_c = transmitted.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        sender.add_side_packed_with_options(
+            "lossy-link",
+            move |bytes: &[u8]| {
+                if transmitted_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(());
+                }
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_packed_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 2,
+                ..RouterSideOptions::default()
+            },
+        );
+        let rx_side = receiver.add_side_packed_with_options(
+            "lossy-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 2,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        for index in 0..11u16 {
+            let pkt = Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[index as f32, 0.0, 0.0],
+                &[DataEndpoint::named("SD_CARD")],
+                u64::from(index),
+            )
+            .unwrap()
+            .with_nonce(index + 1);
+            sender.tx(pkt).unwrap();
+        }
+
+        assert_eq!(transmitted.load(Ordering::SeqCst), 11);
+        assert_eq!(delivered.load(Ordering::SeqCst), 2);
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "lossy-link")
+            .expect("lossy sender side stats");
+        assert_eq!(side.side_transport_full_frames, 2);
+        assert_eq!(side.side_transport_compact_frames, 9);
+    }
+
+    #[test]
     fn compact_header_target_misses_are_counted() {
         crate::tests::ensure_common_test_schema();
         let receiver = Arc::new(Router::new_with_clock(
