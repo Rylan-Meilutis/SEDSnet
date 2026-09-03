@@ -7345,6 +7345,55 @@ mod router_tests {
         }
 
         #[test]
+        fn discovery_advertisements_are_republished_hop_by_hop() {
+            ensure_topology_test_schema();
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b_c = seen_b.clone();
+            let router =
+                Router::new_with_clock(RouterConfig::default().with_sender("BRIDGE"), zero_clock());
+            let side_a = router.add_side_packet("A", |_packet| Ok(()));
+            router.add_side_packet("B", move |packet| {
+                seen_b_c.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            let remote_topology = vec![TopologyBoardNode {
+                sender_id: "REMOTE_A".into(),
+                reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                reachable_timesync_sources: vec![],
+                connections: vec![],
+            }];
+
+            router
+                .rx_from_side(
+                    &build_discovery_topology("REMOTE_A", 1, &remote_topology).unwrap(),
+                    side_a,
+                )
+                .unwrap();
+            assert!(
+                seen_b.lock().unwrap().iter().all(|packet| {
+                    packet.data_type() != DataType::DiscoveryTopology
+                        || packet.sender() != "REMOTE_A"
+                }),
+                "an original remote advertisement must not be reflected as adjacent"
+            );
+
+            router.announce_discovery().unwrap();
+            router.process_all_queues().unwrap();
+            let seen = seen_b.lock().unwrap();
+            let aggregate = seen
+                .iter()
+                .find(|packet| packet.data_type() == DataType::DiscoveryTopology)
+                .expect("bridge did not publish its aggregate topology");
+            assert_eq!(aggregate.sender(), "BRIDGE");
+            assert!(
+                crate::discovery::decode_discovery_topology(aggregate)
+                    .unwrap()
+                    .iter()
+                    .any(|board| board.sender_id == "REMOTE_A")
+            );
+        }
+
+        #[test]
         fn discovered_network_variable_owner_avoids_endpoint_fanout() {
             ensure_topology_test_schema();
             let ty = DataType::named("GPS_DATA");

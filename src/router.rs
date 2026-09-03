@@ -2193,6 +2193,19 @@ struct DiscoveryCandidateMatch {
     overlap: usize,
 }
 
+#[cfg(feature = "discovery")]
+#[inline]
+const fn discovery_is_hop_local_advertisement(ty: DataType) -> bool {
+    matches!(
+        ty,
+        DataType::DiscoveryAnnounce
+            | DataType::DiscoveryTimeSyncSources
+            | DataType::DiscoveryTopology
+            | DataType::DiscoveryAddress
+            | DataType::DiscoveryLinkCapabilities
+    )
+}
+
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let sender = self.sender();
@@ -9861,7 +9874,13 @@ impl Router {
                 }
 
                 if self.learn_discovery_packet(pkt, item.src, called_from_queue)? {
-                    if self.should_route_remote(&item.data, item.src)? {
+                    // Reachability advertisements are hop-local. Learning one
+                    // schedules this Router's own aggregated, split-horizon
+                    // snapshot; transparently relaying the original packet
+                    // would make a distant sender look physically adjacent.
+                    if !discovery_is_hop_local_advertisement(pkt.data_type())
+                        && self.should_route_remote(&item.data, item.src)?
+                    {
                         self.relay_send(
                             RouterItem::Packet(pkt.to_owned()),
                             item.src,
@@ -10014,7 +10033,9 @@ impl Router {
                     let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
                     let _ = self.learn_discovery_packet(&pkt, item.src, called_from_queue)?;
-                    if self.should_route_remote(&item.data, item.src)? {
+                    if !discovery_is_hop_local_advertisement(env.ty)
+                        && self.should_route_remote(&item.data, item.src)?
+                    {
                         self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
                     }
                     return Ok(());
