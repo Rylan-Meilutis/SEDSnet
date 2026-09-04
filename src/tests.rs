@@ -9236,7 +9236,7 @@ mod router_tests {
         }
 
         #[test]
-        fn explicit_fanout_reaches_all_discovered_network_variable_routes() {
+        fn network_variables_reach_all_discovered_owner_segments() {
             ensure_topology_test_schema();
             let ty = DataType::named("GPS_DATA");
             let endpoint = DataEndpoint::named("RADIO");
@@ -9244,6 +9244,25 @@ mod router_tests {
             let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_a_cb = seen_a.clone();
             let seen_b_cb = seen_b.clone();
+            let owner_announcements = |sender: &'static str| {
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let captured_cb = captured.clone();
+                let owner = Router::new_with_clock(
+                    RouterConfig::new(vec![EndpointHandler::new_packet_handler(endpoint, |_| {
+                        Ok(())
+                    })])
+                    .with_sender(sender),
+                    zero_clock(),
+                );
+                owner.enable_managed_variable(ty).unwrap();
+                owner.add_side_packet("uplink", move |packet| {
+                    captured_cb.lock().unwrap().push(packet.clone());
+                    Ok(())
+                });
+                owner.announce_discovery().unwrap();
+                owner.process_all_queues().unwrap();
+                captured.lock().unwrap().clone()
+            };
             let router = Router::new_with_clock(
                 RouterConfig::default().with_reliable_enabled(true),
                 zero_clock(),
@@ -9256,18 +9275,12 @@ mod router_tests {
                 seen_b_cb.lock().unwrap().push(packet.clone());
                 Ok(())
             });
-            router
-                .rx_from_side(
-                    &build_discovery_announce("RF", 1, &[endpoint]).unwrap(),
-                    side_a,
-                )
-                .unwrap();
-            router
-                .rx_from_side(
-                    &build_discovery_announce("GATEWAY", 1, &[endpoint]).unwrap(),
-                    side_b,
-                )
-                .unwrap();
+            for packet in owner_announcements("RF") {
+                router.rx_from_side(&packet, side_a).unwrap();
+            }
+            for packet in owner_announcements("GATEWAY") {
+                router.rx_from_side(&packet, side_b).unwrap();
+            }
             seen_a.lock().unwrap().clear();
             seen_b.lock().unwrap().clear();
             router
@@ -9287,8 +9300,8 @@ mod router_tests {
             let total = count_packets_of_type(&seen_a.lock().unwrap(), ty)
                 + count_packets_of_type(&seen_b.lock().unwrap(), ty);
             assert_eq!(
-                total, 3,
-                "clearing explicit fanout restores one adaptive path"
+                total, 4,
+                "discovered network-variable owners on independent segments must all receive state"
             );
         }
 

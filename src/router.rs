@@ -3728,8 +3728,14 @@ impl Router {
          * every segment must receive it.  Ordinary data continues through the
          * adaptive single-path selector so a multi-homed router does not
          * duplicate application traffic. */
+        let has_distributed_variable_owners = discovered_origin == RouteSelectionOrigin::Discovered
+            && selected.iter().any(|side| {
+                st.discovery_routes
+                    .get(side)
+                    .is_some_and(|route| route.reachable_network_variables.contains(&ty))
+            });
         if discovered_origin == RouteSelectionOrigin::Discovered
-            && DataType::try_named("HEARTBEAT") == Some(ty)
+            && (DataType::try_named("HEARTBEAT") == Some(ty) || has_distributed_variable_owners)
         {
             selected
         } else {
