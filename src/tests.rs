@@ -9281,6 +9281,46 @@ mod router_tests {
             for packet in owner_announcements("GATEWAY") {
                 router.rx_from_side(&packet, side_b).unwrap();
             }
+            router
+                .rx_from_side(
+                    &build_discovery_topology(
+                        "RF",
+                        1,
+                        &[TopologyBoardNode {
+                            sender_id: "RF".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec![],
+                        }],
+                    )
+                    .unwrap(),
+                    side_a,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_topology(
+                        "GATEWAY",
+                        1,
+                        &[
+                            TopologyBoardNode {
+                                sender_id: "GATEWAY".into(),
+                                reachable_endpoints: vec![],
+                                reachable_timesync_sources: vec![],
+                                connections: vec!["FILL_OWNER".into()],
+                            },
+                            TopologyBoardNode {
+                                sender_id: "FILL_OWNER".into(),
+                                reachable_endpoints: vec![endpoint],
+                                reachable_timesync_sources: vec![],
+                                connections: vec!["GATEWAY".into()],
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                    side_b,
+                )
+                .unwrap();
             seen_a.lock().unwrap().clear();
             seen_b.lock().unwrap().clear();
             router

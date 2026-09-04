@@ -4447,11 +4447,17 @@ impl Router {
                 matches =
                     Self::filter_timesync_matches_locked(&mut st, ty, self.clock.now_ms(), matches);
             }
-            /* A heartbeat is network-segment liveness, so a nearer heartbeat
-             * producer on one side must not hide a farther independent
-             * segment. Each segment still receives one copy; ordinary data
-             * retains shortest-path suppression to avoid route echoes. */
-            if DataType::try_named("HEARTBEAT") != Some(ty) {
+            /* Heartbeats and replicated network variables are network-segment
+             * state, so a nearer owner on one side must not hide a farther
+             * independent segment. Discovery's split horizon prevents the
+             * advertisement from being reflected back onto its ingress side.
+             * Ordinary application data retains shortest-path suppression. */
+            let has_distributed_variable_owners = matches.iter().any(|candidate| {
+                st.discovery_routes
+                    .get(&candidate.side)
+                    .is_some_and(|route| route.reachable_network_variables.contains(&ty))
+            });
+            if DataType::try_named("HEARTBEAT") != Some(ty) && !has_distributed_variable_owners {
                 Self::retain_shortest_discovery_candidates_locked(
                     &st,
                     &mut matches,
