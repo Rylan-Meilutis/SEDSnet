@@ -2856,6 +2856,8 @@ impl Relay {
 
     #[cfg(feature = "discovery")]
     fn queue_discovery_announce(&self, include_schema: bool) -> TelemetryResult<()> {
+        #[cfg(not(feature = "std"))]
+        let _ = include_schema;
         let now_ms = self.clock.now_ms();
         let per_side = {
             let mut st = self.state.lock();
