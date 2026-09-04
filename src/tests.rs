@@ -6711,6 +6711,38 @@ mod router_tests {
             );
         }
 
+        #[test]
+        fn compact_topology_identifies_sender_by_embedded_board_name() {
+            ensure_topology_test_schema();
+            let wire_sender = format!("@addr:{}", crate::packet::sender_address_u32("RF"));
+            let topology_packet = build_discovery_topology(
+                &wire_sender,
+                1,
+                &[TopologyBoardNode {
+                    sender_id: "RF".to_owned(),
+                    reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                    reachable_timesync_sources: Vec::new(),
+                    connections: vec!["PB".to_owned(), "FC".to_owned()],
+                }],
+            )
+            .unwrap();
+
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let ingress = router.add_side_packet("radio", |_pkt: &Packet| Ok(()));
+            router.rx_from_side(&topology_packet, ingress).unwrap();
+            router.process_all_queues().unwrap();
+
+            let topology = router.export_topology();
+            let route = topology
+                .routes
+                .iter()
+                .find(|route| route.side_id == ingress)
+                .unwrap();
+            assert_eq!(route.announcers.len(), 1);
+            assert_eq!(route.announcers[0].sender_id, "RF");
+            assert_eq!(route.announcers[0].routers[0].sender_id, "RF");
+        }
+
         #[cfg(feature = "cryptography")]
         fn crypto_test_guard() -> std::sync::MutexGuard<'static, ()> {
             static LOCK: Mutex<()> = Mutex::new(());

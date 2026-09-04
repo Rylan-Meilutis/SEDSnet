@@ -5326,9 +5326,38 @@ impl Router {
             }
             return Ok(true);
         }
+        let mut decoded_topology = if pkt.data_type() == DataType::DiscoveryTopology {
+            Some(discovery::decode_discovery_topology(pkt)?)
+        } else {
+            None
+        };
         let packet_sender = {
             let st = self.state.lock();
-            Self::canonical_sender_locked(&st, pkt.sender())
+            let canonical = Self::canonical_sender_locked(&st, pkt.sender());
+            if canonical != pkt.sender() {
+                canonical
+            } else if let Some(address) = pkt
+                .sender()
+                .strip_prefix("@addr:")
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                // A compact topology frame may arrive before its reliable
+                // DiscoveryAddress frame. Topology still carries stable board
+                // names, so use the entry whose wire hash matches the compact
+                // source address. This keeps autonomous routers keyed by name
+                // even when the header omits that hostname.
+                decoded_topology
+                    .as_ref()
+                    .and_then(|boards| {
+                        boards
+                            .iter()
+                            .find(|board| sender_address_u32(&board.sender_id) == address)
+                    })
+                    .map(|board| board.sender_id.clone())
+                    .unwrap_or(canonical)
+            } else {
+                canonical
+            }
         };
         let local_sender = self.sender_arc();
         if packet_sender == local_sender.as_ref() {
@@ -5479,7 +5508,9 @@ impl Router {
                 changed
             }
             DataType::DiscoveryTopology => {
-                let mut boards = discovery::decode_discovery_topology(pkt)?;
+                let mut boards = decoded_topology
+                    .take()
+                    .expect("topology packet was decoded before route selection");
                 for board in boards.iter_mut() {
                     board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
                     for peer in board.connections.iter_mut() {
