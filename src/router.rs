@@ -4441,13 +4441,19 @@ impl Router {
                 matches =
                     Self::filter_timesync_matches_locked(&mut st, ty, self.clock.now_ms(), matches);
             }
-            Self::retain_shortest_discovery_candidates_locked(
-                &st,
-                &mut matches,
-                &eps,
-                &target_senders,
-                self.clock.now_ms(),
-            );
+            /* A heartbeat is network-segment liveness, so a nearer heartbeat
+             * producer on one side must not hide a farther independent
+             * segment. Each segment still receives one copy; ordinary data
+             * retains shortest-path suppression to avoid route echoes. */
+            if DataType::try_named("HEARTBEAT") != Some(ty) {
+                Self::retain_shortest_discovery_candidates_locked(
+                    &st,
+                    &mut matches,
+                    &eps,
+                    &target_senders,
+                    self.clock.now_ms(),
+                );
+            }
 
             if !matches.is_empty() {
                 Ok(RemoteSidePlan::Target(

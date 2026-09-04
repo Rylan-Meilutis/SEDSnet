@@ -2416,8 +2416,8 @@ mod tests_extra {
     fn heartbeat_reaches_each_independently_discovered_network_side() {
         crate::tests::ensure_common_test_schema();
         use crate::config::register_data_type_with_description;
-        use crate::discovery::build_discovery_announce;
-        use crate::{MessageClass, MessageElement, MessageDataType, ReliableMode};
+        use crate::discovery::{TopologyBoardNode, build_discovery_topology};
+        use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
         let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2447,13 +2447,41 @@ mod tests_extra {
 
         router
             .rx_from_side(
-                &build_discovery_announce("REMOTE_A", 1, &[endpoint]).unwrap(),
+                &build_discovery_topology(
+                    "REMOTE_A",
+                    1,
+                    &[TopologyBoardNode {
+                        sender_id: "REMOTE_A".into(),
+                        reachable_endpoints: vec![endpoint],
+                        reachable_timesync_sources: vec![],
+                        connections: vec![],
+                    }],
+                )
+                .unwrap(),
                 side_a,
             )
             .unwrap();
         router
             .rx_from_side(
-                &build_discovery_announce("REMOTE_B", 1, &[endpoint]).unwrap(),
+                &build_discovery_topology(
+                    "BRIDGE_B",
+                    1,
+                    &[
+                        TopologyBoardNode {
+                            sender_id: "BRIDGE_B".into(),
+                            reachable_endpoints: vec![],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["REMOTE_B".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "REMOTE_B".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["BRIDGE_B".into()],
+                        },
+                    ],
+                )
+                .unwrap(),
                 side_b,
             )
             .unwrap();
@@ -2462,14 +2490,7 @@ mod tests_extra {
         seen_b.lock().unwrap().clear();
 
         router
-            .tx(
-                Packet::from_no_data(
-                    heartbeat,
-                    &[endpoint],
-                    2,
-                )
-                .unwrap(),
-            )
+            .tx(Packet::from_no_data(heartbeat, &[endpoint], 2).unwrap())
             .unwrap();
 
         assert_eq!(seen_a.lock().unwrap().len(), 1);
