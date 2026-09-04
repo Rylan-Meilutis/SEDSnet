@@ -6650,6 +6650,68 @@ mod router_tests {
             StepClock::new_box(0, 0)
         }
 
+        #[test]
+        fn compact_discovery_sender_reuses_hostname_learned_from_address_packet() {
+            ensure_topology_test_schema();
+            let emitted: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let emitted_tx = emitted.clone();
+            let source = Router::new_with_clock(
+                RouterConfig::new([EndpointHandler::new_packet_handler(
+                    DataEndpoint::named("RADIO"),
+                    |_pkt| Ok(()),
+                )])
+                .with_hostname("GB"),
+                zero_clock(),
+            );
+            source.add_side_packet("wire", move |pkt: &Packet| {
+                emitted_tx.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            source.announce_discovery().unwrap();
+            source.process_all_queues().unwrap();
+
+            let address = emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
+                .cloned()
+                .expect("source did not emit an address advertisement");
+            let wire_sender = format!("@addr:{}", crate::packet::sender_address_u32("GB"));
+            let compact_address = Packet::new(
+                address.data_type(),
+                address.endpoints(),
+                &wire_sender,
+                address.timestamp(),
+                address.payload().to_vec().into(),
+            )
+            .unwrap();
+
+            let relay = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let ingress = relay.add_side_packet("ingress", |_pkt: &Packet| Ok(()));
+            relay.rx_from_side(&compact_address, ingress).unwrap();
+            relay.process_all_queues().unwrap();
+            let compact_announce =
+                build_discovery_announce(&wire_sender, 1, &[DataEndpoint::named("RADIO")])
+                    .unwrap();
+            relay.rx_from_side(&compact_announce, ingress).unwrap();
+            relay.process_all_queues().unwrap();
+
+            let topology = relay.export_topology();
+            let route = topology
+                .routes
+                .iter()
+                .find(|route| route.side_id == ingress)
+                .unwrap();
+            assert_eq!(route.announcers.len(), 1);
+            assert_eq!(route.announcers[0].sender_id, "GB");
+            assert!(
+                route
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::named("RADIO"))
+            );
+        }
+
         #[cfg(feature = "cryptography")]
         fn crypto_test_guard() -> std::sync::MutexGuard<'static, ()> {
             static LOCK: Mutex<()> = Mutex::new(());

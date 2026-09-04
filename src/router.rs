@@ -21,7 +21,7 @@ use crate::discovery::{
     TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
     TopologySideRoute, TopologySnapshot,
 };
-use crate::packet::hash_bytes_u64;
+use crate::packet::{hash_bytes_u64, sender_address_u32};
 use crate::queue::{BoundedDeque, ByteCost};
 #[cfg(all(not(feature = "std"), target_os = "none"))]
 use crate::seds_error_msg;
@@ -2854,6 +2854,27 @@ impl Router {
         address
     }
 
+    /// Resolve the compact wire header's numeric source back to the stable
+    /// hostname learned by address discovery. The DHCP-style assigned address
+    /// and the wire address intentionally occupy separate namespaces, so both
+    /// forms must be considered here.
+    fn canonical_sender_locked(st: &RouterInner, sender: &str) -> String {
+        let Some(address) = sender
+            .strip_prefix("@addr:")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return sender.to_string();
+        };
+        if let Some(hostname) = st.address_by_value.get(&address) {
+            return hostname.clone();
+        }
+        st.address_book
+            .values()
+            .find(|entry| sender_address_u32(entry.hostname.as_ref()) == address)
+            .map(|entry| entry.hostname.to_string())
+            .unwrap_or_else(|| sender.to_string())
+    }
+
     fn address_mode_from_code(mode: u8, requested: NodeAddress) -> AddressAssignmentMode {
         match mode {
             2 => AddressAssignmentMode::Static(if requested == 0 { 1 } else { requested }),
@@ -5276,6 +5297,9 @@ impl Router {
                 ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
             }
             let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+            if pkt.sender() != sender_id {
+                route.announcers.remove(pkt.sender());
+            }
             let mut sender_state = route.announcers.get(sender_id).cloned().unwrap_or_default();
             let board = Self::sender_topology_board_mut(&mut sender_state, sender_id);
             if board.reachable_endpoints != ad.reachable_endpoints {
@@ -5302,8 +5326,12 @@ impl Router {
             }
             return Ok(true);
         }
+        let packet_sender = {
+            let st = self.state.lock();
+            Self::canonical_sender_locked(&st, pkt.sender())
+        };
         let local_sender = self.sender_arc();
-        if pkt.sender() == local_sender.as_ref() {
+        if packet_sender == local_sender.as_ref() {
             return Ok(true);
         }
         if pkt.data_type() == DataType::DiscoveryTopologyRequest {
@@ -5314,7 +5342,7 @@ impl Router {
                     self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
-                self.should_answer_discovery_request_locked(&st, pkt.sender(), now_ms)
+                self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
             };
             if should_answer {
                 self.emit_discovery_snapshot(called_from_queue, false, true)?;
@@ -5329,7 +5357,7 @@ impl Router {
                     self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
-                self.should_answer_discovery_request_locked(&st, pkt.sender(), now_ms)
+                self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
             };
             if should_answer {
                 self.emit_discovery_snapshot(called_from_queue, true, true)?;
@@ -5395,7 +5423,7 @@ impl Router {
         let mut st = self.state.lock();
         let now_ms = self.clock.now_ms();
         if pkt.data_type() == DataType::DiscoveryLeave {
-            let leaving = pkt.sender();
+            let leaving = packet_sender.as_str();
             let before = st.discovery_routes.clone();
             for route in st.discovery_routes.values_mut() {
                 route.announcers.remove(leaving);
@@ -5427,7 +5455,7 @@ impl Router {
             .unwrap_or(false);
         let mut sender_state = route
             .announcers
-            .get(pkt.sender())
+            .get(&packet_sender)
             .cloned()
             .unwrap_or_default();
         let changed = match pkt.data_type() {
@@ -5436,7 +5464,7 @@ impl Router {
                 if !side_link_local_enabled {
                     reachable.retain(|ep| !ep.is_link_local_only());
                 }
-                let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+                let board = Self::sender_topology_board_mut(&mut sender_state, &packet_sender);
                 let changed = board.reachable_endpoints != reachable;
                 board.reachable_endpoints = reachable;
                 Self::refresh_sender_topology_state(&mut sender_state);
@@ -5444,7 +5472,7 @@ impl Router {
             }
             DataType::DiscoveryTimeSyncSources => {
                 let sources = discovery::decode_discovery_timesync_sources(pkt)?;
-                let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+                let board = Self::sender_topology_board_mut(&mut sender_state, &packet_sender);
                 let changed = board.reachable_timesync_sources != sources;
                 board.reachable_timesync_sources = sources;
                 Self::refresh_sender_topology_state(&mut sender_state);
@@ -5452,6 +5480,12 @@ impl Router {
             }
             DataType::DiscoveryTopology => {
                 let mut boards = discovery::decode_discovery_topology(pkt)?;
+                for board in boards.iter_mut() {
+                    board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
+                    for peer in board.connections.iter_mut() {
+                        *peer = Self::canonical_sender_locked(&st, peer);
+                    }
+                }
                 if !side_link_local_enabled {
                     for board in boards.iter_mut() {
                         board
@@ -5468,9 +5502,7 @@ impl Router {
             _ => false,
         };
         sender_state.last_seen_ms = now_ms;
-        route
-            .announcers
-            .insert(pkt.sender().to_string(), sender_state);
+        route.announcers.insert(packet_sender, sender_state);
         Self::recompute_discovery_side_state(&mut route);
         st.discovery_routes.insert(side, route);
         st.fit_discovery_budget();
