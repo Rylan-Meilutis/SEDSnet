@@ -2855,7 +2855,7 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
-    fn queue_discovery_announce(&self) -> TelemetryResult<()> {
+    fn queue_discovery_announce(&self, include_schema: bool) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         let per_side = {
             let mut st = self.state.lock();
@@ -2932,7 +2932,7 @@ impl Relay {
             // no_std schemas are immutable and no_std receivers discard
             // remote schema packets, so only hosted relays advertise them.
             #[cfg(feature = "std")]
-            if level == DiscoveryAdvertiseLevel::Full {
+            if include_schema && level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
                 let data = RelayItem::Packet(Arc::new(pkt));
                 let priority = Self::relay_item_priority(&data)?;
@@ -3037,7 +3037,9 @@ impl Relay {
         if !due {
             return Ok(false);
         }
-        self.queue_discovery_announce()?;
+        // Keep periodic discovery lightweight so a hosted relay cannot fill a
+        // constrained link with repeated schema snapshots.
+        self.queue_discovery_announce(false)?;
         Ok(true)
     }
 
@@ -3718,7 +3720,7 @@ impl Relay {
     #[cfg(feature = "discovery")]
     /// Queues an immediate discovery announcement for this relay.
     pub fn announce_discovery(&self) -> TelemetryResult<()> {
-        self.queue_discovery_announce()
+        self.queue_discovery_announce(true)
     }
 
     /// Broadcast that this relay is leaving so peers can prune topology immediately.

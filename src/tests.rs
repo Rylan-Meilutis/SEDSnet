@@ -7355,17 +7355,13 @@ mod router_tests {
             direct_seen.lock().unwrap().clear();
             reflected_seen.lock().unwrap().clear();
 
-            let valve_hash = crate::packet::hash_bytes_u64(0x517C_C1B7_2722_0A95, b"VALVE");
             router
-                .tx(Packet::new_with_wire_contract(
+                .tx(Packet::new(
                     DataType::named("GPS_DATA"),
                     &[endpoint],
                     "GROUND",
                     3,
-                    0,
                     Arc::from([0u8; 12]),
-                    None,
-                    Arc::from([valve_hash]),
                 )
                 .unwrap())
                 .unwrap();

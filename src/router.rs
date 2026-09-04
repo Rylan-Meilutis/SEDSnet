@@ -5117,7 +5117,7 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn queue_discovery_announce(&self) -> TelemetryResult<()> {
+    fn queue_discovery_announce(&self, include_schema: bool) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         {
             let mut st = self.state.lock();
@@ -5131,7 +5131,7 @@ impl Router {
             }
             st.discovery_cadence.on_announce_sent(now_ms);
         }
-        self.emit_discovery_snapshot(true, true, true)
+        self.emit_discovery_snapshot(true, include_schema, true)
     }
 
     #[cfg(feature = "discovery")]
@@ -5164,7 +5164,11 @@ impl Router {
         if !due {
             return Ok(false);
         }
-        self.queue_discovery_announce()?;
+        // Runtime liveness/topology refreshes must stay small. A full schema
+        // is sent by the initial explicit announce and in response to
+        // DiscoverySchemaRequest; repeating it at every cadence can starve
+        // commands on constrained serial and radio links.
+        self.queue_discovery_announce(false)?;
         Ok(true)
     }
 
@@ -8186,7 +8190,7 @@ impl Router {
     /// Queue a built-in discovery advertisement describing this router's local endpoints.
     #[cfg(feature = "discovery")]
     pub fn announce_discovery(&self) -> TelemetryResult<()> {
-        self.queue_discovery_announce()
+        self.queue_discovery_announce(true)
     }
 
     /// Broadcast that this router is leaving so peers can prune topology immediately.

@@ -6328,7 +6328,7 @@ mod tests {
         assert_eq!(seds_router_poll_discovery(router, &mut did_queue), 0);
         assert!(did_queue);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 6);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
 
         seds_router_free(router);
     }
@@ -6753,7 +6753,7 @@ mod tests {
         assert!(side_id >= 0);
 
         assert_eq!(seds_router_periodic_no_timesync(router, 0), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         seds_router_free(router);
     }
@@ -6861,7 +6861,7 @@ mod tests {
         assert_eq!(seds_relay_periodic(relay, 0), 0);
         let hits_after_learning = hits.load(Ordering::SeqCst);
         assert_eq!(seds_relay_periodic(relay, 0), 0);
-        assert_eq!(hits.load(Ordering::SeqCst), hits_after_learning + 8);
+        assert_eq!(hits.load(Ordering::SeqCst), hits_after_learning + 6);
 
         seds_relay_free(relay);
     }
