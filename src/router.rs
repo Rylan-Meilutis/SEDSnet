@@ -367,6 +367,12 @@ struct TxQueued {
     priority: u8,
 }
 
+/// Do not allow a continuously replenished stream of control traffic to keep
+/// an already-queued application packet from ever reaching a transport.
+/// Priorities still determine normal ordering; this only services the oldest
+/// lowest-priority item after a bounded high-priority burst.
+const MAX_PRIORITY_BURST: u8 = 8;
+
 /// ByteCost implementation for TxQueued.
 impl ByteCost for TxQueued {
     /// Byte cost is the cost of the inner item plus one bool.
@@ -1671,6 +1677,7 @@ struct RouterInner {
     next_p2p_stream_id: P2pStreamId,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
+    tx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
     reliable_tx: BTreeMap<(RouterSideId, u32), ReliableTxState>,
     reliable_rx: BTreeMap<(RouterSideId, u32), ReliableRxState>,
@@ -7421,6 +7428,7 @@ impl Router {
                     memory.starting_queue_size,
                     memory.queue_grow_step,
                 ),
+                tx_priority_burst: 0,
                 recent_rx: BoundedDeque::new(
                     memory.recent_rx_queue_bytes(),
                     memory.recent_rx_queue_bytes(),
@@ -8993,6 +9001,14 @@ impl Router {
     pub fn clear_tx_queue(&self) {
         let mut st = self.state.lock();
         st.transmit_queue.clear();
+        st.tx_priority_burst = 0;
+    }
+
+    fn pop_transmit_queue_locked(st: &mut RouterInner) -> Option<TxQueued> {
+        st.transmit_queue
+            .pop_front_fair(&mut st.tx_priority_burst, MAX_PRIORITY_BURST, |item| {
+                item.priority
+            })
     }
 
     /// Process packets in the transmit queue for up to `timeout_ms` milliseconds.
@@ -9006,7 +9022,7 @@ impl Router {
             let _ = self.drain_queued_discovery_rx_before_tx()?;
             let pkt_opt = {
                 let mut st = self.state.lock();
-                st.transmit_queue.pop_front()
+                Self::pop_transmit_queue_locked(&mut st)
             };
             let Some(pkt) = pkt_opt else { break };
             self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
@@ -9076,7 +9092,7 @@ impl Router {
 
                 if let Some(pkt) = {
                     let mut st = self.state.lock();
-                    st.transmit_queue.pop_front()
+                    Self::pop_transmit_queue_locked(&mut st)
                 } {
                     self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
                     did_any = true;
@@ -9108,7 +9124,7 @@ impl Router {
             let _ = self.drain_queued_discovery_rx_before_tx()?;
             let pkt_opt = {
                 let mut st = self.state.lock();
-                st.transmit_queue.pop_front()
+                Self::pop_transmit_queue_locked(&mut st)
             };
             let Some(pkt) = pkt_opt else { break };
             self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;

@@ -175,6 +175,43 @@ impl<T: ByteCost> BoundedDeque<T> {
         Some(v)
     }
 
+    /// Pop in priority order while guaranteeing bounded service for an item
+    /// already waiting at the lowest queued priority.
+    pub fn pop_front_fair<F>(
+        &mut self,
+        priority_burst: &mut u8,
+        max_priority_burst: u8,
+        mut priority_of: F,
+    ) -> Option<T>
+    where
+        F: FnMut(&T) -> u8,
+    {
+        let front_priority = self.q.front().map(&mut priority_of)?;
+        let lowest_priority = self
+            .q
+            .iter()
+            .map(&mut priority_of)
+            .min()
+            .unwrap_or(front_priority);
+
+        if front_priority > lowest_priority && *priority_burst >= max_priority_burst {
+            let oldest_lowest = self
+                .q
+                .iter()
+                .position(|item| priority_of(item) == lowest_priority)
+                .expect("minimum queue priority must exist");
+            *priority_burst = 0;
+            self.remove_pos(oldest_lowest)
+        } else {
+            if front_priority > lowest_priority {
+                *priority_burst = priority_burst.saturating_add(1);
+            } else {
+                *priority_burst = 0;
+            }
+            self.pop_front()
+        }
+    }
+
     /// Pop from back, updating byte count.
     #[allow(dead_code)]
     pub fn pop_back(&mut self) -> Option<T> {
@@ -401,6 +438,48 @@ mod tests {
         assert_eq!(q.pop_front().unwrap().id, 3);
         assert_eq!(q.pop_front().unwrap().id, 1);
         assert_eq!(q.pop_front().unwrap().id, 2);
+    }
+
+    #[test]
+    fn prioritized_queue_eventually_services_waiting_low_priority_item() {
+        let mut q = BoundedDeque::new(512, 128, 2.0);
+        q.push_back_prioritized(
+            Item {
+                id: 1,
+                cost: 1,
+                priority: 1,
+            },
+            |item| item.priority,
+        )
+        .unwrap();
+        for id in 2..=20 {
+            q.push_back_prioritized(
+                Item {
+                    id,
+                    cost: 1,
+                    priority: 250,
+                },
+                |item| item.priority,
+            )
+            .unwrap();
+        }
+
+        let mut burst = 0;
+        for _ in 0..8 {
+            assert_ne!(
+                q.pop_front_fair(&mut burst, 8, |item| item.priority)
+                    .unwrap()
+                    .id,
+                1
+            );
+        }
+        assert_eq!(
+            q.pop_front_fair(&mut burst, 8, |item| item.priority)
+                .unwrap()
+                .id,
+            1
+        );
+        assert_eq!(burst, 0);
     }
 
     #[test]
