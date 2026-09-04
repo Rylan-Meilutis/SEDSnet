@@ -1132,7 +1132,7 @@ impl Relay {
             RelayItem::Packet(pkt) => pkt.data_type(),
             RelayItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
-        Ok(message_priority(ty))
+        Ok(crate::scheduler_priority(ty))
     }
 
     #[inline]

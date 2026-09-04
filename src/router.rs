@@ -4046,12 +4046,12 @@ impl Router {
             RouterItem::Packet(pkt) => pkt.data_type(),
             RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
-        Ok(message_priority(ty))
+        Ok(crate::scheduler_priority(ty))
     }
 
     #[inline]
     fn router_item_priority_bumped(ty: DataType) -> u8 {
-        message_priority(ty).saturating_add(16)
+        crate::scheduler_priority(ty).saturating_add(16)
     }
 
     #[inline]

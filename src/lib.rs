@@ -637,6 +637,45 @@ pub fn message_priority(ty: DataType) -> u8 {
     get_message_meta(ty).priority
 }
 
+/// Priority used by the router/relay schedulers.
+///
+/// Protocol control traffic has reserved bands so an application schema
+/// cannot accidentally starve discovery, managed variables, or time sync by
+/// assigning a user message priority of 255. The priority stored in the
+/// schema is otherwise preserved, including the relative ordering of all
+/// application-defined messages.
+#[inline]
+pub(crate) fn scheduler_priority(ty: DataType) -> u8 {
+    match ty {
+        // Delivery control must be able to release reliable packets already
+        // occupying queues. Treat it as part of the highest control band.
+        DataType::ReliableAck | DataType::ReliablePartialAck | DataType::ReliablePacketRequest => {
+            255
+        }
+
+        // A usable route is a prerequisite for every other network service.
+        DataType::DiscoveryAnnounce
+        | DataType::DiscoveryTimeSyncSources
+        | DataType::DiscoveryTopology
+        | DataType::DiscoverySchema
+        | DataType::DiscoveryTopologyRequest
+        | DataType::DiscoverySchemaRequest
+        | DataType::DiscoveryLeave
+        | DataType::DiscoveryLinkCapabilities
+        | DataType::DiscoveryAddress => 255,
+
+        // Managed variables and time sync intentionally share a band.
+        DataType::ManagedVariableRequest
+        | DataType::ManagedVariableValue
+        | DataType::TimeSyncAnnounce
+        | DataType::TimeSyncRequest
+        | DataType::TimeSyncResponse => 254,
+
+        // Preserve application ordering below the reserved control bands.
+        _ => message_priority(ty).min(253),
+    }
+}
+
 /// Return the end-to-end cryptography policy for a data type.
 #[inline]
 pub fn message_e2e_encryption_policy(ty: DataType) -> E2eEncryptionPolicy {

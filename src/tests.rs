@@ -6692,8 +6692,7 @@ mod router_tests {
             relay.rx_from_side(&compact_address, ingress).unwrap();
             relay.process_all_queues().unwrap();
             let compact_announce =
-                build_discovery_announce(&wire_sender, 1, &[DataEndpoint::named("RADIO")])
-                    .unwrap();
+                build_discovery_announce(&wire_sender, 1, &[DataEndpoint::named("RADIO")]).unwrap();
             relay.rx_from_side(&compact_announce, ingress).unwrap();
             relay.process_all_queues().unwrap();
 
@@ -13240,4 +13239,16 @@ mod router_tests {
             assert_eq!(sample.delay_ms, 20);
         }
     }
+}
+#[test]
+fn scheduler_reserves_discovery_and_shared_state_priority_bands() {
+    let discovery = crate::scheduler_priority(DataType::DiscoveryAddress);
+    let managed = crate::scheduler_priority(DataType::ManagedVariableValue);
+    let timesync = crate::scheduler_priority(DataType::TimeSyncAnnounce);
+    let user = crate::scheduler_priority(DataType::P2pMessage);
+
+    assert_eq!(discovery, 255);
+    assert_eq!(managed, timesync);
+    assert!(discovery > managed);
+    assert!(managed > user);
 }
