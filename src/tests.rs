@@ -11768,7 +11768,7 @@ mod router_tests {
         }
 
         #[test]
-        fn empty_read_only_variable_cache_relays_refresh_request() {
+        fn read_only_variable_replica_relays_refresh_request() {
             crate::tests::ensure_common_test_schema();
             let ty = DataType::named("GPS_DATA");
             let forwarded: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -11779,6 +11779,17 @@ mod router_tests {
             );
             bridge
                 .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+            bridge
+                .seed_managed_variable(
+                    Packet::from_f32_slice(
+                        ty,
+                        &[1.0_f32, 2.0, 3.0],
+                        &[DataEndpoint::named("RADIO")],
+                        0,
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
             let ingress = bridge.add_side_packet("client", |_packet| Ok(()));
             bridge.add_side_packet("owner", move |packet| {

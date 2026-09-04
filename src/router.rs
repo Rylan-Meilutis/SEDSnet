@@ -2454,6 +2454,11 @@ impl Router {
         Self::managed_variable_permissions_locked(&st, ty).read
     }
 
+    fn can_write_managed_variable(&self, ty: DataType) -> bool {
+        let st = self.state.lock();
+        Self::managed_variable_permissions_locked(&st, ty).write
+    }
+
     #[inline]
     fn ensure_side_ingress_enabled(&self, side: RouterSideId) -> TelemetryResult<()> {
         let st = self.state.lock();
@@ -5259,10 +5264,11 @@ impl Router {
         }
         if pkt.data_type() == DataType::ManagedVariableRequest {
             let ty = discovery::decode_managed_variable_request(pkt)?;
-            if !self.can_read_managed_variable(ty) {
-                // This router is not an owner for the requested variable.
+            if !self.can_write_managed_variable(ty) {
+                // Read-only caches are replicas, not authoritative owners.
                 // Leave the request unhandled so normal discovery routing can
-                // carry it toward a reachable owner on another segment.
+                // carry it toward a writer on another segment even when this
+                // subscriber restored an older persisted value at boot.
                 return Ok(false);
             }
             if let Some(value) = self.managed_variable_latest(ty) {
@@ -5277,9 +5283,8 @@ impl Router {
                 )?;
                 return Ok(true);
             }
-            // Read-only subscribers legitimately have no value after boot.
-            // They must relay the request rather than terminating it, or a
-            // farther authoritative cache can never restore their state.
+            // A writer may not have produced its first value yet. Keep the
+            // request moving in case another authoritative writer has one.
             return Ok(false);
         }
         if pkt.data_type() == DataType::DiscoverySchema {
