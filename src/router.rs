@@ -5260,24 +5260,10 @@ impl Router {
         if pkt.data_type() == DataType::ManagedVariableRequest {
             let ty = discovery::decode_managed_variable_request(pkt)?;
             if !self.can_read_managed_variable(ty) {
-                let payload = make_error_payload("managed variable permission denied");
-                let err = Packet::new(
-                    DataType::TelemetryError,
-                    message_meta(DataType::TelemetryError).endpoints_ref(),
-                    self.sender_arc().as_ref(),
-                    self.clock.now_ms(),
-                    payload,
-                )?;
-                self.emit_internal_tx(
-                    RouterTxItem::ToSide {
-                        src: None,
-                        dst: side,
-                        data: RouterItem::Packet(err),
-                    },
-                    true,
-                    called_from_queue,
-                )?;
-                return Ok(true);
+                // This router is not an owner for the requested variable.
+                // Leave the request unhandled so normal discovery routing can
+                // carry it toward a reachable owner on another segment.
+                return Ok(false);
             }
             if let Some(value) = self.managed_variable_latest(ty) {
                 self.emit_internal_tx(
@@ -5289,8 +5275,12 @@ impl Router {
                     true,
                     called_from_queue,
                 )?;
+                return Ok(true);
             }
-            return Ok(true);
+            // Read-only subscribers legitimately have no value after boot.
+            // They must relay the request rather than terminating it, or a
+            // farther authoritative cache can never restore their state.
+            return Ok(false);
         }
         if pkt.data_type() == DataType::DiscoverySchema {
             // no_std schemas are generated into immutable flash tables. The

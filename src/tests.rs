@@ -11768,6 +11768,36 @@ mod router_tests {
         }
 
         #[test]
+        fn empty_read_only_variable_cache_relays_refresh_request() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let forwarded: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let forwarded_cb = forwarded.clone();
+            let bridge = Router::new_with_clock(
+                RouterConfig::default().with_sender("READ_ONLY_BRIDGE"),
+                zero_clock(),
+            );
+            bridge
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+            let ingress = bridge.add_side_packet("client", |_packet| Ok(()));
+            bridge.add_side_packet("owner", move |packet| {
+                forwarded_cb.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+
+            let request =
+                crate::discovery::build_managed_variable_request("CLIENT", 1, ty).unwrap();
+            bridge.rx_from_side(&request, ingress).unwrap();
+            bridge.process_all_queues().unwrap();
+
+            assert!(forwarded.lock().unwrap().iter().any(|packet| {
+                packet.data_type() == DataType::ManagedVariableRequest
+                    && crate::discovery::decode_managed_variable_request(packet) == Ok(ty)
+            }));
+        }
+
+        #[test]
         fn network_variable_getter_requests_missing_value_and_uses_cache() {
             crate::tests::ensure_common_test_schema();
             let ty = DataType::named("GPS_DATA");
