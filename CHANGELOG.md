@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.0.12
+
+- Resolve compact discovery senders to their canonical embedded board names from the advertised
+  wire address, including the initial topology packet before a separate address announcement has
+  arrived. This keeps DHCP/DNS-style endpoint discovery autonomous when compact headers omit the
+  hostname.
+- Re-resolve reliable destinations through current discovery state and preserve learned hostname
+  identities across compact router hops, allowing commands, acknowledgements, and network
+  variables to traverse multi-sided bridges without static fanout overrides.
+- Reserve scheduler priority for reliable discovery traffic, then network variables and time sync,
+  while retaining user-defined ordering for application traffic.
+- Prevent sustained control traffic from starving queued application data and add regression
+  coverage for compact identity resolution, multi-hop discovery, and scheduler fairness.
+
 ## 4.0.10
 
 - Make router compact side transport self-healing after packet loss: unknown compact-template

@@ -1,5 +1,19 @@
 # Changelogs
 
+## Version 4.0.12 highlights
+
+- Autonomous named discovery:
+    - Compact topology advertisements are associated with canonical embedded board names from
+      their wire addresses, even before a separate address advertisement arrives.
+    - Reliable destinations are re-resolved through current discovery state, so commands,
+      acknowledgements, and network variables cross multi-sided routers without static fanout.
+- Congestion-resistant scheduling:
+    - Reliable discovery has the highest built-in priority; network variables and time sync share
+      the next priority; application traffic retains its configured ordering below control traffic.
+    - Fair servicing prevents sustained control traffic from starving queued application data.
+- Full-system validation covers seven firmware nodes plus GroundStation across CAN, radio, and
+  Pico-Fi I2C/UART framing with canonical discovery and bidirectional command/status traffic.
+
 ## Version 4.0.11 highlights
 
 - Discovery-routed bridges:

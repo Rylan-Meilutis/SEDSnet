@@ -1937,12 +1937,13 @@ mod reliable_drop_tests {
             daq.process_all_queues_with_timeout(0).unwrap();
 
             for frame in drain_queue(&src_to_gw) {
-                if let Ok(info) = wire_format::peek_frame_info(&frame) {
-                    if info.envelope.ty == DataType::named("GPS_DATA") && !info.ack_only() {
-                        source_to_gateway_data_frames += 1;
-                        if let Some(hdr) = info.reliable {
-                            source_to_gateway_seqs.insert(hdr.seq);
-                        }
+                if let Ok(info) = wire_format::peek_frame_info(&frame)
+                    && info.envelope.ty == DataType::named("GPS_DATA")
+                    && !info.ack_only()
+                {
+                    source_to_gateway_data_frames += 1;
+                    if let Some(hdr) = info.reliable {
+                        source_to_gateway_seqs.insert(hdr.seq);
                     }
                 }
                 gateway.rx_packed_from_side(uplink, &frame).unwrap();
@@ -3449,11 +3450,18 @@ mod reliable_drop_tests {
             "P2P stream data was never issued; stream hits: {p2p_stream_hits:?}"
         );
         let p2p_hits = p2p_hits.lock().unwrap().clone();
+        let gs_topology_senders: Vec<String> = topology
+            .gs
+            .export_topology()
+            .routers
+            .iter()
+            .map(|board| board.sender_id.clone())
+            .collect();
         assert!(
             p2p_hits
                 .iter()
                 .any(|hit| hit.starts_with("AB:GS:49152:GET /status/")),
-            "static-address P2P hostname service was not exercised: {p2p_hits:?}"
+            "static-address P2P hostname service was not exercised: hits={p2p_hits:?}, topology={gs_topology_senders:?}"
         );
         assert!(
             p2p_hits

@@ -16,6 +16,8 @@ use crate::discovery::{
     TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
     TopologySideRoute, TopologySnapshot,
 };
+#[cfg(feature = "discovery")]
+use crate::packet::sender_address_u32;
 use crate::packet::{Packet, hash_bytes_u64};
 use crate::queue::{BoundedDeque, ByteCost};
 use crate::wire_format;
@@ -33,6 +35,8 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::mem::size_of;
+
+const MAX_PRIORITY_BURST: u8 = 8;
 use crc32fast::Hasher as Crc32Hasher;
 
 /// Logical side index (CAN, UART, RADIO, etc.)
@@ -787,6 +791,7 @@ struct RelayInner {
     side_transport: BTreeMap<RelaySideId, SideTransportState>,
     rx_queue: BoundedDeque<RelayRxItem>,
     tx_queue: BoundedDeque<RelayTxItem>,
+    tx_priority_burst: u8,
     replay_queue: BoundedDeque<RelayReplayItem>,
     recent_rx: BoundedDeque<u64>,
     reliable_tx: BTreeMap<(RelaySideId, u32), ReliableTxState>,
@@ -1186,7 +1191,14 @@ impl Relay {
         RelayItem,
     )> {
         let mut st = self.state.lock();
-        if let Some(item) = st.tx_queue.pop_front() {
+        let mut priority_burst = st.tx_priority_burst;
+        let item = st
+            .tx_queue
+            .pop_front_fair(&mut priority_burst, MAX_PRIORITY_BURST, |queued| {
+                queued.priority
+            });
+        st.tx_priority_burst = priority_burst;
+        if let Some(item) = item {
             let side = st.sides.get(item.dst).and_then(|side| side.clone());
             side.map(|s| (item.src, item.dst, s.tx_handler, s.opts, item.data))
         } else {
@@ -1265,6 +1277,7 @@ impl Relay {
                     memory.starting_queue_size,
                     memory.queue_grow_step,
                 ),
+                tx_priority_burst: 0,
                 replay_queue: BoundedDeque::new(
                     memory.max_queue_budget,
                     memory.starting_queue_size,
@@ -1691,7 +1704,37 @@ impl Relay {
 
     #[inline]
     fn sender_hash(sender: &str) -> u64 {
+        if let Some(address) = sender
+            .strip_prefix("@addr:")
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            return u64::from(address);
+        }
         hash_bytes_u64(0x517C_C1B7_2722_0A95, sender.as_bytes())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn canonical_sender_locked(st: &RelayInner, sender: &str) -> String {
+        let Some(address) = sender
+            .strip_prefix("@addr:")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return sender.to_string();
+        };
+        st.discovery_routes
+            .values()
+            .flat_map(|route| route.announcers.iter())
+            .flat_map(|(announcer, state)| {
+                core::iter::once(announcer.as_str()).chain(
+                    state
+                        .topology_boards
+                        .iter()
+                        .map(|board| board.sender_id.as_str()),
+                )
+            })
+            .find(|candidate| sender_address_u32(candidate) == address)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| sender.to_string())
     }
 
     fn decode_end_to_end_ack_sender_hash(sender: &str) -> Option<u64> {
@@ -3120,11 +3163,39 @@ impl Relay {
         } else {
             None
         };
-        let announcer_id = address_ad
-            .as_ref()
-            .map(|ad| ad.hostname.clone())
-            .unwrap_or_else(|| pkt.sender().to_string());
+        let mut topology_ad = if pkt.data_type() == crate::DataType::DiscoveryTopology {
+            Some(discovery::decode_discovery_topology(&pkt)?)
+        } else {
+            None
+        };
+        let announcer_id = if let Some(ad) = address_ad.as_ref() {
+            ad.hostname.clone()
+        } else {
+            let canonical = Self::canonical_sender_locked(&st, pkt.sender());
+            if canonical != pkt.sender() {
+                canonical
+            } else if let Some(address) = pkt
+                .sender()
+                .strip_prefix("@addr:")
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                topology_ad
+                    .as_ref()
+                    .and_then(|boards| {
+                        boards
+                            .iter()
+                            .find(|board| sender_address_u32(&board.sender_id) == address)
+                    })
+                    .map(|board| board.sender_id.clone())
+                    .unwrap_or(canonical)
+            } else {
+                canonical
+            }
+        };
         let mut route = st.discovery_routes.get(&src).cloned().unwrap_or_default();
+        if pkt.sender() != announcer_id {
+            route.announcers.remove(pkt.sender());
+        }
         let side_link_local_enabled = st
             .sides
             .get(src)
@@ -3156,7 +3227,7 @@ impl Relay {
                 if !side_link_local_enabled {
                     reachable.retain(|ep| !ep.is_link_local_only());
                 }
-                let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+                let board = Self::sender_topology_board_mut(&mut sender_state, &announcer_id);
                 let changed = board.reachable_endpoints != reachable;
                 board.reachable_endpoints = reachable;
                 Self::refresh_sender_topology_state(&mut sender_state);
@@ -3164,14 +3235,22 @@ impl Relay {
             }
             crate::DataType::DiscoveryTimeSyncSources => {
                 let sources = discovery::decode_discovery_timesync_sources(&pkt)?;
-                let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+                let board = Self::sender_topology_board_mut(&mut sender_state, &announcer_id);
                 let changed = board.reachable_timesync_sources != sources;
                 board.reachable_timesync_sources = sources;
                 Self::refresh_sender_topology_state(&mut sender_state);
                 changed
             }
             crate::DataType::DiscoveryTopology => {
-                let mut boards = discovery::decode_discovery_topology(&pkt)?;
+                let mut boards = topology_ad
+                    .take()
+                    .expect("topology packet was decoded before route selection");
+                for board in boards.iter_mut() {
+                    board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
+                    for peer in board.connections.iter_mut() {
+                        *peer = Self::canonical_sender_locked(&st, peer);
+                    }
+                }
                 if !side_link_local_enabled {
                     for board in boards.iter_mut() {
                         board
@@ -4217,6 +4296,7 @@ impl Relay {
         let mut st = self.state.lock();
         st.rx_queue.clear();
         st.tx_queue.clear();
+        st.tx_priority_burst = 0;
     }
 
     /// Clear only RX queue.
@@ -4229,6 +4309,7 @@ impl Relay {
     pub fn clear_tx_queue(&self) {
         let mut st = self.state.lock();
         st.tx_queue.clear();
+        st.tx_priority_burst = 0;
         st.replay_queue.clear();
     }
 
