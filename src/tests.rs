@@ -7772,6 +7772,63 @@ mod router_tests {
         }
 
         #[test]
+        fn reliable_command_re_resolves_at_an_aggregated_discovery_next_hop() {
+            ensure_topology_test_schema();
+            let reliable_ty = ensure_reliable_overlap_test_schema();
+            let gs = DataEndpoint::named("GROUND_STATION");
+            let actuator = DataEndpoint::named("ACTUATOR_BOARD");
+
+            let source_to_gateway: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            let delivered: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let source_wire = source_to_gateway.clone();
+            let delivered_wire = delivered.clone();
+
+            let source = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(gs, |_pkt| Ok(()))])
+                    .with_sender("GS"),
+                zero_clock(),
+            );
+            let gateway =
+                Router::new_with_clock(RouterConfig::default().with_sender("GW"), zero_clock());
+            let source_side = source.add_side_packed("gateway", move |bytes: &[u8]| {
+                source_wire.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            });
+            let gateway_uplink = gateway.add_side_packed("source", |_bytes: &[u8]| Ok(()));
+            let gateway_child = gateway.add_side_packet("child", move |pkt: &Packet| {
+                delivered_wire.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            source
+                .rx_from_side(
+                    &build_discovery_announce("GW", 0, &[actuator]).unwrap(),
+                    source_side,
+                )
+                .unwrap();
+            gateway
+                .rx_from_side(
+                    &build_discovery_announce("AB", 0, &[actuator]).unwrap(),
+                    gateway_child,
+                )
+                .unwrap();
+            source_to_gateway.lock().unwrap().clear();
+            delivered.lock().unwrap().clear();
+
+            source
+                .tx(Packet::from_f32_slice(reliable_ty, &[1.0], &[gs, actuator], 1).unwrap())
+                .unwrap();
+            for frame in source_to_gateway.lock().unwrap().drain(..) {
+                gateway.rx_packed_from_side(&frame, gateway_uplink).unwrap();
+            }
+
+            assert_eq!(
+                count_packets_of_type(&delivered.lock().unwrap(), reliable_ty),
+                1
+            );
+        }
+
+        #[test]
         fn end_to_end_pending_destinations_clear_when_discovered_holder_expires() {
             use std::sync::Arc;
 

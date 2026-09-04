@@ -2835,6 +2835,12 @@ impl Router {
 
     #[inline]
     fn sender_hash(sender: &str) -> u64 {
+        if let Some(address) = sender
+            .strip_prefix("@addr:")
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            return u64::from(address);
+        }
         hash_bytes_u64(0x517C_C1B7_2722_0A95, sender.as_bytes())
     }
 
@@ -4070,6 +4076,7 @@ impl Router {
         exclude: Option<RouterSideId>,
         ignore_local: bool,
     ) -> TelemetryResult<()> {
+        let data = self.clear_intermediate_hop_targets(data)?;
         let plan = self.remote_side_plan(&data, exclude)?;
         let mut st = self.state.lock();
         let priority = Self::router_item_priority(&data)?;
@@ -4100,6 +4107,7 @@ impl Router {
             return self.enqueue_to_sides(data, src, true);
         }
 
+        let data = self.clear_intermediate_hop_targets(data)?;
         let RemoteSidePlan::Target(sides) = self.remote_side_plan(&data, src)?;
         for side in sides {
             self.tx_item_impl(
@@ -4274,6 +4282,49 @@ impl Router {
         Ok(targets.contains(&local_hash))
     }
 
+    fn item_targets_router_as_intermediate_hop(
+        &self,
+        data: &RouterItem,
+        endpoints: &[DataEndpoint],
+    ) -> TelemetryResult<bool> {
+        let targets = self.item_target_senders(data)?;
+        if targets.is_empty()
+            || endpoints.iter().copied().any(|endpoint| {
+                self.endpoint_has_packet_handler(endpoint)
+                    || self.endpoint_has_packed_handler(endpoint)
+            })
+        {
+            return Ok(false);
+        }
+        let local_sender = self.sender_arc();
+        Ok(targets.contains(&Self::sender_hash(local_sender.as_ref())))
+    }
+
+    fn clear_intermediate_hop_targets(&self, data: RouterItem) -> TelemetryResult<RouterItem> {
+        let (endpoints, _) = self.item_route_info(&data)?;
+        if !self.item_targets_router_as_intermediate_hop(&data, &endpoints)? {
+            return Ok(data);
+        }
+        let pkt = match &data {
+            RouterItem::Packet(pkt) => pkt.clone(),
+            RouterItem::Packed(bytes) => wire_format::unpack_packet(bytes.as_ref())?,
+        };
+        let reliable = match &data {
+            RouterItem::Packet(_) => None,
+            RouterItem::Packed(bytes) => wire_format::peek_frame_info(bytes.as_ref())?.reliable,
+        };
+        let shape = match &data {
+            RouterItem::Packet(pkt) => pkt.wire_shape(),
+            RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.wire_shape,
+        };
+        Ok(RouterItem::Packed(self.pack_packet_for_contract(
+            &pkt,
+            reliable,
+            shape,
+            &[],
+        )?))
+    }
+
     #[cfg(feature = "discovery")]
     fn side_matches_target_senders_locked(
         st: &RouterInner,
@@ -4382,6 +4433,13 @@ impl Router {
         {
             let (eps, ty) = self.item_route_info(data)?;
             let target_senders = self.item_target_senders(data)?;
+            let resolve_beyond_local_hop =
+                self.item_targets_router_as_intermediate_hop(data, &eps)?;
+            let routing_target_senders: &[u64] = if resolve_beyond_local_hop {
+                &[]
+            } else {
+                target_senders.as_ref()
+            };
             let preferred_packet_id = Self::reliable_control_target_packet_id(data)?;
             if discovery::is_discovery_type(ty) {
                 let mut st = self.state.lock();
@@ -4425,8 +4483,9 @@ impl Router {
                 return Ok(RemoteSidePlan::Target(Vec::new()));
             }
             let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
-            let prefer_best_overlap =
-                is_reliable_type(ty) && target_senders.is_empty() && preferred_packet_id.is_none();
+            let prefer_best_overlap = is_reliable_type(ty)
+                && routing_target_senders.is_empty()
+                && preferred_packet_id.is_none();
             if st.discovery_routes.is_empty() {
                 let mut fallback =
                     self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
@@ -4450,7 +4509,7 @@ impl Router {
                 exclude,
                 ty,
                 &eps,
-                &target_senders,
+                routing_target_senders,
                 prefer_best_overlap,
                 preferred_timesync_source.as_deref(),
             );
@@ -4474,7 +4533,7 @@ impl Router {
                     &st,
                     &mut matches,
                     &eps,
-                    &target_senders,
+                    routing_target_senders,
                     self.clock.now_ms(),
                 );
             }
@@ -4485,7 +4544,7 @@ impl Router {
                         &mut st,
                         exclude,
                         ty,
-                        &target_senders,
+                        routing_target_senders,
                         prefer_best_overlap,
                         matches,
                     ),
@@ -5195,6 +5254,16 @@ impl Router {
         if pkt.data_type() == DataType::DiscoveryAddress {
             let mut ad = discovery::decode_discovery_address(pkt)?;
             let mut changed = self.ingest_address_advertisement(ad.clone())?;
+            /* Packed no_std frames represent their source as @addr:N until
+             * discovery resolves the address. DiscoveryAddress carries the
+             * authoritative hostname in its payload, so key reachability by
+             * that name immediately instead of permanently treating the
+             * placeholder as a distinct router. */
+            let sender_id = if ad.hostname.is_empty() {
+                pkt.sender()
+            } else {
+                ad.hostname.as_str()
+            };
             let now_ms = self.clock.now_ms();
             let mut st = self.state.lock();
             let side_link_local_enabled = st
@@ -5207,12 +5276,8 @@ impl Router {
                 ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
             }
             let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
-            let mut sender_state = route
-                .announcers
-                .get(pkt.sender())
-                .cloned()
-                .unwrap_or_default();
-            let board = Self::sender_topology_board_mut(&mut sender_state, pkt.sender());
+            let mut sender_state = route.announcers.get(sender_id).cloned().unwrap_or_default();
+            let board = Self::sender_topology_board_mut(&mut sender_state, sender_id);
             if board.reachable_endpoints != ad.reachable_endpoints {
                 board.reachable_endpoints = ad.reachable_endpoints;
                 changed = true;
@@ -5227,9 +5292,7 @@ impl Router {
             }
             Self::refresh_sender_topology_state(&mut sender_state);
             sender_state.last_seen_ms = now_ms;
-            route
-                .announcers
-                .insert(pkt.sender().to_string(), sender_state);
+            route.announcers.insert(sender_id.to_string(), sender_state);
             Self::recompute_discovery_side_state(&mut route);
             st.discovery_routes.insert(side, route);
             st.fit_discovery_budget();

@@ -69,6 +69,14 @@ mod reliable_drop_tests {
                 )
                 .unwrap();
             }
+            if endpoint_definition_by_name("GROUND_STATION").is_none() {
+                register_endpoint_with_description(
+                    "GROUND_STATION",
+                    "Ground-station command and telemetry endpoint.",
+                    false,
+                )
+                .unwrap();
+            }
             if data_type_definition_by_name("GPS_DATA").is_none() {
                 register_data_type_with_description(
                     "GPS_DATA",
@@ -1776,7 +1784,11 @@ mod reliable_drop_tests {
         let actuator_seen = actuator_hits.clone();
 
         let source = Router::new_with_clock(
-            RouterConfig::default().with_sender("GS"),
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("GROUND_STATION"),
+                |_pkt| Ok(()),
+            )])
+            .with_sender("GS"),
             shared_clock(now.clone()),
         );
         let gateway = Relay::new(shared_clock(now.clone()));
@@ -1827,7 +1839,12 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            side_opts,
+            RouterSideOptions {
+                reliable_enabled: true,
+                link_local_enabled: false,
+                max_frame_bytes: 96,
+                ..RouterSideOptions::default().with_ipv6_like_compact_header_target()
+            },
         );
         let uplink = gateway.add_side_packed_with_options(
             "uplink",
@@ -1838,7 +1855,12 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            relay_side_opts,
+            RelaySideOptions {
+                reliable_enabled: true,
+                link_local_enabled: false,
+                max_frame_bytes: 96,
+                ..RelaySideOptions::default().with_ipv6_like_compact_header_target()
+            },
         );
         let gw_child =
             gateway.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts);
@@ -1894,7 +1916,10 @@ mod reliable_drop_tests {
             .tx(Packet::from_f32_slice(
                 DataType::named("GPS_DATA"),
                 &[7.0, 0.0, 0.0],
-                &[DataEndpoint::named("RADIO")],
+                &[
+                    DataEndpoint::named("GROUND_STATION"),
+                    DataEndpoint::named("RADIO"),
+                ],
                 7,
             )
             .unwrap())
@@ -1912,11 +1937,12 @@ mod reliable_drop_tests {
             daq.process_all_queues_with_timeout(0).unwrap();
 
             for frame in drain_queue(&src_to_gw) {
-                let info = wire_format::peek_frame_info(&frame).unwrap();
-                if info.envelope.ty == DataType::named("GPS_DATA") && !info.ack_only() {
-                    source_to_gateway_data_frames += 1;
-                    if let Some(hdr) = info.reliable {
-                        source_to_gateway_seqs.insert(hdr.seq);
+                if let Ok(info) = wire_format::peek_frame_info(&frame) {
+                    if info.envelope.ty == DataType::named("GPS_DATA") && !info.ack_only() {
+                        source_to_gateway_data_frames += 1;
+                        if let Some(hdr) = info.reliable {
+                            source_to_gateway_seqs.insert(hdr.seq);
+                        }
                     }
                 }
                 gateway.rx_packed_from_side(uplink, &frame).unwrap();
