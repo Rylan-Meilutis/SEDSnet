@@ -3722,7 +3722,19 @@ impl Router {
             matches.into_iter().map(|m| m.side).collect()
         };
 
-        self.apply_route_selection_locked(st, exclude, selected, discovered_origin)
+        /* Heartbeats represent network-wide liveness rather than a request for
+         * one interchangeable endpoint owner.  When discovery finds the
+         * heartbeat endpoint on multiple independent shortest-path sides,
+         * every segment must receive it.  Ordinary data continues through the
+         * adaptive single-path selector so a multi-homed router does not
+         * duplicate application traffic. */
+        if discovered_origin == RouteSelectionOrigin::Discovered
+            && DataType::try_named("HEARTBEAT") == Some(ty)
+        {
+            selected
+        } else {
+            self.apply_route_selection_locked(st, exclude, selected, discovered_origin)
+        }
     }
 
     fn register_end_to_end_reliable_tx(&self, data: &RouterItem) -> TelemetryResult<()> {

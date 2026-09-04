@@ -2412,6 +2412,70 @@ mod tests_extra {
         assert_eq!(pkt.timestamp(), 12345);
     }
 
+    #[test]
+    fn heartbeat_reaches_each_independently_discovered_network_side() {
+        crate::tests::ensure_common_test_schema();
+        use crate::config::register_data_type_with_description;
+        use crate::discovery::build_discovery_announce;
+        use crate::{MessageClass, MessageElement, MessageDataType, ReliableMode};
+
+        let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_a_cb = seen_a.clone();
+        let seen_b_cb = seen_b.clone();
+        let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        let side_a = router.add_side_packet("A", move |packet| {
+            seen_a_cb.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+        let side_b = router.add_side_packet("B", move |packet| {
+            seen_b_cb.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+        let endpoint = DataEndpoint::named("SD_CARD");
+        let heartbeat = DataType::try_named("HEARTBEAT").unwrap_or_else(|| {
+            register_data_type_with_description(
+                "HEARTBEAT",
+                "test network heartbeat",
+                MessageElement::Static(0, MessageDataType::NoData, MessageClass::Data),
+                &[endpoint],
+                ReliableMode::None,
+                255,
+            )
+            .expect("register HEARTBEAT")
+        });
+
+        router
+            .rx_from_side(
+                &build_discovery_announce("REMOTE_A", 1, &[endpoint]).unwrap(),
+                side_a,
+            )
+            .unwrap();
+        router
+            .rx_from_side(
+                &build_discovery_announce("REMOTE_B", 1, &[endpoint]).unwrap(),
+                side_b,
+            )
+            .unwrap();
+        router.process_all_queues().unwrap();
+        seen_a.lock().unwrap().clear();
+        seen_b.lock().unwrap().clear();
+
+        router
+            .tx(
+                Packet::from_no_data(
+                    heartbeat,
+                    &[endpoint],
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(seen_a.lock().unwrap().len(), 1);
+        assert_eq!(seen_b.lock().unwrap().len(), 1);
+    }
+
     // --------------------------- Header-only happy path smoke ---------------------------
 
     /// Header-only peek (`peek_envelope`) should match full parse for a normal
