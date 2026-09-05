@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.13
+
+- Prevent recursive transport-error reporting when an isolated or unacknowledged CAN side rejects
+  a transmission, avoiding stack exhaustion and hard faults when a board boots without peers.
+- Promote actual network-variable values to the same reserved scheduling band as time sync while
+  keeping discovery and delivery-control traffic highest priority.
+- Expose the protocol transport-priority mapping so host transports can preserve SEDSNet ordering
+  after packets leave the router's bounded queue.
+
 ## 4.0.12
 
 - Resolve compact discovery senders to their canonical embedded board names from the advertised

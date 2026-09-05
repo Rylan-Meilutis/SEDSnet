@@ -12107,6 +12107,62 @@ mod router_tests {
         }
 
         #[test]
+        fn reentrant_network_variable_update_precedes_ordinary_user_queue() {
+            use std::sync::Weak;
+            use std::sync::atomic::AtomicBool;
+
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+            let router_slot = Arc::new(Mutex::new(Weak::<Router>::new()));
+            let seen = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+            let injected = Arc::new(AtomicBool::new(false));
+
+            let router = Arc::new(Router::new_with_clock(
+                RouterConfig::default().with_sender("NV_PRIORITY"),
+                zero_clock(),
+            ));
+            *router_slot.lock().unwrap() = Arc::downgrade(&router);
+
+            let router_slot_c = router_slot.clone();
+            let seen_c = seen.clone();
+            let injected_c = injected.clone();
+            router.add_side_packet("wire", move |pkt: &Packet| {
+                if pkt.data_type() == ty {
+                    seen_c.lock().unwrap().push(pkt.data_as_f32()?);
+                    if !injected_c.swap(true, Ordering::SeqCst) {
+                        router_slot_c
+                            .lock()
+                            .unwrap()
+                            .upgrade()
+                            .unwrap()
+                            .set_network_variable(Packet::from_f32_slice(
+                                ty,
+                                &[4.0, 5.0, 6.0],
+                                &[ep],
+                                2,
+                            )?)?;
+                    }
+                }
+                Ok(())
+            });
+
+            router
+                .tx(Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[ep], 1).unwrap())
+                .unwrap();
+            seen.lock().unwrap().clear();
+            router
+                .tx_queue(Packet::from_f32_slice(ty, &[7.0, 8.0, 9.0], &[ep], 3).unwrap())
+                .unwrap();
+            router.process_all_queues().unwrap();
+
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![vec![4.0, 5.0, 6.0], vec![7.0, 8.0, 9.0]]
+            );
+        }
+
+        #[test]
         fn router_and_relay_memory_layout_exports_queue_breakdown() {
             crate::tests::ensure_common_test_schema();
             let ep = DataEndpoint::named("RADIO");

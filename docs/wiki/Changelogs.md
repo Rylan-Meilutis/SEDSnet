@@ -1,5 +1,13 @@
 # Changelogs
 
+## Version 4.0.13 highlights
+
+- Isolated CAN nodes no longer recursively report a failed transport through that same failed
+  side, preventing stack exhaustion and startup hard faults when no peer acknowledges the bus.
+- Real network-variable values now share the reserved time-sync priority band, below discovery and
+  delivery control but above application-defined traffic.
+- Host transports can use the exported transport-priority mapping to preserve router ordering.
+
 ## Version 4.0.12 highlights
 
 - Autonomous named discovery:

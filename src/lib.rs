@@ -645,7 +645,7 @@ pub fn message_priority(ty: DataType) -> u8 {
 /// schema is otherwise preserved, including the relative ordering of all
 /// application-defined messages.
 #[inline]
-pub(crate) fn scheduler_priority(ty: DataType) -> u8 {
+pub fn transport_priority(ty: DataType) -> u8 {
     match ty {
         // Delivery control must be able to release reliable packets already
         // occupying queues. Treat it as part of the highest control band.
@@ -674,6 +674,13 @@ pub(crate) fn scheduler_priority(ty: DataType) -> u8 {
         // Preserve application ordering below the reserved control bands.
         _ => message_priority(ty).min(253),
     }
+}
+
+// Internal name retained so the router and relay code remain explicit about
+// where this priority is applied.
+#[inline]
+pub(crate) fn scheduler_priority(ty: DataType) -> u8 {
+    transport_priority(ty)
 }
 
 /// Return the end-to-end cryptography policy for a data type.

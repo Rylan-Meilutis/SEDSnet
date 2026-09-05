@@ -4100,7 +4100,12 @@ impl Router {
         let data = self.clear_intermediate_hop_targets(data)?;
         let plan = self.remote_side_plan(&data, exclude)?;
         let mut st = self.state.lock();
-        let priority = Self::router_item_priority(&data)?;
+        let ty = Self::item_data_type(&data)?;
+        let priority = if st.managed_variable_types.contains(&ty.as_u32()) {
+            crate::transport_priority(DataType::ManagedVariableValue)
+        } else {
+            Self::router_item_priority(&data)?
+        };
 
         let RemoteSidePlan::Target(sides) = plan;
         for idx in sides {
@@ -8452,7 +8457,17 @@ impl Router {
             }
         }
         self.cache_managed_variable_packet(&pkt, false)?;
-        self.tx(pkt)
+        #[cfg(feature = "discovery")]
+        let _ = self.poll_discovery()?;
+        let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
+        if self.side_tx_active() {
+            return self.tx_queue_item_with_priority(
+                item,
+                false,
+                crate::transport_priority(DataType::ManagedVariableValue),
+            );
+        }
+        self.tx_item(item)
     }
 
     /// Read a cached network variable, requesting a refresh if missing or stale.
