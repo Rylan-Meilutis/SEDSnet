@@ -6808,7 +6808,7 @@ mod router_tests {
             build_discovery_link_capabilities, build_discovery_timesync_sources,
             build_discovery_topology, decode_discovery_link_capabilities,
         };
-        use crate::relay::Relay;
+        use crate::relay::{Relay, RelaySideOptions};
         use crate::router::{
             Clock, EndpointHandler, NetworkVariablePermissions, RouterConfig,
             RouterE2eEncryptionMode, RouterSideOptions,
@@ -9128,6 +9128,68 @@ mod router_tests {
             let snap_after = router.export_topology();
             assert_eq!(snap_after.next_announce_ms, DISCOVERY_FAST_INTERVAL_MS);
             assert!(snap_after.current_announce_interval_ms >= DISCOVERY_FAST_INTERVAL_MS);
+        }
+
+        #[test]
+        fn router_does_not_stack_periodic_discovery_behind_an_unacked_snapshot() {
+            ensure_topology_test_schema();
+            let now_ms = Arc::new(AtomicU64::new(0));
+            let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let sent_cb = sent.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default(),
+                Box::new(SharedClock {
+                    now_ms: now_ms.clone(),
+                }),
+            );
+            router.add_side_packed_with_options(
+                "radio",
+                move |bytes| {
+                    sent_cb.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    ..RouterSideOptions::default()
+                },
+            );
+
+            assert!(router.poll_discovery().unwrap());
+            router.process_all_queues().unwrap();
+            let first_count = sent.lock().unwrap().len();
+            assert!(first_count > 0);
+
+            now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
+            assert!(!router.poll_discovery().unwrap());
+        }
+
+        #[test]
+        fn relay_does_not_stack_periodic_discovery_behind_an_unacked_snapshot() {
+            let now_ms = Arc::new(AtomicU64::new(0));
+            let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let sent_cb = sent.clone();
+            let relay = Relay::new(Box::new(SharedClock {
+                now_ms: now_ms.clone(),
+            }));
+            relay.add_side_packed_with_options(
+                "radio",
+                move |bytes| {
+                    sent_cb.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RelaySideOptions {
+                    reliable_enabled: true,
+                    ..RelaySideOptions::default()
+                },
+            );
+
+            assert!(relay.poll_discovery().unwrap());
+            relay.process_all_queues().unwrap();
+            let first_count = sent.lock().unwrap().len();
+            assert!(first_count > 0);
+
+            now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
+            assert!(!relay.poll_discovery().unwrap());
         }
 
         #[test]

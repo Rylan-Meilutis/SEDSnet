@@ -3077,6 +3077,16 @@ impl Relay {
             if !st.sides.iter().any(|side| side.is_some()) || !has_any {
                 return Ok(false);
             }
+            // Keep at most one reliable periodic discovery snapshot in
+            // flight per relay. This lets ACK/retransmit recovery close a
+            // sequence gap before later snapshots consume reliable history.
+            let discovery_in_flight = st.reliable_tx.iter().any(|((_side, ty), tx_state)| {
+                !tx_state.sent.is_empty()
+                    && crate::DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
+            });
+            if discovery_in_flight {
+                return Ok(false);
+            }
             st.discovery_cadence.due(now_ms)
         };
         if !due {

@@ -141,7 +141,10 @@ With discovery enabled, forwarding also consults the learned side map:
 - `periodic_no_timesync()` skips the time-sync maintenance phase while still running discovery and
   queue draining.
 - `announce_discovery()` queues a discovery advertisement immediately.
-- `poll_discovery()` queues one only when the adaptive cadence says it is due.
+- `poll_discovery()` queues one only when the adaptive cadence says it is due. On reliable packed
+  sides, a newer periodic snapshot is coalesced while any reliable discovery frame from the prior
+  snapshot is awaiting its hop ACK; retransmit recovery therefore gets bounded link capacity before
+  another topology refresh is admitted.
 - `export_topology()` snapshots the current learned route map and announce cadence, including
   discovered time source IDs, the top-level `routers` graph, and per-side announcer detail.
 - `note_side_link_probe_sample()` seeds adaptive path selection from a transport-measured bring-up

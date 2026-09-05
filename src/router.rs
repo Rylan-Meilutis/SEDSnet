@@ -5274,6 +5274,18 @@ impl Router {
             if st.sides.is_empty() || !has_any {
                 return Ok(false);
             }
+            // Do not enqueue another periodic snapshot while a reliable
+            // discovery frame from the previous snapshot is still awaiting
+            // its hop ACK. On constrained links, repeatedly appending newer
+            // topology/address frames behind one missing sequence can fill
+            // reliable history and starve managed variables and commands.
+            let discovery_in_flight = st.reliable_tx.iter().any(|((_side, ty), tx_state)| {
+                !tx_state.sent.is_empty()
+                    && DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
+            });
+            if discovery_in_flight {
+                return Ok(false);
+            }
             st.discovery_cadence.due(now_ms)
         };
         if !due {

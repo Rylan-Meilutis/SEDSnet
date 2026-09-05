@@ -10,6 +10,9 @@
   capacity, while retaining deterministic eviction and periodic full-frame recovery.
 - Add a mismatched-capacity regression with six interleaved flows and an 8-entry sender connected
   to a 4-entry receiver.
+- Coalesce periodic discovery while a reliable discovery snapshot is still awaiting its hop ACK.
+  This prevents a missing frame on a constrained radio/serial link from filling reliable history
+  with newer topology snapshots and starving network variables or application commands.
 
 ## 4.0.17
 
