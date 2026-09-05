@@ -161,6 +161,22 @@ impl SideTransportState {
         self.rx_templates_by_id.len()
     }
 
+    fn trim_tx_templates_to(&mut self, limit: usize) -> usize {
+        let mut removed = 0usize;
+        while self.tx_template_ids.len() > limit {
+            let Some(old_hash) = self.tx_template_ids.keys().next().copied() else {
+                break;
+            };
+            if let Some(old_id) = self.tx_template_ids.remove(&old_hash) {
+                self.tx_last_timestamps.remove(&old_id);
+                self.tx_compact_uses.remove(&old_id);
+            }
+            self.tx_templates.remove(&old_hash);
+            removed += 1;
+        }
+        removed
+    }
+
     fn insert_tx_template(
         &mut self,
         template: SideHeaderTemplate,
@@ -170,18 +186,8 @@ impl SideTransportState {
         if max_templates == 0 {
             return false;
         }
-        let mut evicted = false;
-        if self.tx_template_ids.len() >= max_templates
-            && !self.tx_template_ids.contains_key(&template.hash)
-            && let Some(old_hash) = self.tx_template_ids.keys().next().copied()
-        {
-            if let Some(old_id) = self.tx_template_ids.remove(&old_hash) {
-                self.tx_last_timestamps.remove(&old_id);
-                self.tx_compact_uses.remove(&old_id);
-            }
-            self.tx_templates.remove(&old_hash);
-            evicted = true;
-        }
+        let evicted = !self.tx_template_ids.contains_key(&template.hash)
+            && self.trim_tx_templates_to(max_templates.saturating_sub(1)) > 0;
         self.tx_template_ids.insert(template.hash, template_id);
         self.tx_templates.insert(template.hash, template);
         self.tx_compact_uses.insert(template_id, 0);
@@ -436,6 +442,7 @@ struct DiscoverySenderState {
     reachable: Vec<DataEndpoint>,
     reachable_network_variables: Vec<DataType>,
     reachable_timesync_sources: Vec<String>,
+    link_capabilities: Option<discovery::LinkCapabilities>,
     topology_boards: Vec<TopologyBoardNode>,
     last_seen_ms: u64,
 }
@@ -5335,6 +5342,10 @@ impl Router {
                 sender_state.reachable_network_variables = ad.reachable_network_variables;
                 changed = true;
             }
+            if sender_state.link_capabilities != Some(ad.link_capabilities) {
+                sender_state.link_capabilities = Some(ad.link_capabilities);
+                changed = true;
+            }
             Self::refresh_sender_topology_state(&mut sender_state);
             sender_state.last_seen_ms = now_ms;
             route.announcers.insert(sender_id.to_string(), sender_state);
@@ -6356,6 +6367,37 @@ impl Router {
                 Self::extract_side_header_template(raw.as_ref())?;
             let (template_id, use_compact, previous_timestamp) = {
                 let mut st = self.state.lock();
+                /* Keep the sender's compact dictionary within the smallest
+                 * capacity advertised by a live peer on this side. Template
+                 * IDs otherwise outlive entries on a smaller receiver and
+                 * later compact values are silently undecodable. */
+                let mut effective_template_limit = opts.max_side_transport_templates;
+                #[cfg(feature = "discovery")]
+                {
+                    effective_template_limit = st
+                        .discovery_routes
+                        .get(&side)
+                        .into_iter()
+                        .flat_map(|route| route.announcers.values())
+                        .filter_map(|sender| sender.link_capabilities)
+                        .filter(|caps| {
+                            caps.flags & discovery::LINK_CAPABILITY_HEADER_TEMPLATES != 0
+                                && caps.max_side_transport_templates > 0
+                        })
+                        .map(|caps| caps.max_side_transport_templates as usize)
+                        .fold(effective_template_limit, core::cmp::min);
+                }
+                let trimmed = st
+                    .side_transport
+                    .get_mut(&side)
+                    .ok_or(TelemetryError::BadArg)?
+                    .trim_tx_templates_to(effective_template_limit);
+                for _ in 0..trimmed {
+                    st.side_runtime_stats
+                        .entry(side)
+                        .or_default()
+                        .note_side_transport_template_eviction();
+                }
                 let side_state = st
                     .side_transport
                     .get_mut(&side)
@@ -6379,7 +6421,7 @@ impl Router {
                     let evicted = side_state.insert_tx_template(
                         template.clone(),
                         next,
-                        opts.max_side_transport_templates,
+                        effective_template_limit,
                     );
                     if evicted {
                         st.side_runtime_stats

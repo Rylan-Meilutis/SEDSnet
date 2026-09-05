@@ -127,7 +127,9 @@ sender hostname, and optional per-side header templates. Hostnames and endpoint 
 and network configuration; the packet header carries only the source address needed for identity/routing. Per-side
 templates can then replace repeated header fields with a compact template ID on small-packet transports, keeping the
 header-to-payload ratio reasonable for small payloads such as three floats or a few `u8` values. On router packed sides,
-template dictionaries use the same deterministic eviction rule at both ends. The router sender emits a full refresh
+template dictionaries use the same deterministic eviction rule at both ends. Discovery also negotiates the active
+dictionary down to the smallest capacity advertised by a live peer on that side, so a constrained receiver is never
+sent a compact reference to a template it has already evicted. The router sender emits a full refresh
 after every eight compact uses, and the router receiver treats a compact frame whose template is unknown as a dropped
 frame rather than a fatal link error, so loss of the initial template frame heals automatically.
 
@@ -460,7 +462,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.10
+    GIT_TAG v4.0.18
 )
 FetchContent_MakeAvailable(sedsnet)
 

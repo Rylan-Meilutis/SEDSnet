@@ -285,7 +285,8 @@ Runtime stats report:
 Side-local template dictionaries are bounded by `max_side_transport_templates`, which defaults to
 64 entries per side. On router packed sides, both sender and receiver evict the entry with the
 lowest template hash when the dictionary is full, keeping independently maintained dictionaries
-synchronized. If a valid router compact frame references a template the receiver does not know
+synchronized. Discovery link capabilities advertise this limit; a router sender uses the smallest
+live peer limit on the side as its effective transmit capacity. If a valid router compact frame references a template the receiver does not know
 (for example, because its full frame was lost), that frame is dropped without returning a transport
 error. Delivery resumes when the router sender's periodic full refresh arrives. Relay packed sides
 support the same profiles and bounds, but do not currently perform this periodic refresh/nonfatal

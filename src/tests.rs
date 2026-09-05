@@ -5061,6 +5061,155 @@ mod dedupe_tests {
     }
 
     #[test]
+    fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+
+        let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        let sender_side = sender.add_side_packed_with_options(
+            "mismatched-link",
+            move |bytes: &[u8]| {
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_packed_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 8,
+                ..RouterSideOptions::default()
+            },
+        );
+        let rx_side = receiver.add_side_packed_with_options(
+            "mismatched-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 4,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        /* Populate the larger sender dictionary before discovery so learning
+         * the constrained peer must actively shrink existing state. */
+        for (index, sender_id) in ["SRC_A", "SRC_B", "SRC_C", "SRC_D", "SRC_E", "SRC_F"]
+            .into_iter()
+            .enumerate()
+        {
+            let payload: Arc<[u8]> = [index as f32, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .into();
+            sender
+                .tx(Packet::new(
+                    DataType::named("GPS_DATA"),
+                    &[DataEndpoint::named("SD_CARD")],
+                    sender_id,
+                    index as u64 + 1,
+                    payload,
+                )
+                .unwrap()
+                .with_nonce(index as u16 + 100))
+                .unwrap();
+        }
+        let before_discovery = sender.export_runtime_stats();
+        let before_side = before_discovery
+            .sides
+            .iter()
+            .find(|side| side.side_name == "mismatched-link")
+            .expect("sender side before discovery");
+        assert_eq!(before_side.side_transport_tx_template_count, 6);
+
+        let peer_advertisement = crate::discovery::AddressAdvertisement {
+            hostname: "RECEIVER".into(),
+            address: 42,
+            requested_address: 0,
+            mode: crate::discovery::ADDRESS_MODE_DYNAMIC,
+            state: crate::discovery::ADDRESS_STATE_APPROVED,
+            birth_ms: 0,
+            owner_hash: 42,
+            reachable_endpoints: vec![DataEndpoint::named("SD_CARD")],
+            reachable_network_variables: Vec::new(),
+            reachable_timesync_sources: Vec::new(),
+            link_capabilities: crate::discovery::LinkCapabilities {
+                version: 1,
+                flags: crate::discovery::LINK_CAPABILITY_HEADER_TEMPLATES,
+                profile: crate::discovery::LINK_PROFILE_TEMPLATE,
+                max_frame_bytes: 0,
+                compact_header_target_bytes: 0,
+                max_side_transport_templates: 4,
+            },
+        };
+        let discovery =
+            crate::discovery::build_discovery_address("RECEIVER", 0, &peer_advertisement).unwrap();
+        sender.rx_from_side(&discovery, sender_side).unwrap();
+        sender.process_all_queues().unwrap();
+
+        let sources = [
+            "SRC_A", "SRC_B", "SRC_C", "SRC_D", "SRC_E", "SRC_F", "SRC_A", "SRC_B", "SRC_C",
+            "SRC_D", "SRC_E", "SRC_F",
+        ];
+        for (index, sender_id) in sources.into_iter().enumerate() {
+            let payload: Arc<[u8]> = [index as f32, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .into();
+            sender
+                .tx(Packet::new(
+                    DataType::named("GPS_DATA"),
+                    &[DataEndpoint::named("SD_CARD")],
+                    sender_id,
+                    index as u64 + 1,
+                    payload,
+                )
+                .unwrap()
+                .with_nonce(index as u16 + 1))
+                .unwrap();
+            sender.process_all_queues().unwrap();
+            receiver.process_all_queues().unwrap();
+        }
+
+        let receiver_stats = receiver.export_runtime_stats();
+        let receiver_side = receiver_stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "mismatched-link")
+            .expect("mismatched receiver side stats");
+        let received_values = receiver_side
+            .data_types
+            .iter()
+            .find(|item| item.data_type == DataType::named("GPS_DATA"))
+            .expect("received GPS data stats");
+        assert_eq!(received_values.rx_packets, sources.len() as u64 + 6);
+        assert_eq!(receiver_side.side_transport_rx_template_count, 4);
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "mismatched-link")
+            .expect("mismatched sender side stats");
+        assert_eq!(side.side_transport_tx_template_count, 4);
+    }
+
+    #[test]
     fn compact_side_recovers_when_initial_full_template_is_lost() {
         crate::tests::ensure_common_test_schema();
         let delivered = Arc::new(AtomicUsize::new(0));

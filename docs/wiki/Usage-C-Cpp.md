@@ -70,7 +70,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.10
+    GIT_TAG v4.0.18
 )
 FetchContent_MakeAvailable(sedsnet)
 
@@ -718,7 +718,9 @@ For constrained packed links, `seds_router_add_side_packed_profile(...)` and
 side-transport profiles declared by `SedsSideTransportProfile`. On router packed sides, template
 state recovers without recreating the side: unknown compact frames are dropped nonfatally, bounded
 TX/RX dictionaries use the same lowest-hash eviction rule, and the sender emits a full refresh after
-every eight compact uses of an active template. Relay packed sides support the profiles but do not
+every eight compact uses of an active template. Discovery automatically limits the sender to the
+smallest template capacity advertised by a live peer on that side, so C firmware does not need a
+matching hard-coded sender limit. Relay packed sides support the profiles but do not
 currently perform this automatic recovery.
 
 With `timesync` enabled, the router owns an internal network clock and handles `SEDSNET_TIME_SYNC`

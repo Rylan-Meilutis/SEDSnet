@@ -83,7 +83,9 @@ refreshes each active template with a full frame after eight compact uses, so de
 without recreating the router or side. Relay packed sides do not currently have this automatic
 refresh behavior. If router delivery does not recover:
 
-- Verify both peers use compatible side-transport profiles and template limits.
+- Verify both peers use compatible side-transport profiles. Router discovery negotiates the
+  effective sender dictionary down to the smallest advertised peer limit; if the peer has not been
+  discovered yet, initial frames remain full and do not depend on a compact template.
 - Check that full `SDT` frames are allowed by the underlying transport and frame-size configuration.
 - Inspect per-side runtime stats for full/compact counts, active TX/RX templates, and evictions.
 - Use the `canonical` profile while diagnosing a link that persistently drops template refreshes.

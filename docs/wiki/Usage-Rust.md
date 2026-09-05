@@ -499,7 +499,9 @@ Router template transport recovers automatically when a full template frame is l
 compact frames are dropped nonfatally, and the router sender sends a full refresh after every eight
 compact uses of an active template. Router bounded template dictionaries also use identical
 lowest-hash eviction on transmit and receive. Applications do not need to reset or recreate a
-router side to trigger recovery. Relay packed sides support template profiles but do not currently
+router side to trigger recovery. Discovery automatically limits the sender dictionary to the
+smallest capacity advertised by a live peer on that side, which keeps mixed-memory devices
+synchronized without manually duplicating the limit. Relay packed sides support template profiles but do not currently
 perform this automatic refresh/nonfatal unknown-template recovery.
 
 For mixed links, keep absolute/delta timestamps for most traffic and omit unchanged timestamps only

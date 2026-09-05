@@ -294,7 +294,9 @@ On `Router`, compact template state is self-healing on lossy links. An unknown c
 dropped without raising a transport error, and the sender refreshes an active template in full
 after every eight compact uses. Router transmit and receive also share the same deterministic
 eviction rule when `max_side_transport_templates` is reached. `Relay` exposes the same profile
-configuration but does not currently perform this automatic recovery.
+configuration but does not currently perform this automatic recovery. Discovery automatically
+limits a router sender to the smallest template capacity advertised by a live peer on the side, so
+Python hosts interoperate with smaller embedded dictionaries without a duplicate hard-coded limit.
 
 ## P2P Service Ports
 

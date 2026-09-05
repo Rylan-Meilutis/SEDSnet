@@ -1,5 +1,29 @@
 # Changelog
 
+## 4.0.18
+
+- Negotiate compact side-template dictionary capacity from discovery link capabilities. A sender
+  now limits its active templates to the smallest live peer dictionary on that side, preventing
+  compact network-variable and command frames from referencing entries a constrained receiver has
+  already evicted.
+- Shrink an existing transmit dictionary fully when a newly discovered peer advertises a smaller
+  capacity, while retaining deterministic eviction and periodic full-frame recovery.
+- Add a mismatched-capacity regression with six interleaved flows and an 8-entry sender connected
+  to a 4-entry receiver.
+
+## 4.0.17
+
+- Order network-variable timestamps only within one authoritative sender and accept equal-time
+  updates in arrival order, so rapid toggles and restored local seeds converge correctly.
+
+## 4.0.16
+
+- Prevent an older same-writer network-variable update from replacing a newer cached value.
+
+## 4.0.15
+
+- Preserve SEDSNet logical priority through packed-side callbacks used by asynchronous transports.
+
 ## 4.0.14
 
 - Add a priority-aware packed-side callback for asynchronous host transports. Compact and chunked

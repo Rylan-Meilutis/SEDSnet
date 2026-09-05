@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 4.0.18 highlights
+
+- Discovery link capabilities now negotiate compact-template capacity per side.
+- A sender with a larger configured dictionary limits itself to the smallest live peer capacity,
+  preventing later compact network variables or commands from referencing evicted receiver state.
+- Regression coverage exercises six interleaved flows across an 8-entry sender and 4-entry receiver.
+
 ## Version 4.0.17 highlights
 
 - Managed-variable ordering now compares timestamps only for updates from the same sender.
