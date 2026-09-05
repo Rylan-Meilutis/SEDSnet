@@ -1,3 +1,9 @@
+[env]
+# Runtime-schema tests intentionally share one process-global registry. Keep
+# the harness serial; concurrency behavior is exercised explicitly inside the
+# dedicated multithreaded tests.
+RUST_TEST_THREADS = "1"
+
 [target.thumbv7em-none-eabihf]
 linker = "rust-lld"
 rustflags = [

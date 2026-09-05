@@ -739,6 +739,7 @@ type PacketHandlerFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 's
 
 /// Packed Handler function type
 type PackedHandlerFn = dyn Fn(&[u8]) -> TelemetryResult<()> + Send + Sync + 'static;
+type PrioritizedPackedHandlerFn = dyn Fn(&[u8], u8) -> TelemetryResult<()> + Send + Sync + 'static;
 
 // Make handlers usable across tasks
 /// Endpoint handler function enum.
@@ -772,6 +773,7 @@ impl Debug for EndpointHandlerFn {
 #[derive(Clone)]
 pub enum RouterTxHandlerFn {
     Packed(Arc<PackedHandlerFn>),
+    PackedWithPriority(Arc<PrioritizedPackedHandlerFn>),
     Packet(Arc<PacketHandlerFn>),
 }
 
@@ -779,6 +781,10 @@ impl Debug for RouterTxHandlerFn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             RouterTxHandlerFn::Packed(_) => f.debug_tuple("Packed").field(&"<handler>").finish(),
+            RouterTxHandlerFn::PackedWithPriority(_) => f
+                .debug_tuple("PackedWithPriority")
+                .field(&"<handler>")
+                .finish(),
             RouterTxHandlerFn::Packet(_) => f.debug_tuple("Packet").field(&"<handler>").finish(),
         }
     }
@@ -3894,7 +3900,7 @@ impl Router {
                 .get(side)
                 .and_then(Option::as_ref)
                 .map(|side| &side.tx_handler),
-            Some(RouterTxHandlerFn::Packed(_))
+            Some(RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_))
         )
     }
 
@@ -5770,15 +5776,16 @@ impl Router {
         let ty = wire_format::peek_envelope(bytes.as_ref())
             .map(|env| env.ty)
             .unwrap_or(DataType::ReliableAck);
+        let priority = self.effective_transport_priority(ty);
         let result = match handler {
-            RouterTxHandlerFn::Packed(f) => {
+            packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
-                    match self
-                        .retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref()))
-                    {
+                    match self.retry_with_attempts(runtime_max_handler_retries(), || {
+                        Self::packed_handler_call(&packed, frame.as_ref(), priority)
+                    }) {
                         Ok((_, attempts)) => {
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -5831,9 +5838,12 @@ impl Router {
             (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
         };
 
-        let RouterTxHandlerFn::Packed(f) = &handler else {
+        if !matches!(
+            &handler,
+            RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)
+        ) {
             return self.call_side_tx_handler(side, &handler, &data, relayed);
-        };
+        }
 
         if !hop_reliable_enabled {
             let mut adjusted_opts = opts;
@@ -5851,6 +5861,7 @@ impl Router {
             RouterItem::Packet(pkt) => pkt.data_type(),
             RouterItem::Packed(bytes) => wire_format::peek_frame_info(bytes.as_ref())?.envelope.ty,
         };
+        let priority = self.effective_transport_priority(ty);
 
         if !is_reliable_type(ty) {
             if let Some(adjusted) = self.adjust_reliable_for_side(opts, data, true)? {
@@ -5903,7 +5914,7 @@ impl Router {
                         let mut sent_bytes = 0usize;
                         for frame in frames {
                             match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                                f(frame.as_ref())
+                                Self::packed_handler_call(&handler, frame.as_ref(), priority)
                             }) {
                                 Ok((_, attempts)) => {
                                     attempts_total = attempts_total.saturating_add(attempts);
@@ -5945,7 +5956,7 @@ impl Router {
                         let mut sent_bytes = 0usize;
                         for frame in frames {
                             match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                                f(frame.as_ref())
+                                Self::packed_handler_call(&handler, frame.as_ref(), priority)
                             }) {
                                 Ok((_, attempts)) => {
                                     attempts_total = attempts_total.saturating_add(attempts);
@@ -5983,7 +5994,9 @@ impl Router {
         let mut attempts_total = 0usize;
         let mut sent_bytes = 0usize;
         for frame in frames {
-            match self.retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref())) {
+            match self.retry_with_attempts(runtime_max_handler_retries(), || {
+                Self::packed_handler_call(&handler, frame.as_ref(), priority)
+            }) {
                 Ok((_, attempts)) => {
                     attempts_total = attempts_total.saturating_add(attempts);
                     sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -6604,6 +6617,26 @@ impl Router {
         }
     }
 
+    fn packed_handler_call(
+        handler: &RouterTxHandlerFn,
+        bytes: &[u8],
+        priority: u8,
+    ) -> TelemetryResult<()> {
+        match handler {
+            RouterTxHandlerFn::Packed(handler) => handler(bytes),
+            RouterTxHandlerFn::PackedWithPriority(handler) => handler(bytes, priority),
+            RouterTxHandlerFn::Packet(_) => Err(TelemetryError::BadArg),
+        }
+    }
+
+    fn effective_transport_priority(&self, ty: DataType) -> u8 {
+        if self.is_managed_variable_type(ty) {
+            crate::transport_priority(DataType::ManagedVariableValue)
+        } else {
+            crate::transport_priority(ty)
+        }
+    }
+
     fn call_side_tx_handler(
         &self,
         side: RouterSideId,
@@ -6623,8 +6656,12 @@ impl Router {
             RouterItem::Packet(pkt) => pkt.data_type(),
             RouterItem::Packed(bytes) => wire_format::peek_envelope(bytes.as_ref())?.ty,
         };
+        let priority = self.effective_transport_priority(ty);
         let result = match (handler, data) {
-            (RouterTxHandlerFn::Packed(f), RouterItem::Packed(bytes)) => {
+            (
+                packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)),
+                RouterItem::Packed(bytes),
+            ) => {
                 #[cfg(feature = "cryptography")]
                 let send_bytes = self.prepare_packed_for_remote(bytes.clone(), None)?;
                 #[cfg(not(feature = "cryptography"))]
@@ -6633,9 +6670,9 @@ impl Router {
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
-                    match self
-                        .retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref()))
-                    {
+                    match self.retry_with_attempts(runtime_max_handler_retries(), || {
+                        Self::packed_handler_call(packed, frame.as_ref(), priority)
+                    }) {
                         Ok((_, attempts)) => {
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -6657,15 +6694,18 @@ impl Router {
             (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => {
                 self.retry_with_attempts(runtime_max_handler_retries(), || f(pkt))
             }
-            (RouterTxHandlerFn::Packed(f), RouterItem::Packet(pkt)) => {
+            (
+                packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)),
+                RouterItem::Packet(pkt),
+            ) => {
                 let owned = self.pack_packet_for_router(pkt, None)?;
                 let frames = self.encode_side_transport_frames(side, opts, owned)?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
-                    match self
-                        .retry_with_attempts(runtime_max_handler_retries(), || f(frame.as_ref()))
-                    {
+                    match self.retry_with_attempts(runtime_max_handler_retries(), || {
+                        Self::packed_handler_call(packed, frame.as_ref(), priority)
+                    }) {
                         Ok((_, attempts)) => {
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
@@ -7949,6 +7989,46 @@ impl Router {
         let side = Some(RouterSide {
             name: Arc::from(name.as_ref()),
             tx_handler: RouterTxHandlerFn::Packed(Arc::new(tx)),
+            opts,
+        });
+        let id = if let Some(id) = st.sides.iter().position(Option::is_none) {
+            st.sides[id] = side;
+            id
+        } else {
+            let id = st.sides.len();
+            st.sides.push(side);
+            id
+        };
+        st.side_runtime_stats
+            .insert(id, SideRuntimeStatsInner::default());
+        st.side_transport.insert(id, SideTransportState::default());
+        #[cfg(feature = "discovery")]
+        Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        id
+    }
+
+    /// Register a packed-output side whose callback also receives SEDSNet's
+    /// logical scheduler priority for the frame.
+    ///
+    /// This is intended for asynchronous host transports that must queue the
+    /// emitted bytes after this callback returns. Every compact/chunked frame
+    /// belonging to a logical packet receives the same priority, so transport
+    /// backpressure cannot erase discovery, shared-state, time-sync, or schema
+    /// ordering.
+    pub fn add_side_packed_with_priority_and_options<N, F>(
+        &self,
+        name: N,
+        tx: F,
+        opts: RouterSideOptions,
+    ) -> RouterSideId
+    where
+        N: AsRef<str>,
+        F: Fn(&[u8], u8) -> TelemetryResult<()> + Send + Sync + 'static,
+    {
+        let mut st = self.state.lock();
+        let side = Some(RouterSide {
+            name: Arc::from(name.as_ref()),
+            tx_handler: RouterTxHandlerFn::PackedWithPriority(Arc::new(tx)),
             opts,
         });
         let id = if let Some(id) = st.sides.iter().position(Option::is_none) {
@@ -9821,7 +9901,10 @@ impl Router {
                 let opts = side_ref.opts;
                 (
                     opts,
-                    matches!(side_ref.tx_handler, RouterTxHandlerFn::Packed(_)),
+                    matches!(
+                        side_ref.tx_handler,
+                        RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)
+                    ),
                     opts.reliable_enabled
                         && self.cfg.reliable_enabled()
                         && !self.side_has_multiple_announcers_locked(&st, src, self.clock.now_ms()),

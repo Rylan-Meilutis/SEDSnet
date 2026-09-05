@@ -1,5 +1,10 @@
 # Changelogs
 
+## Version 4.0.14 highlights
+
+- Priority-aware packed-side callbacks carry the logical packet priority with every compact or
+  chunked transport frame, allowing queued serial transports to retain SEDSNet scheduling order.
+
 ## Version 4.0.13 highlights
 
 - Isolated CAN nodes no longer recursively report a failed transport through that same failed

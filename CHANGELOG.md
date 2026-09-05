@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.0.14
+
+- Add a priority-aware packed-side callback for asynchronous host transports. Compact and chunked
+  frames retain the logical packet priority, so serial backpressure cannot reorder discovery,
+  network variables, time sync, or application traffic.
+
 ## 4.0.13
 
 - Prevent recursive transport-error reporting when an isolated or unacknowledged CAN side rejects

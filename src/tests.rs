@@ -12163,6 +12163,40 @@ mod router_tests {
         }
 
         #[test]
+        fn compact_transport_callback_preserves_network_variable_priority() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+            let priorities = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let priorities_c = priorities.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_sender("NV_WIRE_PRIORITY"),
+                zero_clock(),
+            );
+            router.add_side_packed_with_priority_and_options(
+                "wire",
+                move |_frame, priority| {
+                    priorities_c.lock().unwrap().push(priority);
+                    Ok(())
+                },
+                RouterSideOptions::default().with_small_packet_transport(24),
+            );
+
+            router
+                .set_network_variable(
+                    Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[ep], 1).unwrap(),
+                )
+                .unwrap();
+
+            let priorities = priorities.lock().unwrap();
+            assert!(
+                priorities.len() > 1,
+                "test packet should use transport chunks"
+            );
+            assert!(priorities.iter().all(|priority| *priority == 254));
+        }
+
+        #[test]
         fn router_and_relay_memory_layout_exports_queue_breakdown() {
             crate::tests::ensure_common_test_schema();
             let ep = DataEndpoint::named("RADIO");
