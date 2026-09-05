@@ -12069,6 +12069,46 @@ mod router_tests {
         }
 
         #[test]
+        fn network_variable_rejects_an_out_of_order_older_update() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side = router.add_side_packet("wire", |_pkt| Ok(()));
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+            let observed = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+            let observed_c = observed.clone();
+            router
+                .on_network_variable_update(ty, move |pkt| {
+                    observed_c.lock().unwrap().push(pkt.data_as_f32()?);
+                    Ok(())
+                })
+                .unwrap();
+
+            let newest = Packet::from_f32_slice(ty, &[1.0, 1.0, 1.0], &[ep], 200)
+                .unwrap()
+                .with_nonce(3);
+            let older = Packet::from_f32_slice(ty, &[0.0, 0.0, 0.0], &[ep], 100)
+                .unwrap()
+                .with_nonce(2);
+            router.rx_from_side(&newest, side).unwrap();
+            router.rx_from_side(&older, side).unwrap();
+
+            assert_eq!(
+                router
+                    .get_cached_network_variable(ty)
+                    .unwrap()
+                    .unwrap()
+                    .data_as_f32()
+                    .unwrap(),
+                vec![1.0, 1.0, 1.0]
+            );
+            assert_eq!(*observed.lock().unwrap(), vec![vec![1.0, 1.0, 1.0]]);
+        }
+
+        #[test]
         fn network_variable_setter_caches_and_respects_permissions() {
             crate::tests::ensure_common_test_schema();
             let ty = DataType::named("GPS_DATA");

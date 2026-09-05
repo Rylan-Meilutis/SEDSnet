@@ -2399,10 +2399,21 @@ impl Router {
             {
                 return Ok(());
             }
-            let changed = st
-                .managed_variable_latest
-                .get(&pkt.data_type().as_u32())
-                .is_none_or(|entry| entry.packet != *pkt);
+            let existing = st.managed_variable_latest.get(&pkt.data_type().as_u32());
+            // A managed variable is a last-writer-wins register. Transport
+            // queues and multi-hop routes may deliver successive writes out
+            // of order, so never let an older packet roll the cache and the
+            // physical output back. The nonce orders same-millisecond writes;
+            // packet_id provides a deterministic final tie-break across
+            // redundant paths.
+            let incoming_version = (pkt.timestamp(), pkt.nonce(), pkt.packet_id());
+            if existing.is_some_and(|entry| {
+                let current = &entry.packet;
+                incoming_version < (current.timestamp(), current.nonce(), current.packet_id())
+            }) {
+                return Ok(());
+            }
+            let changed = existing.is_none_or(|entry| entry.packet != *pkt);
             st.managed_variable_latest.insert(
                 pkt.data_type().as_u32(),
                 ManagedVariableCacheEntry {
