@@ -9055,8 +9055,16 @@ impl Router {
             recipients.retain(|&ep| ep != failed_local);
         }
 
-        // If no local recipient exists, fall back to original packet endpoints
-        // so error telemetry can still egress to remote links.
+        // A side TX failure cannot be reported through the same failed
+        // transport. Doing so recursively creates TelemetryError packets until
+        // an embedded caller exhausts its stack.
+        if recipients.is_empty() && dest.is_none() {
+            fallback_stdout(&error_msg);
+            return Ok(());
+        }
+
+        // Local endpoint failures may still be reported to the packet's other
+        // endpoints when no local error recipient exists.
         if recipients.is_empty() {
             recipients = pkt.endpoints().to_vec();
             recipients.sort_unstable();
@@ -9634,6 +9642,17 @@ impl Router {
             recipients.retain(|&ep| ep != failed);
         }
 
+        let device = self.sender_arc();
+        let error_msg = format!(
+            "Handler for endpoint {:?} failed on device {:?}: {:?}",
+            dest, device, e
+        );
+
+        if recipients.is_empty() && dest.is_none() {
+            fallback_stdout(&error_msg);
+            return Ok(());
+        }
+
         if recipients.is_empty() {
             recipients = env.endpoints.to_vec();
             recipients.sort_unstable();
@@ -9643,11 +9662,6 @@ impl Router {
             }
         }
 
-        let device = self.sender_arc();
-        let error_msg = format!(
-            "Handler for endpoint {:?} failed on device {:?}: {:?}",
-            dest, device, e
-        );
         if recipients.is_empty() {
             fallback_stdout(&error_msg);
             return Ok(());

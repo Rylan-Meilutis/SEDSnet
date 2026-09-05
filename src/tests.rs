@@ -1513,6 +1513,34 @@ mod handler_failure_tests {
         let got = last_payload.lock().unwrap().clone();
         assert_eq!(got, expected, "mismatch in TelemetryError payload text");
     }
+
+    #[test]
+    fn remote_only_tx_failure_is_bounded_and_not_reported_over_failed_side() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_c = attempts.clone();
+        let router = Router::new_with_clock(RouterConfig::default(), StepClock::new_default_box());
+        router.add_side_packed("failed", move |_bytes: &[u8]| {
+            attempts_c.fetch_add(1, Ordering::SeqCst);
+            Err(TelemetryError::Io("transport unavailable"))
+        });
+
+        let ty = pick_any_type();
+        let packet = Packet::new(
+            ty,
+            &[DataEndpoint::named("RADIO")],
+            "isolated_board",
+            0,
+            Arc::<[u8]>::from(payload_for(ty)),
+        )
+        .unwrap();
+
+        assert!(router.tx(packet).is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            crate::config::MAX_HANDLER_RETRIES,
+            "a failed transport must not recursively transmit its own error report"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
