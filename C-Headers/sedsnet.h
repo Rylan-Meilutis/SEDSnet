@@ -305,6 +305,12 @@ typedef enum SedsRouteSelectionMode
 
 typedef SedsResult (* SedsTransmitFn)(const uint8_t * bytes, size_t len, void * user);
 
+/** Packed transmit callback with SEDSNet's logical transport priority. */
+typedef SedsResult (* SedsTransmitPriorityFn)(const uint8_t * bytes,
+                                              size_t len,
+                                              uint8_t priority,
+                                              void * user);
+
 typedef SedsResult (* SedsEndpointHandlerFn)(const SedsPacketView * pkt, void * user);
 
 typedef SedsResult (* SedsPackedHandlerFn)(const uint8_t * bytes, size_t len, void * user);
@@ -919,6 +925,25 @@ int32_t seds_router_add_side_packed_profile(
     const char * name,
     size_t name_len,
     SedsTransmitFn tx,
+    void * tx_user,
+    bool reliable_enabled,
+    SedsSideTransportProfile profile,
+    size_t max_frame_bytes,
+    size_t compact_header_target_bytes,
+    size_t max_side_transport_templates
+);
+
+/**
+ * @brief Add a profiled packed side and pass the logical packet priority to TX.
+ *
+ * Compact and chunk frames inherit their logical packet's priority. Transport
+ * drivers should use this value directly instead of parsing framed bytes.
+ */
+int32_t seds_router_add_side_packed_profile_with_priority(
+    SedsRouter * r,
+    const char * name,
+    size_t name_len,
+    SedsTransmitPriorityFn tx,
     void * tx_user,
     bool reliable_enabled,
     SedsSideTransportProfile profile,

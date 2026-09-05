@@ -476,6 +476,10 @@ pub struct SedsManagedCredentialInfo {
 /// Transmit callback signature used from C (legacy).
 type CTransmit = Option<extern "C" fn(bytes: *const u8, len: usize, user: *mut c_void) -> i32>;
 
+/// Transmit callback that receives the router's authoritative logical priority.
+type CPrioritizedTransmit =
+    Option<extern "C" fn(bytes: *const u8, len: usize, priority: u8, user: *mut c_void) -> i32>;
+
 /// Endpoint handler callback (packet view) (legacy).
 type CEndpointHandler = Option<extern "C" fn(pkt: *const SedsPacketView, user: *mut c_void) -> i32>;
 
@@ -2574,6 +2578,64 @@ pub extern "C" fn seds_router_add_side_packed_profile(
             max_side_transport_templates,
         },
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_add_side_packed_profile_with_priority(
+    r: *mut SedsRouter,
+    name: *const c_char,
+    name_len: usize,
+    tx: CPrioritizedTransmit,
+    tx_user: *mut c_void,
+    reliable_enabled: bool,
+    profile: u32,
+    max_frame_bytes: usize,
+    compact_header_target_bytes: usize,
+    max_side_transport_templates: usize,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let profile = match side_transport_profile_from_code(profile) {
+        Ok(profile) => profile,
+        Err(err) => return status_from_err(err),
+    };
+    let side_name = if name.is_null() || name_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
+        match from_utf8(bytes) {
+            Ok(s) => String::from(s),
+            Err(_) => String::new(),
+        }
+    };
+    let Some(callback) = tx else {
+        return status_from_err(TelemetryError::BadArg);
+    };
+    let user_addr = tx_user as usize;
+    let tx_fn = move |bytes: &[u8], priority: u8| -> TelemetryResult<()> {
+        let code = callback(
+            bytes.as_ptr(),
+            bytes.len(),
+            priority,
+            user_addr as *mut c_void,
+        );
+        if code == status_from_result_code(SedsResult::SedsOk) {
+            Ok(())
+        } else {
+            Err(TelemetryError::Io("router side tx error"))
+        }
+    };
+    let mut opts = router_side_options_for_profile(
+        reliable_enabled,
+        profile,
+        max_frame_bytes,
+        compact_header_target_bytes,
+        max_side_transport_templates,
+    );
+    opts.link_local_enabled = false;
+    let router = unsafe { &(*r).inner };
+    router.add_side_packed_with_priority_and_options(side_name, tx_fn, opts) as i32
 }
 
 fn seds_router_add_side_packed_impl(
@@ -5863,6 +5925,20 @@ mod tests {
         status_from_result_code(SedsResult::SedsOk)
     }
 
+    extern "C" fn packed_priority_cb(
+        bytes: *const u8,
+        _len: usize,
+        priority: u8,
+        user: *mut c_void,
+    ) -> i32 {
+        if bytes.is_null() || user.is_null() {
+            return status_from_result_code(SedsResult::SedsErr);
+        }
+        let priorities = unsafe { &*(user as *const Mutex<Vec<u8>>) };
+        priorities.lock().unwrap().push(priority);
+        status_from_result_code(SedsResult::SedsOk)
+    }
+
     fn export_router_json(
         router: *mut SedsRouter,
         len_fn: extern "C" fn(*mut SedsRouter) -> i32,
@@ -6977,6 +7053,34 @@ mod tests {
             Some(true)
         );
 
+        seds_router_free(router);
+    }
+
+    #[test]
+    fn router_c_abi_profile_callback_preserves_priority_through_chunks() {
+        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        assert!(!router.is_null());
+        let priorities = Mutex::new(Vec::<u8>::new());
+        let side_name = b"PRIORITY_UPLINK";
+        let side_id = seds_router_add_side_packed_profile_with_priority(
+            router,
+            side_name.as_ptr().cast(),
+            side_name.len(),
+            Some(packed_priority_cb),
+            (&priorities as *const Mutex<Vec<u8>>).cast_mut().cast(),
+            false,
+            SEDS_SIDE_TRANSPORT_PROFILE_IPV6_LIKE,
+            24,
+            0,
+            8,
+        );
+        assert!(side_id >= 0);
+        assert_eq!(seds_router_announce_discovery(router), 0);
+        assert_eq!(seds_router_process_tx_queue(router), 0);
+        let priorities = priorities.lock().unwrap();
+        assert!(priorities.len() > 1, "discovery should be chunked");
+        assert!(priorities.iter().all(|priority| *priority == 255));
+        drop(priorities);
         seds_router_free(router);
     }
 
