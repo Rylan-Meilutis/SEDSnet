@@ -12109,6 +12109,37 @@ mod router_tests {
         }
 
         #[test]
+        fn network_variable_accepts_rapid_same_timestamp_updates() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side = router.add_side_packet("wire", |_pkt| Ok(()));
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+
+            let first = Packet::from_f32_slice(ty, &[1.0, 1.0, 1.0], &[ep], 0)
+                .unwrap()
+                .with_nonce(u16::MAX);
+            let second = Packet::from_f32_slice(ty, &[0.0, 0.0, 0.0], &[ep], 0)
+                .unwrap()
+                .with_nonce(1);
+            router.rx_from_side(&first, side).unwrap();
+            router.rx_from_side(&second, side).unwrap();
+
+            assert_eq!(
+                router
+                    .get_cached_network_variable(ty)
+                    .unwrap()
+                    .unwrap()
+                    .data_as_f32()
+                    .unwrap(),
+                vec![0.0, 0.0, 0.0]
+            );
+        }
+
+        #[test]
         fn network_variable_setter_caches_and_respects_permissions() {
             crate::tests::ensure_common_test_schema();
             let ty = DataType::named("GPS_DATA");

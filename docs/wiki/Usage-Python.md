@@ -122,8 +122,9 @@ the getter returns the cached value and internally requests a refresh when the v
 seen or is stale. No separate endpoint registration is needed for the network-variable machinery.
 Routers with write permission are authoritative and can answer refresh requests. Read-only replicas
 forward requests toward a writer instead of replying with possibly stale persisted state. Updates
-use timestamp, nonce, and packet ID as a deterministic last-writer-wins version, so delayed delivery
-cannot roll a cache back after a newer value has arrived.
+from one writer use its sender-local timestamp to reject older delivery. Equal-timestamp updates
+retain arrival order, and another writer can replace a local restored seed; nonce and packet ID are
+deduplication identities rather than revisions.
 
 ```python
 import sedsnet as seds

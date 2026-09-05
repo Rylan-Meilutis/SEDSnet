@@ -176,8 +176,9 @@ getter rather than registering a special endpoint: the setter commits the value 
 permissions allow, and the getter returns the cached value while internally requesting a refresh if
 the value has never been seen or is stale. A router with write permission is an authoritative cache
 and can answer refreshes; read-only replicas forward requests toward a writer instead of replying
-with possibly stale persisted state. Values use timestamp, nonce, and packet ID as a deterministic
-last-writer-wins version, so reordered delivery cannot roll the cache back.
+with possibly stale persisted state. Values from one writer use its sender-local timestamp to reject
+older delivery. Equal-timestamp updates retain arrival order, and another writer can replace a local
+restored seed; nonce and packet ID remain deduplication identities rather than revisions.
 
 Data types can also advertise an E2E cryptography preference:
 

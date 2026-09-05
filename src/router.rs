@@ -2400,16 +2400,15 @@ impl Router {
                 return Ok(());
             }
             let existing = st.managed_variable_latest.get(&pkt.data_type().as_u32());
-            // A managed variable is a last-writer-wins register. Transport
-            // queues and multi-hop routes may deliver successive writes out
-            // of order, so never let an older packet roll the cache and the
-            // physical output back. The nonce orders same-millisecond writes;
-            // packet_id provides a deterministic final tie-break across
-            // redundant paths.
-            let incoming_version = (pkt.timestamp(), pkt.nonce(), pkt.packet_id());
+            // Sender-local timestamps can order updates from one authoritative
+            // writer even before network time is available. They cannot order
+            // a restored local seed against a remote writer, and packet nonces
+            // are deliberately pseudo-random deduplication keys rather than
+            // revisions. Accept equal-timestamp updates in arrival order so
+            // rapid toggles made during one clock tick are not discarded.
             if existing.is_some_and(|entry| {
                 let current = &entry.packet;
-                incoming_version < (current.timestamp(), current.nonce(), current.packet_id())
+                pkt.sender() == current.sender() && pkt.timestamp() < current.timestamp()
             }) {
                 return Ok(());
             }

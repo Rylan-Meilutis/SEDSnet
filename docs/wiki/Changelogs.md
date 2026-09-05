@@ -1,5 +1,15 @@
 # Changelogs
 
+## Version 4.0.17 highlights
+
+- Managed-variable ordering now compares timestamps only for updates from the same sender.
+- Equal-timestamp rapid toggles remain in arrival order instead of being misordered by pseudo-random
+  packet nonces.
+- An authoritative remote value can replace a locally restored seed even when the devices' uptime
+  clocks are not synchronized yet.
+- Regression coverage exercises both delayed older packets and same-tick toggles whose nonce values
+  run in the opposite numerical order.
+
 ## Version 4.0.16 highlights
 
 - Managed network variables now reject updates older than the value already cached.
