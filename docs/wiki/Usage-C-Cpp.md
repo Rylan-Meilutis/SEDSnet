@@ -424,9 +424,11 @@ control over every router and relay call.
 Routers can cache the latest packet for selected user data types and expose it through a setter and
 getter. The setter commits the value to the network when permissions allow. The getter reads the
 cached value and internally requests a refresh when the value has never been seen or is stale; user
-code does not register a separate endpoint for network variables. Caches are tiered: any router that
-has enabled or seen the variable can answer the refresh from its local cache, so reconnecting boards
-can resync from a nearby node instead of always reaching the original producer/master.
+code does not register a separate endpoint for network variables. Routers with write permission are
+authoritative and answer refresh requests from their cache. Read-only replicas forward requests
+toward a writer, so a stale value restored from board flash cannot replace the current network state.
+Received updates are last-writer-wins ordered by timestamp, nonce, and a deterministic packet-ID
+tie-break; delayed or reordered packets cannot roll a physical output back to an older value.
 
 ```C
 SedsTypeRef flight_state_ty;

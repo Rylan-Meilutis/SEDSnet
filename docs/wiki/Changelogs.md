@@ -1,5 +1,22 @@
 # Changelogs
 
+## Version 4.0.16 highlights
+
+- Managed network variables now reject updates older than the value already cached.
+- Timestamp and nonce preserve write order across queued and multi-hop transports, with packet ID as
+  a deterministic final tie-break for redundant paths.
+- Read-only persisted replicas continue to relay refresh requests to an authoritative writer, so a
+  restarting board cannot publish stale local state as the network value.
+- Regression coverage delivers a newer value followed by an older value and verifies that both the
+  cache and application callback remain on the newer state.
+
+## Version 4.0.15 highlights
+
+- The C ABI exposes priority-aware packed-side callbacks, including every compact and chunked frame,
+  so firmware UART/radio transports can preserve SEDSNet's scheduler ordering on the wire.
+- Discovery remains the highest-priority traffic class; network variables and time sync share the
+  next band before application-configured priorities.
+
 ## Version 4.0.14 highlights
 
 - Priority-aware packed-side callbacks carry the logical packet priority with every compact or

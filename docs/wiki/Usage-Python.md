@@ -120,9 +120,10 @@ should be looked up by string name after registration or JSON seeding.
 Network variables cache the latest value packet for a data type. User code uses a setter and getter;
 the getter returns the cached value and internally requests a refresh when the value has never been
 seen or is stale. No separate endpoint registration is needed for the network-variable machinery.
-Caches are tiered: any router that has enabled or seen the variable can answer the refresh from its
-local cache, so reconnecting boards can resync from a nearby node instead of always reaching the
-original producer/master.
+Routers with write permission are authoritative and can answer refresh requests. Read-only replicas
+forward requests toward a writer instead of replying with possibly stale persisted state. Updates
+use timestamp, nonce, and packet ID as a deterministic last-writer-wins version, so delayed delivery
+cannot roll a cache back after a newer value has arrived.
 
 ```python
 import sedsnet as seds

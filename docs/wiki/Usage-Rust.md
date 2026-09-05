@@ -174,9 +174,10 @@ Network variables are latest-value caches for user data types. A router that ena
 variable remembers the newest local or received packet for that type. User code uses a setter and
 getter rather than registering a special endpoint: the setter commits the value to the network when
 permissions allow, and the getter returns the cached value while internally requesting a refresh if
-the value has never been seen or is stale. Caches are tiered: any router that has enabled or seen the
-variable can answer the refresh from its local cache, so reconnecting boards can resync from a nearby
-node instead of always reaching the original producer/master.
+the value has never been seen or is stale. A router with write permission is an authoritative cache
+and can answer refreshes; read-only replicas forward requests toward a writer instead of replying
+with possibly stale persisted state. Values use timestamp, nonce, and packet ID as a deterministic
+last-writer-wins version, so reordered delivery cannot roll the cache back.
 
 Data types can also advertise an E2E cryptography preference:
 

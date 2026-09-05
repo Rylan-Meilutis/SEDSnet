@@ -111,6 +111,9 @@ Routers can also cache selected data types as managed network variables. A board
 cached value and receive it through the normal endpoint handler path instead of waiting for the next publisher update.
 Discovery advertises enabled variable types with split-horizon propagation, allowing multi-link routers to select the
 learned owner path without static fanout or reflecting reachability back toward its source.
+Successive values are ordered by their wire timestamp and nonce. If links deliver updates out of order, an older packet
+cannot roll a cache or physical output back after a newer value has already arrived. Read-only caches relay refresh
+requests toward an authoritative writer instead of answering with potentially stale persisted state.
 For sensitive state or commands, the default `cryptography` feature lets data types prefer or require end-to-end payload
 cryptography while the application supplies a C provider, Rust provider, OS/hardware crypto wrapper, or registered software key.
 
@@ -671,12 +674,13 @@ let cached = router.get_network_variable(flight_state, Some(1_000))?;
 
 The setter commits the value to the network when permissions allow. The getter reads the cached copy
 and internally requests the value if the cache has never seen it or is stale; user code does not
-register a separate endpoint for network variables. Caches are tiered: any router that has enabled
-or seen the variable can answer the refresh from its local cache, so reconnecting boards can resync
-from a nearby node instead of always reaching the original producer/master. If a peer has the value,
-the current packet is replayed through the normal endpoint handler so resync still looks like an
-ordinary update. Register `on_network_variable_update(...)` when code needs a callback whenever an
-inbound network update changes a variable cache.
+register a separate endpoint for network variables. A router with write permission is authoritative
+and can answer refresh requests from its cache. Read-only replicas forward those requests toward a
+writer, preventing a persisted but stale board value from overriding the current network value.
+Replies travel through the normal endpoint handler, so resync still looks like an ordinary update.
+Updates use timestamp, nonce, and a deterministic packet-ID tie-break as a last-writer-wins version;
+late packets cannot roll the cache back. Register `on_network_variable_update(...)` when code needs
+a callback whenever an inbound network update changes a variable cache.
 
 Data types can also choose an E2E payload cryptography policy:
 
