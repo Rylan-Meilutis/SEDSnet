@@ -3981,6 +3981,9 @@ impl Router {
         packet_id: u64,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
+        if !self.cfg.reliable_enabled() {
+            return Ok(());
+        }
         let ack_sender = self.encode_end_to_end_ack_sender();
         let ack = Packet::new(
             DataType::ReliableAck,
@@ -5910,7 +5913,11 @@ impl Router {
         if !hop_reliable_enabled {
             let mut adjusted_opts = opts;
             adjusted_opts.reliable_enabled = false;
-            let preserve_end_to_end_ack = opts.reliable_enabled && self.cfg.reliable_enabled();
+            // End-to-end ACKs are ordinary routed control packets and must cross best-effort
+            // segments. `reliable_enabled` controls only this side's hop sequencing/replay; using
+            // it to discard an ACK prevents a reliable origin from ever confirming destinations
+            // behind Pico-Fi, UDP, radio, or another transport with its own reliability layer.
+            let preserve_end_to_end_ack = true;
             if let Some(adjusted) =
                 self.adjust_reliable_for_side(adjusted_opts, data, preserve_end_to_end_ack)?
             {

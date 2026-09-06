@@ -7413,11 +7413,15 @@ mod router_tests {
                 reliable_enabled: true,
                 ..RouterSideOptions::default()
             };
+            let best_effort = RouterSideOptions {
+                reliable_enabled: false,
+                ..RouterSideOptions::default()
+            };
             let gs_c = gs.clone();
             rf.add_side_packed_with_options(
                 "radio",
                 move |bytes| gs_c.rx_packed_from_side(bytes, 0),
-                reliable,
+                best_effort,
             );
             let power_c = power.clone();
             let flight_c = flight.clone();
@@ -7433,7 +7437,7 @@ mod router_tests {
             let gs_radio = gs.add_side_packed_with_options(
                 "radio",
                 move |bytes| rf_c.rx_packed_from_side(bytes, 0),
-                reliable,
+                best_effort,
             );
             let rf_c = rf.clone();
             power.add_side_packed_with_options(
