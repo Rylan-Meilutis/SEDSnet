@@ -7248,6 +7248,235 @@ mod router_tests {
         }
 
         #[test]
+        fn discovered_endpoint_routes_reliably_back_across_a_two_sided_gateway() {
+            ensure_topology_test_schema();
+            let reliable_ty = ensure_reliable_overlap_test_schema();
+            let gs_endpoint = DataEndpoint::named("GROUND_STATION");
+            let delivered: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let delivered_c = delivered.clone();
+
+            let gs = Arc::new(Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                    gs_endpoint,
+                    move |pkt| {
+                        delivered_c.lock().unwrap().push(pkt.clone());
+                        Ok(())
+                    },
+                )])
+                .with_sender("GS"),
+                zero_clock(),
+            ));
+            let gateway = Arc::new(Router::new_with_clock(
+                RouterConfig::default().with_sender("GW"),
+                zero_clock(),
+            ));
+            let valve = Arc::new(Router::new_with_clock(
+                RouterConfig::default().with_sender("VB"),
+                zero_clock(),
+            ));
+
+            let gs_from_gateway = Arc::new(Mutex::new(None));
+            let gateway_from_gs = Arc::new(Mutex::new(None));
+            let gateway_from_valve = Arc::new(Mutex::new(None));
+            let valve_from_gateway = Arc::new(Mutex::new(None));
+            let opts = RouterSideOptions {
+                reliable_enabled: true,
+                ..RouterSideOptions::default()
+            };
+            let best_effort_opts = RouterSideOptions {
+                reliable_enabled: false,
+                ..RouterSideOptions::default()
+            };
+
+            let gateway_c = gateway.clone();
+            let gateway_from_gs_c = gateway_from_gs.clone();
+            let gs_side = gs.add_side_packed_with_options(
+                "GS_TO_GW",
+                move |bytes| {
+                    if let Some(side) = *gateway_from_gs_c.lock().unwrap() {
+                        gateway_c.rx_packed_from_side(bytes, side)?;
+                    }
+                    Ok(())
+                },
+                opts,
+            );
+            let gs_c = gs.clone();
+            let gs_from_gateway_c = gs_from_gateway.clone();
+            let gateway_uplink = gateway.add_side_packed_with_options(
+                "GW_TO_GS",
+                move |bytes| {
+                    if let Some(side) = *gs_from_gateway_c.lock().unwrap() {
+                        gs_c.rx_packed_from_side(bytes, side)?;
+                    }
+                    Ok(())
+                },
+                best_effort_opts,
+            );
+            *gs_from_gateway.lock().unwrap() = Some(gs_side);
+            *gateway_from_gs.lock().unwrap() = Some(gateway_uplink);
+
+            let valve_c = valve.clone();
+            let valve_from_gateway_c = valve_from_gateway.clone();
+            let gateway_downlink = gateway.add_side_packed_with_options(
+                "GW_TO_VB",
+                move |bytes| {
+                    if let Some(side) = *valve_from_gateway_c.lock().unwrap() {
+                        valve_c.rx_packed_from_side(bytes, side)?;
+                    }
+                    Ok(())
+                },
+                opts,
+            );
+            let gateway_c = gateway.clone();
+            let gateway_from_valve_c = gateway_from_valve.clone();
+            let valve_side = valve.add_side_packed_with_options(
+                "VB_TO_GW",
+                move |bytes| {
+                    if let Some(side) = *gateway_from_valve_c.lock().unwrap() {
+                        gateway_c.rx_packed_from_side(bytes, side)?;
+                    }
+                    Ok(())
+                },
+                opts,
+            );
+            *valve_from_gateway.lock().unwrap() = Some(valve_side);
+            *gateway_from_valve.lock().unwrap() = Some(gateway_downlink);
+
+            gs.announce_discovery().unwrap();
+            gateway.announce_discovery().unwrap();
+            valve.announce_discovery().unwrap();
+            pump_routers(&[gs.as_ref(), gateway.as_ref(), valve.as_ref()], 24);
+
+            let valve_topology = valve.export_topology();
+            assert!(
+                valve_topology
+                    .routes
+                    .iter()
+                    .any(|route| { route.reachable_endpoints.contains(&gs_endpoint) }),
+                "Valve must discover the GroundStation endpoint through Gateway"
+            );
+
+            valve
+                .tx(Packet::from_f32_slice(reliable_ty, &[1.0], &[gs_endpoint], 10).unwrap())
+                .unwrap();
+            pump_routers(&[valve.as_ref(), gateway.as_ref(), gs.as_ref()], 24);
+            assert_eq!(delivered.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn managed_variable_reaches_every_owner_behind_a_two_sided_router() {
+            ensure_topology_test_schema();
+            let ty = ensure_reliable_overlap_test_schema();
+            let endpoint = DataEndpoint::named("ACTUATOR_BOARD");
+            let handler = || EndpointHandler::new_packet_handler(endpoint, |_| Ok(()));
+            let gs = Arc::new(Router::new_with_clock(
+                RouterConfig::new([handler()]).with_sender("GS"),
+                zero_clock(),
+            ));
+            let rf = Arc::new(Router::new_with_clock(
+                RouterConfig::new([handler()]).with_sender("RF"),
+                zero_clock(),
+            ));
+            let power = Arc::new(Router::new_with_clock(
+                RouterConfig::new([handler()]).with_sender("PB"),
+                zero_clock(),
+            ));
+            let flight = Arc::new(Router::new_with_clock(
+                RouterConfig::new([handler()]).with_sender("FC"),
+                zero_clock(),
+            ));
+
+            let observed = |router: &Arc<Router>| {
+                let values = Arc::new(Mutex::new(Vec::new()));
+                let values_c = values.clone();
+                router
+                    .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                    .unwrap();
+                router
+                    .on_network_variable_update(ty, move |packet| {
+                        values_c.lock().unwrap().push(packet.data_as_f32()?[0]);
+                        Ok(())
+                    })
+                    .unwrap();
+                values
+            };
+            let rf_values = observed(&rf);
+            let power_values = observed(&power);
+            let flight_values = observed(&flight);
+            gs.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+                .unwrap();
+
+            let reliable = RouterSideOptions {
+                reliable_enabled: true,
+                ..RouterSideOptions::default()
+            };
+            let gs_c = gs.clone();
+            rf.add_side_packed_with_options(
+                "radio",
+                move |bytes| gs_c.rx_packed_from_side(bytes, 0),
+                reliable,
+            );
+            let power_c = power.clone();
+            let flight_c = flight.clone();
+            rf.add_side_packed_with_options(
+                "can",
+                move |bytes| {
+                    power_c.rx_packed_from_side(bytes, 0)?;
+                    flight_c.rx_packed_from_side(bytes, 0)
+                },
+                reliable,
+            );
+            let rf_c = rf.clone();
+            gs.add_side_packed_with_options(
+                "radio",
+                move |bytes| rf_c.rx_packed_from_side(bytes, 0),
+                reliable,
+            );
+            let rf_c = rf.clone();
+            power.add_side_packed_with_options(
+                "can",
+                move |bytes| rf_c.rx_packed_from_side(bytes, 1),
+                reliable,
+            );
+            let rf_c = rf.clone();
+            flight.add_side_packed_with_options(
+                "can",
+                move |bytes| rf_c.rx_packed_from_side(bytes, 1),
+                reliable,
+            );
+
+            for router in [&gs, &rf, &power, &flight] {
+                router.announce_discovery().unwrap();
+            }
+            pump_routers(
+                &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
+                96,
+            );
+            // RF has now learned the two CAN-side owners; publish its
+            // aggregate split-horizon snapshot back across the radio side.
+            rf.announce_discovery().unwrap();
+            pump_routers(
+                &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
+                96,
+            );
+            for (index, value) in [1.0_f32, 0.0, 1.0].into_iter().enumerate() {
+                let packet = Packet::from_f32_slice(ty, &[value], &[endpoint], 100 + index as u64)
+                    .unwrap()
+                    .with_nonce(index as u16 + 1);
+                gs.set_network_variable(packet).unwrap();
+                pump_routers(
+                    &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
+                    96,
+                );
+            }
+
+            let expected = vec![1.0_f32, 0.0, 1.0];
+            assert_eq!(*rf_values.lock().unwrap(), expected);
+            assert_eq!(*power_values.lock().unwrap(), expected);
+            assert_eq!(*flight_values.lock().unwrap(), expected);
+        }
+
+        #[test]
         fn topology_requests_use_elected_master_and_late_joiners_get_fresh_topology() {
             ensure_topology_test_schema();
 

@@ -4500,7 +4500,23 @@ impl Router {
                     RouteSelectionOrigin::Flood,
                 )));
             }
-            if !(has_nonlocal_endpoint(&eps, &self.cfg) || force_remote_for_type(ty)) {
+            let mut st = self.state.lock();
+            // Preserve the local-only traffic optimization unless discovery
+            // has positively identified a remote owner of this network
+            // variable. A router may own the same schema endpoint locally and
+            // still need to replicate the value across an IPC/network boundary.
+            let now_ms = self.clock.now_ms();
+            let has_remote_variable_owner = st.managed_variable_types.contains(&ty.as_u32())
+                && st.discovery_routes.iter().any(|(&side, route)| {
+                    exclude != Some(side)
+                        && now_ms.saturating_sub(route.last_seen_ms)
+                            <= DISCOVERY_ROUTE_TTL_MS
+                        && route.reachable_network_variables.contains(&ty)
+                });
+            if !(has_nonlocal_endpoint(&eps, &self.cfg)
+                || force_remote_for_type(ty)
+                || has_remote_variable_owner)
+            {
                 return Ok(RemoteSidePlan::Target(Vec::new()));
             }
 
@@ -4509,7 +4525,6 @@ impl Router {
             #[cfg(not(feature = "timesync"))]
             let preferred_timesync_source: Option<String> = None;
 
-            let mut st = self.state.lock();
             if let Some(packet_id) = preferred_packet_id {
                 let target_side = st
                     .reliable_return_routes
