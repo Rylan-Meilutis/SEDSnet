@@ -4338,6 +4338,11 @@ impl Router {
     ) -> TelemetryResult<bool> {
         let targets = self.item_target_senders(data)?;
         if targets.is_empty()
+            // A contract that already names downstream owners must remain byte-identical while
+            // crossing this router. Clearing it changes the packet ID and makes those owners'
+            // end-to-end ACKs impossible for the source to match. Re-resolve only the legacy
+            // single-next-hop form where this router is the sole frozen target.
+            || targets.len() != 1
             || endpoints.iter().copied().any(|endpoint| {
                 self.endpoint_has_packet_handler(endpoint)
                     || self.endpoint_has_packed_handler(endpoint)
@@ -9740,6 +9745,16 @@ impl Router {
             .any(|ep| self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep))
     }
 
+    /// Whether receiving this packet constitutes delivery at this router.
+    ///
+    /// Network variables deliberately use their cache/update callback instead of a conventional
+    /// endpoint handler. Treat that successful cache delivery as local for end-to-end ACKs;
+    /// otherwise a reliable writer waits forever for every variable owner that does not also
+    /// happen to register an unrelated packet handler for the variable's endpoint.
+    fn packet_has_local_delivery(&self, pkt: &Packet) -> bool {
+        self.packet_has_local_handler(pkt) || self.is_managed_variable_type(pkt.data_type())
+    }
+
     /// Call the specified endpoint handler with retries on failure.
     ///
     /// - `data` is present when called from RX processing (queue or immediate).
@@ -10159,7 +10174,7 @@ impl Router {
                             || !pkt.wire_target_senders().is_empty())
                             && pkt.sender() != local_sender.as_ref()
                             && self.item_targets_local_sender(&item.data)?
-                            && self.packet_has_local_handler(pkt) =>
+                            && self.packet_has_local_delivery(pkt) =>
                     {
                         self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
                     }
@@ -10169,7 +10184,7 @@ impl Router {
                                 || !pkt.wire_target_senders().is_empty())
                             && pkt.sender() != local_sender.as_ref()
                             && self.item_targets_local_sender(&item.data)?
-                            && self.packet_has_local_handler(&pkt)
+                            && self.packet_has_local_delivery(&pkt)
                         {
                             let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
                                 .unwrap_or_else(|_| pkt.packet_id());
@@ -10267,6 +10282,8 @@ impl Router {
                 let had_local_handler = eps.iter().copied().any(|ep| {
                     self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
                 });
+                let had_local_delivery =
+                    had_local_handler || self.is_managed_variable_type(pkt.data_type());
 
                 let has_remote = self.should_route_remote(&item.data, item.src)?;
                 let targets_local = self.item_targets_local_sender(&item.data)?;
@@ -10329,14 +10346,14 @@ impl Router {
                 }
 
                 if let Some(src) = item.src
-                    && had_local_handler
+                    && had_local_delivery
                     && targets_local
                 {
                     self.note_side_local_delivery(src, pkt.data_type());
                 }
 
                 if item.src.is_some()
-                    && had_local_handler
+                    && had_local_delivery
                     && targets_local
                     && (is_reliable_type(pkt.data_type()) || !pkt.wire_target_senders().is_empty())
                 {
@@ -10361,8 +10378,13 @@ impl Router {
                 ) {
                     let pkt = wire_format::unpack_packet(bytes.as_ref())?;
                     pkt.validate()?;
-                    let _ =
+                    let handled =
                         self.handle_internal_reliable_packet(&pkt, item.src, called_from_queue)?;
+                    // Hop-level ACKs terminate here. End-to-end ACKs for a packet originated
+                    // farther upstream continue along the learned packet return route.
+                    if !handled && self.should_route_remote(&item.data, item.src)? {
+                        self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
+                    }
                     return Ok(());
                 }
 
@@ -10432,6 +10454,7 @@ impl Router {
                 let had_local_handler = eps.iter().copied().any(|ep| {
                     self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
                 });
+                let had_local_delivery = had_local_handler || self.is_managed_variable_type(env.ty);
 
                 let has_remote = self.should_route_remote(&item.data, item.src)?;
                 let targets_local = self.item_targets_local_sender(&item.data)?;
@@ -10479,13 +10502,17 @@ impl Router {
                 }
 
                 if item.src.is_some()
-                    && had_local_handler
+                    && had_local_delivery
                     && targets_local
                     && (is_reliable_type(env.ty) || !env.target_senders.is_empty())
-                    && let Some(pkt) = pkt_opt.as_ref()
                 {
-                    let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
-                        .unwrap_or_else(|_| pkt.packet_id());
+                    let packet_id =
+                        wire_format::packet_id_from_wire(bytes.as_ref()).or_else(|_| {
+                            pkt_opt
+                                .as_ref()
+                                .map(Packet::packet_id)
+                                .ok_or(TelemetryError::Unpack("missing packet id"))
+                        })?;
                     self.queue_end_to_end_reliable_ack_for_packet_id(packet_id, called_from_queue)?;
                 }
 

@@ -7372,21 +7372,20 @@ mod router_tests {
             ensure_topology_test_schema();
             let ty = ensure_reliable_overlap_test_schema();
             let endpoint = DataEndpoint::named("ACTUATOR_BOARD");
-            let handler = || EndpointHandler::new_packet_handler(endpoint, |_| Ok(()));
             let gs = Arc::new(Router::new_with_clock(
-                RouterConfig::new([handler()]).with_sender("GS"),
+                RouterConfig::default().with_sender("GS"),
                 zero_clock(),
             ));
             let rf = Arc::new(Router::new_with_clock(
-                RouterConfig::new([handler()]).with_sender("RF"),
+                RouterConfig::default().with_sender("RF"),
                 zero_clock(),
             ));
             let power = Arc::new(Router::new_with_clock(
-                RouterConfig::new([handler()]).with_sender("PB"),
+                RouterConfig::default().with_sender("PB"),
                 zero_clock(),
             ));
             let flight = Arc::new(Router::new_with_clock(
-                RouterConfig::new([handler()]).with_sender("FC"),
+                RouterConfig::default().with_sender("FC"),
                 zero_clock(),
             ));
 
@@ -7431,7 +7430,7 @@ mod router_tests {
                 reliable,
             );
             let rf_c = rf.clone();
-            gs.add_side_packed_with_options(
+            let gs_radio = gs.add_side_packed_with_options(
                 "radio",
                 move |bytes| rf_c.rx_packed_from_side(bytes, 0),
                 reliable,
@@ -7463,6 +7462,37 @@ mod router_tests {
                 &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
                 96,
             );
+            // A network-variable owner does not need a conventional endpoint handler. Model the
+            // routed endpoint topology independently so the writer tracks each real destination.
+            gs.rx_from_side(
+                &build_discovery_topology(
+                    "RF",
+                    2,
+                    &[
+                        TopologyBoardNode {
+                            sender_id: "RF".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["PB".into(), "FC".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "PB".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["RF".into()],
+                        },
+                        TopologyBoardNode {
+                            sender_id: "FC".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["RF".into()],
+                        },
+                    ],
+                )
+                .unwrap(),
+                gs_radio,
+            )
+            .unwrap();
             for (index, value) in [1.0_f32, 0.0, 1.0].into_iter().enumerate() {
                 let packet = Packet::from_f32_slice(ty, &[value], &[endpoint], 100 + index as u64)
                     .unwrap()
@@ -7471,6 +7501,13 @@ mod router_tests {
                 pump_routers(
                     &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
                     96,
+                );
+                assert_eq!(
+                    gs.export_runtime_stats()
+                        .reliable
+                        .end_to_end_pending_destination_count,
+                    0,
+                    "managed-variable callbacks must ACK every targeted owner",
                 );
             }
 
