@@ -2898,7 +2898,11 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
-    fn queue_discovery_announce(&self, include_schema: bool) -> TelemetryResult<()> {
+    fn queue_discovery_announce(
+        &self,
+        include_schema: bool,
+        skip_in_flight_sides: bool,
+    ) -> TelemetryResult<()> {
         #[cfg(not(feature = "std"))]
         let _ = include_schema;
         let now_ms = self.clock.now_ms();
@@ -2924,6 +2928,16 @@ impl Relay {
                 .collect::<Vec<_>>();
             let mut per_side = Vec::new();
             for (side_id, link_local_enabled, opts) in side_entries {
+                if skip_in_flight_sides
+                    && st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
+                        *pending_side == side_id
+                            && !tx_state.sent.is_empty()
+                            && crate::DataType::try_from_u32(*ty)
+                                .is_some_and(discovery::is_discovery_type)
+                    })
+                {
+                    continue;
+                }
                 if !self.route_allowed_locked(
                     &st,
                     None,
@@ -3072,19 +3086,14 @@ impl Relay {
                     return false;
                 }
                 let _ = side;
-                true
+                !st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
+                    *pending_side == side_id
+                        && !tx_state.sent.is_empty()
+                        && crate::DataType::try_from_u32(*ty)
+                            .is_some_and(discovery::is_discovery_type)
+                })
             });
             if !st.sides.iter().any(|side| side.is_some()) || !has_any {
-                return Ok(false);
-            }
-            // Keep at most one reliable periodic discovery snapshot in
-            // flight per relay. This lets ACK/retransmit recovery close a
-            // sequence gap before later snapshots consume reliable history.
-            let discovery_in_flight = st.reliable_tx.iter().any(|((_side, ty), tx_state)| {
-                !tx_state.sent.is_empty()
-                    && crate::DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
-            });
-            if discovery_in_flight {
                 return Ok(false);
             }
             st.discovery_cadence.due(now_ms)
@@ -3094,7 +3103,7 @@ impl Relay {
         }
         // Keep periodic discovery lightweight so a hosted relay cannot fill a
         // constrained link with repeated schema snapshots.
-        self.queue_discovery_announce(false)?;
+        self.queue_discovery_announce(false, true)?;
         Ok(true)
     }
 
@@ -3811,7 +3820,7 @@ impl Relay {
     #[cfg(feature = "discovery")]
     /// Queues an immediate discovery announcement for this relay.
     pub fn announce_discovery(&self) -> TelemetryResult<()> {
-        self.queue_discovery_announce(true)
+        self.queue_discovery_announce(true, false)
     }
 
     /// Broadcast that this relay is leaving so peers can prune topology immediately.

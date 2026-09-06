@@ -6996,7 +6996,7 @@ mod router_tests {
             );
 
             router.announce_discovery().unwrap();
-            router.process_tx_queue().unwrap();
+            router.process_all_queues().unwrap();
 
             let packets = seen.lock().unwrap();
             let caps_pkt = packets
@@ -7270,11 +7270,8 @@ mod router_tests {
             // destination contract must still identify it as an intermediate
             // hop and continue toward GroundStation.
             let gateway = Arc::new(Router::new_with_clock(
-                RouterConfig::new([EndpointHandler::new_packet_handler(
-                    gs_endpoint,
-                    |_| Ok(()),
-                )])
-                .with_sender("GW"),
+                RouterConfig::new([EndpointHandler::new_packet_handler(gs_endpoint, |_| Ok(()))])
+                    .with_sender("GW"),
                 zero_clock(),
             ));
             let valve = Arc::new(Router::new_with_clock(
@@ -9312,7 +9309,7 @@ mod router_tests {
                 vec![DataEndpoint::named("SD_CARD")]
             );
             assert!(relay.poll_discovery().unwrap());
-            relay.process_tx_queue().unwrap();
+            relay.process_all_queues().unwrap();
 
             assert!(seen_a.lock().unwrap().is_empty());
             let b_pkts = seen_b.lock().unwrap().clone();
@@ -9400,6 +9397,57 @@ mod router_tests {
         }
 
         #[test]
+        fn router_unacked_discovery_blocks_only_the_affected_side() {
+            ensure_topology_test_schema();
+            let now_ms = Arc::new(AtomicU64::new(0));
+            let reliable_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let best_effort_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let reliable_seen_c = reliable_seen.clone();
+            let best_effort_seen_c = best_effort_seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default(),
+                Box::new(SharedClock {
+                    now_ms: now_ms.clone(),
+                }),
+            );
+            router.add_side_packed_with_options(
+                "reliable_radio",
+                move |bytes| {
+                    reliable_seen_c.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RouterSideOptions {
+                    reliable_enabled: true,
+                    ..RouterSideOptions::default()
+                },
+            );
+            router.add_side_packed_with_options(
+                "best_effort_umbilical",
+                move |bytes| {
+                    best_effort_seen_c.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RouterSideOptions::default(),
+            );
+
+            assert!(router.poll_discovery().unwrap());
+            router.process_all_queues().unwrap();
+            let reliable_first = reliable_seen.lock().unwrap().len();
+            let best_effort_first = best_effort_seen.lock().unwrap().len();
+            assert!(reliable_first > 0);
+            assert!(best_effort_first > 0);
+
+            now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
+            assert!(router.poll_discovery().unwrap());
+            // Drain only the newly queued snapshot; do not turn this routing
+            // assertion into a reliable-retransmit timing test.
+            now_ms.store(0, Ordering::SeqCst);
+            router.process_tx_queue().unwrap();
+            assert_eq!(reliable_seen.lock().unwrap().len(), reliable_first);
+            assert!(best_effort_seen.lock().unwrap().len() > best_effort_first);
+        }
+
+        #[test]
         fn relay_does_not_stack_periodic_discovery_behind_an_unacked_snapshot() {
             let now_ms = Arc::new(AtomicU64::new(0));
             let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -9426,6 +9474,51 @@ mod router_tests {
 
             now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
             assert!(!relay.poll_discovery().unwrap());
+        }
+
+        #[test]
+        fn relay_unacked_discovery_blocks_only_the_affected_side() {
+            let now_ms = Arc::new(AtomicU64::new(0));
+            let reliable_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let best_effort_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let reliable_seen_c = reliable_seen.clone();
+            let best_effort_seen_c = best_effort_seen.clone();
+            let relay = Relay::new(Box::new(SharedClock {
+                now_ms: now_ms.clone(),
+            }));
+            relay.add_side_packed_with_options(
+                "reliable_radio",
+                move |bytes| {
+                    reliable_seen_c.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RelaySideOptions {
+                    reliable_enabled: true,
+                    ..RelaySideOptions::default()
+                },
+            );
+            relay.add_side_packed_with_options(
+                "best_effort_umbilical",
+                move |bytes| {
+                    best_effort_seen_c.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RelaySideOptions::default(),
+            );
+
+            assert!(relay.poll_discovery().unwrap());
+            relay.process_all_queues().unwrap();
+            let reliable_first = reliable_seen.lock().unwrap().len();
+            let best_effort_first = best_effort_seen.lock().unwrap().len();
+            assert!(reliable_first > 0);
+            assert!(best_effort_first > 0);
+
+            now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
+            assert!(relay.poll_discovery().unwrap());
+            now_ms.store(0, Ordering::SeqCst);
+            relay.process_tx_queue().unwrap();
+            assert_eq!(reliable_seen.lock().unwrap().len(), reliable_first);
+            assert!(best_effort_seen.lock().unwrap().len() > best_effort_first);
         }
 
         #[test]

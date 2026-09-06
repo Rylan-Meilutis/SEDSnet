@@ -4509,8 +4509,7 @@ impl Router {
             let has_remote_variable_owner = st.managed_variable_types.contains(&ty.as_u32())
                 && st.discovery_routes.iter().any(|(&side, route)| {
                     exclude != Some(side)
-                        && now_ms.saturating_sub(route.last_seen_ms)
-                            <= DISCOVERY_ROUTE_TTL_MS
+                        && now_ms.saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
                         && route.reachable_network_variables.contains(&ty)
                 });
             if !(has_nonlocal_endpoint(&eps, &self.cfg)
@@ -5079,6 +5078,7 @@ impl Router {
         called_from_queue: bool,
         include_schema: bool,
         include_topology: bool,
+        skip_in_flight_sides: bool,
     ) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         let per_side = {
@@ -5101,6 +5101,15 @@ impl Router {
                 self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
             let mut per_side = Vec::new();
             for (side_id, link_local_enabled, opts) in side_entries {
+                if skip_in_flight_sides
+                    && st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
+                        *pending_side == side_id
+                            && !tx_state.sent.is_empty()
+                            && DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
+                    })
+                {
+                    continue;
+                }
                 if !self.route_allowed_locked(&st, None, Some(DataType::DiscoveryAnnounce), side_id)
                 {
                     continue;
@@ -5248,7 +5257,11 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn queue_discovery_announce(&self, include_schema: bool) -> TelemetryResult<()> {
+    fn queue_discovery_announce(
+        &self,
+        include_schema: bool,
+        skip_in_flight_sides: bool,
+    ) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         {
             let mut st = self.state.lock();
@@ -5262,7 +5275,7 @@ impl Router {
             }
             st.discovery_cadence.on_announce_sent(now_ms);
         }
-        self.emit_discovery_snapshot(true, include_schema, true)
+        self.emit_discovery_snapshot(true, include_schema, true, skip_in_flight_sides)
     }
 
     #[cfg(feature = "discovery")]
@@ -5285,21 +5298,13 @@ impl Router {
                     return false;
                 }
                 let _ = side;
-                true
+                !st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
+                    *pending_side == side_id
+                        && !tx_state.sent.is_empty()
+                        && DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
+                })
             });
             if st.sides.is_empty() || !has_any {
-                return Ok(false);
-            }
-            // Do not enqueue another periodic snapshot while a reliable
-            // discovery frame from the previous snapshot is still awaiting
-            // its hop ACK. On constrained links, repeatedly appending newer
-            // topology/address frames behind one missing sequence can fill
-            // reliable history and starve managed variables and commands.
-            let discovery_in_flight = st.reliable_tx.iter().any(|((_side, ty), tx_state)| {
-                !tx_state.sent.is_empty()
-                    && DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
-            });
-            if discovery_in_flight {
                 return Ok(false);
             }
             st.discovery_cadence.due(now_ms)
@@ -5311,7 +5316,10 @@ impl Router {
         // is sent by the initial explicit announce and in response to
         // DiscoverySchemaRequest; repeating it at every cadence can starve
         // commands on constrained serial and radio links.
-        self.queue_discovery_announce(false)?;
+        // A stalled reliable link must not prevent freshly learned routes
+        // from propagating across another healthy side. Only omit the side
+        // that already has discovery awaiting its hop ACK.
+        self.queue_discovery_announce(false, true)?;
         Ok(true)
     }
 
@@ -5434,7 +5442,7 @@ impl Router {
                 self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
             };
             if should_answer {
-                self.emit_discovery_snapshot(called_from_queue, false, true)?;
+                self.emit_discovery_snapshot(called_from_queue, false, true, false)?;
             }
             return Ok(true);
         }
@@ -5449,7 +5457,7 @@ impl Router {
                 self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
             };
             if should_answer {
-                self.emit_discovery_snapshot(called_from_queue, true, true)?;
+                self.emit_discovery_snapshot(called_from_queue, true, true, false)?;
             }
             return Ok(true);
         }
@@ -8489,7 +8497,7 @@ impl Router {
     /// Queue a built-in discovery advertisement describing this router's local endpoints.
     #[cfg(feature = "discovery")]
     pub fn announce_discovery(&self) -> TelemetryResult<()> {
-        self.queue_discovery_announce(true)
+        self.queue_discovery_announce(true, false)
     }
 
     /// Broadcast that this router is leaving so peers can prune topology immediately.
