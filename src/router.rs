@@ -2824,9 +2824,7 @@ impl Router {
     fn reliable_control_target_packet_id(data: &RouterItem) -> TelemetryResult<Option<u64>> {
         match data {
             RouterItem::Packet(pkt) => {
-                if pkt.data_type() != DataType::ReliableAck
-                    || !Self::is_end_to_end_ack_sender(pkt.sender())
-                {
+                if !Self::is_end_to_end_ack_packet(pkt) {
                     return Ok(None);
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
@@ -2839,9 +2837,7 @@ impl Router {
                     return Ok(None);
                 }
                 let pkt = wire_format::unpack_packet(bytes.as_ref())?;
-                if pkt.data_type() != DataType::ReliableAck
-                    || !Self::is_end_to_end_ack_sender(pkt.sender())
-                {
+                if !Self::is_end_to_end_ack_packet(&pkt) {
                     return Ok(None);
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
@@ -3110,6 +3106,26 @@ impl Router {
             return Some(Self::sender_hash(ack_sender));
         }
         None
+    }
+
+    /// Return the stable destination key carried by an end-to-end ACK.
+    ///
+    /// Compact embedded headers encode senders as numeric addresses, so the legacy
+    /// `E2EACK:<hostname>` marker cannot survive a firmware hop. New ACKs carry the acknowledging
+    /// owner's hash in their frozen target contract; marker decoding remains for older peers.
+    fn end_to_end_ack_sender_hash(pkt: &Packet) -> Option<u64> {
+        if pkt.data_type() != DataType::ReliableAck {
+            return None;
+        }
+        pkt.wire_target_senders()
+            .first()
+            .copied()
+            .or_else(|| Self::decode_end_to_end_ack_sender_hash(pkt.sender()))
+    }
+
+    fn is_end_to_end_ack_packet(pkt: &Packet) -> bool {
+        Self::end_to_end_ack_sender_hash(pkt).is_some()
+            && Self::decode_end_to_end_reliable_ack(pkt.payload()).is_ok()
     }
 
     fn encode_end_to_end_ack_sender(&self) -> String {
@@ -3992,11 +4008,12 @@ impl Router {
             self.packet_timestamp_ms(),
             Self::encode_end_to_end_reliable_ack(packet_id),
         )?;
-        self.emit_internal_tx(
-            RouterTxItem::Broadcast(RouterItem::Packet(ack)),
-            true,
-            called_from_queue,
-        )
+        let local_sender = self.sender_arc();
+        let ack = self.attach_wire_contract_to_item(
+            RouterItem::Packet(ack),
+            &[Self::sender_hash(local_sender.as_ref())],
+        )?;
+        self.emit_internal_tx(RouterTxItem::Broadcast(ack), true, called_from_queue)
     }
 
     fn emit_internal_tx(
@@ -6885,10 +6902,7 @@ impl Router {
                         | DataType::ReliablePartialAck
                         | DataType::ReliablePacketRequest
                 ) {
-                    if preserve_end_to_end_ack
-                        && pkt.data_type() == DataType::ReliableAck
-                        && Self::is_end_to_end_ack_sender(pkt.sender())
-                    {
+                    if preserve_end_to_end_ack && Self::is_end_to_end_ack_packet(&pkt) {
                         return Ok(Some(RouterItem::Packet(pkt)));
                     }
                     return Ok(None);
@@ -9905,13 +9919,12 @@ impl Router {
             return Ok(false);
         };
 
-        if pkt.data_type() == DataType::ReliableAck
-            && Self::is_end_to_end_ack_sender(pkt.sender())
+        if Self::is_end_to_end_ack_packet(pkt)
             && let Ok(packet_id) = Self::decode_end_to_end_reliable_ack(pkt.payload())
         {
             let mut st = self.state.lock();
             if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&packet_id) {
-                if let Some(sender_hash) = Self::decode_end_to_end_ack_sender_hash(pkt.sender()) {
+                if let Some(sender_hash) = Self::end_to_end_ack_sender_hash(pkt) {
                     sent.pending_destinations.remove(&sender_hash);
                     if sent.pending_destinations.is_empty() {
                         st.end_to_end_reliable_tx.remove(&packet_id);
