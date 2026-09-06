@@ -7266,8 +7266,15 @@ mod router_tests {
                 .with_sender("GS"),
                 zero_clock(),
             ));
+            // Gateway also owns this schema endpoint locally. The frozen
+            // destination contract must still identify it as an intermediate
+            // hop and continue toward GroundStation.
             let gateway = Arc::new(Router::new_with_clock(
-                RouterConfig::default().with_sender("GW"),
+                RouterConfig::new([EndpointHandler::new_packet_handler(
+                    gs_endpoint,
+                    |_| Ok(()),
+                )])
+                .with_sender("GW"),
                 zero_clock(),
             ));
             let valve = Arc::new(Router::new_with_clock(

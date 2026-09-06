@@ -4515,6 +4515,7 @@ impl Router {
                 });
             if !(has_nonlocal_endpoint(&eps, &self.cfg)
                 || force_remote_for_type(ty)
+                || !target_senders.is_empty()
                 || has_remote_variable_owner)
             {
                 return Ok(RemoteSidePlan::Target(Vec::new()));
