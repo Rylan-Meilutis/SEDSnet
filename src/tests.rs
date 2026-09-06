@@ -7054,6 +7054,23 @@ mod router_tests {
             DataType::named("RELIABLE_COMMAND_TEST")
         }
 
+        fn ensure_managed_variable_test_schema() -> DataType {
+            ensure_reliable_overlap_test_schema();
+            let actuator = DataEndpoint::named("ACTUATOR_BOARD");
+            if DataType::try_named("MANAGED_VARIABLE_TEST").is_none() {
+                register_data_type_with_description(
+                    "MANAGED_VARIABLE_TEST",
+                    "non-hop-reliable managed variable used to verify end-to-end ACK routing",
+                    MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+                    &[actuator],
+                    ReliableMode::None,
+                    1,
+                )
+                .expect("register MANAGED_VARIABLE_TEST");
+            }
+            DataType::named("MANAGED_VARIABLE_TEST")
+        }
+
         #[derive(Clone)]
         struct SharedClock {
             now_ms: Arc<AtomicU64>,
@@ -7370,7 +7387,9 @@ mod router_tests {
         #[test]
         fn managed_variable_reaches_every_owner_behind_a_two_sided_router() {
             ensure_topology_test_schema();
-            let ty = ensure_reliable_overlap_test_schema();
+            // Network variables use their frozen destination contract for end-to-end delivery;
+            // they do not need to consume hop-reliable sequencing state on every transport.
+            let ty = ensure_managed_variable_test_schema();
             let endpoint = DataEndpoint::named("ACTUATOR_BOARD");
             let gs = Arc::new(Router::new_with_clock(
                 RouterConfig::default().with_sender("GS"),
@@ -7497,23 +7516,26 @@ mod router_tests {
                 gs_radio,
             )
             .unwrap();
+            // Queue a complete control burst before servicing any router. Real GroundStation
+            // startup publishes several managed variables together; serializing each publish
+            // behind its ACKs hid packet-id/return-route bugs under concurrent traffic.
             for (index, value) in [1.0_f32, 0.0, 1.0].into_iter().enumerate() {
                 let packet = Packet::from_f32_slice(ty, &[value], &[endpoint], 100 + index as u64)
                     .unwrap()
                     .with_nonce(index as u16 + 1);
                 gs.set_network_variable(packet).unwrap();
-                pump_routers(
-                    &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
-                    96,
-                );
-                assert_eq!(
-                    gs.export_runtime_stats()
-                        .reliable
-                        .end_to_end_pending_destination_count,
-                    0,
-                    "managed-variable callbacks must ACK every targeted owner",
-                );
             }
+            pump_routers(
+                &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
+                256,
+            );
+            assert_eq!(
+                gs.export_runtime_stats()
+                    .reliable
+                    .end_to_end_pending_destination_count,
+                0,
+                "managed-variable callbacks must ACK every targeted owner in a control burst",
+            );
 
             let expected = vec![1.0_f32, 0.0, 1.0];
             assert_eq!(*rf_values.lock().unwrap(), expected);

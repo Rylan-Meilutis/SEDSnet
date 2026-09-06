@@ -9982,7 +9982,7 @@ impl Router {
             }
             match &item.data {
                 RouterItem::Packet(pkt) => {
-                    if is_reliable_type(pkt.data_type())
+                    if (is_reliable_type(pkt.data_type()) || !pkt.wire_target_senders().is_empty())
                         && !is_internal_control_type(pkt.data_type())
                     {
                         self.note_reliable_return_route(src, pkt.packet_id());
@@ -9990,7 +9990,7 @@ impl Router {
                 }
                 RouterItem::Packed(bytes) => {
                     if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
-                        && is_reliable_type(env.ty)
+                        && (is_reliable_type(env.ty) || !env.target_senders.is_empty())
                         && !is_internal_control_type(env.ty)
                         && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
                     {
