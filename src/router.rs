@@ -4693,6 +4693,14 @@ impl Router {
                         matches,
                     ),
                 ))
+            } else if !target_senders.is_empty() {
+                let fallback =
+                    self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
+                Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
+                    fallback
+                } else {
+                    Vec::new()
+                }))
             } else if prefer_best_overlap {
                 Ok(RemoteSidePlan::Target(Vec::new()))
             } else {

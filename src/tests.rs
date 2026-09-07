@@ -4041,6 +4041,47 @@ mod relay_tests {
         );
 
         uplink_frames.lock().unwrap().clear();
+        let mut bridge_only_address = address.clone();
+        bridge_only_address.reachable_endpoints.clear();
+        relay
+            .rx_from_side(
+                uplink,
+                build_discovery_address("GS", 0, &bridge_only_address).unwrap(),
+            )
+            .unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        uplink_frames.lock().unwrap().clear();
+        let packet =
+            Packet::new(status, &[ground_station], "VB", 3, Arc::<[u8]>::from([3u8])).unwrap();
+        let packed = wire_format::pack_packet_with_wire_contract(
+            &packet,
+            Some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 0,
+            }),
+            Some(MessageElement::Static(
+                1,
+                MessageDataType::UInt8,
+                MessageClass::Data,
+            )),
+            &[98u64],
+        )
+        .unwrap();
+        relay.rx_packed_from_side(can, packed.as_ref()).unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            count_packed_frames_of_type(&uplink_frames.lock().unwrap(), status),
+            1,
+            "a two-sided bridge must use its sole non-ingress path without echoing",
+        );
+
+        uplink_frames.lock().unwrap().clear();
+        relay
+            .rx_from_side(uplink, build_discovery_address("GS", 0, &address).unwrap())
+            .unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        uplink_frames.lock().unwrap().clear();
         let alternate_frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let alternate_frames_c = alternate_frames.clone();
         let alternate = relay.add_side_packed_with_options(
@@ -4068,7 +4109,7 @@ mod relay_tests {
         alternate_frames.lock().unwrap().clear();
 
         let packet =
-            Packet::new(status, &[ground_station], "VB", 3, Arc::<[u8]>::from([3u8])).unwrap();
+            Packet::new(status, &[ground_station], "VB", 4, Arc::<[u8]>::from([4u8])).unwrap();
         let packed = wire_format::pack_packet_with_wire_contract(
             &packet,
             Some(wire_format::ReliableHeader {
