@@ -657,15 +657,18 @@ pub fn transport_priority(ty: DataType) -> u8 {
         DataType::DiscoveryAnnounce
         | DataType::DiscoveryTimeSyncSources
         | DataType::DiscoveryTopology
-        | DataType::DiscoverySchema
         | DataType::DiscoveryTopologyRequest
-        | DataType::DiscoverySchemaRequest
         | DataType::DiscoveryLeave
         | DataType::DiscoveryLinkCapabilities
         | DataType::DiscoveryAddress => 255,
 
-        // Managed variables and time sync intentionally share a band.
-        DataType::ManagedVariableRequest
+        // Schema transfer is discovery-plane repair, but unlike address and
+        // topology advertisements it is not needed to establish a route.
+        // Keep large schema frames below route convergence so they cannot
+        // head-of-line block a constrained serial or radio link.
+        DataType::DiscoverySchema
+        | DataType::DiscoverySchemaRequest
+        | DataType::ManagedVariableRequest
         | DataType::ManagedVariableValue
         | DataType::TimeSyncAnnounce
         | DataType::TimeSyncRequest

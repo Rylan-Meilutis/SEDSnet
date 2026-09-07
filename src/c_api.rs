@@ -7083,7 +7083,12 @@ mod tests {
         assert_eq!(seds_router_process_tx_queue(router), 0);
         let priorities = priorities.lock().unwrap();
         assert!(priorities.len() > 1, "discovery should be chunked");
-        assert!(priorities.iter().all(|priority| *priority == 255));
+        assert_eq!(priorities.first(), Some(&255));
+        assert!(priorities.iter().all(|priority| *priority >= 254));
+        assert!(
+            priorities.contains(&254),
+            "chunked schema transfer should yield to route discovery"
+        );
         drop(priorities);
         seds_router_free(router);
     }

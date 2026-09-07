@@ -14934,11 +14934,13 @@ mod router_tests {
 #[test]
 fn scheduler_reserves_discovery_and_shared_state_priority_bands() {
     let discovery = crate::scheduler_priority(DataType::DiscoveryAddress);
+    let schema = crate::scheduler_priority(DataType::DiscoverySchema);
     let managed = crate::scheduler_priority(DataType::ManagedVariableValue);
     let timesync = crate::scheduler_priority(DataType::TimeSyncAnnounce);
     let user = crate::scheduler_priority(DataType::P2pMessage);
 
     assert_eq!(discovery, 255);
+    assert_eq!(schema, managed);
     assert_eq!(managed, timesync);
     assert!(discovery > managed);
     assert!(managed > user);

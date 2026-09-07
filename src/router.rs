@@ -5368,18 +5368,6 @@ impl Router {
         ) in per_side
         {
             let sender = self.sender_arc();
-            if include_schema && level == DiscoveryAdvertiseLevel::Full {
-                let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
-                self.emit_internal_tx(
-                    RouterTxItem::ToSide {
-                        src: None,
-                        dst: side_id,
-                        data: RouterItem::Packet(pkt),
-                    },
-                    true,
-                    called_from_queue,
-                )?;
-            }
             if matches!(
                 level,
                 DiscoveryAdvertiseLevel::Full | DiscoveryAdvertiseLevel::Incremental
@@ -5436,6 +5424,22 @@ impl Router {
                         &removed_topology,
                     )?
                 };
+                self.emit_internal_tx(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side_id,
+                        data: RouterItem::Packet(pkt),
+                    },
+                    true,
+                    called_from_queue,
+                )?;
+            }
+            // Schema snapshots can be substantially larger than address and
+            // topology advertisements. Send them after the route has been
+            // established so a slow link can discover the network before it
+            // begins transferring the merged metadata catalog.
+            if include_schema && level == DiscoveryAdvertiseLevel::Full {
+                let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
                         src: None,
@@ -5749,7 +5753,6 @@ impl Router {
             if report.changed() {
                 let mut st = self.state.lock();
                 st.fit_discovery_budget();
-                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
             return Ok(true);
         }
