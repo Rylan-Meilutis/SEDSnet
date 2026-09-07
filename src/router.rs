@@ -4525,6 +4525,29 @@ impl Router {
                     RouteSelectionOrigin::Flood,
                 )));
             }
+            #[cfg(feature = "timesync")]
+            if ty == DataType::TimeSyncAnnounce {
+                // A source announcement describes the source carried in the
+                // packet; routing it *toward* that discovered source sends it
+                // back where it came from and leaves downstream clocks blind.
+                // Propagate it once away from the ingress side, like topology
+                // discovery. Dedupe and split-horizon exclusion prevent echoes,
+                // while requests still use the exact discovered source route.
+                let mut st = self.state.lock();
+                let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
+                let sides = Self::filter_timesync_sides_locked(
+                    &mut st,
+                    ty,
+                    self.clock.now_ms(),
+                    sides,
+                );
+                return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
+                    &mut st,
+                    exclude,
+                    sides,
+                    RouteSelectionOrigin::Flood,
+                )));
+            }
             let mut st = self.state.lock();
             // Preserve the local-only traffic optimization unless discovery
             // has positively identified a remote owner of this network

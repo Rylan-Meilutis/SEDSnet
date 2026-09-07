@@ -12349,6 +12349,37 @@ mod router_tests {
             );
         }
 
+        #[cfg(all(feature = "timesync", feature = "discovery"))]
+        #[test]
+        fn timesync_announcements_propagate_away_from_the_source() {
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_c = seen_a.clone();
+            let seen_b_c = seen_b.clone();
+            let relay = Router::new_with_clock(
+                RouterConfig::default().with_sender("RELAY"),
+                zero_clock(),
+            );
+            let side_a = relay.add_side_packet("source", move |packet: &Packet| {
+                seen_a_c.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            relay.add_side_packet("downstream", move |packet: &Packet| {
+                seen_b_c.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+
+            let announce =
+                crate::timesync::build_timesync_announce_with_sender("RF", 1, 1_000).unwrap();
+            relay.rx_from_side(&announce, side_a).unwrap();
+
+            assert!(seen_a.lock().unwrap().is_empty());
+            assert_eq!(
+                count_packets_of_type(&seen_b.lock().unwrap(), DataType::TimeSyncAnnounce),
+                1,
+            );
+        }
+
         #[cfg(feature = "timesync")]
         #[test]
         fn discovery_advertises_local_timesync_source_ids() {
