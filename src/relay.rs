@@ -385,6 +385,7 @@ struct SideTransportState {
     tx_template_ids: BTreeMap<u64, u32>,
     tx_templates: BTreeMap<u64, SideHeaderTemplate>,
     tx_last_timestamps: BTreeMap<u32, u64>,
+    tx_compact_uses: BTreeMap<u32, u8>,
     rx_templates: BTreeMap<u64, SideHeaderTemplate>,
     rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
     rx_last_timestamps: BTreeMap<u32, u64>,
@@ -394,6 +395,16 @@ struct SideTransportState {
 }
 
 impl SideTransportState {
+    fn clear_header_templates(&mut self) {
+        self.tx_template_ids.clear();
+        self.tx_templates.clear();
+        self.tx_last_timestamps.clear();
+        self.tx_compact_uses.clear();
+        self.rx_templates.clear();
+        self.rx_templates_by_id.clear();
+        self.rx_last_timestamps.clear();
+    }
+
     fn tx_template_count(&self) -> usize {
         self.tx_template_ids.len()
     }
@@ -418,12 +429,14 @@ impl SideTransportState {
         {
             if let Some(old_id) = self.tx_template_ids.remove(&old_hash) {
                 self.tx_last_timestamps.remove(&old_id);
+                self.tx_compact_uses.remove(&old_id);
             }
             self.tx_templates.remove(&old_hash);
             evicted = true;
         }
         self.tx_template_ids.insert(template.hash, template_id);
         self.tx_templates.insert(template.hash, template);
+        self.tx_compact_uses.insert(template_id, 0);
         evicted
     }
 
@@ -2767,6 +2780,9 @@ impl Relay {
             throttle.next_full_ms = now_ms;
             throttle.next_ping_ms = now_ms;
         }
+        for transport in st.side_transport.values_mut() {
+            transport.clear_header_templates();
+        }
     }
 
     #[cfg(feature = "discovery")]
@@ -4992,7 +5008,15 @@ impl Relay {
                 .ok_or(TelemetryError::BadArg)?;
             if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
                 let previous = side_state.tx_last_timestamps.get(&id).copied();
-                (id, true, previous)
+                const FULL_REFRESH_AFTER_COMPACT_FRAMES: u8 = 8;
+                let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
+                let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES;
+                if use_compact {
+                    *compact_uses = compact_uses.saturating_add(1);
+                } else {
+                    *compact_uses = 0;
+                }
+                (id, use_compact, previous)
             } else {
                 let next = side_state.next_template_id.wrapping_add(1).max(1);
                 side_state.next_template_id = next;

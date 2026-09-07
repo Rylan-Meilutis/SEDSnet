@@ -5552,6 +5552,110 @@ mod dedupe_tests {
         assert_eq!(side.side_transport_compact_frames, 9);
     }
 
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn topology_change_resynchronizes_a_missing_compact_template_immediately() {
+        use crate::discovery::build_discovery_announce;
+
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_c = delivered.clone();
+        let receiver = Arc::new(Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |_pkt: &Packet| {
+                    delivered_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )])
+            .with_sender("RECEIVER"),
+            zero_clock(),
+        ));
+        let receiver_side_id = Arc::new(Mutex::new(None));
+        let receiver_side_id_c = receiver_side_id.clone();
+        let receiver_c = receiver.clone();
+        let transmitted = Arc::new(AtomicUsize::new(0));
+        let transmitted_c = transmitted.clone();
+
+        let sender =
+            Router::new_with_clock(RouterConfig::default().with_sender("SENDER"), zero_clock());
+        let lossy = sender.add_side_packed_with_options(
+            "lossy-link",
+            move |bytes: &[u8]| {
+                if transmitted_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(());
+                }
+                let side = receiver_side_id_c
+                    .lock()
+                    .unwrap()
+                    .expect("receiver side id");
+                receiver_c.rx_packed_from_side(bytes, side)
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                ..RouterSideOptions::default()
+            },
+        );
+        let ingress = sender.add_side_packet("new-peer", |_pkt| Ok(()));
+        let rx_side = receiver.add_side_packed_with_options(
+            "lossy-link",
+            |_bytes| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                ..RouterSideOptions::default()
+            },
+        );
+        *receiver_side_id.lock().unwrap() = Some(rx_side);
+
+        sender
+            .rx_from_side(
+                &build_discovery_announce("STORAGE_NODE", 0, &[DataEndpoint::named("SD_CARD")])
+                    .unwrap(),
+                lossy,
+            )
+            .unwrap();
+
+        let packet = |nonce| {
+            Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[nonce as f32, 0.0, 0.0],
+                &[DataEndpoint::named("SD_CARD")],
+                u64::from(nonce),
+            )
+            .unwrap()
+            .with_nonce(nonce)
+        };
+        sender.tx(packet(1)).unwrap(); // Full template is lost.
+        sender.tx(packet(2)).unwrap(); // Compact frame cannot be decoded.
+        assert_eq!(delivered.load(Ordering::SeqCst), 0);
+
+        sender
+            .rx_from_side(
+                &build_discovery_announce("NEW_PEER", 2, &[DataEndpoint::named("RADIO")]).unwrap(),
+                ingress,
+            )
+            .unwrap();
+        sender.tx(packet(3)).unwrap();
+        receiver.process_all_queues().unwrap();
+
+        assert_eq!(transmitted.load(Ordering::SeqCst), 3);
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "lossy-link")
+            .expect("lossy sender side stats");
+        assert_eq!(side.side_transport_full_frames, 2);
+        assert_eq!(side.side_transport_compact_frames, 1);
+        let received = receiver.export_runtime_stats();
+        let received_gps = received.sides[0]
+            .data_types
+            .iter()
+            .find(|item| item.data_type == DataType::named("GPS_DATA"))
+            .expect("post-topology-change full frame must decode as GPS_DATA");
+        assert_eq!(received_gps.rx_packets, 1);
+    }
+
     #[test]
     fn compact_header_target_misses_are_counted() {
         crate::tests::ensure_common_test_schema();
@@ -10898,13 +11002,11 @@ mod router_tests {
                     now_ms: now_ms.clone(),
                 }),
             );
-            let slow = router.add_side_packet(
-                "SLOW_UPLINK",
-                move |pkt: &Packet| -> TelemetryResult<()> {
+            let slow =
+                router.add_side_packet("SLOW_UPLINK", move |pkt: &Packet| -> TelemetryResult<()> {
                     seen_c.lock().unwrap().push(pkt.clone());
                     Ok(())
-                },
-            );
+                });
             let ingress = router.add_side_packet("LOCAL_BUS", |_pkt| Ok(()));
             router
                 .note_side_link_probe_sample(slow, 250, 5_000)

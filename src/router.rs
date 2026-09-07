@@ -153,6 +153,16 @@ struct SideTransportState {
 }
 
 impl SideTransportState {
+    fn clear_header_templates(&mut self) {
+        self.tx_template_ids.clear();
+        self.tx_templates.clear();
+        self.tx_last_timestamps.clear();
+        self.tx_compact_uses.clear();
+        self.rx_templates.clear();
+        self.rx_templates_by_id.clear();
+        self.rx_last_timestamps.clear();
+    }
+
     fn tx_template_count(&self) -> usize {
         self.tx_template_ids.len()
     }
@@ -4838,6 +4848,13 @@ impl Router {
         for throttle in st.discovery_side_throttle.values_mut() {
             throttle.next_full_ms = now_ms;
             throttle.next_ping_ms = now_ms;
+        }
+        // Compact side frames are only decodable after the receiver has seen
+        // their full header template. A newly discovered or restarted peer
+        // may not share the existing dictionary, so invalidate both halves;
+        // the first post-change frame in each direction is self-describing.
+        for transport in st.side_transport.values_mut() {
+            transport.clear_header_templates();
         }
     }
 
