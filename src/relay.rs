@@ -323,6 +323,9 @@ struct ReliableReturnRouteState {
 #[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySenderState {
+    /// Numeric identity advertised for this hostname. Compact frames may carry
+    /// this address instead of the hostname, so routing must accept either.
+    advertised_address: Option<u32>,
     reachable: Vec<crate::DataEndpoint>,
     advertised_reachable: Vec<crate::DataEndpoint>,
     reachable_timesync_sources: Vec<String>,
@@ -2247,6 +2250,9 @@ impl Relay {
                         return false;
                     }
                     target_senders.contains(&Self::sender_hash(announcer))
+                        || sender_state
+                            .advertised_address
+                            .is_some_and(|address| target_senders.contains(&u64::from(address)))
                         || sender_state.topology_boards.iter().any(|board| {
                             target_senders.contains(&Self::sender_hash(&board.sender_id))
                         })
@@ -3250,15 +3256,18 @@ impl Relay {
         let changed = match pkt.data_type() {
             crate::DataType::DiscoveryAddress => {
                 let ad = address_ad.expect("decoded above");
+                let advertised_address = ad.address;
                 let mut reachable = ad.reachable_endpoints;
                 if !side_link_local_enabled {
                     reachable.retain(|ep| !ep.is_link_local_only());
                 }
                 // This packet is an aggregate route summary, not a claim that
                 // the announcing bridge owns every endpoint behind it.
-                let changed = sender_state.advertised_reachable != reachable
+                let changed = sender_state.advertised_address != Some(advertised_address)
+                    || sender_state.advertised_reachable != reachable
                     || sender_state.advertised_reachable_timesync_sources
                         != ad.reachable_timesync_sources;
+                sender_state.advertised_address = Some(advertised_address);
                 sender_state.advertised_reachable = reachable;
                 sender_state.advertised_reachable_timesync_sources = ad.reachable_timesync_sources;
                 Self::refresh_sender_topology_state(&mut sender_state);

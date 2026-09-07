@@ -439,6 +439,9 @@ struct ReliableReturnRouteState {
 #[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySenderState {
+    /// Numeric identity advertised for this hostname. Compact frames may carry
+    /// this address instead of the hostname, so routing must accept either.
+    advertised_address: Option<u32>,
     reachable: Vec<DataEndpoint>,
     advertised_reachable: Vec<DataEndpoint>,
     reachable_network_variables: Vec<DataType>,
@@ -4433,6 +4436,9 @@ impl Router {
                         return false;
                     }
                     target_senders.contains(&Self::sender_hash(announcer))
+                        || sender_state
+                            .advertised_address
+                            .is_some_and(|address| target_senders.contains(&u64::from(address)))
                         || sender_state.topology_boards.iter().any(|board| {
                             target_senders.contains(&Self::sender_hash(&board.sender_id))
                         })
@@ -4551,12 +4557,8 @@ impl Router {
                 // while requests still use the exact discovered source route.
                 let mut st = self.state.lock();
                 let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
-                let sides = Self::filter_timesync_sides_locked(
-                    &mut st,
-                    ty,
-                    self.clock.now_ms(),
-                    sides,
-                );
+                let sides =
+                    Self::filter_timesync_sides_locked(&mut st, ty, self.clock.now_ms(), sides);
                 return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
                     &mut st,
                     exclude,
@@ -5451,6 +5453,10 @@ impl Router {
             // entries must not be attached to the announcer's topology node:
             // that would falsely claim ownership and freeze reliable packets
             // to the bridge before detailed topology arrives.
+            if sender_state.advertised_address != Some(ad.address) {
+                sender_state.advertised_address = Some(ad.address);
+                changed = true;
+            }
             if sender_state.advertised_reachable != ad.reachable_endpoints {
                 sender_state.advertised_reachable = ad.reachable_endpoints;
                 changed = true;

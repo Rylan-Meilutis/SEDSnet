@@ -3902,6 +3902,119 @@ mod relay_tests {
         Box::new(|| 0u64)
     }
 
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn relay_routes_targeted_status_to_a_direct_discovery_address_announcer() {
+        use crate::config::{
+            register_data_type_with_description, register_endpoint_with_description,
+        };
+        use crate::discovery::{
+            ADDRESS_MODE_DYNAMIC, ADDRESS_STATE_APPROVED, AddressAdvertisement, LinkCapabilities,
+            build_discovery_address,
+        };
+        use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+
+        let ground_station =
+            DataEndpoint::try_named("RELAY_TEST_GROUND_STATION").unwrap_or_else(|| {
+                register_endpoint_with_description(
+                    "RELAY_TEST_GROUND_STATION",
+                    "target behind the relay uplink",
+                    false,
+                )
+                .unwrap()
+            });
+        let status = DataType::try_named("RELAY_TEST_STATUS").unwrap_or_else(|| {
+            register_data_type_with_description(
+                "RELAY_TEST_STATUS",
+                "reliable status returned through a two-sided relay",
+                MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+                &[ground_station],
+                ReliableMode::Ordered,
+                200,
+            )
+            .unwrap()
+        });
+
+        let uplink_frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let uplink_frames_c = uplink_frames.clone();
+        let relay = Relay::new(zero_clock());
+        let uplink = relay.add_side_packed_with_options(
+            "pico-uart",
+            move |bytes: &[u8]| {
+                uplink_frames_c.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RelaySideOptions {
+                reliable_enabled: false,
+                ..RelaySideOptions::default()
+            },
+        );
+        let can = relay.add_side_packed_with_options(
+            "can",
+            |_bytes| Ok(()),
+            RelaySideOptions {
+                reliable_enabled: false,
+                ..RelaySideOptions::default()
+            },
+        );
+
+        let address = AddressAdvertisement {
+            hostname: "GS".into(),
+            address: 42,
+            requested_address: 0,
+            mode: ADDRESS_MODE_DYNAMIC,
+            state: ADDRESS_STATE_APPROVED,
+            birth_ms: 0,
+            owner_hash: 42,
+            reachable_endpoints: vec![ground_station],
+            reachable_network_variables: vec![],
+            reachable_timesync_sources: vec![],
+            link_capabilities: LinkCapabilities {
+                version: 1,
+                flags: 0,
+                profile: crate::discovery::LINK_PROFILE_CANONICAL,
+                max_frame_bytes: 0,
+                compact_header_target_bytes: 0,
+                max_side_transport_templates: 0,
+            },
+        };
+        relay
+            .rx_from_side(uplink, build_discovery_address("GS", 0, &address).unwrap())
+            .unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        uplink_frames.lock().unwrap().clear();
+
+        let packet =
+            Packet::new(status, &[ground_station], "VB", 1, Arc::<[u8]>::from([1u8])).unwrap();
+        // Compact links may preserve only the assigned source address. The
+        // frozen destination identity must still resolve through the direct
+        // DiscoveryAddress advertisement instead of requiring a hostname.
+        let gs_hash = 42u64;
+        let packed = wire_format::pack_packet_with_wire_contract(
+            &packet,
+            Some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 0,
+            }),
+            Some(MessageElement::Static(
+                1,
+                MessageDataType::UInt8,
+                MessageClass::Data,
+            )),
+            &[gs_hash],
+        )
+        .unwrap();
+        relay.rx_packed_from_side(can, packed.as_ref()).unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+
+        assert_eq!(
+            count_packed_frames_of_type(&uplink_frames.lock().unwrap(), status),
+            1,
+            "a target learned from a direct DiscoveryAddress must route across the relay",
+        );
+    }
+
     #[test]
     fn relay_packed_side_chunking_reassembles_for_fixed_size_links() {
         crate::tests::ensure_common_test_schema();
@@ -7437,7 +7550,9 @@ mod router_tests {
             gs.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
                 .unwrap();
             assert!(
-                !rf.export_topology().advertised_endpoints.contains(&endpoint),
+                !rf.export_topology()
+                    .advertised_endpoints
+                    .contains(&endpoint),
                 "managed-variable metadata endpoints must not become local endpoint claims",
             );
 
@@ -12461,10 +12576,8 @@ mod router_tests {
             let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_a_c = seen_a.clone();
             let seen_b_c = seen_b.clone();
-            let relay = Router::new_with_clock(
-                RouterConfig::default().with_sender("RELAY"),
-                zero_clock(),
-            );
+            let relay =
+                Router::new_with_clock(RouterConfig::default().with_sender("RELAY"), zero_clock());
             let side_a = relay.add_side_packet("source", move |packet: &Packet| {
                 seen_a_c.lock().unwrap().push(packet.clone());
                 Ok(())
