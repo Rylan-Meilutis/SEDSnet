@@ -226,6 +226,18 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.pop_back()
     }
 
+    /// Return the priority of the lowest-priority queued item.
+    ///
+    /// Queues populated by [`Self::push_back_prioritized`] keep that item at
+    /// the back, so shared-budget arbitration can compare queues without
+    /// scanning or removing anything first.
+    pub(crate) fn lowest_priority<F>(&self, mut priority_of: F) -> Option<u8>
+    where
+        F: FnMut(&T) -> u8,
+    {
+        self.q.back().map(&mut priority_of)
+    }
+
     /// Remove item at position, updating byte count.
     pub fn remove_pos(&mut self, idx: usize) -> Option<T> {
         let v = self.q.remove(idx)?;
@@ -355,7 +367,9 @@ impl<T: ByteCost> BoundedDeque<T> {
         let new_priority = priority_of(&v);
         while !self.q.is_empty() && self.cur_bytes + cost > self.max_bytes {
             let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
-            if tail_priority > new_priority {
+            if tail_priority > new_priority
+                || (new_priority == 254 && tail_priority == new_priority)
+            {
                 return Err(TelemetryError::Io("priority queue saturated"));
             }
             let _ = self.pop_back();
@@ -363,7 +377,9 @@ impl<T: ByteCost> BoundedDeque<T> {
 
         if self.q.len() >= self.max_elems {
             let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
-            if tail_priority > new_priority {
+            if tail_priority > new_priority
+                || (new_priority == 254 && tail_priority == new_priority)
+            {
                 return Err(TelemetryError::Io("priority queue saturated"));
             }
             let _ = self.pop_back();
@@ -371,7 +387,9 @@ impl<T: ByteCost> BoundedDeque<T> {
 
         if self.fixed_capacity && self.q.len() >= self.q.capacity() {
             let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
-            if tail_priority > new_priority {
+            if tail_priority > new_priority
+                || (new_priority == 254 && tail_priority == new_priority)
+            {
                 return Err(TelemetryError::Io("priority queue saturated"));
             }
             let _ = self.pop_back();
@@ -580,6 +598,36 @@ mod tests {
             err,
             TelemetryError::Io("priority queue saturated")
         ));
+        assert_eq!(q.pop_front().unwrap().id, 1);
+        assert_eq!(q.pop_front().unwrap().id, 2);
+    }
+
+    #[test]
+    fn saturated_control_queue_never_replaces_an_equal_priority_update() {
+        let mut q = BoundedDeque::new(64, 64, 1.0);
+        for id in [1, 2] {
+            q.push_back_prioritized(
+                Item {
+                    id,
+                    cost: 32,
+                    priority: 254,
+                },
+                |item| item.priority,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            q.push_back_prioritized(
+                Item {
+                    id: 3,
+                    cost: 32,
+                    priority: 254,
+                },
+                |item| item.priority,
+            ),
+            Err(TelemetryError::Io("priority queue saturated"))
+        );
         assert_eq!(q.pop_front().unwrap().id, 1);
         assert_eq!(q.pop_front().unwrap().id, 2);
     }
