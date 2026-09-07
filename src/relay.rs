@@ -2452,18 +2452,14 @@ impl Relay {
                     discovered_origin,
                 )))
             } else {
-                if !target_senders.is_empty() {
-                    let fallback = self.eligible_side_ids_locked(
-                        &st,
-                        Some(exclude),
-                        Some(ty),
-                        restrict_link_local,
-                    );
-                    return Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
-                        fallback
-                    } else {
-                        Vec::new()
-                    }));
+                let fallback = self.eligible_side_ids_locked(
+                    &st,
+                    Some(exclude),
+                    Some(ty),
+                    restrict_link_local,
+                );
+                if fallback.len() == 1 {
+                    return Ok(RemoteSidePlan::Target(fallback));
                 }
                 if Self::has_explicit_route_policy_locked(&st, Some(exclude), ty) {
                     let mut sides = self.eligible_side_ids_locked(

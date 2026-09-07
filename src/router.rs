@@ -4693,7 +4693,7 @@ impl Router {
                         matches,
                     ),
                 ))
-            } else if !target_senders.is_empty() {
+            } else if exclude.is_some() {
                 let fallback =
                     self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
                 Ok(RemoteSidePlan::Target(if fallback.len() == 1 {

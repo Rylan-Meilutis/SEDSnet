@@ -4077,6 +4077,32 @@ mod relay_tests {
         );
 
         uplink_frames.lock().unwrap().clear();
+        let packet =
+            Packet::new(status, &[ground_station], "VB", 4, Arc::<[u8]>::from([4u8])).unwrap();
+        let packed = wire_format::pack_packet_with_wire_contract(
+            &packet,
+            Some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 0,
+            }),
+            Some(MessageElement::Static(
+                1,
+                MessageDataType::UInt8,
+                MessageClass::Data,
+            )),
+            &[],
+        )
+        .unwrap();
+        relay.rx_packed_from_side(can, packed.as_ref()).unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            count_packed_frames_of_type(&uplink_frames.lock().unwrap(), status),
+            1,
+            "an untargeted nonlocal packet must cross a two-sided bridge once",
+        );
+
+        uplink_frames.lock().unwrap().clear();
         relay
             .rx_from_side(uplink, build_discovery_address("GS", 0, &address).unwrap())
             .unwrap();
@@ -4109,7 +4135,7 @@ mod relay_tests {
         alternate_frames.lock().unwrap().clear();
 
         let packet =
-            Packet::new(status, &[ground_station], "VB", 4, Arc::<[u8]>::from([4u8])).unwrap();
+            Packet::new(status, &[ground_station], "VB", 5, Arc::<[u8]>::from([5u8])).unwrap();
         let packed = wire_format::pack_packet_with_wire_contract(
             &packet,
             Some(wire_format::ReliableHeader {
