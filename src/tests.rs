@@ -10283,6 +10283,11 @@ mod router_tests {
             router.rx_from_side(&discovery_pkt, side_a).unwrap();
             assert_eq!(router.export_topology().routes.len(), 1);
 
+            // Publish the addition first so the remaining side has a precise
+            // baseline from which to emit a removal delta.
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+
             seen_a.lock().unwrap().clear();
             seen_b.lock().unwrap().clear();
             router.remove_side(side_a).unwrap();
@@ -10306,11 +10311,15 @@ mod router_tests {
                 .unwrap()
                 .reachable_endpoints;
             assert_eq!(eps, vec![DataEndpoint::named("RADIO")]);
-            assert!(
-                b_pkts
-                    .iter()
-                    .any(|pkt| pkt.data_type() == DataType::DiscoveryTopology)
-            );
+            let update = b_pkts
+                .iter()
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryTopology)
+                .map(crate::discovery::decode_discovery_topology_update)
+                .transpose()
+                .unwrap()
+                .expect("removal must emit an incremental topology update");
+            assert!(update.incremental);
+            assert!(update.removed.iter().any(|sender| sender == "REMOTE_A"));
         }
 
         #[test]
@@ -10986,7 +10995,7 @@ mod router_tests {
         }
 
         #[test]
-        fn topology_change_forces_fresh_full_discovery_on_slow_link() {
+        fn topology_change_sends_only_incremental_route_summary_on_slow_link() {
             ensure_topology_test_schema();
 
             let now_ms = Arc::new(AtomicU64::new(5_000));
@@ -11012,10 +11021,15 @@ mod router_tests {
                 .note_side_link_probe_sample(slow, 250, 5_000)
                 .unwrap();
 
-            // Consume the initial full advertisement. Its slow-link throttle
-            // would ordinarily defer another full summary for 120 seconds.
+            // Consume the initial full advertisement. A topology change must
+            // update routes immediately without repeating that full graph.
             router.announce_discovery().unwrap();
             router.process_tx_queue().unwrap();
+            let initial_packets = seen.lock().unwrap().clone();
+            let initial_wire_bytes: usize = initial_packets
+                .iter()
+                .map(|packet| crate::wire_format::pack_packet(packet).len())
+                .sum();
             seen.lock().unwrap().clear();
 
             now_ms.store(10_000, Ordering::SeqCst);
@@ -11034,10 +11048,33 @@ mod router_tests {
             assert!(router.poll_discovery().unwrap());
             router.process_tx_queue().unwrap();
             let packets = seen.lock().unwrap().clone();
+            let topology_updates: Vec<_> = packets
+                .iter()
+                .filter(|pkt| pkt.data_type() == DataType::DiscoveryTopology)
+                .map(|pkt| crate::discovery::decode_discovery_topology_update(pkt).unwrap())
+                .collect();
+            assert!(
+                topology_updates.iter().all(|update| update.incremental),
+                "a route addition must not resend the full topology graph"
+            );
+            assert!(
+                !packets
+                    .iter()
+                    .any(|pkt| pkt.data_type() == DataType::DiscoverySchema),
+                "a route addition must not resend the schema"
+            );
+            let incremental_wire_bytes: usize = packets
+                .iter()
+                .map(|packet| crate::wire_format::pack_packet(packet).len())
+                .sum();
+            assert!(
+                incremental_wire_bytes < initial_wire_bytes,
+                "incremental update ({incremental_wire_bytes} B) must be smaller than full discovery ({initial_wire_bytes} B)"
+            );
             let address = packets
                 .iter()
                 .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
-                .expect("topology change must bypass the stale full-summary deadline");
+                .expect("topology change must emit an immediate route summary");
             assert!(
                 crate::discovery::decode_discovery_address(address)
                     .unwrap()
@@ -11084,6 +11121,12 @@ mod router_tests {
             router.process_tx_queue().unwrap();
 
             let packets = seen.lock().unwrap().clone();
+            assert!(
+                !packets
+                    .iter()
+                    .any(|pkt| pkt.data_type() == DataType::DiscoveryTopology),
+                "network-variable registration must not restart full discovery"
+            );
             let address = packets
                 .iter()
                 .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)

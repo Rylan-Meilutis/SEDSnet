@@ -23,6 +23,7 @@ pub const DISCOVERY_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 pub const DISCOVERY_SLOW_LINK_PING_INTERVAL_MS: u64 = 15_000;
 pub const DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS: u64 = 120_000;
 pub const TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS: u64 = 30_000;
+const DISCOVERY_TOPOLOGY_DELTA_MARKER: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryCadenceState {
@@ -747,6 +748,57 @@ pub fn build_discovery_topology(
     )
 }
 
+/// A topology update decoded from the wire. Full snapshots replace an
+/// announcer's graph; incremental updates only upsert/remove named nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryTopologyUpdate {
+    pub incremental: bool,
+    pub boards: Vec<TopologyBoardNode>,
+    pub removed: Vec<String>,
+}
+
+/// Computes the minimal named-node delta from one normalized graph to another.
+pub fn topology_delta(
+    previous: &[TopologyBoardNode],
+    current: &[TopologyBoardNode],
+) -> (Vec<TopologyBoardNode>, Vec<String>) {
+    let boards = current
+        .iter()
+        .filter(|node| previous.iter().find(|old| old.sender_id == node.sender_id) != Some(*node))
+        .cloned()
+        .collect();
+    let removed = previous
+        .iter()
+        .filter(|old| !current.iter().any(|node| node.sender_id == old.sender_id))
+        .map(|old| old.sender_id.clone())
+        .collect();
+    (boards, removed)
+}
+
+/// Builds a compact topology delta containing only changed and removed nodes.
+pub fn build_discovery_topology_delta(
+    sender: &str,
+    timestamp_ms: u64,
+    boards: &[TopologyBoardNode],
+    removed: &[String],
+) -> TelemetryResult<Packet> {
+    let full = build_discovery_topology(sender, timestamp_ms, boards)?;
+    let mut payload = Vec::with_capacity(full.payload().len() + 8 + removed.len() * 8);
+    payload.extend_from_slice(&DISCOVERY_TOPOLOGY_DELTA_MARKER.to_le_bytes());
+    payload.extend_from_slice(full.payload());
+    payload.extend_from_slice(&(removed.len() as u32).to_le_bytes());
+    for sender_id in removed {
+        encode_string(&mut payload, sender_id)?;
+    }
+    Packet::new(
+        DataType::DiscoveryTopology,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        payload.into(),
+    )
+}
+
 fn decode_string(
     payload: &[u8],
     cursor: &mut usize,
@@ -776,7 +828,60 @@ pub fn decode_discovery_topology(pkt: &Packet) -> TelemetryResult<Vec<TopologyBo
     if pkt.data_type() != DataType::DiscoveryTopology {
         return Err(TelemetryError::InvalidType);
     }
-    decode_discovery_topology_payload(pkt.payload())
+    Ok(decode_discovery_topology_update(pkt)?.boards)
+}
+
+/// Decodes either a legacy/full topology snapshot or an incremental delta.
+pub fn decode_discovery_topology_update(pkt: &Packet) -> TelemetryResult<DiscoveryTopologyUpdate> {
+    if pkt.data_type() != DataType::DiscoveryTopology {
+        return Err(TelemetryError::InvalidType);
+    }
+    let payload = pkt.payload();
+    if payload.len() < 4 {
+        return Err(TelemetryError::Unpack("discovery topology board count"));
+    }
+    let first = u32::from_le_bytes(payload[..4].try_into().expect("4-byte count"));
+    if first != DISCOVERY_TOPOLOGY_DELTA_MARKER {
+        return Ok(DiscoveryTopologyUpdate {
+            incremental: false,
+            boards: decode_discovery_topology_payload(payload)?,
+            removed: Vec::new(),
+        });
+    }
+    if payload.len() < 8 {
+        return Err(TelemetryError::Unpack("discovery topology delta count"));
+    }
+    let count = u32::from_le_bytes(payload[4..8].try_into().expect("4-byte count")) as usize;
+    let mut cursor = 8usize;
+    let mut boards = decode_topology_boards(payload, &mut cursor, count)?;
+    if payload.len().saturating_sub(cursor) < 4 {
+        return Err(TelemetryError::Unpack("discovery topology removal count"));
+    }
+    let removed_count = u32::from_le_bytes(
+        payload[cursor..cursor + 4]
+            .try_into()
+            .expect("4-byte count"),
+    ) as usize;
+    cursor += 4;
+    let mut removed = Vec::with_capacity(removed_count);
+    for _ in 0..removed_count {
+        removed.push(decode_string(
+            payload,
+            &mut cursor,
+            "discovery topology removed sender id",
+        )?);
+    }
+    if cursor != payload.len() {
+        return Err(TelemetryError::Unpack("discovery topology trailing bytes"));
+    }
+    normalize_topology_boards(&mut boards);
+    removed.sort_unstable();
+    removed.dedup();
+    Ok(DiscoveryTopologyUpdate {
+        incremental: true,
+        boards,
+        removed,
+    })
 }
 
 /// Decodes a discovery topology payload into normalized board-node records.
@@ -789,28 +894,43 @@ pub fn decode_discovery_topology_payload(
 
     let count = u32::from_le_bytes(payload[..4].try_into().expect("4-byte count")) as usize;
     let mut cursor = 4usize;
+    let mut boards = decode_topology_boards(payload, &mut cursor, count)?;
+
+    if cursor != payload.len() {
+        return Err(TelemetryError::Unpack("discovery topology trailing bytes"));
+    }
+
+    normalize_topology_boards(&mut boards);
+    Ok(boards)
+}
+
+fn decode_topology_boards(
+    payload: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> TelemetryResult<Vec<TopologyBoardNode>> {
     let mut boards = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let sender_id = decode_string(payload, &mut cursor, "discovery topology sender id")?;
+        let sender_id = decode_string(payload, cursor, "discovery topology sender id")?;
 
-        if payload.len().saturating_sub(cursor) < 4 {
+        if payload.len().saturating_sub(*cursor) < 4 {
             return Err(TelemetryError::Unpack("discovery topology endpoint count"));
         }
         let endpoint_count = u32::from_le_bytes(
-            payload[cursor..cursor + 4]
+            payload[*cursor..*cursor + 4]
                 .try_into()
                 .expect("4-byte count"),
         ) as usize;
-        cursor += 4;
+        *cursor += 4;
         let mut reachable_endpoints = Vec::with_capacity(endpoint_count);
         for _ in 0..endpoint_count {
-            if payload.len().saturating_sub(cursor) < 4 {
+            if payload.len().saturating_sub(*cursor) < 4 {
                 return Err(TelemetryError::Unpack("discovery topology endpoint"));
             }
             let raw =
-                u32::from_le_bytes(payload[cursor..cursor + 4].try_into().expect("4-byte ep"));
-            cursor += 4;
+                u32::from_le_bytes(payload[*cursor..*cursor + 4].try_into().expect("4-byte ep"));
+            *cursor += 4;
             let ep =
                 try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
             if !is_discovery_endpoint(ep) {
@@ -818,39 +938,39 @@ pub fn decode_discovery_topology_payload(
             }
         }
 
-        if payload.len().saturating_sub(cursor) < 4 {
+        if payload.len().saturating_sub(*cursor) < 4 {
             return Err(TelemetryError::Unpack(
                 "discovery topology timesync source count",
             ));
         }
         let source_count = u32::from_le_bytes(
-            payload[cursor..cursor + 4]
+            payload[*cursor..*cursor + 4]
                 .try_into()
                 .expect("4-byte count"),
         ) as usize;
-        cursor += 4;
+        *cursor += 4;
         let mut reachable_timesync_sources = Vec::with_capacity(source_count);
         for _ in 0..source_count {
-            let source = decode_string(payload, &mut cursor, "discovery topology timesync source")?;
+            let source = decode_string(payload, cursor, "discovery topology timesync source")?;
             if !source.is_empty() {
                 reachable_timesync_sources.push(source);
             }
         }
 
-        if payload.len().saturating_sub(cursor) < 4 {
+        if payload.len().saturating_sub(*cursor) < 4 {
             return Err(TelemetryError::Unpack(
                 "discovery topology connection count",
             ));
         }
         let connection_count = u32::from_le_bytes(
-            payload[cursor..cursor + 4]
+            payload[*cursor..*cursor + 4]
                 .try_into()
                 .expect("4-byte count"),
         ) as usize;
-        cursor += 4;
+        *cursor += 4;
         let mut connections = Vec::with_capacity(connection_count);
         for _ in 0..connection_count {
-            let peer = decode_string(payload, &mut cursor, "discovery topology connection")?;
+            let peer = decode_string(payload, cursor, "discovery topology connection")?;
             if !peer.is_empty() {
                 connections.push(peer);
             }
@@ -864,11 +984,6 @@ pub fn decode_discovery_topology_payload(
         });
     }
 
-    if cursor != payload.len() {
-        return Err(TelemetryError::Unpack("discovery topology trailing bytes"));
-    }
-
-    normalize_topology_boards(&mut boards);
     Ok(boards)
 }
 

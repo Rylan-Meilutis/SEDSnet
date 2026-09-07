@@ -1,5 +1,15 @@
 # Changelogs
 
+## Unreleased
+
+- Topology changes now propagate as incremental named-node upserts and removal tombstones instead
+  of restarting discovery with a complete graph on every change.
+- Compact address/ownership summaries refresh routes and managed-variable owners immediately;
+  complete topology snapshots remain available for bootstrap, explicit recovery, and periodic
+  repair after a lost delta.
+- Discovery tests enforce smaller change traffic, multi-hop reliable convergence, late-join full
+  recovery, and exact removal behavior.
+
 ## Version 4.0.18 highlights
 
 - Discovery link capabilities now negotiate compact-template capacity per side.

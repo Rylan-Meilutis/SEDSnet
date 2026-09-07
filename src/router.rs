@@ -477,6 +477,9 @@ struct DiscoverySideState {
 struct DiscoverySideThrottleState {
     next_ping_ms: u64,
     next_full_ms: u64,
+    pending_incremental: bool,
+    has_sent_full: bool,
+    last_topology: Vec<TopologyBoardNode>,
 }
 
 #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -489,6 +492,7 @@ struct TimeSyncSideThrottleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryAdvertiseLevel {
     MinimalPing,
+    Incremental,
     Full,
 }
 
@@ -4839,20 +4843,24 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RouterInner, now_ms: u64) {
         st.discovery_cadence.on_topology_change(now_ms);
-        // A topology change makes every previously emitted compact route
-        // summary stale. Slow links normally send only an empty liveness ping
-        // between full summaries; retaining their old 120 s deadline here can
-        // leave discovery asymmetric when the startup summary was missed.
-        // Make the next cadence emission full on each active slow side so new
-        // endpoint ownership propagates in both directions immediately.
-        for throttle in st.discovery_side_throttle.values_mut() {
-            throttle.next_full_ms = now_ms;
-            throttle.next_ping_ms = now_ms;
+        // Propagate route changes immediately without restarting discovery or
+        // resending the complete topology graph. DiscoveryAddress replaces the
+        // prior compact route summary, so additions and removals converge while
+        // the infrequent full snapshot remains available as loss recovery.
+        for side_id in st
+            .sides
+            .iter()
+            .enumerate()
+            .filter_map(|(side_id, side)| side.as_ref().map(|_| side_id))
+        {
+            st.discovery_side_throttle
+                .entry(side_id)
+                .or_default()
+                .pending_incremental = true;
         }
-        // Compact side frames are only decodable after the receiver has seen
-        // their full header template. A newly discovered or restarted peer
-        // may not share the existing dictionary, so invalidate both halves;
-        // the first post-change frame in each direction is self-describing.
+        // Make the first incremental control frame self-describing. This is a
+        // small header refresh, not a topology reset, and prevents a restarted
+        // peer from missing the route delta because it lost its RX dictionary.
         for transport in st.side_transport.values_mut() {
             transport.clear_header_templates();
         }
@@ -5128,22 +5136,30 @@ impl Router {
         side_id: RouterSideId,
         now_ms: u64,
     ) -> Option<DiscoveryAdvertiseLevel> {
-        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
-            st.discovery_side_throttle.remove(&side_id);
-            return Some(DiscoveryAdvertiseLevel::Full);
-        }
-
+        let slow = Self::side_is_slow_control_link_locked(st, side_id, now_ms);
         let throttle = st.discovery_side_throttle.entry(side_id).or_default();
-        if now_ms >= throttle.next_full_ms {
+        if !throttle.has_sent_full || now_ms >= throttle.next_full_ms {
+            throttle.has_sent_full = true;
+            throttle.pending_incremental = false;
             throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::Full);
         }
-        if now_ms >= throttle.next_ping_ms {
+        if throttle.pending_incremental {
+            throttle.pending_incremental = false;
+            return Some(DiscoveryAdvertiseLevel::Incremental);
+        }
+        if slow && now_ms >= throttle.next_ping_ms {
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::MinimalPing);
         }
-        None
+        if slow {
+            None
+        } else {
+            // A compact address summary refreshes route TTLs without carrying
+            // the full topology graph or schema.
+            Some(DiscoveryAdvertiseLevel::Incremental)
+        }
     }
 
     #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -5266,11 +5282,38 @@ impl Router {
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
+                        Vec::new(),
                         capabilities,
                         local_is_master,
                     ));
                     continue;
                 }
+                let current_topology = if include_side_topology {
+                    self.advertised_discovery_topology_for_link_locked(
+                        &st,
+                        now_ms,
+                        link_local_enabled,
+                        Some(side_id),
+                    )
+                } else {
+                    Vec::new()
+                };
+                let (topology, removed_topology) = match level {
+                    DiscoveryAdvertiseLevel::Full => (current_topology.clone(), Vec::new()),
+                    DiscoveryAdvertiseLevel::Incremental => {
+                        let previous = &st
+                            .discovery_side_throttle
+                            .get(&side_id)
+                            .expect("discovery throttle exists")
+                            .last_topology;
+                        discovery::topology_delta(previous, &current_topology)
+                    }
+                    DiscoveryAdvertiseLevel::MinimalPing => (Vec::new(), Vec::new()),
+                };
+                st.discovery_side_throttle
+                    .get_mut(&side_id)
+                    .expect("discovery throttle exists")
+                    .last_topology = current_topology;
                 per_side.push((
                     side_id,
                     level,
@@ -5286,16 +5329,8 @@ impl Router {
                         now_ms,
                         Some(side_id),
                     ),
-                    if include_side_topology {
-                        self.advertised_discovery_topology_for_link_locked(
-                            &st,
-                            now_ms,
-                            link_local_enabled,
-                            Some(side_id),
-                        )
-                    } else {
-                        Vec::new()
-                    },
+                    topology,
+                    removed_topology,
                     capabilities,
                     local_is_master,
                 ));
@@ -5309,6 +5344,7 @@ impl Router {
             network_variables,
             timesync_sources,
             topology,
+            removed_topology,
             capabilities,
             local_is_master,
         ) in per_side
@@ -5333,7 +5369,10 @@ impl Router {
             }
             #[cfg(not(feature = "std"))]
             let _ = include_schema;
-            if level == DiscoveryAdvertiseLevel::Full {
+            if matches!(
+                level,
+                DiscoveryAdvertiseLevel::Full | DiscoveryAdvertiseLevel::Incremental
+            ) {
                 let address = self.local_address_advertisement(
                     endpoints.clone(),
                     network_variables.clone(),
@@ -5372,8 +5411,20 @@ impl Router {
                     called_from_queue,
                 )?;
             }
-            if include_topology && level == DiscoveryAdvertiseLevel::Full && !topology.is_empty() {
-                let pkt = discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?;
+            if include_topology
+                && (!topology.is_empty() || !removed_topology.is_empty())
+                && level != DiscoveryAdvertiseLevel::MinimalPing
+            {
+                let pkt = if level == DiscoveryAdvertiseLevel::Full {
+                    discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?
+                } else {
+                    discovery::build_discovery_topology_delta(
+                        sender.as_ref(),
+                        now_ms,
+                        &topology,
+                        &removed_topology,
+                    )?
+                };
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
                         src: None,
@@ -5404,6 +5455,13 @@ impl Router {
             st.fit_discovery_budget();
             if st.sides.iter().all(|side| side.is_none()) {
                 return Ok(());
+            }
+            // An explicit announce is the bootstrap/recovery operation. Keep
+            // it full; cadence-triggered topology changes use Incremental.
+            if include_schema {
+                for throttle in st.discovery_side_throttle.values_mut() {
+                    throttle.has_sent_full = false;
+                }
             }
             st.discovery_cadence.on_announce_sent(now_ms);
         }
@@ -5535,7 +5593,7 @@ impl Router {
             return Ok(true);
         }
         let mut decoded_topology = if pkt.data_type() == DataType::DiscoveryTopology {
-            Some(discovery::decode_discovery_topology(pkt)?)
+            Some(discovery::decode_discovery_topology_update(pkt)?)
         } else {
             None
         };
@@ -5556,8 +5614,9 @@ impl Router {
                 // even when the header omits that hostname.
                 decoded_topology
                     .as_ref()
-                    .and_then(|boards| {
-                        boards
+                    .and_then(|update| {
+                        update
+                            .boards
                             .iter()
                             .find(|board| sender_address_u32(&board.sender_id) == address)
                     })
@@ -5579,6 +5638,10 @@ impl Router {
                     self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
+                st.discovery_side_throttle
+                    .entry(side)
+                    .or_default()
+                    .has_sent_full = false;
                 self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
             };
             if should_answer {
@@ -5594,6 +5657,10 @@ impl Router {
                     self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
+                st.discovery_side_throttle
+                    .entry(side)
+                    .or_default()
+                    .has_sent_full = false;
                 self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
             };
             if should_answer {
@@ -5716,24 +5783,42 @@ impl Router {
                 changed
             }
             DataType::DiscoveryTopology => {
-                let mut boards = decoded_topology
+                let mut update = decoded_topology
                     .take()
                     .expect("topology packet was decoded before route selection");
-                for board in boards.iter_mut() {
+                for board in update.boards.iter_mut() {
                     board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
                     for peer in board.connections.iter_mut() {
                         *peer = Self::canonical_sender_locked(&st, peer);
                     }
                 }
                 if !side_link_local_enabled {
-                    for board in boards.iter_mut() {
+                    for board in update.boards.iter_mut() {
                         board
                             .reachable_endpoints
                             .retain(|ep| !ep.is_link_local_only());
                     }
                 }
-                let changed = sender_state.topology_boards != boards;
-                sender_state.topology_boards = boards;
+                let before = sender_state.topology_boards.clone();
+                if update.incremental {
+                    sender_state.topology_boards.retain(|board| {
+                        !update
+                            .removed
+                            .iter()
+                            .any(|removed| removed == &board.sender_id)
+                            && !update
+                                .boards
+                                .iter()
+                                .any(|replacement| replacement.sender_id == board.sender_id)
+                    });
+                    discovery::merge_topology_boards(
+                        &mut sender_state.topology_boards,
+                        &update.boards,
+                    );
+                } else {
+                    sender_state.topology_boards = update.boards;
+                }
+                let changed = sender_state.topology_boards != before;
                 Self::refresh_sender_topology_state(&mut sender_state);
                 changed
             }

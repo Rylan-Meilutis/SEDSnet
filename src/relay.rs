@@ -511,6 +511,9 @@ struct AdaptiveRouteStats {
 struct DiscoverySideThrottleState {
     next_ping_ms: u64,
     next_full_ms: u64,
+    pending_incremental: bool,
+    has_sent_full: bool,
+    last_topology: Vec<TopologyBoardNode>,
 }
 
 #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -523,6 +526,7 @@ struct TimeSyncSideThrottleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryAdvertiseLevel {
     MinimalPing,
+    Incremental,
     Full,
 }
 
@@ -2776,9 +2780,16 @@ impl Relay {
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RelayInner, now_ms: u64) {
         st.discovery_cadence.on_topology_change(now_ms);
-        for throttle in st.discovery_side_throttle.values_mut() {
-            throttle.next_full_ms = now_ms;
-            throttle.next_ping_ms = now_ms;
+        for side_id in st
+            .sides
+            .iter()
+            .enumerate()
+            .filter_map(|(side_id, side)| side.as_ref().map(|_| side_id))
+        {
+            st.discovery_side_throttle
+                .entry(side_id)
+                .or_default()
+                .pending_incremental = true;
         }
         for transport in st.side_transport.values_mut() {
             transport.clear_header_templates();
@@ -2902,22 +2913,28 @@ impl Relay {
         side_id: RelaySideId,
         now_ms: u64,
     ) -> Option<DiscoveryAdvertiseLevel> {
-        if !Self::side_is_slow_control_link_locked(st, side_id, now_ms) {
-            st.discovery_side_throttle.remove(&side_id);
-            return Some(DiscoveryAdvertiseLevel::Full);
-        }
-
+        let slow = Self::side_is_slow_control_link_locked(st, side_id, now_ms);
         let throttle = st.discovery_side_throttle.entry(side_id).or_default();
-        if now_ms >= throttle.next_full_ms {
+        if !throttle.has_sent_full || now_ms >= throttle.next_full_ms {
+            throttle.has_sent_full = true;
+            throttle.pending_incremental = false;
             throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::Full);
         }
-        if now_ms >= throttle.next_ping_ms {
+        if throttle.pending_incremental {
+            throttle.pending_incremental = false;
+            return Some(DiscoveryAdvertiseLevel::Incremental);
+        }
+        if slow && now_ms >= throttle.next_ping_ms {
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::MinimalPing);
         }
-        None
+        if slow {
+            None
+        } else {
+            Some(DiscoveryAdvertiseLevel::Incremental)
+        }
     }
 
     #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -2986,6 +3003,11 @@ impl Relay {
             if !st.sides.iter().any(|side| side.is_some()) {
                 return Ok(());
             }
+            if include_schema {
+                for throttle in st.discovery_side_throttle.values_mut() {
+                    throttle.has_sent_full = false;
+                }
+            }
             st.discovery_cadence.on_announce_sent(now_ms);
             let side_entries = st
                 .sides
@@ -3028,6 +3050,7 @@ impl Relay {
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
+                        Vec::new(),
                         capabilities,
                     ));
                     continue;
@@ -3039,24 +3062,43 @@ impl Relay {
                 );
                 let timesync_sources =
                     self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
-                let topology = self.advertised_discovery_topology_for_link_locked(
+                let current_topology = self.advertised_discovery_topology_for_link_locked(
                     &st,
                     now_ms,
                     link_local_enabled,
                 );
+                let (topology, removed_topology) = match level {
+                    DiscoveryAdvertiseLevel::Full => (current_topology.clone(), Vec::new()),
+                    DiscoveryAdvertiseLevel::Incremental => {
+                        let previous = &st
+                            .discovery_side_throttle
+                            .get(&side_id)
+                            .expect("discovery throttle exists")
+                            .last_topology;
+                        discovery::topology_delta(previous, &current_topology)
+                    }
+                    DiscoveryAdvertiseLevel::MinimalPing => (Vec::new(), Vec::new()),
+                };
+                st.discovery_side_throttle
+                    .get_mut(&side_id)
+                    .expect("discovery throttle exists")
+                    .last_topology = current_topology;
                 per_side.push((
                     side_id,
                     level,
                     endpoints,
                     timesync_sources,
                     topology,
+                    removed_topology,
                     capabilities,
                 ));
             }
             per_side
         };
         let mut st = self.state.lock();
-        for (dst, level, endpoints, timesync_sources, topology, capabilities) in per_side {
+        for (dst, level, endpoints, timesync_sources, topology, removed_topology, capabilities) in
+            per_side
+        {
             let sender = self.sender_arc();
             // no_std schemas are immutable and no_std receivers discard
             // remote schema packets, so only hosted relays advertise them.
@@ -3087,7 +3129,7 @@ impl Relay {
                     priority,
                 })?;
             }
-            if level == DiscoveryAdvertiseLevel::MinimalPing || !endpoints.is_empty() {
+            if level != DiscoveryAdvertiseLevel::Full || !endpoints.is_empty() {
                 let pkt = discovery::build_discovery_announce(
                     sender.as_ref(),
                     now_ms,
@@ -3102,7 +3144,7 @@ impl Relay {
                     priority,
                 })?;
             }
-            if level == DiscoveryAdvertiseLevel::Full && !timesync_sources.is_empty() {
+            if level != DiscoveryAdvertiseLevel::MinimalPing && !timesync_sources.is_empty() {
                 let pkt = discovery::build_discovery_timesync_sources(
                     sender.as_ref(),
                     now_ms,
@@ -3117,8 +3159,19 @@ impl Relay {
                     priority,
                 })?;
             }
-            if level == DiscoveryAdvertiseLevel::Full && !topology.is_empty() {
-                let pkt = discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?;
+            if level != DiscoveryAdvertiseLevel::MinimalPing
+                && (!topology.is_empty() || !removed_topology.is_empty())
+            {
+                let pkt = if level == DiscoveryAdvertiseLevel::Full {
+                    discovery::build_discovery_topology(sender.as_ref(), now_ms, &topology)?
+                } else {
+                    discovery::build_discovery_topology_delta(
+                        sender.as_ref(),
+                        now_ms,
+                        &topology,
+                        &removed_topology,
+                    )?
+                };
                 let data = RelayItem::Packet(Arc::new(pkt));
                 let priority = Self::relay_item_priority(&data)?;
                 st.push_tx(RelayTxItem {
@@ -3253,7 +3306,7 @@ impl Relay {
             None
         };
         let mut topology_ad = if pkt.data_type() == crate::DataType::DiscoveryTopology {
-            Some(discovery::decode_discovery_topology(&pkt)?)
+            Some(discovery::decode_discovery_topology_update(&pkt)?)
         } else {
             None
         };
@@ -3270,8 +3323,9 @@ impl Relay {
             {
                 topology_ad
                     .as_ref()
-                    .and_then(|boards| {
-                        boards
+                    .and_then(|update| {
+                        update
+                            .boards
                             .iter()
                             .find(|board| sender_address_u32(&board.sender_id) == address)
                     })
@@ -3336,24 +3390,42 @@ impl Relay {
                 changed
             }
             crate::DataType::DiscoveryTopology => {
-                let mut boards = topology_ad
+                let mut update = topology_ad
                     .take()
                     .expect("topology packet was decoded before route selection");
-                for board in boards.iter_mut() {
+                for board in update.boards.iter_mut() {
                     board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
                     for peer in board.connections.iter_mut() {
                         *peer = Self::canonical_sender_locked(&st, peer);
                     }
                 }
                 if !side_link_local_enabled {
-                    for board in boards.iter_mut() {
+                    for board in update.boards.iter_mut() {
                         board
                             .reachable_endpoints
                             .retain(|ep| !ep.is_link_local_only());
                     }
                 }
-                let changed = sender_state.topology_boards != boards;
-                sender_state.topology_boards = boards;
+                let before = sender_state.topology_boards.clone();
+                if update.incremental {
+                    sender_state.topology_boards.retain(|board| {
+                        !update
+                            .removed
+                            .iter()
+                            .any(|removed| removed == &board.sender_id)
+                            && !update
+                                .boards
+                                .iter()
+                                .any(|replacement| replacement.sender_id == board.sender_id)
+                    });
+                    discovery::merge_topology_boards(
+                        &mut sender_state.topology_boards,
+                        &update.boards,
+                    );
+                } else {
+                    sender_state.topology_boards = update.boards;
+                }
+                let changed = sender_state.topology_boards != before;
                 Self::refresh_sender_topology_state(&mut sender_state);
                 changed
             }

@@ -145,6 +145,9 @@ With discovery enabled, forwarding also consults the learned side map:
   sides, a newer periodic snapshot is coalesced while any reliable discovery frame from the prior
   snapshot is awaiting its hop ACK; retransmit recovery therefore gets bounded link capacity before
   another topology refresh is admitted.
+- Topology changes publish an address/ownership summary and a node delta. Additions and changes
+  upsert only their named nodes, removals carry named tombstones, and an infrequent full snapshot
+  repairs a missed delta without treating every change as a blank-slate discovery cycle.
 - `export_topology()` snapshots the current learned route map and announce cadence, including
   discovered time source IDs, the top-level `routers` graph, and per-side announcer detail.
 - `note_side_link_probe_sample()` seeds adaptive path selection from a transport-measured bring-up

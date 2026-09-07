@@ -200,11 +200,11 @@ With `discovery` enabled:
 - discovery also propagates a transitive router graph, not just flattened endpoint sets
 - normal traffic defaults to adaptive discovered-path load balancing
 - reliable traffic still fans out across all known discovered candidates
-- topology changes force a fresh full summary even on throttled slow links, while unchanged
-  topology continues using minimal liveness pings
+- topology changes send an immediate address update and added/changed/removed node delta, while
+  full graph snapshots are reserved for bootstrap and infrequent repair
 - compact-header dictionaries are resynchronized on topology changes, making the first subsequent
   data frame self-describing for newly joined or restarted peers
-- enabling or disabling a network variable schedules an immediate full discovery advertisement,
+- enabling or disabling a network variable schedules an immediate compact ownership update,
   including on slow links
 
 `export_topology()` is available on both `Router` and `Relay`.

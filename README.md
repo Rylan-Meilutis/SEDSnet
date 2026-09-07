@@ -73,13 +73,14 @@ or driver timing samples mark constrained sides, after which routers and relays 
 reachability pings across those sides and reserve full schema/topology/time-source refreshes for a
 much slower cadence. Router-managed time sync keeps its normal cadence on fast sides while each
 measured slow side independently receives sparse time-sync traffic, keeping asymmetric or
-time-sliced radio links available for user payloads. A learned topology change invalidates the
-slow-link summary deadline and schedules a full split-horizon refresh immediately; this prevents
-a missed startup advertisement from leaving endpoint discovery one-way for the slow interval.
+time-sliced radio links available for user payloads. A learned topology change schedules an
+immediate split-horizon address update plus a topology delta containing only added, changed, and
+removed nodes. Full topology snapshots remain on the slow repair cadence or are sent in response
+to an explicit bootstrap/recovery request.
 The same topology-change event resets compact-header dictionaries, so the first data frame after a
 peer joins or restarts is self-describing instead of depending on a template that peer may have missed.
-Registering or removing a network variable is also a topology change: it schedules an immediate full
-advertisement so discovery-driven publication never waits for the slow-link refresh interval.
+Registering or removing a network variable schedules the same immediate compact address update, so
+ownership converges without restarting discovery or waiting for the repair interval.
 
 Detailed topology advertisements also honor typed route policy before the graph is cloned or
 encoded. A bridge can disable `SEDSNET_DISCOVERY_TOPOLOGY` on a constrained side while continuing
