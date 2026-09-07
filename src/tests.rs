@@ -7533,6 +7533,71 @@ mod router_tests {
         }
 
         #[test]
+        fn address_summary_does_not_replace_detailed_endpoint_ownership() {
+            ensure_topology_test_schema();
+            let endpoint = DataEndpoint::named("SD_CARD");
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side = router.add_side_packet("gateway-link", |_| Ok(()));
+            let topology = build_discovery_topology(
+                "GB",
+                1,
+                &[
+                    TopologyBoardNode {
+                        sender_id: "GB".into(),
+                        reachable_endpoints: vec![],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GS".into()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "GS".into(),
+                        reachable_endpoints: vec![endpoint],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GB".into()],
+                    },
+                ],
+            )
+            .unwrap();
+            router.rx_from_side(&topology, side).unwrap();
+
+            let summary = crate::discovery::AddressAdvertisement {
+                hostname: "GB".into(),
+                address: 42,
+                requested_address: 0,
+                mode: crate::discovery::ADDRESS_MODE_DYNAMIC,
+                state: crate::discovery::ADDRESS_STATE_APPROVED,
+                birth_ms: 0,
+                owner_hash: 42,
+                reachable_endpoints: vec![endpoint],
+                reachable_network_variables: vec![],
+                reachable_timesync_sources: vec![],
+                link_capabilities: crate::discovery::LinkCapabilities {
+                    version: 1,
+                    flags: 0,
+                    profile: crate::discovery::LINK_PROFILE_CANONICAL,
+                    max_frame_bytes: 0,
+                    compact_header_target_bytes: 0,
+                    max_side_transport_templates: 0,
+                },
+            };
+            let address = crate::discovery::build_discovery_address("GB", 2, &summary).unwrap();
+            router.rx_from_side(&address, side).unwrap();
+
+            let route = &router.export_topology().routes[0].announcers[0];
+            let gateway = route
+                .routers
+                .iter()
+                .find(|board| board.sender_id == "GB")
+                .expect("gateway topology node");
+            let groundstation = route
+                .routers
+                .iter()
+                .find(|board| board.sender_id == "GS")
+                .expect("groundstation topology node");
+            assert!(gateway.reachable_endpoints.is_empty());
+            assert_eq!(groundstation.reachable_endpoints, vec![endpoint]);
+        }
+
+        #[test]
         fn topology_requests_use_elected_master_and_late_joiners_get_fresh_topology() {
             ensure_topology_test_schema();
 

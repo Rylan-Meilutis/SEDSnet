@@ -5426,14 +5426,28 @@ impl Router {
                 route.announcers.remove(pkt.sender());
             }
             let mut sender_state = route.announcers.get(sender_id).cloned().unwrap_or_default();
-            let board = Self::sender_topology_board_mut(&mut sender_state, sender_id);
-            if board.reachable_endpoints != ad.reachable_endpoints {
-                board.reachable_endpoints = ad.reachable_endpoints;
-                changed = true;
-            }
-            if board.reachable_timesync_sources != ad.reachable_timesync_sources {
-                board.reachable_timesync_sources = ad.reachable_timesync_sources;
-                changed = true;
+            // DiscoveryAddress is also the compact/legacy route summary, so a
+            // multi-sided router advertises endpoints reachable *through* it.
+            // Once detailed topology has identified the individual owners,
+            // do not overwrite the announcer's own node with that aggregate.
+            // Doing so makes a bridge appear to own every endpoint behind it
+            // and freezes end-to-end packets to the bridge instead of the
+            // actual destination.
+            let has_detailed_routed_topology = sender_state.topology_boards.len() > 1
+                || sender_state
+                    .topology_boards
+                    .iter()
+                    .any(|board| !board.connections.is_empty());
+            if !has_detailed_routed_topology {
+                let board = Self::sender_topology_board_mut(&mut sender_state, sender_id);
+                if board.reachable_endpoints != ad.reachable_endpoints {
+                    board.reachable_endpoints = ad.reachable_endpoints;
+                    changed = true;
+                }
+                if board.reachable_timesync_sources != ad.reachable_timesync_sources {
+                    board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                    changed = true;
+                }
             }
             if sender_state.reachable_network_variables != ad.reachable_network_variables {
                 sender_state.reachable_network_variables = ad.reachable_network_variables;
