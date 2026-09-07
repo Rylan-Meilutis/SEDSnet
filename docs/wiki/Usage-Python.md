@@ -204,6 +204,8 @@ With `discovery` enabled:
   topology continues using minimal liveness pings
 - compact-header dictionaries are resynchronized on topology changes, making the first subsequent
   data frame self-describing for newly joined or restarted peers
+- enabling or disabling a network variable schedules an immediate full discovery advertisement,
+  including on slow links
 
 `export_topology()` is available on both `Router` and `Relay`.
 

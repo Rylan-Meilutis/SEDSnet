@@ -11048,6 +11048,55 @@ mod router_tests {
         }
 
         #[test]
+        fn enabling_network_variable_forces_fresh_slow_link_advertisement() {
+            ensure_topology_test_schema();
+
+            let now_ms = Arc::new(AtomicU64::new(5_000));
+            let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c = seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_sender("VARIABLE_NODE"),
+                Box::new(SharedClock {
+                    now_ms: now_ms.clone(),
+                }),
+            );
+            let slow =
+                router.add_side_packet("SLOW_UPLINK", move |pkt: &Packet| -> TelemetryResult<()> {
+                    seen_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                });
+            router
+                .note_side_link_probe_sample(slow, 250, 5_000)
+                .unwrap();
+
+            router.announce_discovery().unwrap();
+            router.process_tx_queue().unwrap();
+            seen.lock().unwrap().clear();
+
+            now_ms.store(10_000, Ordering::SeqCst);
+            router
+                .enable_network_variable(
+                    DataType::named("GPS_DATA"),
+                    crate::router::NetworkVariablePermissions::READ_ONLY,
+                )
+                .unwrap();
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+
+            let packets = seen.lock().unwrap().clone();
+            let address = packets
+                .iter()
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
+                .expect("network-variable registration must bypass slow full-summary deadline");
+            let advertised = crate::discovery::decode_discovery_address(address).unwrap();
+            assert!(
+                advertised
+                    .reachable_network_variables
+                    .contains(&DataType::named("GPS_DATA"))
+            );
+        }
+
+        #[test]
         fn relay_slow_links_get_minimal_discovery_pings_between_full_refreshes() {
             let now_ms = Arc::new(AtomicU64::new(5_000));
             let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));

@@ -8701,9 +8701,13 @@ impl Router {
             return Err(TelemetryError::InvalidType);
         }
         let mut st = self.state.lock();
-        st.managed_variable_types.insert(ty.as_u32());
+        let newly_advertised = st.managed_variable_types.insert(ty.as_u32());
         st.managed_variable_permissions
             .insert(ty.as_u32(), permissions);
+        #[cfg(feature = "discovery")]
+        if newly_advertised {
+            Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        }
         Ok(())
     }
 
@@ -8720,22 +8724,30 @@ impl Router {
             return Err(TelemetryError::InvalidType);
         }
         let mut st = self.state.lock();
-        st.managed_variable_types.insert(ty.as_u32());
+        let newly_advertised = st.managed_variable_types.insert(ty.as_u32());
         st.network_variable_update_handlers
             .entry(ty.as_u32())
             .or_default()
             .push(NetworkVariableUpdateHandler {
                 handler: Arc::new(f),
             });
+        #[cfg(feature = "discovery")]
+        if newly_advertised {
+            Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        }
         Ok(())
     }
 
     pub fn disable_managed_variable(&self, ty: DataType) {
         let mut st = self.state.lock();
-        st.managed_variable_types.remove(&ty.as_u32());
+        let was_advertised = st.managed_variable_types.remove(&ty.as_u32());
         st.managed_variable_permissions.remove(&ty.as_u32());
         st.managed_variable_latest.remove(&ty.as_u32());
         st.network_variable_update_handlers.remove(&ty.as_u32());
+        #[cfg(feature = "discovery")]
+        if was_advertised {
+            Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        }
     }
 
     pub fn seed_managed_variable(&self, pkt: Packet) -> TelemetryResult<()> {
@@ -8745,7 +8757,11 @@ impl Router {
         pkt.validate()?;
         {
             let mut st = self.state.lock();
-            st.managed_variable_types.insert(pkt.data_type().as_u32());
+            let newly_advertised = st.managed_variable_types.insert(pkt.data_type().as_u32());
+            #[cfg(feature = "discovery")]
+            if newly_advertised {
+                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+            }
         }
         self.cache_managed_variable_packet(&pkt, false)
     }

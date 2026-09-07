@@ -78,6 +78,8 @@ slow-link summary deadline and schedules a full split-horizon refresh immediatel
 a missed startup advertisement from leaving endpoint discovery one-way for the slow interval.
 The same topology-change event resets compact-header dictionaries, so the first data frame after a
 peer joins or restarts is self-describing instead of depending on a template that peer may have missed.
+Registering or removing a network variable is also a topology change: it schedules an immediate full
+advertisement so discovery-driven publication never waits for the slow-link refresh interval.
 
 Detailed topology advertisements also honor typed route policy before the graph is cloned or
 encoded. A bridge can disable `SEDSNET_DISCOVERY_TOPOLOGY` on a constrained side while continuing
