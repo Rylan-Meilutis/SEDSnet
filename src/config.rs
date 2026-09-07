@@ -2743,8 +2743,6 @@ pub fn merge_owned_schema_snapshot_with_budget(
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
     unsafe { telemetry_lock() };
-    let mut endpoint_changes: Vec<OwnedEndpointDefinition> = Vec::new();
-    let mut type_changes: Vec<OwnedDataTypeDefinition> = Vec::new();
     let mut report = SchemaMergeReport {
         endpoints_added: 0,
         endpoints_replaced: 0,
@@ -2753,57 +2751,36 @@ pub fn merge_owned_schema_snapshot_with_budget(
         types_replaced: 0,
         types_kept: 0,
     };
-    for incoming in snapshot.endpoints {
-        let conflicts_with_batch = endpoint_changes
-            .iter()
-            .any(|def| def.id == incoming.id || def.name == incoming.name);
-        if conflicts_with_batch
-            || endpoint_exists(incoming.id)
-            || embedded_overlay_endpoint_by_name(&incoming.name).is_some()
-            || EMBEDDED_BUILTIN_ENDPOINTS
-                .iter()
-                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-                .any(|def| def.name == incoming.name)
-        {
-            report.endpoints_kept += 1;
-        } else {
-            endpoint_changes.push(incoming);
-            report.endpoints_added += 1;
-        }
-    }
-    for incoming in snapshot.types {
-        if !incoming
-            .endpoints
-            .iter()
-            .all(|ep| endpoint_changes.iter().any(|def| def.id == *ep) || endpoint_exists(*ep))
-        {
-            report.types_kept += 1;
-            continue;
-        }
-        let conflicts_with_batch = type_changes
-            .iter()
-            .any(|def| def.id == incoming.id || def.name == incoming.name);
-        if conflicts_with_batch
-            || data_type_exists(incoming.id)
-            || embedded_overlay_type_by_name(&incoming.name).is_some()
-            || EMBEDDED_BUILTIN_TYPES
-                .iter()
-                .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                .any(|def| def.name == incoming.name)
-        {
-            report.types_kept += 1;
-        } else {
-            type_changes.push(incoming);
-            report.types_added += 1;
-        }
-    }
-    let added_bytes = endpoint_changes
+    // Validate the complete decoded snapshot before publishing anything. The
+    // second pass moves accepted definitions straight into the append-only
+    // overlay, avoiding duplicate change vectors on constrained targets.
+    let added_bytes = snapshot
+        .endpoints
         .iter()
+        .filter(|incoming| {
+            !endpoint_exists(incoming.id)
+                && embedded_overlay_endpoint_by_name(&incoming.name).is_none()
+                && !EMBEDDED_BUILTIN_ENDPOINTS
+                    .iter()
+                    .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                    .any(|def| def.name == incoming.name)
+        })
         .map(embedded_endpoint_allocation_cost)
         .sum::<usize>()
         .saturating_add(
-            type_changes
+            snapshot
+                .types
                 .iter()
+                .filter(|incoming| {
+                    incoming.endpoints.iter().all(|ep| {
+                        endpoint_exists(*ep) || snapshot.endpoints.iter().any(|def| def.id == *ep)
+                    }) && !data_type_exists(incoming.id)
+                        && embedded_overlay_type_by_name(&incoming.name).is_none()
+                        && !EMBEDDED_BUILTIN_TYPES
+                            .iter()
+                            .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                            .any(|def| def.name == incoming.name)
+                })
                 .map(embedded_type_allocation_cost)
                 .sum::<usize>(),
         );
@@ -2816,14 +2793,42 @@ pub fn merge_owned_schema_snapshot_with_budget(
             "Schema exceeds maximum shared queue budget",
         ));
     }
-    if report.changed() {
-        for incoming in endpoint_changes {
+    let mut committed_bytes = 0usize;
+    for incoming in snapshot.endpoints {
+        if !endpoint_exists(incoming.id)
+            && embedded_overlay_endpoint_by_name(&incoming.name).is_none()
+            && !EMBEDDED_BUILTIN_ENDPOINTS
+                .iter()
+                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                .any(|def| def.name == incoming.name)
+        {
+            committed_bytes =
+                committed_bytes.saturating_add(embedded_endpoint_allocation_cost(&incoming));
             push_embedded_endpoint(incoming);
+            report.endpoints_added += 1;
+        } else {
+            report.endpoints_kept += 1;
         }
-        for incoming in type_changes {
+    }
+    for incoming in snapshot.types {
+        if incoming.endpoints.iter().all(|ep| endpoint_exists(*ep))
+            && !data_type_exists(incoming.id)
+            && embedded_overlay_type_by_name(&incoming.name).is_none()
+            && !EMBEDDED_BUILTIN_TYPES
+                .iter()
+                .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                .any(|def| def.name == incoming.name)
+        {
+            committed_bytes =
+                committed_bytes.saturating_add(embedded_type_allocation_cost(&incoming));
             push_embedded_type(incoming);
+            report.types_added += 1;
+        } else {
+            report.types_kept += 1;
         }
-        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(added_bytes, Ordering::Relaxed);
+    }
+    if committed_bytes != 0 {
+        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(committed_bytes, Ordering::Relaxed);
     }
     unsafe { telemetry_unlock() };
     Ok(report)
