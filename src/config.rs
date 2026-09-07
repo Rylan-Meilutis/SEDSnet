@@ -659,6 +659,27 @@ pub struct OwnedRuntimeSchemaSnapshot {
     pub types: Vec<OwnedDataTypeDefinition>,
 }
 
+// Schema catalogs are small, and embedded builds value flash more than the
+// asymptotic speed of Rust's generic unstable sort. These concrete insertion
+// sorts avoid pulling several independently monomorphized quicksort engines
+// into constrained firmware images.
+pub(crate) fn sort_owned_schema(snapshot: &mut OwnedRuntimeSchemaSnapshot) {
+    for index in 1..snapshot.endpoints.len() {
+        let mut cursor = index;
+        while cursor > 0 && snapshot.endpoints[cursor - 1].id.0 > snapshot.endpoints[cursor].id.0 {
+            snapshot.endpoints.swap(cursor - 1, cursor);
+            cursor -= 1;
+        }
+    }
+    for index in 1..snapshot.types.len() {
+        let mut cursor = index;
+        while cursor > 0 && snapshot.types[cursor - 1].id.0 > snapshot.types[cursor].id.0 {
+            snapshot.types.swap(cursor - 1, cursor);
+            cursor -= 1;
+        }
+    }
+}
+
 impl PartialEq<EndpointDefinition> for OwnedEndpointDefinition {
     fn eq(&self, other: &EndpointDefinition) -> bool {
         self.id == other.id
@@ -1516,9 +1537,8 @@ pub fn merge_owned_schema_snapshot_with_budget(
     mut snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
-    snapshot.endpoints.sort_unstable_by_key(|def| def.id.0);
+    sort_owned_schema(&mut snapshot);
     snapshot.endpoints.dedup_by_key(|def| def.id.0);
-    snapshot.types.sort_unstable_by_key(|def| def.id.0);
     snapshot.types.dedup_by_key(|def| def.id.0);
 
     let reg = registry().lock().expect("schema registry poisoned");
@@ -1550,9 +1570,8 @@ fn merge_owned_schema_snapshot_locked(
     reg: &mut Registry,
     mut snapshot: OwnedRuntimeSchemaSnapshot,
 ) -> SchemaMergeReport {
-    snapshot.endpoints.sort_unstable_by_key(|def| def.id.0);
+    sort_owned_schema(&mut snapshot);
     snapshot.endpoints.dedup_by_key(|def| def.id.0);
-    snapshot.types.sort_unstable_by_key(|def| def.id.0);
     snapshot.types.dedup_by_key(|def| def.id.0);
 
     let mut report = SchemaMergeReport {
@@ -2533,8 +2552,6 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
             link_local_only: incoming.link_local_only,
         });
     }
-    endpoints.sort_unstable_by_key(|def| def.id.0);
-
     let mut types: Vec<OwnedDataTypeDefinition> = embedded_static_data_types()
         .into_iter()
         .map(|def| OwnedDataTypeDefinition {
@@ -2567,8 +2584,9 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
             e2e_encryption: incoming.e2e_encryption,
         });
     }
-    types.sort_unstable_by_key(|def| def.id.0);
-    OwnedRuntimeSchemaSnapshot { endpoints, types }
+    let mut snapshot = OwnedRuntimeSchemaSnapshot { endpoints, types };
+    sort_owned_schema(&mut snapshot);
+    snapshot
 }
 
 #[cfg(not(feature = "std"))]
@@ -2708,9 +2726,8 @@ pub fn merge_owned_schema_snapshot_with_budget(
     mut snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
-    snapshot.endpoints.sort_unstable_by_key(|def| def.id.0);
+    sort_owned_schema(&mut snapshot);
     snapshot.endpoints.dedup_by_key(|def| def.id.0);
-    snapshot.types.sort_unstable_by_key(|def| def.id.0);
     snapshot.types.dedup_by_key(|def| def.id.0);
 
     unsafe { telemetry_lock() };

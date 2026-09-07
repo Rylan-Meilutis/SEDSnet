@@ -1177,8 +1177,7 @@ pub fn build_discovery_schema_from_owned_snapshot(
     let mut payload = Vec::new();
     payload.extend_from_slice(&3u32.to_le_bytes());
 
-    schema.endpoints.sort_unstable_by_key(|def| def.id.as_u32());
-    schema.types.sort_unstable_by_key(|def| def.id.as_u32());
+    crate::config::sort_owned_schema(&mut schema);
 
     payload.extend_from_slice(&(schema.endpoints.len() as u32).to_le_bytes());
     for ep in schema.endpoints {
