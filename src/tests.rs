@@ -13610,6 +13610,49 @@ mod router_tests {
         }
 
         #[test]
+        fn compact_sender_alias_cannot_roll_back_a_newer_managed_value() {
+            crate::tests::ensure_common_test_schema();
+            let ty = DataType::named("GPS_DATA");
+            let ep = DataEndpoint::named("RADIO");
+            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let side = router.add_side_packed("wire", |_bytes| Ok(()));
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+                .unwrap();
+
+            let newest = Packet::new(
+                ty,
+                &[ep],
+                "GROUND_STATION",
+                200,
+                Arc::from([1.0_f32, 1.0, 1.0].map(f32::to_le_bytes).concat()),
+            )
+            .unwrap();
+            router.seed_managed_variable(newest).unwrap();
+
+            let stale = Packet::new(
+                ty,
+                &[ep],
+                "GROUND_STATION",
+                100,
+                Arc::from([0.0_f32, 0.0, 0.0].map(f32::to_le_bytes).concat()),
+            )
+            .unwrap();
+            let stale_wire = crate::wire_format::pack_packet(&stale);
+            router.rx_packed_from_side(&stale_wire, side).unwrap();
+
+            assert_eq!(
+                router
+                    .get_cached_network_variable(ty)
+                    .unwrap()
+                    .unwrap()
+                    .data_as_f32()
+                    .unwrap(),
+                vec![1.0, 1.0, 1.0]
+            );
+        }
+
+        #[test]
         fn network_variable_setter_caches_and_respects_permissions() {
             crate::tests::ensure_common_test_schema();
             let ty = DataType::named("GPS_DATA");

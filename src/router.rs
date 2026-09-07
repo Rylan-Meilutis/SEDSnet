@@ -1733,6 +1733,7 @@ struct RouterInner {
 #[derive(Debug, Clone)]
 struct ManagedVariableCacheEntry {
     packet: Packet,
+    sender_address: u32,
     cached_at_ms: u64,
 }
 
@@ -2442,6 +2443,11 @@ impl Router {
         pkt: &Packet,
         notify_handlers: bool,
     ) -> TelemetryResult<()> {
+        let sender_address = pkt
+            .sender()
+            .strip_prefix("@addr:")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or_else(|| sender_address_u32(pkt.sender()));
         let handlers = {
             let mut st = self.state.lock();
             if !st
@@ -2459,7 +2465,7 @@ impl Router {
             // rapid toggles made during one clock tick are not discarded.
             if existing.is_some_and(|entry| {
                 let current = &entry.packet;
-                pkt.sender() == current.sender() && pkt.timestamp() < current.timestamp()
+                sender_address == entry.sender_address && pkt.timestamp() < current.timestamp()
             }) {
                 return Ok(());
             }
@@ -2468,6 +2474,7 @@ impl Router {
                 pkt.data_type().as_u32(),
                 ManagedVariableCacheEntry {
                     packet: pkt.clone(),
+                    sender_address,
                     cached_at_ms: self.clock.now_ms(),
                 },
             );
