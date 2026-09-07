@@ -13457,10 +13457,7 @@ mod router_tests {
                 .find(|route| route.side_id == ingress)
                 .expect("request ingress becomes a discovered subscriber route");
             assert!(client_route.reachable_network_variables.contains(&ty));
-            assert!(client_route.announcers.iter().any(|announcer| {
-                announcer.sender_id == "CLIENT"
-                    && announcer.reachable_network_variables.contains(&ty)
-            }));
+            assert!(client_route.announcers.is_empty());
         }
 
         #[test]

@@ -467,6 +467,7 @@ struct DiscoverySenderState {
 struct DiscoverySideState {
     reachable: Vec<DataEndpoint>,
     reachable_network_variables: Vec<DataType>,
+    requested_network_variables: BTreeMap<DataType, u64>,
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
     announcers: BTreeMap<String, DiscoverySenderState>,
@@ -1836,6 +1837,10 @@ impl RouterInner {
             .saturating_add(size_of::<DiscoverySideState>())
             .saturating_add(route.reachable.len() * size_of::<DataEndpoint>())
             .saturating_add(route.reachable_network_variables.len() * size_of::<DataType>())
+            .saturating_add(
+                route.requested_network_variables.len()
+                    * (size_of::<DataType>() + size_of::<u64>()),
+            )
             .saturating_add(
                 route
                     .reachable_timesync_sources
@@ -4909,6 +4914,15 @@ impl Router {
             reachable_timesync_sources.extend(sender.reachable_timesync_sources.iter().cloned());
             last_seen_ms = last_seen_ms.max(sender.last_seen_ms);
         }
+        reachable_network_variables.extend(route.requested_network_variables.keys().copied());
+        last_seen_ms = last_seen_ms.max(
+            route
+                .requested_network_variables
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0),
+        );
         reachable.sort_unstable();
         reachable.dedup();
         reachable_network_variables.sort_unstable();
@@ -5010,8 +5024,11 @@ impl Router {
             route.announcers.retain(|_, sender| {
                 now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
             });
+            route.requested_network_variables.retain(|_, last_seen_ms| {
+                now_ms.saturating_sub(*last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+            });
             Self::recompute_discovery_side_state(route);
-            !route.announcers.is_empty()
+            !route.announcers.is_empty() || !route.requested_network_variables.is_empty()
         });
         st.discovery_routes != before
     }
@@ -5697,29 +5714,19 @@ impl Router {
         }
         if pkt.data_type() == DataType::ManagedVariableRequest {
             let ty = discovery::decode_managed_variable_request(pkt)?;
-            // A refresh request is direct evidence that the named sender is a
-            // subscriber for this variable on the ingress side. Learn that
-            // ownership incrementally at every hop. This keeps later writes
-            // selective even when a constrained link lost the larger
-            // DiscoveryAddress advertisement that originally carried the
-            // subscription list.
+            // A refresh request is direct evidence that this ingress segment
+            // contains a subscriber for the variable. Track one bounded entry
+            // per type and side rather than manufacturing a full discovery
+            // announcer for every requester. This keeps later writes selective
+            // without growing the topology graph or fragmenting embedded pools.
             {
                 let now_ms = self.clock.now_ms();
                 let mut st = self.state.lock();
                 let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
-                let mut sender_state = route
-                    .announcers
-                    .get(&packet_sender)
-                    .cloned()
-                    .unwrap_or_default();
-                let newly_reachable = !sender_state.reachable_network_variables.contains(&ty);
-                if newly_reachable {
-                    sender_state.reachable_network_variables.push(ty);
-                    sender_state.reachable_network_variables.sort_unstable();
-                    sender_state.reachable_network_variables.dedup();
-                }
-                sender_state.last_seen_ms = now_ms;
-                route.announcers.insert(packet_sender.clone(), sender_state);
+                let newly_reachable = route
+                    .requested_network_variables
+                    .insert(ty, now_ms)
+                    .is_none();
                 Self::recompute_discovery_side_state(&mut route);
                 st.discovery_routes.insert(side, route);
                 st.fit_discovery_budget();
