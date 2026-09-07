@@ -2763,6 +2763,10 @@ impl Relay {
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RelayInner, now_ms: u64) {
         st.discovery_cadence.on_topology_change(now_ms);
+        for throttle in st.discovery_side_throttle.values_mut() {
+            throttle.next_full_ms = now_ms;
+            throttle.next_ping_ms = now_ms;
+        }
     }
 
     #[cfg(feature = "discovery")]

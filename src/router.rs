@@ -4723,20 +4723,7 @@ impl Router {
                         RouteSelectionOrigin::Flood,
                     )))
                 } else {
-                    // A leaf with one eligible uplink has no ambiguous route
-                    // choice.  Discovery can briefly expire or lag while the
-                    // remote topology crosses a bridge; dropping locally
-                    // originated nonlocal traffic during that window loses
-                    // command acknowledgements permanently.  Use the sole
-                    // egress, while multi-sided routers still refuse to
-                    // broadcast an unresolved destination.
-                    let fallback =
-                        self.eligible_side_ids_locked(&st, None, Some(ty), restrict_link_local);
-                    Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
-                        fallback
-                    } else {
-                        Vec::new()
-                    }))
+                    Ok(RemoteSidePlan::Target(Vec::new()))
                 }
             }
         }
@@ -4842,6 +4829,16 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RouterInner, now_ms: u64) {
         st.discovery_cadence.on_topology_change(now_ms);
+        // A topology change makes every previously emitted compact route
+        // summary stale. Slow links normally send only an empty liveness ping
+        // between full summaries; retaining their old 120 s deadline here can
+        // leave discovery asymmetric when the startup summary was missed.
+        // Make the next cadence emission full on each active slow side so new
+        // endpoint ownership propagates in both directions immediately.
+        for throttle in st.discovery_side_throttle.values_mut() {
+            throttle.next_full_ms = now_ms;
+            throttle.next_ping_ms = now_ms;
+        }
     }
 
     #[cfg(feature = "discovery")]

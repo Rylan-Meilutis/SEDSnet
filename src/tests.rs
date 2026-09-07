@@ -7582,27 +7582,8 @@ mod router_tests {
         }
 
         #[test]
-        fn unknown_remote_endpoint_uses_the_only_leaf_uplink_after_topology_exists() {
+        fn unknown_remote_endpoint_does_not_fallback_to_single_side_after_topology_exists() {
             ensure_topology_test_schema();
-            let leaf_endpoint = DataEndpoint::try_named("LEAF_UPLINK_ONLY").unwrap_or_else(|| {
-                register_endpoint_with_description(
-                    "LEAF_UPLINK_ONLY",
-                    "nonlocal endpoint used by the sole-uplink regression",
-                    false,
-                )
-                .expect("register LEAF_UPLINK_ONLY")
-            });
-            let leaf_type = DataType::try_named("LEAF_UPLINK_DATA").unwrap_or_else(|| {
-                register_data_type_with_description(
-                    "LEAF_UPLINK_DATA",
-                    "sole-uplink regression payload",
-                    MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
-                    &[leaf_endpoint],
-                    ReliableMode::None,
-                    1,
-                )
-                .expect("register LEAF_UPLINK_DATA")
-            });
 
             let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_c = seen.clone();
@@ -7621,15 +7602,16 @@ mod router_tests {
                 )
                 .unwrap();
 
-            let pkt = Packet::from_f32_slice(leaf_type, &[1.0_f32, 2.0, 3.0], &[leaf_endpoint], 42)
-                .unwrap();
+            let pkt = Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[1.0_f32, 2.0, 3.0],
+                &[DataEndpoint::named("RADIO")],
+                42,
+            )
+            .unwrap();
             router.tx(pkt).unwrap();
 
-            assert_eq!(
-                seen.lock().unwrap().len(),
-                1,
-                "a leaf must not lose nonlocal traffic during a discovery-route gap"
-            );
+            assert!(seen.lock().unwrap().is_empty());
         }
 
         #[test]
@@ -10896,6 +10878,70 @@ mod router_tests {
                 crate::discovery::decode_discovery_announce(&pkts[0])
                     .unwrap()
                     .is_empty()
+            );
+        }
+
+        #[test]
+        fn topology_change_forces_fresh_full_discovery_on_slow_link() {
+            ensure_topology_test_schema();
+
+            let now_ms = Arc::new(AtomicU64::new(5_000));
+            let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_c = seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                    DataEndpoint::named("RADIO"),
+                    |_pkt| Ok(()),
+                )])
+                .with_sender("BRIDGE"),
+                Box::new(SharedClock {
+                    now_ms: now_ms.clone(),
+                }),
+            );
+            let slow = router.add_side_packet(
+                "SLOW_UPLINK",
+                move |pkt: &Packet| -> TelemetryResult<()> {
+                    seen_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+            );
+            let ingress = router.add_side_packet("LOCAL_BUS", |_pkt| Ok(()));
+            router
+                .note_side_link_probe_sample(slow, 250, 5_000)
+                .unwrap();
+
+            // Consume the initial full advertisement. Its slow-link throttle
+            // would ordinarily defer another full summary for 120 seconds.
+            router.announce_discovery().unwrap();
+            router.process_tx_queue().unwrap();
+            seen.lock().unwrap().clear();
+
+            now_ms.store(10_000, Ordering::SeqCst);
+            router
+                .rx_from_side(
+                    &build_discovery_announce(
+                        "REMOTE_SD",
+                        10_000,
+                        &[DataEndpoint::named("SD_CARD")],
+                    )
+                    .unwrap(),
+                    ingress,
+                )
+                .unwrap();
+
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+            let packets = seen.lock().unwrap().clone();
+            let address = packets
+                .iter()
+                .find(|pkt| pkt.data_type() == DataType::DiscoveryAddress)
+                .expect("topology change must bypass the stale full-summary deadline");
+            assert!(
+                crate::discovery::decode_discovery_address(address)
+                    .unwrap()
+                    .reachable_endpoints
+                    .contains(&DataEndpoint::named("SD_CARD")),
+                "the new transitive endpoint must be advertised immediately"
             );
         }
 
