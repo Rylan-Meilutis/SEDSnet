@@ -11178,6 +11178,117 @@ mod router_tests {
         }
 
         #[test]
+        fn newly_discovered_variable_owner_gets_only_the_cached_latest_value() {
+            ensure_topology_test_schema();
+
+            let ty = DataType::named("GPS_DATA");
+            let endpoint = DataEndpoint::named("RADIO");
+            let owner_seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let unrelated_seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let owner_seen_c = owner_seen.clone();
+            let unrelated_seen_c = unrelated_seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_sender("VARIABLE_WRITER"),
+                zero_clock(),
+            );
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+                .unwrap();
+            let owner_side = router.add_side_packet("owner", move |pkt: &Packet| {
+                owner_seen_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+            router.add_side_packet("unrelated", move |pkt: &Packet| {
+                unrelated_seen_c.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            // With no discovered remote owner, updates remain local instead
+            // of being broadcast to every side. Only the latest value matters.
+            router
+                .set_network_variable(
+                    Packet::from_f32_slice(ty, &[1.0, 2.0, 3.0], &[endpoint], 1).unwrap(),
+                )
+                .unwrap();
+            router
+                .set_network_variable(
+                    Packet::from_f32_slice(ty, &[4.0, 5.0, 6.0], &[endpoint], 2).unwrap(),
+                )
+                .unwrap();
+            router.process_all_queues().unwrap();
+            assert!(
+                owner_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|pkt| pkt.data_type() != ty)
+            );
+            assert!(
+                unrelated_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|pkt| pkt.data_type() != ty)
+            );
+
+            let address = crate::discovery::AddressAdvertisement {
+                hostname: "VARIABLE_READER".into(),
+                address: 42,
+                requested_address: 0,
+                mode: crate::discovery::ADDRESS_MODE_DYNAMIC,
+                state: crate::discovery::ADDRESS_STATE_APPROVED,
+                birth_ms: 0,
+                owner_hash: 42,
+                reachable_endpoints: Vec::new(),
+                reachable_network_variables: vec![ty],
+                reachable_timesync_sources: Vec::new(),
+                link_capabilities: crate::discovery::LinkCapabilities {
+                    version: 1,
+                    flags: 0,
+                    profile: crate::discovery::LINK_PROFILE_CANONICAL,
+                    max_frame_bytes: 0,
+                    compact_header_target_bytes: 0,
+                    max_side_transport_templates: 0,
+                },
+            };
+            let advertisement =
+                crate::discovery::build_discovery_address("VARIABLE_READER", 3, &address).unwrap();
+            router.rx_from_side(&advertisement, owner_side).unwrap();
+            router.process_all_queues().unwrap();
+
+            let owner_values: Vec<Vec<f32>> = owner_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|pkt| pkt.data_type() == ty)
+                .map(|pkt| pkt.data_as_f32().unwrap())
+                .collect();
+            assert_eq!(owner_values, vec![vec![4.0, 5.0, 6.0]]);
+            assert!(
+                unrelated_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|pkt| pkt.data_type() != ty),
+                "owner discovery must not fan the cached value out to unrelated sides"
+            );
+
+            // Repeating the same idempotent advertisement must not replay the
+            // value again; only an actual ownership addition triggers it.
+            router.rx_from_side(&advertisement, owner_side).unwrap();
+            router.process_all_queues().unwrap();
+            assert_eq!(
+                owner_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|pkt| pkt.data_type() == ty)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
         fn relay_slow_links_get_minimal_discovery_pings_between_full_refreshes() {
             let now_ms = Arc::new(AtomicU64::new(5_000));
             let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));

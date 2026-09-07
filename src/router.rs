@@ -5565,6 +5565,7 @@ impl Router {
                 ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
             }
             let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+            let previously_reachable_network_variables = route.reachable_network_variables.clone();
             if pkt.sender() != sender_id {
                 route.announcers.remove(pkt.sender());
             }
@@ -5598,11 +5599,44 @@ impl Router {
             sender_state.last_seen_ms = now_ms;
             route.announcers.insert(sender_id.to_string(), sender_state);
             Self::recompute_discovery_side_state(&mut route);
+            let newly_reachable_network_variables: Vec<DataType> = route
+                .reachable_network_variables
+                .iter()
+                .copied()
+                .filter(|ty| !previously_reachable_network_variables.contains(ty))
+                .collect();
             st.discovery_routes.insert(side, route);
             st.fit_discovery_budget();
             self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
             if changed {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+            }
+            // A writer may have changed a managed variable while no remote
+            // owner route was present. Local-only suppression correctly kept
+            // that update off unrelated links, but the new owner still needs
+            // the latest value. Replay only newly reachable variable types to
+            // this advertising side; do not fan out or restart discovery.
+            let replay: Vec<Packet> = newly_reachable_network_variables
+                .iter()
+                .filter(|ty| Self::managed_variable_permissions_locked(&st, **ty).write)
+                .filter_map(|ty| {
+                    st.managed_variable_latest
+                        .get(&ty.as_u32())
+                        .map(|entry| entry.packet.clone())
+                })
+                .collect();
+            drop(st);
+            for value in replay {
+                self.emit_internal_tx_with_priority(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side,
+                        data: RouterItem::Packet(value),
+                    },
+                    true,
+                    crate::transport_priority(DataType::ManagedVariableValue),
+                    called_from_queue,
+                )?;
             }
             return Ok(true);
         }
