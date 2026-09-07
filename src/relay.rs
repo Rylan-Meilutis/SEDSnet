@@ -2343,6 +2343,7 @@ impl Relay {
             let mut exact_targets = Vec::new();
             let mut had_known = false;
             let mut generic_targets = Vec::new();
+            let mut unique_endpoint_fallbacks = Vec::new();
 
             for (&side, route) in st.discovery_routes.iter() {
                 if side == exclude
@@ -2366,6 +2367,9 @@ impl Relay {
                 if !target_senders.is_empty() {
                     if !Self::side_matches_target_senders_locked(&st, side, &target_senders, now_ms)
                     {
+                        if eps.iter().copied().any(|ep| route.reachable.contains(&ep)) {
+                            unique_endpoint_fallbacks.push(side);
+                        }
                         continue;
                     }
                     had_known = true;
@@ -2383,6 +2387,16 @@ impl Relay {
                     had_known = true;
                     generic_targets.push(side);
                 }
+            }
+
+            // Compact/DHCP links can temporarily disagree on whether a frozen
+            // destination is represented by hostname hash or assigned address.
+            // Preserve autonomous endpoint routing only when discovery gives
+            // one unambiguous non-ingress route; never fan an unknown target
+            // out across multiple sides.
+            if !target_senders.is_empty() && !had_known && unique_endpoint_fallbacks.len() == 1 {
+                had_known = true;
+                generic_targets = unique_endpoint_fallbacks;
             }
 
             if had_exact {

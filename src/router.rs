@@ -3606,6 +3606,7 @@ impl Router {
                 && route.reachable_network_variables.contains(&ty)
         });
         let mut out = Vec::new();
+        let mut unique_endpoint_fallbacks = Vec::new();
 
         for (&side, route) in st.discovery_routes.iter() {
             if exclude == Some(side)
@@ -3629,6 +3630,13 @@ impl Router {
             if !target_senders.is_empty()
                 && !Self::side_matches_target_senders_locked(st, side, target_senders, now_ms)
             {
+                if scoring_eps
+                    .iter()
+                    .copied()
+                    .any(|ep| route.reachable.contains(&ep))
+                {
+                    unique_endpoint_fallbacks.push(side);
+                }
                 continue;
             }
             if !target_senders.is_empty() {
@@ -3661,6 +3669,12 @@ impl Router {
             if overlap > 0 {
                 out.push(DiscoveryCandidateMatch { side, overlap });
             }
+        }
+        if !target_senders.is_empty() && out.is_empty() && unique_endpoint_fallbacks.len() == 1 {
+            out.push(DiscoveryCandidateMatch {
+                side: unique_endpoint_fallbacks[0],
+                overlap: usize::MAX,
+            });
         }
         out
     }

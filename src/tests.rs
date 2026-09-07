@@ -4013,6 +4013,85 @@ mod relay_tests {
             1,
             "a target learned from a direct DiscoveryAddress must route across the relay",
         );
+
+        uplink_frames.lock().unwrap().clear();
+        let packet =
+            Packet::new(status, &[ground_station], "VB", 2, Arc::<[u8]>::from([2u8])).unwrap();
+        let packed = wire_format::pack_packet_with_wire_contract(
+            &packet,
+            Some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 0,
+            }),
+            Some(MessageElement::Static(
+                1,
+                MessageDataType::UInt8,
+                MessageClass::Data,
+            )),
+            &[99u64],
+        )
+        .unwrap();
+        relay.rx_packed_from_side(can, packed.as_ref()).unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            count_packed_frames_of_type(&uplink_frames.lock().unwrap(), status),
+            1,
+            "an unresolved compact target may use one unambiguous endpoint route",
+        );
+
+        uplink_frames.lock().unwrap().clear();
+        let alternate_frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let alternate_frames_c = alternate_frames.clone();
+        let alternate = relay.add_side_packed_with_options(
+            "alternate-uplink",
+            move |bytes: &[u8]| {
+                alternate_frames_c.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RelaySideOptions {
+                reliable_enabled: false,
+                ..RelaySideOptions::default()
+            },
+        );
+        let mut alternate_address = address;
+        alternate_address.hostname = "OTHER".into();
+        alternate_address.address = 43;
+        relay
+            .rx_from_side(
+                alternate,
+                build_discovery_address("OTHER", 0, &alternate_address).unwrap(),
+            )
+            .unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        uplink_frames.lock().unwrap().clear();
+        alternate_frames.lock().unwrap().clear();
+
+        let packet =
+            Packet::new(status, &[ground_station], "VB", 3, Arc::<[u8]>::from([3u8])).unwrap();
+        let packed = wire_format::pack_packet_with_wire_contract(
+            &packet,
+            Some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 0,
+            }),
+            Some(MessageElement::Static(
+                1,
+                MessageDataType::UInt8,
+                MessageClass::Data,
+            )),
+            &[100u64],
+        )
+        .unwrap();
+        relay.rx_packed_from_side(can, packed.as_ref()).unwrap();
+        relay.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            count_packed_frames_of_type(&uplink_frames.lock().unwrap(), status)
+                + count_packed_frames_of_type(&alternate_frames.lock().unwrap(), status),
+            0,
+            "an unresolved target must not fan out across ambiguous endpoint routes",
+        );
     }
 
     #[test]
