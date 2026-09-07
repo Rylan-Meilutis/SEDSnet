@@ -468,6 +468,14 @@ fn topology_snapshot_to_pydict(
             endpoint_ids(&route.reachable_endpoints),
         )?;
         route_dict.set_item(
+            "reachable_network_variables",
+            route
+                .reachable_network_variables
+                .iter()
+                .map(|ty| ty.as_u32())
+                .collect::<Vec<_>>(),
+        )?;
+        route_dict.set_item(
             "reachable_timesync_sources",
             route.reachable_timesync_sources,
         )?;
@@ -482,6 +490,14 @@ fn topology_snapshot_to_pydict(
             announcer_dict.set_item(
                 "reachable_endpoint_ids",
                 endpoint_ids(&announcer.reachable_endpoints),
+            )?;
+            announcer_dict.set_item(
+                "reachable_network_variables",
+                announcer
+                    .reachable_network_variables
+                    .iter()
+                    .map(|ty| ty.as_u32())
+                    .collect::<Vec<_>>(),
             )?;
             announcer_dict.set_item(
                 "reachable_timesync_sources",

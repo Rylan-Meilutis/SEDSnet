@@ -712,6 +712,14 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
         push_endpoint_names_array(&mut out, &endpoint_names, &route.reachable_endpoints);
         out.push_str(",\"reachable_endpoint_ids\":");
         push_endpoint_ids_array(&mut out, &route.reachable_endpoints);
+        out.push_str(",\"reachable_network_variables\":[");
+        for (idx, ty) in route.reachable_network_variables.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{}", ty.as_u32()));
+        }
+        out.push(']');
         out.push_str(",\"reachable_timesync_sources\":");
         push_string_array(&mut out, &route.reachable_timesync_sources);
         out.push_str(",\"announcers\":[");
@@ -726,6 +734,14 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
             push_endpoint_names_array(&mut out, &endpoint_names, &announcer.reachable_endpoints);
             out.push_str(",\"reachable_endpoint_ids\":");
             push_endpoint_ids_array(&mut out, &announcer.reachable_endpoints);
+            out.push_str(",\"reachable_network_variables\":[");
+            for (idx, ty) in announcer.reachable_network_variables.iter().enumerate() {
+                if idx != 0 {
+                    out.push(',');
+                }
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{}", ty.as_u32()));
+            }
+            out.push(']');
             out.push_str(",\"reachable_timesync_sources\":");
             push_string_array(&mut out, &announcer.reachable_timesync_sources);
             out.push_str(",\"routers\":[");

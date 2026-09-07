@@ -8995,6 +8995,9 @@ impl Router {
                             .copied()
                             .filter(|ep| !discovery::is_router_control_endpoint(*ep))
                             .collect(),
+                        reachable_network_variables: sender_state
+                            .reachable_network_variables
+                            .clone(),
                         reachable_timesync_sources: sender_state.reachable_timesync_sources.clone(),
                         routers: sender_state.topology_boards.clone(),
                         last_seen_ms: sender_state.last_seen_ms,
@@ -9010,6 +9013,7 @@ impl Router {
                         .copied()
                         .filter(|ep| !discovery::is_router_control_endpoint(*ep))
                         .collect(),
+                    reachable_network_variables: route.reachable_network_variables.clone(),
                     reachable_timesync_sources: route.reachable_timesync_sources.clone(),
                     announcers,
                     last_seen_ms: route.last_seen_ms,

@@ -92,6 +92,7 @@ pub struct TopologyLink {
 pub struct TopologyAnnouncerRoute {
     pub sender_id: String,
     pub reachable_endpoints: Vec<DataEndpoint>,
+    pub reachable_network_variables: Vec<DataType>,
     pub reachable_timesync_sources: Vec<String>,
     pub routers: Vec<TopologyBoardNode>,
     pub last_seen_ms: u64,
@@ -103,6 +104,7 @@ pub struct TopologySideRoute {
     pub side_id: usize,
     pub side_name: String,
     pub reachable_endpoints: Vec<DataEndpoint>,
+    pub reachable_network_variables: Vec<DataType>,
     pub reachable_timesync_sources: Vec<String>,
     pub announcers: Vec<TopologyAnnouncerRoute>,
     pub last_seen_ms: u64,
