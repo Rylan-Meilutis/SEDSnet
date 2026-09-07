@@ -2527,6 +2527,11 @@ mod tests_extra {
 
         assert_eq!(seen_a.lock().unwrap().len(), 1);
         assert_eq!(seen_b.lock().unwrap().len(), 1);
+        assert_eq!(
+            router.debug_end_to_end_tracked_count(),
+            0,
+            "periodic freshness packets must not create an end-to-end ACK storm",
+        );
     }
 
     // --------------------------- Header-only happy path smoke ---------------------------

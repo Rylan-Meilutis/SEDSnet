@@ -3940,6 +3940,15 @@ impl Router {
         ty: DataType,
         pending: &mut BTreeMap<u64, RouterSideId>,
     ) {
+        // A heartbeat describes current liveness. Retrying an old heartbeat
+        // until every discovered endpoint acknowledges it turns temporary
+        // congestion into an ACK/retransmit storm and can starve fresh
+        // heartbeats. Per-link reliability still applies where configured;
+        // the next periodic heartbeat is the end-to-end freshness retry.
+        if DataType::try_named("HEARTBEAT") == Some(ty) {
+            pending.clear();
+            return;
+        }
         let now_ms = self.clock.now_ms();
         pending.retain(|_, side| {
             Self::side_supports_end_to_end_tracking_locked(st, *side)
