@@ -7453,7 +7453,7 @@ mod router_tests {
                 reliable,
             );
             let rf_c = rf.clone();
-            let gs_radio = gs.add_side_packed_with_options(
+            let _gs_radio = gs.add_side_packed_with_options(
                 "radio",
                 move |bytes| rf_c.rx_packed_from_side(bytes, 0),
                 best_effort,
@@ -7485,37 +7485,9 @@ mod router_tests {
                 &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
                 96,
             );
-            // A network-variable owner does not need a conventional endpoint handler. Model the
-            // routed endpoint topology independently so the writer tracks each real destination.
-            gs.rx_from_side(
-                &build_discovery_topology(
-                    "RF",
-                    2,
-                    &[
-                        TopologyBoardNode {
-                            sender_id: "RF".into(),
-                            reachable_endpoints: vec![endpoint],
-                            reachable_timesync_sources: vec![],
-                            connections: vec!["PB".into(), "FC".into()],
-                        },
-                        TopologyBoardNode {
-                            sender_id: "PB".into(),
-                            reachable_endpoints: vec![endpoint],
-                            reachable_timesync_sources: vec![],
-                            connections: vec!["RF".into()],
-                        },
-                        TopologyBoardNode {
-                            sender_id: "FC".into(),
-                            reachable_endpoints: vec![endpoint],
-                            reachable_timesync_sources: vec![],
-                            connections: vec!["RF".into()],
-                        },
-                    ],
-                )
-                .unwrap(),
-                gs_radio,
-            )
-            .unwrap();
+            // Managed-variable subscriptions advertise their schema endpoints even without a
+            // conventional endpoint callback. Discovery must therefore identify all three owners
+            // without a test-only topology injection.
             // Queue a complete control burst before servicing any router. Real GroundStation
             // startup publishes several managed variables together; serializing each publish
             // behind its ACKs hid packet-id/return-route bugs under concurrent traffic.

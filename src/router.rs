@@ -4691,8 +4691,15 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn local_discovery_endpoints(&self) -> Vec<DataEndpoint> {
+    fn local_discovery_endpoints(&self, st: &RouterInner) -> Vec<DataEndpoint> {
         let mut eps: Vec<DataEndpoint> = self.cfg.handlers.iter().map(|h| h.endpoint).collect();
+        // A managed variable is a local subscription even when the application uses only the
+        // variable callback API and has no conventional endpoint handler. Advertise its schema
+        // endpoints so discovery can identify the actual owners rather than every board that
+        // merely knows the shared schema.
+        for ty in st.managed_variable_types.iter().copied().map(DataType) {
+            eps.extend_from_slice(message_meta(ty).endpoints_ref());
+        }
         #[cfg(feature = "timesync")]
         if self.cfg.timesync_config().is_some() {
             eps.push(DataEndpoint::TimeSync);
@@ -4826,7 +4833,7 @@ impl Router {
         now_ms: u64,
         link_local_enabled: bool,
     ) -> TopologyBoardNode {
-        let mut reachable_endpoints = self.local_discovery_endpoints();
+        let mut reachable_endpoints = self.local_discovery_endpoints(st);
         if !link_local_enabled {
             reachable_endpoints.retain(|ep| !ep.is_link_local_only());
         }
