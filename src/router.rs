@@ -4732,13 +4732,12 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn local_discovery_endpoints(&self, st: &RouterInner) -> Vec<DataEndpoint> {
         let mut eps: Vec<DataEndpoint> = self.cfg.handlers.iter().map(|h| h.endpoint).collect();
-        // A managed variable is a local subscription even when the application uses only the
-        // variable callback API and has no conventional endpoint handler. Advertise its schema
-        // endpoints so discovery can identify the actual owners rather than every board that
-        // merely knows the shared schema.
-        for ty in st.managed_variable_types.iter().copied().map(DataType) {
-            eps.extend_from_slice(message_meta(ty).endpoints_ref());
-        }
+        // Managed-variable ownership has its own discovery field. Its message
+        // endpoints describe delivery sinks, not ownership: treating them as
+        // local endpoints makes every flight-state replica claim that it is
+        // GroundStation and prevents ordinary telemetry from reaching the
+        // real GroundStation route.
+        let _ = st;
         #[cfg(feature = "timesync")]
         if self.cfg.timesync_config().is_some() {
             eps.push(DataEndpoint::TimeSync);

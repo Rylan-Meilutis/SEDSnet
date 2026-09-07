@@ -7436,6 +7436,10 @@ mod router_tests {
             let flight_values = observed(&flight);
             gs.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
                 .unwrap();
+            assert!(
+                !rf.export_topology().advertised_endpoints.contains(&endpoint),
+                "managed-variable metadata endpoints must not become local endpoint claims",
+            );
 
             let reliable = RouterSideOptions {
                 reliable_enabled: true,
@@ -7502,9 +7506,9 @@ mod router_tests {
                 &[gs.as_ref(), rf.as_ref(), power.as_ref(), flight.as_ref()],
                 96,
             );
-            // Managed-variable subscriptions advertise their schema endpoints even without a
-            // conventional endpoint callback. Discovery must therefore identify all three owners
-            // without a test-only topology injection.
+            // Managed-variable subscriptions advertise their type-specific ownership without a
+            // conventional endpoint callback. Discovery must identify all three replicas without
+            // turning the message's delivery endpoints into false local endpoint claims.
             // Queue a complete control burst before servicing any router. Real GroundStation
             // startup publishes several managed variables together; serializing each publish
             // behind its ACKs hid packet-id/return-route bugs under concurrent traffic.
