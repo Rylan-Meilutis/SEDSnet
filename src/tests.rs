@@ -8437,9 +8437,29 @@ mod router_tests {
                     source_side,
                 )
                 .unwrap();
+            let child_address = crate::discovery::AddressAdvertisement {
+                hostname: "AB".into(),
+                address: 42,
+                requested_address: 0,
+                mode: crate::discovery::ADDRESS_MODE_DYNAMIC,
+                state: crate::discovery::ADDRESS_STATE_APPROVED,
+                birth_ms: 0,
+                owner_hash: 42,
+                reachable_endpoints: vec![actuator],
+                reachable_network_variables: vec![],
+                reachable_timesync_sources: vec![],
+                link_capabilities: crate::discovery::LinkCapabilities {
+                    version: 1,
+                    flags: 0,
+                    profile: crate::discovery::LINK_PROFILE_CANONICAL,
+                    max_frame_bytes: 0,
+                    compact_header_target_bytes: 0,
+                    max_side_transport_templates: 0,
+                },
+            };
             gateway
                 .rx_from_side(
-                    &build_discovery_announce("AB", 0, &[actuator]).unwrap(),
+                    &crate::discovery::build_discovery_address("AB", 0, &child_address).unwrap(),
                     gateway_child,
                 )
                 .unwrap();

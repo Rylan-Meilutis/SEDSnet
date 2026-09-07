@@ -2242,14 +2242,14 @@ impl Relay {
                 if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
                     return false;
                 }
-                route.announcers.values().any(|sender_state| {
+                route.announcers.iter().any(|(announcer, sender_state)| {
                     if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
                         return false;
                     }
-                    sender_state
-                        .topology_boards
-                        .iter()
-                        .any(|board| target_senders.contains(&Self::sender_hash(&board.sender_id)))
+                    target_senders.contains(&Self::sender_hash(announcer))
+                        || sender_state.topology_boards.iter().any(|board| {
+                            target_senders.contains(&Self::sender_hash(&board.sender_id))
+                        })
                 })
             })
             .unwrap_or(false)
