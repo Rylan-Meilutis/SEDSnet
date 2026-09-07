@@ -1791,6 +1791,7 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+#[cfg(feature = "std")]
 fn endpoint_fingerprint(def: &OwnedEndpointDefinition) -> u64 {
     let mut h = 0x4550_4445_4600_0001;
     h = hash_u32(h, def.id.0);
@@ -1799,6 +1800,7 @@ fn endpoint_fingerprint(def: &OwnedEndpointDefinition) -> u64 {
     hash_u8(h, def.link_local_only as u8)
 }
 
+#[cfg(feature = "std")]
 fn type_fingerprint(def: &OwnedDataTypeDefinition) -> u64 {
     let mut h = 0x5459_4445_4600_0001;
     h = hash_u32(h, def.id.0);
@@ -1980,6 +1982,7 @@ pub fn remove_data_type_by_name(name: &str) -> TelemetryResult<bool> {
     }
 }
 
+#[cfg(feature = "std")]
 fn endpoint_def_equivalent(a: &OwnedEndpointDefinition, b: &OwnedEndpointDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
@@ -1987,6 +1990,7 @@ fn endpoint_def_equivalent(a: &OwnedEndpointDefinition, b: &OwnedEndpointDefinit
         && a.link_local_only == b.link_local_only
 }
 
+#[cfg(feature = "std")]
 fn type_def_equivalent(a: &OwnedDataTypeDefinition, b: &OwnedDataTypeDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
@@ -1998,6 +2002,7 @@ fn type_def_equivalent(a: &OwnedDataTypeDefinition, b: &OwnedDataTypeDefinition)
         && a.e2e_encryption == b.e2e_encryption
 }
 
+#[cfg(feature = "std")]
 fn endpoint_winner(
     a: &OwnedEndpointDefinition,
     b: &OwnedEndpointDefinition,
@@ -2007,6 +2012,7 @@ fn endpoint_winner(
     if a_key <= b_key { a.clone() } else { b.clone() }
 }
 
+#[cfg(feature = "std")]
 fn type_winner(
     a: &OwnedDataTypeDefinition,
     b: &OwnedDataTypeDefinition,
@@ -2582,47 +2588,21 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
         .into_iter()
         .map(own_embedded_endpoint)
         .collect();
-    let mut learned_endpoints = Vec::new();
     let mut endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
     while !endpoint_node.is_null() {
-        learned_endpoints.push(unsafe { (*endpoint_node).def });
+        endpoints.push(own_embedded_endpoint(unsafe { (*endpoint_node).def }));
         endpoint_node = unsafe { (*endpoint_node).next };
-    }
-    for incoming in learned_endpoints.into_iter().rev() {
-        endpoints.retain(|def| def.id != incoming.id && def.name != incoming.name);
-        endpoints.push(OwnedEndpointDefinition {
-            id: incoming.id,
-            name: incoming.name.to_string(),
-            description: incoming.description.to_string(),
-            link_local_only: incoming.link_local_only,
-        });
     }
     let mut types: Vec<OwnedDataTypeDefinition> = embedded_static_data_types()
         .into_iter()
         .map(own_embedded_type)
         .collect();
-    let mut learned_types = Vec::new();
     let mut type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
     while !type_node.is_null() {
-        learned_types.push(unsafe { (*type_node).def });
+        types.push(own_embedded_type(unsafe { (*type_node).def }));
         type_node = unsafe { (*type_node).next };
     }
-    for incoming in learned_types.into_iter().rev() {
-        types.retain(|def| def.id != incoming.id && def.name != incoming.name);
-        types.push(OwnedDataTypeDefinition {
-            id: incoming.id,
-            name: incoming.name.to_string(),
-            description: incoming.description.to_string(),
-            element: incoming.element,
-            endpoints: incoming.endpoints.to_vec(),
-            reliable: incoming.reliable,
-            priority: incoming.priority,
-            e2e_encryption: incoming.e2e_encryption,
-        });
-    }
-    let mut snapshot = OwnedRuntimeSchemaSnapshot { endpoints, types };
-    sort_owned_schema(&mut snapshot);
-    snapshot
+    OwnedRuntimeSchemaSnapshot { endpoints, types }
 }
 
 #[cfg(not(feature = "std"))]
@@ -2759,13 +2739,9 @@ pub fn merge_schema_snapshot(snapshot: RuntimeSchemaSnapshot) -> SchemaMergeRepo
 
 #[cfg(not(feature = "std"))]
 pub fn merge_owned_schema_snapshot_with_budget(
-    mut snapshot: OwnedRuntimeSchemaSnapshot,
+    snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
-    sort_owned_schema(&mut snapshot);
-    snapshot.endpoints.dedup_by_key(|def| def.id.0);
-    snapshot.types.dedup_by_key(|def| def.id.0);
-
     unsafe { telemetry_lock() };
     let mut endpoint_changes: Vec<OwnedEndpointDefinition> = Vec::new();
     let mut type_changes: Vec<OwnedDataTypeDefinition> = Vec::new();
@@ -2778,24 +2754,21 @@ pub fn merge_owned_schema_snapshot_with_budget(
         types_kept: 0,
     };
     for incoming in snapshot.endpoints {
-        let conflict = endpoint_changes
+        let conflicts_with_batch = endpoint_changes
             .iter()
-            .find(|def| def.id == incoming.id || def.name == incoming.name)
-            .cloned()
-            .or_else(|| endpoint_definition(incoming.id))
-            .or_else(|| endpoint_definition_by_name(&incoming.name));
-        match conflict {
-            None => {
-                endpoint_changes.push(incoming.clone());
-                report.endpoints_added += 1;
-            }
-            Some(existing) if endpoint_def_equivalent(&existing, &incoming) => {}
-            Some(existing) if endpoint_winner(&existing, &incoming) == incoming => {
-                endpoint_changes.retain(|def| def.id != existing.id && def.name != existing.name);
-                endpoint_changes.push(incoming);
-                report.endpoints_replaced += 1;
-            }
-            Some(_) => report.endpoints_kept += 1,
+            .any(|def| def.id == incoming.id || def.name == incoming.name);
+        if conflicts_with_batch
+            || endpoint_exists(incoming.id)
+            || embedded_overlay_endpoint_by_name(&incoming.name).is_some()
+            || EMBEDDED_BUILTIN_ENDPOINTS
+                .iter()
+                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                .any(|def| def.name == incoming.name)
+        {
+            report.endpoints_kept += 1;
+        } else {
+            endpoint_changes.push(incoming);
+            report.endpoints_added += 1;
         }
     }
     for incoming in snapshot.types {
@@ -2807,24 +2780,21 @@ pub fn merge_owned_schema_snapshot_with_budget(
             report.types_kept += 1;
             continue;
         }
-        let conflict = type_changes
+        let conflicts_with_batch = type_changes
             .iter()
-            .find(|def| def.id == incoming.id || def.name == incoming.name)
-            .cloned()
-            .or_else(|| data_type_definition(incoming.id))
-            .or_else(|| data_type_definition_by_name(&incoming.name));
-        match conflict {
-            None => {
-                type_changes.push(incoming.clone());
-                report.types_added += 1;
-            }
-            Some(existing) if type_def_equivalent(&existing, &incoming) => {}
-            Some(existing) if type_winner(&existing, &incoming) == incoming => {
-                type_changes.retain(|def| def.id != existing.id && def.name != existing.name);
-                type_changes.push(incoming);
-                report.types_replaced += 1;
-            }
-            Some(_) => report.types_kept += 1,
+            .any(|def| def.id == incoming.id || def.name == incoming.name);
+        if conflicts_with_batch
+            || data_type_exists(incoming.id)
+            || embedded_overlay_type_by_name(&incoming.name).is_some()
+            || EMBEDDED_BUILTIN_TYPES
+                .iter()
+                .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                .any(|def| def.name == incoming.name)
+        {
+            report.types_kept += 1;
+        } else {
+            type_changes.push(incoming);
+            report.types_added += 1;
         }
     }
     let added_bytes = endpoint_changes
