@@ -7440,7 +7440,7 @@ mod router_tests {
             rf.add_side_packed_with_options(
                 "radio",
                 move |bytes| gs_c.rx_packed_from_side(bytes, 0),
-                best_effort,
+                reliable,
             );
             let power_c = power.clone();
             let flight_c = flight.clone();
@@ -7450,25 +7450,33 @@ mod router_tests {
                     power_c.rx_packed_from_side(bytes, 0)?;
                     flight_c.rx_packed_from_side(bytes, 0)
                 },
-                reliable,
+                best_effort,
             );
             let rf_c = rf.clone();
             let _gs_radio = gs.add_side_packed_with_options(
                 "radio",
                 move |bytes| rf_c.rx_packed_from_side(bytes, 0),
+                reliable,
+            );
+            let rf_c = rf.clone();
+            let flight_c = flight.clone();
+            power.add_side_packed_with_options(
+                "can",
+                move |bytes| {
+                    rf_c.rx_packed_from_side(bytes, 1)?;
+                    flight_c.rx_packed_from_side(bytes, 0)
+                },
                 best_effort,
             );
             let rf_c = rf.clone();
-            power.add_side_packed_with_options(
-                "can",
-                move |bytes| rf_c.rx_packed_from_side(bytes, 1),
-                reliable,
-            );
-            let rf_c = rf.clone();
+            let power_c = power.clone();
             flight.add_side_packed_with_options(
                 "can",
-                move |bytes| rf_c.rx_packed_from_side(bytes, 1),
-                reliable,
+                move |bytes| {
+                    rf_c.rx_packed_from_side(bytes, 1)?;
+                    power_c.rx_packed_from_side(bytes, 0)
+                },
+                best_effort,
             );
 
             for router in [&gs, &rf, &power, &flight] {

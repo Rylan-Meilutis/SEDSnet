@@ -9929,6 +9929,16 @@ impl Router {
         if Self::is_end_to_end_ack_packet(pkt)
             && let Ok(packet_id) = Self::decode_end_to_end_reliable_ack(pkt.payload())
         {
+            // Relays may also keep a retransmission record for the forwarded
+            // packet. Clearing that local record must not consume an ACK whose
+            // frozen wire contract targets the original sender beyond this
+            // router; it still has to travel back along the learned return
+            // route. This occurs when a router is itself one managed-variable
+            // owner while additional owners sit behind another side.
+            let targets_local_sender = pkt.wire_target_senders().is_empty()
+                || pkt
+                    .wire_target_senders()
+                    .contains(&Self::sender_hash(self.sender_arc().as_ref()));
             let mut st = self.state.lock();
             if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&packet_id) {
                 if let Some(sender_hash) = Self::end_to_end_ack_sender_hash(pkt) {
@@ -9936,10 +9946,10 @@ impl Router {
                     if sent.pending_destinations.is_empty() {
                         st.end_to_end_reliable_tx.remove(&packet_id);
                     }
-                    return Ok(true);
+                    return Ok(targets_local_sender);
                 }
                 st.end_to_end_reliable_tx.remove(&packet_id);
-                return Ok(true);
+                return Ok(targets_local_sender);
             }
             return Ok(false);
         }
