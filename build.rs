@@ -41,10 +41,6 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
         let id = 100_u32 + u32::try_from(index).expect("too many schema endpoints");
         let name = required_str(endpoint, "name");
         let rust_name = endpoint["rust"].as_str().unwrap_or(name);
-        let description = endpoint["doc"]
-            .as_str()
-            .or_else(|| endpoint["description"].as_str())
-            .unwrap_or("");
         let link_local = endpoint["link_local_only"].as_bool().unwrap_or(false)
             || endpoint["broadcast_mode"].as_str() == Some("Never");
         endpoint_ids.insert(rust_name.to_owned(), id);
@@ -52,7 +48,7 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
             generated,
             "    EndpointDefinition {{ id: DataEndpoint({id}), name: {}, description: {}, link_local_only: {link_local} }},",
             rust_string(name),
-            rust_string(description),
+            rust_string(""),
         )
         .unwrap();
     }
@@ -62,10 +58,6 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
     for (index, ty) in types.iter().enumerate() {
         let id = 100_u32 + u32::try_from(index).expect("too many schema types");
         let name = required_str(ty, "name");
-        let description = ty["doc"]
-            .as_str()
-            .or_else(|| ty["description"].as_str())
-            .unwrap_or("");
         let class = match required_str(ty, "class") {
             "Data" => "MessageClass::Data",
             "Error" => "MessageClass::Error",
@@ -133,7 +125,7 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
             generated,
             "    DataTypeDefinition {{ id: DataType({id}), name: {}, description: {}, element: {element}, endpoints: &[{endpoint_expr}], reliable: {reliable}, priority: {priority}, e2e_encryption: {e2e} }},",
             rust_string(name),
-            rust_string(description),
+            rust_string(""),
         )
         .unwrap();
     }
