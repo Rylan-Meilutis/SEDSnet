@@ -118,8 +118,8 @@ configured shared queue budget throughout the pressure run.
 `memory_lifecycle_test` tracks the process allocator while schemas, packets, routers, relays, and
 failure rollbacks are repeatedly created and destroyed. Live allocation counts and bytes must
 return to the warmed baseline after every cycle. `embedded_memory_behavior_test` runs the library's
-`no_std` path on the host and verifies that immutable embedded routers discard large remote schema
-snapshots without decoding or retaining another payload allocation.
+`no_std` path on the host and verifies that embedded routers merge received definitions into a
+bounded runtime overlay and advertise the resulting network schema.
 
 This repo does not currently publish or gate on a single required coverage percentage in `build.py test`. Coverage is
 tracked primarily through regression tests across unit, Rust system, and C system layers. If you want a local

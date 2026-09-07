@@ -4639,7 +4639,11 @@ impl Router {
                     }
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
-                return Ok(RemoteSidePlan::Target(Vec::new()));
+                // A busy multi-source relay can age a packet-id return entry
+                // out of its bounded cache before the end-to-end ACK arrives.
+                // The ACK still carries the original sender hash, so fall
+                // through to the discovered named-sender route. This remains
+                // selective and avoids either dropping the ACK or flooding it.
             }
             let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
             let prefer_best_overlap = is_reliable_type(ty)
@@ -5364,11 +5368,6 @@ impl Router {
         ) in per_side
         {
             let sender = self.sender_arc();
-            // Embedded schemas are immutable flash tables and embedded peers
-            // intentionally ignore remote schema packets. Avoid constructing
-            // and chunking a multi-kilobyte transient frame that no peer can
-            // consume; hosted routers retain dynamic schema discovery.
-            #[cfg(feature = "std")]
             if include_schema && level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
                 self.emit_internal_tx(
@@ -5381,8 +5380,6 @@ impl Router {
                     called_from_queue,
                 )?;
             }
-            #[cfg(not(feature = "std"))]
-            let _ = include_schema;
             if matches!(
                 level,
                 DiscoveryAdvertiseLevel::Full | DiscoveryAdvertiseLevel::Incremental
@@ -5742,31 +5739,19 @@ impl Router {
             return Ok(false);
         }
         if pkt.data_type() == DataType::DiscoverySchema {
-            // no_std schemas are generated into immutable flash tables. The
-            // no_std merge operation is intentionally a no-op, so decoding a
-            // remote schema here only creates a large transient allocation and
-            // then discards it. The packed packet has already passed framing
-            // and CRC validation; host/std routers still decode and merge it.
-            #[cfg(not(feature = "std"))]
-            return Ok(true);
-
-            #[cfg(feature = "std")]
-            {
-                let snapshot = discovery::decode_discovery_schema(pkt)?;
-                let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
+            let snapshot = discovery::decode_discovery_schema(pkt)?;
+            let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
+            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
+            let budget = st.memory.max_queue_budget;
+            drop(st);
+            let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
+            if report.changed() {
                 let mut st = self.state.lock();
-                st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
-                let budget = st.memory.max_queue_budget;
-                drop(st);
-                let report =
-                    crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
-                if report.changed() {
-                    let mut st = self.state.lock();
-                    st.fit_discovery_budget();
-                    Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
-                }
-                return Ok(true);
+                st.fit_discovery_budget();
+                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
+            return Ok(true);
         }
         if pkt.data_type() == DataType::DiscoveryLinkCapabilities {
             let _ = discovery::decode_discovery_link_capabilities(pkt)?;

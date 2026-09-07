@@ -165,6 +165,12 @@ Notes:
 Discovery includes schema advertisements. When nodes connect, they can exchange
 the current endpoint/type list and merge compatible definitions.
 
+Embedded/no-std nodes keep their generated local schema in flash and retain only
+network-learned additions or deterministic conflict winners in a bounded RAM
+overlay. They do not duplicate the compiled schema into RAM. Schema packets are
+forwarded across router sides, so a newly attached node's definitions converge
+through the network without reflashing existing firmware.
+
 Merge behavior:
 
 - new endpoint/type definitions are added

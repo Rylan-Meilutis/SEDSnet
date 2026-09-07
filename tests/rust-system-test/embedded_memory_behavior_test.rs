@@ -1,11 +1,18 @@
 #![cfg(not(feature = "std"))]
 
-use sedsnet::config::{DataEndpoint, DataType};
-use sedsnet::packet::Packet;
+use sedsnet::config::{
+    DataEndpoint, DataType, OwnedDataTypeDefinition, OwnedEndpointDefinition,
+    OwnedRuntimeSchemaSnapshot, data_type_definition, endpoint_definition,
+    merge_owned_schema_snapshot_with_budget, schema_bytes_used,
+};
+use sedsnet::discovery::build_discovery_schema_from_owned_snapshot;
 use sedsnet::router::{Router, RouterConfig};
+use sedsnet::{E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement, ReliableMode};
 
 use std::sync::Arc;
 use std::sync::Mutex;
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 // The no_std library delegates synchronization to the platform. This test is
 // single-threaded, so no-op host shims are sufficient to execute that path.
@@ -16,31 +23,52 @@ extern "C" fn telemetry_lock() {}
 extern "C" fn telemetry_unlock() {}
 
 #[test]
-fn immutable_embedded_router_ignores_remote_schema_without_decoding_it() {
+fn embedded_router_merges_remote_schema_into_its_bounded_overlay() {
+    let _guard = TEST_LOCK.lock().unwrap();
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
     let side = router.add_side_packed("embedded-link", |_bytes| Ok(()));
 
-    // This is intentionally not a valid discovery-schema encoding. Immutable
-    // no_std nodes cannot merge remote schemas, so they must accept and discard
-    // the already-framed packet without allocating a decoded snapshot.
-    let payload = Arc::<[u8]>::from(vec![0xA5; 128 * 1024]);
-    let packet = Packet::new(
-        DataType::DiscoverySchema,
-        &[DataEndpoint::Discovery],
+    let endpoint = DataEndpoint(28_001);
+    let data_type = DataType(28_002);
+    let packet = build_discovery_schema_from_owned_snapshot(
         "REMOTE_NODE",
         1,
-        payload.clone(),
+        OwnedRuntimeSchemaSnapshot {
+            endpoints: vec![OwnedEndpointDefinition {
+                id: endpoint,
+                name: "DYNAMIC_REMOTE_ENDPOINT".into(),
+                description: String::new(),
+                link_local_only: false,
+            }],
+            types: vec![OwnedDataTypeDefinition {
+                id: data_type,
+                name: "DYNAMIC_REMOTE_VALUE".into(),
+                description: String::new(),
+                element: MessageElement::Static(1, MessageDataType::UInt32, MessageClass::Data),
+                endpoints: vec![endpoint],
+                reliable: ReliableMode::Ordered,
+                priority: 42,
+                e2e_encryption: E2eEncryptionPolicy::PreferOff,
+            }],
+        },
     )
     .unwrap();
-    let payload_owners = Arc::strong_count(&payload);
 
     router.rx_from_side(&packet, side).unwrap();
 
-    assert_eq!(Arc::strong_count(&payload), payload_owners);
+    assert_eq!(
+        endpoint_definition(endpoint).unwrap().name,
+        "DYNAMIC_REMOTE_ENDPOINT"
+    );
+    assert_eq!(
+        data_type_definition(data_type).unwrap().name,
+        "DYNAMIC_REMOTE_VALUE"
+    );
 }
 
 #[test]
-fn immutable_embedded_router_does_not_advertise_unused_schema_frames() {
+fn embedded_router_advertises_its_merged_schema() {
+    let _guard = TEST_LOCK.lock().unwrap();
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
     let frames = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let captured = frames.clone();
@@ -54,9 +82,29 @@ fn immutable_embedded_router_does_not_advertise_unused_schema_frames() {
 
     let frames = frames.lock().unwrap();
     assert!(!frames.is_empty());
-    assert!(frames.iter().all(|bytes| {
+    assert!(frames.iter().any(|bytes| {
         sedsnet::wire_format::unpack_packet(bytes)
-            .map(|packet| packet.data_type() != DataType::DiscoverySchema)
-            .unwrap_or(true)
+            .map(|packet| packet.data_type() == DataType::DiscoverySchema)
+            .unwrap_or(false)
     }));
+}
+
+#[test]
+fn embedded_schema_budget_failure_is_atomic() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let endpoint = DataEndpoint(28_101);
+    let before = schema_bytes_used();
+    let oversized = OwnedRuntimeSchemaSnapshot {
+        endpoints: vec![OwnedEndpointDefinition {
+            id: endpoint,
+            name: "X".repeat(1024),
+            description: String::new(),
+            link_local_only: false,
+        }],
+        types: Vec::new(),
+    };
+
+    assert!(merge_owned_schema_snapshot_with_budget(oversized, before + 64).is_err());
+    assert!(endpoint_definition(endpoint).is_none());
+    assert_eq!(schema_bytes_used(), before);
 }

@@ -1027,10 +1027,7 @@ fn read_u32(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telemetr
 
 /// Builds a discovery packet containing the complete runtime schema snapshot.
 pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
-    #[cfg(feature = "std")]
     return build_discovery_schema_from_owned_snapshot(sender, timestamp_ms, export_schema());
-    #[cfg(not(feature = "std"))]
-    return build_discovery_schema_from_snapshot(sender, timestamp_ms, export_schema());
 }
 
 /// Elects the authoritative discovery/schema master for the current topology view.
@@ -1188,12 +1185,9 @@ pub fn build_discovery_schema_from_owned_snapshot(
         payload.extend_from_slice(&ep.id.as_u32().to_le_bytes());
         payload.push(ep.link_local_only as u8);
         encode_string(&mut payload, &ep.name)?;
-        // Descriptions are documentation, not routing metadata. Embedded nodes
-        // retain them in flash for local introspection, but transmitting them
-        // duplicates several KiB into the constrained discovery queue.
-        #[cfg(feature = "std")]
-        encode_string(&mut payload, &ep.description)?;
-        #[cfg(not(feature = "std"))]
+        // Descriptions are documentation, not routing metadata. Every node
+        // keeps its local copy, while omitting them here prevents schema sync
+        // from consuming constrained radio/CAN queue capacity.
         encode_string(&mut payload, "")?;
     }
 
@@ -1201,9 +1195,6 @@ pub fn build_discovery_schema_from_owned_snapshot(
     for ty in schema.types {
         payload.extend_from_slice(&ty.id.as_u32().to_le_bytes());
         encode_string(&mut payload, &ty.name)?;
-        #[cfg(feature = "std")]
-        encode_string(&mut payload, &ty.description)?;
-        #[cfg(not(feature = "std"))]
         encode_string(&mut payload, "")?;
         match ty.element {
             MessageElement::Static(count, data_type, class) => {

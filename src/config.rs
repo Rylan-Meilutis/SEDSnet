@@ -9,6 +9,8 @@ use crate::{
     E2eEncryptionPolicy, EndpointMeta, MessageClass, MessageDataType, MessageElement, MessageMeta,
     ReliableMode, TelemetryError, TelemetryResult, parse_f64, parse_strings, parse_usize,
 };
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use alloc::sync::Arc;
 use alloc::{
@@ -16,6 +18,8 @@ use alloc::{
     vec::Vec,
 };
 use core::mem::size_of;
+#[cfg(not(feature = "std"))]
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[cfg(feature = "std")]
@@ -1747,22 +1751,18 @@ pub fn max_data_type_id() -> u32 {
         .unwrap_or(0)
 }
 
-#[cfg(feature = "std")]
 fn hash_u8(h: u64, v: u8) -> u64 {
     hash_bytes(h, &[v])
 }
 
-#[cfg(feature = "std")]
 fn hash_u32(h: u64, v: u32) -> u64 {
     hash_bytes(h, &v.to_le_bytes())
 }
 
-#[cfg(feature = "std")]
 fn hash_usize(h: u64, v: usize) -> u64 {
     hash_bytes(h, &(v as u64).to_le_bytes())
 }
 
-#[cfg(feature = "std")]
 fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01B3;
     for &b in bytes {
@@ -1772,7 +1772,6 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-#[cfg(feature = "std")]
 fn endpoint_fingerprint(def: &OwnedEndpointDefinition) -> u64 {
     let mut h = 0x4550_4445_4600_0001;
     h = hash_u32(h, def.id.0);
@@ -1781,7 +1780,6 @@ fn endpoint_fingerprint(def: &OwnedEndpointDefinition) -> u64 {
     hash_u8(h, def.link_local_only as u8)
 }
 
-#[cfg(feature = "std")]
 fn type_fingerprint(def: &OwnedDataTypeDefinition) -> u64 {
     let mut h = 0x5459_4445_4600_0001;
     h = hash_u32(h, def.id.0);
@@ -1797,7 +1795,6 @@ fn type_fingerprint(def: &OwnedDataTypeDefinition) -> u64 {
     h
 }
 
-#[cfg(feature = "std")]
 fn hash_message_element(mut h: u64, element: MessageElement) -> u64 {
     match element {
         MessageElement::Static(count, data_type, class) => {
@@ -1964,26 +1961,24 @@ pub fn remove_data_type_by_name(name: &str) -> TelemetryResult<bool> {
     }
 }
 
-#[cfg(feature = "std")]
 fn endpoint_def_equivalent(a: &OwnedEndpointDefinition, b: &OwnedEndpointDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
-        && a.description == b.description
+        && (a.description == b.description || a.description.is_empty() || b.description.is_empty())
         && a.link_local_only == b.link_local_only
 }
 
-#[cfg(feature = "std")]
 fn type_def_equivalent(a: &OwnedDataTypeDefinition, b: &OwnedDataTypeDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
-        && a.description == b.description
+        && (a.description == b.description || a.description.is_empty() || b.description.is_empty())
         && a.element == b.element
         && a.endpoints == b.endpoints
         && a.reliable == b.reliable
         && a.priority == b.priority
+        && a.e2e_encryption == b.e2e_encryption
 }
 
-#[cfg(feature = "std")]
 fn endpoint_winner(
     a: &OwnedEndpointDefinition,
     b: &OwnedEndpointDefinition,
@@ -1993,7 +1988,6 @@ fn endpoint_winner(
     if a_key <= b_key { a.clone() } else { b.clone() }
 }
 
-#[cfg(feature = "std")]
 fn type_winner(
     a: &OwnedDataTypeDefinition,
     b: &OwnedDataTypeDefinition,
@@ -2224,296 +2218,630 @@ pub fn register_data_type_id_with_description_and_e2e_encryption(
 }
 
 #[cfg(not(feature = "std"))]
-pub fn export_schema() -> RuntimeSchemaSnapshot {
-    RuntimeSchemaSnapshot {
-        endpoints: known_endpoints(),
-        types: known_data_types(),
-    }
-}
+const EMBEDDED_BUILTIN_ENDPOINTS: &[EndpointDefinition] = &[
+    EndpointDefinition {
+        id: DataEndpoint::TelemetryError,
+        name: "SEDSNET_ERROR",
+        description: "",
+        link_local_only: false,
+    },
+    EndpointDefinition {
+        id: DataEndpoint::TimeSync,
+        name: "SEDSNET_TIME_SYNC",
+        description: "",
+        link_local_only: false,
+    },
+    EndpointDefinition {
+        id: DataEndpoint::Discovery,
+        name: "SEDSNET_DISCOVERY",
+        description: "",
+        link_local_only: false,
+    },
+];
 
 #[cfg(not(feature = "std"))]
-pub fn known_endpoints() -> Vec<EndpointDefinition> {
-    let mut endpoints = Vec::with_capacity(3 + EMBEDDED_SCHEMA_ENDPOINTS.len());
-    endpoints.extend_from_slice(&[
-        EndpointDefinition {
-            id: DataEndpoint::TelemetryError,
-            name: "SEDSNET_ERROR",
-            description: "",
-            link_local_only: false,
-        },
-        EndpointDefinition {
-            id: DataEndpoint::TimeSync,
-            name: "SEDSNET_TIME_SYNC",
-            description: "",
-            link_local_only: false,
-        },
-        EndpointDefinition {
-            id: DataEndpoint::Discovery,
-            name: "SEDSNET_DISCOVERY",
-            description: "",
-            link_local_only: false,
-        },
-    ]);
+fn embedded_static_endpoints() -> Vec<EndpointDefinition> {
+    let mut endpoints = EMBEDDED_BUILTIN_ENDPOINTS.to_vec();
     endpoints.extend_from_slice(EMBEDDED_SCHEMA_ENDPOINTS);
     endpoints
 }
 
 #[cfg(not(feature = "std"))]
-pub fn known_data_types() -> Vec<DataTypeDefinition> {
-    let mut types = Vec::with_capacity(20 + EMBEDDED_SCHEMA_TYPES.len());
-    types.extend_from_slice(&[
-        DataTypeDefinition {
-            id: DataType::TelemetryError,
-            name: "SEDSNET_ERROR",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
-            endpoints: &[DataEndpoint::TelemetryError],
-            reliable: ReliableMode::None,
-            priority: 255,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::ReliableAck,
-            name: "SEDSNET_RELIABLE_ACK",
-            description: "",
-            element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
-            endpoints: &[DataEndpoint::TelemetryError],
-            reliable: ReliableMode::None,
-            priority: 250,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::ReliablePacketRequest,
-            name: "SEDSNET_RELIABLE_PACKET_REQUEST",
-            description: "",
-            element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
-            endpoints: &[DataEndpoint::TelemetryError],
-            reliable: ReliableMode::None,
-            priority: 250,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::ReliablePartialAck,
-            name: "SEDSNET_RELIABLE_PARTIAL_ACK",
-            description: "",
-            element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
-            endpoints: &[DataEndpoint::TelemetryError],
-            reliable: ReliableMode::None,
-            priority: 250,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::TimeSyncAnnounce,
-            name: "SEDSNET_TIME_SYNC_ANNOUNCE",
-            description: "",
-            element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
-            endpoints: &[DataEndpoint::TimeSync],
-            reliable: ReliableMode::None,
-            priority: 245,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::TimeSyncRequest,
-            name: "SEDSNET_TIME_SYNC_REQUEST",
-            description: "",
-            element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
-            endpoints: &[DataEndpoint::TimeSync],
-            reliable: ReliableMode::None,
-            priority: 245,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::TimeSyncResponse,
-            name: "SEDSNET_TIME_SYNC_RESPONSE",
-            description: "",
-            element: MessageElement::Static(4, MessageDataType::UInt64, MessageClass::Data),
-            endpoints: &[DataEndpoint::TimeSync],
-            reliable: ReliableMode::None,
-            priority: 245,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryAnnounce,
-            name: "SEDSNET_DISCOVERY_ANNOUNCE",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt32, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::None,
-            priority: 240,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryTimeSyncSources,
-            name: "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::None,
-            priority: 240,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryTopology,
-            name: "SEDSNET_DISCOVERY_TOPOLOGY",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 240,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoverySchema,
-            name: "SEDSNET_DISCOVERY_SCHEMA",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 241,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryTopologyRequest,
-            name: "SEDSNET_DISCOVERY_TOPOLOGY_REQUEST",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 242,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoverySchemaRequest,
-            name: "SEDSNET_DISCOVERY_SCHEMA_REQUEST",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 242,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::ManagedVariableRequest,
-            name: "SEDSNET_MANAGED_VARIABLE_REQUEST",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 243,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::ManagedVariableValue,
-            name: "SEDSNET_MANAGED_VARIABLE_VALUE",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 243,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryLeave,
-            name: "SEDSNET_DISCOVERY_LEAVE",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::None,
-            priority: 244,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryLinkCapabilities,
-            name: "SEDSNET_DISCOVERY_LINK_CAPABILITIES",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::None,
-            priority: 240,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::DiscoveryAddress,
-            name: "SEDSNET_DISCOVERY_ADDRESS",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 244,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-        DataTypeDefinition {
-            id: DataType::P2pMessage,
-            name: "SEDSNET_P2P_MESSAGE",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
-            endpoints: &[DataEndpoint::Discovery],
-            reliable: ReliableMode::Ordered,
-            priority: 246,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        },
-    ]);
+const EMBEDDED_BUILTIN_TYPES: &[DataTypeDefinition] = &[
+    DataTypeDefinition {
+        id: DataType::TelemetryError,
+        name: "SEDSNET_ERROR",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
+        endpoints: &[DataEndpoint::TelemetryError],
+        reliable: ReliableMode::None,
+        priority: 255,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::ReliableAck,
+        name: "SEDSNET_RELIABLE_ACK",
+        description: "",
+        element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
+        endpoints: &[DataEndpoint::TelemetryError],
+        reliable: ReliableMode::None,
+        priority: 250,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::ReliablePacketRequest,
+        name: "SEDSNET_RELIABLE_PACKET_REQUEST",
+        description: "",
+        element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
+        endpoints: &[DataEndpoint::TelemetryError],
+        reliable: ReliableMode::None,
+        priority: 250,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::ReliablePartialAck,
+        name: "SEDSNET_RELIABLE_PARTIAL_ACK",
+        description: "",
+        element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
+        endpoints: &[DataEndpoint::TelemetryError],
+        reliable: ReliableMode::None,
+        priority: 250,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::TimeSyncAnnounce,
+        name: "SEDSNET_TIME_SYNC_ANNOUNCE",
+        description: "",
+        element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
+        endpoints: &[DataEndpoint::TimeSync],
+        reliable: ReliableMode::None,
+        priority: 245,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::TimeSyncRequest,
+        name: "SEDSNET_TIME_SYNC_REQUEST",
+        description: "",
+        element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
+        endpoints: &[DataEndpoint::TimeSync],
+        reliable: ReliableMode::None,
+        priority: 245,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::TimeSyncResponse,
+        name: "SEDSNET_TIME_SYNC_RESPONSE",
+        description: "",
+        element: MessageElement::Static(4, MessageDataType::UInt64, MessageClass::Data),
+        endpoints: &[DataEndpoint::TimeSync],
+        reliable: ReliableMode::None,
+        priority: 245,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryAnnounce,
+        name: "SEDSNET_DISCOVERY_ANNOUNCE",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt32, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::None,
+        priority: 240,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryTimeSyncSources,
+        name: "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::None,
+        priority: 240,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryTopology,
+        name: "SEDSNET_DISCOVERY_TOPOLOGY",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 240,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoverySchema,
+        name: "SEDSNET_DISCOVERY_SCHEMA",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 241,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryTopologyRequest,
+        name: "SEDSNET_DISCOVERY_TOPOLOGY_REQUEST",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 242,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoverySchemaRequest,
+        name: "SEDSNET_DISCOVERY_SCHEMA_REQUEST",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 242,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::ManagedVariableRequest,
+        name: "SEDSNET_MANAGED_VARIABLE_REQUEST",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 243,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::ManagedVariableValue,
+        name: "SEDSNET_MANAGED_VARIABLE_VALUE",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 243,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryLeave,
+        name: "SEDSNET_DISCOVERY_LEAVE",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::None,
+        priority: 244,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryLinkCapabilities,
+        name: "SEDSNET_DISCOVERY_LINK_CAPABILITIES",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::None,
+        priority: 240,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::DiscoveryAddress,
+        name: "SEDSNET_DISCOVERY_ADDRESS",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 244,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+    DataTypeDefinition {
+        id: DataType::P2pMessage,
+        name: "SEDSNET_P2P_MESSAGE",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
+        endpoints: &[DataEndpoint::Discovery],
+        reliable: ReliableMode::Ordered,
+        priority: 246,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    },
+];
+
+#[cfg(not(feature = "std"))]
+fn embedded_static_data_types() -> Vec<DataTypeDefinition> {
+    let mut types = EMBEDDED_BUILTIN_TYPES.to_vec();
     types.extend_from_slice(EMBEDDED_SCHEMA_TYPES);
     types
 }
 
 #[cfg(not(feature = "std"))]
-pub fn merge_schema_snapshot(_snapshot: RuntimeSchemaSnapshot) -> SchemaMergeReport {
-    SchemaMergeReport {
-        endpoints_added: 0,
-        endpoints_replaced: 0,
-        endpoints_kept: 0,
-        types_added: 0,
-        types_replaced: 0,
-        types_kept: 0,
+struct EmbeddedEndpointNode {
+    def: EndpointDefinition,
+    next: *mut EmbeddedEndpointNode,
+}
+
+#[cfg(not(feature = "std"))]
+struct EmbeddedTypeNode {
+    def: DataTypeDefinition,
+    next: *mut EmbeddedTypeNode,
+}
+
+// Learned definitions are immutable append-only nodes. Readers never lock and
+// normal packet metadata lookup never allocates. Superseded definitions remain
+// accounted against the schema budget, which makes both memory use and update
+// count bounded even under repeated conflicting advertisements.
+#[cfg(not(feature = "std"))]
+static EMBEDDED_ENDPOINT_HEAD: AtomicPtr<EmbeddedEndpointNode> =
+    AtomicPtr::new(core::ptr::null_mut());
+#[cfg(not(feature = "std"))]
+static EMBEDDED_TYPE_HEAD: AtomicPtr<EmbeddedTypeNode> = AtomicPtr::new(core::ptr::null_mut());
+#[cfg(not(feature = "std"))]
+static EMBEDDED_SCHEMA_OWNED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(feature = "std"))]
+unsafe extern "C" {
+    fn telemetry_lock();
+    fn telemetry_unlock();
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_overlay_endpoint(id: DataEndpoint) -> Option<EndpointDefinition> {
+    let mut node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    while !node.is_null() {
+        // SAFETY: published nodes and their referenced fields are immutable
+        // and intentionally live until reboot.
+        let current = unsafe { &*node };
+        if current.def.id == id {
+            return Some(current.def);
+        }
+        node = current.next;
+    }
+    None
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_overlay_type(id: DataType) -> Option<DataTypeDefinition> {
+    let mut node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    while !node.is_null() {
+        // SAFETY: published nodes and their referenced fields are immutable
+        // and intentionally live until reboot.
+        let current = unsafe { &*node };
+        if current.def.id == id {
+            return Some(current.def);
+        }
+        node = current.next;
+    }
+    None
+}
+
+#[cfg(not(feature = "std"))]
+fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
+    let mut endpoints: Vec<OwnedEndpointDefinition> = embedded_static_endpoints()
+        .into_iter()
+        .map(|def| OwnedEndpointDefinition {
+            id: def.id,
+            name: def.name.to_string(),
+            description: def.description.to_string(),
+            link_local_only: def.link_local_only,
+        })
+        .collect();
+    let mut learned_endpoints = Vec::new();
+    let mut endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    while !endpoint_node.is_null() {
+        learned_endpoints.push(unsafe { (*endpoint_node).def });
+        endpoint_node = unsafe { (*endpoint_node).next };
+    }
+    for incoming in learned_endpoints.into_iter().rev() {
+        endpoints.retain(|def| def.id != incoming.id && def.name != incoming.name);
+        endpoints.push(OwnedEndpointDefinition {
+            id: incoming.id,
+            name: incoming.name.to_string(),
+            description: incoming.description.to_string(),
+            link_local_only: incoming.link_local_only,
+        });
+    }
+    endpoints.sort_unstable_by_key(|def| def.id.0);
+
+    let mut types: Vec<OwnedDataTypeDefinition> = embedded_static_data_types()
+        .into_iter()
+        .map(|def| OwnedDataTypeDefinition {
+            id: def.id,
+            name: def.name.to_string(),
+            description: def.description.to_string(),
+            element: def.element,
+            endpoints: def.endpoints.to_vec(),
+            reliable: def.reliable,
+            priority: def.priority,
+            e2e_encryption: def.e2e_encryption,
+        })
+        .collect();
+    let mut learned_types = Vec::new();
+    let mut type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    while !type_node.is_null() {
+        learned_types.push(unsafe { (*type_node).def });
+        type_node = unsafe { (*type_node).next };
+    }
+    for incoming in learned_types.into_iter().rev() {
+        types.retain(|def| def.id != incoming.id && def.name != incoming.name);
+        types.push(OwnedDataTypeDefinition {
+            id: incoming.id,
+            name: incoming.name.to_string(),
+            description: incoming.description.to_string(),
+            element: incoming.element,
+            endpoints: incoming.endpoints.to_vec(),
+            reliable: incoming.reliable,
+            priority: incoming.priority,
+            e2e_encryption: incoming.e2e_encryption,
+        });
+    }
+    types.sort_unstable_by_key(|def| def.id.0);
+    OwnedRuntimeSchemaSnapshot { endpoints, types }
+}
+
+#[cfg(not(feature = "std"))]
+fn materialize_embedded_endpoint(def: OwnedEndpointDefinition) -> EndpointDefinition {
+    EndpointDefinition {
+        id: def.id,
+        name: Box::leak(def.name.into_boxed_str()),
+        description: Box::leak(def.description.into_boxed_str()),
+        link_local_only: def.link_local_only,
     }
 }
 
 #[cfg(not(feature = "std"))]
+fn materialize_embedded_type(def: OwnedDataTypeDefinition) -> DataTypeDefinition {
+    DataTypeDefinition {
+        id: def.id,
+        name: Box::leak(def.name.into_boxed_str()),
+        description: Box::leak(def.description.into_boxed_str()),
+        element: def.element,
+        endpoints: Box::leak(def.endpoints.into_boxed_slice()),
+        reliable: def.reliable,
+        priority: def.priority,
+        e2e_encryption: def.e2e_encryption,
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_endpoint_allocation_cost(def: &OwnedEndpointDefinition) -> usize {
+    size_of::<EmbeddedEndpointNode>()
+        .saturating_add(def.name.len())
+        .saturating_add(def.description.len())
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_type_allocation_cost(def: &OwnedDataTypeDefinition) -> usize {
+    size_of::<EmbeddedTypeNode>()
+        .saturating_add(def.name.len())
+        .saturating_add(def.description.len())
+        .saturating_add(
+            def.endpoints
+                .len()
+                .saturating_mul(size_of::<DataEndpoint>()),
+        )
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_static_schema_cost() -> usize {
+    EMBEDDED_BUILTIN_ENDPOINTS
+        .iter()
+        .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+        .map(|def| endpoint_schema_byte_cost(def.name.len(), def.description.len()))
+        .sum::<usize>()
+        .saturating_add(
+            EMBEDDED_BUILTIN_TYPES
+                .iter()
+                .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                .map(|def| {
+                    type_schema_byte_cost(
+                        def.name.len(),
+                        def.description.len(),
+                        def.endpoints.len(),
+                    )
+                })
+                .sum::<usize>(),
+        )
+}
+
+#[cfg(not(feature = "std"))]
+fn push_embedded_endpoint(def: OwnedEndpointDefinition) {
+    let node = Box::new(EmbeddedEndpointNode {
+        def: materialize_embedded_endpoint(def),
+        next: EMBEDDED_ENDPOINT_HEAD.load(Ordering::Relaxed),
+    });
+    EMBEDDED_ENDPOINT_HEAD.store(Box::into_raw(node), Ordering::Release);
+}
+
+#[cfg(not(feature = "std"))]
+fn push_embedded_type(def: OwnedDataTypeDefinition) {
+    let node = Box::new(EmbeddedTypeNode {
+        def: materialize_embedded_type(def),
+        next: EMBEDDED_TYPE_HEAD.load(Ordering::Relaxed),
+    });
+    EMBEDDED_TYPE_HEAD.store(Box::into_raw(node), Ordering::Release);
+}
+
+#[cfg(not(feature = "std"))]
+pub fn export_schema() -> OwnedRuntimeSchemaSnapshot {
+    effective_embedded_schema()
+}
+
+#[cfg(not(feature = "std"))]
+pub fn known_endpoints() -> Vec<OwnedEndpointDefinition> {
+    export_schema().endpoints
+}
+
+#[cfg(not(feature = "std"))]
+pub fn known_data_types() -> Vec<OwnedDataTypeDefinition> {
+    export_schema().types
+}
+
+#[cfg(not(feature = "std"))]
+pub fn merge_schema_snapshot(snapshot: RuntimeSchemaSnapshot) -> SchemaMergeReport {
+    merge_owned_schema_snapshot_with_budget(
+        OwnedRuntimeSchemaSnapshot {
+            endpoints: snapshot
+                .endpoints
+                .into_iter()
+                .map(|def| OwnedEndpointDefinition {
+                    id: def.id,
+                    name: def.name.to_string(),
+                    description: def.description.to_string(),
+                    link_local_only: def.link_local_only,
+                })
+                .collect(),
+            types: snapshot
+                .types
+                .into_iter()
+                .map(|def| OwnedDataTypeDefinition {
+                    id: def.id,
+                    name: def.name.to_string(),
+                    description: def.description.to_string(),
+                    element: def.element,
+                    endpoints: def.endpoints.to_vec(),
+                    reliable: def.reliable,
+                    priority: def.priority,
+                    e2e_encryption: def.e2e_encryption,
+                })
+                .collect(),
+        },
+        usize::MAX,
+    )
+    .expect("unbounded embedded schema merge")
+}
+
+#[cfg(not(feature = "std"))]
 pub fn merge_owned_schema_snapshot_with_budget(
-    _snapshot: OwnedRuntimeSchemaSnapshot,
-    _max_schema_bytes: usize,
+    mut snapshot: OwnedRuntimeSchemaSnapshot,
+    max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
-    Ok(SchemaMergeReport {
+    snapshot.endpoints.sort_unstable_by_key(|def| def.id.0);
+    snapshot.endpoints.dedup_by_key(|def| def.id.0);
+    snapshot.types.sort_unstable_by_key(|def| def.id.0);
+    snapshot.types.dedup_by_key(|def| def.id.0);
+
+    unsafe { telemetry_lock() };
+    let mut effective = effective_embedded_schema();
+    let mut endpoint_changes = Vec::new();
+    let mut type_changes = Vec::new();
+    let mut report = SchemaMergeReport {
         endpoints_added: 0,
         endpoints_replaced: 0,
         endpoints_kept: 0,
         types_added: 0,
         types_replaced: 0,
         types_kept: 0,
-    })
+    };
+    for incoming in snapshot.endpoints {
+        let conflict = effective
+            .endpoints
+            .iter()
+            .find(|def| def.id == incoming.id || def.name == incoming.name)
+            .cloned();
+        match conflict {
+            None => {
+                endpoint_changes.push(incoming.clone());
+                effective.endpoints.push(incoming);
+                report.endpoints_added += 1;
+            }
+            Some(existing) if endpoint_def_equivalent(&existing, &incoming) => {}
+            Some(existing) if endpoint_winner(&existing, &incoming) == incoming => {
+                endpoint_changes.push(incoming.clone());
+                effective
+                    .endpoints
+                    .retain(|def| def.id != existing.id && def.name != existing.name);
+                effective.endpoints.push(incoming);
+                report.endpoints_replaced += 1;
+            }
+            Some(_) => report.endpoints_kept += 1,
+        }
+    }
+    for incoming in snapshot.types {
+        if !incoming
+            .endpoints
+            .iter()
+            .all(|ep| effective.endpoints.iter().any(|def| def.id == *ep))
+        {
+            report.types_kept += 1;
+            continue;
+        }
+        let conflict = effective
+            .types
+            .iter()
+            .find(|def| def.id == incoming.id || def.name == incoming.name)
+            .cloned();
+        match conflict {
+            None => {
+                type_changes.push(incoming.clone());
+                effective.types.push(incoming);
+                report.types_added += 1;
+            }
+            Some(existing) if type_def_equivalent(&existing, &incoming) => {}
+            Some(existing) if type_winner(&existing, &incoming) == incoming => {
+                type_changes.push(incoming.clone());
+                effective
+                    .types
+                    .retain(|def| def.id != existing.id && def.name != existing.name);
+                effective.types.push(incoming);
+                report.types_replaced += 1;
+            }
+            Some(_) => report.types_kept += 1,
+        }
+    }
+    let added_bytes = endpoint_changes
+        .iter()
+        .map(embedded_endpoint_allocation_cost)
+        .sum::<usize>()
+        .saturating_add(
+            type_changes
+                .iter()
+                .map(embedded_type_allocation_cost)
+                .sum::<usize>(),
+        );
+    let projected_bytes = embedded_static_schema_cost()
+        .saturating_add(EMBEDDED_SCHEMA_OWNED_BYTES.load(Ordering::Relaxed))
+        .saturating_add(added_bytes);
+    if projected_bytes > max_schema_bytes {
+        unsafe { telemetry_unlock() };
+        return Err(TelemetryError::PacketTooLarge(
+            "Schema exceeds maximum shared queue budget",
+        ));
+    }
+    if report.changed() {
+        for incoming in endpoint_changes {
+            push_embedded_endpoint(incoming);
+        }
+        for incoming in type_changes {
+            push_embedded_type(incoming);
+        }
+        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(added_bytes, Ordering::Relaxed);
+    }
+    unsafe { telemetry_unlock() };
+    Ok(report)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn schema_fingerprint() -> u64 {
-    0
+    let snapshot = export_schema();
+    let mut h = 0x5E_D5_50_4F_52_49_4E_54u64;
+    for ep in snapshot.endpoints {
+        h = hash_u32(h, ep.id.0);
+        h = hash_bytes(h, ep.name.as_bytes());
+        h = hash_bytes(h, ep.description.as_bytes());
+        h = hash_u8(h, ep.link_local_only as u8);
+    }
+    for ty in snapshot.types {
+        h = hash_u32(h, ty.id.0);
+        h = hash_bytes(h, ty.name.as_bytes());
+        h = hash_bytes(h, ty.description.as_bytes());
+        h = hash_message_element(h, ty.element);
+        h = hash_u8(h, reliable_code(ty.reliable));
+        h = hash_u8(h, ty.priority);
+        h = hash_u8(h, e2e_encryption_policy_code(ty.e2e_encryption));
+        for ep in ty.endpoints {
+            h = hash_u32(h, ep.0);
+        }
+    }
+    h
 }
 
 #[cfg(not(feature = "std"))]
 pub fn schema_bytes_used() -> usize {
-    known_endpoints()
-        .iter()
-        .map(|def| {
-            size_of::<EndpointDefinition>()
-                .saturating_add(def.name.len())
-                .saturating_add(def.description.len())
-        })
-        .sum::<usize>()
-        .saturating_add(
-            known_data_types()
-                .iter()
-                .map(|def| {
-                    size_of::<DataTypeDefinition>()
-                        .saturating_add(def.name.len())
-                        .saturating_add(def.description.len())
-                        .saturating_add(
-                            def.endpoints
-                                .len()
-                                .saturating_mul(size_of::<DataEndpoint>()),
-                        )
-                })
-                .sum::<usize>(),
-        )
+    embedded_static_schema_cost()
+        .saturating_add(EMBEDDED_SCHEMA_OWNED_BYTES.load(Ordering::Relaxed))
 }
 
 #[cfg(not(feature = "std"))]
@@ -2527,22 +2855,22 @@ pub fn data_type_exists(ty: DataType) -> bool {
 }
 
 #[cfg(not(feature = "std"))]
-pub fn endpoint_definition(ep: DataEndpoint) -> Option<EndpointDefinition> {
+pub fn endpoint_definition(ep: DataEndpoint) -> Option<OwnedEndpointDefinition> {
     known_endpoints().into_iter().find(|def| def.id == ep)
 }
 
 #[cfg(not(feature = "std"))]
-pub fn data_type_definition(ty: DataType) -> Option<DataTypeDefinition> {
+pub fn data_type_definition(ty: DataType) -> Option<OwnedDataTypeDefinition> {
     known_data_types().into_iter().find(|def| def.id == ty)
 }
 
 #[cfg(not(feature = "std"))]
-pub fn endpoint_definition_by_name(name: &str) -> Option<EndpointDefinition> {
+pub fn endpoint_definition_by_name(name: &str) -> Option<OwnedEndpointDefinition> {
     known_endpoints().into_iter().find(|def| def.name == name)
 }
 
 #[cfg(not(feature = "std"))]
-pub fn data_type_definition_by_name(name: &str) -> Option<DataTypeDefinition> {
+pub fn data_type_definition_by_name(name: &str) -> Option<OwnedDataTypeDefinition> {
     known_data_types().into_iter().find(|def| def.name == name)
 }
 
@@ -2568,9 +2896,14 @@ pub fn remove_data_type_by_name(_name: &str) -> TelemetryResult<bool> {
 
 #[cfg(not(feature = "std"))]
 pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
-    known_endpoints()
-        .iter()
-        .find(|def| def.id == endpoint_type)
+    embedded_overlay_endpoint(endpoint_type)
+        .or_else(|| {
+            EMBEDDED_BUILTIN_ENDPOINTS
+                .iter()
+                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                .find(|def| def.id == endpoint_type)
+                .copied()
+        })
         .map(|def| EndpointMeta {
             name: def.name,
             description: def.description,
@@ -2585,9 +2918,14 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 
 #[cfg(not(feature = "std"))]
 pub fn get_message_meta(data_type: DataType) -> MessageMeta {
-    known_data_types()
-        .iter()
-        .find(|def| def.id == data_type)
+    embedded_overlay_type(data_type)
+        .or_else(|| {
+            EMBEDDED_BUILTIN_TYPES
+                .iter()
+                .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                .find(|def| def.id == data_type)
+                .copied()
+        })
         .map(|def| MessageMeta {
             name: def.name,
             description: def.description,

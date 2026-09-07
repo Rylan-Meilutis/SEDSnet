@@ -106,8 +106,8 @@ state is evicted so total queue-owned memory stays bounded.
 The test route includes an allocator-instrumented lifecycle regression that repeatedly creates,
 fills, clears, and drops routers, relays, runtime schemas, and packets. Each cycle must return live
 allocation counts and bytes to the warmed baseline. A separate hosted `no_std` regression verifies
-that immutable embedded routers discard remote schema snapshots without decoding them into a second
-large allocation. Link side-table capacity is reused during remove/add churn and released when the
+that embedded routers merge remote definitions into a bounded RAM overlay without duplicating their
+compiled flash schema. Link side-table capacity is reused during remove/add churn and released when the
 owning router or relay is dropped.
 
 Reliable delivery uses internal ACK/request control packets. Ordered reliable receivers buffer out-of-order packets,
