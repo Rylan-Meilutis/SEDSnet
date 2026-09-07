@@ -5697,6 +5697,37 @@ impl Router {
         }
         if pkt.data_type() == DataType::ManagedVariableRequest {
             let ty = discovery::decode_managed_variable_request(pkt)?;
+            // A refresh request is direct evidence that the named sender is a
+            // subscriber for this variable on the ingress side. Learn that
+            // ownership incrementally at every hop. This keeps later writes
+            // selective even when a constrained link lost the larger
+            // DiscoveryAddress advertisement that originally carried the
+            // subscription list.
+            {
+                let now_ms = self.clock.now_ms();
+                let mut st = self.state.lock();
+                let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+                let mut sender_state = route
+                    .announcers
+                    .get(&packet_sender)
+                    .cloned()
+                    .unwrap_or_default();
+                let newly_reachable = !sender_state.reachable_network_variables.contains(&ty);
+                if newly_reachable {
+                    sender_state.reachable_network_variables.push(ty);
+                    sender_state.reachable_network_variables.sort_unstable();
+                    sender_state.reachable_network_variables.dedup();
+                }
+                sender_state.last_seen_ms = now_ms;
+                route.announcers.insert(packet_sender.clone(), sender_state);
+                Self::recompute_discovery_side_state(&mut route);
+                st.discovery_routes.insert(side, route);
+                st.fit_discovery_budget();
+                self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+                if newly_reachable {
+                    Self::note_discovery_topology_change_locked(&mut st, now_ms);
+                }
+            }
             if !self.can_write_managed_variable(ty) {
                 // Read-only caches are replicas, not authoritative owners.
                 // Leave the request unhandled so normal discovery routing can
