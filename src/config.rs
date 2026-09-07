@@ -2607,6 +2607,94 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
 }
 
 #[cfg(not(feature = "std"))]
+pub(crate) fn encode_embedded_schema_payload() -> Vec<u8> {
+    fn push_string(payload: &mut Vec<u8>, value: &str) {
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_endpoint(payload: &mut Vec<u8>, def: EndpointDefinition) {
+        payload.extend_from_slice(&def.id.0.to_le_bytes());
+        payload.push(def.link_local_only as u8);
+        push_string(payload, def.name);
+        push_string(payload, "");
+    }
+
+    fn push_type(payload: &mut Vec<u8>, def: DataTypeDefinition) {
+        payload.extend_from_slice(&def.id.0.to_le_bytes());
+        push_string(payload, def.name);
+        push_string(payload, "");
+        match def.element {
+            MessageElement::Static(count, data_type, class) => {
+                payload.push(0);
+                payload.extend_from_slice(&(count as u32).to_le_bytes());
+                payload.push(message_data_type_code(data_type));
+                payload.push(message_class_code(class));
+            }
+            MessageElement::Dynamic(data_type, class) => {
+                payload.push(1);
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.push(message_data_type_code(data_type));
+                payload.push(message_class_code(class));
+            }
+        }
+        payload.push(reliable_code(def.reliable));
+        payload.push(def.priority);
+        payload.push(e2e_encryption_policy_code(def.e2e_encryption));
+        payload.extend_from_slice(&(def.endpoints.len() as u32).to_le_bytes());
+        for endpoint in def.endpoints {
+            payload.extend_from_slice(&endpoint.0.to_le_bytes());
+        }
+    }
+
+    let static_endpoint_count = EMBEDDED_BUILTIN_ENDPOINTS.len() + EMBEDDED_SCHEMA_ENDPOINTS.len();
+    let mut learned_endpoint_count = 0usize;
+    let mut endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    while !endpoint_node.is_null() {
+        learned_endpoint_count += 1;
+        endpoint_node = unsafe { (*endpoint_node).next };
+    }
+    let static_type_count = EMBEDDED_BUILTIN_TYPES.len() + EMBEDDED_SCHEMA_TYPES.len();
+    let mut learned_type_count = 0usize;
+    let mut type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    while !type_node.is_null() {
+        learned_type_count += 1;
+        type_node = unsafe { (*type_node).next };
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(
+        &((static_endpoint_count + learned_endpoint_count) as u32).to_le_bytes(),
+    );
+    for def in EMBEDDED_BUILTIN_ENDPOINTS
+        .iter()
+        .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+    {
+        push_endpoint(&mut payload, *def);
+    }
+    endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    while !endpoint_node.is_null() {
+        push_endpoint(&mut payload, unsafe { (*endpoint_node).def });
+        endpoint_node = unsafe { (*endpoint_node).next };
+    }
+
+    payload.extend_from_slice(&((static_type_count + learned_type_count) as u32).to_le_bytes());
+    for def in EMBEDDED_BUILTIN_TYPES
+        .iter()
+        .chain(EMBEDDED_SCHEMA_TYPES.iter())
+    {
+        push_type(&mut payload, *def);
+    }
+    type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    while !type_node.is_null() {
+        push_type(&mut payload, unsafe { (*type_node).def });
+        type_node = unsafe { (*type_node).next };
+    }
+    payload
+}
+
+#[cfg(not(feature = "std"))]
 fn materialize_embedded_endpoint(def: OwnedEndpointDefinition) -> EndpointDefinition {
     EndpointDefinition {
         id: def.id,

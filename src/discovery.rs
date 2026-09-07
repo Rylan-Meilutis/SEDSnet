@@ -3,13 +3,15 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(feature = "std")]
+use crate::config::export_schema;
 use crate::router::encode_slice_le;
 use crate::{
     DataEndpoint, DataType, E2eEncryptionPolicy, MessageElement, TelemetryError, TelemetryResult,
     config::{
         OwnedDataTypeDefinition, OwnedEndpointDefinition, OwnedRuntimeSchemaSnapshot,
         RuntimeSchemaSnapshot, e2e_encryption_policy_code, e2e_encryption_policy_from_code,
-        export_schema, message_class_code, message_class_from_code, message_data_type_code,
+        message_class_code, message_class_from_code, message_data_type_code,
         message_data_type_from_code, reliable_code, reliable_from_code,
     },
     packet::Packet,
@@ -1027,7 +1029,16 @@ fn read_u32(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telemetr
 
 /// Builds a discovery packet containing the complete runtime schema snapshot.
 pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
+    #[cfg(feature = "std")]
     return build_discovery_schema_from_owned_snapshot(sender, timestamp_ms, export_schema());
+    #[cfg(not(feature = "std"))]
+    return Packet::new(
+        DataType::DiscoverySchema,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        crate::config::encode_embedded_schema_payload().into(),
+    );
 }
 
 /// Elects the authoritative discovery/schema master for the current topology view.
