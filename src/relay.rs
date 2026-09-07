@@ -324,7 +324,9 @@ struct ReliableReturnRouteState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySenderState {
     reachable: Vec<crate::DataEndpoint>,
+    advertised_reachable: Vec<crate::DataEndpoint>,
     reachable_timesync_sources: Vec<String>,
+    advertised_reachable_timesync_sources: Vec<String>,
     topology_boards: Vec<TopologyBoardNode>,
     last_seen_ms: u64,
 }
@@ -845,9 +847,17 @@ impl RelayInner {
         sender
             .len()
             .saturating_add(state.reachable.len() * size_of::<crate::DataEndpoint>())
+            .saturating_add(state.advertised_reachable.len() * size_of::<crate::DataEndpoint>())
             .saturating_add(
                 state
                     .reachable_timesync_sources
+                    .iter()
+                    .map(|s| s.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                state
+                    .advertised_reachable_timesync_sources
                     .iter()
                     .map(|s| s.len())
                     .sum::<usize>(),
@@ -2616,8 +2626,19 @@ impl Relay {
     #[cfg(feature = "discovery")]
     fn refresh_sender_topology_state(sender_state: &mut DiscoverySenderState) {
         discovery::normalize_topology_boards(&mut sender_state.topology_boards);
-        let (reachable, reachable_timesync_sources) =
+        let (mut reachable, mut reachable_timesync_sources) =
             discovery::summarize_topology_boards(&sender_state.topology_boards);
+        reachable.extend(sender_state.advertised_reachable.iter().copied());
+        reachable.sort_unstable();
+        reachable.dedup();
+        reachable_timesync_sources.extend(
+            sender_state
+                .advertised_reachable_timesync_sources
+                .iter()
+                .cloned(),
+        );
+        reachable_timesync_sources.sort_unstable();
+        reachable_timesync_sources.dedup();
         sender_state.reachable = reachable;
         sender_state.reachable_timesync_sources = reachable_timesync_sources;
     }
@@ -3233,11 +3254,13 @@ impl Relay {
                 if !side_link_local_enabled {
                     reachable.retain(|ep| !ep.is_link_local_only());
                 }
-                let board = Self::sender_topology_board_mut(&mut sender_state, &ad.hostname);
-                let changed = board.reachable_endpoints != reachable
-                    || board.reachable_timesync_sources != ad.reachable_timesync_sources;
-                board.reachable_endpoints = reachable;
-                board.reachable_timesync_sources = ad.reachable_timesync_sources;
+                // This packet is an aggregate route summary, not a claim that
+                // the announcing bridge owns every endpoint behind it.
+                let changed = sender_state.advertised_reachable != reachable
+                    || sender_state.advertised_reachable_timesync_sources
+                        != ad.reachable_timesync_sources;
+                sender_state.advertised_reachable = reachable;
+                sender_state.advertised_reachable_timesync_sources = ad.reachable_timesync_sources;
                 Self::refresh_sender_topology_state(&mut sender_state);
                 changed
             }

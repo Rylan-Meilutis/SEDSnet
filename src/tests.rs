@@ -7538,27 +7538,6 @@ mod router_tests {
             let endpoint = DataEndpoint::named("SD_CARD");
             let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
             let side = router.add_side_packet("gateway-link", |_| Ok(()));
-            let topology = build_discovery_topology(
-                "GB",
-                1,
-                &[
-                    TopologyBoardNode {
-                        sender_id: "GB".into(),
-                        reachable_endpoints: vec![],
-                        reachable_timesync_sources: vec![],
-                        connections: vec!["GS".into()],
-                    },
-                    TopologyBoardNode {
-                        sender_id: "GS".into(),
-                        reachable_endpoints: vec![endpoint],
-                        reachable_timesync_sources: vec![],
-                        connections: vec!["GB".into()],
-                    },
-                ],
-            )
-            .unwrap();
-            router.rx_from_side(&topology, side).unwrap();
-
             let summary = crate::discovery::AddressAdvertisement {
                 hostname: "GB".into(),
                 address: 42,
@@ -7581,6 +7560,34 @@ mod router_tests {
             };
             let address = crate::discovery::build_discovery_address("GB", 2, &summary).unwrap();
             router.rx_from_side(&address, side).unwrap();
+
+            let summarized_route = &router.export_topology().routes[0];
+            assert_eq!(summarized_route.reachable_endpoints, vec![endpoint]);
+            assert!(
+                summarized_route.announcers[0].routers.is_empty(),
+                "an aggregate address summary must select the link without inventing an owner",
+            );
+
+            let topology = build_discovery_topology(
+                "GB",
+                3,
+                &[
+                    TopologyBoardNode {
+                        sender_id: "GB".into(),
+                        reachable_endpoints: vec![],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GS".into()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "GS".into(),
+                        reachable_endpoints: vec![endpoint],
+                        reachable_timesync_sources: vec![],
+                        connections: vec!["GB".into()],
+                    },
+                ],
+            )
+            .unwrap();
+            router.rx_from_side(&topology, side).unwrap();
 
             let route = &router.export_topology().routes[0].announcers[0];
             let gateway = route

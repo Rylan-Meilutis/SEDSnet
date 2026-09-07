@@ -440,8 +440,10 @@ struct ReliableReturnRouteState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySenderState {
     reachable: Vec<DataEndpoint>,
+    advertised_reachable: Vec<DataEndpoint>,
     reachable_network_variables: Vec<DataType>,
     reachable_timesync_sources: Vec<String>,
+    advertised_reachable_timesync_sources: Vec<String>,
     link_capabilities: Option<discovery::LinkCapabilities>,
     topology_boards: Vec<TopologyBoardNode>,
     last_seen_ms: u64,
@@ -1787,10 +1789,18 @@ impl RouterInner {
         sender
             .len()
             .saturating_add(state.reachable.len() * size_of::<DataEndpoint>())
+            .saturating_add(state.advertised_reachable.len() * size_of::<DataEndpoint>())
             .saturating_add(state.reachable_network_variables.len() * size_of::<DataType>())
             .saturating_add(
                 state
                     .reachable_timesync_sources
+                    .iter()
+                    .map(|s| s.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                state
+                    .advertised_reachable_timesync_sources
                     .iter()
                     .map(|s| s.len())
                     .sum::<usize>(),
@@ -4825,8 +4835,19 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn refresh_sender_topology_state(sender_state: &mut DiscoverySenderState) {
         discovery::normalize_topology_boards(&mut sender_state.topology_boards);
-        let (reachable, reachable_timesync_sources) =
+        let (mut reachable, mut reachable_timesync_sources) =
             discovery::summarize_topology_boards(&sender_state.topology_boards);
+        reachable.extend(sender_state.advertised_reachable.iter().copied());
+        reachable.sort_unstable();
+        reachable.dedup();
+        reachable_timesync_sources.extend(
+            sender_state
+                .advertised_reachable_timesync_sources
+                .iter()
+                .cloned(),
+        );
+        reachable_timesync_sources.sort_unstable();
+        reachable_timesync_sources.dedup();
         sender_state.reachable = reachable;
         sender_state.reachable_timesync_sources = reachable_timesync_sources;
     }
@@ -5426,28 +5447,18 @@ impl Router {
                 route.announcers.remove(pkt.sender());
             }
             let mut sender_state = route.announcers.get(sender_id).cloned().unwrap_or_default();
-            // DiscoveryAddress is also the compact/legacy route summary, so a
-            // multi-sided router advertises endpoints reachable *through* it.
-            // Once detailed topology has identified the individual owners,
-            // do not overwrite the announcer's own node with that aggregate.
-            // Doing so makes a bridge appear to own every endpoint behind it
-            // and freezes end-to-end packets to the bridge instead of the
-            // actual destination.
-            let has_detailed_routed_topology = sender_state.topology_boards.len() > 1
-                || sender_state
-                    .topology_boards
-                    .iter()
-                    .any(|board| !board.connections.is_empty());
-            if !has_detailed_routed_topology {
-                let board = Self::sender_topology_board_mut(&mut sender_state, sender_id);
-                if board.reachable_endpoints != ad.reachable_endpoints {
-                    board.reachable_endpoints = ad.reachable_endpoints;
-                    changed = true;
-                }
-                if board.reachable_timesync_sources != ad.reachable_timesync_sources {
-                    board.reachable_timesync_sources = ad.reachable_timesync_sources;
-                    changed = true;
-                }
+            // DiscoveryAddress is a compact route summary. A multi-sided
+            // router advertises endpoints reachable *through* it, so these
+            // entries must not be attached to the announcer's topology node:
+            // that would falsely claim ownership and freeze reliable packets
+            // to the bridge before detailed topology arrives.
+            if sender_state.advertised_reachable != ad.reachable_endpoints {
+                sender_state.advertised_reachable = ad.reachable_endpoints;
+                changed = true;
+            }
+            if sender_state.advertised_reachable_timesync_sources != ad.reachable_timesync_sources {
+                sender_state.advertised_reachable_timesync_sources = ad.reachable_timesync_sources;
+                changed = true;
             }
             if sender_state.reachable_network_variables != ad.reachable_network_variables {
                 sender_state.reachable_network_variables = ad.reachable_network_variables;
