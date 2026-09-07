@@ -124,12 +124,6 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.q.iter()
     }
 
-    /// Inspect the item that would be removed by
-    /// [`Self::pop_lowest_priority`] after prioritized insertion.
-    pub(crate) fn lowest_priority_item(&self) -> Option<&T> {
-        self.q.back()
-    }
-
     /// Check if item is contained in the queue.
     #[inline]
     pub fn contains(&self, v: &T) -> bool

@@ -1942,50 +1942,51 @@ impl RouterInner {
         true
     }
 
-    fn lowest_priority_shared_queue(&self) -> Option<(RouterQueueKind, u8)> {
-        let mut candidates = Vec::new();
-        if let Some(item) = self.received_queue.lowest_priority_item() {
-            candidates.push((
+    fn largest_shared_queue(&self) -> Option<RouterQueueKind> {
+        let candidates = [
+            (
                 RouterQueueKind::Received,
-                item.priority,
                 self.received_queue.bytes_used(),
-            ));
-        }
-        if let Some(item) = self.transmit_queue.lowest_priority_item() {
-            candidates.push((
+                self.received_queue.len(),
+            ),
+            (
                 RouterQueueKind::Transmit,
-                item.priority,
                 self.transmit_queue.bytes_used(),
-            ));
-        }
-        if self.reliable_rx_buffer_len() > 0 {
-            // Buffered application data is always below the reserved control
-            // bands. Its precise type is decoded when it is processed.
-            candidates.push((
+                self.transmit_queue.len(),
+            ),
+            (RouterQueueKind::Recent, 0, 0),
+            (
                 RouterQueueKind::ReliableRxBuffer,
-                253,
                 self.reliable_rx_buffered_bytes(),
-            ));
-        }
-        #[cfg(feature = "discovery")]
-        if !self.discovery_routes.is_empty() {
-            candidates.push((
+                self.reliable_rx_buffer_len(),
+            ),
+            #[cfg(feature = "discovery")]
+            (
                 RouterQueueKind::Discovery,
-                crate::transport_priority(DataType::DiscoveryTopology),
                 self.discovery_bytes_used(),
-            ));
-        }
+                self.discovery_routes.len(),
+            ),
+        ];
         candidates
             .into_iter()
-            .min_by_key(|(_, priority, bytes)| (*priority, usize::MAX - *bytes))
-            .map(|(kind, priority, _)| (kind, priority))
+            .filter(|(_, bytes, len)| *bytes > 0 && *len > 0)
+            .max_by_key(|(kind, bytes, _)| {
+                (
+                    *bytes,
+                    if *kind == RouterQueueKind::ReliableRxBuffer {
+                        0
+                    } else {
+                        1
+                    },
+                )
+            })
+            .map(|(kind, _, _)| kind)
     }
 
     fn make_shared_queue_room(
         &mut self,
         incoming_cost: usize,
         preferred: RouterQueueKind,
-        incoming_priority: u8,
     ) -> TelemetryResult<()> {
         if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
@@ -1996,16 +1997,7 @@ impl RouterInner {
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
-            let Some((victim, victim_priority)) = self.lowest_priority_shared_queue() else {
-                return Err(TelemetryError::PacketTooLarge(
-                    "Item exceeds maximum shared queue budget",
-                ));
-            };
-            if victim_priority > incoming_priority {
-                return Err(TelemetryError::Io(
-                    "shared queue contains only higher-priority traffic",
-                ));
-            }
+            let victim = self.largest_shared_queue().unwrap_or(preferred);
             if victim == RouterQueueKind::Discovery {
                 Self::queue_budget_warning("topology data is using the largest queue budget share");
             }
@@ -2036,13 +2028,13 @@ impl RouterInner {
     }
 
     fn push_received(&mut self, item: RouterRxItem) -> TelemetryResult<()> {
-        self.make_shared_queue_room(item.byte_cost(), RouterQueueKind::Received, item.priority)?;
+        self.make_shared_queue_room(item.byte_cost(), RouterQueueKind::Received)?;
         self.received_queue
             .push_back_prioritized(item, |queued| queued.priority)
     }
 
     fn push_transmit(&mut self, item: TxQueued) -> TelemetryResult<()> {
-        self.make_shared_queue_room(item.byte_cost(), RouterQueueKind::Transmit, item.priority)?;
+        self.make_shared_queue_room(item.byte_cost(), RouterQueueKind::Transmit)?;
         self.transmit_queue
             .push_back_prioritized(item, |queued| queued.priority)
     }
@@ -2051,7 +2043,7 @@ impl RouterInner {
         while self.recent_rx.len() >= self.memory.max_recent_rx_ids {
             let _ = self.recent_rx.pop_front();
         }
-        self.make_shared_queue_room(0, RouterQueueKind::Recent, 0)?;
+        self.make_shared_queue_room(0, RouterQueueKind::Recent)?;
         self.recent_rx.push_back(id)
     }
 
@@ -2071,11 +2063,7 @@ impl RouterInner {
             return Ok(());
         }
         let cost = size_of::<Arc<[u8]>>() + bytes.len();
-        self.make_shared_queue_room(
-            cost,
-            RouterQueueKind::ReliableRxBuffer,
-            crate::transport_priority(ty),
-        )?;
+        self.make_shared_queue_room(cost, RouterQueueKind::ReliableRxBuffer)?;
         let rx_state = self
             .reliable_rx
             .entry(key)
@@ -5769,11 +5757,7 @@ impl Router {
             let snapshot = discovery::decode_discovery_schema(pkt)?;
             let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
             let mut st = self.state.lock();
-            st.make_shared_queue_room(
-                incoming_cost,
-                RouterQueueKind::Discovery,
-                crate::transport_priority(DataType::DiscoverySchema),
-            )?;
+            st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
             let budget = st.memory.max_queue_budget;
             drop(st);
             let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
