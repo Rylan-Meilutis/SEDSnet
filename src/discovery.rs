@@ -1109,13 +1109,10 @@ pub fn elect_discovery_master(local_sender: &str, boards: &[TopologyBoardNode]) 
 pub fn build_discovery_schema_from_snapshot(
     sender: &str,
     timestamp_ms: u64,
-    mut schema: RuntimeSchemaSnapshot,
+    schema: RuntimeSchemaSnapshot,
 ) -> TelemetryResult<Packet> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&3u32.to_le_bytes());
-
-    schema.endpoints.sort_unstable_by_key(|def| def.id.as_u32());
-    schema.types.sort_unstable_by_key(|def| def.id.as_u32());
 
     payload.extend_from_slice(&(schema.endpoints.len() as u32).to_le_bytes());
     for ep in schema.endpoints {
