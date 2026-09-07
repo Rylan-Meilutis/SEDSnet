@@ -4,10 +4,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(feature = "std")]
+use crate::E2eEncryptionPolicy;
+#[cfg(feature = "std")]
 use crate::config::export_schema;
 use crate::router::encode_slice_le;
 use crate::{
-    DataEndpoint, DataType, E2eEncryptionPolicy, MessageElement, TelemetryError, TelemetryResult,
+    DataEndpoint, DataType, MessageElement, TelemetryError, TelemetryResult,
     config::{
         OwnedDataTypeDefinition, OwnedEndpointDefinition, OwnedRuntimeSchemaSnapshot,
         RuntimeSchemaSnapshot, e2e_encryption_policy_code, e2e_encryption_policy_from_code,
@@ -1027,6 +1029,16 @@ fn read_u32(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telemetr
     Ok(out)
 }
 
+#[cfg(not(feature = "std"))]
+fn skip_string(payload: &[u8], cursor: &mut usize, label: &'static str) -> TelemetryResult<()> {
+    let len = read_u32(payload, cursor, label)? as usize;
+    if payload.len().saturating_sub(*cursor) < len {
+        return Err(TelemetryError::Unpack(label));
+    }
+    *cursor += len;
+    Ok(())
+}
+
 /// Builds a discovery packet containing the complete runtime schema snapshot.
 pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
     #[cfg(feature = "std")]
@@ -1247,7 +1259,12 @@ pub fn decode_discovery_schema_payload(
 ) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     let mut cursor = 0usize;
     let version = read_u32(payload, &mut cursor, "discovery schema version")?;
+    #[cfg(feature = "std")]
     if version != 1 && version != 2 && version != 3 {
+        return Err(TelemetryError::Unpack("discovery schema version"));
+    }
+    #[cfg(not(feature = "std"))]
+    if version != 3 {
         return Err(TelemetryError::Unpack("discovery schema version"));
     }
 
@@ -1263,6 +1280,7 @@ pub fn decode_discovery_schema_payload(
         let link_local_only =
             read_u8(payload, &mut cursor, "discovery schema endpoint flags")? != 0;
         let name = decode_string(payload, &mut cursor, "discovery schema endpoint name")?;
+        #[cfg(feature = "std")]
         let description = if version >= 2 {
             decode_string(
                 payload,
@@ -1270,6 +1288,15 @@ pub fn decode_discovery_schema_payload(
                 "discovery schema endpoint description",
             )?
         } else {
+            String::new()
+        };
+        #[cfg(not(feature = "std"))]
+        let description = {
+            skip_string(
+                payload,
+                &mut cursor,
+                "discovery schema endpoint description",
+            )?;
             String::new()
         };
         endpoints.push(OwnedEndpointDefinition {
@@ -1285,9 +1312,15 @@ pub fn decode_discovery_schema_payload(
     for _ in 0..type_count {
         let id = DataType(read_u32(payload, &mut cursor, "discovery schema type id")?);
         let name = decode_string(payload, &mut cursor, "discovery schema type name")?;
+        #[cfg(feature = "std")]
         let description = if version >= 2 {
             decode_string(payload, &mut cursor, "discovery schema type description")?
         } else {
+            String::new()
+        };
+        #[cfg(not(feature = "std"))]
+        let description = {
+            skip_string(payload, &mut cursor, "discovery schema type description")?;
             String::new()
         };
         let element_kind = read_u8(payload, &mut cursor, "discovery schema element kind")?;
@@ -1310,6 +1343,7 @@ pub fn decode_discovery_schema_payload(
             reliable_from_code(read_u8(payload, &mut cursor, "discovery schema reliable")?)
                 .ok_or(TelemetryError::Unpack("discovery schema reliable"))?;
         let priority = read_u8(payload, &mut cursor, "discovery schema priority")?;
+        #[cfg(feature = "std")]
         let e2e_encryption = if version >= 3 {
             e2e_encryption_policy_from_code(read_u8(
                 payload,
@@ -1320,6 +1354,13 @@ pub fn decode_discovery_schema_payload(
         } else {
             E2eEncryptionPolicy::PreferOff
         };
+        #[cfg(not(feature = "std"))]
+        let e2e_encryption = e2e_encryption_policy_from_code(read_u8(
+            payload,
+            &mut cursor,
+            "discovery schema e2e cryptography",
+        )?)
+        .ok_or(TelemetryError::Unpack("discovery schema e2e cryptography"))?;
         let endpoint_count =
             read_u32(payload, &mut cursor, "discovery schema type endpoint count")? as usize;
         let mut type_endpoints = Vec::with_capacity(endpoint_count);
