@@ -2527,15 +2527,60 @@ fn embedded_overlay_type(id: DataType) -> Option<DataTypeDefinition> {
 }
 
 #[cfg(not(feature = "std"))]
+fn embedded_overlay_endpoint_by_name(name: &str) -> Option<EndpointDefinition> {
+    let mut node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    while !node.is_null() {
+        let current = unsafe { &*node };
+        if current.def.name == name {
+            return Some(current.def);
+        }
+        node = current.next;
+    }
+    None
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_overlay_type_by_name(name: &str) -> Option<DataTypeDefinition> {
+    let mut node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    while !node.is_null() {
+        let current = unsafe { &*node };
+        if current.def.name == name {
+            return Some(current.def);
+        }
+        node = current.next;
+    }
+    None
+}
+
+#[cfg(not(feature = "std"))]
+fn own_embedded_endpoint(def: EndpointDefinition) -> OwnedEndpointDefinition {
+    OwnedEndpointDefinition {
+        id: def.id,
+        name: def.name.to_string(),
+        description: def.description.to_string(),
+        link_local_only: def.link_local_only,
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn own_embedded_type(def: DataTypeDefinition) -> OwnedDataTypeDefinition {
+    OwnedDataTypeDefinition {
+        id: def.id,
+        name: def.name.to_string(),
+        description: def.description.to_string(),
+        element: def.element,
+        endpoints: def.endpoints.to_vec(),
+        reliable: def.reliable,
+        priority: def.priority,
+        e2e_encryption: def.e2e_encryption,
+    }
+}
+
+#[cfg(not(feature = "std"))]
 fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
     let mut endpoints: Vec<OwnedEndpointDefinition> = embedded_static_endpoints()
         .into_iter()
-        .map(|def| OwnedEndpointDefinition {
-            id: def.id,
-            name: def.name.to_string(),
-            description: def.description.to_string(),
-            link_local_only: def.link_local_only,
-        })
+        .map(own_embedded_endpoint)
         .collect();
     let mut learned_endpoints = Vec::new();
     let mut endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
@@ -2554,16 +2599,7 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
     }
     let mut types: Vec<OwnedDataTypeDefinition> = embedded_static_data_types()
         .into_iter()
-        .map(|def| OwnedDataTypeDefinition {
-            id: def.id,
-            name: def.name.to_string(),
-            description: def.description.to_string(),
-            element: def.element,
-            endpoints: def.endpoints.to_vec(),
-            reliable: def.reliable,
-            priority: def.priority,
-            e2e_encryption: def.e2e_encryption,
-        })
+        .map(own_embedded_type)
         .collect();
     let mut learned_types = Vec::new();
     let mut type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
@@ -2731,9 +2767,8 @@ pub fn merge_owned_schema_snapshot_with_budget(
     snapshot.types.dedup_by_key(|def| def.id.0);
 
     unsafe { telemetry_lock() };
-    let mut effective = effective_embedded_schema();
-    let mut endpoint_changes = Vec::new();
-    let mut type_changes = Vec::new();
+    let mut endpoint_changes: Vec<OwnedEndpointDefinition> = Vec::new();
+    let mut type_changes: Vec<OwnedDataTypeDefinition> = Vec::new();
     let mut report = SchemaMergeReport {
         endpoints_added: 0,
         endpoints_replaced: 0,
@@ -2743,24 +2778,21 @@ pub fn merge_owned_schema_snapshot_with_budget(
         types_kept: 0,
     };
     for incoming in snapshot.endpoints {
-        let conflict = effective
-            .endpoints
+        let conflict = endpoint_changes
             .iter()
             .find(|def| def.id == incoming.id || def.name == incoming.name)
-            .cloned();
+            .cloned()
+            .or_else(|| endpoint_definition(incoming.id))
+            .or_else(|| endpoint_definition_by_name(&incoming.name));
         match conflict {
             None => {
                 endpoint_changes.push(incoming.clone());
-                effective.endpoints.push(incoming);
                 report.endpoints_added += 1;
             }
             Some(existing) if endpoint_def_equivalent(&existing, &incoming) => {}
             Some(existing) if endpoint_winner(&existing, &incoming) == incoming => {
-                endpoint_changes.push(incoming.clone());
-                effective
-                    .endpoints
-                    .retain(|def| def.id != existing.id && def.name != existing.name);
-                effective.endpoints.push(incoming);
+                endpoint_changes.retain(|def| def.id != existing.id && def.name != existing.name);
+                endpoint_changes.push(incoming);
                 report.endpoints_replaced += 1;
             }
             Some(_) => report.endpoints_kept += 1,
@@ -2770,29 +2802,26 @@ pub fn merge_owned_schema_snapshot_with_budget(
         if !incoming
             .endpoints
             .iter()
-            .all(|ep| effective.endpoints.iter().any(|def| def.id == *ep))
+            .all(|ep| endpoint_changes.iter().any(|def| def.id == *ep) || endpoint_exists(*ep))
         {
             report.types_kept += 1;
             continue;
         }
-        let conflict = effective
-            .types
+        let conflict = type_changes
             .iter()
             .find(|def| def.id == incoming.id || def.name == incoming.name)
-            .cloned();
+            .cloned()
+            .or_else(|| data_type_definition(incoming.id))
+            .or_else(|| data_type_definition_by_name(&incoming.name));
         match conflict {
             None => {
                 type_changes.push(incoming.clone());
-                effective.types.push(incoming);
                 report.types_added += 1;
             }
             Some(existing) if type_def_equivalent(&existing, &incoming) => {}
             Some(existing) if type_winner(&existing, &incoming) == incoming => {
-                type_changes.push(incoming.clone());
-                effective
-                    .types
-                    .retain(|def| def.id != existing.id && def.name != existing.name);
-                effective.types.push(incoming);
+                type_changes.retain(|def| def.id != existing.id && def.name != existing.name);
+                type_changes.push(incoming);
                 report.types_replaced += 1;
             }
             Some(_) => report.types_kept += 1,
@@ -2863,32 +2892,72 @@ pub fn schema_bytes_used() -> usize {
 
 #[cfg(not(feature = "std"))]
 pub fn endpoint_exists(ep: DataEndpoint) -> bool {
-    known_endpoints().iter().any(|def| def.id == ep)
+    embedded_overlay_endpoint(ep).is_some()
+        || EMBEDDED_BUILTIN_ENDPOINTS
+            .iter()
+            .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+            .any(|def| def.id == ep)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_exists(ty: DataType) -> bool {
-    known_data_types().iter().any(|def| def.id == ty)
+    embedded_overlay_type(ty).is_some()
+        || EMBEDDED_BUILTIN_TYPES
+            .iter()
+            .chain(EMBEDDED_SCHEMA_TYPES.iter())
+            .any(|def| def.id == ty)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn endpoint_definition(ep: DataEndpoint) -> Option<OwnedEndpointDefinition> {
-    known_endpoints().into_iter().find(|def| def.id == ep)
+    embedded_overlay_endpoint(ep)
+        .or_else(|| {
+            EMBEDDED_BUILTIN_ENDPOINTS
+                .iter()
+                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                .find(|def| def.id == ep)
+                .copied()
+        })
+        .map(own_embedded_endpoint)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_definition(ty: DataType) -> Option<OwnedDataTypeDefinition> {
-    known_data_types().into_iter().find(|def| def.id == ty)
+    embedded_overlay_type(ty)
+        .or_else(|| {
+            EMBEDDED_BUILTIN_TYPES
+                .iter()
+                .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                .find(|def| def.id == ty)
+                .copied()
+        })
+        .map(own_embedded_type)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn endpoint_definition_by_name(name: &str) -> Option<OwnedEndpointDefinition> {
-    known_endpoints().into_iter().find(|def| def.name == name)
+    embedded_overlay_endpoint_by_name(name)
+        .or_else(|| {
+            EMBEDDED_BUILTIN_ENDPOINTS
+                .iter()
+                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                .find(|def| def.name == name)
+                .copied()
+        })
+        .map(own_embedded_endpoint)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_definition_by_name(name: &str) -> Option<OwnedDataTypeDefinition> {
-    known_data_types().into_iter().find(|def| def.name == name)
+    embedded_overlay_type_by_name(name)
+        .or_else(|| {
+            EMBEDDED_BUILTIN_TYPES
+                .iter()
+                .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                .find(|def| def.name == name)
+                .copied()
+        })
+        .map(own_embedded_type)
 }
 
 #[cfg(not(feature = "std"))]
