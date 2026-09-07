@@ -11082,6 +11082,44 @@ mod router_tests {
                     .contains(&DataEndpoint::named("SD_CARD")),
                 "the new transitive endpoint must be advertised immediately"
             );
+
+            // Repeat the same idempotent delta a small, bounded number of
+            // times. Losing one discovery control frame must not postpone
+            // convergence until the 120-second full repair snapshot.
+            let mut retry_at_ms = 10_250;
+            let mut retry_interval_ms = 500;
+            for _retry in 1..crate::discovery::DISCOVERY_INCREMENTAL_RETRY_COUNT {
+                seen.lock().unwrap().clear();
+                now_ms.store(retry_at_ms, Ordering::SeqCst);
+                assert!(router.poll_discovery().unwrap());
+                router.process_tx_queue().unwrap();
+                let retry_packets = seen.lock().unwrap().clone();
+                let update = retry_packets
+                    .iter()
+                    .find(|pkt| pkt.data_type() == DataType::DiscoveryTopology)
+                    .map(crate::discovery::decode_discovery_topology_update)
+                    .transpose()
+                    .unwrap()
+                    .expect("bounded retry must repeat the topology delta");
+                assert!(update.incremental);
+                assert!(
+                    update
+                        .boards
+                        .iter()
+                        .any(|board| board.sender_id == "REMOTE_SD")
+                );
+                retry_at_ms += retry_interval_ms;
+                retry_interval_ms *= 2;
+            }
+
+            seen.lock().unwrap().clear();
+            now_ms.store(retry_at_ms, Ordering::SeqCst);
+            assert!(router.poll_discovery().unwrap());
+            router.process_tx_queue().unwrap();
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "bounded delta retries must stop on a slow link"
+            );
         }
 
         #[test]

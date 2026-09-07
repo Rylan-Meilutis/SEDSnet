@@ -75,8 +75,9 @@ much slower cadence. Router-managed time sync keeps its normal cadence on fast s
 measured slow side independently receives sparse time-sync traffic, keeping asymmetric or
 time-sliced radio links available for user payloads. A learned topology change schedules an
 immediate split-horizon address update plus a topology delta containing only added, changed, and
-removed nodes. Full topology snapshots remain on the slow repair cadence or are sent in response
-to an explicit bootstrap/recovery request.
+removed nodes. The idempotent delta is repeated three times with discovery backoff so one lost
+control frame does not delay convergence. Full topology snapshots remain on the slow repair
+cadence or are sent in response to an explicit bootstrap/recovery request.
 The same topology-change event resets compact-header dictionaries, so the first data frame after a
 peer joins or restarts is self-describing instead of depending on a template that peer may have missed.
 Registering or removing a network variable schedules the same immediate compact address update, so

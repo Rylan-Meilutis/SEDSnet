@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Topology changes now propagate as incremental named-node upserts and removal tombstones instead
-  of restarting discovery with a complete graph on every change.
+  of restarting discovery with a complete graph on every change. Each idempotent delta is repeated
+  three times with backoff to tolerate a lost discovery frame without waiting for periodic repair.
 - Compact address/ownership summaries refresh routes and managed-variable owners immediately;
   complete topology snapshots remain available for bootstrap, explicit recovery, and periodic
   repair after a lost delta.

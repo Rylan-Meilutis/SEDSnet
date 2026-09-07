@@ -22,6 +22,11 @@ pub const DISCOVERY_SLOW_INTERVAL_MS: u64 = 5_000;
 pub const DISCOVERY_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 pub const DISCOVERY_SLOW_LINK_PING_INTERVAL_MS: u64 = 15_000;
 pub const DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS: u64 = 120_000;
+/// Number of compact topology advertisements emitted for each change. These
+/// packets are intentionally idempotent, so a small bounded repeat avoids a
+/// 120-second repair delay after one lossy control frame without resending the
+/// complete graph.
+pub const DISCOVERY_INCREMENTAL_RETRY_COUNT: u8 = 3;
 pub const TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS: u64 = 30_000;
 // A zero-node full topology is never emitted. Reusing zero as the extension
 // marker makes older decoders reject the trailing delta payload cheaply

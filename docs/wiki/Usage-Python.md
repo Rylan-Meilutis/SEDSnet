@@ -200,8 +200,9 @@ With `discovery` enabled:
 - discovery also propagates a transitive router graph, not just flattened endpoint sets
 - normal traffic defaults to adaptive discovered-path load balancing
 - reliable traffic still fans out across all known discovered candidates
-- topology changes send an immediate address update and added/changed/removed node delta, while
-  full graph snapshots are reserved for bootstrap and infrequent repair
+- topology changes send an immediate address update and a bounded three-send
+  added/changed/removed node delta, while full graph snapshots are reserved for bootstrap and
+  infrequent repair
 - compact-header dictionaries are resynchronized on topology changes, making the first subsequent
   data frame self-describing for newly joined or restarted peers
 - enabling or disabling a network variable schedules an immediate compact ownership update,

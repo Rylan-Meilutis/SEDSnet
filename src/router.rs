@@ -16,10 +16,10 @@ use crate::diagnostics::{
 };
 #[cfg(feature = "discovery")]
 use crate::discovery::{
-    self, ClientStatsSnapshot, DISCOVERY_ROUTE_TTL_MS, DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS,
-    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState,
-    TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
-    TopologySideRoute, TopologySnapshot,
+    self, ClientStatsSnapshot, DISCOVERY_INCREMENTAL_RETRY_COUNT, DISCOVERY_ROUTE_TTL_MS,
+    DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS, DISCOVERY_SLOW_LINK_PING_INTERVAL_MS,
+    DiscoveryCadenceState, TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute,
+    TopologyBoardNode, TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::{hash_bytes_u64, sender_address_u32};
 use crate::queue::{BoundedDeque, ByteCost};
@@ -478,6 +478,7 @@ struct DiscoverySideThrottleState {
     next_ping_ms: u64,
     next_full_ms: u64,
     pending_incremental: bool,
+    incremental_retries_remaining: u8,
     has_sent_full: bool,
     last_topology: Vec<TopologyBoardNode>,
 }
@@ -4857,6 +4858,10 @@ impl Router {
                 .entry(side_id)
                 .or_default()
                 .pending_incremental = true;
+            st.discovery_side_throttle
+                .entry(side_id)
+                .or_default()
+                .incremental_retries_remaining = DISCOVERY_INCREMENTAL_RETRY_COUNT;
         }
         // Make the first incremental control frame self-describing. This is a
         // small header refresh, not a topology reset, and prevents a restarted
@@ -5141,12 +5146,15 @@ impl Router {
         if !throttle.has_sent_full || now_ms >= throttle.next_full_ms {
             throttle.has_sent_full = true;
             throttle.pending_incremental = false;
+            throttle.incremental_retries_remaining = 0;
             throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::Full);
         }
         if throttle.pending_incremental {
-            throttle.pending_incremental = false;
+            throttle.incremental_retries_remaining =
+                throttle.incremental_retries_remaining.saturating_sub(1);
+            throttle.pending_incremental = throttle.incremental_retries_remaining > 0;
             return Some(DiscoveryAdvertiseLevel::Incremental);
         }
         if slow && now_ms >= throttle.next_ping_ms {
@@ -5310,10 +5318,16 @@ impl Router {
                     }
                     DiscoveryAdvertiseLevel::MinimalPing => (Vec::new(), Vec::new()),
                 };
-                st.discovery_side_throttle
+                let throttle = st
+                    .discovery_side_throttle
                     .get_mut(&side_id)
-                    .expect("discovery throttle exists")
-                    .last_topology = current_topology;
+                    .expect("discovery throttle exists");
+                if level == DiscoveryAdvertiseLevel::Full
+                    || (level == DiscoveryAdvertiseLevel::Incremental
+                        && throttle.incremental_retries_remaining == 0)
+                {
+                    throttle.last_topology = current_topology;
+                }
                 per_side.push((
                     side_id,
                     level,
