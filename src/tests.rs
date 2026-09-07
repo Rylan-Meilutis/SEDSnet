@@ -6655,6 +6655,88 @@ mod reliable_tests {
     }
 
     #[test]
+    fn lost_request_after_partial_ack_resumes_bounded_retransmission() {
+        ensure_reliable_test_schema();
+        struct ManualClock(Arc<std::sync::atomic::AtomicU64>);
+        impl crate::router::Clock for ManualClock {
+            fn now_ms(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sent_frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sent_frames_c = sent_frames.clone();
+        let sender = Router::new_with_clock(
+            RouterConfig::default().with_reliable_enabled(true),
+            Box::new(ManualClock(now.clone())),
+        );
+        let side = sender.add_side_packed_with_options(
+            "uplink",
+            move |bytes| {
+                sent_frames_c.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions {
+                reliable_enabled: true,
+                ..RouterSideOptions::default()
+            },
+        );
+        sender
+            .tx(Packet::from_f32_slice(
+                DataType::named("RELIABLE_TEST_DATA"),
+                &[1.0, 2.0, 3.0],
+                &[DataEndpoint::named("RADIO")],
+                1,
+            )
+            .unwrap())
+            .unwrap();
+        assert_eq!(sent_frames.lock().unwrap().len(), 1);
+
+        let partial = Packet::new(
+            DataType::ReliablePartialAck,
+            &crate::message_meta(DataType::ReliablePartialAck).endpoints,
+            "RX",
+            1,
+            crate::router::encode_slice_le(&[DataType::named("RELIABLE_TEST_DATA").as_u32(), 1]),
+        )
+        .unwrap();
+        sender.rx_from_side(&partial, side).unwrap();
+        let reliable_data_frames = || {
+            sent_frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| {
+                    wire_format::peek_envelope(frame)
+                        .map(|env| env.ty == DataType::named("RELIABLE_TEST_DATA"))
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        let frames_after_partial_ack = reliable_data_frames();
+
+        now.store(crate::config::RELIABLE_RETRANSMIT_MS + 1, Ordering::SeqCst);
+        sender.process_all_queues().unwrap();
+        assert_eq!(
+            reliable_data_frames(),
+            frames_after_partial_ack,
+            "partial ACK grants one interval for the explicit packet request"
+        );
+
+        now.store(
+            2 * crate::config::RELIABLE_RETRANSMIT_MS + 2,
+            Ordering::SeqCst,
+        );
+        sender.process_all_queues().unwrap();
+        assert_eq!(
+            reliable_data_frames(),
+            frames_after_partial_ack + 1,
+            "a lost packet request must not pin reliable history forever"
+        );
+    }
+
+    #[test]
     fn reliable_ordered_delivers_in_order() {
         let delivered: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let delivered_c = delivered.clone();
@@ -7500,8 +7582,27 @@ mod router_tests {
         }
 
         #[test]
-        fn unknown_remote_endpoint_does_not_fallback_to_single_side_after_topology_exists() {
+        fn unknown_remote_endpoint_uses_the_only_leaf_uplink_after_topology_exists() {
             ensure_topology_test_schema();
+            let leaf_endpoint = DataEndpoint::try_named("LEAF_UPLINK_ONLY").unwrap_or_else(|| {
+                register_endpoint_with_description(
+                    "LEAF_UPLINK_ONLY",
+                    "nonlocal endpoint used by the sole-uplink regression",
+                    false,
+                )
+                .expect("register LEAF_UPLINK_ONLY")
+            });
+            let leaf_type = DataType::try_named("LEAF_UPLINK_DATA").unwrap_or_else(|| {
+                register_data_type_with_description(
+                    "LEAF_UPLINK_DATA",
+                    "sole-uplink regression payload",
+                    MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+                    &[leaf_endpoint],
+                    ReliableMode::None,
+                    1,
+                )
+                .expect("register LEAF_UPLINK_DATA")
+            });
 
             let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_c = seen.clone();
@@ -7520,16 +7621,15 @@ mod router_tests {
                 )
                 .unwrap();
 
-            let pkt = Packet::from_f32_slice(
-                DataType::named("GPS_DATA"),
-                &[1.0_f32, 2.0, 3.0],
-                &[DataEndpoint::named("RADIO")],
-                42,
-            )
-            .unwrap();
+            let pkt = Packet::from_f32_slice(leaf_type, &[1.0_f32, 2.0, 3.0], &[leaf_endpoint], 42)
+                .unwrap();
             router.tx(pkt).unwrap();
 
-            assert!(seen.lock().unwrap().is_empty());
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "a leaf must not lose nonlocal traffic during a discovery-route gap"
+            );
         }
 
         #[test]
@@ -7658,7 +7758,10 @@ mod router_tests {
             // Network variables use their frozen destination contract for end-to-end delivery;
             // they do not need to consume hop-reliable sequencing state on every transport.
             let ty = ensure_managed_variable_test_schema();
-            let endpoint = DataEndpoint::named("ACTUATOR_BOARD");
+            // A network variable's schema endpoint is descriptive metadata;
+            // ownership is advertised independently through discovery.  No
+            // board registers this endpoint as a normal packet handler.
+            let endpoint = DataEndpoint::named("SD_CARD");
             let gs = Arc::new(Router::new_with_clock(
                 RouterConfig::default().with_sender("GS"),
                 zero_clock(),

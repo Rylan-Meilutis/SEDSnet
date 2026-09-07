@@ -4723,7 +4723,20 @@ impl Router {
                         RouteSelectionOrigin::Flood,
                     )))
                 } else {
-                    Ok(RemoteSidePlan::Target(Vec::new()))
+                    // A leaf with one eligible uplink has no ambiguous route
+                    // choice.  Discovery can briefly expire or lag while the
+                    // remote topology crosses a bridge; dropping locally
+                    // originated nonlocal traffic during that window loses
+                    // command acknowledgements permanently.  Use the sole
+                    // egress, while multi-sided routers still refuse to
+                    // broadcast an unresolved destination.
+                    let fallback =
+                        self.eligible_side_ids_locked(&st, None, Some(ty), restrict_link_local);
+                    Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
+                        fallback
+                    } else {
+                        Vec::new()
+                    }))
                 }
             }
         }
@@ -7025,6 +7038,14 @@ impl Router {
                         continue;
                     }
                     if sent.partial_acked {
+                        // A partial ACK normally arrives with a request for
+                        // the missing sequence. If that request is itself
+                        // lost, retaining this flag forever pins the history
+                        // entry and eventually rejects unrelated traffic with
+                        // `reliable history full`. Give the request one retry
+                        // interval, then resume normal bounded retransmission.
+                        sent.partial_acked = false;
+                        sent.last_send_ms = now;
                         continue;
                     }
                     if sent.retries >= runtime_reliable_max_retries() {

@@ -3393,6 +3393,11 @@ impl Relay {
                         continue;
                     }
                     if sent.partial_acked {
+                        // Do not let a lost packet-request pin a partially
+                        // acknowledged entry forever. Allow one interval for
+                        // the explicit request, then return to bounded replay.
+                        sent.partial_acked = false;
+                        sent.last_send_ms = now;
                         continue;
                     }
                     if sent.retries >= runtime_reliable_max_retries() {
