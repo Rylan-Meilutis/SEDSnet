@@ -165,7 +165,11 @@ pub const RELIABLE_MAX_PENDING: usize = match option_env!("RELIABLE_MAX_PENDING"
 
 pub const RELIABLE_MAX_RETURN_ROUTES: usize = match option_env!("RELIABLE_MAX_RETURN_ROUTES") {
     Some(val) => parse_usize(val),
-    None => MAX_RECENT_RX_IDS,
+    // Return routes protect ACKs for packets that are still in the reliable
+    // pending window. Tying this to the unrelated RX de-duplication cache can
+    // evict a live ACK path when memory-constrained targets reduce
+    // MAX_RECENT_RX_IDS below RELIABLE_MAX_PENDING.
+    None => RELIABLE_MAX_PENDING,
 };
 
 pub const RELIABLE_MAX_END_TO_END_PENDING: usize =
