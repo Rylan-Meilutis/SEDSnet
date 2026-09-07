@@ -23,7 +23,10 @@ pub const DISCOVERY_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 pub const DISCOVERY_SLOW_LINK_PING_INTERVAL_MS: u64 = 15_000;
 pub const DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS: u64 = 120_000;
 pub const TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS: u64 = 30_000;
-const DISCOVERY_TOPOLOGY_DELTA_MARKER: u32 = u32::MAX;
+// A zero-node full topology is never emitted. Reusing zero as the extension
+// marker makes older decoders reject the trailing delta payload cheaply
+// instead of interpreting a marker as an enormous allocation count.
+const DISCOVERY_TOPOLOGY_DELTA_MARKER: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryCadenceState {
