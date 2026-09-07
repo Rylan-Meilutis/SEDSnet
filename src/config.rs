@@ -2560,6 +2560,42 @@ fn embedded_overlay_type_by_name(name: &str) -> Option<DataTypeDefinition> {
 }
 
 #[cfg(not(feature = "std"))]
+fn embedded_endpoint_name_exists(name: &str) -> bool {
+    if embedded_overlay_endpoint_by_name(name).is_some() {
+        return true;
+    }
+    for def in EMBEDDED_BUILTIN_ENDPOINTS {
+        if def.name == name {
+            return true;
+        }
+    }
+    for def in EMBEDDED_SCHEMA_ENDPOINTS {
+        if def.name == name {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(feature = "std"))]
+fn embedded_type_name_exists(name: &str) -> bool {
+    if embedded_overlay_type_by_name(name).is_some() {
+        return true;
+    }
+    for def in EMBEDDED_BUILTIN_TYPES {
+        if def.name == name {
+            return true;
+        }
+    }
+    for def in EMBEDDED_SCHEMA_TYPES {
+        if def.name == name {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(feature = "std"))]
 fn own_embedded_endpoint(def: EndpointDefinition) -> OwnedEndpointDefinition {
     OwnedEndpointDefinition {
         id: def.id,
@@ -2843,36 +2879,36 @@ pub fn merge_owned_schema_snapshot_with_budget(
     // Validate the complete decoded snapshot before publishing anything. The
     // second pass moves accepted definitions straight into the append-only
     // overlay, avoiding duplicate change vectors on constrained targets.
-    let added_bytes = snapshot
-        .endpoints
-        .iter()
-        .filter(|incoming| {
-            !endpoint_exists(incoming.id)
-                && embedded_overlay_endpoint_by_name(&incoming.name).is_none()
-                && !EMBEDDED_BUILTIN_ENDPOINTS
-                    .iter()
-                    .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-                    .any(|def| def.name == incoming.name)
-        })
-        .map(embedded_endpoint_allocation_cost)
-        .sum::<usize>()
-        .saturating_add(
-            snapshot
-                .types
-                .iter()
-                .filter(|incoming| {
-                    incoming.endpoints.iter().all(|ep| {
-                        endpoint_exists(*ep) || snapshot.endpoints.iter().any(|def| def.id == *ep)
-                    }) && !data_type_exists(incoming.id)
-                        && embedded_overlay_type_by_name(&incoming.name).is_none()
-                        && !EMBEDDED_BUILTIN_TYPES
-                            .iter()
-                            .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                            .any(|def| def.name == incoming.name)
-                })
-                .map(embedded_type_allocation_cost)
-                .sum::<usize>(),
-        );
+    let mut added_bytes = 0usize;
+    for incoming in &snapshot.endpoints {
+        if !endpoint_exists(incoming.id) && !embedded_endpoint_name_exists(&incoming.name) {
+            added_bytes = added_bytes.saturating_add(embedded_endpoint_allocation_cost(incoming));
+        }
+    }
+    for incoming in &snapshot.types {
+        let mut endpoints_available = true;
+        for endpoint in &incoming.endpoints {
+            let mut supplied = endpoint_exists(*endpoint);
+            if !supplied {
+                for definition in &snapshot.endpoints {
+                    if definition.id == *endpoint {
+                        supplied = true;
+                        break;
+                    }
+                }
+            }
+            if !supplied {
+                endpoints_available = false;
+                break;
+            }
+        }
+        if endpoints_available
+            && !data_type_exists(incoming.id)
+            && !embedded_type_name_exists(&incoming.name)
+        {
+            added_bytes = added_bytes.saturating_add(embedded_type_allocation_cost(incoming));
+        }
+    }
     let projected_bytes = embedded_static_schema_cost()
         .saturating_add(EMBEDDED_SCHEMA_OWNED_BYTES.load(Ordering::Relaxed))
         .saturating_add(added_bytes);
@@ -2884,13 +2920,7 @@ pub fn merge_owned_schema_snapshot_with_budget(
     }
     let mut committed_bytes = 0usize;
     for incoming in snapshot.endpoints {
-        if !endpoint_exists(incoming.id)
-            && embedded_overlay_endpoint_by_name(&incoming.name).is_none()
-            && !EMBEDDED_BUILTIN_ENDPOINTS
-                .iter()
-                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-                .any(|def| def.name == incoming.name)
-        {
+        if !endpoint_exists(incoming.id) && !embedded_endpoint_name_exists(&incoming.name) {
             committed_bytes =
                 committed_bytes.saturating_add(embedded_endpoint_allocation_cost(&incoming));
             push_embedded_endpoint(incoming);
@@ -2900,13 +2930,16 @@ pub fn merge_owned_schema_snapshot_with_budget(
         }
     }
     for incoming in snapshot.types {
-        if incoming.endpoints.iter().all(|ep| endpoint_exists(*ep))
+        let mut endpoints_available = true;
+        for endpoint in &incoming.endpoints {
+            if !endpoint_exists(*endpoint) {
+                endpoints_available = false;
+                break;
+            }
+        }
+        if endpoints_available
             && !data_type_exists(incoming.id)
-            && embedded_overlay_type_by_name(&incoming.name).is_none()
-            && !EMBEDDED_BUILTIN_TYPES
-                .iter()
-                .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                .any(|def| def.name == incoming.name)
+            && !embedded_type_name_exists(&incoming.name)
         {
             committed_bytes =
                 committed_bytes.saturating_add(embedded_type_allocation_cost(&incoming));
