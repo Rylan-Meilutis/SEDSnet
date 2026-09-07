@@ -2447,17 +2447,21 @@ mod tests_extra {
         use crate::discovery::{TopologyBoardNode, build_discovery_topology};
         use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
-        let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+        // Packed sides enable the destination contract used by the real
+        // GroundStation links. The contract names owners on both sides; route
+        // selection must not collapse that multi-segment delivery to one
+        // adaptive path.
+        let seen_a: Arc<Mutex<Vec<Arc<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_b: Arc<Mutex<Vec<Arc<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_a_cb = seen_a.clone();
         let seen_b_cb = seen_b.clone();
         let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
-        let side_a = router.add_side_packet("A", move |packet| {
-            seen_a_cb.lock().unwrap().push(packet.clone());
+        let side_a = router.add_side_packed("A", move |bytes| {
+            seen_a_cb.lock().unwrap().push(Arc::from(bytes));
             Ok(())
         });
-        let side_b = router.add_side_packet("B", move |packet| {
-            seen_b_cb.lock().unwrap().push(packet.clone());
+        let side_b = router.add_side_packed("B", move |bytes| {
+            seen_b_cb.lock().unwrap().push(Arc::from(bytes));
             Ok(())
         });
         let endpoint = DataEndpoint::named("SD_CARD");
