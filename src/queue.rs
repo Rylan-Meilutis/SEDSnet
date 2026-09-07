@@ -220,6 +220,12 @@ impl<T: ByteCost> BoundedDeque<T> {
         Some(v)
     }
 
+    /// Remove the lowest-priority item from a deque populated with
+    /// [`Self::push_back_prioritized`].
+    pub(crate) fn pop_lowest_priority(&mut self) -> Option<T> {
+        self.pop_back()
+    }
+
     /// Remove item at position, updating byte count.
     pub fn remove_pos(&mut self, idx: usize) -> Option<T> {
         let v = self.q.remove(idx)?;
@@ -438,6 +444,42 @@ mod tests {
         assert_eq!(q.pop_front().unwrap().id, 3);
         assert_eq!(q.pop_front().unwrap().id, 1);
         assert_eq!(q.pop_front().unwrap().id, 2);
+    }
+
+    #[test]
+    fn prioritized_queue_evicts_the_lowest_priority_item() {
+        let mut q = BoundedDeque::new(4096, 4096, 1.0);
+        q.push_back_prioritized(
+            Item {
+                id: 1,
+                cost: 1,
+                priority: 10,
+            },
+            |item| item.priority,
+        )
+        .unwrap();
+        q.push_back_prioritized(
+            Item {
+                id: 2,
+                cost: 1,
+                priority: 200,
+            },
+            |item| item.priority,
+        )
+        .unwrap();
+        q.push_back_prioritized(
+            Item {
+                id: 3,
+                cost: 1,
+                priority: 100,
+            },
+            |item| item.priority,
+        )
+        .unwrap();
+
+        assert_eq!(q.pop_lowest_priority().map(|item| item.id), Some(1));
+        assert_eq!(q.pop_front().map(|item| item.id), Some(2));
+        assert_eq!(q.pop_front().map(|item| item.id), Some(3));
     }
 
     #[test]

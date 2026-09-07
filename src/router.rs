@@ -1914,8 +1914,12 @@ impl RouterInner {
 
     fn pop_shared_queue_item(&mut self, preferred: RouterQueueKind) -> bool {
         match preferred {
-            RouterQueueKind::Received => self.received_queue.pop_front().is_some(),
-            RouterQueueKind::Transmit => self.transmit_queue.pop_front().is_some(),
+            // RX and TX queues are stored in descending priority order.  When
+            // the shared byte budget is exhausted, evict from the tail so a
+            // low-priority telemetry packet cannot displace discovery or a
+            // managed-variable update at the head of the queue.
+            RouterQueueKind::Received => self.received_queue.pop_lowest_priority().is_some(),
+            RouterQueueKind::Transmit => self.transmit_queue.pop_lowest_priority().is_some(),
             RouterQueueKind::Recent => self.recent_rx.pop_front().is_some(),
             RouterQueueKind::ReliableRxBuffer => self.pop_reliable_rx_buffered().is_some(),
             #[cfg(feature = "discovery")]
