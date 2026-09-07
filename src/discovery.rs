@@ -1169,12 +1169,10 @@ pub fn build_discovery_schema_from_snapshot(
 pub fn build_discovery_schema_from_owned_snapshot(
     sender: &str,
     timestamp_ms: u64,
-    mut schema: OwnedRuntimeSchemaSnapshot,
+    schema: OwnedRuntimeSchemaSnapshot,
 ) -> TelemetryResult<Packet> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&3u32.to_le_bytes());
-
-    crate::config::sort_owned_schema(&mut schema);
 
     payload.extend_from_slice(&(schema.endpoints.len() as u32).to_le_bytes());
     for ep in schema.endpoints {

@@ -663,6 +663,7 @@ pub struct OwnedRuntimeSchemaSnapshot {
 // asymptotic speed of Rust's generic unstable sort. These concrete insertion
 // sorts avoid pulling several independently monomorphized quicksort engines
 // into constrained firmware images.
+#[cfg(feature = "std")]
 pub(crate) fn sort_owned_schema(snapshot: &mut OwnedRuntimeSchemaSnapshot) {
     for index in 1..snapshot.endpoints.len() {
         let mut cursor = index;
