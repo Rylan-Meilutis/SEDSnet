@@ -625,7 +625,10 @@ mod threaded_system_tests {
         sender_c.join().expect("sender C panicked");
 
         // ------------- 8) Wait for expected hits or timeout -------------
-        let expected_total = 20;
+        // Each endpoint receives 15 packets produced by the other nodes.
+        // A router intentionally does not reflect its own five transmissions
+        // back through its local endpoint.
+        let expected_total = 15;
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
