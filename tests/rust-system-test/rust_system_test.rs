@@ -332,6 +332,10 @@ mod threaded_system_tests {
     #[test]
     fn threaded_system_sim_rust() {
         ensure_common_test_schema();
+        // Leave enough time for the bus and router workers to drain between
+        // bursts on small shared CI runners. The test verifies lossless normal
+        // traffic, not intentional queue overload (covered separately).
+        const SEND_INTERVAL: Duration = Duration::from_millis(10);
         // ------------- 1) Relay + two buses -------------
         // Buses are MPSC channels of (from_node_idx, wire_bytes).
         type BusMsg = (usize, Vec<u8>);
@@ -571,7 +575,7 @@ mod threaded_system_tests {
                 make_series(&mut buf[..3], 10.0);
                 let pkt = make_packet(DataType::named("GPS_DATA"), &buf[..3], i);
                 radio_router.tx(pkt).unwrap();
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(SEND_INTERVAL);
             }
         });
 
@@ -583,13 +587,13 @@ mod threaded_system_tests {
                 make_series(&mut buf[..3], 0.5);
                 let pkt1 = make_packet(DataType::named("GPS_DATA"), &buf[..3], i);
                 flight_router.tx(pkt1).unwrap();
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(SEND_INTERVAL);
 
                 // BARO-like data
                 make_series(&mut buf[..3], 101.3);
                 let pkt2 = make_packet(DataType::named("GPS_DATA"), &buf[..3], i + 100);
                 flight_router.tx(pkt2).unwrap();
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(SEND_INTERVAL);
             }
         });
 
@@ -600,7 +604,7 @@ mod threaded_system_tests {
                 make_series(&mut buf[..2], 3.7);
                 let pkt1 = make_packet(DataType::named("BATTERY_STATUS"), &buf[..2], i + 200);
                 power_router.tx(pkt1).unwrap();
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(SEND_INTERVAL);
 
                 let msg = "hello world!";
                 let pkt2 = Packet::from_str_slice(
@@ -611,7 +615,7 @@ mod threaded_system_tests {
                 )
                 .unwrap();
                 power_router.tx(pkt2).unwrap();
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(SEND_INTERVAL);
             }
         });
 
