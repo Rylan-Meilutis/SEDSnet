@@ -4,8 +4,8 @@ SEDSnet is a Rust telemetry transport and logging library with a shared schema, 
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 
-The current release is v4.0.19. Router compact side transport uses synchronized bounded template
-dictionaries and periodic full refreshes so lossy links recover when a template frame is missed.
+The current release is v4.0.20. Discovery snapshots queued during topology churn are coalesced per
+sender and destination, keeping embedded transmit memory bounded without losing other boards.
 
 See [Changelogs](Changelogs) for version highlights and release notes.
 

@@ -33,6 +33,4 @@ jobs:
         run: cargo install cargo-nextest --locked
 
       - name: 'Build and test'
-        run: |
-          chmod +x ./build.py
-          ./build.py test
+        run: python3 publish_crates.py

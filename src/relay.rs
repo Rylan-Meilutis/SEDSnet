@@ -1093,6 +1093,26 @@ impl RelayInner {
     }
 
     fn push_tx(&mut self, item: RelayTxItem) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        {
+            let incoming = match &item.data {
+                RelayItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()) => {
+                    Some((pkt.data_type(), pkt.sender().to_owned()))
+                }
+                RelayItem::Packet(_) | RelayItem::Packed(_) => None,
+            };
+            if let Some((incoming_ty, incoming_sender)) = incoming {
+                self.tx_queue.retain(|queued| {
+                    let same_snapshot = match &queued.data {
+                        RelayItem::Packet(pkt) => {
+                            pkt.data_type() == incoming_ty && pkt.sender() == incoming_sender
+                        }
+                        RelayItem::Packed(_) => false,
+                    };
+                    queued.dst != item.dst || !same_snapshot
+                });
+            }
+        }
         self.make_shared_queue_room(item.byte_cost(), RelayQueueKind::Tx)?;
         self.tx_queue
             .push_back_prioritized(item, |queued| queued.priority)

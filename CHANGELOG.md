@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.0.20
+
+- Coalesce superseded queued discovery snapshots per destination, data type, and sender. Repeated
+  topology updates no longer consume the complete embedded transmit budget while each distinct
+  board's latest advertisement remains available for forwarding.
+- Repair the comprehensive reliable compact-link soak so it returns hop acknowledgements to the
+  sender and exercises sustained traffic instead of stalling after the first reliable frame.
+- Run the publish script as the complete release gate in both GitHub and GitLab CI, including the
+  full Rust, Python, no-std, benchmark, and packaging checks before any release job can run.
+- Discover every Python unit test during the full suite, including publish and CI contract tests,
+  instead of maintaining a partial hard-coded file list.
+
 ## 4.0.19
 
 - Charge embedded runtime-schema synchronization for only the definitions actually retained in

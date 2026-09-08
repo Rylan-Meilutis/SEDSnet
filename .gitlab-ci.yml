@@ -1,6 +1,7 @@
 # GitLab CI Pipeline Configuration
 workflow:
   rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
     - if: '$CI_COMMIT_BRANCH == "main"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
@@ -19,14 +20,19 @@ variables:
 
 rust-tests:
   stage: test
-  image:
-    name: registry.gitlab.rylanswebsite.com/rylan-meilutis/rust-docker-builder:x86
+  image: rust:latest
+  before_script:
+    - apt-get update
+    - apt-get install -y gcc-arm-none-eabi gnuplot python3-tk
+    - cargo install cargo-nextest --locked
   script:
-    - chmod +x build.py && ./build.py test
+    - python3 publish_crates.py
 
 cargo-release:
   stage: release
   image: rust:latest
+  needs:
+    - rust-tests
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
   before_script:
@@ -42,6 +48,8 @@ linux-wheels:
     entrypoint: [""]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
+  needs:
+    - rust-tests
   parallel:
     matrix:
       - TARGET:
@@ -63,6 +71,8 @@ windows-cross-wheels:
   image: rust:bookworm
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
+  needs:
+    - rust-tests
   parallel:
     matrix:
       - TARGET:
@@ -87,6 +97,8 @@ macos-cross-wheels:
   stage: wheels
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
+  needs:
+    - rust-tests
   parallel:
     matrix:
       - TARGET: x86_64-apple-darwin
@@ -130,6 +142,8 @@ python-sdist:
     entrypoint: [""]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
+  needs:
+    - rust-tests
   script:
     - maturin sdist --out dist
   artifacts:
@@ -155,7 +169,7 @@ pypi-release:
       optional: true
   script:
     - python3 -m pip install twine
-    - python3 -m twine upload --skip-existing --username __token__ --password "$MATURIN_PYPI_TOKEN" dist/* || echo "warning: PyPI upload failed; artifacts were already built"
+    - python3 publish_crates.py --skip-crates --skip-tests --publish-pypi --pypi-skip-existing --wheel-out dist
 
 sast:
   stage: test

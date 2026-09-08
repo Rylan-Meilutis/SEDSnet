@@ -2892,6 +2892,8 @@ mod reliable_drop_tests {
 
         let link: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
         let tx_link = link.clone();
+        let ack_link: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let rx_ack_link = ack_link.clone();
         let sender = Router::new_with_clock(
             RouterConfig::default().with_sender("COMPACT_TX"),
             shared_clock(now),
@@ -2913,7 +2915,10 @@ mod reliable_drop_tests {
         );
         let rx_side = receiver.add_side_packed_with_options(
             "compact-can-fd",
-            |_bytes| Ok(()),
+            move |bytes| {
+                rx_ack_link.lock().unwrap().push_back(bytes.to_vec());
+                Ok(())
+            },
             RouterSideOptions {
                 reliable_enabled: true,
                 max_frame_bytes: 48,
@@ -2944,6 +2949,10 @@ mod reliable_drop_tests {
                 receiver.rx_packed_queue_from_side(&frame, rx_side).unwrap();
             }
             receiver.process_all_queues_with_timeout(0).unwrap();
+            for frame in drain_queue(&ack_link) {
+                sender.rx_packed_queue_from_side(&frame, tx_side).unwrap();
+            }
+            sender.process_all_queues_with_timeout(0).unwrap();
         }
 
         let stats = sender.export_runtime_stats();

@@ -9334,13 +9334,16 @@ mod router_tests {
                 for (idx, (label, router, side)) in nodes.iter().enumerate() {
                     router.rx_from_side(&topology_pkt, *side).unwrap();
                     max_discovery_seen[idx] = max_discovery_seen[idx].max(discovery_bytes(router));
-                    router
-                        .log_queue_ts(
-                            DataType::named("GPS_DATA"),
-                            round * 10 + idx as u64,
-                            &[round as f32, idx as f32, (round + idx as u64) as f32],
-                        )
-                        .unwrap();
+                    let queued = router.log_queue_ts(
+                        DataType::named("GPS_DATA"),
+                        round * 10 + idx as u64,
+                        &[round as f32, idx as f32, (round + idx as u64) as f32],
+                    );
+                    assert!(
+                        queued.is_ok(),
+                        "{label}: telemetry admission failed at round {round}: {queued:?}; layout={}",
+                        router.export_memory_layout_json()
+                    );
                     let pkt = Packet::from_f32_slice(
                         DataType::named("GPS_DATA"),
                         &[idx as f32, round as f32, 42.0],

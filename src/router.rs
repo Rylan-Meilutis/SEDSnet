@@ -2006,6 +2006,34 @@ impl RouterInner {
     }
 
     fn push_transmit(&mut self, item: TxQueued) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        if let RouterTxItem::ToSide { dst, data, .. } = &item.item {
+            let incoming = match data {
+                RouterItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()) => {
+                    Some((pkt.data_type(), pkt.sender().to_owned()))
+                }
+                RouterItem::Packet(_) | RouterItem::Packed(_) => None,
+            };
+            if let Some((incoming_ty, incoming_sender)) = incoming {
+                self.transmit_queue.retain(|queued| {
+                    let RouterTxItem::ToSide {
+                        dst: queued_dst,
+                        data: queued_data,
+                        ..
+                    } = &queued.item
+                    else {
+                        return true;
+                    };
+                    let same_snapshot = match queued_data {
+                        RouterItem::Packet(pkt) => {
+                            pkt.data_type() == incoming_ty && pkt.sender() == incoming_sender
+                        }
+                        RouterItem::Packed(_) => false,
+                    };
+                    *queued_dst != *dst || !same_snapshot
+                });
+            }
+        }
         self.make_shared_queue_room(item.byte_cost(), item.priority)?;
         self.transmit_queue
             .push_back_prioritized(item, |queued| queued.priority)

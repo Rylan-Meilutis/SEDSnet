@@ -1,5 +1,15 @@
 # Changelogs
 
+## Version 4.0.20 highlights
+
+- Superseded discovery snapshots are coalesced per destination, data type, and sender before queue
+  admission, preventing topology churn from exhausting constrained embedded transmit pools.
+- Distinct boards retain independent queued advertisements, so coalescing does not hide downstream
+  devices during multi-hop discovery.
+- The reliable compact-link soak now exchanges hop acknowledgements and validates sustained traffic.
+- GitHub and GitLab use the publish script as their full pre-release validation gate.
+- The full build test discovers all Python test modules, including release-automation regressions.
+
 ## Version 4.0.19 highlights
 
 - Embedded schema synchronization charges only definitions retained in RAM, so a large overlapping
