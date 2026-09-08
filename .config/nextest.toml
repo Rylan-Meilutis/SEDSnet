@@ -1,0 +1,5 @@
+[profile.default]
+# The system tests create their own router, transport, and processor threads.
+# Running too many test binaries beside them can starve their real-time
+# deadlines on smaller CI runners even though the network behavior is healthy.
+test-threads = 2

@@ -23,7 +23,7 @@ rust-tests:
   image: rust:latest
   before_script:
     - apt-get update
-    - apt-get install -y gcc-arm-none-eabi gnuplot python3-tk
+    - apt-get install -y cmake gcc-arm-none-eabi gnuplot python3-tk
     - rustup component add clippy rustfmt
     - cargo install cargo-nextest --locked
   script:
