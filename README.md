@@ -17,7 +17,7 @@ including wire/discovery formats and binding guides, is mirrored in
 ## Authors
 
 - [@Rylan-Meilutis](https://github.com/rylan-meilutis) (Original Author, Maintainer, and co-creator of the protocol)
-- [@origami-yoda](https://github.com/origami-yoda) (Co-creator of the protocol and co-author of the original C++
+- [@origami-yoda](https://github.com/origami-yoda) (Co-creator of the V1 protocol and co-author of the original C++
   implementation)
 
 ---
