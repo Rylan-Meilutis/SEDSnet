@@ -1,11 +1,11 @@
 mod c_system_test {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    fn run_exe(root: &PathBuf, build_dir: &PathBuf, name: &str) {
+    fn run_exe(root: &Path, build_dir: &Path, name: &str) {
         let exe = build_dir.join(name);
         let mut child = Command::new(&exe)
             .current_dir(root)
