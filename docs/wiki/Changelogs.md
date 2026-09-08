@@ -1,18 +1,17 @@
 # Changelogs
 
-## Unreleased
-
-- Topology changes now propagate as incremental named-node upserts and removal tombstones instead
-  of restarting discovery with a complete graph on every change. Each idempotent delta is repeated
-  three times with backoff to tolerate a lost discovery frame without waiting for periodic repair.
-- Compact address/ownership summaries refresh routes and managed-variable owners immediately;
-  complete topology snapshots remain available for bootstrap, explicit recovery, and periodic
-  repair after a lost delta.
-- Discovery tests enforce smaller change traffic, multi-hop reliable convergence, late-join full
-  recovery, and exact removal behavior.
-
 ## Version 4.0.18 highlights
 
+- Topology changes propagate as incremental named-node upserts and removal tombstones; complete
+  snapshots remain available for bootstrap, explicit recovery, and periodic repair.
+- Received runtime schemas merge into the network schema instead of being discarded.
+- Managed-variable refresh requests teach routers selective subscriber ownership with compact,
+  bounded per-side state rather than static fanout or synthetic topology nodes.
+- Autonomous named discovery routes commands, ACKs, normal endpoint data, managed variables, and
+  time sync across multi-hop bridges, including constrained radio and serial links.
+- Discovery has the highest reserved priority; network variables and time sync share the next band;
+  application traffic retains its configured ordering and cannot be starved indefinitely.
+- Embedded schema merging and fixed-capacity queues reduce peak allocation pressure and fragmentation.
 - Discovery link capabilities now negotiate compact-template capacity per side.
 - A sender with a larger configured dictionary limits itself to the smallest live peer capacity,
   preventing later compact network variables or commands from referencing evicted receiver state.

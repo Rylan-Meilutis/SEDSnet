@@ -4,6 +4,10 @@ A Rust networking stack with compact packets, runtime schema, discovery, routing
 managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
 bindings for distributed embedded and host systems.
 
+Current stable release: **4.0.18** on crates.io and PyPI. Embedded CMake
+consumers use the `v4.0.18` Git tag; Rust and Python consumers should use the
+registry release.
+
 Crate API docs are published on [docs.rs](https://docs.rs/SEDSnet). The implementation-level wiki,
 including wire/discovery formats and binding guides, is mirrored in
 [docs/wiki](./docs/wiki/Home.md) and on the project wiki.

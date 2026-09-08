@@ -2,6 +2,20 @@
 
 ## 4.0.18
 
+- Propagate topology changes as compact incremental upserts and removals while retaining full
+  snapshots for bootstrap and repair. Received runtime schemas are merged rather than discarded.
+- Resolve autonomous board names and discovered endpoint owners across multi-hop router links,
+  including compact headers that omit hostnames.
+- Learn managed-variable subscribers from refresh requests using bounded per-side storage, so
+  selective delivery works without static fanout or unbounded embedded topology growth.
+- Route commands, acknowledgements, regular endpoint traffic, network variables, and time sync
+  through discovered owners across CAN, radio, UART, and I2C/UART bridges.
+- Reserve scheduler capacity for discovery first, then network variables and time sync, followed by
+  application-configured priority, while preventing control traffic from starving application data.
+- Prevent transport-error recursion and reliable-history growth when a board boots without an
+  acknowledged CAN peer or a constrained link drops discovery traffic.
+- Reduce embedded schema merge allocations, queue churn, and flash cost; support fixed-capacity
+  queues when the growth multiplier is `1.0`.
 - Negotiate compact side-template dictionary capacity from discovery link capabilities. A sender
   now limits its active templates to the smallest live peer dictionary on that side, preventing
   compact network-variable and command frames from referencing entries a constrained receiver has
