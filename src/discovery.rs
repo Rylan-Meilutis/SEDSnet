@@ -37,6 +37,30 @@ pub const TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS: u64 = 30_000;
 // instead of interpreting a marker as an enormous allocation count.
 const DISCOVERY_TOPOLOGY_DELTA_MARKER: u32 = 0;
 
+/// Validate an untrusted wire count before reserving collection storage.
+///
+/// Every decoded element consumes at least `minimum_encoded_bytes` from the
+/// remaining payload. Checking that relationship before `Vec::with_capacity`
+/// prevents a corrupt count from reaching Rust's infallible capacity path and
+/// halting an embedded router with `capacity overflow`.
+fn bounded_wire_vec<T>(
+    payload: &[u8],
+    cursor: usize,
+    count: usize,
+    minimum_encoded_bytes: usize,
+    label: &'static str,
+) -> TelemetryResult<Vec<T>> {
+    let remaining = payload.len().saturating_sub(cursor);
+    if minimum_encoded_bytes == 0 || count > remaining / minimum_encoded_bytes {
+        return Err(TelemetryError::Unpack(label));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| TelemetryError::Unpack(label))?;
+    Ok(values)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryCadenceState {
     pub current_interval_ms: u64,
@@ -562,7 +586,9 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
     let hostname = decode_string(payload, &mut cursor, "discovery address hostname")?;
     let endpoint_count =
         read_u32(payload, &mut cursor, "discovery address endpoint count")? as usize;
-    let mut reachable_endpoints = Vec::with_capacity(endpoint_count);
+    let mut reachable_endpoints = bounded_wire_vec(
+        payload, cursor, endpoint_count, 4, "discovery address endpoint count",
+    )?;
     for _ in 0..endpoint_count {
         let raw = read_u32(payload, &mut cursor, "discovery address endpoint")?;
         let ep = try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
@@ -579,7 +605,9 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
             &mut cursor,
             "discovery address network variable count",
         )? as usize;
-        reachable_network_variables.reserve(count);
+        reachable_network_variables = bounded_wire_vec(
+            payload, cursor, count, 4, "discovery address network variable count",
+        )?;
         for _ in 0..count {
             let raw = read_u32(payload, &mut cursor, "discovery address network variable")?;
             let ty = DataType::try_from_u32(raw)
@@ -592,7 +620,9 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
         reachable_network_variables.dedup();
     }
     let source_count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
-    let mut reachable_timesync_sources = Vec::with_capacity(source_count);
+    let mut reachable_timesync_sources = bounded_wire_vec(
+        payload, cursor, source_count, 4, "discovery address source count",
+    )?;
     for _ in 0..source_count {
         let source = decode_string(payload, &mut cursor, "discovery address source")?;
         if !source.is_empty() {
@@ -681,7 +711,9 @@ pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryRes
 
     let count = u32::from_le_bytes(payload[..4].try_into().expect("4-byte count")) as usize;
     let mut cursor = 4usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = bounded_wire_vec(
+        payload, cursor, count, 4, "discovery timesync source count",
+    )?;
 
     for _ in 0..count {
         if payload.len().saturating_sub(cursor) < 4 {
@@ -877,7 +909,9 @@ pub fn decode_discovery_topology_update(pkt: &Packet) -> TelemetryResult<Discove
             .expect("4-byte count"),
     ) as usize;
     cursor += 4;
-    let mut removed = Vec::with_capacity(removed_count);
+    let mut removed = bounded_wire_vec(
+        payload, cursor, removed_count, 4, "discovery topology removal count",
+    )?;
     for _ in 0..removed_count {
         removed.push(decode_string(
             payload,
@@ -923,7 +957,10 @@ fn decode_topology_boards(
     cursor: &mut usize,
     count: usize,
 ) -> TelemetryResult<Vec<TopologyBoardNode>> {
-    let mut boards = Vec::with_capacity(count);
+    /* Each board has at minimum a string length and three collection counts. */
+    let mut boards = bounded_wire_vec(
+        payload, *cursor, count, 16, "discovery topology board count",
+    )?;
 
     for _ in 0..count {
         let sender_id = decode_string(payload, cursor, "discovery topology sender id")?;
@@ -937,7 +974,9 @@ fn decode_topology_boards(
                 .expect("4-byte count"),
         ) as usize;
         *cursor += 4;
-        let mut reachable_endpoints = Vec::with_capacity(endpoint_count);
+        let mut reachable_endpoints = bounded_wire_vec(
+            payload, *cursor, endpoint_count, 4, "discovery topology endpoint count",
+        )?;
         for _ in 0..endpoint_count {
             if payload.len().saturating_sub(*cursor) < 4 {
                 return Err(TelemetryError::Unpack("discovery topology endpoint"));
@@ -963,7 +1002,10 @@ fn decode_topology_boards(
                 .expect("4-byte count"),
         ) as usize;
         *cursor += 4;
-        let mut reachable_timesync_sources = Vec::with_capacity(source_count);
+        let mut reachable_timesync_sources = bounded_wire_vec(
+            payload, *cursor, source_count, 4,
+            "discovery topology timesync source count",
+        )?;
         for _ in 0..source_count {
             let source = decode_string(payload, cursor, "discovery topology timesync source")?;
             if !source.is_empty() {
@@ -982,7 +1024,10 @@ fn decode_topology_boards(
                 .expect("4-byte count"),
         ) as usize;
         *cursor += 4;
-        let mut connections = Vec::with_capacity(connection_count);
+        let mut connections = bounded_wire_vec(
+            payload, *cursor, connection_count, 4,
+            "discovery topology connection count",
+        )?;
         for _ in 0..connection_count {
             let peer = decode_string(payload, cursor, "discovery topology connection")?;
             if !peer.is_empty() {
@@ -1272,7 +1317,9 @@ pub fn decode_discovery_schema_payload(
 
     let endpoint_count =
         read_u32(payload, &mut cursor, "discovery schema endpoint count")? as usize;
-    let mut endpoints = Vec::with_capacity(endpoint_count);
+    let mut endpoints = bounded_wire_vec(
+        payload, cursor, endpoint_count, 13, "discovery schema endpoint count",
+    )?;
     for _ in 0..endpoint_count {
         let id = DataEndpoint(read_u32(
             payload,
@@ -1310,7 +1357,9 @@ pub fn decode_discovery_schema_payload(
     }
 
     let type_count = read_u32(payload, &mut cursor, "discovery schema type count")? as usize;
-    let mut types = Vec::with_capacity(type_count);
+    let mut types = bounded_wire_vec(
+        payload, cursor, type_count, 19, "discovery schema type count",
+    )?;
     for _ in 0..type_count {
         let id = DataType(read_u32(payload, &mut cursor, "discovery schema type id")?);
         let name = decode_string(payload, &mut cursor, "discovery schema type name")?;
@@ -1365,7 +1414,10 @@ pub fn decode_discovery_schema_payload(
         .ok_or(TelemetryError::Unpack("discovery schema e2e cryptography"))?;
         let endpoint_count =
             read_u32(payload, &mut cursor, "discovery schema type endpoint count")? as usize;
-        let mut type_endpoints = Vec::with_capacity(endpoint_count);
+        let mut type_endpoints = bounded_wire_vec(
+            payload, cursor, endpoint_count, 4,
+            "discovery schema type endpoint count",
+        )?;
         for _ in 0..endpoint_count {
             type_endpoints.push(DataEndpoint(read_u32(
                 payload,
@@ -1389,4 +1441,34 @@ pub fn decode_discovery_schema_payload(
         return Err(TelemetryError::Unpack("discovery schema trailing bytes"));
     }
     Ok(OwnedRuntimeSchemaSnapshot { endpoints, types })
+}
+
+#[cfg(test)]
+mod bounded_decode_tests {
+    use super::{
+        decode_discovery_schema_payload, decode_discovery_timesync_sources_payload,
+        decode_discovery_topology_payload,
+    };
+
+    #[test]
+    fn corrupt_timesync_count_is_rejected_without_reserving() {
+        assert!(decode_discovery_timesync_sources_payload(&u32::MAX.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn corrupt_topology_count_is_rejected_without_reserving() {
+        assert!(decode_discovery_topology_payload(&u32::MAX.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn corrupt_schema_counts_are_rejected_without_reserving() {
+        let mut endpoints = 3u32.to_le_bytes().to_vec();
+        endpoints.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_discovery_schema_payload(&endpoints).is_err());
+
+        let mut types = 3u32.to_le_bytes().to_vec();
+        types.extend_from_slice(&0u32.to_le_bytes());
+        types.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_discovery_schema_payload(&types).is_err());
+    }
 }

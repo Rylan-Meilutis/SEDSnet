@@ -1,5 +1,13 @@
 # Changelogs
 
+## Version 4.0.21 highlights
+
+- Discovery decoders bound every untrusted collection count by the remaining packet bytes before
+  reserving storage, preventing malformed frames from causing embedded capacity-overflow panics.
+- Collection reservation in these decode paths is fallible and returns a normal unpack error when
+  memory is unavailable.
+- Regression tests cover corrupt time-source, topology, and runtime-schema counts.
+
 ## Version 4.0.20 highlights
 
 - Superseded discovery snapshots are coalesced per destination, data type, and sender before queue

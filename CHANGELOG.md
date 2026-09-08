@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.0.21
+
+- Validate all collection counts decoded from discovery address, time-source, topology, incremental
+  removal, and runtime-schema packets against the bytes remaining on the wire before reserving
+  storage. Corrupt, truncated, or desynchronized frames now return an unpack error instead of
+  entering Rust's fatal `capacity overflow` path on embedded boards.
+- Use fallible collection reservation for those wire-owned values so temporary memory pressure is
+  reported as a normal decode failure and cannot halt a router whose RTOS thread remains alive.
+- Add malformed-count regressions for time-source, topology, and schema discovery decoders.
+
 ## 4.0.20
 
 - Coalesce superseded queued discovery snapshots per destination, data type, and sender. Repeated
