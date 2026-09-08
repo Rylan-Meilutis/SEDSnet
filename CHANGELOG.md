@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.19
+
+- Charge embedded runtime-schema synchronization for only the definitions actually retained in
+  RAM, rather than the sender's complete overlapping wire snapshot. Heterogeneous boards can now
+  learn small schema additions through constrained 8 KiB router pools without rejecting the
+  snapshot, emitting transport errors, or leaving network variables undiscoverable.
+- Add a no-std regression that merges a small remote schema delta from a full snapshot larger than
+  the receiving router's free shared-queue budget.
+
 ## 4.0.18
 
 - Propagate topology changes as compact incremental upserts and removals while retaining full

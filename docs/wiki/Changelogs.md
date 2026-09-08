@@ -1,5 +1,10 @@
 # Changelogs
 
+## Version 4.0.19 highlights
+
+- Embedded schema synchronization charges only definitions retained in RAM, so a large overlapping
+  snapshot can contribute a small missing schema delta without exhausting an 8 KiB router pool.
+
 ## Version 4.0.18 highlights
 
 - Topology changes propagate as incremental named-node upserts and removal tombstones; complete

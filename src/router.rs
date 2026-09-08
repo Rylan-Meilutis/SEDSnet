@@ -5770,17 +5770,19 @@ impl Router {
         }
         if pkt.data_type() == DataType::DiscoverySchema {
             let snapshot = discovery::decode_discovery_schema(pkt)?;
-            let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
-            let mut st = self.state.lock();
-            st.make_shared_queue_room(
-                incoming_cost,
-                crate::transport_priority(DataType::DiscoverySchema),
-            )?;
-            let budget = st.memory.max_queue_budget;
-            drop(st);
+            // The decoded snapshot contains the sender's complete schema, but
+            // embedded targets retain only definitions that are not already
+            // compiled into their local schema. Charging the complete wire
+            // snapshot here made heterogeneous boards reject small schema
+            // deltas whenever the sender's full snapshot exceeded the shared
+            // queue budget. The merge performs an atomic projected-retained-
+            // bytes check; afterwards, reclaim queue/topology space using the
+            // actual retained schema size included by shared_queue_bytes_used.
+            let budget = self.state.lock().memory.max_queue_budget;
             let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
             if report.changed() {
                 let mut st = self.state.lock();
+                st.make_shared_queue_room(0, crate::transport_priority(DataType::DiscoverySchema))?;
                 st.fit_discovery_budget();
             }
             return Ok(true);
