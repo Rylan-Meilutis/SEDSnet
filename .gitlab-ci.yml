@@ -24,6 +24,7 @@ rust-tests:
   before_script:
     - apt-get update
     - apt-get install -y gcc-arm-none-eabi gnuplot python3-tk
+    - rustup component add clippy rustfmt
     - cargo install cargo-nextest --locked
   script:
     - python3 publish_crates.py
