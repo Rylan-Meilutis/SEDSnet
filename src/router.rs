@@ -467,7 +467,7 @@ struct DiscoverySenderState {
 struct DiscoverySideState {
     reachable: Vec<DataEndpoint>,
     reachable_network_variables: Vec<DataType>,
-    requested_network_variables: BTreeMap<DataType, u64>,
+    requested_network_variables: Vec<(DataType, u64)>,
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
     announcers: BTreeMap<String, DiscoverySenderState>,
@@ -4914,12 +4914,13 @@ impl Router {
             reachable_timesync_sources.extend(sender.reachable_timesync_sources.iter().cloned());
             last_seen_ms = last_seen_ms.max(sender.last_seen_ms);
         }
-        reachable_network_variables.extend(route.requested_network_variables.keys().copied());
+        reachable_network_variables
+            .extend(route.requested_network_variables.iter().map(|(ty, _)| *ty));
         last_seen_ms = last_seen_ms.max(
             route
                 .requested_network_variables
-                .values()
-                .copied()
+                .iter()
+                .map(|(_, last_seen_ms)| *last_seen_ms)
                 .max()
                 .unwrap_or(0),
         );
@@ -5024,9 +5025,11 @@ impl Router {
             route.announcers.retain(|_, sender| {
                 now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
             });
-            route.requested_network_variables.retain(|_, last_seen_ms| {
-                now_ms.saturating_sub(*last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
-            });
+            route
+                .requested_network_variables
+                .retain(|(_, last_seen_ms)| {
+                    now_ms.saturating_sub(*last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                });
             Self::recompute_discovery_side_state(route);
             !route.announcers.is_empty() || !route.requested_network_variables.is_empty()
         });
@@ -5723,10 +5726,17 @@ impl Router {
                 let now_ms = self.clock.now_ms();
                 let mut st = self.state.lock();
                 let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
-                let newly_reachable = route
+                let newly_reachable = if let Some((_, last_seen_ms)) = route
                     .requested_network_variables
-                    .insert(ty, now_ms)
-                    .is_none();
+                    .iter_mut()
+                    .find(|(requested, _)| *requested == ty)
+                {
+                    *last_seen_ms = now_ms;
+                    false
+                } else {
+                    route.requested_network_variables.push((ty, now_ms));
+                    true
+                };
                 Self::recompute_discovery_side_state(&mut route);
                 st.discovery_routes.insert(side, route);
                 st.fit_discovery_budget();
