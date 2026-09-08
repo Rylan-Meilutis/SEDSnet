@@ -5,8 +5,8 @@ mod c_system_test {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    fn run_exe(root: &PathBuf, name: &str) {
-        let exe = root.join("build").join(name);
+    fn run_exe(root: &PathBuf, build_dir: &PathBuf, name: &str) {
+        let exe = build_dir.join(name);
         let mut child = Command::new(&exe)
             .current_dir(root)
             .spawn()
@@ -68,11 +68,17 @@ mod c_system_test {
     fn run_c_system_test() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("c-system-test");
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let build_dir = root.join("build");
+        // A fixed source-tree build directory can be removed by another test
+        // or release-gate invocation while CMake is still running inside it.
+        // Give every harness process an isolated directory instead.
+        let build_dir = std::env::temp_dir().join(format!(
+            "sedsnet-c-system-test-{}",
+            std::process::id()
+        ));
         let macos_deployment_target = "26.0";
 
         if build_dir.exists() {
-            fs::remove_dir_all(&build_dir).expect("Failed to remove stale c-system-test/build");
+            fs::remove_dir_all(&build_dir).expect("Failed to remove stale C system-test build");
         }
 
         // Force-refresh Rust staticlib in non-python mode so C linking never
@@ -117,10 +123,15 @@ mod c_system_test {
         let status = cmake_build.status().expect("Failed to invoke cmake build");
         assert!(status.success(), "CMake build failed");
 
-        run_exe(&root, "c_system_test");
-        run_exe(&root, "c_system_timesync_test");
-        run_exe(&root, "c_system_board_topology_timesync_test");
-        run_exe(&root, "c_system_multi_endpoint_topology_test");
-        run_exe(&root, "c_system_runtime_schema_test");
+        run_exe(&root, &build_dir, "c_system_test");
+        run_exe(&root, &build_dir, "c_system_timesync_test");
+        run_exe(
+            &root,
+            &build_dir,
+            "c_system_board_topology_timesync_test",
+        );
+        run_exe(&root, &build_dir, "c_system_multi_endpoint_topology_test");
+        run_exe(&root, &build_dir, "c_system_runtime_schema_test");
+        fs::remove_dir_all(&build_dir).expect("Failed to remove C system-test build");
     }
 }

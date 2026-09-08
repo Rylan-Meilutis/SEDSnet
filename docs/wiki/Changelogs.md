@@ -9,6 +9,7 @@
 - The reliable compact-link soak now exchanges hop acknowledgements and validates sustained traffic.
 - GitHub and GitLab use the publish script as their full pre-release validation gate.
 - The full build test discovers all Python test modules, including release-automation regressions.
+- C-system tests use an isolated build directory per harness process, avoiding stale-build races.
 
 ## Version 4.0.19 highlights
 

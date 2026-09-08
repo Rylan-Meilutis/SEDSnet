@@ -11,6 +11,8 @@
   full Rust, Python, no-std, benchmark, and packaging checks before any release job can run.
 - Discover every Python unit test during the full suite, including publish and CI contract tests,
   instead of maintaining a partial hard-coded file list.
+- Isolate each C-system harness build in a process-specific temporary directory so overlapping or
+  repeated release gates cannot delete CMake's active working directory.
 
 ## 4.0.19
 
