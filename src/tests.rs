@@ -7353,12 +7353,20 @@ mod router_tests {
             let topology_packet = build_discovery_topology(
                 &wire_sender,
                 1,
-                &[TopologyBoardNode {
-                    sender_id: "RF".to_owned(),
-                    reachable_endpoints: vec![DataEndpoint::named("RADIO")],
-                    reachable_timesync_sources: Vec::new(),
-                    connections: vec!["PB".to_owned(), "FC".to_owned()],
-                }],
+                &[
+                    TopologyBoardNode {
+                        sender_id: "RF".to_owned(),
+                        reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                        reachable_timesync_sources: Vec::new(),
+                        connections: vec!["PB".to_owned(), "FC".to_owned()],
+                    },
+                    TopologyBoardNode {
+                        sender_id: "PB".to_owned(),
+                        reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                        reachable_timesync_sources: Vec::new(),
+                        connections: vec!["RF".to_owned()],
+                    },
+                ],
             )
             .unwrap();
 
@@ -7375,7 +7383,16 @@ mod router_tests {
                 .unwrap();
             assert_eq!(route.announcers.len(), 1);
             assert_eq!(route.announcers[0].sender_id, "RF");
-            assert_eq!(route.announcers[0].routers[0].sender_id, "RF");
+            assert!(
+                route.announcers[0]
+                    .routers
+                    .iter()
+                    .any(|board| board.sender_id == "RF")
+            );
+            let remote = router
+                .resolve_address(crate::packet::sender_address_u32("PB"))
+                .expect("topology-only compact sender should resolve");
+            assert_eq!(remote.hostname.as_ref(), "PB");
         }
 
         #[cfg(feature = "cryptography")]

@@ -1,5 +1,11 @@
 # Changelogs
 
+## Version 4.0.23 highlights
+
+- Router address resolution includes compact sender identities retained in multi-hop topology
+  summaries, so edge applications can identify telemetry from boards behind another router.
+- Relay and router canonicalization use the same collision-safe topology lookup behavior.
+
 ## Version 4.0.21 highlights
 
 - Discovery decoders bound every untrusted collection count by the remaining packet bytes before

@@ -2923,14 +2923,49 @@ impl Router {
         else {
             return sender.to_string();
         };
+        Self::hostname_for_address_locked(st, address).unwrap_or_else(|| sender.to_string())
+    }
+
+    /// Resolve both assigned node addresses and stable compact wire hashes.
+    ///
+    /// Remote boards behind a router appear in incremental topology summaries,
+    /// but do not send their link-local address advertisement across that
+    /// router. Include those retained topology names so application packets
+    /// can still be attributed at the far edge of a multi-hop network.
+    fn hostname_for_address_locked(st: &RouterInner, address: NodeAddress) -> Option<String> {
         if let Some(hostname) = st.address_by_value.get(&address) {
-            return hostname.clone();
+            return Some(hostname.clone());
         }
-        st.address_book
-            .values()
-            .find(|entry| sender_address_u32(entry.hostname.as_ref()) == address)
-            .map(|entry| entry.hostname.to_string())
-            .unwrap_or_else(|| sender.to_string())
+
+        let mut found: Option<String> = None;
+        let mut collision = false;
+        let mut consider = |candidate: &str| {
+            if sender_address_u32(candidate) != address {
+                return;
+            }
+            match found.as_deref() {
+                None => found = Some(candidate.to_string()),
+                Some(existing) if existing == candidate => {}
+                // Do not guess if two discovered names have the same compact
+                // 32-bit wire address. Address discovery must resolve that
+                // conflict before callers can safely attribute the packet.
+                Some(_) => collision = true,
+            }
+        };
+
+        for entry in st.address_book.values() {
+            consider(entry.hostname.as_ref());
+        }
+        #[cfg(feature = "discovery")]
+        for route in st.discovery_routes.values() {
+            for (announcer, state) in &route.announcers {
+                consider(announcer);
+                for board in &state.topology_boards {
+                    consider(&board.sender_id);
+                }
+            }
+        }
+        if collision { None } else { found }
     }
 
     fn address_mode_from_code(mode: u8, requested: NodeAddress) -> AddressAssignmentMode {
@@ -8079,22 +8114,34 @@ impl Router {
 
     pub fn resolve_address(&self, address: NodeAddress) -> Option<AddressBookEntry> {
         let st = self.state.lock();
-        st.address_by_value
+        let direct = st
+            .address_by_value
             .get(&address)
             .and_then(|hostname| st.address_book.get(hostname))
-            .cloned()
-            .or_else(|| {
-                // Compact packet headers carry the stable wire hash of the
-                // sender hostname, while DHCP-style discovery maintains a
-                // separately assigned node address. Callers observing a
-                // compact `@addr:` sender must be able to resolve either
-                // namespace, just like canonical_sender_locked() does for
-                // router-internal delivery.
-                st.address_book
-                    .values()
-                    .find(|entry| sender_address_u32(entry.hostname.as_ref()) == address)
-                    .cloned()
-            })
+            .cloned();
+        if direct.is_some() {
+            return direct;
+        }
+
+        let hostname = Self::hostname_for_address_locked(&st, address)?;
+        if let Some(entry) = st.address_book.get(&hostname) {
+            return Some(entry.clone());
+        }
+
+        // A topology-only remote has no DHCP-style address record on this
+        // link. Return a compact-address identity entry; callers that need to
+        // route to it still use discovery, while telemetry consumers can use
+        // the stable hostname immediately.
+        let hostname: Arc<str> = Arc::from(hostname);
+        Some(AddressBookEntry {
+            hostname: hostname.clone(),
+            address,
+            requested_address: 0,
+            mode: AddressAssignmentMode::Dynamic,
+            birth_ms: 0,
+            owner_hash: Self::sender_hash(hostname.as_ref()),
+            last_seen_ms: self.clock.now_ms(),
+        })
     }
 
     pub fn bind_p2p_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>

@@ -1772,20 +1772,32 @@ impl Relay {
         else {
             return sender.to_string();
         };
-        st.discovery_routes
-            .values()
-            .flat_map(|route| route.announcers.iter())
-            .flat_map(|(announcer, state)| {
-                core::iter::once(announcer.as_str()).chain(
-                    state
-                        .topology_boards
-                        .iter()
-                        .map(|board| board.sender_id.as_str()),
-                )
-            })
-            .find(|candidate| sender_address_u32(candidate) == address)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| sender.to_string())
+        Self::hostname_for_wire_address_locked(st, address).unwrap_or_else(|| sender.to_string())
+    }
+
+    #[cfg(feature = "discovery")]
+    fn hostname_for_wire_address_locked(st: &RelayInner, address: u32) -> Option<String> {
+        let mut found: Option<String> = None;
+        let mut collision = false;
+        let mut consider = |candidate: &str| {
+            if sender_address_u32(candidate) != address {
+                return;
+            }
+            match found.as_deref() {
+                None => found = Some(candidate.to_string()),
+                Some(existing) if existing == candidate => {}
+                Some(_) => collision = true,
+            }
+        };
+        for route in st.discovery_routes.values() {
+            for (announcer, state) in &route.announcers {
+                consider(announcer);
+                for board in &state.topology_boards {
+                    consider(&board.sender_id);
+                }
+            }
+        }
+        if collision { None } else { found }
     }
 
     fn decode_end_to_end_ack_sender_hash(sender: &str) -> Option<u64> {

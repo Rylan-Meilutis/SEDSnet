@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.23
+
+- Resolve compact sender hashes using retained multi-hop topology identities, including boards
+  behind router and relay nodes whose link-local address advertisements do not cross the link.
+  GroundStation and other edge consumers can now attribute returned telemetry from every discovered
+  board without broadcast fanout or manual route overrides.
+- Apply collision-safe canonical sender resolution consistently to routers and relays and add a
+  topology-only remote-board regression.
+
 ## 4.0.22
 
 - Resolve deterministic compact wire sender addresses through the public address-book API, matching
