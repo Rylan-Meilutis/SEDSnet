@@ -14,6 +14,8 @@ c-system-test/build/
 
 c-example-code/build/
 
+Cargo.lock
+
 *.so
 python-files/sedsnet/sedsprintf_rs.pyi
 /sedsnet_macros/target/
@@ -21,3 +23,5 @@ python-files/sedsnet/sedsprintf_rs.pyi
 
 *..wiki/
 /inspection/
+
+telemetry_config.json
