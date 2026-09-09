@@ -4,8 +4,8 @@ A Rust networking stack with compact packets, runtime schema, discovery, routing
 managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
 bindings for distributed embedded and host systems.
 
-Current stable release: **4.0.21** on crates.io and PyPI. Embedded CMake
-consumers use the `v4.0.21` Git tag; Rust and Python consumers should use the
+Current stable release: **4.0.22** on crates.io and PyPI. Embedded CMake
+consumers use the `v4.0.22` Git tag; Rust and Python consumers should use the
 registry release.
 
 Crate API docs are published on [docs.rs](https://docs.rs/SEDSnet). The implementation-level wiki,
@@ -97,6 +97,10 @@ by hostname or address, or open a P2P stream with connect/accept/data/close even
 as HTTP can be carried over SEDSnet links without IP being the underlying transport. Broadcast
 endpoint delivery remains available for telemetry data types; P2P service frames use discovery
 identity and ports for board-to-board traffic.
+
+`Router::resolve_address` accepts both an assigned discovery address and the deterministic compact
+wire address derived from a discovered hostname. Applications can therefore attribute compact
+telemetry senders to their board identity without requiring repeated hostnames in every frame.
 
 Queue memory is bounded per router/relay instance. Packaged values such as `MAX_QUEUE_BUDGET`
 provide defaults, and Rust, C, and Python constructors can override the active budget at runtime.
@@ -474,7 +478,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.21
+    GIT_TAG v4.0.22
 )
 FetchContent_MakeAvailable(sedsnet)
 

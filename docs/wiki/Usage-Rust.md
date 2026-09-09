@@ -532,6 +532,10 @@ addresses and hostnames deterministically. Static addresses are preserved first;
 nodes collide, the older identity keeps the address and newer identities move. Register
 `on_address_change(...)` to be notified when the local address or hostname changes.
 
+Use `router.resolve_address(address)` to map an observed source back to its discovered identity.
+The lookup accepts both dynamically assigned addresses and deterministic compact wire addresses,
+so a compact application packet can still be attributed to the hostname learned during discovery.
+
 P2P service traffic is separate from endpoint broadcast telemetry. A service binds a port and
 receives opaque bytes:
 

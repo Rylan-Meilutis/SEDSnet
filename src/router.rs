@@ -8083,6 +8083,18 @@ impl Router {
             .get(&address)
             .and_then(|hostname| st.address_book.get(hostname))
             .cloned()
+            .or_else(|| {
+                // Compact packet headers carry the stable wire hash of the
+                // sender hostname, while DHCP-style discovery maintains a
+                // separately assigned node address. Callers observing a
+                // compact `@addr:` sender must be able to resolve either
+                // namespace, just like canonical_sender_locked() does for
+                // router-internal delivery.
+                st.address_book
+                    .values()
+                    .find(|entry| sender_address_u32(entry.hostname.as_ref()) == address)
+                    .cloned()
+            })
     }
 
     pub fn bind_p2p_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>

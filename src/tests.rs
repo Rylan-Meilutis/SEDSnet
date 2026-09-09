@@ -7322,6 +7322,10 @@ mod router_tests {
             let ingress = relay.add_side_packet("ingress", |_pkt: &Packet| Ok(()));
             relay.rx_from_side(&compact_address, ingress).unwrap();
             relay.process_all_queues().unwrap();
+            let resolved = relay
+                .resolve_address(crate::packet::sender_address_u32("GB"))
+                .expect("compact wire address should resolve through the learned hostname");
+            assert_eq!(resolved.hostname.as_ref(), "GB");
             let compact_announce =
                 build_discovery_announce(&wire_sender, 1, &[DataEndpoint::named("RADIO")]).unwrap();
             relay.rx_from_side(&compact_announce, ingress).unwrap();

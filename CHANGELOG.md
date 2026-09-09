@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.0.22
+
+- Resolve deterministic compact wire sender addresses through the public address-book API, matching
+  the router's internal canonical-sender lookup. Hosted consumers such as GroundStation can now
+  attribute routed telemetry to discovered board names without adding broadcast or fanout rules.
+- Add a regression covering identity learned from an address packet followed by compact application
+  traffic.
+
 ## 4.0.21
 
 - Validate all collection counts decoded from discovery address, time-source, topology, incremental
