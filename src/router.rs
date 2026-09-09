@@ -3585,6 +3585,44 @@ impl Router {
         let (eps, ty) = self.item_route_info(data)?;
         let now_ms = self.clock.now_ms();
         let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
+        /* Managed-variable ownership is advertised independently from normal
+         * endpoint handlers.  Using topology-board endpoint overlap here can
+         * silently narrow a variable update to one segment once detailed
+         * topology arrives (for example FLIGHT_STATE is a conventional
+         * endpoint on the fill side but only a managed variable on avionics).
+         * Freeze one destination contract per advertising segment instead;
+         * its announcer is the segment router that can ACK and replicate the
+         * value to the owners behind it. */
+        if st.managed_variable_types.contains(&ty.as_u32()) {
+            let mut out = BTreeMap::new();
+            for (&side, route) in st.discovery_routes.iter() {
+                if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                    continue;
+                }
+                let Some(side_ref) = st.sides.get(side).and_then(Option::as_ref) else {
+                    continue;
+                };
+                if restrict_link_local && !side_ref.opts.link_local_enabled {
+                    continue;
+                }
+                if !self.route_allowed_locked(st, None, Some(ty), side) {
+                    continue;
+                }
+                for (sender_id, sender_state) in route.announcers.iter() {
+                    if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
+                        || !sender_state.reachable_network_variables.contains(&ty)
+                        || !Self::is_end_to_end_destination_sender(sender_id)
+                    {
+                        continue;
+                    }
+                    out.insert(Self::sender_hash(sender_id), side);
+                    if out.len() >= runtime_reliable_max_end_to_end_pending().max(1) {
+                        return Ok(out);
+                    }
+                }
+            }
+            return Ok(out);
+        }
         let prefer_best_overlap =
             is_reliable_type(ty) && Self::reliable_control_target_packet_id(data)?.is_none();
         let scoring_eps = self.preferred_scoring_endpoints(&eps, prefer_best_overlap);

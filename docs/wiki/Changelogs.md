@@ -1,5 +1,14 @@
 # Changelogs
 
+## Version 4.0.24 highlights
+
+- Reliable managed-variable destination contracts are derived from advertised variable owners on
+  every discovered segment, independently of ordinary endpoint topology.
+- A fully converged heterogeneous topology can no longer route the final value in a rapid state
+  sequence to only the segment that happens to advertise a same-named endpoint.
+- Shared CAN producers use collision-safe compact/chunk transport identities, and compact template
+  dictionaries automatically fall back to self-describing frames on multi-producer sides.
+
 ## Version 4.0.23 highlights
 
 - Router address resolution includes compact sender identities retained in multi-hop topology

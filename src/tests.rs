@@ -11010,6 +11010,115 @@ mod router_tests {
         }
 
         #[test]
+        fn detailed_endpoint_topology_cannot_narrow_managed_variable_segments() {
+            ensure_topology_test_schema();
+            let ty = ensure_managed_variable_test_schema();
+            let endpoint = DataEndpoint::named("SD_CARD");
+            let rocket_seen = Arc::new(Mutex::new(Vec::new()));
+            let fill_seen = Arc::new(Mutex::new(Vec::new()));
+            let rocket_seen_cb = rocket_seen.clone();
+            let fill_seen_cb = fill_seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::default().with_reliable_enabled(true),
+                zero_clock(),
+            );
+            router
+                .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+                .unwrap();
+            let rocket = router.add_side_packet("rocket", move |packet| {
+                rocket_seen_cb.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+            let fill = router.add_side_packet("fill", move |packet| {
+                fill_seen_cb.lock().unwrap().push(packet.clone());
+                Ok(())
+            });
+
+            let owner_address = |sender: &str, address: u32| {
+                crate::discovery::build_discovery_address(
+                    sender,
+                    address as u64,
+                    &crate::discovery::AddressAdvertisement {
+                        hostname: sender.into(),
+                        address,
+                        requested_address: address,
+                        mode: crate::discovery::ADDRESS_MODE_STATIC,
+                        state: crate::discovery::ADDRESS_STATE_APPROVED,
+                        birth_ms: 0,
+                        owner_hash: address as u64,
+                        reachable_endpoints: vec![],
+                        reachable_network_variables: vec![ty],
+                        reachable_timesync_sources: vec![],
+                        link_capabilities: crate::discovery::LinkCapabilities {
+                            version: 1,
+                            flags: 0,
+                            profile: crate::discovery::LINK_PROFILE_CANONICAL,
+                            max_frame_bytes: 0,
+                            compact_header_target_bytes: 0,
+                            max_side_transport_templates: 0,
+                        },
+                    },
+                )
+                .unwrap()
+            };
+            router
+                .rx_from_side(&owner_address("RF", 1), rocket)
+                .unwrap();
+            router.rx_from_side(&owner_address("GB", 2), fill).unwrap();
+
+            // Only the fill segment advertises FLIGHT_STATE as an ordinary
+            // endpoint. That endpoint detail must not erase the independent
+            // managed-variable owner learned on the rocket segment.
+            router
+                .rx_from_side(
+                    &build_discovery_topology(
+                        "RF",
+                        3,
+                        &[TopologyBoardNode {
+                            sender_id: "FC".into(),
+                            reachable_endpoints: vec![],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["RF".into()],
+                        }],
+                    )
+                    .unwrap(),
+                    rocket,
+                )
+                .unwrap();
+            router
+                .rx_from_side(
+                    &build_discovery_topology(
+                        "GB",
+                        4,
+                        &[TopologyBoardNode {
+                            sender_id: "VB".into(),
+                            reachable_endpoints: vec![endpoint],
+                            reachable_timesync_sources: vec![],
+                            connections: vec!["GB".into()],
+                        }],
+                    )
+                    .unwrap(),
+                    fill,
+                )
+                .unwrap();
+            rocket_seen.lock().unwrap().clear();
+            fill_seen.lock().unwrap().clear();
+
+            for (nonce, value) in [(1, 1.0_f32), (2, 0.0), (3, 1.0)] {
+                router
+                    .set_network_variable(
+                        Packet::from_f32_slice(ty, &[value], &[endpoint], nonce)
+                            .unwrap()
+                            .with_nonce(nonce as u16),
+                    )
+                    .unwrap();
+                router.process_all_queues().unwrap();
+            }
+            assert_eq!(count_packets_of_type(&rocket_seen.lock().unwrap(), ty), 3);
+            assert_eq!(count_packets_of_type(&fill_seen.lock().unwrap(), ty), 3);
+        }
+
+        #[test]
         fn explicit_ingress_fanout_crosses_both_router_egress_sides() {
             ensure_topology_test_schema();
             let ty = DataType::named("GPS_DATA");

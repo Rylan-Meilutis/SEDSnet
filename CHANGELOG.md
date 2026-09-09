@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.0.24
+
+- Route managed-variable updates using discovery's advertised variable ownership rather than
+  ordinary endpoint overlap. Once detailed topology converges, a similarly named endpoint on one
+  segment can no longer narrow a replicated variable to that segment and leave other owners stale.
+- Add a two-segment regression that completes detailed topology first and then verifies a rapid
+  `1 -> 0 -> 1` managed-variable sequence reaches both segments.
+- Make packed shared-bus transport identities collision-safe across producers, disable compact
+  template dictionaries after discovering multiple announcers on a side, and aggregate relay
+  discovery with split-horizon semantics.
+
 ## 4.0.23
 
 - Resolve compact sender hashes using retained multi-hop topology identities, including boards
