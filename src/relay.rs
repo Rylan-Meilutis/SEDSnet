@@ -2771,9 +2771,13 @@ impl Relay {
         st: &RelayInner,
         now_ms: u64,
         link_local_enabled: bool,
+        exclude_side: Option<RelaySideId>,
     ) -> Vec<TopologyBoardNode> {
         let mut boards = vec![self.local_discovery_topology_board(st, now_ms)];
-        for route in st.discovery_routes.values() {
+        for (&route_side, route) in st.discovery_routes.iter() {
+            if exclude_side == Some(route_side) {
+                continue;
+            }
             if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
                 continue;
             }
@@ -2870,9 +2874,15 @@ impl Relay {
         st: &RelayInner,
         now_ms: u64,
         link_local_enabled: bool,
+        exclude_side: Option<RelaySideId>,
     ) -> Vec<crate::DataEndpoint> {
         let (reachable_endpoints, _) = discovery::summarize_topology_boards(
-            &self.advertised_discovery_topology_for_link_locked(st, now_ms, link_local_enabled),
+            &self.advertised_discovery_topology_for_link_locked(
+                st,
+                now_ms,
+                link_local_enabled,
+                exclude_side,
+            ),
         );
         reachable_endpoints
             .into_iter()
@@ -2888,9 +2898,10 @@ impl Relay {
         &self,
         st: &RelayInner,
         now_ms: u64,
+        exclude_side: Option<RelaySideId>,
     ) -> Vec<String> {
         let (_, sources) = discovery::summarize_topology_boards(
-            &self.advertised_discovery_topology_for_link_locked(st, now_ms, true),
+            &self.advertised_discovery_topology_for_link_locked(st, now_ms, true, exclude_side),
         );
         sources
     }
@@ -3099,13 +3110,18 @@ impl Relay {
                     &st,
                     now_ms,
                     link_local_enabled,
+                    Some(side_id),
                 );
-                let timesync_sources =
-                    self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+                let timesync_sources = self.advertised_discovery_timesync_sources_for_link_locked(
+                    &st,
+                    now_ms,
+                    Some(side_id),
+                );
                 let current_topology = self.advertised_discovery_topology_for_link_locked(
                     &st,
                     now_ms,
                     link_local_enabled,
+                    Some(side_id),
                 );
                 let (topology, removed_topology) = match level {
                     DiscoveryAdvertiseLevel::Full => (current_topology.clone(), Vec::new()),
@@ -4096,11 +4112,11 @@ impl Relay {
                 })
             })
             .collect();
-        let routers = self.advertised_discovery_topology_for_link_locked(&st, now_ms, true);
+        let routers = self.advertised_discovery_topology_for_link_locked(&st, now_ms, true, None);
         let advertised_endpoints =
-            self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true);
+            self.advertised_discovery_endpoints_for_link_locked(&st, now_ms, true, None);
         let advertised_timesync_sources =
-            self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms);
+            self.advertised_discovery_timesync_sources_for_link_locked(&st, now_ms, None);
         let links = discovery::topology_links_from_boards(&routers);
         TopologySnapshot {
             advertised_endpoints,

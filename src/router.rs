@@ -148,8 +148,6 @@ struct SideTransportState {
     rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
     rx_last_timestamps: BTreeMap<u32, u64>,
     rx_chunks: BTreeMap<u32, SideChunkAssembly>,
-    next_chunk_id: u32,
-    next_template_id: u32,
 }
 
 impl SideTransportState {
@@ -6707,7 +6705,7 @@ impl Router {
     }
     fn split_side_transport_frame(
         &self,
-        side: RouterSideId,
+        _side: RouterSideId,
         frame: Arc<[u8]>,
         max_frame_bytes: usize,
     ) -> TelemetryResult<Vec<Arc<[u8]>>> {
@@ -6715,14 +6713,13 @@ impl Router {
             return Err(TelemetryError::BadArg);
         }
         let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
-        let mut st = self.state.lock();
-        let side_state = st
-            .side_transport
-            .get_mut(&side)
-            .ok_or(TelemetryError::BadArg)?;
-        let transfer_id = side_state.next_chunk_id.wrapping_add(1).max(1);
-        side_state.next_chunk_id = transfer_id;
-        drop(st);
+        /* A side can represent a shared multi-drop bus. Per-router sequence
+         * numbers collide there because every producer starts at one, causing
+         * receivers to merge chunks from unrelated frames. Derive the ID from
+         * the complete wrapped frame instead, which is stable for every
+         * receiver and includes the packet sender in the encoded header. */
+        let sender_component = sender_address_u32(self.sender_arc().as_ref());
+        let transfer_id = (Self::crc32_bytes(frame.as_ref()) ^ sender_component).max(1);
 
         let total = frame.len().div_ceil(payload_budget);
         let total_u16 =
@@ -6769,18 +6766,37 @@ impl Router {
                 let mut effective_template_limit = opts.max_side_transport_templates;
                 #[cfg(feature = "discovery")]
                 {
-                    effective_template_limit = st
-                        .discovery_routes
-                        .get(&side)
-                        .into_iter()
-                        .flat_map(|route| route.announcers.values())
-                        .filter_map(|sender| sender.link_capabilities)
-                        .filter(|caps| {
-                            caps.flags & discovery::LINK_CAPABILITY_HEADER_TEMPLATES != 0
-                                && caps.max_side_transport_templates > 0
-                        })
-                        .map(|caps| caps.max_side_transport_templates as usize)
-                        .fold(effective_template_limit, core::cmp::min);
+                    if let Some(route) = st.discovery_routes.get(&side) {
+                        let active_peers = route
+                            .announcers
+                            .values()
+                            .filter(|sender| {
+                                self.clock.now_ms().saturating_sub(sender.last_seen_ms)
+                                    <= DISCOVERY_ROUTE_TTL_MS
+                            })
+                            .count();
+                        /* Compact template state is intentionally side-local.
+                         * On a shared bus, independent producers cannot divide
+                         * a receiver's bounded dictionary between themselves,
+                         * so their compact frames can evict one another. Keep
+                         * compression for point-to-point links and
+                         * automatically use self-describing full frames once
+                         * discovery proves a side is multi-producer. */
+                        if active_peers > 1 {
+                            effective_template_limit = 0;
+                        } else {
+                            effective_template_limit = route
+                                .announcers
+                                .values()
+                                .filter_map(|sender| sender.link_capabilities)
+                                .filter(|caps| {
+                                    caps.flags & discovery::LINK_CAPABILITY_HEADER_TEMPLATES != 0
+                                        && caps.max_side_transport_templates > 0
+                                })
+                                .map(|caps| caps.max_side_transport_templates as usize)
+                                .fold(effective_template_limit, core::cmp::min);
+                        }
+                    }
                 }
                 let trimmed = st
                     .side_transport
@@ -6811,11 +6827,15 @@ impl Router {
                     }
                     (id, use_compact, previous)
                 } else {
-                    let next = side_state.next_template_id.wrapping_add(1).max(1);
-                    side_state.next_template_id = next;
+                    /* Sequential template IDs collide when multiple routers
+                     * transmit on one physical bus. The template hash covers
+                     * the source address and immutable header fields, making
+                     * this ID producer-stable without adding bytes to compact
+                     * frames. */
+                    let template_id = ((template.hash >> 32) as u32 ^ template.hash as u32).max(1);
                     let evicted = side_state.insert_tx_template(
                         template.clone(),
-                        next,
+                        template_id,
                         effective_template_limit,
                     );
                     if evicted {
@@ -6825,9 +6845,9 @@ impl Router {
                             .note_side_transport_template_eviction();
                     }
                     if let Some(side_state) = st.side_transport.get_mut(&side) {
-                        side_state.tx_last_timestamps.insert(next, timestamp);
+                        side_state.tx_last_timestamps.insert(template_id, timestamp);
                     }
-                    (next, false, None)
+                    (template_id, false, None)
                 }
             };
             if use_compact {
@@ -6932,13 +6952,28 @@ impl Router {
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
+                let header_templates_enabled = self
+                    .state
+                    .lock()
+                    .sides
+                    .get(side)
+                    .and_then(|entry| entry.as_ref())
+                    .map(|side| side.opts.header_template_enabled)
+                    .unwrap_or(false);
                 let mut off = 0usize;
-                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                let template_id = if header_templates_enabled {
+                    Some(
+                        u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                            .map_err(|_| TelemetryError::Unpack("side template id too large"))?,
+                    )
+                } else {
+                    None
+                };
                 let raw = Arc::<[u8]>::from(&body[off..]);
-                if let Ok((template, _, _, _, timestamp, _, _, _)) =
-                    Self::extract_side_header_template(raw.as_ref())
-                {
+                if let (Some(template_id), Ok((template, _, _, _, timestamp, _, _, _))) = (
+                    template_id,
+                    Self::extract_side_header_template(raw.as_ref()),
+                ) {
                     let mut st = self.state.lock();
                     let max_templates = st
                         .sides

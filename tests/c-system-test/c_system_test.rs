@@ -71,10 +71,8 @@ mod c_system_test {
         // A fixed source-tree build directory can be removed by another test
         // or release-gate invocation while CMake is still running inside it.
         // Give every harness process an isolated directory instead.
-        let build_dir = std::env::temp_dir().join(format!(
-            "sedsnet-c-system-test-{}",
-            std::process::id()
-        ));
+        let build_dir =
+            std::env::temp_dir().join(format!("sedsnet-c-system-test-{}", std::process::id()));
         let macos_deployment_target = "26.0";
 
         if build_dir.exists() {
@@ -125,11 +123,7 @@ mod c_system_test {
 
         run_exe(&root, &build_dir, "c_system_test");
         run_exe(&root, &build_dir, "c_system_timesync_test");
-        run_exe(
-            &root,
-            &build_dir,
-            "c_system_board_topology_timesync_test",
-        );
+        run_exe(&root, &build_dir, "c_system_board_topology_timesync_test");
         run_exe(&root, &build_dir, "c_system_multi_endpoint_topology_test");
         run_exe(&root, &build_dir, "c_system_runtime_schema_test");
         fs::remove_dir_all(&build_dir).expect("Failed to remove C system-test build");

@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, Ident, LitBool, LitInt, LitStr, Token};
+use syn::{Ident, LitBool, LitInt, LitStr, Token, parse_macro_input};
 
 // NOTE:
 // This proc-macro crate must depend on:
@@ -423,8 +423,11 @@ fn ensure_caps_name(kind: &str, s: &str) -> Result<(), String> {
 }
 
 fn valid_ident_or_compile_error(s: &str) -> Result<syn::Ident, TokenStream> {
-    ensure_valid_ident(s)
-        .map_err(|e| syn::Error::new(Span::call_site(), e).to_compile_error().into())
+    ensure_valid_ident(s).map_err(|e| {
+        syn::Error::new(Span::call_site(), e)
+            .to_compile_error()
+            .into()
+    })
 }
 
 fn quoted_variant_with_doc(id: &syn::Ident, doc: &str) -> proc_macro2::TokenStream {
@@ -647,7 +650,7 @@ fn reliable_mode_token(mode: &str) -> Result<proc_macro2::TokenStream, String> {
         _ => {
             return Err(format!(
                 "invalid reliable_mode: {mode:?} (expected \"None\", \"Ordered\", or \"Unordered\")"
-            ))
+            ));
         }
     };
     Ok(ts)
@@ -663,7 +666,11 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
 
     let cfg = match load_merged_schema(&path) {
         Ok(v) => v,
-        Err(e) => return syn::Error::new(Span::call_site(), e).to_compile_error().into(),
+        Err(e) => {
+            return syn::Error::new(Span::call_site(), e)
+                .to_compile_error()
+                .into();
+        }
     };
     let timesync_enabled = timesync;
     let discovery_enabled = discovery;
@@ -731,7 +738,9 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
 
     for ep in &cfg.endpoints {
         if let Err(e) = ensure_caps_name("endpoint", &ep.name) {
-            return syn::Error::new(Span::call_site(), e).to_compile_error().into();
+            return syn::Error::new(Span::call_site(), e)
+                .to_compile_error()
+                .into();
         }
 
         let id = match valid_ident_or_compile_error(&ep.rust) {
@@ -797,7 +806,9 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
 
     for ty in &cfg.types {
         if let Err(e) = ensure_caps_name("type", &ty.name) {
-            return syn::Error::new(Span::call_site(), e).to_compile_error().into();
+            return syn::Error::new(Span::call_site(), e)
+                .to_compile_error()
+                .into();
         }
 
         let mut saw_link_local = false;
@@ -1113,7 +1124,11 @@ mod tests {
                 endpoint("Radio", "RADIO", false),
                 endpoint("SdCard", "SD_CARD", false),
             ],
-            types: vec![datatype("MessageData", "MESSAGE_DATA", &["Radio", "SdCard"])],
+            types: vec![datatype(
+                "MessageData",
+                "MESSAGE_DATA",
+                &["Radio", "SdCard"],
+            )],
         }
     }
 

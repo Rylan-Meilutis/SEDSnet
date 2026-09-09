@@ -4979,6 +4979,259 @@ mod dedupe_tests {
     }
 
     #[test]
+    fn compact_templates_from_multiple_bus_producers_do_not_alias() {
+        crate::tests::ensure_common_test_schema();
+        let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let delivered_c = delivered.clone();
+        let receiver = Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |packet| {
+                    delivered_c
+                        .lock()
+                        .unwrap()
+                        .push(packet.sender().to_string());
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        );
+        let receiver_side = receiver.add_side_packed_with_options(
+            "shared-can",
+            |_| Ok(()),
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 8,
+                ..RouterSideOptions::default()
+            },
+        );
+
+        let frames_a = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let frames_b = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let make_sender = |name: &'static str, frames: Arc<Mutex<Vec<Vec<u8>>>>| {
+            let router =
+                Router::new_with_clock(RouterConfig::default().with_sender(name), zero_clock());
+            router.add_side_packed_with_options(
+                "shared-can",
+                move |bytes| {
+                    frames.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RouterSideOptions {
+                    header_template_enabled: true,
+                    max_side_transport_templates: 8,
+                    ..RouterSideOptions::default()
+                },
+            );
+            router
+        };
+        let sender_a = make_sender("PRODUCER_A", frames_a.clone());
+        let sender_b = make_sender("PRODUCER_B", frames_b.clone());
+
+        for (router, sender, base) in [
+            (&sender_a, "PRODUCER_A", 10u16),
+            (&sender_b, "PRODUCER_B", 20u16),
+        ] {
+            for offset in 0..2u16 {
+                router
+                    .tx(Packet::new(
+                        DataType::named("GPS_DATA"),
+                        &[DataEndpoint::named("SD_CARD")],
+                        sender,
+                        u64::from(base + offset),
+                        Arc::from(
+                            [f32::from(offset), 0.0, 0.0]
+                                .into_iter()
+                                .flat_map(f32::to_le_bytes)
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                    .unwrap()
+                    .with_nonce(base + offset))
+                    .unwrap();
+            }
+        }
+
+        let a = frames_a.lock().unwrap().clone();
+        let b = frames_b.lock().unwrap().clone();
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+        for frame in [&a[0], &b[0], &a[1], &b[1]] {
+            receiver
+                .rx_packed_from_side(frame.as_slice(), receiver_side)
+                .unwrap();
+        }
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec!["PRODUCER_A", "PRODUCER_B", "PRODUCER_A", "PRODUCER_B"]
+        );
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn compact_templates_are_disabled_after_shared_bus_discovery() {
+        crate::tests::ensure_common_test_schema();
+        let frames = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let frames_c = frames.clone();
+        let sender =
+            Router::new_with_clock(RouterConfig::default().with_sender("LOCAL"), zero_clock());
+        let side = sender.add_side_packed_with_options(
+            "shared-can",
+            move |bytes| {
+                frames_c.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions {
+                header_template_enabled: true,
+                max_side_transport_templates: 8,
+                ..RouterSideOptions::default()
+            },
+        );
+        for peer in ["PEER_A", "PEER_B"] {
+            sender
+                .rx_from_side(
+                    &build_discovery_announce(peer, 0, &[DataEndpoint::named("SD_CARD")]).unwrap(),
+                    side,
+                )
+                .unwrap();
+        }
+        frames.lock().unwrap().clear();
+
+        for nonce in 1..=2u16 {
+            sender
+                .tx(Packet::from_f32_slice(
+                    DataType::named("GPS_DATA"),
+                    &[f32::from(nonce), 0.0, 0.0],
+                    &[DataEndpoint::named("SD_CARD")],
+                    u64::from(nonce),
+                )
+                .unwrap()
+                .with_nonce(nonce))
+                .unwrap();
+        }
+        let stats = sender.export_runtime_stats();
+        let side = stats
+            .sides
+            .iter()
+            .find(|side| side.side_name == "shared-can")
+            .unwrap();
+        assert_eq!(side.side_transport_tx_template_count, 0);
+        assert_eq!(side.side_transport_compact_frames, 0);
+    }
+
+    #[test]
+    fn chunk_transfer_ids_do_not_collide_across_bus_producers() {
+        crate::tests::ensure_common_test_schema();
+        let ty = DataType::try_named("SHARED_BUS_CHUNK_TEST").unwrap_or_else(|| {
+            crate::config::register_data_type_with_description(
+                "SHARED_BUS_CHUNK_TEST",
+                "multi-producer chunk reassembly regression test",
+                crate::MessageElement::Dynamic(
+                    crate::MessageDataType::Binary,
+                    crate::MessageClass::Data,
+                ),
+                &[DataEndpoint::named("SD_CARD")],
+                crate::ReliableMode::None,
+                1,
+            )
+            .unwrap()
+        });
+        let delivered = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let delivered_c = delivered.clone();
+        let receiver = Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                DataEndpoint::named("SD_CARD"),
+                move |packet| {
+                    delivered_c
+                        .lock()
+                        .unwrap()
+                        .push((packet.sender().to_string(), packet.payload().to_vec()));
+                    Ok(())
+                },
+            )]),
+            zero_clock(),
+        );
+        let receiver_side = receiver.add_side_packed_with_options(
+            "shared-can",
+            |_| Ok(()),
+            RouterSideOptions {
+                max_frame_bytes: 64,
+                ..RouterSideOptions::default()
+            },
+        );
+
+        let capture = |sender: &'static str, salt: u8| {
+            let frames = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let frames_c = frames.clone();
+            let router =
+                Router::new_with_clock(RouterConfig::default().with_sender(sender), zero_clock());
+            router.add_side_packed_with_options(
+                "shared-can",
+                move |bytes| {
+                    frames_c.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                RouterSideOptions {
+                    max_frame_bytes: 64,
+                    ..RouterSideOptions::default()
+                },
+            );
+            router
+                .tx(Packet::new(
+                    ty,
+                    &[DataEndpoint::named("SD_CARD")],
+                    sender,
+                    u64::from(salt),
+                    Arc::from(
+                        (0..180u16)
+                            .map(|value| (value as u8).wrapping_add(salt))
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .unwrap()
+                .with_nonce(u16::from(salt)))
+                .unwrap();
+            let captured = frames.lock().unwrap().clone();
+            assert!(captured.len() > 1);
+            let application_transfer_id =
+                u32::from_le_bytes(captured.last().unwrap()[4..8].try_into().unwrap());
+            captured
+                .into_iter()
+                .filter(|frame| {
+                    frame.starts_with(b"SDT\x03")
+                        && u32::from_le_bytes(frame[4..8].try_into().unwrap())
+                            == application_transfer_id
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = capture("PRODUCER_A", 0x11);
+        let b = capture("PRODUCER_B", 0x77);
+        let transfer_id = |frame: &[u8]| {
+            assert_eq!(&frame[..4], b"SDT\x03");
+            u32::from_le_bytes(frame[4..8].try_into().unwrap())
+        };
+        assert_ne!(transfer_id(&a[0]), transfer_id(&b[0]));
+        for index in 0..a.len().max(b.len()) {
+            if let Some(frame) = a.get(index) {
+                receiver.rx_packed_from_side(frame, receiver_side).unwrap();
+            }
+            if let Some(frame) = b.get(index) {
+                receiver.rx_packed_from_side(frame, receiver_side).unwrap();
+            }
+        }
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 2, "delivered={delivered:?}");
+        let expected_a = (0..180u16)
+            .map(|value| (value as u8).wrapping_add(0x11))
+            .collect::<Vec<_>>();
+        let expected_b = (0..180u16)
+            .map(|value| (value as u8).wrapping_add(0x77))
+            .collect::<Vec<_>>();
+        assert!(delivered.contains(&("PRODUCER_A".into(), expected_a)));
+        assert!(delivered.contains(&("PRODUCER_B".into(), expected_b)));
+    }
+
+    #[test]
     fn packed_side_header_templates_can_omit_unchanged_timestamps() {
         crate::tests::ensure_common_test_schema();
         let delivered_payloads = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
@@ -9624,6 +9877,69 @@ mod router_tests {
         }
 
         #[test]
+        fn relay_advertises_only_remote_routes_on_each_side() {
+            ensure_topology_test_schema();
+            let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_a_c = seen_a.clone();
+            let seen_b_c = seen_b.clone();
+            let relay = Relay::new(zero_clock());
+            let side_a = relay.add_side_packet_with_options(
+                "A",
+                move |pkt: &Packet| {
+                    seen_a_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+                RelaySideOptions {
+                    reliable_enabled: false,
+                    ..RelaySideOptions::default()
+                },
+            );
+            let side_b = relay.add_side_packet_with_options(
+                "B",
+                move |pkt: &Packet| {
+                    seen_b_c.lock().unwrap().push(pkt.clone());
+                    Ok(())
+                },
+                RelaySideOptions {
+                    reliable_enabled: false,
+                    ..RelaySideOptions::default()
+                },
+            );
+
+            relay
+                .rx_from_side(
+                    side_a,
+                    build_discovery_announce("NODE_A", 0, &[DataEndpoint::named("RADIO")]).unwrap(),
+                )
+                .unwrap();
+            relay
+                .rx_from_side(
+                    side_b,
+                    build_discovery_announce("NODE_B", 0, &[DataEndpoint::named("SD_CARD")])
+                        .unwrap(),
+                )
+                .unwrap();
+            relay.process_all_queues().unwrap();
+            seen_a.lock().unwrap().clear();
+            seen_b.lock().unwrap().clear();
+
+            relay.announce_discovery().unwrap();
+            relay.process_all_queues().unwrap();
+            let endpoints_on = |packets: &Vec<Packet>| {
+                packets
+                    .iter()
+                    .find(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
+                    .map(|pkt| crate::discovery::decode_discovery_announce(pkt).unwrap())
+                    .expect("relay did not advertise an endpoint summary")
+            };
+            let to_a = endpoints_on(&seen_a.lock().unwrap());
+            let to_b = endpoints_on(&seen_b.lock().unwrap());
+            assert_eq!(to_a, vec![DataEndpoint::named("SD_CARD")]);
+            assert_eq!(to_b, vec![DataEndpoint::named("RADIO")]);
+        }
+
+        #[test]
         fn relay_runtime_routes_support_asymmetric_and_ingress_only_links() {
             ensure_topology_test_schema();
             let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -9940,7 +10256,10 @@ mod router_tests {
                 .find(|pkt| pkt.data_type() == DataType::DiscoveryAnnounce)
                 .unwrap();
             let eps = crate::discovery::decode_discovery_announce(announce).unwrap();
-            assert_eq!(eps, vec![DataEndpoint::named("SD_CARD")]);
+            assert!(
+                eps.is_empty(),
+                "a relay must not reflect a route learned from the only remaining side back to it"
+            );
             assert!(
                 b_pkts
                     .iter()

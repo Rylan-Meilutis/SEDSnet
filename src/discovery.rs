@@ -587,7 +587,11 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
     let endpoint_count =
         read_u32(payload, &mut cursor, "discovery address endpoint count")? as usize;
     let mut reachable_endpoints = bounded_wire_vec(
-        payload, cursor, endpoint_count, 4, "discovery address endpoint count",
+        payload,
+        cursor,
+        endpoint_count,
+        4,
+        "discovery address endpoint count",
     )?;
     for _ in 0..endpoint_count {
         let raw = read_u32(payload, &mut cursor, "discovery address endpoint")?;
@@ -606,7 +610,11 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
             "discovery address network variable count",
         )? as usize;
         reachable_network_variables = bounded_wire_vec(
-            payload, cursor, count, 4, "discovery address network variable count",
+            payload,
+            cursor,
+            count,
+            4,
+            "discovery address network variable count",
         )?;
         for _ in 0..count {
             let raw = read_u32(payload, &mut cursor, "discovery address network variable")?;
@@ -621,7 +629,11 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
     }
     let source_count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
     let mut reachable_timesync_sources = bounded_wire_vec(
-        payload, cursor, source_count, 4, "discovery address source count",
+        payload,
+        cursor,
+        source_count,
+        4,
+        "discovery address source count",
     )?;
     for _ in 0..source_count {
         let source = decode_string(payload, &mut cursor, "discovery address source")?;
@@ -711,9 +723,7 @@ pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryRes
 
     let count = u32::from_le_bytes(payload[..4].try_into().expect("4-byte count")) as usize;
     let mut cursor = 4usize;
-    let mut out = bounded_wire_vec(
-        payload, cursor, count, 4, "discovery timesync source count",
-    )?;
+    let mut out = bounded_wire_vec(payload, cursor, count, 4, "discovery timesync source count")?;
 
     for _ in 0..count {
         if payload.len().saturating_sub(cursor) < 4 {
@@ -910,7 +920,11 @@ pub fn decode_discovery_topology_update(pkt: &Packet) -> TelemetryResult<Discove
     ) as usize;
     cursor += 4;
     let mut removed = bounded_wire_vec(
-        payload, cursor, removed_count, 4, "discovery topology removal count",
+        payload,
+        cursor,
+        removed_count,
+        4,
+        "discovery topology removal count",
     )?;
     for _ in 0..removed_count {
         removed.push(decode_string(
@@ -959,7 +973,11 @@ fn decode_topology_boards(
 ) -> TelemetryResult<Vec<TopologyBoardNode>> {
     /* Each board has at minimum a string length and three collection counts. */
     let mut boards = bounded_wire_vec(
-        payload, *cursor, count, 16, "discovery topology board count",
+        payload,
+        *cursor,
+        count,
+        16,
+        "discovery topology board count",
     )?;
 
     for _ in 0..count {
@@ -975,7 +993,11 @@ fn decode_topology_boards(
         ) as usize;
         *cursor += 4;
         let mut reachable_endpoints = bounded_wire_vec(
-            payload, *cursor, endpoint_count, 4, "discovery topology endpoint count",
+            payload,
+            *cursor,
+            endpoint_count,
+            4,
+            "discovery topology endpoint count",
         )?;
         for _ in 0..endpoint_count {
             if payload.len().saturating_sub(*cursor) < 4 {
@@ -1003,7 +1025,10 @@ fn decode_topology_boards(
         ) as usize;
         *cursor += 4;
         let mut reachable_timesync_sources = bounded_wire_vec(
-            payload, *cursor, source_count, 4,
+            payload,
+            *cursor,
+            source_count,
+            4,
             "discovery topology timesync source count",
         )?;
         for _ in 0..source_count {
@@ -1025,7 +1050,10 @@ fn decode_topology_boards(
         ) as usize;
         *cursor += 4;
         let mut connections = bounded_wire_vec(
-            payload, *cursor, connection_count, 4,
+            payload,
+            *cursor,
+            connection_count,
+            4,
             "discovery topology connection count",
         )?;
         for _ in 0..connection_count {
@@ -1318,7 +1346,11 @@ pub fn decode_discovery_schema_payload(
     let endpoint_count =
         read_u32(payload, &mut cursor, "discovery schema endpoint count")? as usize;
     let mut endpoints = bounded_wire_vec(
-        payload, cursor, endpoint_count, 13, "discovery schema endpoint count",
+        payload,
+        cursor,
+        endpoint_count,
+        13,
+        "discovery schema endpoint count",
     )?;
     for _ in 0..endpoint_count {
         let id = DataEndpoint(read_u32(
@@ -1358,7 +1390,11 @@ pub fn decode_discovery_schema_payload(
 
     let type_count = read_u32(payload, &mut cursor, "discovery schema type count")? as usize;
     let mut types = bounded_wire_vec(
-        payload, cursor, type_count, 19, "discovery schema type count",
+        payload,
+        cursor,
+        type_count,
+        19,
+        "discovery schema type count",
     )?;
     for _ in 0..type_count {
         let id = DataType(read_u32(payload, &mut cursor, "discovery schema type id")?);
@@ -1415,7 +1451,10 @@ pub fn decode_discovery_schema_payload(
         let endpoint_count =
             read_u32(payload, &mut cursor, "discovery schema type endpoint count")? as usize;
         let mut type_endpoints = bounded_wire_vec(
-            payload, cursor, endpoint_count, 4,
+            payload,
+            cursor,
+            endpoint_count,
+            4,
             "discovery schema type endpoint count",
         )?;
         for _ in 0..endpoint_count {
