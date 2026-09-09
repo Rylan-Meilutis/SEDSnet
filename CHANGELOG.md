@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.0.25
+
+- Preserve unknown endpoint and managed-variable wire IDs in discovery advertisements and
+  requests until their runtime-schema fragments arrive. Relays can now advertise and route newly
+  introduced board data without every intermediate firmware image already compiling that type.
+- Add a regression covering discovery and managed-variable control received before schema merge.
+
 ## 4.0.24
 
 - Route managed-variable updates using discovery's advertised variable ownership rather than

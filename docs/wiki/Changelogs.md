@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 4.0.25 highlights
+
+- Discovery keeps stable raw endpoint and managed-variable identifiers while a newly learned
+  runtime schema is still propagating, so intermediate routers do not discard new board routes.
+- Managed-variable requests can cross relays that have not compiled the requested type, allowing
+  incremental schema growth without network-wide firmware replacement.
+
 ## Version 4.0.24 highlights
 
 - Reliable managed-variable destination contracts are derived from advertised variable owners on

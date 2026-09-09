@@ -17,7 +17,6 @@ use crate::{
         message_data_type_from_code, reliable_code, reliable_from_code,
     },
     packet::Packet,
-    try_enum_from_u32,
 };
 
 pub const DISCOVERY_ROUTE_TTL_MS: u64 = 30_000;
@@ -371,7 +370,7 @@ pub fn decode_discovery_payload(payload: &[u8]) -> TelemetryResult<Vec<DataEndpo
     let mut endpoints = Vec::with_capacity(payload.len() / 4);
     for chunk in payload.as_chunks::<4>().0 {
         let raw = u32::from_le_bytes(*chunk);
-        let ep = try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
+        let ep = DataEndpoint(raw);
         if is_discovery_endpoint(ep) {
             continue;
         }
@@ -595,7 +594,7 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
     )?;
     for _ in 0..endpoint_count {
         let raw = read_u32(payload, &mut cursor, "discovery address endpoint")?;
-        let ep = try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
+        let ep = DataEndpoint(raw);
         if !is_discovery_endpoint(ep) {
             reachable_endpoints.push(ep);
         }
@@ -618,8 +617,11 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
         )?;
         for _ in 0..count {
             let raw = read_u32(payload, &mut cursor, "discovery address network variable")?;
-            let ty = DataType::try_from_u32(raw)
-                .ok_or(TelemetryError::Unpack("bad discovery network variable"))?;
+            /* A relay may hear the address advertisement before the matching
+             * runtime-schema fragment. Preserve the stable wire id so the
+             * route is usable immediately and the later schema merge can add
+             * its name/shape without requiring a blank-slate rediscovery. */
+            let ty = DataType(raw);
             if !is_discovery_type(ty) {
                 reachable_network_variables.push(ty);
             }
@@ -704,7 +706,9 @@ pub fn decode_managed_variable_request(pkt: &Packet) -> TelemetryResult<DataType
         return Err(TelemetryError::Unpack("managed variable request width"));
     }
     let raw = u32::from_le_bytes(payload.try_into().expect("4-byte payload"));
-    try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad managed variable data type"))
+    /* Managed-variable requests are routable by their stable wire id. The
+     * relay itself need not have received that type's schema yet. */
+    Ok(DataType(raw))
 }
 
 /// Decodes a discovery time sync source packet into source identifiers.
@@ -1006,8 +1010,7 @@ fn decode_topology_boards(
             let raw =
                 u32::from_le_bytes(payload[*cursor..*cursor + 4].try_into().expect("4-byte ep"));
             *cursor += 4;
-            let ep =
-                try_enum_from_u32(raw).ok_or(TelemetryError::Unpack("bad discovery endpoint"))?;
+            let ep = DataEndpoint(raw);
             if !is_discovery_endpoint(ep) {
                 reachable_endpoints.push(ep);
             }
@@ -1485,9 +1488,45 @@ pub fn decode_discovery_schema_payload(
 #[cfg(test)]
 mod bounded_decode_tests {
     use super::{
+        ADDRESS_MODE_STATIC, ADDRESS_STATE_APPROVED, AddressAdvertisement, LinkCapabilities,
+        build_discovery_address, build_managed_variable_request, decode_discovery_address,
         decode_discovery_schema_payload, decode_discovery_timesync_sources_payload,
-        decode_discovery_topology_payload,
+        decode_discovery_topology_payload, decode_managed_variable_request,
     };
+    use crate::{DataEndpoint, DataType};
+
+    #[test]
+    fn unknown_managed_variable_ids_survive_discovery_before_schema_merge() {
+        let unknown = DataType(4090);
+        let unknown_endpoint = DataEndpoint(4090);
+        let advertisement = AddressAdvertisement {
+            hostname: "flight".into(),
+            address: 42,
+            requested_address: 42,
+            mode: ADDRESS_MODE_STATIC,
+            state: ADDRESS_STATE_APPROVED,
+            birth_ms: 10,
+            owner_hash: 20,
+            reachable_endpoints: vec![unknown_endpoint],
+            reachable_network_variables: vec![unknown],
+            reachable_timesync_sources: Vec::new(),
+            link_capabilities: LinkCapabilities {
+                version: 1,
+                flags: 0,
+                profile: 0,
+                max_frame_bytes: 128,
+                compact_header_target_bytes: 40,
+                max_side_transport_templates: 4,
+            },
+        };
+        let packet = build_discovery_address("FC", 1, &advertisement).unwrap();
+        let decoded = decode_discovery_address(&packet).unwrap();
+        assert_eq!(decoded.reachable_endpoints, vec![unknown_endpoint]);
+        assert_eq!(decoded.reachable_network_variables, vec![unknown]);
+
+        let request = build_managed_variable_request("GS", 2, unknown).unwrap();
+        assert_eq!(decode_managed_variable_request(&request).unwrap(), unknown);
+    }
 
     #[test]
     fn corrupt_timesync_count_is_rejected_without_reserving() {
