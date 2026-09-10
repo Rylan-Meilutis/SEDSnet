@@ -1107,7 +1107,7 @@ fn read_u32(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telemetr
     Ok(out)
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(any(not(feature = "std"), test))]
 fn skip_string(payload: &[u8], cursor: &mut usize, label: &'static str) -> TelemetryResult<()> {
     let len = read_u32(payload, cursor, label)? as usize;
     if payload.len().saturating_sub(*cursor) < len {
@@ -1115,6 +1115,83 @@ fn skip_string(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telem
     }
     *cursor += len;
     Ok(())
+}
+
+/// Checks a version-3 schema payload without allocating any owned strings or
+/// vectors. Embedded routers use this before the full decoder so repeated
+/// snapshots made entirely of compiled/previously learned IDs do not create a
+/// large transient heap burst merely to discard every decoded definition.
+#[cfg(any(not(feature = "std"), test))]
+pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> TelemetryResult<bool> {
+    let mut cursor = 0usize;
+    if read_u32(payload, &mut cursor, "discovery schema version")? != 3 {
+        return Ok(false);
+    }
+
+    let endpoint_count =
+        read_u32(payload, &mut cursor, "discovery schema endpoint count")? as usize;
+    if endpoint_count > payload.len().saturating_sub(cursor) / 13 {
+        return Err(TelemetryError::Unpack("discovery schema endpoint count"));
+    }
+    let mut all_known = true;
+    for _ in 0..endpoint_count {
+        let id = DataEndpoint(read_u32(
+            payload,
+            &mut cursor,
+            "discovery schema endpoint id",
+        )?);
+        all_known &= crate::config::endpoint_exists(id);
+        let _ = read_u8(payload, &mut cursor, "discovery schema endpoint flags")?;
+        skip_string(payload, &mut cursor, "discovery schema endpoint name")?;
+        skip_string(
+            payload,
+            &mut cursor,
+            "discovery schema endpoint description",
+        )?;
+    }
+
+    let type_count = read_u32(payload, &mut cursor, "discovery schema type count")? as usize;
+    if type_count > payload.len().saturating_sub(cursor) / 19 {
+        return Err(TelemetryError::Unpack("discovery schema type count"));
+    }
+    for _ in 0..type_count {
+        let id = DataType(read_u32(payload, &mut cursor, "discovery schema type id")?);
+        all_known &= crate::config::data_type_exists(id);
+        skip_string(payload, &mut cursor, "discovery schema type name")?;
+        skip_string(payload, &mut cursor, "discovery schema type description")?;
+        let element_kind = read_u8(payload, &mut cursor, "discovery schema element kind")?;
+        if element_kind > 1 {
+            return Err(TelemetryError::Unpack("discovery schema element kind"));
+        }
+        let _ = read_u32(payload, &mut cursor, "discovery schema element count")?;
+        message_data_type_from_code(read_u8(payload, &mut cursor, "discovery schema data type")?)
+            .ok_or(TelemetryError::Unpack("discovery schema data type"))?;
+        message_class_from_code(read_u8(payload, &mut cursor, "discovery schema class")?)
+            .ok_or(TelemetryError::Unpack("discovery schema class"))?;
+        reliable_from_code(read_u8(payload, &mut cursor, "discovery schema reliable")?)
+            .ok_or(TelemetryError::Unpack("discovery schema reliable"))?;
+        let _ = read_u8(payload, &mut cursor, "discovery schema priority")?;
+        e2e_encryption_policy_from_code(read_u8(
+            payload,
+            &mut cursor,
+            "discovery schema e2e cryptography",
+        )?)
+        .ok_or(TelemetryError::Unpack("discovery schema e2e cryptography"))?;
+        let endpoint_count =
+            read_u32(payload, &mut cursor, "discovery schema type endpoint count")? as usize;
+        if endpoint_count > payload.len().saturating_sub(cursor) / 4 {
+            return Err(TelemetryError::Unpack(
+                "discovery schema type endpoint count",
+            ));
+        }
+        for _ in 0..endpoint_count {
+            let _ = read_u32(payload, &mut cursor, "discovery schema type endpoint")?;
+        }
+    }
+    if cursor != payload.len() {
+        return Err(TelemetryError::Unpack("discovery schema trailing bytes"));
+    }
+    Ok(all_known)
 }
 
 /// Builds a discovery packet containing the complete runtime schema snapshot.
@@ -1492,8 +1569,33 @@ mod bounded_decode_tests {
         build_discovery_address, build_managed_variable_request, decode_discovery_address,
         decode_discovery_schema_payload, decode_discovery_timesync_sources_payload,
         decode_discovery_topology_payload, decode_managed_variable_request,
+        discovery_schema_payload_is_fully_known,
     };
     use crate::{DataEndpoint, DataType};
+
+    #[test]
+    fn known_schema_ids_are_detected_without_owned_decode() {
+        fn one_endpoint(id: DataEndpoint) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&3u32.to_le_bytes());
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(&id.0.to_le_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload
+        }
+
+        assert!(
+            discovery_schema_payload_is_fully_known(&one_endpoint(DataEndpoint::Discovery,))
+                .unwrap()
+        );
+        assert!(
+            !discovery_schema_payload_is_fully_known(&one_endpoint(DataEndpoint(u32::MAX - 7),))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn unknown_managed_variable_ids_survive_discovery_before_schema_merge() {

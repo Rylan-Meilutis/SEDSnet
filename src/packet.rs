@@ -303,7 +303,7 @@ impl Packet {
             endpoints: Arc::<[DataEndpoint]>::from(endpoints),
             timestamp,
             nonce,
-            payload: StandardSmallPayload::new(&payload),
+            payload: StandardSmallPayload::from_arc(payload),
             wire_shape,
             wire_target_senders,
         })

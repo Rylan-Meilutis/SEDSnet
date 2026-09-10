@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.0.26
+
+- Avoid decoding and allocating owned runtime-schema discovery data when an embedded router
+  already knows every advertised endpoint, managed variable, and data type. Unknown schema
+  additions still merge normally.
+- Reuse the existing reference-counted backing allocation when converting large packed payloads
+  into internal small-payload storage, eliminating a second transient allocation on forwarding
+  and discovery paths.
+- Add no-std and payload regressions covering allocation-free known-schema discovery and shared
+  backing storage for large frames.
+
 ## 4.0.25
 
 - Preserve unknown endpoint and managed-variable wire IDs in discovery advertisements and

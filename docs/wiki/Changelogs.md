@@ -1,5 +1,14 @@
 # Changelogs
 
+## Version 4.0.26 highlights
+
+- Embedded routers preflight runtime-schema advertisements without allocating an owned decoded
+  copy when every advertised definition is already known.
+- New schema definitions continue through the normal bounded merge path, retaining dynamic
+  topology support without paying repeated allocation costs for unchanged schemas.
+- Large packed payloads retain their existing reference-counted storage when forwarded, reducing
+  peak heap demand and fragmentation on constrained multi-sided routers.
+
 ## Version 4.0.25 highlights
 
 - Discovery keeps stable raw endpoint and managed-variable identifiers while a newly learned

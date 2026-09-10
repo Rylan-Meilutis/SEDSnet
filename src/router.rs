@@ -5868,6 +5868,10 @@ impl Router {
             return Ok(false);
         }
         if pkt.data_type() == DataType::DiscoverySchema {
+            #[cfg(not(feature = "std"))]
+            if discovery::discovery_schema_payload_is_fully_known(pkt.payload())? {
+                return Ok(true);
+            }
             let snapshot = discovery::decode_discovery_schema(pkt)?;
             // The decoded snapshot contains the sender's complete schema, but
             // embedded targets retain only definitions that are not already

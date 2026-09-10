@@ -108,6 +108,22 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         }
     }
 
+    /// Consume an existing shared payload without copying its heap storage.
+    ///
+    /// Small values are still moved inline. Large values retain the supplied
+    /// `Arc`, which avoids a second payload-sized allocation during packet
+    /// construction. This is particularly important for discovery schemas on
+    /// fragmented embedded heaps.
+    #[inline]
+    pub fn from_arc(data: Arc<[u8]>) -> Self {
+        if data.len() <= INLINE {
+            let (buf, len) = InlineBuf::<INLINE>::from_slice(&data);
+            Self::Inline { len, buf }
+        } else {
+            Self::Heap(data)
+        }
+    }
+
     /// Byte cost of the payload (for use in byte-limited queues).
     #[inline]
     fn byte_cost(&self) -> usize {
@@ -221,5 +237,29 @@ impl<const INLINE: usize> ByteCost for SmallPayload<INLINE> {
     #[inline]
     fn byte_cost(&self) -> usize {
         self.byte_cost()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SmallPayload;
+    use alloc::sync::Arc;
+
+    #[test]
+    fn from_arc_reuses_large_payload_allocation() {
+        let original: Arc<[u8]> = Arc::from([0x5a; 65]);
+        let retained = original.clone();
+        let payload = SmallPayload::<64>::from_arc(original);
+        let SmallPayload::Heap(stored) = payload else {
+            panic!("large payload must use heap storage");
+        };
+        assert!(Arc::ptr_eq(&stored, &retained));
+    }
+
+    #[test]
+    fn from_arc_keeps_small_payload_inline() {
+        let payload = SmallPayload::<64>::from_arc(Arc::from([1, 2, 3]));
+        assert!(payload.is_inline());
+        assert_eq!(payload.as_slice(), [1, 2, 3]);
     }
 }

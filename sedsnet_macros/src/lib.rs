@@ -104,6 +104,19 @@ pub fn define_stack_payload(input: TokenStream) -> TokenStream {
         }
     });
 
+    // from_arc() selection arms. Small payloads retain the inline layout;
+    // larger payloads preserve the caller's allocation instead of copying it.
+    let from_arc_arms = caps.iter().map(|c| {
+        let vname = syn::Ident::new(&format!("Inline{}", c), Span::call_site());
+        quote! {
+            if len <= #c {
+                return StandardSmallPayload::#vname(
+                    crate::small_payload::SmallPayload::<#c>::from_arc(data)
+                );
+            }
+        }
+    });
+
     // match arms for as_slice()
     let as_slice_arms = caps.iter().map(|c| {
         let vname = syn::Ident::new(&format!("Inline{}", c), Span::call_site());
@@ -179,6 +192,13 @@ pub fn define_stack_payload(input: TokenStream) -> TokenStream {
                 let len = data.len();
                 #(#new_arms)*
                 StandardSmallPayload::Heap(alloc::sync::Arc::from(data))
+            }
+
+            #[inline]
+            pub fn from_arc(data: alloc::sync::Arc<[u8]>) -> Self {
+                let len = data.len();
+                #(#from_arc_arms)*
+                StandardSmallPayload::Heap(data)
             }
 
             #[inline]

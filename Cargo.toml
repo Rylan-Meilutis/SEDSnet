@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "4.0.25"
+version = "4.0.26"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -91,7 +91,7 @@ name = "route_selection_paths"
 harness = false
 
 [dependencies]
-sedsnet_macros = { version = "2.0.0", path = "sedsnet_macros" }
+sedsnet_macros = { version = "2.0.1", path = "sedsnet_macros" }
 crc32fast = { version = "1.5.1", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1.0.150", default-features = false, optional = true }

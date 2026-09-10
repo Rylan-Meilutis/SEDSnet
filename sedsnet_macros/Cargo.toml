@@ -1,6 +1,6 @@
 [package]
 name = "sedsnet_macros"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
 description = "Compile-time helper macros for SEDSnet embedded configuration."
