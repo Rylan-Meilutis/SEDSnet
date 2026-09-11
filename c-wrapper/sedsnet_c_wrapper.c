@@ -14,7 +14,6 @@ SedsWrapperRouterConfig seds_wrapper_router_default_config(void)
 {
     SedsWrapperRouterConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.mode = Seds_RM_Relay;
 #if defined(SEDS_ENABLE_CRYPTOGRAPHY)
     cfg.e2e_mode = SEDS_ROUTER_E2E_PREFERRED;
 #else
@@ -48,8 +47,7 @@ SedsResult seds_wrapper_router_init(SedsWrapperRouter * node,
     memset(node, 0, sizeof(*node));
     node->primary_side = SEDS_SIDE_INVALID;
     node->init_error = SEDS_OK;
-    node->router = seds_router_new_ex(cfg->mode,
-                                      cfg->now_ms,
+    node->router = seds_router_new_ex(cfg->now_ms,
                                       cfg->now_user,
                                       cfg->handlers,
                                       cfg->num_handlers,

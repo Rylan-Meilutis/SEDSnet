@@ -45,6 +45,21 @@ Built-in router data types:
 Discovery, reliable-control, managed-variable request, and P2P packets are router-owned control
 traffic. Applications should not register normal user handlers on the discovery endpoint.
 
+## Preferred Discovery Master
+
+Routers normally elect the lexicographically first visible topology member as discovery master.
+Deployments with a stable host can instead configure a preferred name. Rust uses
+`RouterConfig::with_preferred_discovery_master("GS")` or
+`router.set_preferred_discovery_master(Some("GS"))`; C uses
+`seds_router_set_preferred_discovery_master(router, "GS", 2)`; Python uses
+`router.set_preferred_discovery_master("GS")`.
+
+The preference is opportunistic. If the named router is absent, normal topology election continues.
+When the preferred router restarts without cached topology, its adjacent bridge answers the bounded
+topology request so the network is reconstructed incrementally. Existing topology and received
+runtime schemas are retained and merged; this is not a network-wide blank-slate discovery flood.
+Discovery-master preference does not select the time-sync leader.
+
 ## Common String Encoding
 
 Discovery payload strings use this fixed format:

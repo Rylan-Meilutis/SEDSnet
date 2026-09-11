@@ -1304,6 +1304,18 @@ impl PyRouter {
         Ok(())
     }
 
+    /// Prefer a named discovery master. Passing `None` or an empty string
+    /// restores topology-based election; time-sync leadership is unchanged.
+    #[pyo3(signature = (hostname=None))]
+    fn set_preferred_discovery_master(&self, hostname: Option<&str>) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.set_preferred_discovery_master(hostname);
+        Ok(())
+    }
+
     #[pyo3(signature = (address_mode=0, requested_address=0))]
     fn configure_address(&self, address_mode: u8, requested_address: u32) -> PyResult<()> {
         let mode = match address_mode {
@@ -2305,6 +2317,28 @@ impl PyRouter {
             .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
         rtr.set_network_variable(pkt.inner.clone())
             .map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn seed_managed_variable(&self, pkt: &PyPacket) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.seed_managed_variable(pkt.inner.clone())
+            .map_err(py_err_from)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn request_managed_variable(&self, ty: u32) -> PyResult<()> {
+        let rtr = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        rtr.request_managed_variable(
+            DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+        )
+        .map_err(py_err_from)
     }
 
     #[cfg(feature = "discovery")]

@@ -1386,14 +1386,12 @@ pub extern "C" fn seds_set_runtime_tuning_config(cfg: *const SedsRuntimeTuningCo
 /// Router constructor (no TX callback; sides are added separately).
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_new(
-    mode: u8,
     now_ms_cb: CNowMs,
     user: *mut c_void,
     handlers: *const SedsLocalEndpointDesc,
     n_handlers: usize,
 ) -> *mut SedsRouter {
     seds_router_new_impl(SedsRouterNewOptions {
-        mode,
         now_ms_cb,
         user,
         handlers,
@@ -1406,7 +1404,6 @@ pub extern "C" fn seds_router_new(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_new_ex(
-    mode: u8,
     now_ms_cb: CNowMs,
     user: *mut c_void,
     handlers: *const SedsLocalEndpointDesc,
@@ -1418,7 +1415,6 @@ pub extern "C" fn seds_router_new_ex(
         return ptr::null_mut();
     };
     seds_router_new_impl(SedsRouterNewOptions {
-        mode,
         now_ms_cb,
         user,
         handlers,
@@ -1431,7 +1427,6 @@ pub extern "C" fn seds_router_new_ex(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_new_with_memory(
-    mode: u8,
     now_ms_cb: CNowMs,
     user: *mut c_void,
     handlers: *const SedsLocalEndpointDesc,
@@ -1447,7 +1442,6 @@ pub extern "C" fn seds_router_new_with_memory(
         return ptr::null_mut();
     };
     seds_router_new_impl(SedsRouterNewOptions {
-        mode,
         now_ms_cb,
         user,
         handlers,
@@ -1469,7 +1463,6 @@ fn router_e2e_mode_from_code(code: u8) -> Option<RouterE2eEncryptionMode> {
 }
 
 struct SedsRouterNewOptions {
-    mode: u8,
     now_ms_cb: CNowMs,
     user: *mut c_void,
     handlers: *const SedsLocalEndpointDesc,
@@ -1570,7 +1563,6 @@ fn seds_router_new_impl(opts: SedsRouterNewOptions) -> *mut SedsRouter {
         let cfg = cfg.with_timesync(TimeSyncConfig::default());
         cfg
     };
-    let _ = opts.mode;
 
     #[cfg(feature = "std")]
     let router = if opts.now_ms_cb.is_some() {
@@ -1635,6 +1627,31 @@ pub extern "C" fn seds_router_set_sender_id(
     };
     let router = unsafe { &mut *r };
     router.inner.set_sender(sender_id);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Prefer a named discovery master, independently of time-sync leadership.
+/// Passing a zero-length hostname restores topology-based election.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_preferred_discovery_master(
+    r: *mut SedsRouter,
+    hostname: *const c_char,
+    hostname_len: usize,
+) -> i32 {
+    if r.is_null() || (hostname_len > 0 && hostname.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let hostname = if hostname_len == 0 {
+        None
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(hostname), hostname_len) };
+        match from_utf8(bytes) {
+            Ok(value) => Some(value),
+            Err(_) => return status_from_err(TelemetryError::BadArg),
+        }
+    };
+    let router = unsafe { &(*r).inner };
+    router.set_preferred_discovery_master(hostname);
     status_from_result_code(SedsResult::SedsOk)
 }
 
@@ -6165,7 +6182,7 @@ mod tests {
             user: ptr::null_mut(),
         };
 
-        let router = seds_router_new(0, None, ptr::null_mut(), &desc, 1);
+        let router = seds_router_new(None, ptr::null_mut(), &desc, 1);
         assert!(router.is_null());
     }
 
@@ -6179,7 +6196,7 @@ mod tests {
             user: ptr::null_mut(),
         };
 
-        let router = seds_router_new(0, None, ptr::null_mut(), &desc, 1);
+        let router = seds_router_new(None, ptr::null_mut(), &desc, 1);
         assert!(router.is_null());
     }
 
@@ -6192,7 +6209,7 @@ mod tests {
             queue_grow_step: 2.0,
         };
         let router =
-            seds_router_new_with_memory(0, None, ptr::null_mut(), ptr::null(), 0, 2, 0, &memory);
+            seds_router_new_with_memory(None, ptr::null_mut(), ptr::null(), 0, 2, 0, &memory);
         assert!(!router.is_null());
         let router_json: Value = serde_json::from_str(&export_router_json(
             router,
@@ -6222,7 +6239,7 @@ mod tests {
         };
         assert!(seds_relay_new_with_memory(None, ptr::null_mut(), &bad).is_null());
         assert!(
-            seds_router_new_with_memory(0, None, ptr::null_mut(), ptr::null(), 0, 2, 0, &bad)
+            seds_router_new_with_memory(None, ptr::null_mut(), ptr::null(), 0, 2, 0, &bad)
                 .is_null()
         );
     }
@@ -6359,7 +6376,7 @@ mod tests {
         crate::tests::ensure_common_test_schema();
         let ty = DataType::named("GPS_DATA");
         let endpoints = [DataEndpoint::named("RADIO")];
-        let router = seds_router_new(0, None, ptr::null_mut(), ptr::null(), 0);
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
 
         assert_eq!(seds_router_enable_managed_variable(router, ty), 0);
@@ -6433,7 +6450,7 @@ mod tests {
         let side_name_b = b"uart";
         let tx_state = PackedTxState::default();
 
-        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
 
         let side_a = seds_router_add_side_packed(
@@ -6964,7 +6981,7 @@ mod tests {
 
     #[test]
     fn router_c_abi_runtime_stats_json_has_expected_schema() {
-        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
 
         let side_name = b"UPLINK";
@@ -7007,7 +7024,7 @@ mod tests {
 
     #[test]
     fn router_c_abi_packed_profile_sets_compact_side_options() {
-        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
 
         let side_name = b"PROFILE_UPLINK";
@@ -7078,7 +7095,7 @@ mod tests {
 
     #[test]
     fn router_c_abi_profile_callback_preserves_priority_through_chunks() {
-        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
         let priorities = Mutex::new(Vec::<u8>::new());
         let side_name = b"PRIORITY_UPLINK";
@@ -7226,7 +7243,7 @@ mod tests {
 
     #[test]
     fn c_abi_sender_id_setters_update_exported_topology() {
-        let router = seds_router_new(1, None, ptr::null_mut(), ptr::null(), 0);
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
         assert!(!router.is_null());
         let side_name = b"UPLINK";
         let side_id = seds_router_add_side_packed(
@@ -7266,6 +7283,28 @@ mod tests {
         assert_eq!(seds_router_current_address(router, &mut address), 0);
         assert_eq!(address, 0x1020_3040);
         assert_eq!(seds_router_configure_address(router, 9, 0), -10);
+        let preferred_master = b"GS";
+        assert_eq!(
+            seds_router_set_preferred_discovery_master(
+                router,
+                preferred_master.as_ptr() as *const c_char,
+                preferred_master.len(),
+            ),
+            0
+        );
+        unsafe {
+            assert_eq!(
+                (*router).inner.preferred_discovery_master().as_deref(),
+                Some("GS")
+            );
+        }
+        assert_eq!(
+            seds_router_set_preferred_discovery_master(router, ptr::null(), 0),
+            0
+        );
+        unsafe {
+            assert_eq!((*router).inner.preferred_discovery_master(), None);
+        }
         seds_router_free(router);
 
         let relay = seds_relay_new(None, ptr::null_mut());

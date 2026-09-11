@@ -58,7 +58,7 @@ int main(void)
         {.endpoint = sd_card_endpoint.id, .packet_handler = on_packet, .user = NULL},
     };
 
-    SedsRouter * r = seds_router_new(Seds_RM_Sink, host_now_ms, NULL, locals, 2);
+    SedsRouter * r = seds_router_new(host_now_ms, NULL, locals, 2);
     if (!r)
     {
         fprintf(stderr, "router init failed\n");

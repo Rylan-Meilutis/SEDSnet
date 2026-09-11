@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.0.27
+
+- Align C construction with the Rust and Python unified-router APIs by removing the obsolete
+  `SedsRouterMode` argument and wrapper configuration field. Routing behavior is controlled by
+  sides, discovered endpoints, and runtime route rules in every language.
+- Resolve compact sender addresses from named connection peers retained in constrained bridge
+  topology. GroundStation can now attribute command acknowledgements and telemetry to boards behind
+  Gateway or RF even when their complete node records were elided from a compact snapshot.
+- Add an optional preferred discovery master, configurable from Rust, C, and Python. A restarted
+  preferred master receives one bounded adjacent snapshot, while an unavailable preference falls
+  back to the existing topology election without discarding learned topology or runtime schemas.
+- Keep discovery leadership independent of time synchronization and add regressions for the vehicle
+  policy of RF time source first, GroundStation fallback second, and normal consumer promotion last.
+
 ## 4.0.26
 
 - Avoid decoding and allocating owned runtime-schema discovery data when an embedded router

@@ -1380,6 +1380,8 @@ pub struct RouterConfig {
     #[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
     e2e_key_id: u32,
     memory: RuntimeMemoryConfig,
+    #[cfg(feature = "discovery")]
+    preferred_discovery_master: Option<Arc<str>>,
     #[cfg(feature = "timesync")]
     timesync: Option<TimeSyncConfig>,
 }
@@ -1421,6 +1423,8 @@ impl RouterConfig {
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
             memory: RuntimeMemoryConfig::default(),
+            #[cfg(feature = "discovery")]
+            preferred_discovery_master: None,
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -1493,6 +1497,22 @@ impl RouterConfig {
         Ok(self)
     }
 
+    /// Prefer a named router as discovery master whenever it is visible.
+    ///
+    /// All routers in a deployment should use the same preference. If that
+    /// router is absent, normal topology-based election is used. Discovery
+    /// leadership remains independent from time-sync source priority.
+    #[cfg(feature = "discovery")]
+    pub fn with_preferred_discovery_master<S: AsRef<str>>(mut self, hostname: S) -> Self {
+        let hostname = hostname.as_ref();
+        self.preferred_discovery_master = if hostname.is_empty() {
+            None
+        } else {
+            Some(Arc::from(hostname))
+        };
+        self
+    }
+
     #[cfg(feature = "timesync")]
     /// Enables and configures built-in time synchronization for this router.
     pub fn with_timesync(mut self, cfg: TimeSyncConfig) -> Self {
@@ -1561,6 +1581,8 @@ impl Default for RouterConfig {
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
             memory: RuntimeMemoryConfig::default(),
+            #[cfg(feature = "discovery")]
+            preferred_discovery_master: None,
             #[cfg(feature = "timesync")]
             timesync: None,
         }
@@ -1725,6 +1747,8 @@ struct RouterInner {
     discovery_cadence: DiscoveryCadenceState,
     #[cfg(feature = "discovery")]
     discovery_side_throttle: BTreeMap<RouterSideId, DiscoverySideThrottleState>,
+    #[cfg(feature = "discovery")]
+    preferred_discovery_master: Option<Arc<str>>,
     #[cfg(all(feature = "discovery", feature = "timesync"))]
     timesync_side_throttle: BTreeMap<RouterSideId, TimeSyncSideThrottleState>,
 }
@@ -2960,6 +2984,14 @@ impl Router {
                 consider(announcer);
                 for board in &state.topology_boards {
                     consider(&board.sender_id);
+                    // A constrained bridge can retain a remote only as a
+                    // named connection on its own topology node.  That name
+                    // is still authoritative discovery identity and is
+                    // sufficient to resolve the deterministic compact sender
+                    // address used by application and ACK packets.
+                    for peer in &board.connections {
+                        consider(peer);
+                    }
                 }
             }
         }
@@ -5202,6 +5234,15 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn discovery_master_sender_locked(&self, st: &RouterInner, now_ms: u64) -> String {
         let boards = self.advertised_discovery_topology_for_link_locked(st, now_ms, true, None);
+        if let Some(preferred) = st.preferred_discovery_master.as_deref()
+            && (preferred == self.sender_arc().as_ref()
+                || boards.iter().any(|board| {
+                    board.sender_id == preferred
+                        || board.connections.iter().any(|peer| peer == preferred)
+                }))
+        {
+            return preferred.to_string();
+        }
         discovery::elect_discovery_master(self.sender_arc().as_ref(), &boards)
     }
 
@@ -5214,6 +5255,12 @@ impl Router {
     ) -> bool {
         if requester == self.sender_arc().as_ref() {
             return false;
+        }
+        // A preferred master that restarted has no topology to advertise.
+        // Its directly adjacent router must answer this one bounded request,
+        // even though that router is not normally elected master.
+        if st.preferred_discovery_master.as_deref() == Some(requester) {
+            return true;
         }
         self.discovery_master_sender_locked(st, now_ms) == self.sender_arc().as_ref()
     }
@@ -8068,6 +8115,8 @@ impl Router {
     pub fn new_with_clock(cfg: RouterConfig, clock: Box<dyn Clock + Send + Sync>) -> Self {
         #[cfg(feature = "timesync")]
         let timesync_cfg = cfg.timesync_config();
+        #[cfg(feature = "discovery")]
+        let preferred_discovery_master = cfg.preferred_discovery_master.clone();
         let memory = cfg.memory_config();
         let hostname: Arc<str> = Arc::from(cfg.sender());
         let address_mode = cfg.address_mode();
@@ -8148,6 +8197,8 @@ impl Router {
                 discovery_cadence: DiscoveryCadenceState::default(),
                 #[cfg(feature = "discovery")]
                 discovery_side_throttle: BTreeMap::new(),
+                #[cfg(feature = "discovery")]
+                preferred_discovery_master,
                 #[cfg(all(feature = "discovery", feature = "timesync"))]
                 timesync_side_throttle: BTreeMap::new(),
             }),
@@ -8179,6 +8230,36 @@ impl Router {
 
     pub fn hostname(&self) -> Arc<str> {
         self.sender_arc()
+    }
+
+    /// Change the preferred discovery master at runtime.
+    ///
+    /// Passing `None` or an empty hostname restores topology-based election.
+    /// This does not alter time-sync leadership or source priority.
+    pub fn set_preferred_discovery_master(&self, hostname: Option<&str>) {
+        #[cfg(feature = "discovery")]
+        {
+            let preferred = hostname
+                .filter(|value| !value.is_empty())
+                .map(Arc::<str>::from);
+            let mut st = self.state.lock();
+            if st.preferred_discovery_master != preferred {
+                st.preferred_discovery_master = preferred;
+                Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+            }
+        }
+        #[cfg(not(feature = "discovery"))]
+        let _ = hostname;
+    }
+
+    /// Return the currently configured preferred discovery master.
+    pub fn preferred_discovery_master(&self) -> Option<Arc<str>> {
+        #[cfg(feature = "discovery")]
+        {
+            return self.state.lock().preferred_discovery_master.clone();
+        }
+        #[cfg(not(feature = "discovery"))]
+        None
     }
 
     pub fn address_book(&self) -> Vec<AddressBookEntry> {

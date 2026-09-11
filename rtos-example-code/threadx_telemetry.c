@@ -326,7 +326,7 @@ SedsResult init_telemetry_router(void) {
     }
   }
 
-  r = seds_router_new(Seds_RM_Relay, node_now_since_ms, NULL, NULL, 0U);
+  r = seds_router_new(node_now_since_ms, NULL, NULL, 0U);
   if (!r) {
     printf("Error: failed to create router\r\n");
     g_router.r = NULL;

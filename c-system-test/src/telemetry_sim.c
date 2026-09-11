@@ -408,7 +408,6 @@ SedsResult node_init(SimNode * n, SimBus * bus, const char * name, int radio, in
         };
     }
     n->r = seds_router_new(
-        Seds_RM_Sink,
         node_now_since_bus_ms,
         n, /* user */
         (num ? locals : NULL),

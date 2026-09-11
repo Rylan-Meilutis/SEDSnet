@@ -28,8 +28,7 @@ void managed_variables_e2e_cpp_example()
     (void)seds::type_ref_by_name(SEDS_NAME_LITERAL("FLIGHT_STATE"), flight_state);
     (void)seds::set_e2e_encryption_policy(flight_state, SEDS_E2E_REQUIRE_ON);
 
-    SedsRouter * router = seds::router_new(Seds_RM_Relay,
-                                           nullptr,
+    SedsRouter * router = seds::router_new(nullptr,
                                            nullptr,
                                            nullptr,
                                            0U,

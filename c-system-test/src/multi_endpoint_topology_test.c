@@ -79,7 +79,6 @@ int main(void)
     };
 
     SedsRouter *r = seds_router_new(
-        Seds_RM_Relay,
         host_now_ms,
         NULL,
         locals,

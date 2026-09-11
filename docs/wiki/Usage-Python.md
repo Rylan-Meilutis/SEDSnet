@@ -148,7 +148,9 @@ seds.register_data_type(
 router = seds.Router(e2e_mode=1, e2e_key_id=7)  # RequiredOnly
 router.enable_network_variable(FLIGHT_STATE, True, True)
 router.on_network_variable_update(FLIGHT_STATE, on_flight_state_update)
+router.seed_managed_variable(initial_packet)
 router.set_network_variable(packet)
+router.request_managed_variable(FLIGHT_STATE)
 cached = router.get_network_variable(FLIGHT_STATE, 1000)
 router.process_all_queues()
 ```

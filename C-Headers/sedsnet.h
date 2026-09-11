@@ -289,12 +289,6 @@ typedef enum SedsElemKind
 } SedsElemKind;
 
 
-typedef enum SedsRouterMode
-{
-    Seds_RM_Sink = 0,
-    Seds_RM_Relay = 1,
-} SedsRouterMode;
-
 typedef enum SedsRouteSelectionMode
 {
     Seds_RSM_Fanout = 0,
@@ -416,7 +410,6 @@ SedsResult seds_set_runtime_tuning_config(const SedsRuntimeTuningConfig * cfg);
  * @return Non-NULL handle on success; NULL on failure.
  */
 SedsRouter * seds_router_new(
-                             SedsRouterMode mode,
                              SedsNowMsFn now_ms_cb,
                              void * user,
                              const SedsLocalEndpointDesc * handlers,
@@ -431,7 +424,6 @@ SedsRouter * seds_router_new(
  * `e2e_key_id` is application-defined and passed through to the registered cryptography provider.
  */
 SedsRouter * seds_router_new_ex(
-                                SedsRouterMode mode,
                                 SedsNowMsFn now_ms_cb,
                                 void * user,
                                 const SedsLocalEndpointDesc * handlers,
@@ -444,7 +436,6 @@ SedsRouter * seds_router_new_ex(
  * @brief Create a router with explicit memory limits and end-to-end cryptography settings.
  */
 SedsRouter * seds_router_new_with_memory(
-                                         SedsRouterMode mode,
                                          SedsNowMsFn now_ms_cb,
                                          void * user,
                                          const SedsLocalEndpointDesc * handlers,
@@ -457,6 +448,12 @@ SedsRouter * seds_router_new_with_memory(
 /** @brief Destroy a router created by seds_router_new(). */
 void seds_router_free(SedsRouter * r);
 SedsResult seds_router_set_sender_id(SedsRouter * r, const char * sender, size_t sender_len);
+
+/** Prefer a named discovery master independently of time-sync leadership.
+ * Pass a zero-length hostname to restore topology-based election. */
+SedsResult seds_router_set_preferred_discovery_master(SedsRouter *r,
+                                                       const char *hostname,
+                                                       size_t hostname_len);
 SedsResult seds_router_current_address(SedsRouter * r, uint32_t * out_address);
 SedsResult seds_router_configure_address(SedsRouter * r,
                                          uint8_t address_mode,

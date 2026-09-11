@@ -142,7 +142,7 @@ SedsRuntimeMemoryConfig memory = {
     .queue_grow_step = 2.0,
 };
 SedsRouter * router = seds_router_new_with_memory(
-    0, now_ms, user, handlers, n_handlers,
+    now_ms, user, handlers, n_handlers,
     SEDS_ROUTER_E2E_PREFERRED, 7, &memory
 );
 seds_router_set_sender_id(router, "FC26_MAIN", 9);
@@ -302,7 +302,6 @@ int main(void)
     };
 
     SedsRouter *r = seds_router_new(
-        Seds_RM_Relay,
         NULL,
         NULL,
         locals,
@@ -609,9 +608,8 @@ For multi-drop traffic where three boards advertise the same endpoint, use a sha
 traffic key so all intended boards can open the same payload; the authenticated header and tag
 prevent a receiver from modifying that frame for another board without detection.
 
-The first `seds_router_new(...)` mode argument is retained for ABI compatibility with older
-headers. Current routers use runtime side route controls instead of sink/relay construction modes,
-so local-only behavior is achieved by creating no sides or disabling the relevant routes.
+The C API follows Rust's unified router model: `seds_router_new(...)` has no sink/relay mode.
+Local-only behavior is achieved by creating no sides or disabling the relevant runtime routes.
 
 Reserved internal endpoints:
 

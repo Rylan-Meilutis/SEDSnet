@@ -85,6 +85,12 @@ These roles are runtime configuration, not compile-time board roles. Use `Source
 grandmaster/source node, `Consumer` for a follower, and `Auto` for a node that should become a
 source only when no better source is active and it already has usable time.
 
+Discovery-master preference is independent from these roles. For example, a vehicle can prefer
+GroundStation (`GS`) as discovery master while configuring RF as time source priority `1`,
+GroundStation as source priority `50`, and other boards as promotable consumers. RF then wins while
+present, GroundStation takes over after RF's source timeout, and ordinary consumer promotion remains
+the final fallback when neither configured source is available.
+
 Runtime configuration entry points:
 
 - Rust: `RouterConfig::with_timesync(TimeSyncConfig { ... })` at construction, or

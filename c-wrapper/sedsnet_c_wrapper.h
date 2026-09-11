@@ -11,7 +11,6 @@ extern "C" {
 
 typedef struct SedsWrapperRouterConfig
 {
-    SedsRouterMode mode;
     SedsNowMsFn now_ms;
     void * now_user;
     const SedsLocalEndpointDesc * handlers;

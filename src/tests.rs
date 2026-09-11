@@ -7869,6 +7869,86 @@ mod router_tests {
         }
 
         #[test]
+        fn preferred_discovery_master_restart_request_gets_adjacent_snapshot() {
+            ensure_topology_test_schema();
+            let emitted: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let emitted_tx = emitted.clone();
+            let gateway = Router::new_with_clock(
+                RouterConfig::default()
+                    .with_sender("GB")
+                    .with_preferred_discovery_master("GS"),
+                zero_clock(),
+            );
+            let side = gateway.add_side_packet("pico_i2c", move |pkt: &Packet| {
+                emitted_tx.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            let request = crate::discovery::build_discovery_topology_request("GS", 1).unwrap();
+            gateway.rx_from_side(&request, side).unwrap();
+            gateway.process_all_queues().unwrap();
+
+            assert_eq!(gateway.preferred_discovery_master().as_deref(), Some("GS"));
+            assert!(emitted.lock().unwrap().iter().any(|pkt| {
+                pkt.data_type() == DataType::DiscoveryTopology && pkt.sender() == "GB"
+            }));
+        }
+
+        #[test]
+        fn missing_preferred_discovery_master_falls_back_to_normal_election() {
+            ensure_topology_test_schema();
+            let emitted: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
+            let emitted_tx = emitted.clone();
+            let gateway = Router::new_with_clock(
+                RouterConfig::default()
+                    .with_sender("GB")
+                    .with_preferred_discovery_master("GS"),
+                zero_clock(),
+            );
+            let side = gateway.add_side_packet("isolated", move |pkt: &Packet| {
+                emitted_tx.lock().unwrap().push(pkt.clone());
+                Ok(())
+            });
+
+            let request = crate::discovery::build_discovery_topology_request("CLIENT", 1).unwrap();
+            gateway.rx_from_side(&request, side).unwrap();
+            gateway.process_all_queues().unwrap();
+
+            assert!(emitted.lock().unwrap().iter().any(|pkt| {
+                pkt.data_type() == DataType::DiscoveryTopology && pkt.sender() == "GB"
+            }));
+        }
+
+        #[test]
+        fn compact_sender_resolves_from_bridge_connection_only_topology() {
+            let topology_packet = build_discovery_topology(
+                "GB",
+                1,
+                &[TopologyBoardNode {
+                    sender_id: "GB".to_string(),
+                    reachable_endpoints: Vec::new(),
+                    reachable_timesync_sources: Vec::new(),
+                    connections: vec!["AB".to_string(), "DAQ".to_string(), "VB".to_string()],
+                }],
+            )
+            .unwrap();
+
+            let router =
+                Router::new_with_clock(RouterConfig::default().with_hostname("GS"), zero_clock());
+            let ingress = router.add_side_packet("pico_i2c", |_pkt: &Packet| Ok(()));
+            router.rx_from_side(&topology_packet, ingress).unwrap();
+            router.process_all_queues().unwrap();
+
+            for sender in ["AB", "DAQ", "VB"] {
+                let address = crate::packet::sender_address_u32(sender);
+                let resolved = router
+                    .resolve_address(address)
+                    .unwrap_or_else(|| panic!("missing compact identity for {sender}"));
+                assert_eq!(resolved.hostname.as_ref(), sender);
+            }
+        }
+
+        #[test]
         fn discovery_master_election_uses_deterministic_tiebreaks_and_fails_over() {
             let symmetric_ring = vec![
                 TopologyBoardNode {

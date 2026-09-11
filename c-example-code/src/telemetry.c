@@ -152,7 +152,7 @@ SedsResult init_telemetry_router(void) {
       {.endpoint = radio_endpoint.id, .packet_handler = on_radio_packet, .user = NULL},
   };
 
-  SedsRouter *r = seds_router_new(Seds_RM_Sink, host_now_ms, NULL, locals,
+  SedsRouter *r = seds_router_new(host_now_ms, NULL, locals,
                                   sizeof(locals) / sizeof(locals[0]));
   if (!r) {
     printf("Error: failed to create router\n");

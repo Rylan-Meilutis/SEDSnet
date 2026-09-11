@@ -229,6 +229,37 @@ mod timesync_system_test {
     }
 
     #[test]
+    fn vehicle_priority_prefers_rf_then_groundstation_then_default_promotion() {
+        let mut tracker = TimeSyncTracker::new(TimeSyncConfig {
+            role: TimeSyncRole::Consumer,
+            priority: 100,
+            source_timeout_ms: 1_000,
+            consumer_promotion_enabled: true,
+            ..Default::default()
+        });
+
+        let groundstation = build_timesync_announce_with_sender("GS", 50, 1_000).unwrap();
+        let rf = build_timesync_announce_with_sender("RF", 1, 1_000).unwrap();
+        tracker.handle_announce(&groundstation, 1_000).unwrap();
+        tracker.handle_announce(&rf, 1_000).unwrap();
+        assert_eq!(tracker.current_source().unwrap().sender, "RF");
+
+        // RF expires while a refreshed GroundStation source remains live.
+        let groundstation_refresh = build_timesync_announce_with_sender("GS", 50, 1_750).unwrap();
+        tracker
+            .handle_announce(&groundstation_refresh, 1_750)
+            .unwrap();
+        tracker.refresh(2_100);
+        assert_eq!(tracker.current_source().unwrap().sender, "GS");
+
+        // With neither configured source present, the ordinary consumer
+        // promotion path remains available as the final fallback.
+        tracker.refresh(2_800);
+        assert!(tracker.current_source().is_none());
+        assert!(tracker.should_announce(2_800, true));
+    }
+
+    #[test]
     fn timesync_equal_priority_failover_uses_standby_without_reannounce() {
         let mut tracker = TimeSyncTracker::new(TimeSyncConfig {
             role: TimeSyncRole::Consumer,
