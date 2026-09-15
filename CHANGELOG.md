@@ -1,5 +1,30 @@
 # Changelog
 
+## 4.0.28
+
+- Split the monolithic unit-test source into per-suite modules under `src/tests/`,
+  preserving test names, feature gates, and shared helpers.
+
+- Preserve receive-side compact-header dictionaries across topology changes.
+  Refresh only transmit templates so in-flight compact ACKs remain decodable.
+- Avoid independent hop sequence queues for contracted ordered streams; their
+  final-destination ACKs provide retry and source-order control across bridges.
+
+- Gate ordered end-to-end streams at their originating router: a later message
+  of the same type waits for all contracted destinations to acknowledge its
+  predecessor. Shared CAN does not need hop-level ACKs for this mechanism.
+  Pending-window exhaustion returns an error instead of evicting a predecessor;
+  exhausted retries fail the waiting tail rather than delivering past a gap.
+- Forward end-to-end retries through Router intermediaries at a bounded rate;
+  duplicate suppression no longer strands a source after a lost final ACK.
+
+- Preserve compact endpoint and time-source reachability across routers and relays
+  when detailed topology is incomplete, without fabricating endpoint ownership.
+  Ingress split-horizon and route expiry remain enforced.
+- Strengthen ordered-delivery tests to check buffering before a missing packet
+  arrives and immediate in-order release afterward. Fix isolated unit-test schema
+  initialization so this test does not depend on other tests having run first.
+
 ## 4.0.27
 
 - Align C construction with the Rust and Python unified-router APIs by removing the obsolete

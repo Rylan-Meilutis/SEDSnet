@@ -123,6 +123,27 @@ partial-ACK packets that arrived after a gap, request the missing sequence, and 
 the gap is filled. A partial ACK suppresses timeout retransmission for that exact packet, but an explicit packet request
 can still retransmit it later.
 
+For discovery-contracted `ReliableMode::Ordered` traffic, the originating Router
+also gates transmission by **end-to-end** acknowledgements. Only one message of
+each ordered data type is in flight from that router; later messages of that
+type wait until all contracted recipients acknowledge the predecessor. This
+works across shared CAN with hop reliability disabled and across Router/Relay
+bridges, without changing the wire format or the Rust/C/Python API. Unordered
+types and other data types are not held behind that stream. This is asynchronous
+stop-and-wait, so an ordered stream's throughput is limited by its slowest
+recipient's round-trip time; use unordered telemetry where transition order is
+not required.
+
+Waiting messages use the existing bounded end-to-end pending window. A full
+window returns an error instead of evicting unacknowledged data. Retry exhaustion
+fails the ordered stream's queued tail and returns an error from queue/periodic
+processing, rather than releasing later transitions past the unconfirmed gap.
+Topology disappearance is not treated as an ACK. Pending traffic is in RAM and
+does not survive source restart; this is not a durable transaction protocol or
+a guarantee of physical actuator completion. Applications must still report
+actual actuator state. All participating intermediaries need the retry-forwarding
+fix for recovery from a lost final ACK.
+
 Routers can also cache selected data types as managed network variables. A board that restarts can request the current
 cached value and receive it through the normal endpoint handler path instead of waiting for the next publisher update.
 Discovery advertises enabled variable types with split-horizon propagation, allowing multi-link routers to select the
@@ -389,7 +410,7 @@ cargo bench --bench packet_paths -- --profile-time=5
 `./build.py test` now starts with the same strict clippy checks as `./build.py check`, then runs:
 
 - `cargo nextest run --features timesync` when `cargo-nextest` is installed, otherwise
-  `cargo test --features timesync -- --test-threads=1`, covering the unit tests in `src/tests.rs`, the Rust system tests under
+  `cargo test --features timesync -- --test-threads=1`, covering the unit suites registered by `src/tests/mod.rs`, the Rust system tests under
   `tests/rust-system-test/`, and the C integration tests under `tests/c-system-test/`
 - `cargo test --doc --features timesync` when nextest is used, since nextest does not run doctests
 - a stable Criterion smoke pass for `packet_paths` and `router_system_paths`
@@ -478,7 +499,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.26
+    GIT_TAG v4.0.28
 )
 FetchContent_MakeAvailable(sedsnet)
 

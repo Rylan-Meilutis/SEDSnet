@@ -773,15 +773,174 @@ mod reliable_drop_tests {
         router
             .rx_packed_from_side(seq2.as_ref(), side)
             .expect("rx seq2 failed");
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "ordered status must be held until the missing earlier packet arrives"
+        );
         router
             .rx_packed_from_side(seq1.as_ref(), side)
             .expect("rx seq1 failed");
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![1, 2],
+            "arrival of the missing packet must immediately release both in order"
+        );
         router
             .rx_packed_from_side(seq2.as_ref(), side)
             .expect("rx seq2 retransmit failed");
 
         let got = received.lock().expect("received lock poisoned").clone();
         assert_eq!(got, vec![1, 2], "ordered reliable delivery must reorder");
+    }
+
+    #[test]
+    fn ordered_end_to_end_waits_for_ack_across_unsequenced_gateway() {
+        ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = register_data_type_with_description(
+            "ORDERED_VALVE_REGRESSION",
+            "ordered valve transitions",
+            MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+            &[ep],
+            ReliableMode::Ordered,
+            200,
+        )
+        .unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let dest = Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, move |pkt| {
+                if pkt.data_type() == ty {
+                    sink.lock().unwrap().push(pkt.payload()[0]);
+                }
+                Ok(())
+            })])
+            .with_sender("DEST"),
+            shared_clock(now.clone()),
+        );
+        let source = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("SOURCE"),
+            shared_clock(now.clone()),
+        );
+        let gateway = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GATEWAY"),
+            shared_clock(now.clone()),
+        );
+        let up = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let down = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let back = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let ack = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let opts = RouterSideOptions {
+            reliable_enabled: false,
+            link_local_enabled: false,
+            ..Default::default()
+        };
+        let q = up.clone();
+        let ss = source.add_side_packed_with_options(
+            "can",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts,
+        );
+        let q = back.clone();
+        let gs = gateway.add_side_packed_with_options(
+            "can",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts,
+        );
+        let q = down.clone();
+        let gd = gateway.add_side_packed_with_options(
+            "uart",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts,
+        );
+        let q = ack.clone();
+        let ds = dest.add_side_packed_with_options(
+            "uart",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts,
+        );
+        let announce = build_discovery_announce("DEST", 0, &[ep]).unwrap();
+        source.rx_from_side(&announce, ss).unwrap();
+        gateway.rx_from_side(&announce, gd).unwrap();
+        for q in [&up, &down, &back, &ack] {
+            drain_queue(q);
+        }
+        for (index, value) in [1u8, 0, 1].into_iter().enumerate() {
+            source
+                .tx(Packet::new(
+                    ty,
+                    &[ep],
+                    "SOURCE",
+                    index as u64 + 1,
+                    Arc::<[u8]>::from([value]),
+                )
+                .unwrap())
+                .unwrap();
+        }
+        let initial = drain_queue(&up);
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|b| wire_format::peek_envelope(b).unwrap().ty == ty)
+                .count(),
+            1,
+            "later ordered transitions must not leave the source before the first final ACK"
+        );
+        for b in initial {
+            gateway.rx_packed_from_side(&b, gs).unwrap();
+        }
+        let mut dropped_ack = false;
+        let mut wire_transitions = Vec::new();
+        for _ in 0..40 {
+            source.process_all_queues().unwrap();
+            gateway.process_all_queues().unwrap();
+            dest.process_all_queues().unwrap();
+            for b in drain_queue(&up) {
+                gateway.rx_packed_from_side(&b, gs).unwrap();
+            }
+            for b in drain_queue(&down) {
+                if wire_format::peek_envelope(&b).unwrap().ty == ty {
+                    wire_transitions.push(wire_format::unpack_packet(&b).unwrap().payload()[0]);
+                }
+                dest.rx_packed_from_side(&b, ds).unwrap();
+            }
+            for b in drain_queue(&ack) {
+                if wire_format::peek_envelope(&b).unwrap().ty == DataType::ReliableAck
+                    && !dropped_ack
+                {
+                    dropped_ack = true;
+                    assert_eq!(*received.lock().unwrap(), vec![1]);
+                    continue;
+                }
+                gateway.rx_packed_from_side(&b, gd).unwrap();
+            }
+            for b in drain_queue(&back) {
+                source.rx_packed_from_side(&b, ss).unwrap();
+            }
+            now.fetch_add(RELIABLE_RETRANSMIT_MS, Ordering::SeqCst);
+            if received.lock().unwrap().len() == 3 {
+                break;
+            }
+        }
+        assert!(dropped_ack);
+        assert_eq!(*received.lock().unwrap(), vec![1, 0, 1]);
+        assert!(
+            wire_transitions.starts_with(&[1, 1]),
+            "lost ACK must retransmit the predecessor, not advance to close"
+        );
     }
 
     #[test]
@@ -2648,6 +2807,7 @@ mod reliable_drop_tests {
 
     #[derive(Debug)]
     struct SoakLinkPolicy {
+        inject_loss: bool,
         rng: u64,
         down_until_tick: [usize; 14],
         delivered: usize,
@@ -2659,6 +2819,7 @@ mod reliable_drop_tests {
     impl SoakLinkPolicy {
         fn new() -> Self {
             Self {
+                inject_loss: true,
                 rng: 0x5ED5_2026_CAFE_BABE,
                 down_until_tick: [0; 14],
                 delivered: 0,
@@ -2713,6 +2874,9 @@ mod reliable_drop_tests {
         }
 
         fn should_drop(&mut self, link: usize, frame: &[u8]) -> bool {
+            if !self.inject_loss {
+                return false;
+            }
             let divisor = match link {
                 2 | 3 => 5,
                 8..=13 => 11,
@@ -2763,12 +2927,19 @@ mod reliable_drop_tests {
         }
     }
 
+    static SOAK_ORDERED_FAILURES: AtomicU64 = AtomicU64::new(0);
+
     fn tolerate_soak_backpressure(result: TelemetryResult<()>) {
         match result {
             Ok(()) => {}
             Err(sedsnet::TelemetryError::PacketTooLarge(msg))
                 if msg.contains("reliable history full") => {}
             Err(sedsnet::TelemetryError::HandlerError(msg)) if msg.contains("ingress disabled") => {
+            }
+            Err(sedsnet::TelemetryError::HandlerError(
+                "ordered end-to-end delivery exhausted retries",
+            )) => {
+                SOAK_ORDERED_FAILURES.fetch_add(1, Ordering::SeqCst);
             }
             Err(err) => panic!("unexpected soak processing error: {err:?}"),
         }
@@ -2872,6 +3043,12 @@ mod reliable_drop_tests {
         });
     }
 
+    #[test]
+    fn compact_ordered_end_to_end_stream_delivers_all_messages() {
+        ensure_common_test_schema();
+        exercise_compact_side_transport_in_soak(Arc::new(AtomicU64::new(0)));
+    }
+
     fn exercise_compact_side_transport_in_soak(now: Arc<AtomicU64>) {
         let received: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let received_c = received.clone();
@@ -2935,11 +3112,17 @@ mod reliable_drop_tests {
         sender.set_route_priority(None, tx_side, 1).unwrap();
 
         for seq in 0..12u32 {
-            let pkt = Packet::from_f32_slice(
+            let pkt = Packet::new(
                 DataType::named("GPS_DATA"),
-                &[seq as f32, 1.0, 2.0],
                 &[DataEndpoint::named("RADIO")],
+                "COMPACT_TX",
                 77_000,
+                Arc::<[u8]>::from(
+                    [seq as f32, 1.0, 2.0]
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
             )
             .unwrap()
             .with_nonce(seq as u16 + 1);
@@ -2955,13 +3138,35 @@ mod reliable_drop_tests {
             sender.process_all_queues_with_timeout(0).unwrap();
         }
 
+        // ACK-gated sending may release the next queued message at the end of
+        // a pump round; drain both directions after the final producer call.
+        for _ in 0..100 {
+            sender.process_all_queues_with_timeout(0).unwrap();
+            for frame in drain_queue(&link) {
+                receiver.rx_packed_queue_from_side(&frame, rx_side).unwrap();
+            }
+            receiver.process_all_queues_with_timeout(0).unwrap();
+            for frame in drain_queue(&ack_link) {
+                sender.rx_packed_queue_from_side(&frame, tx_side).unwrap();
+            }
+            if received.lock().unwrap().len() == 12 {
+                break;
+            }
+        }
         let stats = sender.export_runtime_stats();
         let side = stats
             .sides
             .iter()
             .find(|side| side.side_name == "compact-can-fd")
             .expect("missing compact side stats");
-        assert!(side.side_transport_compact_frames >= 8);
+        assert!(
+            side.side_transport_compact_frames >= 8,
+            "compact={}, omitted={}, full={}, received={}",
+            side.side_transport_compact_frames,
+            side.side_transport_compact_omitted_timestamp_frames,
+            side.side_transport_full_frames,
+            received.lock().unwrap().len()
+        );
         assert!(side.side_transport_compact_omitted_timestamp_frames >= 8);
         assert!(side.side_transport_chunk_frames > 0);
         assert_eq!(received.lock().unwrap().len(), 12);
@@ -3387,6 +3592,46 @@ mod reliable_drop_tests {
             topology.advance(RELIABLE_RETRANSMIT_MS);
         }
 
+        // After the lossy/disconnected run, prove a fresh command still reaches
+        // its destination. Merely observing any traffic earlier is insufficient.
+        policy.inject_loss = false;
+        policy.down_until_tick.fill(0);
+        let recovery_marker = 65_000u32;
+        topology
+            .gs
+            .tx(Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[recovery_marker as f32, 0.25, 0.5],
+                &[DataEndpoint::named("RADIO")],
+                topology.now.load(Ordering::SeqCst),
+            )
+            .unwrap()
+            .with_nonce(65_000))
+            .unwrap();
+        for recovery_tick in 0..400 {
+            pump_soak_topology(&topology, tick_count + 800 + recovery_tick, &mut policy);
+            topology.advance(RELIABLE_RETRANSMIT_MS);
+            if topology
+                .actuator_hits
+                .lock()
+                .unwrap()
+                .contains(&recovery_marker)
+            {
+                break;
+            }
+        }
+        assert!(
+            topology
+                .actuator_hits
+                .lock()
+                .unwrap()
+                .contains(&recovery_marker),
+            "fresh command must arrive after restoring links"
+        );
+        eprintln!(
+            "fault-injection ordered delivery failures: {}; post-recovery delivery: PASS",
+            SOAK_ORDERED_FAILURES.load(Ordering::SeqCst)
+        );
         let actuator_hits = topology.actuator_hits.lock().unwrap().clone();
         assert!(
             !actuator_hits.is_empty(),

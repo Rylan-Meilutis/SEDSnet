@@ -1,3 +1,80 @@
+#[cfg(all(test, feature = "discovery"))]
+mod compact_summary_tests {
+    use super::*;
+
+    #[test]
+    fn relay_preserves_compact_routes_without_inventing_endpoint_ownership() {
+        crate::tests::ensure_common_test_schema();
+        let endpoint = crate::DataEndpoint::named("RADIO");
+        let relay = Relay::new(Box::new(|| 0));
+        let mut sender = DiscoverySenderState {
+            advertised_reachable: vec![endpoint],
+            advertised_reachable_timesync_sources: vec!["clock-behind-bridge".into()],
+            topology_boards: vec![TopologyBoardNode {
+                sender_id: "bridge".into(),
+                reachable_endpoints: vec![],
+                reachable_timesync_sources: vec![],
+                connections: vec![],
+            }],
+            ..Default::default()
+        };
+        Relay::refresh_sender_topology_state(&mut sender);
+        let mut route = DiscoverySideState::default();
+        route.announcers.insert("bridge".into(), sender);
+        Relay::recompute_discovery_side_state(&mut route);
+        let mut state = relay.state.lock();
+        state.discovery_routes.insert(0, route);
+        assert!(
+            relay
+                .advertised_discovery_endpoints_for_link_locked(&state, 0, true, Some(1))
+                .contains(&endpoint)
+        );
+        assert!(
+            !relay
+                .advertised_discovery_endpoints_for_link_locked(&state, 0, true, Some(0))
+                .contains(&endpoint)
+        );
+        assert!(
+            !relay
+                .advertised_discovery_endpoints_for_link_locked(
+                    &state,
+                    DISCOVERY_ROUTE_TTL_MS + 1,
+                    true,
+                    Some(1)
+                )
+                .contains(&endpoint)
+        );
+        assert_eq!(
+            relay.advertised_discovery_timesync_sources_for_link_locked(&state, 0, Some(1)),
+            vec!["clock-behind-bridge".to_string()]
+        );
+        assert!(
+            relay
+                .advertised_discovery_timesync_sources_for_link_locked(&state, 0, Some(0))
+                .is_empty()
+        );
+        assert!(
+            relay
+                .advertised_discovery_timesync_sources_for_link_locked(
+                    &state,
+                    DISCOVERY_ROUTE_TTL_MS + 1,
+                    Some(1)
+                )
+                .is_empty()
+        );
+        let topology =
+            relay.advertised_discovery_topology_for_link_locked(&state, 0, true, Some(1));
+        assert!(
+            topology
+                .iter()
+                .find(|node| node.sender_id == "bridge")
+                .unwrap()
+                .reachable_endpoints
+                .is_empty()
+        );
+    }
+}
+
 use crate::config::{
     RuntimeMemoryConfig, runtime_reliable_max_end_to_end_ack_cache,
     runtime_reliable_max_end_to_end_pending, runtime_reliable_max_pending,
@@ -318,6 +395,7 @@ struct ReliableRxState {
 #[derive(Debug, Clone)]
 struct ReliableReturnRouteState {
     side: RelaySideId,
+    last_replay_ms: u64,
 }
 
 #[cfg(feature = "discovery")]
@@ -395,14 +473,13 @@ struct SideTransportState {
 }
 
 impl SideTransportState {
-    fn clear_header_templates(&mut self) {
+    fn refresh_transmit_header_templates(&mut self) {
         self.tx_template_ids.clear();
         self.tx_templates.clear();
         self.tx_last_timestamps.clear();
         self.tx_compact_uses.clear();
-        self.rx_templates.clear();
-        self.rx_templates_by_id.clear();
-        self.rx_last_timestamps.clear();
+        // Local topology changes do not invalidate dictionaries received from
+        // peers. Dropping RX state here loses already-in-flight compact ACKs.
     }
 
     fn tx_template_count(&self) -> usize {
@@ -1852,7 +1929,12 @@ impl Relay {
         let mut st = self.state.lock();
         Self::remember_reliable_return_route_locked(&mut st, packet_id);
         st.reliable_return_routes
-            .insert(packet_id, ReliableReturnRouteState { side });
+            .entry(packet_id)
+            .and_modify(|route| route.side = side)
+            .or_insert(ReliableReturnRouteState {
+                side,
+                last_replay_ms: self.clock.now_ms(),
+            });
     }
 
     /// Refresh or insert `packet_id` in the bounded reliable return-route cache.
@@ -2120,11 +2202,18 @@ impl Relay {
     }
 
     fn send_reliable_to_side(&self, side: RelaySideId, data: RelayItem) -> TelemetryResult<()> {
+        let ty = match &data {
+            RelayItem::Packet(pkt) => pkt.data_type(),
+            RelayItem::Packed(bytes) => wire_format::peek_envelope(bytes)?.ty,
+        };
+        let end_to_end_ordered = !self.item_target_senders(&data)?.is_empty()
+            && matches!(reliable_mode(ty), crate::ReliableMode::Ordered);
         let (handler, opts, hop_reliable_enabled) = {
             let st = self.state.lock();
             let side_ref = Self::side_ref(&st, side)?;
             let opts = side_ref.opts;
             let hop_reliable_enabled = opts.reliable_enabled
+                && !end_to_end_ordered
                 && !self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms());
             (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
         };
@@ -2833,7 +2922,7 @@ impl Relay {
                 .incremental_retries_remaining = DISCOVERY_INCREMENTAL_RETRY_COUNT;
         }
         for transport in st.side_transport.values_mut() {
-            transport.clear_header_templates();
+            transport.refresh_transmit_header_templates();
         }
     }
 
@@ -2876,7 +2965,7 @@ impl Relay {
         link_local_enabled: bool,
         exclude_side: Option<RelaySideId>,
     ) -> Vec<crate::DataEndpoint> {
-        let (reachable_endpoints, _) = discovery::summarize_topology_boards(
+        let (mut reachable_endpoints, _) = discovery::summarize_topology_boards(
             &self.advertised_discovery_topology_for_link_locked(
                 st,
                 now_ms,
@@ -2884,6 +2973,22 @@ impl Relay {
                 exclude_side,
             ),
         );
+        // Compact advertisements can know routes before detailed topology arrives.
+        // Preserve that reachability without assigning downstream endpoints to the bridge.
+        for (&side, route) in &st.discovery_routes {
+            if exclude_side == Some(side)
+                || now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
+            {
+                continue;
+            }
+            for sender in route.announcers.values() {
+                if now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS {
+                    reachable_endpoints.extend(sender.advertised_reachable.iter().copied());
+                }
+            }
+        }
+        reachable_endpoints.sort_unstable();
+        reachable_endpoints.dedup();
         reachable_endpoints
             .into_iter()
             .filter(|ep| {
@@ -2900,9 +3005,23 @@ impl Relay {
         now_ms: u64,
         exclude_side: Option<RelaySideId>,
     ) -> Vec<String> {
-        let (_, sources) = discovery::summarize_topology_boards(
+        let (_, mut sources) = discovery::summarize_topology_boards(
             &self.advertised_discovery_topology_for_link_locked(st, now_ms, true, exclude_side),
         );
+        for (&side, route) in &st.discovery_routes {
+            if exclude_side == Some(side)
+                || now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
+            {
+                continue;
+            }
+            for sender in route.announcers.values() {
+                if now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS {
+                    sources.extend(sender.advertised_reachable_timesync_sources.iter().cloned());
+                }
+            }
+        }
+        sources.sort_unstable();
+        sources.dedup();
         sources
     }
 
@@ -3632,6 +3751,22 @@ impl Relay {
             )
         {
             return Ok(false);
+        }
+
+        if !self.item_target_senders(&item.data)?.is_empty() {
+            let id = match &item.data {
+                RelayItem::Packet(pkt) => pkt.packet_id(),
+                RelayItem::Packed(bytes) => wire_format::packet_id_from_wire(bytes)?,
+            };
+            let mut st = self.state.lock();
+            return Ok(st.reliable_return_routes.get_mut(&id).is_some_and(|route| {
+                let now = self.clock.now_ms();
+                if now.saturating_sub(route.last_replay_ms) < runtime_reliable_retransmit_ms() {
+                    return false;
+                }
+                route.last_replay_ms = now;
+                true
+            }));
         }
 
         let RemoteSidePlan::Target(sides) = self.remote_side_plan(&item.data, item.src)?;

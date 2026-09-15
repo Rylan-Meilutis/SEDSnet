@@ -88,7 +88,7 @@ It covers four layers:
 
 - Static analysis: strict `cargo clippy -D warnings` for default, `python`, and embedded variants.
 - Rust unit and integration tests: `cargo nextest run --features timesync` when available, otherwise
-  `cargo test --features timesync`, including `src/tests.rs`, Rust system tests in `tests/rust-system-test/`,
+  `cargo test --features timesync`, including the suites in `src/tests/`, Rust system tests in `tests/rust-system-test/`,
   and the Rust harness that configures and runs the C system tests in `tests/c-system-test/c_system_test.rs`.
 - Benchmark smoke: run Criterion benchmarks into a dedicated `sedsnet_smoke` baseline, with plot generation
   disabled, longer timing than the old fast path, and a wider smoke-test noise threshold so validation exercises
@@ -110,7 +110,7 @@ regressions:
 - end-to-end reliable verification and directed ACK return-path routing
 - time-sync election, failover, and multi-node convergence
 
-`src/tests.rs` also includes a combined multi-node memory exhaustion regression. It constructs
+`src/tests/router_tests/discovery_tests.rs` also includes a combined multi-node memory exhaustion regression. It constructs
 multiple routers with small `RuntimeMemoryConfig` pools, injects large discovery topology updates,
 queues telemetry RX/TX work, and asserts each router's exported memory layout remains within its
 configured shared queue budget throughout the pressure run.

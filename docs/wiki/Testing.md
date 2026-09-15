@@ -28,7 +28,19 @@ The repo intentionally uses several layers instead of relying on one giant end-t
 
 ### Unit tests
 
-The unit tests live primarily in `src/tests.rs`.
+The unit-test entry point is `src/tests/mod.rs`. It keeps shared helpers and declares
+the per-suite modules in `src/tests/`: reliability, relays, dedupe, concurrency,
+timeouts, packet conversion, compression memory, and P2P addressing. Router suites
+are further separated under `src/tests/router_tests/` into discovery, schema sync,
+and timesync. Existing Rust module paths and test filters are preserved.
+
+The mixed-link reliability regressions in
+`tests/rust-system-test/reliable_drop_test.rs` cover ACK-gated ordered transitions,
+lost final ACKs through unsequenced Gateway links, compact ACK dictionaries during
+topology changes, and fresh-command delivery after the churn soak restores links.
+Fault-injected retry exhaustion is counted and reported; it is not treated as a
+successful delivery. Window limits and failure of the waiting ordered tail also
+have dedicated unit coverage.
 
 They cover:
 
