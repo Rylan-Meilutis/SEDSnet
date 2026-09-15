@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.0.29
+
+- Preserve the original publisher identity separately from the acknowledging owner
+  in end-to-end ACKs. After bounded return-route cache eviction, routers can use
+  discovery to return ACKs to the publisher rather than the acknowledging owner.
+- Resolve compact firmware sender addresses through retained discovery identities
+  when constructing ACKs. Add named and compact-source cache-pressure regressions.
+- Keep ordered delivery and bounded caches intact; ACK recovery does not flood
+  unrelated links. Legacy ACKs continue to use learned packet return routes.
+
+
 ## 4.0.28
 
 - Split the monolithic unit-test source into per-suite modules under `src/tests/`,

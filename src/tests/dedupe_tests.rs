@@ -1,4 +1,3 @@
-
 //! Tests specifically for RX/relay deduplication behavior.
 
 use crate::config::{DataEndpoint, DataType};
@@ -819,6 +818,8 @@ fn packed_side_template_dictionary_is_bounded() {
 #[test]
 fn bounded_side_template_dictionaries_remain_synchronized() {
     crate::tests::ensure_common_test_schema();
+    // Compare one-way template evictions only; generated ACKs use their own
+    // templates and legitimately add to the receiver side eviction counter.
     let delivered = Arc::new(AtomicUsize::new(0));
     let delivered_c = delivered.clone();
     let receiver = Arc::new(Router::new_with_clock(
@@ -828,7 +829,8 @@ fn bounded_side_template_dictionaries_remain_synchronized() {
                 delivered_c.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
-        )]),
+        )])
+        .with_reliable_enabled(false),
         zero_clock(),
     ));
     let receiver_side_id = Arc::new(Mutex::new(None));

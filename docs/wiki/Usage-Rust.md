@@ -404,6 +404,10 @@ The end-to-end path works like this:
   acknowledgement tagged with its identity
 - routers and relays learn the return path from the reliable packet’s ingress side and route that
   acknowledgement only where it needs to go
+- ACKs retain the acknowledging owner and the original publisher separately. If a bounded
+  packet return-route entry is evicted, discovery routes the ACK toward the publisher, not
+  back toward the acknowledging owner. Compact source addresses are resolved through the
+  retained discovery identities. This fallback does not broadcast ACKs.
 - the source keeps the packet in flight until all currently discovered holders have acknowledged
 - if one end-to-end acknowledgement is lost, the source retransmits only toward the holders that
   are still outstanding until they respond or the retry limit is reached

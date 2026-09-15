@@ -9,6 +9,10 @@
 //! - De-duplication remains packet-id based and side-agnostic.
 
 #[cfg(all(test, feature = "discovery"))]
+#[path = "tests/ack_return_identity.rs"]
+mod ack_return_identity;
+
+#[cfg(all(test, feature = "discovery"))]
 mod compact_summary_tests {
     use super::*;
 
@@ -4340,12 +4344,17 @@ impl Router {
         pkt: &Packet,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
-        self.queue_end_to_end_reliable_ack_for_packet_id(pkt.packet_id(), called_from_queue)
+        self.queue_end_to_end_reliable_ack_for_packet_id(
+            pkt.packet_id(),
+            pkt.sender(),
+            called_from_queue,
+        )
     }
 
     fn queue_end_to_end_reliable_ack_for_packet_id(
         &self,
         packet_id: u64,
+        original_sender: &str,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
         if !self.cfg.reliable_enabled() {
@@ -4360,9 +4369,19 @@ impl Router {
             Self::encode_end_to_end_reliable_ack(packet_id),
         )?;
         let local_sender = self.sender_arc();
+        // Keep the acknowledging owner first for compatibility. The second
+        // identity is the original publisher: it lets a busy relay recover the
+        // ACK route from discovery after its bounded packet-id cache expires.
+        let original_sender = {
+            let st = self.state.lock();
+            Self::canonical_sender_locked(&st, original_sender)
+        };
         let ack = self.attach_wire_contract_to_item(
             RouterItem::Packet(ack),
-            &[Self::sender_hash(local_sender.as_ref())],
+            &[
+                Self::sender_hash(local_sender.as_ref()),
+                Self::sender_hash(&original_sender),
+            ],
         )?;
         self.emit_internal_tx(RouterTxItem::Broadcast(ack), true, called_from_queue)
     }
@@ -4869,12 +4888,16 @@ impl Router {
             let target_senders = self.item_target_senders(data)?;
             let resolve_beyond_local_hop =
                 self.item_targets_router_as_intermediate_hop(data, &eps)?;
-            let routing_target_senders: &[u64] = if resolve_beyond_local_hop {
+            let preferred_packet_id = Self::reliable_control_target_packet_id(data)?;
+            let routing_target_senders: &[u64] = if preferred_packet_id.is_some() {
+                // ACK target[0] identifies the acknowledging owner, not the
+                // destination. Never route an ACK back toward that owner.
+                target_senders.get(1..).unwrap_or(&[])
+            } else if resolve_beyond_local_hop {
                 &[]
             } else {
                 target_senders.as_ref()
             };
-            let preferred_packet_id = Self::reliable_control_target_packet_id(data)?;
             if discovery::is_discovery_type(ty) {
                 let mut st = self.state.lock();
                 let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
@@ -11061,6 +11084,7 @@ impl Router {
                                 .unwrap_or_else(|_| pkt.packet_id());
                             self.queue_end_to_end_reliable_ack_for_packet_id(
                                 packet_id,
+                                pkt.sender(),
                                 called_from_queue,
                             )?;
                         }
@@ -11269,6 +11293,7 @@ impl Router {
                                 .unwrap_or_else(|_| pkt.packet_id());
                             self.queue_end_to_end_reliable_ack_for_packet_id(
                                 packet_id,
+                                pkt.sender(),
                                 called_from_queue,
                             )?;
                         }
@@ -11384,7 +11409,11 @@ impl Router {
                                 .map(Packet::packet_id)
                                 .ok_or(TelemetryError::Unpack("missing packet id"))
                         })?;
-                    self.queue_end_to_end_reliable_ack_for_packet_id(packet_id, called_from_queue)?;
+                    self.queue_end_to_end_reliable_ack_for_packet_id(
+                        packet_id,
+                        &env.sender,
+                        called_from_queue,
+                    )?;
                 }
 
                 if has_remote {

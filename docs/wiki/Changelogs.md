@@ -1,5 +1,13 @@
 # Changelogs
 
+## Version 4.0.29 highlights
+
+- End-to-end ACKs retain both the acknowledging owner and original publisher.
+- Selective discovery routing recovers ACK delivery after packet return-cache
+  eviction, including compact firmware source addresses.
+- Regression tests cover bounded-cache pressure without weakening ordered delivery.
+
+
 ## Version 4.0.26 highlights
 
 - Embedded routers preflight runtime-schema advertisements without allocating an owned decoded
