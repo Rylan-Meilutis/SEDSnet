@@ -52,8 +52,10 @@ link of a topology/schema request. The next application header is complete.
 Receive dictionaries and learned routes stay intact, and other links retain
 compression. This does not flood application traffic or reset discovery.
 The focused router regression fails before the fix; router and relay tests
-cover both request types and dictionary isolation. Full-system qualification
-with the new fix is pending; v4.0.30 does not contain this restart recovery.
+cover both request types and dictionary isolation. The matching candidate passed
+the 16-second gate, 120-second restart regression and 600-second seven-board soak
+on Jupiter. v4.0.30 does not contain this restart recovery; v4.0.31 does.
+Hardware qualification remains separate.
 
 Reliability-control frames (ACK, partial ACK, and retransmission request) also
 carry complete headers in v4.0.31. These controls must remain
