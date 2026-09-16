@@ -5,7 +5,8 @@ managed state sync, P2P service ports/streams, optional E2E payload cryptography
 bindings for distributed embedded and host systems.
 
 Current stable release: **4.0.32** on crates.io and PyPI. Embedded CMake
-consumers can use `v4.0.32` for reproducible builds or `main` for rolling firmware updates; Rust and Python consumers should use the
+consumers use the `v4.0.32` Git tag for reproducible builds, or `main` for rolling
+firmware updates. Rust and Python consumers should use the
 registry release.
 
 Crate API docs are published on [docs.rs](https://docs.rs/SEDSnet). The implementation-level wiki,
