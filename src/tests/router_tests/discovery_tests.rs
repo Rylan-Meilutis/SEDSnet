@@ -1,4 +1,3 @@
-
 use std::sync::Once;
 
 use crate::config::{
@@ -425,6 +424,70 @@ fn missing_preferred_discovery_master_falls_back_to_normal_election() {
 }
 
 #[test]
+fn topology_recovery_request_is_answered_on_ingress_without_master_identity() {
+    ensure_topology_test_schema();
+    let returned = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let unrelated = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let gateway = Router::new_with_clock(
+        RouterConfig::default()
+            .with_sender("GB")
+            .with_preferred_discovery_master("GS"),
+        zero_clock(),
+    );
+    let out = returned.clone();
+    let host = gateway.add_side_packet("pico", move |p| {
+        out.lock().unwrap().push(p.clone());
+        Ok(())
+    });
+    let out = unrelated.clone();
+    let can = gateway.add_side_packet("can", move |p| {
+        out.lock().unwrap().push(p.clone());
+        Ok(())
+    });
+    let topology = build_discovery_topology(
+        "VB",
+        0,
+        &[TopologyBoardNode {
+            sender_id: "VB".into(),
+            reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+            reachable_timesync_sources: vec![],
+            connections: vec!["GS".into()],
+        }],
+    )
+    .unwrap();
+    gateway.rx_from_side(&topology, can).unwrap();
+    gateway.announce_discovery().unwrap();
+    gateway.process_all_queues().unwrap();
+    returned.lock().unwrap().clear();
+    unrelated.lock().unwrap().clear();
+
+    // The incumbent master is known, but this recovering neighbor's identity
+    // advertisement was lost. A request cannot depend on already knowing it.
+    let request = crate::discovery::build_discovery_topology_request("@addr:1234567", 1).unwrap();
+    gateway.rx_from_side(&request, host).unwrap();
+    gateway.process_all_queues().unwrap();
+    let packets = returned.lock().unwrap();
+    let response = packets
+        .iter()
+        .find(|p| p.data_type() == DataType::DiscoveryTopology)
+        .expect("adjacent router must answer recovery even when it is not master");
+    let update = crate::discovery::decode_discovery_topology_update(response).unwrap();
+    assert!(
+        !update.incremental,
+        "a restarted receiver needs the full baseline"
+    );
+    assert!(update.boards.iter().any(|b| b.sender_id == "VB"));
+    assert!(
+        !unrelated
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.data_type() == DataType::DiscoveryTopology),
+        "recovery response must not flood the CAN side"
+    );
+}
+
+#[test]
 fn compact_sender_resolves_from_bridge_connection_only_topology() {
     let topology_packet = build_discovery_topology(
         "GB",
@@ -450,6 +513,220 @@ fn compact_sender_resolves_from_bridge_connection_only_topology() {
             .unwrap_or_else(|| panic!("missing compact identity for {sender}"));
         assert_eq!(resolved.hostname.as_ref(), sender);
     }
+}
+
+#[test]
+fn missing_topology_baseline_retries_bounded_recovery_until_full_snapshot_arrives() {
+    ensure_topology_test_schema();
+    let sent = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let out = sent.clone();
+    let source = Router::new_with_clock(RouterConfig::default().with_sender("GB"), zero_clock());
+    source.add_side_packet("pico", move |p| {
+        out.lock().unwrap().push(p.clone());
+        Ok(())
+    });
+    let can = source.add_side_packet("can", |_| Ok(()));
+    source
+        .rx_from_side(
+            &build_discovery_topology(
+                "VB",
+                0,
+                &[TopologyBoardNode {
+                    sender_id: "VB".into(),
+                    reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                    reachable_timesync_sources: vec![],
+                    connections: vec!["AB".into(), "DAQ".into()],
+                }],
+            )
+            .unwrap(),
+            can,
+        )
+        .unwrap();
+    source.announce_discovery().unwrap();
+    source.process_all_queues().unwrap();
+    let packets = sent.lock().unwrap();
+    let address = packets
+        .iter()
+        .find(|p| p.data_type() == DataType::DiscoveryAddress)
+        .unwrap()
+        .clone();
+    let full = packets
+        .iter()
+        .find(|p| p.data_type() == DataType::DiscoveryTopology)
+        .unwrap()
+        .clone();
+    drop(packets);
+
+    let now_ms = Arc::new(AtomicU64::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let relay_requests = Arc::new(AtomicUsize::new(0));
+    let receiver = Router::new_with_clock(
+        RouterConfig::default().with_sender("GS"),
+        Box::new(SharedClock {
+            now_ms: now_ms.clone(),
+        }),
+    );
+    let relay = Relay::new(Box::new(SharedClock {
+        now_ms: now_ms.clone(),
+    }));
+    let out = requests.clone();
+    let side = receiver.add_side_packet("pico", move |p| {
+        if p.data_type() == DataType::DiscoveryTopologyRequest {
+            out.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let out = relay_requests.clone();
+    let relay_side = relay.add_side_packet("pico", move |p| {
+        if p.data_type() == DataType::DiscoveryTopologyRequest {
+            out.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    // Drop the initial full topology but deliver the aggregate address. The
+    // bridge is alive; its downstream identities are not yet a valid baseline.
+    receiver.rx_from_side(&address, side).unwrap();
+    relay.rx_from_side(relay_side, address).unwrap();
+    relay.process_all_queues().unwrap();
+    receiver.poll_discovery().unwrap();
+    relay.poll_discovery().unwrap();
+    for expected in [1, 2] {
+        now_ms.store(1_000 + (expected as u64 - 1) * 5_000, Ordering::SeqCst);
+        receiver.poll_discovery().unwrap();
+        relay.poll_discovery().unwrap();
+        receiver.process_all_queues().unwrap();
+        relay.process_all_queues().unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            expected,
+            "router must repair missing baseline"
+        );
+        assert_eq!(
+            relay_requests.load(Ordering::SeqCst),
+            expected,
+            "relay must repair missing baseline"
+        );
+        for _ in 0..10 {
+            receiver.poll_discovery().unwrap();
+            relay.poll_discovery().unwrap();
+            receiver.process_all_queues().unwrap();
+            relay.process_all_queues().unwrap();
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            expected,
+            "polling must not flood requests"
+        );
+        assert_eq!(relay_requests.load(Ordering::SeqCst), expected);
+    }
+    receiver.rx_from_side(&full, side).unwrap();
+    relay.rx_from_side(relay_side, full).unwrap();
+    relay.process_all_queues().unwrap();
+    now_ms.store(11_000, Ordering::SeqCst);
+    receiver.poll_discovery().unwrap();
+    relay.poll_discovery().unwrap();
+    receiver.process_all_queues().unwrap();
+    relay.process_all_queues().unwrap();
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "recovery must stop after full snapshot"
+    );
+    assert_eq!(relay_requests.load(Ordering::SeqCst), 2);
+    for board in ["VB", "AB", "DAQ"] {
+        let address = crate::packet::sender_address_u32(board);
+        assert_eq!(
+            receiver.resolve_address(address).unwrap().hostname.as_ref(),
+            board,
+            "recovery must restore downstream packet attribution, not just bridge liveness"
+        );
+    }
+}
+
+#[test]
+fn relay_answers_recovery_request_with_full_ingress_snapshot() {
+    ensure_topology_test_schema();
+    let returned = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let unrelated = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let relay = Relay::new(zero_clock());
+    let out = returned.clone();
+    let host = relay.add_side_packet("pico", move |p| {
+        out.lock().unwrap().push(p.clone());
+        Ok(())
+    });
+    let out = unrelated.clone();
+    let can = relay.add_side_packet("can", move |p| {
+        out.lock().unwrap().push(p.clone());
+        Ok(())
+    });
+    relay
+        .rx_from_side(
+            can,
+            build_discovery_topology(
+                "VB",
+                0,
+                &[TopologyBoardNode {
+                    sender_id: "VB".into(),
+                    reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                    reachable_timesync_sources: vec![],
+                    connections: vec![],
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    relay.announce_discovery().unwrap();
+    // Drain both the queued ingress and its normal incremental announcements
+    // before observing traffic caused by the explicit recovery request.
+    for _ in 0..8 {
+        relay.process_all_queues().unwrap();
+    }
+    returned.lock().unwrap().clear();
+    unrelated.lock().unwrap().clear();
+    relay
+        .rx_from_side(
+            host,
+            crate::discovery::build_discovery_topology_request("GS", 1).unwrap(),
+        )
+        .unwrap();
+    relay.process_all_queues().unwrap();
+    let packets = returned.lock().unwrap();
+    let reply = packets
+        .iter()
+        .find(|p| p.data_type() == DataType::DiscoveryTopology)
+        .unwrap();
+    let update = crate::discovery::decode_discovery_topology_update(reply).unwrap();
+    assert!(!update.incremental);
+    assert!(update.boards.iter().any(|b| b.sender_id == "VB"));
+    assert!(
+        !unrelated
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.data_type() == DataType::DiscoveryTopology)
+    );
+}
+
+#[test]
+fn relay_discovery_keeps_downstream_nodes_behind_the_bridge() {
+    ensure_topology_test_schema();
+    let sent = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let out = sent.clone();
+    let relay = Relay::new(zero_clock());
+    relay.set_sender("GB");
+    relay.add_side_packet("pico", move |p| { out.lock().unwrap().push(p.clone()); Ok(()) });
+    let can = relay.add_side_packet("can", |_| Ok(()));
+    relay.rx_from_side(can, build_discovery_topology("VB", 0, &[TopologyBoardNode {
+        sender_id: "VB".into(), reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+        reachable_timesync_sources: vec![], connections: vec![],
+    }]).unwrap()).unwrap();
+    for _ in 0..8 { relay.process_all_queues().unwrap(); }
+    let packets = sent.lock().unwrap();
+    assert!(!packets.iter().any(|p| p.data_type() == DataType::DiscoveryTopology && p.sender() == "VB"),
+        "forwarding a downstream advertisement makes it falsely appear directly attached");
+    assert!(packets.iter().filter(|p| p.data_type() == DataType::DiscoveryTopology && p.sender() == "GB")
+        .any(|p| crate::discovery::decode_discovery_topology_update(p).unwrap().boards.iter().any(|b| b.sender_id == "VB")),
+        "the bridge must advertise its retained downstream topology instead");
 }
 
 #[test]
@@ -923,10 +1200,17 @@ fn minimal_discovery_ping_preserves_ownership_until_explicit_withdrawal() {
     let relay = Relay::new(zero_clock());
     let relay_side = relay.add_side_packet("gs", |_| Ok(()));
     for endpoints in [vec![endpoint], vec![]] {
-        let topology = build_discovery_topology("GS", 1, &[TopologyBoardNode {
-            sender_id: "GS".into(), reachable_endpoints: endpoints.clone(),
-            reachable_timesync_sources: vec![], connections: vec![],
-        }]).unwrap();
+        let topology = build_discovery_topology(
+            "GS",
+            1,
+            &[TopologyBoardNode {
+                sender_id: "GS".into(),
+                reachable_endpoints: endpoints.clone(),
+                reachable_timesync_sources: vec![],
+                connections: vec![],
+            }],
+        )
+        .unwrap();
         router.rx_from_side(&topology, side).unwrap();
         relay.rx_from_side(relay_side, topology).unwrap();
         let ping = build_discovery_announce("GS", 2, &[]).unwrap();
@@ -934,10 +1218,15 @@ fn minimal_discovery_ping_preserves_ownership_until_explicit_withdrawal() {
         relay.rx_from_side(relay_side, ping).unwrap();
         relay.process_all_queues().unwrap();
         for snapshot in [router.export_topology(), relay.export_topology()] {
-            let board = snapshot.routes[0].announcers[0].routers.iter()
-                .find(|board| board.sender_id == "GS").unwrap();
-            assert_eq!(board.reachable_endpoints, endpoints,
-                "empty keepalive must not erase ownership; explicit topology must still withdraw it");
+            let board = snapshot.routes[0].announcers[0]
+                .routers
+                .iter()
+                .find(|board| board.sender_id == "GS")
+                .unwrap();
+            assert_eq!(
+                board.reachable_endpoints, endpoints,
+                "empty keepalive must not erase ownership; explicit topology must still withdraw it"
+            );
         }
     }
 }

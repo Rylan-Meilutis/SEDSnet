@@ -446,6 +446,7 @@ struct DiscoverySenderState {
     reachable_timesync_sources: Vec<String>,
     advertised_reachable_timesync_sources: Vec<String>,
     topology_boards: Vec<TopologyBoardNode>,
+    has_full_topology: bool,
     last_seen_ms: u64,
 }
 
@@ -625,6 +626,7 @@ struct AdaptiveRouteStats {
 #[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default)]
 struct DiscoverySideThrottleState {
+    next_topology_request_ms: u64,
     next_ping_ms: u64,
     next_full_ms: u64,
     pending_incremental: bool,
@@ -2450,6 +2452,18 @@ impl Relay {
             let target_senders = self.item_target_senders(data)?;
             let preferred_packet_id = Self::reliable_control_target_packet_id(data)?;
             if discovery::is_discovery_type(ty) {
+                // Publish an aggregate split-horizon topology instead of
+                // leaking far-side topology as direct neighbors. Address
+                // allocation advertisements still cross transparent relays:
+                // static/requested address conflicts must be resolved globally.
+                if matches!(ty,
+                    crate::DataType::DiscoveryAnnounce
+                    | crate::DataType::DiscoveryTimeSyncSources
+                    | crate::DataType::DiscoveryTopology
+                    | crate::DataType::DiscoveryLinkCapabilities)
+                {
+                    return Ok(RemoteSidePlan::Target(Vec::new()));
+                }
                 let mut st = self.state.lock();
                 let sides = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), false);
                 return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
@@ -3199,6 +3213,16 @@ impl Relay {
         include_schema: bool,
         skip_in_flight_sides: bool,
     ) -> TelemetryResult<()> {
+        self.queue_discovery_announce_on_side(include_schema, skip_in_flight_sides, None)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn queue_discovery_announce_on_side(
+        &self,
+        include_schema: bool,
+        skip_in_flight_sides: bool,
+        requested_side: Option<RelaySideId>,
+    ) -> TelemetryResult<()> {
         #[cfg(not(feature = "std"))]
         let _ = include_schema;
         let now_ms = self.clock.now_ms();
@@ -3213,8 +3237,10 @@ impl Relay {
                 return Ok(());
             }
             if include_schema {
-                for throttle in st.discovery_side_throttle.values_mut() {
-                    throttle.has_sent_full = false;
+                for (side, throttle) in st.discovery_side_throttle.iter_mut() {
+                    if requested_side.is_none_or(|requested| requested == *side) {
+                        throttle.has_sent_full = false;
+                    }
                 }
             }
             st.discovery_cadence.on_announce_sent(now_ms);
@@ -3229,6 +3255,9 @@ impl Relay {
                 .collect::<Vec<_>>();
             let mut per_side = Vec::new();
             for (side_id, link_local_enabled, opts) in side_entries {
+                if requested_side.is_some_and(|requested| requested != side_id) {
+                    continue;
+                }
                 if skip_in_flight_sides
                     && st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
                         *pending_side == side_id
@@ -3405,6 +3434,51 @@ impl Relay {
     #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
+        let recovering = {
+            let mut st = self.state.lock();
+            let missing = st
+                .discovery_routes
+                .iter()
+                .filter(|(_, route)| {
+                    route.announcers.iter().any(|(name, peer)| {
+                        !peer.has_full_topology
+                            && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                            && !route.announcers.values().any(|bridge| bridge.has_full_topology
+                                && now_ms.saturating_sub(bridge.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                                && bridge.topology_boards.iter().any(|board| board.sender_id == *name))
+                    })
+                })
+                .map(|(side, _)| *side)
+                .collect::<Vec<_>>();
+            let mut recovering = false;
+            for side in missing {
+                let throttle = st.discovery_side_throttle.entry(side).or_default();
+                if throttle.next_topology_request_ms == 0 {
+                    throttle.next_topology_request_ms =
+                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
+                    continue;
+                }
+                if now_ms < throttle.next_topology_request_ms {
+                    continue;
+                }
+                throttle.next_topology_request_ms =
+                    now_ms.saturating_add(discovery::DISCOVERY_BASELINE_RETRY_MS);
+                let pkt = discovery::build_discovery_topology_request(
+                    self.sender_arc().as_ref(),
+                    now_ms,
+                )?;
+                let data = RelayItem::Packet(Arc::new(pkt));
+                let priority = Self::relay_item_priority(&data)?;
+                st.push_tx(RelayTxItem {
+                    src: None,
+                    dst: side,
+                    data,
+                    priority,
+                })?;
+                recovering = true;
+            }
+            recovering
+        };
         let due = {
             let mut st = self.state.lock();
             let removed = Self::prune_discovery_routes_locked(&mut st, now_ms);
@@ -3434,12 +3508,12 @@ impl Relay {
                 })
             });
             if !st.sides.iter().any(|side| side.is_some()) || !has_any {
-                return Ok(false);
+                return Ok(recovering);
             }
             st.discovery_cadence.due(now_ms)
         };
         if !due {
-            return Ok(false);
+            return Ok(recovering);
         }
         // Keep periodic discovery lightweight so a hosted relay cannot fill a
         // constrained link with repeated schema snapshots.
@@ -3482,6 +3556,19 @@ impl Relay {
             if let Some(transport) = self.state.lock().side_transport.get_mut(&src) {
                 transport.refresh_transmit_header_templates();
             }
+            // Like routers, relays retain a split-horizon baseline and must
+            // answer a restarting neighbor without waiting for master election.
+            self.state
+                .lock()
+                .discovery_side_throttle
+                .entry(src)
+                .or_default()
+                .has_sent_full = false;
+            return self.queue_discovery_announce_on_side(
+                pkt.data_type() == crate::DataType::DiscoverySchemaRequest,
+                false,
+                Some(src),
+            );
         }
         if pkt.data_type() == crate::DataType::DiscoverySchema {
             let snapshot = discovery::decode_discovery_schema(&pkt)?;
@@ -3660,6 +3747,7 @@ impl Relay {
                     );
                 } else {
                     sender_state.topology_boards = update.boards;
+                    sender_state.has_full_topology = true;
                 }
                 let changed = sender_state.topology_boards != before;
                 Self::refresh_sender_topology_state(&mut sender_state);
@@ -5320,9 +5408,14 @@ impl Relay {
         // Reliable frames never use dictionary compression. Send the native,
         // self-describing wire packet without allocating/retaining an unused
         // template on either peer. Raw packets are accepted by both decoders.
-        if is_reliable_type(_ty) || reliable_seq_ack.is_some() || matches!(_ty,
-            crate::DataType::ReliableAck | crate::DataType::ReliablePartialAck
-                | crate::DataType::ReliablePacketRequest)
+        if is_reliable_type(_ty)
+            || reliable_seq_ack.is_some()
+            || matches!(
+                _ty,
+                crate::DataType::ReliableAck
+                    | crate::DataType::ReliablePartialAck
+                    | crate::DataType::ReliablePacketRequest
+            )
         {
             let frames = if opts.max_frame_bytes != 0 && raw_len > opts.max_frame_bytes {
                 self.split_side_transport_frame(side, raw, opts.max_frame_bytes)?
@@ -5353,8 +5446,8 @@ impl Relay {
                 let discovery_refresh = discovery::is_discovery_type(_ty);
                 #[cfg(not(feature = "discovery"))]
                 let discovery_refresh = false;
-                let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES
-                    && !discovery_refresh;
+                let use_compact =
+                    *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES && !discovery_refresh;
                 if use_compact {
                     *compact_uses = compact_uses.saturating_add(1);
                 } else {

@@ -146,6 +146,8 @@ mod reliable_drop_tests {
             );
             let gw = Relay::new(shared_clock(now.clone()));
             let rf = Relay::new(shared_clock(now.clone()));
+            gw.set_sender("GB");
+            rf.set_sender("RF");
 
             let actuator_hits: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
             let actuator_handler_hits = actuator_hits.clone();
@@ -1314,6 +1316,8 @@ mod reliable_drop_tests {
                 build_discovery_announce("DEST_B", 0, &[DataEndpoint::named("RADIO")]).unwrap(),
             )
             .unwrap();
+        relay.process_all_queues().unwrap();
+        relay.announce_discovery().unwrap();
         for _ in 0..8 {
             relay.process_all_queues().unwrap();
             for frame in drain_queue(&r_to_s) {
@@ -1705,6 +1709,8 @@ mod reliable_drop_tests {
         );
         let gw = Relay::new(shared_clock(now.clone()));
         let rf = Relay::new(shared_clock(now.clone()));
+        gw.set_sender("GB");
+        rf.set_sender("RF");
         let actuator = Router::new_with_clock(
             RouterConfig::new(vec![EndpointHandler::new_packet_handler(
                 DataEndpoint::named("RADIO"),
@@ -2044,6 +2050,8 @@ mod reliable_drop_tests {
         gateway
             .rx_from_side(gw_child, build_discovery_announce("DAQ", 0, &[]).unwrap())
             .unwrap();
+        gateway.process_all_queues().unwrap();
+        gateway.announce_discovery().unwrap();
         for _ in 0..4 {
             gateway.process_all_queues().unwrap();
             for frame in drain_queue(&gw_to_src) {
@@ -2501,6 +2509,9 @@ mod reliable_drop_tests {
                 build_discovery_announce("AB", 0, &[DataEndpoint::named("RADIO")]).unwrap(),
             )
             .unwrap();
+        // Process queued discovery before taking the relay's aggregate
+        // snapshot. Far-side announcements are not direct-neighbor adverts.
+        relay.process_all_queues().unwrap();
         relay.announce_discovery().unwrap();
         relay.process_all_queues().unwrap();
         for frame in drain_queue(&r_to_s) {
@@ -2654,6 +2665,7 @@ mod reliable_drop_tests {
                 build_discovery_announce("AB", 0, &[DataEndpoint::named("RADIO")]).unwrap(),
             )
             .unwrap();
+        relay.process_all_queues().unwrap();
         relay.announce_discovery().unwrap();
         relay.process_all_queues().unwrap();
         for frame in drain_queue(&r_to_s) {
@@ -3630,7 +3642,9 @@ mod reliable_drop_tests {
                 .lock()
                 .unwrap()
                 .contains(&recovery_marker),
-            "fresh command must arrive after restoring links"
+            "fresh command must arrive after restoring links; GS topology={:?}; Gateway topology={:?}; Actuator topology={:?}; GS runtime={:?}; Gateway runtime={:?}",
+            topology.gs.export_topology(), topology.gw.export_topology(), topology.actuator.export_topology(),
+            topology.gs.export_runtime_stats(), topology.gw.export_runtime_stats()
         );
         eprintln!(
             "fault-injection ordered delivery failures: {}; post-recovery delivery: PASS",

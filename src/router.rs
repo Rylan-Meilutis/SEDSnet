@@ -586,6 +586,7 @@ struct DiscoverySenderState {
     advertised_reachable_timesync_sources: Vec<String>,
     link_capabilities: Option<discovery::LinkCapabilities>,
     topology_boards: Vec<TopologyBoardNode>,
+    has_full_topology: bool,
     last_seen_ms: u64,
 }
 
@@ -603,6 +604,7 @@ struct DiscoverySideState {
 #[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default)]
 struct DiscoverySideThrottleState {
+    next_topology_request_ms: u64,
     next_ping_ms: u64,
     next_full_ms: u64,
     pending_incremental: bool,
@@ -5518,25 +5520,6 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn should_answer_discovery_request_locked(
-        &self,
-        st: &RouterInner,
-        requester: &str,
-        now_ms: u64,
-    ) -> bool {
-        if requester == self.sender_arc().as_ref() {
-            return false;
-        }
-        // A preferred master that restarted has no topology to advertise.
-        // Its directly adjacent router must answer this one bounded request,
-        // even though that router is not normally elected master.
-        if st.preferred_discovery_master.as_deref() == Some(requester) {
-            return true;
-        }
-        self.discovery_master_sender_locked(st, now_ms) == self.sender_arc().as_ref()
-    }
-
-    #[cfg(feature = "discovery")]
     #[inline]
     fn side_is_slow_control_link_locked(
         st: &RouterInner,
@@ -5655,6 +5638,24 @@ impl Router {
         include_topology: bool,
         skip_in_flight_sides: bool,
     ) -> TelemetryResult<()> {
+        self.emit_discovery_snapshot_on_side(
+            called_from_queue,
+            include_schema,
+            include_topology,
+            skip_in_flight_sides,
+            None,
+        )
+    }
+
+    #[cfg(feature = "discovery")]
+    fn emit_discovery_snapshot_on_side(
+        &self,
+        called_from_queue: bool,
+        include_schema: bool,
+        include_topology: bool,
+        skip_in_flight_sides: bool,
+        requested_side: Option<RouterSideId>,
+    ) -> TelemetryResult<()> {
         let now_ms = self.clock.now_ms();
         let per_side = {
             let mut st = self.state.lock();
@@ -5676,6 +5677,9 @@ impl Router {
                 self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
             let mut per_side = Vec::new();
             for (side_id, link_local_enabled, opts) in side_entries {
+                if requested_side.is_some_and(|requested| requested != side_id) {
+                    continue;
+                }
                 if skip_in_flight_sides
                     && st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
                         *pending_side == side_id
@@ -5901,6 +5905,57 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
+        // An address/keepalive proves liveness, not receipt of the detailed
+        // baseline. Recover a lost bootstrap without waiting 120 seconds or
+        // discarding existing routes. Coalesce all missing peers on one side.
+        let recovery_sides = {
+            let mut st = self.state.lock();
+            let missing = st
+                .discovery_routes
+                .iter()
+                .filter(|(_, route)| {
+                    route.announcers.iter().any(|(name, peer)| {
+                        !peer.has_full_topology
+                            && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                            && !route.announcers.values().any(|bridge| bridge.has_full_topology
+                                && now_ms.saturating_sub(bridge.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                                && bridge.topology_boards.iter().any(|board| board.sender_id == *name))
+                    })
+                })
+                .map(|(side, _)| *side)
+                .collect::<Vec<_>>();
+            missing
+                .into_iter()
+                .filter(|side| {
+                    let throttle = st.discovery_side_throttle.entry(*side).or_default();
+                    if throttle.next_topology_request_ms == 0 {
+                        throttle.next_topology_request_ms =
+                            now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
+                        return false;
+                    }
+                    if now_ms < throttle.next_topology_request_ms {
+                        return false;
+                    }
+                    throttle.next_topology_request_ms =
+                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_RETRY_MS);
+                    true
+                })
+                .collect::<Vec<_>>()
+        };
+        let recovering = !recovery_sides.is_empty();
+        for side in recovery_sides {
+            let pkt =
+                discovery::build_discovery_topology_request(self.sender_arc().as_ref(), now_ms)?;
+            self.emit_internal_tx(
+                RouterTxItem::ToSide {
+                    src: None,
+                    dst: side,
+                    data: RouterItem::Packet(pkt),
+                },
+                true,
+                true,
+            )?;
+        }
         let due = {
             let mut st = self.state.lock();
             let removed = Self::prune_discovery_routes_locked(&mut st, now_ms);
@@ -5925,12 +5980,12 @@ impl Router {
                 })
             });
             if st.sides.is_empty() || !has_any {
-                return Ok(false);
+                return Ok(recovering);
             }
             st.discovery_cadence.due(now_ms)
         };
         if !due {
-            return Ok(false);
+            return Ok(recovering);
         }
         // Runtime liveness/topology refreshes must stay small. A full schema
         // is sent by the initial explicit announce and in response to
@@ -6106,9 +6161,12 @@ impl Router {
                 transport.refresh_transmit_header_templates();
             }
         }
-        if pkt.data_type() == DataType::DiscoveryTopologyRequest {
+        if matches!(
+            pkt.data_type(),
+            DataType::DiscoveryTopologyRequest | DataType::DiscoverySchemaRequest
+        ) {
             let now_ms = self.clock.now_ms();
-            let should_answer = {
+            {
                 let mut st = self.state.lock();
                 if Self::prune_discovery_routes_locked(&mut st, now_ms) {
                     self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
@@ -6118,30 +6176,18 @@ impl Router {
                     .entry(side)
                     .or_default()
                     .has_sent_full = false;
-                self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
-            };
-            if should_answer {
-                self.emit_discovery_snapshot(called_from_queue, false, true, false)?;
             }
-            return Ok(true);
-        }
-        if pkt.data_type() == DataType::DiscoverySchemaRequest {
-            let now_ms = self.clock.now_ms();
-            let should_answer = {
-                let mut st = self.state.lock();
-                if Self::prune_discovery_routes_locked(&mut st, now_ms) {
-                    self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
-                    Self::note_discovery_topology_change_locked(&mut st, now_ms);
-                }
-                st.discovery_side_throttle
-                    .entry(side)
-                    .or_default()
-                    .has_sent_full = false;
-                self.should_answer_discovery_request_locked(&st, &packet_sender, now_ms)
-            };
-            if should_answer {
-                self.emit_discovery_snapshot(called_from_queue, true, true, false)?;
-            }
+            // Do not depend on the elected master answering a forwarded request.
+            // A recovering neighbor must get our retained downstream baseline
+            // even before its identity is known. Reply only on its ingress link;
+            // do not reset other links or broadcast application traffic.
+            self.emit_discovery_snapshot_on_side(
+                called_from_queue,
+                pkt.data_type() == DataType::DiscoverySchemaRequest,
+                true,
+                false,
+                Some(side),
+            )?;
             return Ok(true);
         }
         if pkt.data_type() == DataType::ManagedVariableRequest {
@@ -6251,6 +6297,11 @@ impl Router {
             return Ok(true);
         }
         let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+        let alias_state = if packet_sender != pkt.sender() {
+            route.announcers.remove(pkt.sender())
+        } else {
+            None
+        };
         let side_link_local_enabled = st
             .sides
             .get(side)
@@ -6261,6 +6312,7 @@ impl Router {
             .announcers
             .get(&packet_sender)
             .cloned()
+            .or(alias_state)
             .unwrap_or_default();
         let changed = match pkt.data_type() {
             DataType::DiscoveryAnnounce => {
@@ -6325,6 +6377,7 @@ impl Router {
                     );
                 } else {
                     sender_state.topology_boards = update.boards;
+                    sender_state.has_full_topology = true;
                 }
                 let changed = sender_state.topology_boards != before;
                 Self::refresh_sender_topology_state(&mut sender_state);
@@ -7137,9 +7190,14 @@ impl Router {
             // Reliable frames never use dictionary compression. Send the native,
             // self-describing wire packet without allocating/retaining an unused
             // template on either peer. Raw packets are accepted by both decoders.
-            if is_reliable_type(_ty) || reliable_seq_ack.is_some() || matches!(_ty,
-                crate::DataType::ReliableAck | crate::DataType::ReliablePartialAck
-                    | crate::DataType::ReliablePacketRequest)
+            if is_reliable_type(_ty)
+                || reliable_seq_ack.is_some()
+                || matches!(
+                    _ty,
+                    crate::DataType::ReliableAck
+                        | crate::DataType::ReliablePartialAck
+                        | crate::DataType::ReliablePacketRequest
+                )
             {
                 let frames = if opts.max_frame_bytes != 0 && raw_len > opts.max_frame_bytes {
                     self.split_side_transport_frame(side, raw, opts.max_frame_bytes)?
@@ -7222,8 +7280,8 @@ impl Router {
                     let discovery_refresh = discovery::is_discovery_type(_ty);
                     #[cfg(not(feature = "discovery"))]
                     let discovery_refresh = false;
-                    let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES
-                        && !discovery_refresh;
+                    let use_compact =
+                        *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES && !discovery_refresh;
                     if use_compact {
                         *compact_uses = compact_uses.saturating_add(1);
                     } else {
@@ -11659,7 +11717,11 @@ impl Router {
                         && !is_internal_control_type(ty)
                         && is_reliable_type(ty)
                         && has_nonlocal_endpoint(&endpoints, &self.cfg)
-                        && !self.state.lock().managed_variable_types.contains(&ty.as_u32())
+                        && !self
+                            .state
+                            .lock()
+                            .managed_variable_types
+                            .contains(&ty.as_u32())
                     {
                         // Nothing was queued or transmitted. Reporting success
                         // here loses application state during route expiry.

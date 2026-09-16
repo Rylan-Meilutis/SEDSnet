@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.0.32
+
+- Recover a missing full topology baseline after restart or packet loss with a
+  one-second bootstrap grace period and at most one request per link every five
+  seconds. Preserve learned routes and schemas; stop retries after recovery.
+- Answer explicit topology requests on the ingress link independently of master
+  election, in both routers and relays, without application-data fanout.
+- Republish relay topology with split-horizon ownership rather than forwarding
+  distant neighbor advertisements as direct peers. Keep global address-allocation
+  advertisements forwarded, and canonicalize compact sender aliases.
+- Add dropped-baseline, lost-recovery-response, ingress-only reply and relay
+  ownership regressions. The full built-in suite passes; hardware qualification
+  and a new firmware soak remain separate validation steps.
+
 ## 4.0.31
 
 - Bound timestamp-cache retention when compact-template capacity is zero,

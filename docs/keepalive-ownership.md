@@ -1,5 +1,35 @@
 # Discovery keepalive ownership
 
+## Missing topology baseline recovery (v4.0.32)
+
+A restarted receiver can receive a bridge's aggregate address advertisement
+while losing its full topology snapshot. Previously, later deltas were accepted
+without tracking whether their baseline had arrived. Periodic keepalives could
+therefore keep the bridge alive while downstream board names remained missing
+until the 120-second full refresh. This prevents reliable attribution of compact
+sender addresses even when downstream status packets are arriving.
+
+Routers and relays now track full-topology receipt per announcer. After a
+one-second bootstrap grace period they request the missing baseline on the
+affected link, at most once per five seconds per link. Retries stop when the
+full snapshot arrives; learned routes and schemas are not cleared. An adjacent
+router or relay answers an explicit topology request with a full split-horizon
+snapshot on that ingress link, independently of discovery-master election.
+Ordinary application routing is unchanged; no telemetry fanout is introduced.
+
+Regression tests drop the bootstrap snapshot and a recovery attempt, verify
+bounded retries and their cancellation, and verify restored downstream identity
+resolution. These reproduce protocol recovery gaps in software, not proof that
+every hardware ACK delay has the same cause. The full built-in suite passes;
+hardware restart validation and a new multi-board soak remain required before
+claiming the deployed stack is qualified.
+
+Relays learn and republish neighbor announcements, topology, time sources and
+link capabilities using split-horizon ownership instead of forwarding them as
+direct-neighbor claims. Address advertisements still propagate for global
+address allocation. A sender already covered by a fresh full bridge snapshot
+does not trigger a redundant baseline request.
+
 An empty DiscoveryAnnounce is the existing slow-link keepalive. It refreshes
 the announcing peer timestamp without replacing its learned endpoint ownership
 or triggering a topology-change advertisement. Nonempty announcements retain

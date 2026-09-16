@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 4.0.32 highlights
+
+- Bounded missing-baseline recovery restores downstream names after receiver restart or discovery packet loss.
+- Routers and relays answer explicit recovery requests on the requesting link without waiting for master election.
+- Relay split-horizon topology preserves downstream ownership while global address allocation still propagates.
+- Full built-in tests cover dropped recovery replies and restored downstream identities; hardware qualification remains separate.
+
 ## Version 4.0.31 highlights
 
 - Reliable application frames and ACK controls remain self-describing after packet loss or peer restart.

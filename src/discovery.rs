@@ -25,6 +25,10 @@ pub const DISCOVERY_SLOW_INTERVAL_MS: u64 = 5_000;
 pub const DISCOVERY_SLOW_LINK_CAPACITY_BPS: u64 = 512;
 pub const DISCOVERY_SLOW_LINK_PING_INTERVAL_MS: u64 = 15_000;
 pub const DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS: u64 = 120_000;
+/// Retry only links with an unreceived topology baseline, not healthy links.
+pub const DISCOVERY_BASELINE_RETRY_MS: u64 = 5_000;
+/// Let the address and full topology in a normal bootstrap arrive together.
+pub const DISCOVERY_BASELINE_GRACE_MS: u64 = 1_000;
 /// Number of compact topology advertisements emitted for each change. These
 /// packets are intentionally idempotent, so a small bounded repeat avoids a
 /// 120-second repair delay after one lossy control frame without resending the
