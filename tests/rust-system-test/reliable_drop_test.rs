@@ -3044,7 +3044,7 @@ mod reliable_drop_tests {
     }
 
     #[test]
-    fn compact_ordered_end_to_end_stream_delivers_all_messages() {
+    fn template_enabled_ordered_stream_uses_self_describing_headers() {
         ensure_common_test_schema();
         exercise_compact_side_transport_in_soak(Arc::new(AtomicU64::new(0)));
     }
@@ -3159,19 +3159,21 @@ mod reliable_drop_tests {
             .iter()
             .find(|side| side.side_name == "compact-can-fd")
             .expect("missing compact side stats");
-        assert!(
-            side.side_transport_compact_frames >= 8,
+        assert_eq!(
+            side.side_transport_compact_frames, 0,
             "compact={}, omitted={}, full={}, received={}",
             side.side_transport_compact_frames,
             side.side_transport_compact_omitted_timestamp_frames,
             side.side_transport_full_frames,
             received.lock().unwrap().len()
         );
-        // Compact headers remain enabled, but timestamps are loss-independent.
+        // Template support stays enabled on the link, but reliable messages
+        // must decode without prior dictionary state (including retransmits).
+        assert!(side.side_transport_full_frames >= 12);
         assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 0);
         assert_eq!(side.side_transport_compact_delta_frames, 0);
         assert!(side.side_transport_chunk_frames > 0);
-        assert_eq!(received.lock().unwrap().len(), 12);
+        assert_eq!(*received.lock().unwrap(), (0..12u32).collect::<Vec<_>>());
     }
 
     #[test]

@@ -1,5 +1,29 @@
 # Changelog
 
+## 4.0.31
+
+- Bound timestamp-cache retention when compact-template capacity is zero,
+  including shared-bus links that disable compression after discovery. Router
+  and relay regressions reproduce the old growth and require empty TX/RX caches.
+
+- Avoid retaining unused TX/RX compression templates for reliable frames.
+  Use the existing self-describing raw wire path (with normal chunking when
+  required), reducing cache churn and transient allocation pressure on relays.
+
+- Preserve TX dictionary entries while marking them for complete-header refresh.
+  Clearing only the sender dictionary desynchronized bounded TX/RX eviction,
+  including after negotiating a smaller peer capacity. Preserve receive state.
+- Keep protocol ACKs, partial ACKs and retransmission requests self-describing
+  so a lost compact dictionary cannot stall ordered application streams.
+  Reliable application frames also retain complete headers on every hop: the
+  compact refresh interval could otherwise outlast their retry budget. Bulk
+  best-effort data retains compression. Regressions cover routers and relays.
+- Refresh transmit compact-header dictionaries on the requesting link when a
+  peer requests discovery topology or schema. A restarted receiver can decode
+  the next application/state report without waiting for periodic header refresh.
+- Apply the recovery to routers and relays without resetting learned routes,
+  receive dictionaries, or unrelated links. Add regressions for both request types.
+
 ## 4.0.30
 
 - Preserve discovered endpoint ownership across empty slow-link keepalives in routers and relays.

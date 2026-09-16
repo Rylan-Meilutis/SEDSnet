@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 4.0.31 highlights
+
+- Reliable application frames and ACK controls remain self-describing after packet loss or peer restart.
+- Routers and relays refresh headers on discovery requests without clearing learned routes or unrelated links.
+- Bounded dictionary refresh preserves eviction history; disabled compression retains no timestamp cache entries.
+- Full built-in tests cover router and relay recovery, ordered delivery, and cache retention.
+
 ## Version 4.0.30 highlights
 
 - Router and relay keepalives preserve discovered endpoint ownership.

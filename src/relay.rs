@@ -1,4 +1,8 @@
 #[cfg(all(test, feature = "discovery"))]
+#[path = "tests/relay_restart_transport.rs"]
+mod restart_transport_tests;
+
+#[cfg(all(test, feature = "discovery"))]
 mod compact_summary_tests {
     use super::*;
 
@@ -507,10 +511,12 @@ struct SideTransportState {
 
 impl SideTransportState {
     fn refresh_transmit_header_templates(&mut self) {
-        self.tx_template_ids.clear();
-        self.tx_templates.clear();
-        self.tx_last_timestamps.clear();
-        self.tx_compact_uses.clear();
+        // Refresh on the wire, not by forgetting the eviction history. RX
+        // retains its dictionary; clearing only TX makes bounded caches evict
+        // different entries after the next insertion/capacity negotiation.
+        for uses in self.tx_compact_uses.values_mut() {
+            *uses = u8::MAX;
+        }
         // Local topology changes do not invalidate dictionaries received from
         // peers. Dropping RX state here loses already-in-flight compact ACKs.
     }
@@ -3466,6 +3472,17 @@ impl Relay {
         };
 
         let now_ms = self.clock.now_ms();
+        if matches!(
+            pkt.data_type(),
+            crate::DataType::DiscoveryTopologyRequest | crate::DataType::DiscoverySchemaRequest
+        ) {
+            // A restarted receiver has no compact-header dictionary even if
+            // discovery still has exactly the same routes. Refresh TX only on
+            // its ingress link; do not erase RX templates or routing state.
+            if let Some(transport) = self.state.lock().side_transport.get_mut(&src) {
+                transport.refresh_transmit_header_templates();
+            }
+        }
         if pkt.data_type() == crate::DataType::DiscoverySchema {
             let snapshot = discovery::decode_discovery_schema(&pkt)?;
             let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
@@ -5300,6 +5317,27 @@ impl Relay {
         let omitted_timestamp = false;
         let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
             Self::extract_side_header_template(raw.as_ref())?;
+        // Reliable frames never use dictionary compression. Send the native,
+        // self-describing wire packet without allocating/retaining an unused
+        // template on either peer. Raw packets are accepted by both decoders.
+        if is_reliable_type(_ty) || reliable_seq_ack.is_some() || matches!(_ty,
+            crate::DataType::ReliableAck | crate::DataType::ReliablePartialAck
+                | crate::DataType::ReliablePacketRequest)
+        {
+            let frames = if opts.max_frame_bytes != 0 && raw_len > opts.max_frame_bytes {
+                self.split_side_transport_frame(side, raw, opts.max_frame_bytes)?
+            } else {
+                vec![raw]
+            };
+            let wire_len = frames.iter().map(|frame| frame.len()).sum::<usize>();
+            let mut st = self.state.lock();
+            let stats = st.side_runtime_stats.entry(side).or_default();
+            stats.note_side_transport_full(raw_len, wire_len);
+            if frames.len() > 1 {
+                stats.note_side_transport_chunks(frames.len());
+            }
+            return Ok(frames);
+        }
         let (template_id, use_compact, _previous_timestamp) = {
             let mut st = self.state.lock();
             let side_state = st
@@ -5337,7 +5375,9 @@ impl Relay {
                         .or_default()
                         .note_side_transport_template_eviction();
                 }
-                if let Some(side_state) = st.side_transport.get_mut(&side) {
+                if let Some(side_state) = st.side_transport.get_mut(&side)
+                    && opts.max_side_transport_templates > 0
+                {
                     side_state.tx_last_timestamps.insert(next, timestamp);
                 }
                 (next, false, None)
@@ -5443,7 +5483,9 @@ impl Relay {
                     let evicted = st.side_transport.get_mut(&side).is_some_and(|side_state| {
                         let evicted =
                             side_state.insert_rx_template(template_id, template, max_templates);
-                        side_state.rx_last_timestamps.insert(template_id, timestamp);
+                        if max_templates > 0 {
+                            side_state.rx_last_timestamps.insert(template_id, timestamp);
+                        }
                         evicted
                     });
                     if evicted {

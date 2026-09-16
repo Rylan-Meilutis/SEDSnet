@@ -350,6 +350,13 @@ fn relay_packed_side_chunking_reassembles_for_fixed_size_links() {
 fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
     crate::tests::ensure_common_test_schema();
     use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
+    // Reliable packets intentionally carry self-describing headers. Exercise
+    // timestamp compression with an explicitly best-effort schema instead.
+    let data_type = crate::config::register_data_type_with_description(
+        "RELAY_BEST_EFFORT_TIMESTAMPS", "compact timestamp regression fixture",
+        crate::MessageElement::Static(3, crate::MessageDataType::Float32, crate::MessageClass::Data),
+        &[DataEndpoint::named("SD_CARD")], crate::ReliableMode::None, 1,
+    ).unwrap();
 
     let delivered = Arc::new(AtomicUsize::new(0));
     let delivered_c = delivered.clone();
@@ -385,7 +392,7 @@ fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
             header_template_enabled: true,
             compact_header_target_bytes: 20,
             ..RelaySideOptions::default()
-                .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+                .with_omitted_unchanged_compact_timestamps_for_type(data_type)
         },
     );
     let rx_side = receiver.add_side_packed_with_options(
@@ -395,7 +402,7 @@ fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
             header_template_enabled: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
-                .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+                .with_omitted_unchanged_compact_timestamps_for_type(data_type)
         },
     );
     *receiver_side_id.lock().unwrap() = Some(rx_side);
@@ -417,7 +424,7 @@ fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
         .clone();
 
     let pkt_a = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        data_type,
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         10_000,
@@ -425,7 +432,7 @@ fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
     .unwrap()
     .with_nonce(41);
     let pkt_b = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        data_type,
         &[4.0_f32, 5.0, 6.0],
         &[DataEndpoint::named("SD_CARD")],
         10_000,

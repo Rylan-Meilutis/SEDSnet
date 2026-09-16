@@ -17,9 +17,24 @@ fn zero_clock() -> Box<dyn Clock + Send + Sync> {
     Box::new(|| 0u64)
 }
 
+// Compression tests need explicitly best-effort traffic. The loaded runtime
+// schema may mark GPS_DATA reliable, which now intentionally uses full headers.
+fn best_effort_type() -> DataType {
+    static TYPE: std::sync::OnceLock<DataType> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        crate::tests::ensure_common_test_schema();
+        crate::config::register_data_type_with_description(
+            "DEDUPE_BEST_EFFORT_DATA", "compact transport regression fixture",
+            crate::MessageElement::Static(3, crate::MessageDataType::Float32, crate::MessageClass::Data),
+            &[DataEndpoint::named("RADIO"), DataEndpoint::named("SD_CARD")],
+            crate::ReliableMode::None, 1,
+        ).unwrap()
+    })
+}
+
 fn wire_for_value(v: u64) -> Arc<[u8]> {
     let pkt = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[v as f32, 0.0, 0.0],
         &[DataEndpoint::named("SD_CARD")],
         v,
@@ -58,7 +73,7 @@ fn router_rx_packed_deduplicates_identical_frames() {
 
     // Build a single wire frame we will reuse.
     let pkt = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         0,
@@ -98,7 +113,7 @@ fn router_rx_packed_dedup_persists_across_time_advance() {
     let r = Router::new_with_clock(RouterConfig::new(vec![handler]), clock);
 
     let pkt = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         0,
@@ -137,7 +152,7 @@ fn router_rx_packed_does_not_dedupe_different_frames() {
 
     // Frame A
     let pkt_a = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         0,
@@ -147,7 +162,7 @@ fn router_rx_packed_does_not_dedupe_different_frames() {
 
     // Frame B (different payload)
     let pkt_b = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[4.0_f32, 5.0, 6.0],
         &[DataEndpoint::named("SD_CARD")],
         0,
@@ -182,14 +197,14 @@ fn router_rx_packed_does_not_dedupe_same_payload_same_ms_when_nonce_differs() {
     let r = Router::new_with_clock(RouterConfig::new(vec![handler]), zero_clock());
 
     let pkt_a = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         0,
     )
     .unwrap();
     let pkt_b = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         0,
@@ -251,7 +266,7 @@ fn packed_side_header_templates_reduce_followup_frame_size() {
     *receiver_side_id.lock().unwrap() = Some(rx_side);
 
     let pkt_a = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         10_000,
@@ -259,7 +274,7 @@ fn packed_side_header_templates_reduce_followup_frame_size() {
     .unwrap()
     .with_nonce(11);
     let pkt_b = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[4.0_f32, 5.0, 6.0],
         &[DataEndpoint::named("SD_CARD")],
         10_001,
@@ -357,7 +372,7 @@ fn compact_templates_from_multiple_bus_producers_do_not_alias() {
         for offset in 0..2u16 {
             router
                 .tx(Packet::new(
-                    DataType::named("GPS_DATA"),
+                    best_effort_type(),
                     &[DataEndpoint::named("SD_CARD")],
                     sender,
                     u64::from(base + offset),
@@ -421,7 +436,7 @@ fn compact_templates_are_disabled_after_shared_bus_discovery() {
     for nonce in 1..=2u16 {
         sender
             .tx(Packet::from_f32_slice(
-                DataType::named("GPS_DATA"),
+                best_effort_type(),
                 &[f32::from(nonce), 0.0, 0.0],
                 &[DataEndpoint::named("SD_CARD")],
                 u64::from(nonce),
@@ -592,7 +607,7 @@ fn packed_side_header_templates_preserve_absolute_unchanged_timestamps() {
             header_template_enabled: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
-                .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+                .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
         },
     );
     let rx_side = receiver.add_side_packed_with_options(
@@ -602,13 +617,13 @@ fn packed_side_header_templates_preserve_absolute_unchanged_timestamps() {
             header_template_enabled: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
-                .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+                .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
         },
     );
     *receiver_side_id.lock().unwrap() = Some(rx_side);
 
     let pkt_a = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[1.0_f32, 2.0, 3.0],
         &[DataEndpoint::named("SD_CARD")],
         10_000,
@@ -616,7 +631,7 @@ fn packed_side_header_templates_preserve_absolute_unchanged_timestamps() {
     .unwrap()
     .with_nonce(21);
     let pkt_b = Packet::from_f32_slice(
-        DataType::named("GPS_DATA"),
+        best_effort_type(),
         &[4.0_f32, 5.0, 6.0],
         &[DataEndpoint::named("SD_CARD")],
         10_000,
@@ -698,7 +713,7 @@ fn packed_side_timestamp_omission_policy_does_not_apply_to_other_types() {
             header_template_enabled: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
-                .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+                .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
         },
     );
     let rx_side = receiver.add_side_packed_with_options(
@@ -708,7 +723,7 @@ fn packed_side_timestamp_omission_policy_does_not_apply_to_other_types() {
             header_template_enabled: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
-                .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"))
+                .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
         },
     );
     *receiver_side_id.lock().unwrap() = Some(rx_side);
@@ -790,7 +805,7 @@ fn packed_side_template_dictionary_is_bounded() {
         payload.extend_from_slice(&0.0f32.to_le_bytes());
         payload.extend_from_slice(&0.0f32.to_le_bytes());
         let pkt = Packet::new(
-            DataType::named("GPS_DATA"),
+            best_effort_type(),
             &[DataEndpoint::named("SD_CARD")],
             sender_id,
             ts,
@@ -872,7 +887,7 @@ fn bounded_side_template_dictionaries_remain_synchronized() {
             .collect::<Vec<_>>()
             .into();
         let pkt = Packet::new(
-            DataType::named("GPS_DATA"),
+            best_effort_type(),
             &[DataEndpoint::named("SD_CARD")],
             sender_id,
             index as u64,
@@ -964,7 +979,7 @@ fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
             .into();
         sender
             .tx(Packet::new(
-                DataType::named("GPS_DATA"),
+                best_effort_type(),
                 &[DataEndpoint::named("SD_CARD")],
                 sender_id,
                 index as u64 + 1,
@@ -1019,7 +1034,7 @@ fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
             .into();
         sender
             .tx(Packet::new(
-                DataType::named("GPS_DATA"),
+                best_effort_type(),
                 &[DataEndpoint::named("SD_CARD")],
                 sender_id,
                 index as u64 + 1,
@@ -1041,7 +1056,7 @@ fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
     let received_values = receiver_side
         .data_types
         .iter()
-        .find(|item| item.data_type == DataType::named("GPS_DATA"))
+        .find(|item| item.data_type == best_effort_type())
         .expect("received GPS data stats");
     assert_eq!(received_values.rx_packets, sources.len() as u64 + 6);
     assert_eq!(receiver_side.side_transport_rx_template_count, 4);
@@ -1107,7 +1122,7 @@ fn compact_side_recovers_when_initial_full_template_is_lost() {
 
     for index in 0..11u16 {
         let pkt = Packet::from_f32_slice(
-            DataType::named("GPS_DATA"),
+            best_effort_type(),
             &[index as f32, 0.0, 0.0],
             &[DataEndpoint::named("SD_CARD")],
             u64::from(index),
@@ -1135,18 +1150,18 @@ fn topology_change_resynchronizes_a_missing_compact_template_immediately() {
     use crate::discovery::build_discovery_announce;
 
     crate::tests::ensure_common_test_schema();
-    // This test intentionally drops data without ACKs to exercise template
-    // recovery; an ordered stream must not advance past that missing data.
+    // This test drops best-effort data to exercise compact-template recovery.
+    // Reliable frames are self-describing and tested separately.
     let template_type = crate::config::register_data_type_with_description(
         "TEMPLATE_RESET_DATA",
-        "unordered template recovery fixture",
+        "best-effort template recovery fixture",
         crate::MessageElement::Static(
             3,
             crate::MessageDataType::Float32,
             crate::MessageClass::Data,
         ),
         &[DataEndpoint::named("SD_CARD")],
-        crate::ReliableMode::Unordered,
+        crate::ReliableMode::None,
         1,
     )
     .unwrap();
@@ -1287,7 +1302,7 @@ fn compact_header_target_misses_are_counted() {
 
     for (value, nonce) in [(1.0, 11), (2.0, 12)] {
         let pkt = Packet::from_f32_slice(
-            DataType::named("GPS_DATA"),
+            best_effort_type(),
             &[value, 0.0, 0.0],
             &[DataEndpoint::named("SD_CARD")],
             nonce as u64,
@@ -1398,7 +1413,7 @@ fn relay_deduplicates_identical_frames_per_side() {
     let tx_b_c = tx_count_b.clone();
     let tx_b = move |bytes: &[u8]| -> TelemetryResult<()> {
         assert!(!bytes.is_empty());
-        if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+        if packed_frame_type(bytes) == Some(best_effort_type()) {
             tx_b_c.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -1407,7 +1422,7 @@ fn relay_deduplicates_identical_frames_per_side() {
     let tx_c_c = tx_count_c.clone();
     let tx_c = move |bytes: &[u8]| -> TelemetryResult<()> {
         assert!(!bytes.is_empty());
-        if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+        if packed_frame_type(bytes) == Some(best_effort_type()) {
             tx_c_c.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -1461,7 +1476,7 @@ fn relay_dedup_persists_across_time_advance() {
     let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
     let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
         assert!(!bytes.is_empty());
-        if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+        if packed_frame_type(bytes) == Some(best_effort_type()) {
             txc.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -1505,7 +1520,7 @@ fn relay_does_not_dedupe_different_frames_from_same_side() {
     let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
     let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
         assert!(!bytes.is_empty());
-        if packed_frame_type(bytes) == Some(DataType::named("GPS_DATA")) {
+        if packed_frame_type(bytes) == Some(best_effort_type()) {
             txc.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
