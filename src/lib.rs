@@ -44,7 +44,6 @@ use crate::config::{
     runtime_static_hex_length, runtime_static_string_length,
 };
 use crate::macros::{ReprI32Enum, ReprU32Enum};
-use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::fmt::Formatter;
 use core::mem::size_of;
@@ -951,7 +950,11 @@ impl TelemetryError {
 /// Allow conversion of `TelemetryError` to human-readable string.
 impl core::fmt::Display for TelemetryError {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&TelemetryError::to_string(self))
+        // ToString delegates to Display: calling it here recurses until the
+        // caller overflows its stack, including on embedded error paths.
+        // Derived Debug formats every variant and its details without recursion
+        // or an intermediate allocation.
+        core::fmt::Debug::fmt(self, f)
     }
 }
 

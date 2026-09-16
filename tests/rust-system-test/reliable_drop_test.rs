@@ -3167,7 +3167,9 @@ mod reliable_drop_tests {
             side.side_transport_full_frames,
             received.lock().unwrap().len()
         );
-        assert!(side.side_transport_compact_omitted_timestamp_frames >= 8);
+        // Compact headers remain enabled, but timestamps are loss-independent.
+        assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 0);
+        assert_eq!(side.side_transport_compact_delta_frames, 0);
         assert!(side.side_transport_chunk_frames > 0);
         assert_eq!(received.lock().unwrap().len(), 12);
     }

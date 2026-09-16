@@ -1,4 +1,5 @@
 use crate::config::{STATIC_HEX_LENGTH, STATIC_STRING_LENGTH, get_message_meta};
+mod error_display_tests;
 use crate::get_needed_message_size;
 use crate::packet::Packet;
 use crate::relay::Relay;

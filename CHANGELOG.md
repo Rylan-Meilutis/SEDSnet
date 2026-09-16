@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.30
+
+- Preserve discovered endpoint ownership across empty slow-link keepalives in routers and relays.
+- Send discovery in self-describing frames and preserve packet identity across compact-frame loss/reordering using absolute timestamps.
+- Return an error for reliable application sends with no discovered route so callers can retain and retry state reports.
+- Fix recursive error formatting that could overflow host or embedded stacks.
+- Add routing/ACK, compact-frame and error-formatting regressions; multibus tests now establish real discovery before sending.
+- Validation: full built-in suite and seven-board short/reconnection simulations passed. Ten-minute stability qualification is separate and pending.
+
 ## 4.0.29
 
 - Preserve the original publisher identity separately from the acknowledging owner

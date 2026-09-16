@@ -1,5 +1,13 @@
 # Changelogs
 
+## Version 4.0.30 highlights
+
+- Router and relay keepalives preserve discovered endpoint ownership.
+- Self-describing discovery and absolute compact timestamps recover after loss and reordering without corrupting ACK identity.
+- Reliable sends without a discovered route report failure instead of silently losing application state.
+- Error formatting no longer recursively overflows the stack.
+- Full library tests and short seven-board recovery tests pass; ten-minute qualification remains a separate gate.
+
 ## Version 4.0.29 highlights
 
 - End-to-end ACKs retain both the acknowledging owner and original publisher.

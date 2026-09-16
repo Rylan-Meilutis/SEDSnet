@@ -285,7 +285,7 @@ fn packed_side_header_templates_reduce_followup_frame_size() {
     assert_eq!(side.side_transport_profile, "ipv6_like");
     assert_eq!(side.side_transport_full_frames, 1);
     assert_eq!(side.side_transport_compact_frames, 1);
-    assert_eq!(side.side_transport_compact_delta_frames, 1);
+    assert_eq!(side.side_transport_compact_delta_frames, 0);
     assert!(side.side_transport_bytes_saved > 0);
     assert_eq!(
         side.compact_header_target_bytes,
@@ -553,7 +553,7 @@ fn chunk_transfer_ids_do_not_collide_across_bus_producers() {
 }
 
 #[test]
-fn packed_side_header_templates_can_omit_unchanged_timestamps() {
+fn packed_side_header_templates_preserve_absolute_unchanged_timestamps() {
     crate::tests::ensure_common_test_schema();
     let delivered_payloads = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
     let delivered_payloads_c = delivered_payloads.clone();
@@ -647,7 +647,7 @@ fn packed_side_header_templates_can_omit_unchanged_timestamps() {
     assert_eq!(side.side_transport_full_frames, 1);
     assert_eq!(side.side_transport_compact_frames, 1);
     assert_eq!(side.side_transport_compact_delta_frames, 0);
-    assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 1);
+    assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 0);
     assert!(side.side_transport_bytes_saved > 0);
     assert_eq!(side.side_transport_compact_target_misses, 0);
 }
@@ -742,7 +742,7 @@ fn packed_side_timestamp_omission_policy_does_not_apply_to_other_types() {
         .expect("link side stats");
     assert_eq!(side.side_transport_full_frames, 1);
     assert_eq!(side.side_transport_compact_frames, 1);
-    assert_eq!(side.side_transport_compact_delta_frames, 1);
+    assert_eq!(side.side_transport_compact_delta_frames, 0);
     assert_eq!(side.side_transport_compact_omitted_timestamp_frames, 0);
 }
 

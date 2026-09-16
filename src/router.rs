@@ -6251,14 +6251,22 @@ impl Router {
         let changed = match pkt.data_type() {
             DataType::DiscoveryAnnounce => {
                 let mut reachable = discovery::decode_discovery_announce(pkt)?;
-                if !side_link_local_enabled {
-                    reachable.retain(|ep| !ep.is_link_local_only());
+                // Empty announcements are slow-link keepalives, not endpoint
+                // withdrawals. Preserve ownership until an explicit topology
+                // update, leave, or expiry removes it. The common receive tail
+                // still refreshes last_seen_ms without scheduling rediscovery.
+                if reachable.is_empty() {
+                    false
+                } else {
+                    if !side_link_local_enabled {
+                        reachable.retain(|ep| !ep.is_link_local_only());
+                    }
+                    let board = Self::sender_topology_board_mut(&mut sender_state, &packet_sender);
+                    let changed = board.reachable_endpoints != reachable;
+                    board.reachable_endpoints = reachable;
+                    Self::refresh_sender_topology_state(&mut sender_state);
+                    changed
                 }
-                let board = Self::sender_topology_board_mut(&mut sender_state, &packet_sender);
-                let changed = board.reachable_endpoints != reachable;
-                board.reachable_endpoints = reachable;
-                Self::refresh_sender_topology_state(&mut sender_state);
-                changed
             }
             DataType::DiscoveryTimeSyncSources => {
                 let sources = discovery::decode_discovery_timesync_sources(pkt)?;
@@ -6843,15 +6851,6 @@ impl Router {
         }
     }
 
-    fn uleb128_len_local(mut value: u64) -> usize {
-        let mut len = 1;
-        while value >= 0x80 {
-            value >>= 7;
-            len += 1;
-        }
-        len
-    }
-
     fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
         let mut out = Vec::with_capacity(
             SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES,
@@ -7116,12 +7115,12 @@ impl Router {
         let raw_len = raw.len();
         let mut compact_payload_len = None;
         let mut used_compact = false;
-        let mut used_timestamp_delta = false;
-        let mut omitted_timestamp = false;
+        let used_timestamp_delta = false;
+        let omitted_timestamp = false;
         let wrapped = if opts.header_template_enabled {
-            let (template, ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+            let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
                 Self::extract_side_header_template(raw.as_ref())?;
-            let (template_id, use_compact, previous_timestamp) = {
+            let (template_id, use_compact, _previous_timestamp) = {
                 let mut st = self.state.lock();
                 /* Keep the sender's compact dictionary within the smallest
                  * capacity advertised by a live peer on this side. Template
@@ -7183,7 +7182,13 @@ impl Router {
                      * the receiver missed the original template frame. */
                     const FULL_REFRESH_AFTER_COMPACT_FRAMES: u8 = 8;
                     let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
-                    let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES;
+                    // Discovery must bootstrap even when a receiver lost its dictionary.
+                    #[cfg(feature = "discovery")]
+                    let discovery_refresh = discovery::is_discovery_type(_ty);
+                    #[cfg(not(feature = "discovery"))]
+                    let discovery_refresh = false;
+                    let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES
+                        && !discovery_refresh;
                     if use_compact {
                         *compact_uses = compact_uses.saturating_add(1);
                     } else {
@@ -7217,24 +7222,9 @@ impl Router {
             if use_compact {
                 used_compact = true;
                 compact_payload_len = Some(payload.len());
-                let timestamp_field = if let Some(previous) = previous_timestamp {
-                    let delta = timestamp.saturating_sub(previous);
-                    let omit_timestamp = opts.omit_unchanged_compact_timestamps
-                        || opts.compact_timestamp_omission_types.contains(ty);
-                    if omit_timestamp && timestamp == previous {
-                        omitted_timestamp = true;
-                        None
-                    } else if timestamp >= previous
-                        && Self::uleb128_len_local(delta) < Self::uleb128_len_local(timestamp)
-                    {
-                        used_timestamp_delta = true;
-                        Some(delta)
-                    } else {
-                        Some(timestamp)
-                    }
-                } else {
-                    Some(timestamp)
-                };
+                // A previous transmitted frame is not a confirmed receive base.
+                // Absolute timestamps preserve identity after loss or reordering.
+                let timestamp_field = Some(timestamp);
                 let mut body = Vec::with_capacity(payload.len() + 32);
                 body.push(flags);
                 Self::write_uleb128_local(u64::from(template_id), &mut body);
@@ -11625,6 +11615,19 @@ impl Router {
                 };
 
                 if !send_remote {
+                    let (endpoints, ty) = self.item_route_info(&data)?;
+                    if !ignore_local
+                        && !is_internal_control_type(ty)
+                        && is_reliable_type(ty)
+                        && has_nonlocal_endpoint(&endpoints, &self.cfg)
+                        && !self.state.lock().managed_variable_types.contains(&ty.as_u32())
+                    {
+                        // Nothing was queued or transmitted. Reporting success
+                        // here loses application state during route expiry.
+                        // Permit retry of the same packet after discovery heals.
+                        self.remove_pkt_id(&data);
+                        return Err(TelemetryError::Io("no discovered route"));
+                    }
                     return Ok(());
                 }
                 let mut data = data;

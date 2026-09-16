@@ -3,6 +3,39 @@ mod compact_summary_tests {
     use super::*;
 
     #[test]
+    fn compact_loss_and_reordering_preserve_packet_identity() {
+        crate::tests::ensure_common_test_schema();
+        let tx = Relay::new(Box::new(|| 0));
+        let rx = Relay::new(Box::new(|| 0));
+        let opts = RelaySideOptions::default().with_small_packet_transport(0);
+        let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+        let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+        let mut encoded = Vec::new();
+        for timestamp in [10000, 10010, 10020, 10030] {
+            let pkt = Packet::new(
+                crate::DataType::named("GPS_DATA"),
+                &[crate::DataEndpoint::named("RADIO")],
+                "VB",
+                timestamp,
+                Arc::<[u8]>::from([0u8; 12]),
+            )
+            .unwrap();
+            let raw = wire_format::pack_packet(&pkt);
+            let frames = tx
+                .encode_side_transport_frames(a, opts, raw.clone())
+                .unwrap();
+            assert_eq!(frames.len(), 1);
+            encoded.push((raw, frames[0].clone()));
+        }
+        // Establish template, lose frame 1, reorder and duplicate later frames.
+        for index in [0, 3, 2, 3] {
+            let (raw, frame) = &encoded[index];
+            let received = rx.decode_side_transport_frame(b, frame).unwrap().unwrap();
+            assert_eq!(&received, raw);
+        }
+    }
+
+    #[test]
     fn relay_preserves_compact_routes_without_inventing_endpoint_ownership() {
         crate::tests::ensure_common_test_schema();
         let endpoint = crate::DataEndpoint::named("RADIO");
@@ -3550,14 +3583,22 @@ impl Relay {
             }
             crate::DataType::DiscoveryAnnounce => {
                 let mut reachable = discovery::decode_discovery_announce(&pkt)?;
-                if !side_link_local_enabled {
-                    reachable.retain(|ep| !ep.is_link_local_only());
+                // Empty announcements are slow-link keepalives, not endpoint
+                // withdrawals. Preserve ownership until an explicit topology
+                // update, leave, or expiry removes it. The common receive tail
+                // still refreshes last_seen_ms without scheduling rediscovery.
+                if reachable.is_empty() {
+                    false
+                } else {
+                    if !side_link_local_enabled {
+                        reachable.retain(|ep| !ep.is_link_local_only());
+                    }
+                    let board = Self::sender_topology_board_mut(&mut sender_state, &announcer_id);
+                    let changed = board.reachable_endpoints != reachable;
+                    board.reachable_endpoints = reachable;
+                    Self::refresh_sender_topology_state(&mut sender_state);
+                    changed
                 }
-                let board = Self::sender_topology_board_mut(&mut sender_state, &announcer_id);
-                let changed = board.reachable_endpoints != reachable;
-                board.reachable_endpoints = reachable;
-                Self::refresh_sender_topology_state(&mut sender_state);
-                changed
             }
             crate::DataType::DiscoveryTimeSyncSources => {
                 let sources = discovery::decode_discovery_timesync_sources(&pkt)?;
@@ -5027,15 +5068,6 @@ impl Relay {
         }
     }
 
-    fn uleb128_len_local(mut value: u64) -> usize {
-        let mut len = 1;
-        while value >= 0x80 {
-            value >>= 7;
-            len += 1;
-        }
-        len
-    }
-
     fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
         if bytes.len() < wire_format::CRC32_BYTES + 4 {
             return Err(TelemetryError::Unpack("short buffer"));
@@ -5264,11 +5296,11 @@ impl Relay {
         let raw_len = raw.len();
         let mut compact_payload_len = None;
         let mut used_compact = false;
-        let mut used_timestamp_delta = false;
-        let mut omitted_timestamp = false;
-        let (template, ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+        let used_timestamp_delta = false;
+        let omitted_timestamp = false;
+        let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
             Self::extract_side_header_template(raw.as_ref())?;
-        let (template_id, use_compact, previous_timestamp) = {
+        let (template_id, use_compact, _previous_timestamp) = {
             let mut st = self.state.lock();
             let side_state = st
                 .side_transport
@@ -5278,7 +5310,13 @@ impl Relay {
                 let previous = side_state.tx_last_timestamps.get(&id).copied();
                 const FULL_REFRESH_AFTER_COMPACT_FRAMES: u8 = 8;
                 let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
-                let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES;
+                // Discovery must bootstrap even when a receiver lost its dictionary.
+                #[cfg(feature = "discovery")]
+                let discovery_refresh = discovery::is_discovery_type(_ty);
+                #[cfg(not(feature = "discovery"))]
+                let discovery_refresh = false;
+                let use_compact = *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES
+                    && !discovery_refresh;
                 if use_compact {
                     *compact_uses = compact_uses.saturating_add(1);
                 } else {
@@ -5308,24 +5346,9 @@ impl Relay {
         let wrapped = if use_compact {
             used_compact = true;
             compact_payload_len = Some(payload.len());
-            let timestamp_field = if let Some(previous) = previous_timestamp {
-                let delta = timestamp.saturating_sub(previous);
-                let omit_timestamp = opts.omit_unchanged_compact_timestamps
-                    || opts.compact_timestamp_omission_types.contains(ty);
-                if omit_timestamp && timestamp == previous {
-                    omitted_timestamp = true;
-                    None
-                } else if timestamp >= previous
-                    && Self::uleb128_len_local(delta) < Self::uleb128_len_local(timestamp)
-                {
-                    used_timestamp_delta = true;
-                    Some(delta)
-                } else {
-                    Some(timestamp)
-                }
-            } else {
-                Some(timestamp)
-            };
+            // A previous transmitted frame is not a confirmed receive base.
+            // Absolute timestamps preserve identity after loss or reordering.
+            let timestamp_field = Some(timestamp);
             let mut body = Vec::with_capacity(payload.len() + 32);
             body.push(flags);
             Self::write_uleb128_local(u64::from(template_id), &mut body);

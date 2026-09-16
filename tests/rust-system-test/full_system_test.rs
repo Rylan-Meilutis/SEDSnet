@@ -101,7 +101,10 @@ mod mega_library_system_tests {
                 mk_counter_handler(DataEndpoint::named("SD_CARD"), a_sd_hits.clone()),
             ];
 
-            let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
+            let router = Router::new_with_clock(
+                RouterConfig::new(handlers).with_sender("node_a"),
+                zero_clock(),
+            );
             router.add_side_packed("bus_a", {
                 let bus = bus_a_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
@@ -118,7 +121,10 @@ mod mega_library_system_tests {
                 mk_counter_handler(DataEndpoint::named("SD_CARD"), b_sd_hits.clone()),
             ];
 
-            let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
+            let router = Router::new_with_clock(
+                RouterConfig::new(handlers).with_sender("node_b"),
+                zero_clock(),
+            );
             router.add_side_packed("bus_b", {
                 let bus = bus_b_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
@@ -135,7 +141,10 @@ mod mega_library_system_tests {
                 mk_counter_handler(DataEndpoint::named("SD_CARD"), c_sd_hits.clone()),
             ];
 
-            let router = Router::new_with_clock(RouterConfig::new(handlers), zero_clock());
+            let router = Router::new_with_clock(
+                RouterConfig::new(handlers).with_sender("node_c"),
+                zero_clock(),
+            );
             router.add_side_packed("bus_c", {
                 let bus = bus_c_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
@@ -150,7 +159,8 @@ mod mega_library_system_tests {
         // 5) Hub router in RELAY mode (no local handlers)
         // -------------------------------
         let (hub_router, hub_side_a, hub_side_b, hub_side_c) = {
-            let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+            let router =
+                Router::new_with_clock(RouterConfig::default().with_sender("hub"), zero_clock());
             let hub_side_a = router.add_side_packed("bus_a", {
                 let bus = bus_a_tx.clone();
                 move |bytes: &[u8]| -> TelemetryResult<()> {
@@ -276,6 +286,31 @@ mod mega_library_system_tests {
         let proc_b = spawn_router_proc(node_b_router.clone(), stop.clone());
         let proc_c = spawn_router_proc(node_c_router.clone(), stop.clone());
         let proc_hub = spawn_router_proc(hub_router.clone(), stop.clone());
+
+        // Exercise learned routing, not silent success before any destination
+        // exists. Each physical node needs a distinct discovery identity.
+        #[cfg(feature = "discovery")]
+        {
+            for router in [&node_a_router, &node_b_router, &node_c_router, &hub_router] {
+                router.announce_discovery().unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let topology = hub_router.export_topology();
+                if ["node_a", "node_b", "node_c"].iter().all(|name| {
+                    topology.routes.iter().any(|route| {
+                        route
+                            .announcers
+                            .iter()
+                            .any(|announcer| announcer.sender_id == *name)
+                    })
+                }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "hub did not discover all sinks");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
 
         // -------------------------------
         // 8) Generators

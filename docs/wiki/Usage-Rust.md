@@ -508,13 +508,13 @@ smallest capacity advertised by a live peer on that side, which keeps mixed-memo
 synchronized without manually duplicating the limit. Relay packed sides support template profiles but do not currently
 perform this automatic refresh/nonfatal unknown-template recovery.
 
-For mixed links, keep absolute/delta timestamps for most traffic and omit unchanged timestamps only
-for selected data types:
+Compact transmitters always preserve absolute timestamps so loss and reordering
+cannot alter packet identity. Legacy timestamp-omission options remain accepted
+for source compatibility but no longer enable omission. Use header compaction:
 
 ```rust
 let opts = RouterSideOptions::default()
-    .with_ipv6_like_compact_header_target()
-    .with_omitted_unchanged_compact_timestamps_for_type(DataType::named("GPS_DATA"));
+    .with_ipv6_like_compact_header_target();
 ```
 
 ## P2P Service Ports

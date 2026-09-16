@@ -237,16 +237,14 @@ static header shape can use kind `0x02`, replacing repeated type/endpoint/sender
 that template id plus the fields that still vary per packet. On router packed sides, after eight
 compact uses of an active template, the next matching packet is emitted as another full `0x01`
 frame. This periodic refresh allows a router receiver that missed the initial full frame to relearn
-the template. When the previous timestamp for that template is known and the nonnegative delta is
-smaller than the full timestamp varint, the sender
-uses kind `0x04` and carries the timestamp delta instead. When unchanged-timestamp omission is
-enabled and the timestamp is identical to the previous frame for that template, the sender uses kind
-`0x05` and omits the timestamp field entirely. Omission can be enabled side-wide, by the IPv4-like
-profile, or for selected data types on a mixed link.
+the template. Current transmitters always carry absolute timestamps in compact
+kind `0x02` frames. Delta and omitted-timestamp formats remain decodable for
+legacy peers, but are not emitted: a lost or reordered frame otherwise changes
+the receiver timestamp base and can corrupt packet identity and ACK matching.
 
 Python and C bindings expose the same profiles through `add_side_packed_profile(...)` and
 `seds_*_add_side_packed_profile(...)`. `ipv6_like` uses a 40-byte compact-header profiling
-target; `ipv4_like` uses a 20-byte target and enables unchanged-timestamp omission.
+target; `ipv4_like` uses a 20-byte target. Both preserve absolute timestamps.
 
 Router and relay packed sides both support bounded frame sizes. Relay small-packet sides use the
 same side-local template id compaction when `max_frame_bytes` is non-zero. When the side-transport

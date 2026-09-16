@@ -295,9 +295,9 @@ router.add_side_packed_profile(
 
 Profiles are `canonical`, `template`, `ipv6_like`, and `ipv4_like`. A
 `compact_header_target_bytes` value of `0` uses the IPv6-like 40-byte or IPv4-like 20-byte default
-target for the selected profile. The `ipv4_like` profile also omits unchanged compact timestamps.
-The same method is available on `Relay`. Per-data-type timestamp omission policy is currently a
-Rust-side option; Python callers use profile-wide timestamp omission through `ipv4_like`.
+target for the selected profile. Both profiles preserve absolute timestamps:
+delta/omission could corrupt packet identity after frame loss. The same method
+is available on `Relay`.
 
 On `Router`, compact template state is self-healing on lossy links. An unknown compact frame is
 dropped without raising a transport error, and the sender refreshes an active template in full

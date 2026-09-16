@@ -537,7 +537,7 @@ fn unknown_remote_endpoint_does_not_flood_without_discovery_route() {
         42,
     )
     .unwrap();
-    router.tx(pkt).unwrap();
+    assert!(router.tx(pkt).is_err());
 
     assert!(seen_a.lock().unwrap().is_empty());
     assert!(seen_b.lock().unwrap().is_empty());
@@ -569,7 +569,7 @@ fn unknown_remote_endpoint_does_not_fallback_to_single_side_after_topology_exist
         42,
     )
     .unwrap();
-    router.tx(pkt).unwrap();
+    assert!(router.tx(pkt).is_err());
 
     assert!(seen.lock().unwrap().is_empty());
 }
@@ -912,6 +912,34 @@ fn address_summary_does_not_replace_detailed_endpoint_ownership() {
         .expect("groundstation topology node");
     assert!(gateway.reachable_endpoints.is_empty());
     assert_eq!(groundstation.reachable_endpoints, vec![endpoint]);
+}
+
+#[test]
+fn minimal_discovery_ping_preserves_ownership_until_explicit_withdrawal() {
+    ensure_topology_test_schema();
+    let endpoint = DataEndpoint::named("RADIO");
+    let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+    let side = router.add_side_packet("gs", |_| Ok(()));
+    let relay = Relay::new(zero_clock());
+    let relay_side = relay.add_side_packet("gs", |_| Ok(()));
+    for endpoints in [vec![endpoint], vec![]] {
+        let topology = build_discovery_topology("GS", 1, &[TopologyBoardNode {
+            sender_id: "GS".into(), reachable_endpoints: endpoints.clone(),
+            reachable_timesync_sources: vec![], connections: vec![],
+        }]).unwrap();
+        router.rx_from_side(&topology, side).unwrap();
+        relay.rx_from_side(relay_side, topology).unwrap();
+        let ping = build_discovery_announce("GS", 2, &[]).unwrap();
+        router.rx_from_side(&ping, side).unwrap();
+        relay.rx_from_side(relay_side, ping).unwrap();
+        relay.process_all_queues().unwrap();
+        for snapshot in [router.export_topology(), relay.export_topology()] {
+            let board = snapshot.routes[0].announcers[0].routers.iter()
+                .find(|board| board.sender_id == "GS").unwrap();
+            assert_eq!(board.reachable_endpoints, endpoints,
+                "empty keepalive must not erase ownership; explicit topology must still withdraw it");
+        }
+    }
 }
 
 #[test]
@@ -3742,7 +3770,7 @@ fn router_typed_routes_still_respect_base_route_disables() {
         1,
     )
     .unwrap();
-    router.tx(gps_pkt).unwrap();
+    assert!(router.tx(gps_pkt).is_err());
 
     assert!(seen_a.lock().unwrap().is_empty());
     assert!(seen_b.lock().unwrap().is_empty());

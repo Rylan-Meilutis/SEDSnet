@@ -1,4 +1,3 @@
-
 //! Tests for the packed relay fan-out behavior and timeout semantics.
 
 use crate::config::{DataEndpoint, DataType};
@@ -348,7 +347,7 @@ fn relay_packed_side_chunking_reassembles_for_fixed_size_links() {
 }
 
 #[test]
-fn relay_packed_side_templates_can_omit_unchanged_timestamps() {
+fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
     crate::tests::ensure_common_test_schema();
     use crate::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
 
@@ -459,7 +458,7 @@ fn relay_packed_side_templates_can_omit_unchanged_timestamps() {
     assert_eq!(
         side.side_transport_compact_omitted_timestamp_frames
             - side_before.side_transport_compact_omitted_timestamp_frames,
-        1
+        0
     );
 }
 
