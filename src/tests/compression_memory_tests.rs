@@ -1,4 +1,3 @@
-
 use crate::config::{DataEndpoint, DataType};
 use crate::packet::Packet;
 use crate::wire_format;

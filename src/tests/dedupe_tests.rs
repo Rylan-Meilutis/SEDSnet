@@ -24,11 +24,18 @@ fn best_effort_type() -> DataType {
     *TYPE.get_or_init(|| {
         crate::tests::ensure_common_test_schema();
         crate::config::register_data_type_with_description(
-            "DEDUPE_BEST_EFFORT_DATA", "compact transport regression fixture",
-            crate::MessageElement::Static(3, crate::MessageDataType::Float32, crate::MessageClass::Data),
+            "DEDUPE_BEST_EFFORT_DATA",
+            "compact transport regression fixture",
+            crate::MessageElement::Static(
+                3,
+                crate::MessageDataType::Float32,
+                crate::MessageClass::Data,
+            ),
             &[DataEndpoint::named("RADIO"), DataEndpoint::named("SD_CARD")],
-            crate::ReliableMode::None, 1,
-        ).unwrap()
+            crate::ReliableMode::None,
+            1,
+        )
+        .unwrap()
     })
 }
 

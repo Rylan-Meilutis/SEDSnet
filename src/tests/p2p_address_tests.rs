@@ -1,4 +1,3 @@
-
 use crate::{
     TelemetryResult,
     router::{AddressChange, AddressChangeReason, P2pStreamEventKind, Router, RouterConfig},

@@ -1,4 +1,3 @@
-
 use crate::config::{
     DataEndpoint, DataType, register_data_type_with_description, register_endpoint_with_description,
 };

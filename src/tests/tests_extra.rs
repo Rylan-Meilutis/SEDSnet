@@ -1,4 +1,3 @@
-
 //! Extra unit tests that cover previously-missing paths and invariants.
 //!
 //! These are white-box tests that exercise public APIs (and some

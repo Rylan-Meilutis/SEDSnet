@@ -1,4 +1,3 @@
-
 //! Additional coverage tests for router, packet, and packing logic.
 //! These tests complement `tests_extra` by covering boundary,
 //! error, and fast-path behaviors not previously exercised.

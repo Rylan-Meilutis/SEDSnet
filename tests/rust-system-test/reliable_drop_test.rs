@@ -3172,7 +3172,8 @@ mod reliable_drop_tests {
             .find(|side| side.side_name == "compact-can-fd")
             .expect("missing compact side stats");
         assert_eq!(
-            side.side_transport_compact_frames, 0,
+            side.side_transport_compact_frames,
+            0,
             "compact={}, omitted={}, full={}, received={}",
             side.side_transport_compact_frames,
             side.side_transport_compact_omitted_timestamp_frames,
@@ -3643,8 +3644,11 @@ mod reliable_drop_tests {
                 .unwrap()
                 .contains(&recovery_marker),
             "fresh command must arrive after restoring links; GS topology={:?}; Gateway topology={:?}; Actuator topology={:?}; GS runtime={:?}; Gateway runtime={:?}",
-            topology.gs.export_topology(), topology.gw.export_topology(), topology.actuator.export_topology(),
-            topology.gs.export_runtime_stats(), topology.gw.export_runtime_stats()
+            topology.gs.export_topology(),
+            topology.gw.export_topology(),
+            topology.actuator.export_topology(),
+            topology.gs.export_runtime_stats(),
+            topology.gw.export_runtime_stats()
         );
         eprintln!(
             "fault-injection ordered delivery failures: {}; post-recovery delivery: PASS",

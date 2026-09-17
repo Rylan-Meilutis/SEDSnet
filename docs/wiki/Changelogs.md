@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 4.0.33 highlights
+
+- Idle discovery expiry checks no longer clone route tables or rebuild unchanged summaries.
+- The optimization covers both routers and relays without changing discovery cadence or route expiry.
+- An allocation-counted regression requires zero allocations over 1,000 unchanged polls and verifies stale-peer removal.
+- Seven-board/GroundStation 600-second service-only and mixed-restart simulations pass without relaxing memory or command-response bounds. Hardware validation remains separate.
+
 ## Version 4.0.32 highlights
 
 - Bounded missing-baseline recovery restores downstream names after receiver restart or discovery packet loss.

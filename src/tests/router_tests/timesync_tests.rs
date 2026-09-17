@@ -1,4 +1,3 @@
-
 use crate::timesync::{
     build_timesync_request, build_timesync_response, compute_offset_delay, decode_timesync_request,
     decode_timesync_response,

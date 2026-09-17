@@ -2456,12 +2456,13 @@ impl Relay {
                 // leaking far-side topology as direct neighbors. Address
                 // allocation advertisements still cross transparent relays:
                 // static/requested address conflicts must be resolved globally.
-                if matches!(ty,
+                if matches!(
+                    ty,
                     crate::DataType::DiscoveryAnnounce
-                    | crate::DataType::DiscoveryTimeSyncSources
-                    | crate::DataType::DiscoveryTopology
-                    | crate::DataType::DiscoveryLinkCapabilities)
-                {
+                        | crate::DataType::DiscoveryTimeSyncSources
+                        | crate::DataType::DiscoveryTopology
+                        | crate::DataType::DiscoveryLinkCapabilities
+                ) {
                     return Ok(RemoteSidePlan::Target(Vec::new()));
                 }
                 let mut st = self.state.lock();
@@ -2981,15 +2982,22 @@ impl Relay {
 
     #[cfg(feature = "discovery")]
     fn prune_discovery_routes_locked(st: &mut RelayInner, now_ms: u64) -> bool {
-        let before = st.discovery_routes.clone();
+        // Match router maintenance: unchanged routes require no heap work.
+        let mut changed = false;
         st.discovery_routes.retain(|_, route| {
+            let before_peers = route.announcers.len();
             route.announcers.retain(|_, sender| {
                 now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
             });
-            Self::recompute_discovery_side_state(route);
-            !route.announcers.is_empty()
+            if before_peers != route.announcers.len() {
+                Self::recompute_discovery_side_state(route);
+                changed = true;
+            }
+            let keep = !route.announcers.is_empty();
+            changed |= !keep;
+            keep
         });
-        st.discovery_routes != before
+        changed
     }
 
     #[cfg(feature = "discovery")]
@@ -3443,9 +3451,15 @@ impl Relay {
                     route.announcers.iter().any(|(name, peer)| {
                         !peer.has_full_topology
                             && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
-                            && !route.announcers.values().any(|bridge| bridge.has_full_topology
-                                && now_ms.saturating_sub(bridge.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
-                                && bridge.topology_boards.iter().any(|board| board.sender_id == *name))
+                            && !route.announcers.values().any(|bridge| {
+                                bridge.has_full_topology
+                                    && now_ms.saturating_sub(bridge.last_seen_ms)
+                                        < DISCOVERY_ROUTE_TTL_MS
+                                    && bridge
+                                        .topology_boards
+                                        .iter()
+                                        .any(|board| board.sender_id == *name)
+                            })
                     })
                 })
                 .map(|(side, _)| *side)

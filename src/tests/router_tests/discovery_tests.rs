@@ -714,19 +714,48 @@ fn relay_discovery_keeps_downstream_nodes_behind_the_bridge() {
     let out = sent.clone();
     let relay = Relay::new(zero_clock());
     relay.set_sender("GB");
-    relay.add_side_packet("pico", move |p| { out.lock().unwrap().push(p.clone()); Ok(()) });
+    relay.add_side_packet("pico", move |p| {
+        out.lock().unwrap().push(p.clone());
+        Ok(())
+    });
     let can = relay.add_side_packet("can", |_| Ok(()));
-    relay.rx_from_side(can, build_discovery_topology("VB", 0, &[TopologyBoardNode {
-        sender_id: "VB".into(), reachable_endpoints: vec![DataEndpoint::named("RADIO")],
-        reachable_timesync_sources: vec![], connections: vec![],
-    }]).unwrap()).unwrap();
-    for _ in 0..8 { relay.process_all_queues().unwrap(); }
+    relay
+        .rx_from_side(
+            can,
+            build_discovery_topology(
+                "VB",
+                0,
+                &[TopologyBoardNode {
+                    sender_id: "VB".into(),
+                    reachable_endpoints: vec![DataEndpoint::named("RADIO")],
+                    reachable_timesync_sources: vec![],
+                    connections: vec![],
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    for _ in 0..8 {
+        relay.process_all_queues().unwrap();
+    }
     let packets = sent.lock().unwrap();
-    assert!(!packets.iter().any(|p| p.data_type() == DataType::DiscoveryTopology && p.sender() == "VB"),
-        "forwarding a downstream advertisement makes it falsely appear directly attached");
-    assert!(packets.iter().filter(|p| p.data_type() == DataType::DiscoveryTopology && p.sender() == "GB")
-        .any(|p| crate::discovery::decode_discovery_topology_update(p).unwrap().boards.iter().any(|b| b.sender_id == "VB")),
-        "the bridge must advertise its retained downstream topology instead");
+    assert!(
+        !packets
+            .iter()
+            .any(|p| p.data_type() == DataType::DiscoveryTopology && p.sender() == "VB"),
+        "forwarding a downstream advertisement makes it falsely appear directly attached"
+    );
+    assert!(
+        packets
+            .iter()
+            .filter(|p| p.data_type() == DataType::DiscoveryTopology && p.sender() == "GB")
+            .any(|p| crate::discovery::decode_discovery_topology_update(p)
+                .unwrap()
+                .boards
+                .iter()
+                .any(|b| b.sender_id == "VB")),
+        "the bridge must advertise its retained downstream topology instead"
+    );
 }
 
 #[test]

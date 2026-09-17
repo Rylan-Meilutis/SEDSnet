@@ -1,4 +1,3 @@
-
 //! Basic smoke tests for packet roundtrip, string formatting, and simple
 //! router send/receive paths.
 

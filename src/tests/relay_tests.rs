@@ -353,10 +353,18 @@ fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
     // Reliable packets intentionally carry self-describing headers. Exercise
     // timestamp compression with an explicitly best-effort schema instead.
     let data_type = crate::config::register_data_type_with_description(
-        "RELAY_BEST_EFFORT_TIMESTAMPS", "compact timestamp regression fixture",
-        crate::MessageElement::Static(3, crate::MessageDataType::Float32, crate::MessageClass::Data),
-        &[DataEndpoint::named("SD_CARD")], crate::ReliableMode::None, 1,
-    ).unwrap();
+        "RELAY_BEST_EFFORT_TIMESTAMPS",
+        "compact timestamp regression fixture",
+        crate::MessageElement::Static(
+            3,
+            crate::MessageDataType::Float32,
+            crate::MessageClass::Data,
+        ),
+        &[DataEndpoint::named("SD_CARD")],
+        crate::ReliableMode::None,
+        1,
+    )
+    .unwrap();
 
     let delivered = Arc::new(AtomicUsize::new(0));
     let delivered_c = delivered.clone();

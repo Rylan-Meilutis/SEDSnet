@@ -1,4 +1,3 @@
-
 //! Concurrency-focused tests that exercise Router’s thread-safety
 //! guarantees for logging, receiving, and processing.
 

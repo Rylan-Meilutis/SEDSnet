@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.0.33
+
+- Remove full route-table cloning from idle discovery expiry checks in routers
+  and relays. Recompute summaries only when a peer or managed-variable request
+  expires; keep active topology and normal discovery cadence unchanged.
+- Add a measured idle-maintenance regression: 1,000 unchanged polls perform
+  zero allocations while preserving routes, and expired peers are still removed.
+  The old router performed 73,000 allocations for that workload.
+- Validation: all seven firmware builds and two 600-second full-system soaks
+  passed, including repeated GroundStation-only and mixed avionics restarts,
+  all scheduled command/state responses, discovery, and memory thresholds.
+  Hardware validation remains separate; finite simulation is not a guarantee
+  of indefinite operation.
+
 ## 4.0.32
 
 - Recover a missing full topology baseline after restart or packet loss with a

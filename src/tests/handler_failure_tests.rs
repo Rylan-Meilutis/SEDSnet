@@ -1,4 +1,3 @@
-
 //! Tests around handler failures and how they generate/route
 //! `TELEMETRY_ERROR` packets.
 
