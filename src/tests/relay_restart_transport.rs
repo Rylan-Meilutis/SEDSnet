@@ -1,6 +1,106 @@
 use super::*;
 
 #[test]
+fn relay_chunk_identity_and_loss_are_bounded() {
+    crate::tests::ensure_common_test_schema();
+    let relay = Relay::new(Box::new(|| 0));
+    let side = relay.add_side_packed_with_options("CAN", |_| Ok(()), RelaySideOptions::default());
+    // Relay full frames include a leading one-byte template ID.
+    let a = Relay::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 181]);
+    let b = Relay::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 181]);
+    let first = relay
+        .split_side_transport_frame(side, a.clone(), 128)
+        .unwrap();
+    let repeat = relay.split_side_transport_frame(side, a, 128).unwrap();
+    let second = relay.split_side_transport_frame(side, b, 128).unwrap();
+    assert_eq!(&first[0][4..8], &repeat[0][4..8]);
+    assert_ne!(&first[0][4..8], &second[0][4..8]);
+    assert!(
+        relay
+            .decode_side_transport_frame(side, &first[0])
+            .unwrap()
+            .is_none()
+    );
+    let mut decoded = None;
+    for frame in second {
+        decoded = relay.decode_side_transport_frame(side, &frame).unwrap();
+    }
+    assert_eq!(decoded.unwrap().as_ref(), &[2; 180]);
+    for i in 0..1000u32 {
+        let mut data = vec![0; 180];
+        data[..4].copy_from_slice(&i.to_le_bytes());
+        let frame = Relay::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
+        let chunks = relay.split_side_transport_frame(side, frame, 128).unwrap();
+        relay.decode_side_transport_frame(side, &chunks[0]).unwrap();
+        assert!(relay.state.lock().side_transport[&side].rx_chunks.len() <= 4);
+    }
+}
+
+#[test]
+fn unacknowledged_topology_does_not_silence_relay_liveness() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let emitted = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let output = emitted.clone();
+    let relay = Relay::new(Box::new(move || clock.load(Ordering::Relaxed)));
+    let side = relay.add_side_packed_with_options(
+        "CAN",
+        move |frame| {
+            output.lock().unwrap().push(frame.to_vec());
+            Ok(())
+        },
+        RelaySideOptions {
+            reliable_enabled: true,
+            ..Default::default()
+        },
+    );
+    relay.announce_discovery().unwrap();
+    relay.process_tx_queue().unwrap();
+    assert!(
+        relay
+            .state
+            .lock()
+            .reliable_tx
+            .iter()
+            .any(|((s, ty), tx)| *s == side
+                && *ty == crate::DataType::DiscoveryTopology.as_u32()
+                && !tx.sent.is_empty())
+    );
+    emitted.lock().unwrap().clear();
+    for ms in (1_000..=60_000).step_by(1_000) {
+        now.store(ms, Ordering::Relaxed);
+        relay.poll_discovery().unwrap();
+        // Hold the baseline ACK outstanding; drain only new advertisements.
+        while let Some((src, dst, handler, opts, item)) = relay.pop_ready_tx_item() {
+            relay.send_tx_item(src, dst, handler, opts, item).unwrap();
+        }
+    }
+    let frames = emitted.lock().unwrap();
+    let types: Vec<_> = frames
+        .iter()
+        .map(|frame| wire_format::peek_envelope(frame).unwrap().ty)
+        .collect();
+    let pings = types
+        .iter()
+        .filter(|ty| **ty == crate::DataType::DiscoveryAnnounce)
+        .count();
+    assert!(
+        (3..=5).contains(&pings),
+        "keepalives must continue at a bounded rate despite a lost topology ACK; got {pings}"
+    );
+    assert!(
+        types
+            .iter()
+            .all(|ty| *ty != crate::DataType::DiscoveryTopology)
+    );
+}
+
+#[test]
 fn zero_template_capacity_does_not_retain_timestamp_entries() {
     crate::tests::ensure_common_test_schema();
     let ty = crate::config::register_data_type_with_description(

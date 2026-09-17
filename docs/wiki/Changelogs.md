@@ -1,5 +1,13 @@
 # Changelogs
 
+## Version 4.0.34 highlights
+
+- Sender-seeded chunk content IDs prevent stale fragments from corrupting later packets.
+- Router and relay incomplete assemblies are bounded by count, inactivity, and bytes.
+- Discovery keepalives continue while topology ACKs are outstanding, without application fanout.
+- Hostname-addressed P2P/OTA targets can resolve through retained downstream topology.
+- Full built-in tests include the lost-chunk regression observed during FC debugging. Short hardware validation is not a guarantee of long-term operation.
+
 ## Version 4.0.33 highlights
 
 - Idle discovery expiry checks no longer clone route tables or rebuild unchanged summaries.

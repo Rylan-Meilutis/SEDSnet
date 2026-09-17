@@ -4,7 +4,11 @@ SEDSnet is a Rust telemetry transport and logging library with a shared schema, 
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 
-The current release is v4.0.33. Idle discovery checks avoid heap allocation in
+The current release is v4.0.34. Chunk transfer IDs no longer use the constant
+CRC residue of CRC-appended frames, preventing lost fragments from poisoning
+later traffic from the same sender. Incomplete assemblies are bounded and
+discovery keepalives are independent of pending topology ACKs.
+Idle discovery checks avoid heap allocation in
 routers and relays while preserving route expiry and topology updates.
 Restarted peers request missing full topology baselines with bounded retries, and adjacent routers and relays answer without waiting for master election. Untrusted discovery counts are bounded by the remaining wire payload
 before collection storage is reserved, so malformed or truncated traffic is rejected instead of

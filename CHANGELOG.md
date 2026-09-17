@@ -1,5 +1,27 @@
 # Changelog
 
+## 4.0.34
+
+- Fix side-transport transfer-ID collisions: CRC over a frame including its CRC
+  has a constant residue and allowed missing fragments to corrupt later packets
+  from the same sender. Use a sender-seeded content hash for routers and relays;
+  bound incomplete transfers by count, bytes, and inactivity. Regression
+  reproduces the transfer ID observed in an FC CAN receive failure.
+- Keep router and relay discovery liveness independent of outstanding topology
+  ACKs. Send bounded lightweight keepalives while retaining the pending baseline;
+  do not lengthen route expiry or flood application traffic. Regression covers
+  withheld ACKs, retained downstream endpoints, and expiry after real silence.
+- Resolve hostname-addressed P2P/OTA targets from retained downstream topology,
+  not only link-local address advertisements. Keep unknown/colliding identities
+  rejected and expire topology before lookup; no broadcast-routing override.
+- Add a regression reproducing the missing downstream OTA targets with no
+  direct address-book entry and checking stream initiation and route expiry.
+- Validation: full built-in test script passed before release preparation,
+  including 376 Rust tests and embedded-memory/API checks. RF and FC Release
+  factory images built successfully. A two-minute post-flash hardware window
+  showed FC telemetry near 5 Hz with no inter-sample gap above 495 ms; this is
+  not a long-duration hardware qualification.
+
 ## 4.0.33
 
 - Remove full route-table cloning from idle discovery expiry checks in routers

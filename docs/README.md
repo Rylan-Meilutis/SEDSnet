@@ -31,6 +31,7 @@ Start here:
 - [Telemetry schema](wiki/Technical-Telemetry-Schema.md)
 - [Wire format](wiki/Technical-Wire-Format.md)
 - [Discovery and internal formats](wiki/Technical-Discovery-and-Internal-Formats.md)
+- [Discovery liveness with outstanding ACKs](discovery-liveness.md)
 - [Router details](wiki/Technical-Router-Details.md)
 - [Queues and memory](wiki/Technical-Queues-and-Memory.md)
 - [Packet details](wiki/Technical-Packet-Details.md)

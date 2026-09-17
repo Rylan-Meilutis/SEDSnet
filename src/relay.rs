@@ -492,6 +492,7 @@ struct DiscoverySideState {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SideChunkAssembly {
+    last_seen_ms: u64,
     total: u16,
     received: BTreeMap<u16, Arc<[u8]>>,
 }
@@ -506,7 +507,6 @@ struct SideTransportState {
     rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
     rx_last_timestamps: BTreeMap<u32, u64>,
     rx_chunks: BTreeMap<u32, SideChunkAssembly>,
-    next_chunk_id: u32,
     next_template_id: u32,
 }
 
@@ -3266,16 +3266,13 @@ impl Relay {
                 if requested_side.is_some_and(|requested| requested != side_id) {
                     continue;
                 }
-                if skip_in_flight_sides
+                let discovery_in_flight = skip_in_flight_sides
                     && st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
                         *pending_side == side_id
                             && !tx_state.sent.is_empty()
                             && crate::DataType::try_from_u32(*ty)
                                 .is_some_and(discovery::is_discovery_type)
-                    })
-                {
-                    continue;
-                }
+                    });
                 if !self.route_allowed_locked(
                     &st,
                     None,
@@ -3284,8 +3281,21 @@ impl Relay {
                 ) {
                     continue;
                 }
-                let Some(level) = Self::discovery_level_for_side_locked(&mut st, side_id, now_ms)
-                else {
+                // Preserve neighbor liveness even if a reliable discovery
+                // baseline is still waiting for its hop ACK.
+                let level = if discovery_in_flight {
+                    let throttle = st.discovery_side_throttle.entry(side_id).or_default();
+                    if now_ms < throttle.next_ping_ms {
+                        None
+                    } else {
+                        throttle.next_ping_ms =
+                            now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
+                        Some(DiscoveryAdvertiseLevel::MinimalPing)
+                    }
+                } else {
+                    Self::discovery_level_for_side_locked(&mut st, side_id, now_ms)
+                };
+                let Some(level) = level else {
                     continue;
                 };
                 let capabilities = opts.link_capabilities();
@@ -3519,7 +3529,10 @@ impl Relay {
                         && !tx_state.sent.is_empty()
                         && crate::DataType::try_from_u32(*ty)
                             .is_some_and(discovery::is_discovery_type)
-                })
+                }) || st
+                    .discovery_side_throttle
+                    .get(&side_id)
+                    .is_none_or(|throttle| now_ms >= throttle.next_ping_ms)
             });
             if !st.sides.iter().any(|side| side.is_some()) || !has_any {
                 return Ok(recovering);
@@ -5376,14 +5389,10 @@ impl Relay {
             return Err(TelemetryError::BadArg);
         }
         let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
-        let mut st = self.state.lock();
-        let side_state = st
-            .side_transport
-            .get_mut(&side)
-            .ok_or(TelemetryError::BadArg)?;
-        let transfer_id = side_state.next_chunk_id.wrapping_add(1).max(1);
-        side_state.next_chunk_id = transfer_id;
-        drop(st);
+        let _ = side;
+        let seed = hash_bytes_u64(0x517C_C1B7_2722_0A95, self.sender_arc().as_bytes());
+        let hash = hash_bytes_u64(seed, frame.as_ref());
+        let transfer_id = ((hash >> 32) as u32 ^ hash as u32).max(1);
 
         let total = frame.len().div_ceil(payload_budget);
         let total_u16 =
@@ -5661,14 +5670,52 @@ impl Relay {
                 let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let index = u16::from_le_bytes([body[4], body[5]]);
                 let total = u16::from_le_bytes([body[6], body[7]]);
+                if total == 0 || index >= total {
+                    return Err(TelemetryError::Unpack("invalid side chunk index"));
+                }
                 let payload = Arc::<[u8]>::from(&body[8..]);
                 let assembled = {
                     let mut st = self.state.lock();
+                    let budget = st.memory.max_queue_budget;
+                    let now_ms = self.clock.now_ms();
                     let side_state = st
                         .side_transport
                         .get_mut(&side)
                         .ok_or(TelemetryError::BadArg)?;
+                    side_state
+                        .rx_chunks
+                        .retain(|_, assembly| now_ms.saturating_sub(assembly.last_seen_ms) <= 2000);
+                    if !side_state.rx_chunks.contains_key(&transfer_id)
+                        && side_state.rx_chunks.len() >= 4
+                        && let Some(oldest) = side_state
+                            .rx_chunks
+                            .iter()
+                            .min_by_key(|(_, a)| a.last_seen_ms)
+                            .map(|(id, _)| *id)
+                    {
+                        side_state.rx_chunks.remove(&oldest);
+                    }
+                    // Include a conservative allowance for each map entry,
+                    // so tiny/empty fragments cannot bypass the byte bound.
+                    let buffered: usize = side_state
+                        .rx_chunks
+                        .values()
+                        .flat_map(|a| a.received.values())
+                        .map(|p| p.len().saturating_add(64))
+                        .sum();
+                    let duplicate = side_state
+                        .rx_chunks
+                        .get(&transfer_id)
+                        .is_some_and(|a| a.received.contains_key(&index));
+                    if usize::from(total) > budget / 64
+                        || (!duplicate
+                            && buffered.saturating_add(payload.len()).saturating_add(64) > budget)
+                    {
+                        side_state.rx_chunks.remove(&transfer_id);
+                        return Err(TelemetryError::PacketTooLarge("side chunk receive budget"));
+                    }
                     let entry = side_state.rx_chunks.entry(transfer_id).or_default();
+                    entry.last_seen_ms = now_ms;
                     if entry.total == 0 {
                         entry.total = total;
                     } else if entry.total != total {
