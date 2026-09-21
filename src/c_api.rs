@@ -11,6 +11,7 @@
 //! Router sides are registered explicitly (like the Relay), and RX can specify
 //! an ingress side for relay-style behavior.
 
+use crate::binding_options::{relay_side_options_for_profile, router_side_options_for_profile};
 #[cfg(feature = "timesync")]
 use crate::timesync::{NetworkTimeReading, PartialNetworkTime, TimeSyncConfig};
 use crate::{
@@ -299,86 +300,6 @@ fn side_transport_profile_from_code(code: u32) -> TelemetryResult<SideTransportP
         SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE => Ok(SideTransportProfile::Ipv4Like),
         _ => Err(TelemetryError::BadArg),
     }
-}
-
-fn router_side_options_for_profile(
-    reliable_enabled: bool,
-    profile: SideTransportProfile,
-    max_frame_bytes: usize,
-    compact_header_target_bytes: usize,
-    max_side_transport_templates: usize,
-) -> RouterSideOptions {
-    let mut opts = RouterSideOptions {
-        reliable_enabled,
-        max_frame_bytes,
-        max_side_transport_templates,
-        side_transport_profile: profile,
-        ..RouterSideOptions::default()
-    };
-    match profile {
-        SideTransportProfile::Canonical => {}
-        SideTransportProfile::Template => {
-            opts.header_template_enabled = true;
-        }
-        SideTransportProfile::Ipv6Like => {
-            opts.header_template_enabled = true;
-            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
-                crate::router::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
-            } else {
-                compact_header_target_bytes
-            };
-        }
-        SideTransportProfile::Ipv4Like => {
-            opts.header_template_enabled = true;
-            opts.omit_unchanged_compact_timestamps = true;
-            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
-                crate::router::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
-            } else {
-                compact_header_target_bytes
-            };
-        }
-    }
-    opts
-}
-
-fn relay_side_options_for_profile(
-    reliable_enabled: bool,
-    profile: SideTransportProfile,
-    max_frame_bytes: usize,
-    compact_header_target_bytes: usize,
-    max_side_transport_templates: usize,
-) -> RelaySideOptions {
-    let mut opts = RelaySideOptions {
-        reliable_enabled,
-        max_frame_bytes,
-        max_side_transport_templates,
-        side_transport_profile: profile,
-        ..RelaySideOptions::default()
-    };
-    match profile {
-        SideTransportProfile::Canonical => {}
-        SideTransportProfile::Template => {
-            opts.header_template_enabled = true;
-        }
-        SideTransportProfile::Ipv6Like => {
-            opts.header_template_enabled = true;
-            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
-                crate::relay::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
-            } else {
-                compact_header_target_bytes
-            };
-        }
-        SideTransportProfile::Ipv4Like => {
-            opts.header_template_enabled = true;
-            opts.omit_unchanged_compact_timestamps = true;
-            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
-                crate::relay::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
-            } else {
-                compact_header_target_bytes
-            };
-        }
-    }
-    opts
 }
 
 // ============================================================================
@@ -1472,6 +1393,41 @@ struct SedsRouterNewOptions {
     memory: RuntimeMemoryConfig,
 }
 
+/// Keeps endpoint storage alive for the entire callback, including the heap fallback.
+fn with_packet_view<T>(pkt: &Packet, callback: impl FnOnce(&SedsPacketView) -> T) -> T {
+    let mut stack_eps: [u32; STACK_EPS] = [0; STACK_EPS];
+    let (endpoints_ptr, num_endpoints, _owned_vec): (*const u32, usize, Option<Vec<u32>>) =
+        if pkt.endpoints().len() <= STACK_EPS {
+            for (i, e) in pkt.endpoints().iter().enumerate() {
+                stack_eps[i] = e.as_u32();
+            }
+            (stack_eps.as_ptr(), pkt.endpoints().len(), None)
+        } else {
+            let mut eps_u32 = Vec::with_capacity(pkt.endpoints().len());
+            for e in pkt.endpoints().iter() {
+                eps_u32.push(e.as_u32());
+            }
+            let ptr = eps_u32.as_ptr();
+            let len = eps_u32.len();
+            (ptr, len, Some(eps_u32))
+        };
+
+    let sender_bytes = pkt.sender().as_bytes();
+    let view = SedsPacketView {
+        ty: pkt.data_type().as_u32(),
+        data_size: pkt.data_size(),
+        sender: sender_bytes.as_ptr() as *const c_char,
+        sender_len: sender_bytes.len(),
+        endpoints: endpoints_ptr,
+        num_endpoints,
+        timestamp: pkt.timestamp(),
+        payload: pkt.payload().as_ptr(),
+        payload_len: pkt.payload().len(),
+    };
+
+    callback(&view)
+}
+
 fn seds_router_new_impl(opts: SedsRouterNewOptions) -> *mut SedsRouter {
     // Build handler vector
     let mut v: Vec<EndpointHandler> = Vec::new();
@@ -1490,42 +1446,9 @@ fn seds_router_new_impl(opts: SedsRouterNewOptions) -> *mut SedsRouter {
             // If a PACKET handler is provided, register it
             if let Some(cb_fn) = desc.packet_handler {
                 let eh = EndpointHandler::new_packet_handler(endpoint, move |pkt: &Packet| {
-                    // Fast path: up to STACK_EPS endpoints, no heap allocation
-                    let mut stack_eps: [u32; STACK_EPS] = [0; STACK_EPS];
-
-                    let (endpoints_ptr, num_endpoints, _owned_vec): (
-                        *const u32,
-                        usize,
-                        Option<Vec<u32>>,
-                    ) = if pkt.endpoints().len() <= STACK_EPS {
-                        for (i, e) in pkt.endpoints().iter().enumerate() {
-                            stack_eps[i] = e.as_u32();
-                        }
-                        (stack_eps.as_ptr(), pkt.endpoints().len(), None)
-                    } else {
-                        let mut eps_u32 = Vec::with_capacity(pkt.endpoints().len());
-                        for e in pkt.endpoints().iter() {
-                            eps_u32.push(e.as_u32());
-                        }
-                        let ptr = eps_u32.as_ptr();
-                        let len = eps_u32.len();
-                        (ptr, len, Some(eps_u32))
-                    };
-
-                    let sender_bytes = pkt.sender().as_bytes();
-                    let view = SedsPacketView {
-                        ty: pkt.data_type().as_u32(),
-                        data_size: pkt.data_size(),
-                        sender: sender_bytes.as_ptr() as *const c_char,
-                        sender_len: sender_bytes.len(),
-                        endpoints: endpoints_ptr,
-                        num_endpoints,
-                        timestamp: pkt.timestamp(),
-                        payload: pkt.payload().as_ptr(),
-                        payload_len: pkt.payload().len(),
-                    };
-
-                    let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+                    let code = with_packet_view(pkt, |view| {
+                        cb_fn(view as *const _, user_addr as *mut c_void)
+                    });
                     if code == status_from_result_code(SedsResult::SedsOk) {
                         Ok(())
                     } else {
@@ -2126,37 +2049,9 @@ pub extern "C" fn seds_router_on_network_variable_update(
     let user_addr = user as usize;
     let router = unsafe { &(*r).inner };
     ok_or_status(router.on_network_variable_update(ty, move |pkt: &Packet| {
-        let mut stack_eps: [u32; STACK_EPS] = [0; STACK_EPS];
-        let (endpoints_ptr, num_endpoints, _owned_vec): (*const u32, usize, Option<Vec<u32>>) =
-            if pkt.endpoints().len() <= STACK_EPS {
-                for (i, e) in pkt.endpoints().iter().enumerate() {
-                    stack_eps[i] = e.as_u32();
-                }
-                (stack_eps.as_ptr(), pkt.endpoints().len(), None)
-            } else {
-                let mut eps_u32 = Vec::with_capacity(pkt.endpoints().len());
-                for e in pkt.endpoints().iter() {
-                    eps_u32.push(e.as_u32());
-                }
-                let ptr = eps_u32.as_ptr();
-                let len = eps_u32.len();
-                (ptr, len, Some(eps_u32))
-            };
-
-        let sender_bytes = pkt.sender().as_bytes();
-        let view = SedsPacketView {
-            ty: pkt.data_type().as_u32(),
-            data_size: pkt.data_size(),
-            sender: sender_bytes.as_ptr() as *const c_char,
-            sender_len: sender_bytes.len(),
-            endpoints: endpoints_ptr,
-            num_endpoints,
-            timestamp: pkt.timestamp(),
-            payload: pkt.payload().as_ptr(),
-            payload_len: pkt.payload().len(),
-        };
-
-        let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+        let code = with_packet_view(pkt, |view| {
+            cb_fn(view as *const _, user_addr as *mut c_void)
+        });
         if code == status_from_result_code(SedsResult::SedsOk) {
             Ok(())
         } else {
@@ -2779,37 +2674,9 @@ pub extern "C" fn seds_router_add_side_packet(
     let user_addr = tx_user as usize;
 
     let tx_closure = move |pkt: &Packet| -> TelemetryResult<()> {
-        let mut stack_eps: [u32; STACK_EPS] = [0; STACK_EPS];
-        let (endpoints_ptr, num_endpoints, _owned_vec): (*const u32, usize, Option<Vec<u32>>) =
-            if pkt.endpoints().len() <= STACK_EPS {
-                for (i, e) in pkt.endpoints().iter().enumerate() {
-                    stack_eps[i] = e.as_u32();
-                }
-                (stack_eps.as_ptr(), pkt.endpoints().len(), None)
-            } else {
-                let mut eps_u32 = Vec::with_capacity(pkt.endpoints().len());
-                for e in pkt.endpoints().iter() {
-                    eps_u32.push(e.as_u32());
-                }
-                let ptr = eps_u32.as_ptr();
-                let len = eps_u32.len();
-                (ptr, len, Some(eps_u32))
-            };
-
-        let sender_bytes = pkt.sender().as_bytes();
-        let view = SedsPacketView {
-            ty: pkt.data_type().as_u32(),
-            data_size: pkt.data_size(),
-            sender: sender_bytes.as_ptr() as *const c_char,
-            sender_len: sender_bytes.len(),
-            endpoints: endpoints_ptr,
-            num_endpoints,
-            timestamp: pkt.timestamp(),
-            payload: pkt.payload().as_ptr(),
-            payload_len: pkt.payload().len(),
-        };
-
-        let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+        let code = with_packet_view(pkt, |view| {
+            cb_fn(view as *const _, user_addr as *mut c_void)
+        });
         if code == status_from_result_code(SedsResult::SedsOk) {
             Ok(())
         } else {
@@ -4129,37 +3996,9 @@ pub extern "C" fn seds_relay_add_side_packet(
     let user_addr = tx_user as usize;
 
     let tx_closure = move |pkt: &Packet| -> TelemetryResult<()> {
-        let mut stack_eps: [u32; STACK_EPS] = [0; STACK_EPS];
-        let (endpoints_ptr, num_endpoints, _owned_vec): (*const u32, usize, Option<Vec<u32>>) =
-            if pkt.endpoints().len() <= STACK_EPS {
-                for (i, e) in pkt.endpoints().iter().enumerate() {
-                    stack_eps[i] = e.as_u32();
-                }
-                (stack_eps.as_ptr(), pkt.endpoints().len(), None)
-            } else {
-                let mut eps_u32 = Vec::with_capacity(pkt.endpoints().len());
-                for e in pkt.endpoints().iter() {
-                    eps_u32.push(e.as_u32());
-                }
-                let ptr = eps_u32.as_ptr();
-                let len = eps_u32.len();
-                (ptr, len, Some(eps_u32))
-            };
-
-        let sender_bytes = pkt.sender().as_bytes();
-        let view = SedsPacketView {
-            ty: pkt.data_type().as_u32(),
-            data_size: pkt.data_size(),
-            sender: sender_bytes.as_ptr() as *const c_char,
-            sender_len: sender_bytes.len(),
-            endpoints: endpoints_ptr,
-            num_endpoints,
-            timestamp: pkt.timestamp(),
-            payload: pkt.payload().as_ptr(),
-            payload_len: pkt.payload().len(),
-        };
-
-        let code = cb_fn(&view as *const _, user_addr as *mut c_void);
+        let code = with_packet_view(pkt, |view| {
+            cb_fn(view as *const _, user_addr as *mut c_void)
+        });
         if code == status_from_result_code(SedsResult::SedsOk) {
             Ok(())
         } else {
@@ -5887,6 +5726,42 @@ mod tests {
     use serde_json::Value;
     use std::ffi::CStr;
     use std::sync::Mutex;
+
+    #[test]
+    fn packet_view_preserves_fields_across_endpoint_storage_boundary() {
+        crate::tests::ensure_common_test_schema();
+        for count in [1, STACK_EPS, STACK_EPS + 1] {
+            let endpoints: Vec<_> = (0..count as u32).map(DataEndpoint).collect();
+            let pkt = Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[4.0, 5.0, 6.0],
+                &endpoints,
+                42,
+            )
+            .unwrap();
+            with_packet_view(&pkt, |view| {
+                assert_eq!(view.ty, pkt.data_type().as_u32());
+                assert_eq!(view.data_size, pkt.data_size());
+                assert_eq!(view.timestamp, 42);
+                assert_eq!(view.num_endpoints, count);
+                // All borrowed buffers must remain valid during the callback.
+                unsafe {
+                    assert_eq!(
+                        slice::from_raw_parts(view.endpoints, view.num_endpoints),
+                        (0..count as u32).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        slice::from_raw_parts(view.sender.cast::<u8>(), view.sender_len),
+                        pkt.sender().as_bytes()
+                    );
+                    assert_eq!(
+                        slice::from_raw_parts(view.payload, view.payload_len),
+                        pkt.payload()
+                    );
+                }
+            });
+        }
+    }
 
     struct TestClock {
         now_ms: Arc<AtomicU64>,

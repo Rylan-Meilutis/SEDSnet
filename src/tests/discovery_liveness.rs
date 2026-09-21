@@ -10,10 +10,13 @@ fn lost_chunk_cannot_poison_later_frames_from_same_router() {
     let rf = Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), Box::new(|| 0));
     let fc = Router::new_with_clock(RouterConfig::new([]).with_sender("FC"), Box::new(|| 0));
     let side = fc.add_side_packed_with_options("CAN", |_| Ok(()), RouterSideOptions::default());
-    let first = Router::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 180]);
-    let second = Router::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 180]);
+    let first = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 180]);
+    let second = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 180]);
     // CRC including the appended CRC has a constant residue: it is NOT an ID.
-    assert_eq!(Router::crc32_bytes(&first), Router::crc32_bytes(&second));
+    assert_eq!(
+        crate::side_transport::crc32_bytes(&first),
+        crate::side_transport::crc32_bytes(&second)
+    );
     let a = rf.split_side_transport_frame(0, first, 128).unwrap();
     let b = rf.split_side_transport_frame(0, second, 128).unwrap();
     assert_ne!(
@@ -42,7 +45,7 @@ fn incomplete_side_transfers_stay_bounded_under_repeated_loss() {
     for i in 0..1000u32 {
         let mut data = vec![0; 180];
         data[..4].copy_from_slice(&i.to_le_bytes());
-        let frame = Router::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
+        let frame = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
         let chunks = router.split_side_transport_frame(side, frame, 128).unwrap();
         assert!(
             router

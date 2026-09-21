@@ -8,6 +8,14 @@
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
 
+use crate::side_transport::{
+    SIDE_TRANSPORT_CHUNK_OVERHEAD, SIDE_TRANSPORT_FLAG_PACKET_NONCE, SIDE_TRANSPORT_KIND_CHUNK,
+    SIDE_TRANSPORT_KIND_COMPACT, SIDE_TRANSPORT_KIND_COMPACT_DELTA,
+    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP, SIDE_TRANSPORT_KIND_FULL, SideCompactTimestampMode,
+    SideHeaderTemplate, extract_side_header_template, parse_side_transport_wrapper,
+    read_uleb128_local, reconstruct_side_compact_frame, wrap_side_transport_frame,
+    write_uleb128_local,
+};
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
@@ -37,7 +45,7 @@ mod compact_summary_tests {
         let clock = now.clone();
         let router = Router::new_with_clock(
             RouterConfig::new([]),
-            Box::new(move || clock.load(core::sync::atomic::Ordering::Relaxed)),
+            Box::new(move || clock.load(Ordering::Relaxed)),
         );
         let capacity = runtime_reliable_max_end_to_end_pending().max(1);
         for index in 0..capacity {
@@ -77,10 +85,7 @@ mod compact_summary_tests {
                 .unwrap()
                 .retries = runtime_reliable_max_retries();
         }
-        now.store(
-            runtime_reliable_retransmit_ms(),
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
         assert!(router.process_end_to_end_reliable_timeouts().is_err());
         assert!(router.state.lock().end_to_end_reliable_tx.is_empty());
     }
@@ -192,29 +197,14 @@ use core::fmt::{Debug, Formatter};
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
 /// Logical side index (CAN, UART, RADIO, etc.)
 pub type RouterSideId = usize;
 
-const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
-const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
-const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
-const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
-const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
-const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
-const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
-const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
-const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
-const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
-const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
 const CONTROL_SLOW_LINK_CAPACITY_BPS: u64 = 512;
-const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = 3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
 const SIDE_TIMESTAMP_POLICY_WORDS: usize = ((crate::MAX_VALUE_DATA_TYPE as usize) + 1).div_ceil(64);
-const SIDE_TRANSPORT_EP_BITMAP_BITS: usize = (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
-const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
 pub const IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES: usize = 20;
 pub const IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES: usize = 40;
 pub const DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT: usize = 64;
@@ -249,16 +239,6 @@ impl SideTransportProfile {
             Self::Ipv4Like => discovery::LINK_PROFILE_IPV4_LIKE,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SideHeaderTemplate {
-    hash: u64,
-    base_flags: u8,
-    prefix: Arc<[u8]>,
-    between: Arc<[u8]>,
-    reliable_flags: Option<u8>,
-    reliable_compact: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -366,17 +346,6 @@ impl SideTransportState {
     }
 }
 
-type SideTemplateExtract<'a> = (
-    SideHeaderTemplate,
-    DataType,
-    u8,
-    u64,
-    u64,
-    u16,
-    Option<(u32, u32)>,
-    &'a [u8],
-);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactTimestampOmissionPolicy {
     all: bool,
@@ -435,13 +404,6 @@ impl Default for CompactTimestampOmissionPolicy {
     fn default() -> Self {
         Self::none()
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SideCompactTimestampMode {
-    Absolute,
-    Delta,
-    Omitted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6920,257 +6882,6 @@ impl Router {
         Ok(())
     }
 
-    #[inline]
-    fn crc32_bytes(data: &[u8]) -> u32 {
-        let mut hasher = Crc32Hasher::new();
-        hasher.update(data);
-        hasher.finalize()
-    }
-
-    fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
-        let mut result = 0u64;
-        let mut shift = 0u32;
-        for _ in 0..10 {
-            let byte = *buf.get(*off).ok_or(TelemetryError::Unpack("short read"))?;
-            *off += 1;
-            result |= u64::from(byte & 0x7F) << shift;
-            if (byte & 0x80) == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-        }
-        Err(TelemetryError::Unpack("uleb128 too long"))
-    }
-
-    fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
-        loop {
-            let mut byte = (value & 0x7F) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
-    }
-
-    fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
-        let mut out = Vec::with_capacity(
-            SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES,
-        );
-        out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
-        out.push(kind);
-        out.extend_from_slice(body);
-        let crc = Self::crc32_bytes(&out);
-        out.extend_from_slice(&crc.to_le_bytes());
-        Arc::from(out)
-    }
-
-    fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
-        if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES {
-            return Ok(None);
-        }
-        if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
-            return Ok(None);
-        }
-        let data_len = bytes.len() - wire_format::CRC32_BYTES;
-        let expected = u32::from_le_bytes([
-            bytes[data_len],
-            bytes[data_len + 1],
-            bytes[data_len + 2],
-            bytes[data_len + 3],
-        ]);
-        let data = &bytes[..data_len];
-        if Self::crc32_bytes(data) != expected {
-            return Err(TelemetryError::Unpack("side transport crc32 mismatch"));
-        }
-        let kind = data[SIDE_TRANSPORT_MAGIC.len()];
-        Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
-    }
-
-    fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideTemplateExtract<'_>> {
-        if bytes.len() < wire_format::CRC32_BYTES + 4 {
-            return Err(TelemetryError::Unpack("short buffer"));
-        }
-        let data_len = bytes.len() - wire_format::CRC32_BYTES;
-        let data = &bytes[..data_len];
-        let mut off = 0usize;
-        let flags = *data
-            .get(off)
-            .ok_or(TelemetryError::Unpack("short prelude"))?;
-        off += 1;
-        off += 1; // NEP
-        let ty_end_start = off;
-        let ty_u64 = Self::read_uleb128_local(data, &mut off)?;
-        let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
-        if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
-            return Err(TelemetryError::Unpack("bad data type"));
-        }
-        let ty = DataType(ty_u32);
-        let data_size_off = off;
-        let data_size = Self::read_uleb128_local(data, &mut off)?;
-        let _timestamp_off = off;
-        let timestamp = Self::read_uleb128_local(data, &mut off)?;
-        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-            u16::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
-        } else {
-            0
-        };
-        let between_start = off;
-        let _source_address = u32::try_from(Self::read_uleb128_local(data, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("source address too large"))?;
-        let endpoint_bitmap_bytes = if (flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT) != 0 {
-            SIDE_TRANSPORT_EP_BITMAP_BYTES
-        } else {
-            0
-        };
-        if data.len() < off + endpoint_bitmap_bytes {
-            return Err(TelemetryError::Unpack("short buffer"));
-        }
-        off += endpoint_bitmap_bytes;
-        if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
-            let contract_len = usize::try_from(Self::read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
-            if data.len() < off + contract_len {
-                return Err(TelemetryError::Unpack("short buffer"));
-            }
-            off += contract_len;
-        }
-        let reliable_span = wire_format::reliable_header_span(bytes)?;
-        let (reliable_flags, reliable_seq_ack, reliable_compact, payload_off) =
-            if let Some((rel_off, rel_len, hdr)) = reliable_span {
-                if data.len() < rel_off + rel_len {
-                    return Err(TelemetryError::Unpack("short buffer"));
-                }
-                (
-                    Some(hdr.flags),
-                    Some((hdr.seq, hdr.ack)),
-                    (flags & SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER) != 0,
-                    rel_off + rel_len,
-                )
-            } else {
-                (None, None, false, off)
-            };
-        if payload_off > data.len() {
-            return Err(TelemetryError::Unpack("short buffer"));
-        }
-        let payload = &data[payload_off..];
-        let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
-        let between_end = reliable_span
-            .map(|(rel_off, _, _)| rel_off)
-            .unwrap_or(payload_off);
-        let between = Arc::<[u8]>::from(&data[between_start..between_end]);
-        let base_flags =
-            flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
-        let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
-        hash = hash_bytes_u64(hash, &[base_flags]);
-        hash = hash_bytes_u64(hash, &prefix);
-        hash = hash_bytes_u64(hash, &between);
-        if let Some(rel_flags) = reliable_flags {
-            hash = hash_bytes_u64(hash, &[rel_flags]);
-        }
-        let template = SideHeaderTemplate {
-            hash,
-            base_flags,
-            prefix,
-            between,
-            reliable_flags,
-            reliable_compact,
-        };
-        let _ = ty_end_start;
-        Ok((
-            template,
-            ty,
-            flags,
-            data_size,
-            timestamp,
-            nonce,
-            reliable_seq_ack,
-            payload,
-        ))
-    }
-
-    fn reconstruct_side_compact_frame(
-        template: &SideHeaderTemplate,
-        body: &[u8],
-        timestamp_mode: SideCompactTimestampMode,
-        timestamp_base: Option<u64>,
-    ) -> TelemetryResult<(Arc<[u8]>, u64)> {
-        if body.is_empty() {
-            return Err(TelemetryError::Unpack("short side compact frame"));
-        }
-        let mut off = 0usize;
-        let flags = body[off];
-        off += 1;
-        if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
-            != template.base_flags
-        {
-            return Err(TelemetryError::Unpack("side compact flags mismatch"));
-        }
-        let data_size = Self::read_uleb128_local(body, &mut off)?;
-        let timestamp = match timestamp_mode {
-            SideCompactTimestampMode::Absolute => Self::read_uleb128_local(body, &mut off)?,
-            SideCompactTimestampMode::Delta => {
-                let timestamp_field = Self::read_uleb128_local(body, &mut off)?;
-                let base = timestamp_base.ok_or(TelemetryError::Unpack(
-                    "missing side compact timestamp context",
-                ))?;
-                base.checked_add(timestamp_field)
-                    .ok_or(TelemetryError::Unpack(
-                        "side compact timestamp delta overflow",
-                    ))?
-            }
-            SideCompactTimestampMode::Omitted => timestamp_base.ok_or(TelemetryError::Unpack(
-                "missing side compact timestamp context",
-            ))?,
-        };
-        let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-            Some(Self::read_uleb128_local(body, &mut off)?)
-        } else {
-            None
-        };
-        let reliable_seq_ack = if template.reliable_flags.is_some() {
-            let seq = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("side compact reliable seq too large"))?;
-            let ack = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("side compact reliable ack too large"))?;
-            Some((seq, ack))
-        } else {
-            None
-        };
-        let payload = &body[off..];
-        let mut raw = Vec::with_capacity(
-            1 + template.prefix.len() + template.between.len() + payload.len() + 32,
-        );
-        raw.push(flags);
-        raw.extend_from_slice(&template.prefix);
-        Self::write_uleb128_local(data_size, &mut raw);
-        Self::write_uleb128_local(timestamp, &mut raw);
-        if let Some(nonce) = nonce {
-            Self::write_uleb128_local(nonce, &mut raw);
-        }
-        raw.extend_from_slice(&template.between);
-        if let Some(rel_flags) = template.reliable_flags {
-            let (seq, ack) =
-                reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
-            wire_format::write_reliable_header_encoded(
-                wire_format::ReliableHeader {
-                    flags: rel_flags,
-                    seq,
-                    ack,
-                },
-                template.reliable_compact,
-                &mut raw,
-            );
-        }
-        raw.extend_from_slice(payload);
-        let crc = Self::crc32_bytes(&raw);
-        raw.extend_from_slice(&crc.to_le_bytes());
-        Ok((Arc::from(raw), timestamp))
-    }
     fn split_side_transport_frame(
         &self,
         _side: RouterSideId,
@@ -7201,10 +6912,7 @@ impl Router {
             body.extend_from_slice(&(idx as u16).to_le_bytes());
             body.extend_from_slice(&total_u16.to_le_bytes());
             body.extend_from_slice(chunk);
-            frames.push(Self::wrap_side_transport_frame(
-                SIDE_TRANSPORT_KIND_CHUNK,
-                &body,
-            ));
+            frames.push(wrap_side_transport_frame(SIDE_TRANSPORT_KIND_CHUNK, &body));
         }
         Ok(frames)
     }
@@ -7226,7 +6934,7 @@ impl Router {
         let omitted_timestamp = false;
         let wrapped = if opts.header_template_enabled {
             let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
-                Self::extract_side_header_template(raw.as_ref())?;
+                extract_side_header_template(raw.as_ref())?;
             // Reliable frames never use dictionary compression. Send the native,
             // self-describing wire packet without allocating/retaining an unused
             // template on either peer. Raw packets are accepted by both decoders.
@@ -7234,9 +6942,9 @@ impl Router {
                 || reliable_seq_ack.is_some()
                 || matches!(
                     _ty,
-                    crate::DataType::ReliableAck
-                        | crate::DataType::ReliablePartialAck
-                        | crate::DataType::ReliablePacketRequest
+                    DataType::ReliableAck
+                        | DataType::ReliablePartialAck
+                        | DataType::ReliablePacketRequest
                 )
             {
                 let frames = if opts.max_frame_bytes != 0 && raw_len > opts.max_frame_bytes {
@@ -7362,17 +7070,17 @@ impl Router {
                 let timestamp_field = Some(timestamp);
                 let mut body = Vec::with_capacity(payload.len() + 32);
                 body.push(flags);
-                Self::write_uleb128_local(u64::from(template_id), &mut body);
-                Self::write_uleb128_local(data_size, &mut body);
+                write_uleb128_local(u64::from(template_id), &mut body);
+                write_uleb128_local(data_size, &mut body);
                 if let Some(timestamp_field) = timestamp_field {
-                    Self::write_uleb128_local(timestamp_field, &mut body);
+                    write_uleb128_local(timestamp_field, &mut body);
                 }
                 if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-                    Self::write_uleb128_local(u64::from(nonce), &mut body);
+                    write_uleb128_local(u64::from(nonce), &mut body);
                 }
                 if let Some((seq, ack)) = reliable_seq_ack {
-                    Self::write_uleb128_local(u64::from(seq), &mut body);
-                    Self::write_uleb128_local(u64::from(ack), &mut body);
+                    write_uleb128_local(u64::from(seq), &mut body);
+                    write_uleb128_local(u64::from(ack), &mut body);
                 }
                 body.extend_from_slice(payload);
                 {
@@ -7388,15 +7096,15 @@ impl Router {
                 } else {
                     SIDE_TRANSPORT_KIND_COMPACT
                 };
-                Self::wrap_side_transport_frame(kind, &body)
+                wrap_side_transport_frame(kind, &body)
             } else {
                 let mut body = Vec::with_capacity(raw.len() + 4);
-                Self::write_uleb128_local(u64::from(template_id), &mut body);
+                write_uleb128_local(u64::from(template_id), &mut body);
                 body.extend_from_slice(raw.as_ref());
-                Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
+                wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
             }
         } else {
-            Self::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref())
+            wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref())
         };
 
         let frames = if opts.max_frame_bytes != 0 && wrapped.len() > opts.max_frame_bytes {
@@ -7436,7 +7144,7 @@ impl Router {
         side: RouterSideId,
         bytes: &[u8],
     ) -> TelemetryResult<Option<Arc<[u8]>>> {
-        let Some((kind, body)) = Self::parse_side_transport_wrapper(bytes)? else {
+        let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             return Ok(Some(Arc::from(bytes)));
         };
         match kind {
@@ -7452,17 +7160,16 @@ impl Router {
                 let mut off = 0usize;
                 let template_id = if header_templates_enabled {
                     Some(
-                        u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                        u32::try_from(read_uleb128_local(body, &mut off)?)
                             .map_err(|_| TelemetryError::Unpack("side template id too large"))?,
                     )
                 } else {
                     None
                 };
                 let raw = Arc::<[u8]>::from(&body[off..]);
-                if let (Some(template_id), Ok((template, _, _, _, timestamp, _, _, _))) = (
-                    template_id,
-                    Self::extract_side_header_template(raw.as_ref()),
-                ) {
+                if let (Some(template_id), Ok((template, _, _, _, timestamp, _, _, _))) =
+                    (template_id, extract_side_header_template(raw.as_ref()))
+                {
                     let mut st = self.state.lock();
                     let max_templates = st
                         .sides
@@ -7494,7 +7201,7 @@ impl Router {
                     return Err(TelemetryError::Unpack("short side compact frame"));
                 }
                 let mut off = 1usize;
-                let template_id = u32::try_from(Self::read_uleb128_local(body, &mut off)?)
+                let template_id = u32::try_from(read_uleb128_local(body, &mut off)?)
                     .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
                 let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
                 compact_body.push(body[0]);
@@ -7529,7 +7236,7 @@ impl Router {
                     SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
                     _ => SideCompactTimestampMode::Absolute,
                 };
-                let (frame, timestamp) = Self::reconstruct_side_compact_frame(
+                let (frame, timestamp) = reconstruct_side_compact_frame(
                     &template,
                     &compact_body,
                     timestamp_mode,

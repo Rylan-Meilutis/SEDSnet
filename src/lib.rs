@@ -163,6 +163,7 @@ mod embedded_alloc {
 //  Portable core logic: modules
 // ============================================================================
 
+mod binding_options;
 mod c_api;
 pub mod config;
 #[cfg(feature = "cryptography")]
@@ -176,6 +177,7 @@ pub mod packet;
 mod queue;
 pub mod relay;
 pub mod router;
+mod side_transport;
 mod small_payload;
 #[cfg(feature = "timesync")]
 pub mod timesync;

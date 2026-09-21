@@ -6,8 +6,8 @@ fn relay_chunk_identity_and_loss_are_bounded() {
     let relay = Relay::new(Box::new(|| 0));
     let side = relay.add_side_packed_with_options("CAN", |_| Ok(()), RelaySideOptions::default());
     // Relay full frames include a leading one-byte template ID.
-    let a = Relay::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 181]);
-    let b = Relay::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 181]);
+    let a = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 181]);
+    let b = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 181]);
     let first = relay
         .split_side_transport_frame(side, a.clone(), 128)
         .unwrap();
@@ -29,7 +29,7 @@ fn relay_chunk_identity_and_loss_are_bounded() {
     for i in 0..1000u32 {
         let mut data = vec![0; 180];
         data[..4].copy_from_slice(&i.to_le_bytes());
-        let frame = Relay::wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
+        let frame = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
         let chunks = relay.split_side_transport_frame(side, frame, 128).unwrap();
         relay.decode_side_transport_frame(side, &chunks[0]).unwrap();
         assert!(relay.state.lock().side_transport[&side].rx_chunks.len() <= 4);
