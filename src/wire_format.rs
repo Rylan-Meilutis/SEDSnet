@@ -628,38 +628,26 @@ fn build_endpoint_bitmap(eps: &[DataEndpoint]) -> [u8; EP_BITMAP_BYTES] {
     bm
 }
 
-/// Expand a bitmap of endpoints into a dense array and its logical length.
-///
-/// Returns `(array, len)` where:
-/// - `array[0..len]` are the active endpoints in ascending discriminant order.
-/// - `array[len..]` is filled with a dummy `DataEndpoint` and should be ignored.
-fn expand_endpoint_bitmap(
-    bm: &[u8],
-) -> Result<([DataEndpoint; EP_BITMAP_BITS], usize), TelemetryError> {
+/// Expand a bitmap into registered endpoints in ascending discriminant order.
+fn expand_endpoint_bitmap(bm: &[u8]) -> TelemetryResult<Arc<[DataEndpoint]>> {
     if bm.len() != EP_BITMAP_BYTES {
         return Err(TelemetryError::Unpack("bad endpoint bitmap size"));
     }
-
-    // Pick *any* valid endpoint as filler/dummy for the array.
-    let dummy = DataEndpoint::TelemetryError;
-
-    // Entire array is initialized to a valid value ⇒ fully safe.
-    let mut arr = [dummy; EP_BITMAP_BITS];
-
-    let mut len = 0usize;
-    for idx in 0..EP_BITMAP_BITS {
-        let byte = idx / 8;
-        let bit = idx % 8;
-        if (bm[byte] >> bit) & 1 != 0 {
-            let v = idx as u32;
-            let ep = DataEndpoint::try_from_u32(v)
-                .ok_or(TelemetryError::Unpack("bad endpoint bit set"))?;
-            arr[len] = ep;
-            len += 1;
+    // Only visit set bits. Sparse telemetry destinations should not initialize
+    // and copy a 256-element endpoint array on every header inspection.
+    let mut endpoints = Vec::with_capacity(bitmap_popcount(bm));
+    for (byte_index, &byte) in bm.iter().enumerate() {
+        let mut bits = byte;
+        while bits != 0 {
+            let idx = byte_index * 8 + bits.trailing_zeros() as usize;
+            endpoints.push(
+                DataEndpoint::try_from_u32(idx as u32)
+                    .ok_or(TelemetryError::Unpack("bad endpoint bit set"))?,
+            );
+            bits &= bits - 1;
         }
     }
-
-    Ok((arr, len))
+    Ok(Arc::from(endpoints))
 }
 
 #[inline]
@@ -678,12 +666,26 @@ fn endpoints_match_schema(ty: DataType, eps: &[DataEndpoint]) -> bool {
 
 #[inline]
 fn schema_endpoints_from_type(ty: DataType, nep: usize) -> TelemetryResult<Arc<[DataEndpoint]>> {
-    let (bm, count) = endpoint_bitmap_and_count(message_meta(ty).endpoints_ref());
-    let (ep_buf, ep_len) = expand_endpoint_bitmap(&bm)?;
-    if count != nep || ep_len != nep {
+    // Match bitmap ordering and duplicate removal without expanding all 256
+    // possible destinations for the usual one-endpoint schema.
+    let meta = message_meta(ty);
+    let mut endpoints: Vec<_> = meta
+        .endpoints_ref()
+        .iter()
+        .copied()
+        .filter(|ep| ep.as_u32() <= MAX_VALUE_DATA_ENDPOINT)
+        .collect();
+    endpoints.sort_unstable_by_key(|ep| ep.as_u32());
+    endpoints.dedup();
+    if endpoints.len() != nep {
         return Err(TelemetryError::Unpack("endpoint count mismatch"));
     }
-    Ok(Arc::from(&ep_buf[..ep_len]))
+    for ep in &endpoints {
+        if DataEndpoint::try_from_u32(ep.as_u32()).is_none() {
+            return Err(TelemetryError::Unpack("bad endpoint bit set"));
+        }
+    }
+    Ok(Arc::from(endpoints))
 }
 
 #[inline]
@@ -695,11 +697,11 @@ fn endpoints_from_wire_or_schema(
 ) -> TelemetryResult<Arc<[DataEndpoint]>> {
     if bitmap_present {
         let bm = r.read_bytes(EP_BITMAP_BYTES)?;
-        let (ep_buf, ep_len) = expand_endpoint_bitmap(bm)?;
-        if ep_len != nep {
+        let endpoints = expand_endpoint_bitmap(bm)?;
+        if endpoints.len() != nep {
             return Err(TelemetryError::Unpack("endpoint count mismatch"));
         }
-        Ok(Arc::from(&ep_buf[..ep_len]))
+        Ok(endpoints)
     } else {
         let ty = ty.ok_or(TelemetryError::InvalidType)?;
         schema_endpoints_from_type(ty, nep)
@@ -864,7 +866,9 @@ fn pack_packet_inner_with_contract(
     let payload = pkt.payload();
     let (payload_compressed, payload_wire) = payload_compression::compress_if_beneficial(payload);
 
-    // Heuristic capacity: fixed prelude + bitmap + reliable + payload_wire.
+    // Size the variable-length prefix exactly. A 16-byte estimate can be
+    // too small for real timestamps/nonces, doubling a multi-KiB schema
+    // buffer while its payload and the old allocation are still retained.
     let reliable_is_compact = reliable.is_some_and(should_compact_reliable_header);
     let reliable_len = if let Some(hdr) = reliable {
         reliable_wire_size(hdr, reliable_is_compact)
@@ -878,9 +882,25 @@ fn pack_packet_inner_with_contract(
     } else {
         0
     };
-    let mut out = Vec::with_capacity(
-        16 + endpoint_bytes + contract_len + reliable_len + payload_wire.len() + CRC32_BYTES,
-    );
+    let capacity = header_size_bytes(pkt)
+        + endpoint_bytes
+        + contract_len
+        + reliable_len
+        + payload_wire.len()
+        + CRC32_BYTES;
+    #[cfg(feature = "cryptography")]
+    let capacity = capacity
+        + e2e.map_or(0, |seal| {
+            uleb128_size(u64::from(seal.key_id))
+                + uleb128_size(payload_wire.len() as u64)
+                + uleb128_size(E2E_NONCE_LEN as u64)
+                + E2E_NONCE_LEN
+                + uleb128_size(E2E_TAG_CAP as u64)
+                + E2E_TAG_CAP
+        });
+    let mut out = Vec::with_capacity(capacity);
+    #[cfg(debug_assertions)]
+    let initial_capacity = out.capacity();
 
     // FLAGS byte
     let mut flags: u8 = 0;
@@ -946,6 +966,12 @@ fn pack_packet_inner_with_contract(
     }
     append_crc32(&mut out);
 
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        out.capacity(),
+        initial_capacity,
+        "packet packing grew its buffer"
+    );
     Ok(Arc::<[u8]>::from(out))
 }
 
@@ -1703,5 +1729,68 @@ mod payload_compression {
         Err(TelemetryError::Unpack(
             "compressed payloads not supported (compression feature disabled)",
         ))
+    }
+}
+
+#[cfg(test)]
+mod endpoint_decode_tests {
+    use super::*;
+
+    #[test]
+    fn large_packet_with_long_prefix_does_not_grow_packing_buffer() {
+        let payload: Vec<u8> = (0..3500)
+            .map(|i| ((i * 73 + i / 251) % 256) as u8)
+            .collect();
+        let packet = Packet::new(
+            DataType::DiscoverySchema,
+            &[DataEndpoint::Discovery],
+            "LONG_PREFIX_SENDER",
+            u64::MAX,
+            payload.into(),
+        )
+        .unwrap()
+        .with_nonce(u16::MAX);
+        assert!(header_size_bytes(&packet) > 16);
+        let packed = pack_packet(&packet);
+        let unpacked = unpack_packet(&packed).unwrap();
+        assert_eq!(unpacked.payload(), packet.payload());
+        assert_eq!(unpacked.timestamp(), u64::MAX);
+        assert_eq!(unpacked.nonce(), u16::MAX);
+    }
+
+    #[test]
+    fn bitmap_decode_preserves_sorted_unique_destinations() {
+        let input = [
+            DataEndpoint::TelemetryError,
+            DataEndpoint::TimeSync,
+            DataEndpoint::Discovery,
+            DataEndpoint::TimeSync,
+        ];
+        let decoded = expand_endpoint_bitmap(&build_endpoint_bitmap(&input)).unwrap();
+        assert_eq!(
+            &*decoded,
+            &[
+                DataEndpoint::TimeSync,
+                DataEndpoint::Discovery,
+                DataEndpoint::TelemetryError
+            ]
+        );
+        assert!(
+            expand_endpoint_bitmap(&[0; EP_BITMAP_BYTES])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(expand_endpoint_bitmap(&[0; EP_BITMAP_BYTES - 1]).is_err());
+    }
+
+    #[test]
+    fn bitmap_decode_rejects_unregistered_endpoint_bits() {
+        if let Some(id) =
+            (0..=MAX_VALUE_DATA_ENDPOINT).find(|id| DataEndpoint::try_from_u32(*id).is_none())
+        {
+            let mut bitmap = [0; EP_BITMAP_BYTES];
+            bitmap[id as usize / 8] = 1 << (id % 8);
+            assert!(expand_endpoint_bitmap(&bitmap).is_err());
+        }
     }
 }

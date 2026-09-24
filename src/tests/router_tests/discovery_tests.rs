@@ -7709,3 +7709,109 @@ fn immediate_cross_wired_router_reentry_falls_back_to_queue() {
     assert!(!b_reentered.load(Ordering::SeqCst));
     assert!(remaining.load(Ordering::SeqCst) < 6);
 }
+
+#[test]
+fn missing_schema_recovery_retries_until_valid_merge_without_flooding_other_links() {
+    ensure_topology_test_schema();
+    let now_ms = Arc::new(AtomicU64::new(0));
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_sender("SCHEMA_HOST"),
+        Box::new(SharedClock {
+            now_ms: now_ms.clone(),
+        }),
+    );
+    let relay = Relay::new(Box::new(SharedClock {
+        now_ms: now_ms.clone(),
+    }));
+    let router_requests = Arc::new(AtomicUsize::new(0));
+    let relay_requests = Arc::new(AtomicUsize::new(0));
+    let unrelated_requests = Arc::new(AtomicUsize::new(0));
+    let count = router_requests.clone();
+    let rs = router.add_side_packet("missing-schema", move |p| {
+        if p.data_type() == DataType::DiscoverySchemaRequest {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let count = relay_requests.clone();
+    let ls = relay.add_side_packet("missing-schema", move |p| {
+        if p.data_type() == DataType::DiscoverySchemaRequest {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let count = unrelated_requests.clone();
+    router.add_side_packet("unrelated", move |p| {
+        if p.data_type() == DataType::DiscoverySchemaRequest {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let count = unrelated_requests.clone();
+    relay.add_side_packet("unrelated", move |p| {
+        if p.data_type() == DataType::DiscoverySchemaRequest {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let topology = build_discovery_topology(
+        "SCHEMA_PEER",
+        0,
+        &[TopologyBoardNode {
+            sender_id: "SCHEMA_PEER".into(),
+            reachable_endpoints: vec![],
+            reachable_timesync_sources: vec![],
+            connections: vec![],
+        }],
+    )
+    .unwrap();
+    router.rx_from_side(&topology, rs).unwrap();
+    relay.rx_from_side(ls, topology).unwrap();
+    relay.process_all_queues().unwrap();
+    router.poll_discovery().unwrap();
+    relay.poll_discovery().unwrap();
+    // Lose both initial schema and the first repair reply. Frequent polls
+    // must not duplicate requests, even though topology is already healthy.
+    for (now, expected) in [(999, 0), (1000, 1), (5999, 1), (6000, 2)] {
+        now_ms.store(now, Ordering::SeqCst);
+        for _ in 0..3 {
+            router.poll_discovery().unwrap();
+            relay.poll_discovery().unwrap();
+            router.process_all_queues().unwrap();
+            relay.process_all_queues().unwrap();
+        }
+        assert_eq!(router_requests.load(Ordering::SeqCst), expected);
+        assert_eq!(relay_requests.load(Ordering::SeqCst), expected);
+        assert_eq!(unrelated_requests.load(Ordering::SeqCst), 0);
+    }
+    // An invalid snapshot must not mark synchronization complete.
+    let bad = Packet::new(
+        DataType::DiscoverySchema,
+        &[DataEndpoint::Discovery],
+        "SCHEMA_PEER",
+        6001,
+        Arc::from([255u8]),
+    )
+    .unwrap();
+    assert!(router.rx_from_side(&bad, rs).is_err());
+    let _ = relay.rx_from_side(ls, bad);
+    let _ = relay.process_all_queues();
+    now_ms.store(11000, Ordering::SeqCst);
+    router.poll_discovery().unwrap();
+    relay.poll_discovery().unwrap();
+    router.process_all_queues().unwrap();
+    relay.process_all_queues().unwrap();
+    assert_eq!(router_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(relay_requests.load(Ordering::SeqCst), 3);
+    let schema = crate::discovery::build_discovery_schema("SCHEMA_PEER", 11001).unwrap();
+    router.rx_from_side(&schema, rs).unwrap();
+    relay.rx_from_side(ls, schema).unwrap();
+    relay.process_all_queues().unwrap();
+    now_ms.store(16000, Ordering::SeqCst);
+    router.poll_discovery().unwrap();
+    relay.poll_discovery().unwrap();
+    router.process_all_queues().unwrap();
+    relay.process_all_queues().unwrap();
+    assert_eq!(router_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(relay_requests.load(Ordering::SeqCst), 3);
+}

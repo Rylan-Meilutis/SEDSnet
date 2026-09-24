@@ -554,6 +554,7 @@ struct DiscoverySenderState {
     link_capabilities: Option<discovery::LinkCapabilities>,
     topology_boards: Vec<TopologyBoardNode>,
     has_full_topology: bool,
+    has_schema: bool,
     last_seen_ms: u64,
 }
 
@@ -572,6 +573,7 @@ struct DiscoverySideState {
 #[derive(Debug, Clone, Default)]
 struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
+    next_schema_request_ms: u64,
     next_ping_ms: u64,
     next_full_ms: u64,
     pending_incremental: bool,
@@ -5893,6 +5895,19 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
+    fn note_schema_received(&self, side: RouterSideId, sender: &str) {
+        let mut st = self.state.lock();
+        // Schema snapshots can be forwarded. They must never introduce a new
+        // link-local announcer or change shared-bus reliability semantics.
+        // If schema precedes topology, bounded recovery will request it again.
+        if let Some(route) = st.discovery_routes.get_mut(&side)
+            && let Some(peer) = route.announcers.get_mut(sender)
+        {
+            peer.has_schema = true;
+        }
+    }
+
+    #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
         // An address/keepalive proves liveness, not receipt of the detailed
@@ -5942,6 +5957,52 @@ impl Router {
         for side in recovery_sides {
             let pkt =
                 discovery::build_discovery_topology_request(self.sender_arc().as_ref(), now_ms)?;
+            self.emit_internal_tx(
+                RouterTxItem::ToSide {
+                    src: None,
+                    dst: side,
+                    data: RouterItem::Packet(pkt),
+                },
+                true,
+                true,
+            )?;
+        }
+        let schema_recovery_sides = {
+            let mut st = self.state.lock();
+            let missing = st
+                .discovery_routes
+                .iter()
+                .filter(|(_, route)| {
+                    route.announcers.values().any(|peer| {
+                        peer.has_full_topology
+                            && !peer.has_schema
+                            && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                    })
+                })
+                .map(|(side, _)| *side)
+                .collect::<Vec<_>>();
+            missing
+                .into_iter()
+                .filter(|side| {
+                    let throttle = st.discovery_side_throttle.entry(*side).or_default();
+                    if throttle.next_schema_request_ms == 0 {
+                        throttle.next_schema_request_ms =
+                            now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
+                        return false;
+                    }
+                    if now_ms < throttle.next_schema_request_ms {
+                        return false;
+                    }
+                    throttle.next_schema_request_ms =
+                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_RETRY_MS);
+                    true
+                })
+                .collect::<Vec<_>>()
+        };
+        let recovering = recovering || !schema_recovery_sides.is_empty();
+        for side in schema_recovery_sides {
+            let pkt =
+                discovery::build_discovery_schema_request(self.sender_arc().as_ref(), now_ms)?;
             self.emit_internal_tx(
                 RouterTxItem::ToSide {
                     src: None,
@@ -6246,6 +6307,7 @@ impl Router {
         if pkt.data_type() == DataType::DiscoverySchema {
             #[cfg(not(feature = "std"))]
             if discovery::discovery_schema_payload_is_fully_known(pkt.payload())? {
+                self.note_schema_received(side, &packet_sender);
                 return Ok(true);
             }
             let snapshot = discovery::decode_discovery_schema(pkt)?;
@@ -6264,6 +6326,7 @@ impl Router {
                 st.make_shared_queue_room(0, crate::transport_priority(DataType::DiscoverySchema))?;
                 st.fit_discovery_budget();
             }
+            self.note_schema_received(side, &packet_sender);
             return Ok(true);
         }
         if pkt.data_type() == DataType::DiscoveryLinkCapabilities {

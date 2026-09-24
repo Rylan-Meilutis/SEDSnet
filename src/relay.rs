@@ -440,6 +440,7 @@ struct DiscoverySenderState {
     advertised_reachable_timesync_sources: Vec<String>,
     topology_boards: Vec<TopologyBoardNode>,
     has_full_topology: bool,
+    has_schema: bool,
     last_seen_ms: u64,
 }
 
@@ -592,6 +593,7 @@ struct AdaptiveRouteStats {
 #[derive(Debug, Clone, Default)]
 struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
+    next_schema_request_ms: u64,
     next_ping_ms: u64,
     next_full_ms: u64,
     pending_incremental: bool,
@@ -3415,6 +3417,19 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
+    fn note_schema_received(&self, side: RelaySideId, sender: &str) {
+        let mut st = self.state.lock();
+        // Schema snapshots can be forwarded. They must never introduce a new
+        // link-local announcer or change shared-bus reliability semantics.
+        // If schema precedes topology, bounded recovery will request it again.
+        if let Some(route) = st.discovery_routes.get_mut(&side)
+            && let Some(peer) = route.announcers.get_mut(sender)
+        {
+            peer.has_schema = true;
+        }
+    }
+
+    #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
         let recovering = {
@@ -3468,6 +3483,51 @@ impl Relay {
             }
             recovering
         };
+        let schema_recovery_sides = {
+            let mut st = self.state.lock();
+            let missing = st
+                .discovery_routes
+                .iter()
+                .filter(|(_, route)| {
+                    route.announcers.values().any(|peer| {
+                        peer.has_full_topology
+                            && !peer.has_schema
+                            && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                    })
+                })
+                .map(|(side, _)| *side)
+                .collect::<Vec<_>>();
+            missing
+                .into_iter()
+                .filter(|side| {
+                    let throttle = st.discovery_side_throttle.entry(*side).or_default();
+                    if throttle.next_schema_request_ms == 0 {
+                        throttle.next_schema_request_ms =
+                            now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
+                        return false;
+                    }
+                    if now_ms < throttle.next_schema_request_ms {
+                        return false;
+                    }
+                    throttle.next_schema_request_ms =
+                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_RETRY_MS);
+                    true
+                })
+                .collect::<Vec<_>>()
+        };
+        let recovering = recovering || !schema_recovery_sides.is_empty();
+        for side in schema_recovery_sides {
+            let pkt =
+                discovery::build_discovery_schema_request(self.sender_arc().as_ref(), now_ms)?;
+            let data = RelayItem::Packet(Arc::new(pkt));
+            let priority = Self::relay_item_priority(&data)?;
+            self.state.lock().push_tx(RelayTxItem {
+                src: None,
+                dst: side,
+                data,
+                priority,
+            })?;
+        }
         let due = {
             let mut st = self.state.lock();
             let removed = Self::prune_discovery_routes_locked(&mut st, now_ms);
@@ -3575,6 +3635,7 @@ impl Relay {
                 st.fit_discovery_budget();
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
+            self.note_schema_received(src, pkt.sender());
             return Ok(());
         }
         if pkt.data_type() == crate::DataType::DiscoveryLinkCapabilities {
