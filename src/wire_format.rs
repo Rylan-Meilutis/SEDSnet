@@ -347,6 +347,26 @@ fn append_crc32(out: &mut Vec<u8>) {
     out.extend_from_slice(&crc.to_le_bytes());
 }
 
+// Initialize every byte before publishing the shared frame. Keeping the
+// payload separate avoids a second full-size allocation during Arc creation.
+fn join_frame_with_crc(header: &[u8], payload: &[u8]) -> Arc<[u8]> {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(header);
+    hasher.update(payload);
+    let crc = hasher.finalize().to_le_bytes();
+    let mut frame = Arc::<[u8]>::new_uninit_slice(header.len() + payload.len() + crc.len());
+    let bytes = Arc::get_mut(&mut frame).expect("new frame is exclusively owned");
+    for (slot, value) in bytes
+        .iter_mut()
+        .zip(header.iter().chain(payload).chain(&crc))
+    {
+        slot.write(*value);
+    }
+    // SAFETY: the iterator above writes exactly header + payload + CRC bytes,
+    // which is the full allocation length. No uninitialized byte escapes.
+    unsafe { frame.assume_init() }
+}
+
 #[inline]
 fn split_crc32(buf: &[u8]) -> Result<(&[u8], u32), TelemetryError> {
     if buf.len() < CRC32_BYTES {
@@ -898,7 +918,19 @@ fn pack_packet_inner_with_contract(
                 + uleb128_size(E2E_TAG_CAP as u64)
                 + E2E_TAG_CAP
         });
-    let mut out = Vec::with_capacity(capacity);
+    // Plain frames need only a small header scratch buffer. Construct the
+    // final Arc directly: Vec -> Arc otherwise retains two frame-sized
+    // allocations alongside the schema payload on embedded routers.
+    #[cfg(feature = "cryptography")]
+    let encrypted = e2e.is_some();
+    #[cfg(not(feature = "cryptography"))]
+    let encrypted = false;
+    let scratch_capacity = if encrypted {
+        capacity
+    } else {
+        capacity - payload_wire.len() - CRC32_BYTES
+    };
+    let mut out = Vec::with_capacity(scratch_capacity);
     #[cfg(debug_assertions)]
     let initial_capacity = out.capacity();
 
@@ -957,22 +989,16 @@ fn pack_packet_inner_with_contract(
     #[cfg(feature = "cryptography")]
     if let Some(e2e) = e2e {
         write_encrypted_payload(pkt, e2e.key_id, &payload_wire, &mut out)?;
-    } else {
-        out.extend_from_slice(&payload_wire);
+        append_crc32(&mut out);
+        return Ok(Arc::<[u8]>::from(out));
     }
-    #[cfg(not(feature = "cryptography"))]
-    {
-        out.extend_from_slice(&payload_wire);
-    }
-    append_crc32(&mut out);
-
     #[cfg(debug_assertions)]
     debug_assert_eq!(
         out.capacity(),
         initial_capacity,
-        "packet packing grew its buffer"
+        "packet header grew its buffer"
     );
-    Ok(Arc::<[u8]>::from(out))
+    Ok(join_frame_with_crc(&out, &payload_wire))
 }
 
 // ===========================================================================
