@@ -248,6 +248,56 @@ struct SideChunkAssembly {
     received: BTreeMap<u16, Arc<[u8]>>,
 }
 
+impl SideChunkAssembly {
+    fn assemble(self) -> TelemetryResult<Vec<u8>> {
+        if self.received.len() != usize::from(self.total) {
+            return Err(TelemetryError::Unpack("side chunk gap"));
+        }
+        let len = self.received.values().try_fold(0usize, |n, chunk| {
+            n.checked_add(chunk.len()).ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
+        })?;
+        // Repeated extend growth can double a ~3.6 KiB discovery packet to
+        // 7 KiB while retaining the old buffer and every received fragment.
+        // Reserve once, report exhaustion instead of panicking, and consume
+        // fragments as we copy. Decoding accepts the Vec directly: no extra Arc.
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
+        for (expected, (index, chunk)) in self.received.into_iter().enumerate() {
+            if usize::from(index) != expected {
+                return Err(TelemetryError::Unpack("side chunk gap"));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod chunk_assembly_memory_tests {
+    use super::*;
+    #[test]
+    fn schema_sized_reassembly_allocates_exactly_and_preserves_order() {
+        let payload: Vec<u8> = (0..3652).map(|i| (i % 251) as u8).collect();
+        let mut assembly = SideChunkAssembly::default();
+        for (index, chunk) in payload.chunks(56).enumerate().rev() {
+            assembly.received.insert(index as u16, Arc::from(chunk));
+        }
+        assembly.total = assembly.received.len() as u16;
+        let out = assembly.assemble().unwrap();
+        assert_eq!(out, payload);
+        assert_eq!(out.capacity(), payload.len(), "do not double discovery reassembly capacity");
+    }
+    #[test]
+    fn incomplete_or_noncontiguous_chunks_are_rejected() {
+        let mut assembly = SideChunkAssembly { total: 2, ..Default::default() };
+        assembly.received.insert(0, Arc::from([1u8]));
+        assert!(assembly.clone().assemble().is_err());
+        assembly.received.insert(2, Arc::from([2u8]));
+        assert!(assembly.assemble().is_err());
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct SideTransportState {
     tx_template_ids: BTreeMap<u64, u32>,
@@ -7376,15 +7426,7 @@ impl Router {
                             .rx_chunks
                             .remove(&transfer_id)
                             .ok_or(TelemetryError::Unpack("side chunk missing"))?;
-                        let mut out = Vec::new();
-                        for idx in 0..entry.total {
-                            let chunk = entry
-                                .received
-                                .get(&idx)
-                                .ok_or(TelemetryError::Unpack("side chunk gap"))?;
-                            out.extend_from_slice(chunk);
-                        }
-                        Some(Arc::<[u8]>::from(out))
+                        Some(entry.assemble()?)
                     } else {
                         None
                     }
