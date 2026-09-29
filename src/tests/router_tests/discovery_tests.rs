@@ -7815,3 +7815,61 @@ fn missing_schema_recovery_retries_until_valid_merge_without_flooding_other_link
     assert_eq!(router_requests.load(Ordering::SeqCst), 3);
     assert_eq!(relay_requests.load(Ordering::SeqCst), 3);
 }
+
+#[test]
+fn ingress_without_matching_route_does_not_spill_to_only_other_link() {
+    ensure_topology_test_schema();
+    let seen = Arc::new(Mutex::new(Vec::<Packet>::new()));
+    let output = seen.clone();
+    let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+    let fill = router.add_side_packet("fill", |_| Ok(()));
+    let radio = router.add_side_packet("radio", move |pkt| {
+        output.lock().unwrap().push(pkt.clone());
+        Ok(())
+    });
+    router
+        .rx_from_side(
+            &build_discovery_announce("AV_BAY", 0, &[DataEndpoint::named("SD_CARD")]).unwrap(),
+            radio,
+        )
+        .unwrap();
+    seen.lock().unwrap().clear();
+    let packet = Packet::from_f32_slice(
+        DataType::named("GPS_DATA"),
+        &[1.0, 2.0, 3.0],
+        &[DataEndpoint::named("RADIO")],
+        42,
+    )
+    .unwrap();
+    let _ = router.rx_from_side(&packet, fill);
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.data_type() == packet.data_type()),
+        "absence of a destination route is not permission to use the other link"
+    );
+    // Learning the destination restores forwarding without a compiled route.
+    router
+        .rx_from_side(
+            &build_discovery_announce("AV_BAY", 1, &[DataEndpoint::named("RADIO")]).unwrap(),
+            radio,
+        )
+        .unwrap();
+    seen.lock().unwrap().clear();
+    let routed = Packet::from_f32_slice(
+        DataType::named("GPS_DATA"),
+        &[4.0, 5.0, 6.0],
+        &[DataEndpoint::named("RADIO")],
+        43,
+    )
+    .unwrap();
+    router.rx_from_side(&routed, fill).unwrap();
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.data_type() == routed.data_type())
+    );
+}

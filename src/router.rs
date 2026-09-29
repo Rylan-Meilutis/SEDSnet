@@ -254,7 +254,8 @@ impl SideChunkAssembly {
             return Err(TelemetryError::Unpack("side chunk gap"));
         }
         let len = self.received.values().try_fold(0usize, |n, chunk| {
-            n.checked_add(chunk.len()).ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
+            n.checked_add(chunk.len())
+                .ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
         })?;
         // Repeated extend growth can double a ~3.6 KiB discovery packet to
         // 7 KiB while retaining the old buffer and every received fragment.
@@ -286,11 +287,18 @@ mod chunk_assembly_memory_tests {
         assembly.total = assembly.received.len() as u16;
         let out = assembly.assemble().unwrap();
         assert_eq!(out, payload);
-        assert_eq!(out.capacity(), payload.len(), "do not double discovery reassembly capacity");
+        assert_eq!(
+            out.capacity(),
+            payload.len(),
+            "do not double discovery reassembly capacity"
+        );
     }
     #[test]
     fn incomplete_or_noncontiguous_chunks_are_rejected() {
-        let mut assembly = SideChunkAssembly { total: 2, ..Default::default() };
+        let mut assembly = SideChunkAssembly {
+            total: 2,
+            ..Default::default()
+        };
         assembly.received.insert(0, Arc::from([1u8]));
         assert!(assembly.clone().assemble().is_err());
         assembly.received.insert(2, Arc::from([2u8]));
@@ -5067,14 +5075,6 @@ impl Router {
                         matches,
                     ),
                 ))
-            } else if exclude.is_some() {
-                let fallback =
-                    self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
-                Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
-                    fallback
-                } else {
-                    Vec::new()
-                }))
             } else if prefer_best_overlap {
                 Ok(RemoteSidePlan::Target(Vec::new()))
             } else {
