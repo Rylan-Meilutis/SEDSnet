@@ -10216,68 +10216,37 @@ impl Router {
     /// Process both transmit and receive queues for up to `timeout_ms` milliseconds.
     /// If `timeout_ms == 0`, drains both queues fully.
     fn process_all_queues_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
-        if timeout_ms == 0 {
-            loop {
-                let mut did_any = false;
-                self.process_reliable_timeouts()?;
-                self.process_end_to_end_reliable_timeouts()?;
-                #[cfg(feature = "discovery")]
-                if self.drain_queued_discovery_rx_before_tx()? {
-                    did_any = true;
-                }
-
-                if let Some(pkt) = {
-                    let mut st = self.state.lock();
-                    Self::pop_transmit_queue_locked(&mut st)
-                } {
-                    self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
-                    did_any = true;
-                }
-
-                if let Some(item) = self.isr_rx_queue.pop_front().unwrap_or(None).or_else(|| {
-                    let mut st = self.state.lock();
-                    st.received_queue.pop_front()
-                }) {
-                    self.process_rx_queue_item(item)?;
-                    did_any = true;
-                }
-
-                if !did_any {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-
-        let tx_budget_ms = u64::from(timeout_ms / 2);
-        let rx_budget_ms = u64::from(timeout_ms) - tx_budget_ms;
-
-        let tx_start = self.clock.now_ms();
+        // Share the deadline between directions. Splitting a 1 ms budget in
+        // half rounded TX down to zero and serviced only one transmit item,
+        // even when the remainder of the pass was idle. One TX/RX pair is
+        // atomic for fairness; a slow handler may overrun the deadline.
+        let start = self.clock.now_ms();
         loop {
+            let mut did_any = false;
             self.process_reliable_timeouts()?;
             self.process_end_to_end_reliable_timeouts()?;
             #[cfg(feature = "discovery")]
-            let _ = self.drain_queued_discovery_rx_before_tx()?;
-            let pkt_opt = {
+            if self.drain_queued_discovery_rx_before_tx()? {
+                did_any = true;
+            }
+            if let Some(pkt) = {
                 let mut st = self.state.lock();
                 Self::pop_transmit_queue_locked(&mut st)
-            };
-            let Some(pkt) = pkt_opt else { break };
-            self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
-            if self.clock.now_ms().wrapping_sub(tx_start) >= tx_budget_ms {
-                break;
+            } {
+                self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
+                did_any = true;
             }
-        }
-
-        let rx_start = self.clock.now_ms();
-        loop {
-            let item_opt = self.isr_rx_queue.pop_front().unwrap_or(None).or_else(|| {
+            if let Some(item) = self.isr_rx_queue.pop_front().unwrap_or(None).or_else(|| {
                 let mut st = self.state.lock();
                 st.received_queue.pop_front()
-            });
-            let Some(item) = item_opt else { break };
-            self.process_rx_queue_item(item)?;
-            if self.clock.now_ms().wrapping_sub(rx_start) >= rx_budget_ms {
+            }) {
+                self.process_rx_queue_item(item)?;
+                did_any = true;
+            }
+            if !did_any
+                || (timeout_ms != 0
+                    && self.clock.now_ms().wrapping_sub(start) >= u64::from(timeout_ms))
+            {
                 break;
             }
         }
