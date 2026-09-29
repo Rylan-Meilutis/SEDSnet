@@ -6311,23 +6311,26 @@ impl Router {
             {
                 let now_ms = self.clock.now_ms();
                 let mut st = self.state.lock();
-                let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+                // Refreshing an existing subscription changes only its lease.
+                // Do not clone the complete learned topology or rebuild route
+                // summaries on every retry from a slow/disconnected subscriber.
+                let route = st.discovery_routes.entry(side).or_default();
                 let newly_reachable = if let Some((_, last_seen_ms)) = route
                     .requested_network_variables
                     .iter_mut()
                     .find(|(requested, _)| *requested == ty)
                 {
                     *last_seen_ms = now_ms;
+                    route.last_seen_ms = route.last_seen_ms.max(now_ms);
                     false
                 } else {
                     route.requested_network_variables.push((ty, now_ms));
+                    Self::recompute_discovery_side_state(route);
                     true
                 };
-                Self::recompute_discovery_side_state(&mut route);
-                st.discovery_routes.insert(side, route);
-                st.fit_discovery_budget();
-                self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                 if newly_reachable {
+                    st.fit_discovery_budget();
+                    self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
             }
