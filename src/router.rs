@@ -13,7 +13,7 @@ use crate::side_transport::{
     SIDE_TRANSPORT_KIND_COMPACT, SIDE_TRANSPORT_KIND_COMPACT_DELTA,
     SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP, SIDE_TRANSPORT_KIND_FULL, SideCompactTimestampMode,
     SideHeaderTemplate, extract_side_header_template, parse_side_transport_wrapper,
-    read_uleb128_local, reconstruct_side_compact_frame, wrap_side_transport_frame,
+    read_uleb128_local, reconstruct_side_compact_frame, wrap_side_transport_frame, wrap_side_transport_frame_parts,
     write_uleb128_local,
 };
 #[cfg(all(test, feature = "discovery"))]
@@ -7023,12 +7023,11 @@ impl Router {
             u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
         let mut frames = Vec::with_capacity(total);
         for (idx, chunk) in frame.chunks(payload_budget).enumerate() {
-            let mut body = Vec::with_capacity(8 + chunk.len());
-            body.extend_from_slice(&transfer_id.to_le_bytes());
-            body.extend_from_slice(&(idx as u16).to_le_bytes());
-            body.extend_from_slice(&total_u16.to_le_bytes());
-            body.extend_from_slice(chunk);
-            frames.push(wrap_side_transport_frame(SIDE_TRANSPORT_KIND_CHUNK, &body));
+            frames.push(wrap_side_transport_frame_parts(
+                SIDE_TRANSPORT_KIND_CHUNK,
+                &[&transfer_id.to_le_bytes(), &(idx as u16).to_le_bytes(),
+                  &total_u16.to_le_bytes(), chunk],
+            ));
         }
         Ok(frames)
     }

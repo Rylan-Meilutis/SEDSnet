@@ -86,14 +86,32 @@ pub(crate) fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
 }
 
 pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
-    let mut out =
-        Vec::with_capacity(SIDE_TRANSPORT_MAGIC.len() + 1 + body.len() + wire_format::CRC32_BYTES);
-    out.extend_from_slice(SIDE_TRANSPORT_MAGIC);
-    out.push(kind);
-    out.extend_from_slice(body);
-    let crc = crc32_bytes(&out);
-    out.extend_from_slice(&crc.to_le_bytes());
-    Arc::from(out)
+    wrap_side_transport_frame_parts(kind, &[body])
+}
+
+// Write body segments directly into the final allocation. This also lets a
+// chunk header stay on the stack instead of copying its payload into a Vec.
+pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> Arc<[u8]> {
+    let header = [b'S', b'D', b'T', kind];
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&header);
+    for part in parts {
+        hasher.update(part);
+    }
+    let crc = hasher.finalize().to_le_bytes();
+    let body_len: usize = parts.iter().map(|part| part.len()).sum();
+    let mut frame = Arc::<[u8]>::new_uninit_slice(header.len() + body_len + crc.len());
+    let bytes = Arc::get_mut(&mut frame).expect("new frame is exclusively owned");
+    for (slot, value) in bytes.iter_mut().zip(
+        header
+            .iter()
+            .chain(parts.iter().flat_map(|part| part.iter()))
+            .chain(&crc),
+    ) {
+        slot.write(*value);
+    }
+    // SAFETY: header, all body segments and CRC fill the entire allocation.
+    unsafe { frame.assume_init() }
 }
 
 pub(crate) fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {

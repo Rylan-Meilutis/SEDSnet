@@ -4,6 +4,7 @@ use sedsnet::packet::Packet;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
+thread_local! { static CHUNK: Cell<Option<usize>> = const { Cell::new(None) }; }
 struct Counter;
 thread_local! { static LARGE: Cell<Option<usize>> = const { Cell::new(None) }; }
 #[global_allocator]
@@ -12,6 +13,13 @@ unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() >= 3000 {
             let _ = LARGE.try_with(|n| {
+                if let Some(v) = n.get() {
+                    n.set(Some(v + 1));
+                }
+            });
+        }
+        if (1000..=1050).contains(&layout.size()) {
+            let _ = CHUNK.try_with(|n| {
                 if let Some(v) = n.get() {
                     n.set(Some(v + 1));
                 }
@@ -53,4 +61,43 @@ fn schema_packing_allocates_only_one_frame_sized_buffer() {
     );
     let decoded = sedsnet::wire_format::unpack_packet(&packed).unwrap();
     assert_eq!(decoded.payload(), payload.as_ref());
+}
+
+#[test]
+fn schema_chunks_do_not_allocate_body_and_wrapper_copies() {
+    use sedsnet::router::{Router, RouterConfig, RouterSideOptions};
+    let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+    router.add_side_packed_with_options(
+        "uart",
+        |frame| {
+            assert!(frame.len() <= 1024);
+            assert_eq!(&frame[..4], b"SDT\x03");
+            let n = frame.len() - 4;
+            assert_eq!(
+                crc32fast::hash(&frame[..n]),
+                u32::from_le_bytes(frame[n..].try_into().unwrap())
+            );
+            Ok(())
+        },
+        RouterSideOptions {
+            header_template_enabled: false,
+            max_frame_bytes: 1024,
+            ..Default::default()
+        },
+    );
+    let packet = Packet::new(
+        DataType::DiscoverySchema,
+        &[DataEndpoint::Discovery],
+        "GB",
+        1,
+        Arc::from(vec![0x5au8; 3600]),
+    )
+    .unwrap();
+    CHUNK.with(|n| n.set(Some(0)));
+    router.tx(packet).unwrap();
+    let count = CHUNK.with(|n| n.replace(None).unwrap());
+    assert_eq!(
+        count, 3,
+        "each full chunk must allocate only its final shared frame"
+    );
 }
