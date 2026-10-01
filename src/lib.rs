@@ -173,6 +173,7 @@ pub mod diagnostics;
 pub mod discovery;
 mod lock;
 mod macros;
+pub mod memory_admission;
 pub mod packet;
 mod queue;
 pub mod relay;

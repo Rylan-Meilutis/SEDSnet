@@ -11,7 +11,6 @@ use crate::{
 };
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
-#[cfg(feature = "std")]
 use alloc::sync::Arc;
 use alloc::{
     string::{String, ToString},
@@ -1718,7 +1717,7 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
         .iter()
         .find(|(id, _)| *id == endpoint_type)
         .map(|(_, meta)| meta.clone())
-        .unwrap_or(EndpointMeta {
+        .unwrap_or_else(|| EndpointMeta {
             name: Arc::from("UNKNOWN_ENDPOINT"),
             description: Arc::from(""),
             link_local_only: false,
@@ -1726,7 +1725,7 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 }
 
 #[cfg(feature = "std")]
-pub fn get_message_meta(data_type: DataType) -> MessageMeta {
+pub(crate) fn try_get_message_meta(data_type: DataType) -> Option<MessageMeta> {
     #[cfg(all(test, feature = "std"))]
     seed_test_schema();
     registry()
@@ -1736,15 +1735,19 @@ pub fn get_message_meta(data_type: DataType) -> MessageMeta {
         .iter()
         .find(|(id, _)| *id == data_type)
         .map(|(_, meta)| meta.clone())
-        .unwrap_or(MessageMeta {
-            name: Arc::from("UNKNOWN_TYPE"),
-            description: Arc::from(""),
-            element: MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
-            endpoints: Arc::from([]),
-            reliable: ReliableMode::None,
-            priority: 0,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        })
+}
+
+#[cfg(feature = "std")]
+pub fn get_message_meta(data_type: DataType) -> MessageMeta {
+    try_get_message_meta(data_type).unwrap_or_else(|| MessageMeta {
+        name: Arc::from("UNKNOWN_TYPE"),
+        description: Arc::from(""),
+        element: MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
+        endpoints: Arc::from([]),
+        reliable: ReliableMode::None,
+        priority: 0,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    })
 }
 
 #[cfg(feature = "std")]
@@ -2643,20 +2646,41 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
 }
 
 #[cfg(not(feature = "std"))]
-pub(crate) fn encode_embedded_schema_payload() -> Vec<u8> {
-    fn push_string(payload: &mut Vec<u8>, value: &str) {
+pub(crate) fn encode_embedded_schema_payload() -> TelemetryResult<Arc<[u8]>> {
+    struct SchemaWriter<'a> {
+        bytes: Option<&'a mut [core::mem::MaybeUninit<u8>]>,
+        len: usize,
+    }
+    impl SchemaWriter<'_> {
+        fn extend_from_slice(&mut self, values: &[u8]) {
+            let end = self
+                .len
+                .checked_add(values.len())
+                .expect("schema length overflow");
+            if let Some(bytes) = &mut self.bytes {
+                for (slot, value) in bytes[self.len..end].iter_mut().zip(values) {
+                    slot.write(*value);
+                }
+            }
+            self.len = end;
+        }
+        fn push(&mut self, value: u8) {
+            self.extend_from_slice(&[value]);
+        }
+    }
+    fn push_string(payload: &mut SchemaWriter<'_>, value: &str) {
         payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
         payload.extend_from_slice(value.as_bytes());
     }
 
-    fn push_endpoint(payload: &mut Vec<u8>, def: EndpointDefinition) {
+    fn push_endpoint(payload: &mut SchemaWriter<'_>, def: EndpointDefinition) {
         payload.extend_from_slice(&def.id.0.to_le_bytes());
         payload.push(def.link_local_only as u8);
         push_string(payload, def.name);
         push_string(payload, "");
     }
 
-    fn push_type(payload: &mut Vec<u8>, def: DataTypeDefinition) {
+    fn push_type(payload: &mut SchemaWriter<'_>, def: DataTypeDefinition) {
         payload.extend_from_slice(&def.id.0.to_le_bytes());
         push_string(payload, def.name);
         push_string(payload, "");
@@ -2685,49 +2709,69 @@ pub(crate) fn encode_embedded_schema_payload() -> Vec<u8> {
 
     let static_endpoint_count = EMBEDDED_BUILTIN_ENDPOINTS.len() + EMBEDDED_SCHEMA_ENDPOINTS.len();
     let mut learned_endpoint_count = 0usize;
-    let mut endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    let endpoint_head = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    let mut endpoint_node = endpoint_head;
     while !endpoint_node.is_null() {
         learned_endpoint_count += 1;
         endpoint_node = unsafe { (*endpoint_node).next };
     }
     let static_type_count = EMBEDDED_BUILTIN_TYPES.len() + EMBEDDED_SCHEMA_TYPES.len();
     let mut learned_type_count = 0usize;
-    let mut type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    let type_head = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    let mut type_node = type_head;
     while !type_node.is_null() {
         learned_type_count += 1;
         type_node = unsafe { (*type_node).next };
     }
 
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&3u32.to_le_bytes());
-    payload.extend_from_slice(
-        &((static_endpoint_count + learned_endpoint_count) as u32).to_le_bytes(),
-    );
-    for def in EMBEDDED_BUILTIN_ENDPOINTS
-        .iter()
-        .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-    {
-        push_endpoint(&mut payload, *def);
-    }
-    endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
-    while !endpoint_node.is_null() {
-        push_endpoint(&mut payload, unsafe { (*endpoint_node).def });
-        endpoint_node = unsafe { (*endpoint_node).next };
-    }
+    // Capture immutable overlay heads once so both passes encode the same schema,
+    // even if another caller publishes additional definitions in the meantime.
+    let encode = |payload: &mut SchemaWriter<'_>| {
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(
+            &((static_endpoint_count + learned_endpoint_count) as u32).to_le_bytes(),
+        );
+        for def in EMBEDDED_BUILTIN_ENDPOINTS
+            .iter()
+            .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+        {
+            push_endpoint(payload, *def);
+        }
+        let mut endpoint_node = endpoint_head;
+        while !endpoint_node.is_null() {
+            push_endpoint(payload, unsafe { (*endpoint_node).def });
+            endpoint_node = unsafe { (*endpoint_node).next };
+        }
 
-    payload.extend_from_slice(&((static_type_count + learned_type_count) as u32).to_le_bytes());
-    for def in EMBEDDED_BUILTIN_TYPES
-        .iter()
-        .chain(EMBEDDED_SCHEMA_TYPES.iter())
-    {
-        push_type(&mut payload, *def);
-    }
-    type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
-    while !type_node.is_null() {
-        push_type(&mut payload, unsafe { (*type_node).def });
-        type_node = unsafe { (*type_node).next };
-    }
-    payload
+        payload.extend_from_slice(&((static_type_count + learned_type_count) as u32).to_le_bytes());
+        for def in EMBEDDED_BUILTIN_TYPES
+            .iter()
+            .chain(EMBEDDED_SCHEMA_TYPES.iter())
+        {
+            push_type(payload, *def);
+        }
+        let mut type_node = type_head;
+        while !type_node.is_null() {
+            push_type(payload, unsafe { (*type_node).def });
+            type_node = unsafe { (*type_node).next };
+        }
+    };
+    let mut count = SchemaWriter {
+        bytes: None,
+        len: 0,
+    };
+    encode(&mut count);
+    crate::memory_admission::check(count.len.saturating_add(512), count.len.saturating_add(32))?;
+    let mut payload = Arc::<[u8]>::new_uninit_slice(count.len);
+    let bytes = Arc::get_mut(&mut payload).expect("new schema is exclusively owned");
+    let mut writer = SchemaWriter {
+        bytes: Some(bytes),
+        len: 0,
+    };
+    encode(&mut writer);
+    assert_eq!(writer.len, count.len);
+    // SAFETY: the writer initialized every byte of the counted allocation.
+    Ok(unsafe { payload.assume_init() })
 }
 
 #[cfg(not(feature = "std"))]
@@ -3092,7 +3136,7 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
             description: def.description,
             link_local_only: def.link_local_only,
         })
-        .unwrap_or(EndpointMeta {
+        .unwrap_or_else(|| EndpointMeta {
             name: "UNKNOWN_ENDPOINT",
             description: "",
             link_local_only: false,
@@ -3100,7 +3144,7 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 }
 
 #[cfg(not(feature = "std"))]
-pub fn get_message_meta(data_type: DataType) -> MessageMeta {
+pub(crate) fn try_get_message_meta(data_type: DataType) -> Option<MessageMeta> {
     embedded_overlay_type(data_type)
         .or_else(|| {
             EMBEDDED_BUILTIN_TYPES
@@ -3118,15 +3162,19 @@ pub fn get_message_meta(data_type: DataType) -> MessageMeta {
             priority: def.priority,
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
-        .unwrap_or(MessageMeta {
-            name: "UNKNOWN_TYPE",
-            description: "",
-            element: MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
-            endpoints: &[],
-            reliable: ReliableMode::None,
-            priority: 0,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
-        })
+}
+
+#[cfg(not(feature = "std"))]
+pub fn get_message_meta(data_type: DataType) -> MessageMeta {
+    try_get_message_meta(data_type).unwrap_or( MessageMeta {
+        name: "UNKNOWN_TYPE",
+        description: "",
+        element: MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),
+        endpoints: &[],
+        reliable: ReliableMode::None,
+        priority: 0,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    })
 }
 
 #[cfg(not(feature = "std"))]

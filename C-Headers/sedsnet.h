@@ -19,6 +19,13 @@ extern "C" {
 
 #endif
 
+/* Optional non-allocating, nonblocking allocator-headroom probe. Return false
+ * to reject work with SEDS_IO before allocating. Must not call SEDSnet; NULL
+ * disables it. Includes scratch headroom beyond queue byte limits. */
+typedef bool (*SedsMemoryAdmissionProbe)(size_t additional_bytes, size_t largest_allocation);
+void seds_set_memory_admission_probe(SedsMemoryAdmissionProbe probe);
+size_t seds_memory_admission_rejected(void);
+
 /* =================================================================
    Public built-in enums / constants. User schema entries are registered at runtime.
    ================================================================= */
@@ -1157,6 +1164,10 @@ SedsResult seds_router_rx_packet_to_queue(SedsRouter * r, const SedsPacketView *
 
 /** @brief Process TX queue for up to @p timeout_ms (0 drains fully). */
 SedsResult seds_router_process_tx_queue_with_timeout(SedsRouter * r, uint32_t timeout_ms);
+
+/* Drain TX without generating periodic discovery/time-sync announcements.
+ * Reliable retries still run. Call periodic/normal queue maintenance regularly. */
+SedsResult seds_router_dispatch_tx_queue_with_timeout(SedsRouter * r, uint32_t timeout_ms);
 
 /** @brief Process RX queue for up to @p timeout_ms (0 drains fully). */
 SedsResult seds_router_process_rx_queue_with_timeout(SedsRouter * r, uint32_t timeout_ms);

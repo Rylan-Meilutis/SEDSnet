@@ -5,6 +5,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 thread_local! { static CHUNK: Cell<Option<usize>> = const { Cell::new(None) }; }
+thread_local! { static CHUNK_LIVE: Cell<Option<(usize, usize)>> = const { Cell::new(None) }; }
 struct Counter;
 thread_local! { static LARGE: Cell<Option<usize>> = const { Cell::new(None) }; }
 #[global_allocator]
@@ -19,6 +20,11 @@ unsafe impl GlobalAlloc for Counter {
             });
         }
         if (1000..=1050).contains(&layout.size()) {
+            let _ = CHUNK_LIVE.try_with(|n| {
+                if let Some((live, peak)) = n.get() {
+                    n.set(Some((live + 1, peak.max(live + 1))));
+                }
+            });
             let _ = CHUNK.try_with(|n| {
                 if let Some(v) = n.get() {
                     n.set(Some(v + 1));
@@ -28,6 +34,13 @@ unsafe impl GlobalAlloc for Counter {
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if (1000..=1050).contains(&layout.size()) {
+            let _ = CHUNK_LIVE.try_with(|n| {
+                if let Some((live, peak)) = n.get() {
+                    n.set(Some((live - 1, peak)));
+                }
+            });
+        }
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -93,9 +106,16 @@ fn schema_chunks_do_not_allocate_body_and_wrapper_copies() {
         Arc::from(vec![0x5au8; 3600]),
     )
     .unwrap();
+    LARGE.with(|n| n.set(Some(0)));
     CHUNK.with(|n| n.set(Some(0)));
+    CHUNK_LIVE.with(|n| n.set(Some((0, 0))));
     router.tx(packet).unwrap();
+    let large = LARGE.with(|n| n.replace(None).unwrap());
+    assert_eq!(large, 0, "chunked schema allocated a duplicate full frame");
     let count = CHUNK.with(|n| n.replace(None).unwrap());
+    let (live, peak) = CHUNK_LIVE.with(|n| n.replace(None).unwrap());
+    assert_eq!(live, 0);
+    assert_eq!(peak, 1, "all outgoing chunks were retained at once");
     assert_eq!(
         count, 3,
         "each full chunk must allocate only its final shared frame"

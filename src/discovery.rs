@@ -1208,7 +1208,7 @@ pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResul
         &[DataEndpoint::Discovery],
         sender,
         timestamp_ms,
-        crate::config::encode_embedded_schema_payload().into(),
+        crate::config::encode_embedded_schema_payload()?,
     );
 }
 

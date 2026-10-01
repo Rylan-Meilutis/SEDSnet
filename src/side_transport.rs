@@ -21,6 +21,83 @@ pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BITS: usize =
     (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
 pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
 
+/// An outgoing frame or lazily encoded chunks. Retains the source plus at most
+/// the current chunk instead of allocating every fragment before the first TX.
+pub(crate) struct SideTransportFrames {
+    frame: Arc<[u8]>,
+    payload_budget: usize,
+    transfer_id: u32,
+    index: usize,
+    total: usize,
+}
+impl SideTransportFrames {
+    pub fn single(frame: Arc<[u8]>) -> Self {
+        Self {
+            frame,
+            payload_budget: 0,
+            transfer_id: 0,
+            index: 0,
+            total: 1,
+        }
+    }
+    pub fn split(frame: Arc<[u8]>, max_frame_bytes: usize, sender: &[u8]) -> TelemetryResult<Self> {
+        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
+            return Err(TelemetryError::BadArg);
+        }
+        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
+        let total = frame.len().div_ceil(payload_budget);
+        u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        // Stable content ID, including sender; CRC(frame || CRC) is constant.
+        let seed = hash_bytes_u64(0x517C_C1B7_2722_0A95, sender);
+        let hash = hash_bytes_u64(seed, &frame);
+        let transfer_id = ((hash >> 32) as u32 ^ hash as u32).max(1);
+        Ok(Self {
+            frame,
+            payload_budget,
+            transfer_id,
+            index: 0,
+            total,
+        })
+    }
+    pub fn wire_len(&self) -> usize {
+        self.frame.len()
+            + if self.payload_budget == 0 {
+                0
+            } else {
+                self.total * SIDE_TRANSPORT_CHUNK_OVERHEAD
+            }
+    }
+}
+impl Iterator for SideTransportFrames {
+    type Item = Arc<[u8]>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.total {
+            return None;
+        }
+        let index = self.index;
+        self.index += 1;
+        if self.payload_budget == 0 {
+            return Some(self.frame.clone());
+        }
+        let start = index * self.payload_budget;
+        let end = (start + self.payload_budget).min(self.frame.len());
+        Some(wrap_side_transport_frame_parts(
+            SIDE_TRANSPORT_KIND_CHUNK,
+            &[
+                &self.transfer_id.to_le_bytes(),
+                &(index as u16).to_le_bytes(),
+                &(self.total as u16).to_le_bytes(),
+                &self.frame[start..end],
+            ],
+        ))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total - self.index;
+        (remaining, Some(remaining))
+    }
+}
+impl ExactSizeIterator for SideTransportFrames {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SideHeaderTemplate {
     pub(crate) hash: u64,
@@ -314,4 +391,91 @@ pub(crate) fn reconstruct_side_compact_frame(
     let crc = crc32_bytes(&raw);
     raw.extend_from_slice(&crc.to_le_bytes());
     Ok((Arc::from(raw), timestamp))
+}
+
+/// Send a large plaintext packet as canonical chunks without assembling an
+/// additional full wire frame. Callback errors stop transmission immediately.
+pub(crate) fn send_packet_chunks(
+    packet: &crate::packet::Packet,
+    max_frame_bytes: usize,
+    sender: &[u8],
+    mut send: impl FnMut(&[u8]) -> TelemetryResult<()>,
+) -> TelemetryResult<(usize, usize, usize)> {
+    if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
+        return Err(TelemetryError::BadArg);
+    }
+    wire_format::with_plain_packet_parts(packet, |header, payload| {
+        let mut crc = Crc32Hasher::new();
+        crc.update(header);
+        crc.update(payload);
+        let crc = crc.finalize().to_le_bytes();
+        let parts = [header, payload, &crc];
+        let len = header.len() + payload.len() + crc.len();
+        let budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
+        let total = len.div_ceil(budget);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let mut hash = hash_bytes_u64(0x517C_C1B7_2722_0A95, sender);
+        for part in parts {
+            hash = hash_bytes_u64(hash, part);
+        }
+        let transfer = ((hash >> 32) as u32 ^ hash as u32).max(1).to_le_bytes();
+        for index in 0..total {
+            let start = index * budget;
+            let end = (start + budget).min(len);
+            let index_bytes = (index as u16).to_le_bytes();
+            let total_bytes = total_u16.to_le_bytes();
+            let mut slices: [&[u8]; 6] = [&transfer, &index_bytes, &total_bytes, &[], &[], &[]];
+            let mut offset = 0;
+            for (i, part) in parts.iter().enumerate() {
+                let low = start.saturating_sub(offset).min(part.len());
+                let high = end.saturating_sub(offset).min(part.len());
+                slices[i + 3] = &part[low..high];
+                offset += part.len();
+            }
+            crate::memory_admission::check(
+                max_frame_bytes.saturating_add(256),
+                max_frame_bytes.saturating_add(32),
+            )?;
+            let chunk = wrap_side_transport_frame_parts(SIDE_TRANSPORT_KIND_CHUNK, &slices);
+            send(&chunk)?;
+        }
+        Ok((len, len + total * SIDE_TRANSPORT_CHUNK_OVERHEAD, total))
+    })
+}
+
+#[cfg(test)]
+mod streamed_chunk_tests {
+    use super::*;
+    #[test]
+    fn streamed_chunks_match_canonical_frame_and_stop_on_callback_error() {
+        let packet = crate::packet::Packet::new(
+            DataType::DiscoverySchema,
+            &[crate::DataEndpoint::Discovery],
+            "GB",
+            u64::MAX,
+            Arc::from((0..3600).map(|i| (i % 251) as u8).collect::<Vec<_>>()),
+        )
+        .unwrap();
+        let raw = wire_format::pack_packet(&packet);
+        for max_bytes in [32, 128, 1024, 4096] {
+            let expected = SideTransportFrames::split(raw.clone(), max_bytes, b"GB")
+                .unwrap()
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            send_packet_chunks(&packet, max_bytes, b"GB", |chunk| {
+                actual.push(Arc::<[u8]>::from(chunk));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+        let mut calls = 0;
+        let result = send_packet_chunks(&packet, 32, b"GB", |_| {
+            calls += 1;
+            Err(TelemetryError::Io("test stop"))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
 }

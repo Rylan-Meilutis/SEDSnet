@@ -1061,7 +1061,7 @@ def main(argv: list[str]) -> None:
                 "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
-        total_steps = 9 if can_check_embedded else 8
+        total_steps = 10 if can_check_embedded else 9
 
         run_clippy_checks(
             env=env,
@@ -1103,6 +1103,7 @@ def main(argv: list[str]) -> None:
                 f"embedded{feature_suffix}",
                 "--test",
                 "embedded_memory_behavior_test",
+                "--test", "embedded_schema_memory",
             ],
             env=env,
             repo_root=repo_root,
@@ -1110,6 +1111,16 @@ def main(argv: list[str]) -> None:
             release_build=release_build,
         )
         _success("Hosted no_std memory regression passed.")
+        next_step += 1
+
+        run_cmd(
+            ["cargo", "test", *build_mode, "--no-default-features",
+             "--features", "std,discovery,timesync",
+             "--test", "packet_packing_memory", "--test", "packet_routing_memory"],
+            env=env, repo_root=repo_root,
+            title=f"{next_step}/{total_steps} cargo test (uncompressed forwarding memory)",
+            release_build=release_build,
+        )
         next_step += 1
 
         run_cmd(

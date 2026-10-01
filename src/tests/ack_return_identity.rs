@@ -32,7 +32,8 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         let raw = wire_format::pack_packet(&packet);
         let frames = tx
             .encode_side_transport_frames(a, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
             Some(raw)
@@ -85,12 +86,14 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         )
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
-        tx.encode_side_transport_frames(a, opts, raw.clone())
+        let _ = tx
+            .encode_side_transport_frames(a, opts, raw.clone())
             .unwrap();
         // Lose the initial header (or restart the receiver), then send control.
         let frames = tx
             .encode_side_transport_frames(a, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
             Some(raw),
@@ -148,11 +151,13 @@ fn check_restarting_peer_header(schema_request: bool) {
     // The peer knew this template before its process restarted.
     let initial = tx
         .encode_side_transport_frames(side, opts, wire_format::pack_packet(&packet))
-        .unwrap();
+        .unwrap()
+        .collect::<Vec<_>>();
     tx.decode_side_transport_frame(side, &initial[0])
         .unwrap()
         .unwrap();
-    tx.encode_side_transport_frames(unrelated, opts, wire_format::pack_packet(&packet))
+    let _ = tx
+        .encode_side_transport_frames(unrelated, opts, wire_format::pack_packet(&packet))
         .unwrap();
     let restarted = Router::new(RouterConfig::default());
     let rx_side = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts);
@@ -165,7 +170,8 @@ fn check_restarting_peer_header(schema_request: bool) {
     tx.rx_from_side(&request, side).unwrap();
     let frames = tx
         .encode_side_transport_frames(side, opts, wire_format::pack_packet(&packet))
-        .unwrap();
+        .unwrap()
+        .collect::<Vec<_>>();
     assert!(
         restarted
             .decode_side_transport_frame(rx_side, &frames[0])
@@ -180,7 +186,8 @@ fn check_restarting_peer_header(schema_request: bool) {
     );
     let unrelated_frames = tx
         .encode_side_transport_frames(unrelated, opts, wire_format::pack_packet(&packet))
-        .unwrap();
+        .unwrap()
+        .collect::<Vec<_>>();
     let empty = Router::new(RouterConfig::default());
     let empty_side = empty.add_side_packed_with_options("wire", |_| Ok(()), opts);
     assert!(
@@ -251,7 +258,8 @@ fn discovery_refresh_survives_a_missed_transport_template() {
         let packet = discovery::build_discovery_announce("GB", timestamp, &[]).unwrap();
         let frames = tx
             .encode_side_transport_frames(tx_side, opts, wire_format::pack_packet(&packet))
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         if timestamp == 1000 {
             continue;
         }
@@ -283,7 +291,8 @@ fn compact_loss_must_not_change_packet_identity() {
         let raw = wire_format::pack_packet(&pkt);
         let frames = tx
             .encode_side_transport_frames(a, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(frames.len(), 1);
         if index == 1 {
             continue;

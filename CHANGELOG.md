@@ -1,5 +1,24 @@
 # Changelog
 
+## 4.0.35
+
+- Route packed transit traffic using borrowed metadata; avoid full payload decoding
+  in router/relay ACK-route checks and avoid allocating unused metadata fallbacks.
+- Encode embedded schema payloads directly into shared storage, stream schema
+  fragments without a second full frame, and allocate other fragments lazily.
+- Add optional Rust/C allocator-headroom admission with a rejection counter.
+  Reject new work before large transient allocations; memory-pressure refusals
+  during maintenance no longer prevent dispatch of retained queue entries.
+- Add a router TX dispatch API for ingress bursts without generating fresh periodic
+  announcements; defer discovery snapshots under pressure and avoid copying side options.
+- Keep idle discovery recovery allocation-free while waiting for missing schemas.
+- Include the post-4.0.34 shared queue deadline, schema recovery, bounded reassembly,
+  selective learned-route forwarding, and managed-variable refresh fixes.
+- Add malformed-header, canonical chunk parity, allocation-pressure, dispatch and
+  recovery regressions to the release checks. Wire format remains compatible.
+- Hardware validation is finite; this release does not claim lossless CAN service
+  or indefinite OOM immunity for every board configuration.
+
 ## 4.0.34
 
 - Fix side-transport transfer-ID collisions: CRC over a frame including its CRC

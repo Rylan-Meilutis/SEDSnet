@@ -4894,6 +4894,20 @@ pub extern "C" fn seds_router_process_tx_queue_with_timeout(
     ok_or_status(router.process_tx_queue_with_timeout(timeout_ms))
 }
 
+/// Drain TX without generating periodic announcements; normal maintenance is
+/// still required. See `Router::dispatch_tx_queue_with_timeout`.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_dispatch_tx_queue_with_timeout(
+    r: *mut SedsRouter,
+    timeout_ms: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.dispatch_tx_queue_with_timeout(timeout_ms))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_process_rx_queue_with_timeout(
     r: *mut SedsRouter,

@@ -19,10 +19,8 @@ use crate::{
 
 use crate::packet::{hash_bytes_u64, sender_address_u32};
 #[cfg(feature = "std")]
-use alloc::borrow::ToOwned;
-#[cfg(feature = "std")]
 use alloc::collections::BTreeMap;
-use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::sync::{Mutex, OnceLock};
@@ -198,6 +196,7 @@ impl<'a> ByteReader<'a> {
     }
 
     /// Read exactly `n` bytes, advancing the internal offset.
+    #[inline(always)]
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], TelemetryError> {
         if self.remaining() < n {
             return Err(TelemetryError::Unpack("short read"));
@@ -605,18 +604,25 @@ pub(crate) fn remember_source_address(addr: u32, sender: &str) {
 pub(crate) fn remember_source_address(_addr: u32, _sender: &str) {}
 
 #[cfg(feature = "std")]
-fn sender_name_for_address(addr: u32) -> String {
+fn sender_name_for_address(addr: u32) -> Arc<str> {
     address_book()
         .lock()
         .expect("wire address book poisoned")
         .get(&addr)
-        .map(|sender| sender.as_ref().to_owned())
-        .unwrap_or_else(|| format!("@addr:{addr}"))
+        .cloned()
+        .unwrap_or_else(|| format_sender_address(addr))
 }
 
 #[cfg(not(feature = "std"))]
-fn sender_name_for_address(addr: u32) -> String {
-    format!("@addr:{addr}")
+fn sender_name_for_address(addr: u32) -> Arc<str> {
+    format_sender_address(addr)
+}
+
+fn format_sender_address(addr: u32) -> Arc<str> {
+    use core::fmt::Write;
+    let mut name = String::with_capacity(16); // "@addr:" + at most ten decimal digits
+    write!(&mut name, "@addr:{addr}").expect("writing to a String cannot fail");
+    Arc::from(name)
 }
 
 // ===========================================================================
@@ -868,8 +874,47 @@ fn pack_packet_inner_with_contract(
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
     target_senders: &[u64],
-    #[cfg_attr(not(feature = "cryptography"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
+    e2e: Option<E2eSealConfig>,
 ) -> TelemetryResult<Arc<[u8]>> {
+    with_packet_frame_parts(
+        pkt,
+        reliable,
+        shape,
+        target_senders,
+        e2e,
+        |header, payload| Ok(join_frame_with_crc(header, payload)),
+    )
+}
+
+/// Serialize the normal plaintext header while retaining the existing payload.
+/// Used by chunked internal discovery to avoid a second schema-sized buffer.
+pub(crate) fn with_plain_packet_parts<T>(
+    pkt: &Packet,
+    consume: impl FnOnce(&[u8], &[u8]) -> TelemetryResult<T>,
+) -> TelemetryResult<T> {
+    let reliable = is_reliable_type(pkt.data_type()).then_some(ReliableHeader {
+        flags: RELIABLE_FLAG_UNSEQUENCED,
+        seq: 0,
+        ack: 0,
+    });
+    with_packet_frame_parts(
+        pkt,
+        reliable,
+        pkt.wire_shape(),
+        pkt.wire_target_senders(),
+        None,
+        consume,
+    )
+}
+
+fn with_packet_frame_parts<T>(
+    pkt: &Packet,
+    reliable: Option<ReliableHeader>,
+    shape: Option<MessageElement>,
+    target_senders: &[u64],
+    #[cfg_attr(not(feature = "cryptography"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
+    consume: impl FnOnce(&[u8], &[u8]) -> TelemetryResult<T>,
+) -> TelemetryResult<T> {
     let carries_wire_contract = shape.is_some() || !target_senders.is_empty();
     let endpoints_are_schema_default = endpoints_match_schema(pkt.data_type(), pkt.endpoints());
     let endpoint_bitmap_present = carries_wire_contract || !endpoints_are_schema_default;
@@ -989,8 +1034,7 @@ fn pack_packet_inner_with_contract(
     #[cfg(feature = "cryptography")]
     if let Some(e2e) = e2e {
         write_encrypted_payload(pkt, e2e.key_id, &payload_wire, &mut out)?;
-        append_crc32(&mut out);
-        return Ok(Arc::<[u8]>::from(out));
+        return consume(&out, &[]);
     }
     #[cfg(debug_assertions)]
     debug_assert_eq!(
@@ -998,7 +1042,7 @@ fn pack_packet_inner_with_contract(
         initial_capacity,
         "packet header grew its buffer"
     );
-    Ok(join_frame_with_crc(&out, &payload_wire))
+    consume(&out, &payload_wire)
 }
 
 // ===========================================================================
@@ -1165,56 +1209,151 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 /// - [`TelemetryError::Unpack`] if the frame is malformed or fails CRC.
 /// - [`TelemetryError::InvalidType`] if the type ID cannot be resolved.
 pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
-    let data = verify_crc32(buf)?;
-    if data.is_empty() {
-        return Err(TelemetryError::Unpack("short prelude"));
-    }
-    let mut r = ByteReader::new(data);
+    Ok(peek_routing_envelope(buf)?.into_owned())
+}
 
+/// Validated routing metadata without owned strings or heap-backed arrays.
+/// The fixed bitmap is normalized against the current schema on every parse;
+/// nothing is cached across schema updates or packet lifetimes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoutingEnvelope<'a> {
+    pub ty: DataType,
+    bitmap: [u64; EP_BITMAP_BYTES / 8],
+    pub source_address: u32,
+    pub timestamp_ms: u64,
+    pub wire_shape: Option<MessageElement>,
+    pub is_reliable: bool,
+    targets: &'a [u8],
+    has_reliable_header: bool,
+}
+impl RoutingEnvelope<'_> {
+    pub fn endpoints(&self) -> impl Iterator<Item = DataEndpoint> + '_ {
+        self.bitmap.iter().enumerate().flat_map(|(index, &byte)| {
+            let mut bits = byte;
+            core::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some(DataEndpoint((index * 64 + bit as usize) as u32))
+            })
+        })
+    }
+    pub fn target_senders(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.targets
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| u64::from_le_bytes(*bytes))
+    }
+    fn into_owned(self) -> TelemetryEnvelope {
+        TelemetryEnvelope {
+            ty: self.ty,
+            endpoints: self.endpoints().collect::<Arc<[_]>>(),
+            sender: sender_name_for_address(self.source_address),
+            source_address: self.source_address,
+            timestamp_ms: self.timestamp_ms,
+            wire_shape: self.wire_shape,
+            target_senders: self.target_senders().collect::<Arc<[_]>>(),
+        }
+    }
+}
+
+fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingEnvelope<'a>> {
     let flags = r.read_bytes(1)?[0];
-    let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
-    // We don't care about payload compression here.
-    let _payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
-
     let nep = r.read_bytes(1)?[0] as usize;
-
-    let ty_v = read_uleb128(&mut r)?;
-    let _dsz = read_uleb128(&mut r)? as usize;
-    let ts_v = read_uleb128(&mut r)?;
-    if (flags & FLAG_PACKET_NONCE) != 0 {
-        let _ = read_uleb128(&mut r)?;
+    let ty_v = read_uleb128(r)?;
+    let _data_size = read_uleb128(r)?;
+    let timestamp_ms = read_uleb128(r)?;
+    if flags & FLAG_PACKET_NONCE != 0 {
+        let _ = read_uleb128(r)?;
     }
-    let source_address = u32::try_from(read_uleb128(&mut r)?)
+    let source_address = u32::try_from(read_uleb128(r)?)
         .map_err(|_| TelemetryError::Unpack("source address too large"))?;
-    let sender_str = sender_name_for_address(source_address);
     let ty_u32 = data_type_id_from_wire(ty_v)?;
-    let known_ty = DataType::try_from_u32(ty_u32);
-    let endpoint_bytes = if endpoint_bitmap_present {
-        EP_BITMAP_BYTES
+    let metadata = crate::config::try_get_message_meta(DataType(ty_u32));
+    let known_ty = metadata.as_ref().map(|_| DataType(ty_u32));
+    let is_reliable = metadata
+        .as_ref()
+        .is_some_and(|meta| meta.reliable != crate::ReliableMode::None);
+    // Word-sized bitmaps avoid repeatedly scanning 32 individual bytes for
+    // the usual one-destination telemetry frame on size-optimized MCUs.
+    let mut bitmap = [0u64; EP_BITMAP_BYTES / 8];
+    if flags & FLAG_ENDPOINT_BITMAP_PRESENT != 0 {
+        let bytes = r.read_bytes(EP_BITMAP_BYTES)?;
+        for (word, chunk) in bitmap.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *word = u64::from_le_bytes(*chunk);
+        }
     } else {
-        0
-    };
-
-    if r.remaining() < endpoint_bytes {
-        return Err(TelemetryError::Unpack("short buffer"));
+        let meta = metadata.as_ref().ok_or(TelemetryError::InvalidType)?;
+        for endpoint in meta.endpoints_ref() {
+            let id = endpoint.as_u32() as usize;
+            if id < EP_BITMAP_BITS {
+                bitmap[id / 64] |= 1u64 << (id % 64);
+            }
+        }
     }
-
-    let eps = endpoints_from_wire_or_schema(&mut r, endpoint_bitmap_present, known_ty, nep)?;
-
-    let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
+    if bitmap
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum::<usize>()
+        != nep
+    {
+        return Err(TelemetryError::Unpack("endpoint count mismatch"));
+    }
+    for (index, &word) in bitmap.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let id = index * 64 + bits.trailing_zeros() as usize;
+            if DataEndpoint::try_from_u32(id as u32).is_none() {
+                return Err(TelemetryError::Unpack("bad endpoint bit set"));
+            }
+            bits &= bits - 1;
+        }
+    }
+    let mut shape = None;
+    let mut targets: &'a [u8] = &[];
+    let mut has_reliable_header = false;
+    if flags & FLAG_WIRE_CONTRACT != 0 {
+        let len = usize::try_from(read_uleb128(r)?)
+            .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
+        let mut cr = ByteReader::new(r.read_bytes(len)?);
+        let contract_flags = cr.read_bytes(1)?[0];
+        if contract_flags & CONTRACT_FLAG_SHAPE != 0 {
+            shape = Some(decode_wire_shape(&mut cr)?);
+        }
+        if contract_flags & CONTRACT_FLAG_TARGETS != 0 {
+            let count = usize::try_from(read_uleb128(&mut cr)?)
+                .map_err(|_| TelemetryError::Unpack("wire contract target count"))?;
+            let bytes = count
+                .checked_mul(8)
+                .ok_or(TelemetryError::Unpack("wire contract target count"))?;
+            targets = cr.read_bytes(bytes)?;
+        }
+        if cr.remaining() != 0 {
+            return Err(TelemetryError::Unpack("wire contract trailing bytes"));
+        }
+        has_reliable_header = contract_flags & CONTRACT_FLAG_RELIABLE_HEADER != 0;
+    }
     let ty = known_ty
-        .or_else(|| contract.shape.map(|_| DataType(ty_u32)))
+        .or_else(|| shape.map(|_| DataType(ty_u32)))
         .ok_or(TelemetryError::InvalidType)?;
-
-    Ok(TelemetryEnvelope {
+    Ok(RoutingEnvelope {
         ty,
-        endpoints: eps,
-        sender: Arc::<str>::from(sender_str),
+        bitmap,
         source_address,
-        timestamp_ms: ts_v,
-        wire_shape: contract.shape,
-        target_senders: contract.target_senders,
+        timestamp_ms,
+        wire_shape: shape,
+        is_reliable,
+        targets,
+        has_reliable_header,
     })
+}
+
+pub(crate) fn peek_routing_envelope(buf: &[u8]) -> TelemetryResult<RoutingEnvelope<'_>> {
+    let data = verify_crc32(buf)?;
+    read_routing_envelope(&mut ByteReader::new(data))
 }
 
 /// Decode the header/envelope and optional reliable header without touching the payload.
@@ -1233,69 +1372,44 @@ impl TelemetryFrameInfo {
     }
 }
 
-fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
-    if buf.is_empty() {
-        return Err(TelemetryError::Unpack("short prelude"));
+pub(crate) struct RoutingFrameInfo<'a> {
+    pub envelope: RoutingEnvelope<'a>,
+    pub reliable: Option<ReliableHeader>,
+}
+impl RoutingFrameInfo<'_> {
+    pub fn ack_only(&self) -> bool {
+        self.reliable
+            .is_some_and(|header| header.flags & RELIABLE_FLAG_ACK_ONLY != 0)
     }
-    let mut r = ByteReader::new(buf);
-
-    let flags = r.read_bytes(1)?[0];
-    let endpoint_bitmap_present = (flags & FLAG_ENDPOINT_BITMAP_PRESENT) != 0;
-    let compact_reliable_header = (flags & FLAG_COMPACT_RELIABLE_HEADER) != 0;
-    let _payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
-
-    let nep = r.read_bytes(1)?[0] as usize;
-
-    let ty_v = read_uleb128(&mut r)?;
-    let _dsz = read_uleb128(&mut r)? as usize;
-    let ts_v = read_uleb128(&mut r)?;
-    if (flags & FLAG_PACKET_NONCE) != 0 {
-        let _ = read_uleb128(&mut r)?;
-    }
-    let source_address = u32::try_from(read_uleb128(&mut r)?)
-        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
-    let sender_str = sender_name_for_address(source_address);
-    let ty_u32 = data_type_id_from_wire(ty_v)?;
-    let known_ty = DataType::try_from_u32(ty_u32);
-    let endpoint_bytes = if endpoint_bitmap_present {
-        EP_BITMAP_BYTES
-    } else {
-        0
-    };
-
-    if r.remaining() < endpoint_bytes {
-        return Err(TelemetryError::Unpack("short buffer"));
-    }
-
-    let eps = endpoints_from_wire_or_schema(&mut r, endpoint_bitmap_present, known_ty, nep)?;
-
-    let contract = decode_wire_contract(&mut r, (flags & FLAG_WIRE_CONTRACT) != 0)?;
-    let ty = known_ty
-        .or_else(|| contract.shape.map(|_| DataType(ty_u32)))
-        .ok_or(TelemetryError::InvalidType)?;
-
-    let reliable = if is_reliable_type(ty) || contract.has_reliable_header {
-        if r.remaining() < 1 {
-            return Err(TelemetryError::Unpack("short buffer"));
-        }
+}
+pub(crate) fn peek_routing_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
+    let data = verify_crc32(buf)?;
+    let mut reader = ByteReader::new(data);
+    let envelope = read_routing_envelope(&mut reader)?;
+    let reliable = if envelope.is_reliable || envelope.has_reliable_header {
         Some(read_reliable_header_encoded(
-            &mut r,
-            compact_reliable_header,
+            &mut reader,
+            data[0] & FLAG_COMPACT_RELIABLE_HEADER != 0,
         )?)
     } else {
         None
     };
+    Ok(RoutingFrameInfo { envelope, reliable })
+}
 
+fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
+    let mut r = ByteReader::new(buf);
+    let header = read_routing_envelope(&mut r)?;
+    let reliable = if header.is_reliable || header.has_reliable_header {
+        Some(read_reliable_header_encoded(
+            &mut r,
+            buf[0] & FLAG_COMPACT_RELIABLE_HEADER != 0,
+        )?)
+    } else {
+        None
+    };
     Ok(TelemetryFrameInfo {
-        envelope: TelemetryEnvelope {
-            ty,
-            endpoints: eps,
-            sender: Arc::<str>::from(sender_str),
-            source_address,
-            timestamp_ms: ts_v,
-            wire_shape: contract.shape,
-            target_senders: contract.target_senders,
-        },
+        envelope: header.into_owned(),
         reliable,
     })
 }
@@ -1761,6 +1875,47 @@ mod payload_compression {
 #[cfg(test)]
 mod endpoint_decode_tests {
     use super::*;
+
+    #[test]
+    fn borrowed_routing_header_preserves_targets_and_validates_truncated_contracts() {
+        let targets: Arc<[u64]> = Arc::from([1, u64::MAX, 42]);
+        let packet = Packet::new_with_wire_contract(
+            DataType::DiscoverySchema,
+            &[DataEndpoint::Discovery],
+            "PEER",
+            1234,
+            7,
+            Arc::from([1u8, 2, 3]),
+            Some(MessageElement::Dynamic(
+                crate::MessageDataType::Binary,
+                crate::MessageClass::Data,
+            )),
+            targets.clone(),
+        )
+        .unwrap();
+        let packed = pack_packet(&packet);
+        let routing = peek_routing_envelope(&packed).unwrap();
+        let full = unpack_packet(&packed).unwrap();
+        assert_eq!(routing.ty, full.data_type());
+        assert_eq!(routing.endpoints().collect::<Vec<_>>(), full.endpoints());
+        assert_eq!(
+            routing.target_senders().collect::<Vec<_>>(),
+            targets.as_ref()
+        );
+        assert_eq!(routing.timestamp_ms, full.timestamp());
+        // Cut through the header, recomputing CRC so truncation validation runs.
+        let data = verify_crc32(&packed).unwrap();
+        let mut reader = ByteReader::new(data);
+        read_routing_envelope(&mut reader).unwrap();
+        for end in 0..reader.off {
+            let mut truncated = data[..end].to_vec();
+            append_crc32(&mut truncated);
+            assert!(
+                peek_routing_envelope(&truncated).is_err(),
+                "accepted cut at {end}"
+            );
+        }
+    }
 
     #[test]
     fn large_packet_with_long_prefix_does_not_grow_packing_buffer() {

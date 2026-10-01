@@ -10,9 +10,16 @@ fn relay_chunk_identity_and_loss_are_bounded() {
     let b = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 181]);
     let first = relay
         .split_side_transport_frame(side, a.clone(), 128)
-        .unwrap();
-    let repeat = relay.split_side_transport_frame(side, a, 128).unwrap();
-    let second = relay.split_side_transport_frame(side, b, 128).unwrap();
+        .unwrap()
+        .collect::<Vec<_>>();
+    let repeat = relay
+        .split_side_transport_frame(side, a, 128)
+        .unwrap()
+        .collect::<Vec<_>>();
+    let second = relay
+        .split_side_transport_frame(side, b, 128)
+        .unwrap()
+        .collect::<Vec<_>>();
     assert_eq!(&first[0][4..8], &repeat[0][4..8]);
     assert_ne!(&first[0][4..8], &second[0][4..8]);
     assert!(
@@ -30,7 +37,10 @@ fn relay_chunk_identity_and_loss_are_bounded() {
         let mut data = vec![0; 180];
         data[..4].copy_from_slice(&i.to_le_bytes());
         let frame = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
-        let chunks = relay.split_side_transport_frame(side, frame, 128).unwrap();
+        let chunks = relay
+            .split_side_transport_frame(side, frame, 128)
+            .unwrap()
+            .collect::<Vec<_>>();
         relay.decode_side_transport_frame(side, &chunks[0]).unwrap();
         assert!(relay.state.lock().side_transport[&side].rx_chunks.len() <= 4);
     }
@@ -132,7 +142,8 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         let raw = wire_format::pack_packet(&packet);
         let frames = tx
             .encode_side_transport_frames(a, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
             Some(raw)
@@ -185,12 +196,14 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         )
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
-        tx.encode_side_transport_frames(a, opts, raw.clone())
+        let _ = tx
+            .encode_side_transport_frames(a, opts, raw.clone())
             .unwrap();
         // Lose the initial header (or restart the receiver), then send control.
         let frames = tx
             .encode_side_transport_frames(a, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
             Some(raw),
@@ -238,11 +251,13 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         let raw = wire_format::pack_packet(&packet);
         let initial = tx
             .encode_side_transport_frames(side, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         tx.decode_side_transport_frame(side, &initial[0])
             .unwrap()
             .unwrap();
-        tx.encode_side_transport_frames(unrelated, opts, raw.clone())
+        let _ = tx
+            .encode_side_transport_frames(unrelated, opts, raw.clone())
             .unwrap();
         let request = if schema_request {
             discovery::build_discovery_schema_request("GS", 2)
@@ -256,7 +271,8 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         let rx = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts);
         let frames = tx
             .encode_side_transport_frames(side, opts, raw.clone())
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert!(
             restarted
                 .decode_side_transport_frame(rx, &frames[0])
@@ -266,7 +282,8 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         assert_eq!(tx.state.lock().side_transport[&side].rx_template_count(), 1);
         let frames = tx
             .encode_side_transport_frames(unrelated, opts, raw)
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         let empty = Relay::new(Box::new(|| 100));
         let rx = empty.add_side_packed_with_options("uart", |_| Ok(()), opts);
         assert!(matches!(

@@ -4,8 +4,8 @@ A Rust networking stack with compact packets, runtime schema, discovery, routing
 managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
 bindings for distributed embedded and host systems.
 
-Current stable release: **4.0.34** on crates.io and PyPI. Embedded CMake
-consumers use the `v4.0.34` Git tag for reproducible builds, or `main` for rolling
+Current stable release: **4.0.35** on crates.io and PyPI. Embedded CMake
+consumers use the `v4.0.35` Git tag for reproducible builds, or `main` for rolling
 firmware updates. Rust and Python consumers should use the
 registry release.
 
@@ -111,6 +111,20 @@ recent packet ID cache preallocates its final storage because it is expected to 
 operation, so its reserved bytes come out of the shared budget immediately. If one active queue area
 is idle, another can use more of the remaining budget; if several areas fill at once, older queued
 state is evicted so total queue-owned memory stays bounded.
+
+Embedded applications can additionally register `memory_admission::set_probe` (C:
+`seds_set_memory_admission_probe`) to reject incoming packed work and large schema
+operations before transient allocations. The allocation-free callback receives estimated
+additional bytes and the largest required contiguous block; inspect both total headroom
+and fragmentation, reserving space for dispatch and ACKs. Refusal returns `Io("memory pressure")`
+(`SEDS_IO`) and increments `seds_memory_admission_rejected`. Memory-pressure refusals from
+background maintenance do not prevent queue dispatch. Continue servicing TX under overload;
+do not turn each refusal into a newly allocated log packet. Routers can call
+`dispatch_tx_queue_with_timeout` (C: `seds_router_dispatch_tx_queue_with_timeout`)
+between ingress bursts without creating new periodic announcements; continue calling
+normal queue/periodic maintenance regularly. NULL/`None` disables the probe.
+This admission estimate supplements queue bounds; it cannot guarantee arbitrary user callbacks
+or concurrent allocations will never exhaust the allocator.
 
 The test route includes an allocator-instrumented lifecycle regression that repeatedly creates,
 fills, clears, and drops routers, relays, runtime schemas, and packets. Each cycle must return live
@@ -500,7 +514,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.34
+    GIT_TAG v4.0.35
 )
 FetchContent_MakeAvailable(sedsnet)
 

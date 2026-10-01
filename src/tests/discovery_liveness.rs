@@ -17,8 +17,14 @@ fn lost_chunk_cannot_poison_later_frames_from_same_router() {
         crate::side_transport::crc32_bytes(&first),
         crate::side_transport::crc32_bytes(&second)
     );
-    let a = rf.split_side_transport_frame(0, first, 128).unwrap();
-    let b = rf.split_side_transport_frame(0, second, 128).unwrap();
+    let a = rf
+        .split_side_transport_frame(0, first, 128)
+        .unwrap()
+        .collect::<Vec<_>>();
+    let b = rf
+        .split_side_transport_frame(0, second, 128)
+        .unwrap()
+        .collect::<Vec<_>>();
     assert_ne!(
         &a[0][4..8],
         &b[0][4..8],
@@ -46,7 +52,10 @@ fn incomplete_side_transfers_stay_bounded_under_repeated_loss() {
         let mut data = vec![0; 180];
         data[..4].copy_from_slice(&i.to_le_bytes());
         let frame = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &data);
-        let chunks = router.split_side_transport_frame(side, frame, 128).unwrap();
+        let chunks = router
+            .split_side_transport_frame(side, frame, 128)
+            .unwrap()
+            .collect::<Vec<_>>();
         assert!(
             router
                 .decode_side_transport_frame(side, &chunks[0])
