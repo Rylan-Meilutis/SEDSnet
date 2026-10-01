@@ -1,6 +1,17 @@
 # Changelog
 
-## 4.0.35
+## 4.0.36
+
+- Recheck allocator headroom immediately before decoded payload allocation,
+  including reassembled frames whose individual fragments passed ingress checks.
+  Check decompression scratch and final shared payload storage separately.
+- Add an allocation-instrumented regression proving refusal occurs before any
+  payload-sized allocation and decoding recovers after pressure clears.
+- Includes the 4.0.35 forwarding and dispatch changes below. The 4.0.35 registry
+  release was stopped after a hardware soak exposed this missing check; its
+  GitHub tag is retained as a prerelease.
+
+## 4.0.35 (prerelease)
 
 - Route packed transit traffic using borrowed metadata; avoid full payload decoding
   in router/relay ACK-route checks and avoid allocating unused metadata fallbacks.

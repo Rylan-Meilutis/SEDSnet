@@ -4,8 +4,8 @@ A Rust networking stack with compact packets, runtime schema, discovery, routing
 managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
 bindings for distributed embedded and host systems.
 
-Current stable release: **4.0.35** on crates.io and PyPI. Embedded CMake
-consumers use the `v4.0.35` Git tag for reproducible builds, or `main` for rolling
+Current stable release: **4.0.36** on crates.io and PyPI. Embedded CMake
+consumers use the `v4.0.36` Git tag for reproducible builds, or `main` for rolling
 firmware updates. Rust and Python consumers should use the
 registry release.
 
@@ -514,7 +514,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.35
+    GIT_TAG v4.0.36
 )
 FetchContent_MakeAvailable(sedsnet)
 

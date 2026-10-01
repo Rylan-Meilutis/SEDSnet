@@ -4,7 +4,7 @@ SEDSnet is a Rust telemetry transport and logging library with a shared schema, 
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 
-The current release is v4.0.35. Packed transit forwarding uses borrowed metadata,
+The current release is v4.0.36. Packed transit forwarding uses borrowed metadata,
 and embedded schema transmission avoids duplicate full-size buffers. Optional
 allocator-headroom admission rejects work under memory pressure while retained
 queues continue dispatching. Idle discovery recovery avoids repeated allocations.

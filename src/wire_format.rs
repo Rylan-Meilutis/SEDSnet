@@ -1137,6 +1137,16 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
         reliable_hdr = Some(hdr);
     }
 
+    // Reassembled side frames bypass the small-fragment ingress estimate.
+    // Check again immediately before allocating their logical payload, including
+    // decompression/decryption scratch when enabled.
+    let payload_copies = if payload_is_compressed { 3 } else { 1 };
+    #[cfg(feature = "cryptography")]
+    let payload_copies = payload_copies + usize::from(payload_is_encrypted);
+    crate::memory_admission::check(
+        dsz.saturating_mul(payload_copies).saturating_add(512),
+        dsz.saturating_add(32),
+    )?;
     // ----- Payload handling -----
     let payload_arc: Arc<[u8]> = {
         #[cfg(feature = "cryptography")]
@@ -1163,6 +1173,7 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 
         if payload_is_compressed {
             let decompressed = payload_compression::decompress(payload_wire, dsz)?;
+            crate::memory_admission::check(dsz.saturating_add(512), dsz.saturating_add(32))?;
             Arc::<[u8]>::from(decompressed)
         } else {
             if payload_wire.len() != dsz {
