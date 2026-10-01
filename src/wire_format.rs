@@ -1143,8 +1143,15 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let payload_copies = if payload_is_compressed { 3 } else { 1 };
     #[cfg(feature = "cryptography")]
     let payload_copies = payload_copies + usize::from(payload_is_encrypted);
+    let small_ack = matches!(ty, DataType::ReliableAck | DataType::ReliablePartialAck)
+        && dsz <= 32
+        && payload_copies == 1;
     crate::memory_admission::check(
-        dsz.saturating_mul(payload_copies).saturating_add(512),
+        if small_ack {
+            512
+        } else {
+            dsz.saturating_mul(payload_copies).saturating_add(512)
+        },
         dsz.saturating_add(32),
     )?;
     // ----- Payload handling -----

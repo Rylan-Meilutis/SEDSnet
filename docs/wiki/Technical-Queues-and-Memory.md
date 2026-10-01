@@ -16,9 +16,14 @@ Key properties:
 - **Growth policy**: multiplicative growth using `QUEUE_GROW_STEP`. Set it to
   exactly `1.0` on fragmented embedded heaps to retain the startup capacity
   and evict from a full bounded queue without reallocating under live traffic.
-- **Embedded discovery**: no-std nodes use immutable flash schemas, so they do
-  not advertise or decode dynamic schema snapshots. This avoids multi-kilobyte
-  transient reassembly buffers on fragmented RTOS heaps.
+- **Embedded discovery**: no-std nodes retain immutable flash schemas plus a
+  bounded runtime overlay. Discovery snapshots and reassembly require transient
+  storage; an optional allocator-headroom probe can reject work before allocating.
+- **Pressure recovery**: Router and Relay reclaim incomplete side transfers after
+  two seconds of inactivity during queue service and before ingress admission.
+  Small ACKs use reserved headroom so ordinary ingress refusal does not block
+  release of reliable replay buffers. The probe estimates headroom; it cannot
+  guarantee every later allocation succeeds.
 
 This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded builds.
 

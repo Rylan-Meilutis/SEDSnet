@@ -46,7 +46,7 @@ pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
         return Ok(());
     }
     // Keep a smaller admission requirement for ACKs that can release retained
-    // replay buffers. Side-wrapped frames use the conservative normal estimate.
+    // replay buffers. Side wrappers are classified after their header is decoded.
     let ack = crate::wire_format::peek_routing_frame_info(bytes)
         .ok()
         .is_some_and(|frame| {
@@ -56,12 +56,18 @@ pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
                     crate::DataType::ReliableAck | crate::DataType::ReliablePartialAck
                 )
         });
-    if ack {
-        check(512, bytes.len().saturating_add(32))
+    check_frame(bytes.len(), ack)
+}
+
+pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {
+    // Only small control frames use the reserved ACK headroom. An oversized
+    // or malformed ACK must not bypass ordinary allocation admission.
+    if ack && len <= 128 {
+        check(512, len.saturating_add(32))
     } else {
         check(
-            bytes.len().saturating_mul(3).saturating_add(2048),
-            bytes.len().saturating_add(32),
+            len.saturating_mul(3).saturating_add(2048),
+            len.saturating_add(32),
         )
     }
 }

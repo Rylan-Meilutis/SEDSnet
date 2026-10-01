@@ -11,9 +11,10 @@
 use crate::side_transport::{
     SIDE_TRANSPORT_FLAG_PACKET_NONCE, SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT,
     SIDE_TRANSPORT_KIND_COMPACT_DELTA, SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP,
-    SIDE_TRANSPORT_KIND_FULL, SideCompactTimestampMode, SideHeaderTemplate, SideTransportFrames,
-    extract_side_header_template, parse_side_transport_wrapper, read_uleb128_local,
-    reconstruct_side_compact_frame, wrap_side_transport_frame, write_uleb128_local,
+    SIDE_TRANSPORT_KIND_FULL, SideChunkAssembly, SideCompactTimestampMode, SideHeaderTemplate,
+    SideTransportFrames, extract_side_header_template, parse_side_transport_wrapper,
+    read_uleb128_local, reconstruct_side_compact_frame, wrap_side_transport_frame,
+    write_uleb128_local,
 };
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_return_identity.rs"]
@@ -237,40 +238,6 @@ impl SideTransportProfile {
             Self::Ipv6Like => discovery::LINK_PROFILE_IPV6_LIKE,
             Self::Ipv4Like => discovery::LINK_PROFILE_IPV4_LIKE,
         }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SideChunkAssembly {
-    last_seen_ms: u64,
-    total: u16,
-    received: BTreeMap<u16, Arc<[u8]>>,
-}
-
-impl SideChunkAssembly {
-    fn assemble(self) -> TelemetryResult<Vec<u8>> {
-        if self.received.len() != usize::from(self.total) {
-            return Err(TelemetryError::Unpack("side chunk gap"));
-        }
-        let len = self.received.values().try_fold(0usize, |n, chunk| {
-            n.checked_add(chunk.len())
-                .ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
-        })?;
-        // Repeated extend growth can double a ~3.6 KiB discovery packet to
-        // 7 KiB while retaining the old buffer and every received fragment.
-        // Reserve once, report exhaustion instead of panicking, and consume
-        // fragments as we copy. Decoding accepts the Vec directly: no extra Arc.
-        crate::memory_admission::check(len.saturating_add(512), len.saturating_add(32))?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(len)
-            .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
-        for (expected, (index, chunk)) in self.received.into_iter().enumerate() {
-            if usize::from(index) != expected {
-                return Err(TelemetryError::Unpack("side chunk gap"));
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
     }
 }
 
@@ -5709,7 +5676,9 @@ impl Router {
                 self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
             let mut per_side = Vec::new();
             for side_id in 0..st.sides.len() {
-                let Some(side) = st.sides[side_id].as_ref() else { continue };
+                let Some(side) = st.sides[side_id].as_ref() else {
+                    continue;
+                };
                 let opts = side.opts;
                 let link_local_enabled = opts.link_local_enabled;
                 if requested_side.is_some_and(|requested| requested != side_id) {
@@ -6156,9 +6125,8 @@ impl Router {
             if pkt.sender() != sender_id {
                 route.announcers.remove(pkt.sender());
             }
-            let mut sender_state = core::mem::take(
-                route.announcers.entry(sender_id.to_string()).or_default(),
-            );
+            let mut sender_state =
+                core::mem::take(route.announcers.entry(sender_id.to_string()).or_default());
             // DiscoveryAddress is a compact route summary. A multi-sided
             // router advertises endpoints reachable *through* it, so these
             // entries must not be attached to the announcer's topology node:
@@ -7253,13 +7221,24 @@ impl Router {
         Ok(frames)
     }
 
+    fn expire_side_chunks(&self) {
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        for side in st.side_transport.values_mut() {
+            side.rx_chunks
+                .retain(|_, assembly| now.saturating_sub(assembly.last_seen_ms) <= 2000);
+        }
+    }
+
     fn decode_side_transport_frame(
         &self,
         side: RouterSideId,
         bytes: &[u8],
     ) -> TelemetryResult<Option<Arc<[u8]>>> {
-        crate::memory_admission::check_receive(bytes)?;
+        // Reclaim abandoned transfers before admission, even when new work is refused.
+        self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
+            crate::memory_admission::check_receive(bytes)?;
             return Ok(Some(Arc::from(bytes)));
         };
         match kind {
@@ -7281,6 +7260,7 @@ impl Router {
                 } else {
                     None
                 };
+                crate::memory_admission::check_receive(&body[off..])?;
                 let raw = Arc::<[u8]>::from(&body[off..]);
                 if let (Some(template_id), Ok((template, _, _, _, timestamp, _, _, _))) =
                     (template_id, extract_side_header_template(raw.as_ref()))
@@ -7318,9 +7298,6 @@ impl Router {
                 let mut off = 1usize;
                 let template_id = u32::try_from(read_uleb128_local(body, &mut off)?)
                     .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
-                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
-                compact_body.push(body[0]);
-                compact_body.extend_from_slice(&body[off..]);
                 let (template, timestamp_base) = {
                     let st = self.state.lock();
                     let state = st.side_transport.get(&side);
@@ -7346,6 +7323,15 @@ impl Router {
                 let Some(template) = template else {
                     return Ok(None);
                 };
+                let reconstructed_bound = body
+                    .len()
+                    .saturating_add(template.prefix.len())
+                    .saturating_add(template.between.len())
+                    .saturating_add(32);
+                crate::memory_admission::check_frame(reconstructed_bound, template.is_ack())?;
+                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
+                compact_body.push(body[0]);
+                compact_body.extend_from_slice(&body[off..]);
                 let timestamp_mode = match kind {
                     SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
                     SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
@@ -7364,6 +7350,7 @@ impl Router {
                 Ok(Some(frame))
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
+                crate::memory_admission::check_receive(bytes)?;
                 if body.len() < 8 {
                     return Err(TelemetryError::Unpack("short side chunk frame"));
                 }
@@ -10241,6 +10228,7 @@ impl Router {
     /// Process packets in the transmit queue for up to `timeout_ms` milliseconds.
     /// If `timeout_ms == 0`, drains the queue fully.
     fn process_tx_queue_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        self.expire_side_chunks();
         let start = self.clock.now_ms();
         loop {
             crate::memory_admission::allow_drain(self.process_reliable_timeouts())?;
@@ -10289,6 +10277,7 @@ impl Router {
     /// Process packets in the receive queue for up to `timeout_ms` milliseconds.
     /// If `timeout_ms == 0`, drains the queue fully.
     fn process_rx_queue_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        self.expire_side_chunks();
         let start = self.clock.now_ms();
         loop {
             let item_opt = self.isr_rx_queue.pop_front().unwrap_or(None).or_else(|| {
@@ -10317,6 +10306,7 @@ impl Router {
     /// Process both transmit and receive queues for up to `timeout_ms` milliseconds.
     /// If `timeout_ms == 0`, drains both queues fully.
     fn process_all_queues_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        self.expire_side_chunks();
         // Share the deadline between directions. Splitting a 1 ms budget in
         // half rounded TX down to zero and serviced only one transmit item,
         // even when the remainder of the pass was idle. One TX/RX pair is

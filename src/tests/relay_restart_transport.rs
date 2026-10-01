@@ -292,3 +292,197 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         ));
     }
 }
+
+#[test]
+fn queue_service_expires_incomplete_transfers_without_new_fragments() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let router = Relay::new(Box::new(move || {
+        clock.load(core::sync::atomic::Ordering::Relaxed)
+    }));
+    let side = router.add_side_packed("CAN", |_| Ok(()));
+    let retained = Arc::<[u8]>::from([42; 128]);
+    let witness = Arc::downgrade(&retained);
+    router
+        .state
+        .lock()
+        .side_transport
+        .get_mut(&side)
+        .unwrap()
+        .rx_chunks
+        .insert(
+            7,
+            SideChunkAssembly {
+                last_seen_ms: 0,
+                total: 2,
+                received: [(0, retained)].into_iter().collect(),
+            },
+        );
+    now.store(2000, core::sync::atomic::Ordering::Relaxed);
+    router.process_tx_queue_with_timeout(1).unwrap();
+    assert!(witness.upgrade().is_some(), "live transfer expired early");
+    extern "C" fn deny_new_work(_: usize, _: usize) -> bool {
+        false
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(deny_new_work));
+    now.store(2001, core::sync::atomic::Ordering::Relaxed);
+    router.process_tx_queue_with_timeout(1).unwrap();
+    assert!(
+        witness.upgrade().is_none(),
+        "abandoned transfer pinned its payload without new ingress"
+    );
+    assert!(
+        router.state.lock().side_transport[&side]
+            .rx_chunks
+            .is_empty()
+    );
+}
+
+#[test]
+fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
+    extern "C" fn only_control(additional: usize, largest: usize) -> bool {
+        additional <= 512 && largest <= 160
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let rx = Relay::new(Box::new(|| 0));
+    let opts = RelaySideOptions::default().with_small_packet_transport(0);
+    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+    let packet = Packet::new(
+        crate::DataType::ReliableAck,
+        &[crate::DataEndpoint::Discovery],
+        "GS",
+        100,
+        Arc::<[u8]>::from([0; 8]),
+    )
+    .unwrap();
+    let raw = wire_format::pack_packet(&packet);
+    // Current senders use canonical ACKs; older peers can still wrap them.
+    let mut body = vec![1];
+    body.extend_from_slice(&raw);
+    let full = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body);
+    let (_, _, flags, size, timestamp, nonce, reliable, payload) =
+        extract_side_header_template(&raw).unwrap();
+    let mut body = vec![flags, 1];
+    write_uleb128_local(size, &mut body);
+    write_uleb128_local(timestamp, &mut body);
+    if flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
+        write_uleb128_local(u64::from(nonce), &mut body);
+    }
+    if let Some((seq, ack)) = reliable {
+        write_uleb128_local(u64::from(seq), &mut body);
+        write_uleb128_local(u64::from(ack), &mut body);
+    }
+    body.extend_from_slice(payload);
+    let compact = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body);
+    let ordinary = Packet::new(
+        crate::DataType::DiscoverySchema,
+        &[crate::DataEndpoint::Discovery],
+        "GS",
+        101,
+        Arc::<[u8]>::from([1; 32]),
+    )
+    .unwrap();
+    let ordinary = wire_format::pack_packet(&ordinary);
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(only_control));
+    assert!(
+        rx.decode_side_transport_frame(b, &ordinary).is_err(),
+        "ordinary ingress must remain refused"
+    );
+    for wire in [&raw, &full, &compact] {
+        let decoded = rx.decode_side_transport_frame(b, wire).unwrap().unwrap();
+        assert_eq!(decoded, raw);
+        let packet = wire_format::unpack_packet(&decoded).unwrap();
+        assert_eq!(packet.data_type(), crate::DataType::ReliableAck);
+    }
+}
+
+#[test]
+fn short_budget_still_dispatches_retained_relay_tx() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let time = Arc::new(AtomicU64::new(0));
+    let clock = time.clone();
+    let relay = Relay::new(Box::new(move || clock.fetch_add(1, Ordering::Relaxed)));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let count = sent.clone();
+    let ty = crate::DataType::named("GPS_DATA");
+    let side = relay.add_side_packed("output", move |wire| {
+        if wire_format::peek_routing_envelope(wire).is_ok_and(|env| env.ty == ty) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    let packet = Packet::new(
+        ty,
+        &[crate::DataEndpoint::named("RADIO")],
+        "GS",
+        1,
+        Arc::<[u8]>::from([0; 12]),
+    )
+    .unwrap();
+    relay
+        .state
+        .lock()
+        .push_tx(RelayTxItem {
+            src: None,
+            dst: side,
+            data: RelayItem::Packet(Arc::new(packet)),
+            priority: 255,
+        })
+        .unwrap();
+    relay.process_all_queues_with_timeout(1).unwrap();
+    assert_eq!(
+        sent.load(Ordering::Relaxed),
+        1,
+        "RX budget boundary must not starve retained TX"
+    );
+}
+
+#[test]
+fn malformed_discovery_preserves_retained_relay_routes() {
+    crate::tests::ensure_common_test_schema();
+    let relay = Relay::new(Box::new(|| 1));
+    let side = relay.add_side_packed("CAN", |_| Ok(()));
+    let mut route = DiscoverySideState::default();
+    route.announcers.insert(
+        "VB".into(),
+        DiscoverySenderState {
+            last_seen_ms: 1,
+            advertised_reachable: vec![crate::DataEndpoint::named("RADIO")],
+            ..Default::default()
+        },
+    );
+    relay
+        .state
+        .lock()
+        .discovery_routes
+        .insert(side, route.clone());
+    let packet = Packet::new(
+        crate::DataType::DiscoveryTimeSyncSources,
+        &[crate::DataEndpoint::Discovery],
+        "VB",
+        1,
+        Arc::<[u8]>::from([0xff; 4]),
+    )
+    .unwrap();
+    assert!(
+        relay
+            .learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+            .is_err()
+    );
+    assert_eq!(relay.state.lock().discovery_routes[&side], route);
+}

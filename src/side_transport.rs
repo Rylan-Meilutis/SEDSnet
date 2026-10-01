@@ -1,7 +1,7 @@
 //! Shared wire codec for router and relay side transports.
 
 use crate::{DataType, TelemetryError, TelemetryResult, packet::hash_bytes_u64, wire_format};
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
 
 pub(crate) const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
@@ -106,6 +106,25 @@ pub(crate) struct SideHeaderTemplate {
     pub(crate) between: Arc<[u8]>,
     pub(crate) reliable_flags: Option<u8>,
     pub(crate) reliable_compact: bool,
+}
+
+impl SideHeaderTemplate {
+    pub(crate) fn is_ack(&self) -> bool {
+        if self
+            .reliable_flags
+            .is_some_and(|flags| flags & wire_format::RELIABLE_FLAG_ACK_ONLY != 0)
+        {
+            return true;
+        }
+        // Prefix is endpoint count followed by the canonical type ULEB128.
+        let mut off = 1;
+        read_uleb128_local(&self.prefix, &mut off)
+            .ok()
+            .is_some_and(|ty| {
+                ty == u64::from(DataType::ReliableAck.as_u32())
+                    || ty == u64::from(DataType::ReliablePartialAck.as_u32())
+            })
+    }
 }
 
 type SideTemplateExtract<'a> = (
@@ -477,5 +496,39 @@ mod streamed_chunk_tests {
         });
         assert!(result.is_err());
         assert_eq!(calls, 1);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SideChunkAssembly {
+    pub(crate) last_seen_ms: u64,
+    pub(crate) total: u16,
+    pub(crate) received: BTreeMap<u16, Arc<[u8]>>,
+}
+
+impl SideChunkAssembly {
+    pub(crate) fn assemble(self) -> TelemetryResult<Vec<u8>> {
+        if self.received.len() != usize::from(self.total) {
+            return Err(TelemetryError::Unpack("side chunk gap"));
+        }
+        let len = self.received.values().try_fold(0usize, |n, chunk| {
+            n.checked_add(chunk.len())
+                .ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
+        })?;
+        // Repeated extend growth can double a ~3.6 KiB discovery packet to
+        // 7 KiB while retaining the old buffer and every received fragment.
+        // Reserve once, report exhaustion instead of panicking, and consume
+        // fragments as we copy. Decoding accepts the Vec directly: no extra Arc.
+        crate::memory_admission::check(len.saturating_add(512), len.saturating_add(32))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
+        for (expected, (index, chunk)) in self.received.into_iter().enumerate() {
+            if usize::from(index) != expected {
+                return Err(TelemetryError::Unpack("side chunk gap"));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 }

@@ -226,3 +226,57 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
         "a genuinely silent RF must still expire even with PB present"
     );
 }
+
+#[test]
+fn queue_service_expires_incomplete_transfers_without_new_fragments() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::new([]),
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    );
+    let side = router.add_side_packed("CAN", |_| Ok(()));
+    let retained = Arc::<[u8]>::from([42; 128]);
+    let witness = Arc::downgrade(&retained);
+    router
+        .state
+        .lock()
+        .side_transport
+        .get_mut(&side)
+        .unwrap()
+        .rx_chunks
+        .insert(
+            7,
+            SideChunkAssembly {
+                last_seen_ms: 0,
+                total: 2,
+                received: [(0, retained)].into_iter().collect(),
+            },
+        );
+    now.store(2000, Ordering::Relaxed);
+    router.dispatch_tx_queue_with_timeout(1).unwrap();
+    assert!(witness.upgrade().is_some(), "live transfer expired early");
+    extern "C" fn deny_new_work(_: usize, _: usize) -> bool {
+        false
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(deny_new_work));
+    now.store(2001, Ordering::Relaxed);
+    router.dispatch_tx_queue_with_timeout(1).unwrap();
+    assert!(
+        witness.upgrade().is_none(),
+        "abandoned transfer pinned its payload without new ingress"
+    );
+    assert!(
+        router.state.lock().side_transport[&side]
+            .rx_chunks
+            .is_empty()
+    );
+}

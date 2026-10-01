@@ -1,5 +1,20 @@
 # Changelogs
 
+## Version 4.0.37 highlights
+
+- Fix memory-pressure recovery in both Router and Relay: expire incomplete side
+  transfers during queue service and before ingress admission, so rejected new
+  fragments cannot leave old buffers retained indefinitely.
+- Preserve reserved headroom for small canonical ACK payloads and legacy full/
+  compact wrapped ACKs. Oversized ACKs retain ordinary allocation checks.
+- Share exact-size, checked fragment reassembly between Router and Relay; relay
+  reassembly no longer grows a second buffer while retaining every fragment.
+- Apply router route-learning allocation fixes to Relay, parsing fallible updates
+  and resolving aliases before moving retained route state instead of cloning it.
+- Give Relay TX/RX a shared service deadline so short budgets cannot starve TX.
+- Add matching pressure, idle cleanup, malformed discovery, and short-budget
+  regressions. Admission remains a headroom estimate, not an OOM guarantee.
+
 ## Version 4.0.34 highlights
 
 - Sender-seeded chunk content IDs prevent stale fragments from corrupting later packets.

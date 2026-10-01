@@ -1,9 +1,10 @@
 use crate::side_transport::{
     SIDE_TRANSPORT_FLAG_PACKET_NONCE, SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT,
     SIDE_TRANSPORT_KIND_COMPACT_DELTA, SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP,
-    SIDE_TRANSPORT_KIND_FULL, SideCompactTimestampMode, SideHeaderTemplate, SideTransportFrames,
-    extract_side_header_template, parse_side_transport_wrapper, read_uleb128_local,
-    reconstruct_side_compact_frame, wrap_side_transport_frame, write_uleb128_local,
+    SIDE_TRANSPORT_KIND_FULL, SideChunkAssembly, SideCompactTimestampMode, SideHeaderTemplate,
+    SideTransportFrames, extract_side_header_template, parse_side_transport_wrapper,
+    read_uleb128_local, reconstruct_side_compact_frame, wrap_side_transport_frame,
+    write_uleb128_local,
 };
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/relay_restart_transport.rs"]
@@ -481,13 +482,6 @@ struct DiscoverySideState {
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
     announcers: BTreeMap<String, DiscoverySenderState>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SideChunkAssembly {
-    last_seen_ms: u64,
-    total: u16,
-    received: BTreeMap<u16, Arc<[u8]>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3227,7 +3221,9 @@ impl Relay {
             st.discovery_cadence.on_announce_sent(now_ms);
             let mut per_side = Vec::new();
             for side_id in 0..st.sides.len() {
-                let Some(side) = st.sides[side_id].as_ref() else { continue };
+                let Some(side) = st.sides[side_id].as_ref() else {
+                    continue;
+                };
                 let opts = side.opts;
                 let link_local_enabled = opts.link_local_enabled;
                 if requested_side.is_some_and(|requested| requested != side_id) {
@@ -3575,7 +3571,7 @@ impl Relay {
                 pkt.as_ref().clone()
             }
             RelayItem::Packed(bytes) => {
-                let env = wire_format::peek_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
                 if !discovery::is_discovery_type(env.ty) {
                     return Ok(());
                 }
@@ -3699,7 +3695,26 @@ impl Relay {
                 canonical
             }
         };
-        let mut route = st.discovery_routes.get(&src).cloned().unwrap_or_default();
+        // Parse fallible payloads and resolve aliases before moving retained state.
+        let announced = if pkt.data_type() == crate::DataType::DiscoveryAnnounce {
+            Some(discovery::decode_discovery_announce(&pkt)?)
+        } else {
+            None
+        };
+        let timesync_sources = if pkt.data_type() == crate::DataType::DiscoveryTimeSyncSources {
+            Some(discovery::decode_discovery_timesync_sources(&pkt)?)
+        } else {
+            None
+        };
+        if let Some(update) = topology_ad.as_mut() {
+            for board in &mut update.boards {
+                board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
+                for peer in &mut board.connections {
+                    *peer = Self::canonical_sender_locked(&st, peer);
+                }
+            }
+        }
+        let mut route = core::mem::take(st.discovery_routes.entry(src).or_default());
         if pkt.sender() != announcer_id {
             route.announcers.remove(pkt.sender());
         }
@@ -3709,11 +3724,8 @@ impl Relay {
             .and_then(|entry| entry.as_ref())
             .map(|side_ref| side_ref.opts.link_local_enabled)
             .unwrap_or(false);
-        let mut sender_state = route
-            .announcers
-            .get(&announcer_id)
-            .cloned()
-            .unwrap_or_default();
+        let mut sender_state =
+            core::mem::take(route.announcers.entry(announcer_id.clone()).or_default());
         let changed = match pkt.data_type() {
             crate::DataType::DiscoveryAddress => {
                 let ad = address_ad.expect("decoded above");
@@ -3735,7 +3747,7 @@ impl Relay {
                 changed
             }
             crate::DataType::DiscoveryAnnounce => {
-                let mut reachable = discovery::decode_discovery_announce(&pkt)?;
+                let mut reachable = announced.expect("parsed before moving route state");
                 // Empty announcements are slow-link keepalives, not endpoint
                 // withdrawals. Preserve ownership until an explicit topology
                 // update, leave, or expiry removes it. The common receive tail
@@ -3754,7 +3766,7 @@ impl Relay {
                 }
             }
             crate::DataType::DiscoveryTimeSyncSources => {
-                let sources = discovery::decode_discovery_timesync_sources(&pkt)?;
+                let sources = timesync_sources.expect("parsed before moving route state");
                 let board = Self::sender_topology_board_mut(&mut sender_state, &announcer_id);
                 let changed = board.reachable_timesync_sources != sources;
                 board.reachable_timesync_sources = sources;
@@ -3765,12 +3777,6 @@ impl Relay {
                 let mut update = topology_ad
                     .take()
                     .expect("topology packet was decoded before route selection");
-                for board in update.boards.iter_mut() {
-                    board.sender_id = Self::canonical_sender_locked(&st, &board.sender_id);
-                    for peer in board.connections.iter_mut() {
-                        *peer = Self::canonical_sender_locked(&st, peer);
-                    }
-                }
                 if !side_link_local_enabled {
                     for board in update.boards.iter_mut() {
                         board
@@ -4886,7 +4892,7 @@ impl Relay {
                 self.note_side_rx(item.src, pkt.data_type(), bytes);
             }
             RelayItem::Packed(bytes) => {
-                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                if let Ok(env) = wire_format::peek_routing_envelope(bytes.as_ref()) {
                     self.note_side_rx(item.src, env.ty, bytes.len());
                 }
             }
@@ -4898,7 +4904,7 @@ impl Relay {
                 }
             }
             RelayItem::Packed(bytes) => {
-                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref())
+                if let Ok(env) = wire_format::peek_routing_envelope(bytes.as_ref())
                     && is_reliable_type(env.ty)
                     && !is_internal_control_type(env.ty)
                     && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
@@ -5116,7 +5122,7 @@ impl Relay {
                 }
             }
             RelayItem::Packed(bytes) => {
-                let env = wire_format::peek_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
                 if matches!(
                     env.ty,
                     crate::DataType::ReliableAck
@@ -5321,13 +5327,23 @@ impl Relay {
         Ok(frames)
     }
 
+    fn expire_side_chunks(&self) {
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        for side in st.side_transport.values_mut() {
+            side.rx_chunks
+                .retain(|_, assembly| now.saturating_sub(assembly.last_seen_ms) <= 2000);
+        }
+    }
+
     fn decode_side_transport_frame(
         &self,
         side: RelaySideId,
         bytes: &[u8],
     ) -> TelemetryResult<Option<Arc<[u8]>>> {
-        crate::memory_admission::check_receive(bytes)?;
+        self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
+            crate::memory_admission::check_receive(bytes)?;
             return Ok(Some(Arc::from(bytes)));
         };
         match kind {
@@ -5335,6 +5351,7 @@ impl Relay {
                 let mut off = 0usize;
                 let template_id = u32::try_from(read_uleb128_local(body, &mut off)?)
                     .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                crate::memory_admission::check_receive(&body[off..])?;
                 let raw = Arc::<[u8]>::from(&body[off..]);
                 if let Ok((template, _, _, _, timestamp, _, _, _)) =
                     extract_side_header_template(raw.as_ref())
@@ -5372,9 +5389,6 @@ impl Relay {
                 let mut off = 1usize;
                 let template_id = u32::try_from(read_uleb128_local(body, &mut off)?)
                     .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
-                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
-                compact_body.push(body[0]);
-                compact_body.extend_from_slice(&body[off..]);
                 let (template, timestamp_base) = {
                     let st = self.state.lock();
                     let state = st.side_transport.get(&side);
@@ -5396,6 +5410,15 @@ impl Relay {
                 };
                 let template =
                     template.ok_or(TelemetryError::Unpack("unknown side compact template"))?;
+                let reconstructed_bound = body
+                    .len()
+                    .saturating_add(template.prefix.len())
+                    .saturating_add(template.between.len())
+                    .saturating_add(32);
+                crate::memory_admission::check_frame(reconstructed_bound, template.is_ack())?;
+                let mut compact_body = Vec::with_capacity(1 + body.len().saturating_sub(off));
+                compact_body.push(body[0]);
+                compact_body.extend_from_slice(&body[off..]);
                 let timestamp_mode = match kind {
                     SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
                     SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
@@ -5414,6 +5437,7 @@ impl Relay {
                 Ok(Some(frame))
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
+                crate::memory_admission::check_receive(bytes)?;
                 if body.len() < 8 {
                     return Err(TelemetryError::Unpack("short side chunk frame"));
                 }
@@ -5478,15 +5502,7 @@ impl Relay {
                             .rx_chunks
                             .remove(&transfer_id)
                             .ok_or(TelemetryError::Unpack("side chunk missing"))?;
-                        let mut out = Vec::new();
-                        for idx in 0..entry.total {
-                            let chunk = entry
-                                .received
-                                .get(&idx)
-                                .ok_or(TelemetryError::Unpack("side chunk gap"))?;
-                            out.extend_from_slice(chunk);
-                        }
-                        Some(Arc::<[u8]>::from(out))
+                        Some(entry.assemble()?)
                     } else {
                         None
                     }
@@ -5678,6 +5694,7 @@ impl Relay {
     /// `timeout_ms == 0` drains fully. If called from inside a side TX callback, this becomes a
     /// no-op so relay TX handlers cannot recurse into nested queue drains on the same stack.
     pub fn process_tx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        self.expire_side_chunks();
         if self.side_tx_active() {
             return Ok(());
         }
@@ -5725,6 +5742,7 @@ impl Relay {
 
     /// Process RX queue with timeout.
     pub fn process_rx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        self.expire_side_chunks();
         #[cfg(feature = "discovery")]
         {
             let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
@@ -5750,6 +5768,7 @@ impl Relay {
     /// `timeout_ms == 0` drains fully. If called from inside a side TX callback, this becomes a
     /// no-op so relay TX handlers cannot recurse into nested queue drains on the same stack.
     pub fn process_all_queues_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
+        self.expire_side_chunks();
         if self.side_tx_active() {
             return Ok(());
         }
@@ -5764,17 +5783,13 @@ impl Relay {
             let mut did_any = false;
             crate::memory_admission::allow_drain(self.process_reliable_timeouts())?;
 
-            // First move RX → TX
+            // One TX/RX pair is atomic for fairness under a short budget.
             if let Some(item) = {
                 let mut st = self.state.lock();
                 st.rx_queue.pop_front()
             } {
                 self.process_rx_queue_item(item)?;
                 did_any = true;
-            }
-
-            if !drain_fully && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
-                break;
             }
 
             if self.process_replay_queue_item()? {

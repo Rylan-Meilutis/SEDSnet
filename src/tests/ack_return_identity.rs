@@ -390,3 +390,67 @@ fn check_ack_return_identity(original_sender: &str) {
         Some(&Router::sender_hash("AB"))
     );
 }
+
+#[test]
+fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
+    extern "C" fn only_control(additional: usize, largest: usize) -> bool {
+        additional <= 512 && largest <= 160
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let rx = Router::new(RouterConfig::new([]));
+    let opts = RouterSideOptions::default().with_small_packet_transport(0);
+    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+    let packet = Packet::new(
+        crate::DataType::ReliableAck,
+        &[crate::DataEndpoint::Discovery],
+        "GS",
+        100,
+        Arc::<[u8]>::from([0; 8]),
+    )
+    .unwrap();
+    let raw = wire_format::pack_packet(&packet);
+    // Current senders use canonical ACKs; older peers can still wrap them.
+    let mut body = vec![1];
+    body.extend_from_slice(&raw);
+    let full = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body);
+    let (_, _, flags, size, timestamp, nonce, reliable, payload) =
+        extract_side_header_template(&raw).unwrap();
+    let mut body = vec![flags, 1];
+    write_uleb128_local(size, &mut body);
+    write_uleb128_local(timestamp, &mut body);
+    if flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
+        write_uleb128_local(u64::from(nonce), &mut body);
+    }
+    if let Some((seq, ack)) = reliable {
+        write_uleb128_local(u64::from(seq), &mut body);
+        write_uleb128_local(u64::from(ack), &mut body);
+    }
+    body.extend_from_slice(payload);
+    let compact = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body);
+    let ordinary = Packet::new(
+        crate::DataType::DiscoverySchema,
+        &[crate::DataEndpoint::Discovery],
+        "GS",
+        101,
+        Arc::<[u8]>::from([1; 32]),
+    )
+    .unwrap();
+    let ordinary = wire_format::pack_packet(&ordinary);
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(only_control));
+    assert!(
+        rx.decode_side_transport_frame(b, &ordinary).is_err(),
+        "ordinary ingress must remain refused"
+    );
+    for wire in [&raw, &full, &compact] {
+        let decoded = rx.decode_side_transport_frame(b, wire).unwrap().unwrap();
+        assert_eq!(decoded, raw);
+        let packet = wire_format::unpack_packet(&decoded).unwrap();
+        assert_eq!(packet.data_type(), crate::DataType::ReliableAck);
+    }
+}
