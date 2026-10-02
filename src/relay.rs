@@ -5798,7 +5798,22 @@ impl Relay {
 
             // Then send out TX
             let sent_one = if let Some((src, dst, handler, opts, data)) = self.pop_ready_tx_item() {
-                self.send_tx_item(src, dst, handler, opts, data)?
+                match self.send_tx_item(src, dst, handler, opts, data.clone()) {
+                    Ok(sent) => sent,
+                    Err(error) if Self::is_side_tx_busy(&error) => {
+                        let priority = Self::relay_item_priority(&data)?;
+                        self.state.lock().push_tx(RelayTxItem {
+                            src,
+                            dst,
+                            data,
+                            priority,
+                        })?;
+                        // The transport needs service before another attempt.
+                        // Retain ownership and yield, including an unbounded drain.
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 false
             };

@@ -213,6 +213,19 @@ fn status_from_err(e: TelemetryError) -> i32 {
     e.to_error_code() as i32
 }
 
+// A side callback returning SEDS_IO has not accepted the frame. Preserve
+// ownership in the router/relay queue rather than treating backpressure as
+// a permanent handler failure. Other failures retain their existing behavior.
+fn side_callback_result(code: i32, error: &'static str) -> TelemetryResult<()> {
+    if code == status_from_result_code(SedsResult::SedsOk) {
+        Ok(())
+    } else if code == status_from_err(TelemetryError::Io("side tx busy")) {
+        Err(TelemetryError::Io("side tx busy"))
+    } else {
+        Err(TelemetryError::Io(error))
+    }
+}
+
 #[inline]
 fn ok_or_status(r: TelemetryResult<()>) -> i32 {
     match r {
@@ -2548,11 +2561,7 @@ pub extern "C" fn seds_router_add_side_packed_profile_with_priority(
             priority,
             user_addr as *mut c_void,
         );
-        if code == status_from_result_code(SedsResult::SedsOk) {
-            Ok(())
-        } else {
-            Err(TelemetryError::Io("router side tx error"))
-        }
+        side_callback_result(code, "router side tx error")
     };
     let mut opts = router_side_options_for_profile(
         reliable_enabled,
@@ -2595,11 +2604,7 @@ fn seds_router_add_side_packed_impl(
         let user_addr = tx_user as usize;
         move |bytes: &[u8]| -> TelemetryResult<()> {
             let code = f(bytes.as_ptr(), bytes.len(), user_addr as *mut c_void);
-            if code == status_from_result_code(SedsResult::SedsOk) {
-                Ok(())
-            } else {
-                Err(TelemetryError::Io("router side tx error"))
-            }
+            side_callback_result(code, "router side tx error")
         }
     });
 
@@ -2677,11 +2682,7 @@ pub extern "C" fn seds_router_add_side_packet(
         let code = with_packet_view(pkt, |view| {
             cb_fn(view as *const _, user_addr as *mut c_void)
         });
-        if code == status_from_result_code(SedsResult::SedsOk) {
-            Ok(())
-        } else {
-            Err(TelemetryError::Io("router side tx error"))
-        }
+        side_callback_result(code, "router side tx error")
     };
 
     let opts = RouterSideOptions {
@@ -3918,11 +3919,7 @@ fn seds_relay_add_side_packed_impl(
         let user_addr = tx_user as usize;
         move |bytes: &[u8]| -> TelemetryResult<()> {
             let code = f(bytes.as_ptr(), bytes.len(), user_addr as *mut c_void);
-            if code == status_from_result_code(SedsResult::SedsOk) {
-                Ok(())
-            } else {
-                Err(TelemetryError::Io("relay tx error"))
-            }
+            side_callback_result(code, "relay tx error")
         }
     });
 
@@ -3999,11 +3996,7 @@ pub extern "C" fn seds_relay_add_side_packet(
         let code = with_packet_view(pkt, |view| {
             cb_fn(view as *const _, user_addr as *mut c_void)
         });
-        if code == status_from_result_code(SedsResult::SedsOk) {
-            Ok(())
-        } else {
-            Err(TelemetryError::Io("relay packet tx error"))
-        }
+        side_callback_result(code, "relay packet tx error")
     };
 
     let opts = RelaySideOptions {
@@ -5740,6 +5733,173 @@ mod tests {
     use serde_json::Value;
     use std::ffi::CStr;
     use std::sync::Mutex;
+
+    struct BackpressureProbe {
+        busy: core::sync::atomic::AtomicBool,
+        delivered: AtomicUsize,
+    }
+    extern "C" fn busy_packed(_bytes: *const u8, _len: usize, user: *mut c_void) -> i32 {
+        let probe = unsafe { &*(user as *const BackpressureProbe) };
+        if probe.busy.load(Ordering::SeqCst) {
+            status_from_err(TelemetryError::Io("busy"))
+        } else {
+            probe.delivered.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+    }
+    extern "C" fn busy_priority(
+        bytes: *const u8,
+        len: usize,
+        _priority: u8,
+        user: *mut c_void,
+    ) -> i32 {
+        busy_packed(bytes, len, user)
+    }
+    extern "C" fn busy_packet(_packet: *const SedsPacketView, user: *mut c_void) -> i32 {
+        busy_packed(core::ptr::null(), 0, user)
+    }
+
+    #[test]
+    fn c_side_backpressure_retains_router_packet_until_transport_accepts() {
+        crate::tests::ensure_common_test_schema();
+        for kind in 0..3 {
+            let probe = BackpressureProbe {
+                busy: core::sync::atomic::AtomicBool::new(true),
+                delivered: AtomicUsize::new(0),
+            };
+            let user = &probe as *const _ as *mut c_void;
+            let mut handle = SedsRouter {
+                inner: Arc::new(Router::new(RouterConfig::default())),
+            };
+            let r = &mut handle as *mut SedsRouter;
+            let side = match kind {
+                0 => seds_router_add_side_packed(
+                    r,
+                    core::ptr::null(),
+                    0,
+                    Some(busy_packed),
+                    user,
+                    false,
+                ),
+                1 => seds_router_add_side_packet(
+                    r,
+                    core::ptr::null(),
+                    0,
+                    Some(busy_packet),
+                    user,
+                    false,
+                ),
+                _ => seds_router_add_side_packed_profile_with_priority(
+                    r,
+                    core::ptr::null(),
+                    0,
+                    Some(busy_priority),
+                    user,
+                    false,
+                    SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL,
+                    0,
+                    0,
+                    0,
+                ),
+            };
+            assert!(side >= 0);
+            let packet = build_discovery_announce("BUSY_TEST", 0, &[]).unwrap();
+            assert!(
+                handle.inner.tx(packet).is_ok(),
+                "kind {kind}: busy must retain ownership"
+            );
+            assert_eq!(probe.delivered.load(Ordering::SeqCst), 0);
+            probe.busy.store(false, Ordering::SeqCst);
+            handle.inner.process_tx_queue().unwrap();
+            assert!(
+                probe.delivered.load(Ordering::SeqCst) > 0,
+                "kind {kind}: retained frame must drain"
+            );
+        }
+    }
+
+    #[test]
+    fn c_side_backpressure_retains_relay_packet_until_transport_accepts() {
+        crate::tests::ensure_common_test_schema();
+        for kind in 0..2 {
+            let ingress = BackpressureProbe {
+                busy: core::sync::atomic::AtomicBool::new(false),
+                delivered: AtomicUsize::new(0),
+            };
+            let egress = BackpressureProbe {
+                busy: core::sync::atomic::AtomicBool::new(false),
+                delivered: AtomicUsize::new(0),
+            };
+            let r = seds_relay_new(None, core::ptr::null_mut());
+            let a = seds_relay_add_side_packed(
+                r,
+                core::ptr::null(),
+                0,
+                Some(busy_packed),
+                &ingress as *const _ as *mut c_void,
+                false,
+            );
+            let b = if kind == 0 {
+                seds_relay_add_side_packed(
+                    r,
+                    core::ptr::null(),
+                    0,
+                    Some(busy_packed),
+                    &egress as *const _ as *mut c_void,
+                    false,
+                )
+            } else {
+                seds_relay_add_side_packet(
+                    r,
+                    core::ptr::null(),
+                    0,
+                    Some(busy_packet),
+                    &egress as *const _ as *mut c_void,
+                    false,
+                )
+            };
+            assert!(a >= 0 && b >= 0);
+            let ad = build_discovery_announce("DEST", 0, &[DataEndpoint(101)]).unwrap();
+            unsafe {
+                (*r).inner.rx_from_side(b as RelaySideId, ad).unwrap();
+            }
+            assert_eq!(seds_relay_process_all_queues(r), 0);
+            egress.delivered.store(0, Ordering::SeqCst);
+            egress.busy.store(true, Ordering::SeqCst);
+            let packet =
+                Packet::from_f32_slice(DataType(100), &[1.0, 2.0, 3.0], &[DataEndpoint(101)], 10)
+                    .unwrap();
+            unsafe {
+                (*r).inner.rx_from_side(a as RelaySideId, packet).unwrap();
+            }
+            assert_eq!(
+                seds_relay_process_all_queues(r),
+                0,
+                "kind {kind}: retain on busy"
+            );
+            assert_eq!(egress.delivered.load(Ordering::SeqCst), 0);
+            egress.busy.store(false, Ordering::SeqCst);
+            assert_eq!(seds_relay_process_all_queues(r), 0);
+            assert!(
+                egress.delivered.load(Ordering::SeqCst) > 0,
+                "kind {kind}: drain retained frame"
+            );
+            seds_relay_free(r);
+        }
+    }
+
+    #[test]
+    fn side_callback_permanent_errors_are_not_backpressure() {
+        assert!(matches!(
+            side_callback_result(-14, "failed"),
+            Err(TelemetryError::Io("side tx busy"))
+        ));
+        assert!(matches!(
+            side_callback_result(-1, "failed"),
+            Err(TelemetryError::Io("failed"))
+        ));
+        assert!(side_callback_result(0, "failed").is_ok());
+    }
 
     #[test]
     fn packet_view_preserves_fields_across_endpoint_storage_boundary() {

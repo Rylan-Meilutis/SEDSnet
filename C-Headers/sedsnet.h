@@ -304,6 +304,10 @@ typedef enum SedsRouteSelectionMode
 } SedsRouteSelectionMode;
 
 
+/* Side TX callbacks: SEDS_OK transfers ownership to the transport. SEDS_IO
+ * refuses the frame temporarily; the router/relay retains it for retry.
+ * A transport must never discard a frame after returning SEDS_OK.
+ * Other errors are permanent failures. Applies to packet side callbacks too. */
 typedef SedsResult (* SedsTransmitFn)(const uint8_t * bytes, size_t len, void * user);
 
 /** Packed transmit callback with SEDSNet's logical transport priority. */
