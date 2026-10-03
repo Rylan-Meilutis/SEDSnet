@@ -4,14 +4,12 @@ SEDSnet is a Rust telemetry transport and logging library with a shared schema, 
 multi-language bindings (C/C++ and Python). It targets embedded and host environments and supports optional compression
 for senders and payloads.
 
-The current release is v4.0.38. Router and Relay release expired incomplete
-transfers during queue service, even while ingress is refused under memory
-pressure. Small ACKs retain access to reserved headroom. Shared reassembly avoids
-duplicate full-size buffers, and short relay service budgets do not starve TX.
-The optional allocator probe remains an estimate, not an OOM guarantee; hardware
-validation does not guarantee lossless CAN service or indefinite uptime.
-
-See [Changelogs](Changelogs) for version highlights and release notes.
+See [Changelogs](Changelogs) for release highlights and the
+[full changelog](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md)
+for version history. Transport integration is covered in [Usage-C-Cpp](Usage-C-Cpp),
+including temporary backpressure and ownership of accepted frames. See
+[Technical-Queues-and-Memory](Technical-Queues-and-Memory) for allocation admission,
+queue budgets, and memory-pressure recovery.
 
 ## Start here (easy overview)
 

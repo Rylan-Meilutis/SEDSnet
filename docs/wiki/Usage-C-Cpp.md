@@ -359,6 +359,19 @@ The shared helper surface includes:
   `seds_relay_add_side_packed_small_packets(...)` expose compact/bounded side transport from C.
   Use these for fixed-size links such as CAN or I2C.
 
+Side TX callbacks have the same acceptance contract for Router and Relay:
+
+- Return `SEDS_OK` only after transmitting the frame or copying it into transport-owned
+  storage. Callback byte buffers are borrowed; do not retain their pointers after return.
+  Accepted frames must not be discarded to make room for newer frames.
+- Return `SEDS_IO` when temporarily unable to accept a frame, including a full driver
+  queue or a radio RX window. SEDSnet retains the refused work for later queue service.
+- Other errors indicate permanent failure; do not use them for ordinary backpressure.
+
+This contract covers packet-view, packed, priority-aware, and small-packet side callbacks.
+In the example below, `board_can_send` returns zero on acceptance and nonzero only for
+transient refusal; adapt permanent driver errors separately.
+
 Example:
 
 ```C
@@ -833,7 +846,7 @@ traffic still propagates so paths can be learned; user data uses discovered path
 policy. This keeps low-bandwidth sides such as LoRa from being saturated just because they are the
 only currently eligible side.
 
-For time-sliced radios, return the side TX error code for `TelemetryError::Io("side tx busy")` while
+For time-sliced radios, return `SEDS_IO` from the C side TX callback while
 the radio is in an RX window or otherwise cannot accept another frame. The router/relay leaves the
 work queued and retries during later queue processing. If the driver measures link speed during
 bring-up or per-slot operation, call `seds_router_note_side_link_probe_sample(...)` or

@@ -4,11 +4,6 @@ A Rust networking stack with compact packets, runtime schema, discovery, routing
 managed state sync, P2P service ports/streams, optional E2E payload cryptography, and C/Python
 bindings for distributed embedded and host systems.
 
-Current stable release: **4.0.38** on crates.io and PyPI. Embedded CMake
-consumers use the `v4.0.38` Git tag for reproducible builds, or `main` for rolling
-firmware updates. Rust and Python consumers should use the
-registry release.
-
 Crate API docs are published on [docs.rs](https://docs.rs/SEDSnet). The implementation-level wiki,
 including wire/discovery formats and binding guides, is mirrored in
 [docs/wiki](./docs/wiki/Home.md) and on the project wiki.
@@ -188,6 +183,33 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 ---
 
 ## Recent changelog milestones
+
+### Version 4.0.38 highlights
+
+- C side-transmit callbacks now preserve temporary backpressure: `SEDS_IO` keeps
+  refused work queued for retry in routers and relays.
+- Relay's combined RX/TX loop retains refused frames, matching TX-only service.
+- Transport ownership and permanent-error handling are documented and regression-tested.
+
+### Versions 4.0.35–4.0.37 highlights
+
+- Transit routing avoids unnecessary payload decoding and copies; embedded schema
+  and fragment encoding reduce temporary allocations.
+- Optional allocator-headroom admission checks reject work before payload allocation.
+  Queue service continues dispatching retained work during memory pressure.
+- Routers and relays reclaim expired incomplete transfers, share checked reassembly,
+  and reserve headroom for small ACKs. These checks do not guarantee OOM immunity.
+- 4.0.35 remains a prerelease; its fixes and the additional allocation checks are in 4.0.36.
+
+### Versions 4.0.29–4.0.34 highlights
+
+- ACK routing retains publisher and recipient identity; discovery recovers missing
+  schemas and downstream routes after restart or packet loss.
+- Sender-seeded fragment IDs prevent stale fragments from corrupting later packets.
+- Idle discovery checks avoid allocations; keepalives continue while topology ACKs
+  are outstanding without flooding application traffic.
+
+Full release history: [CHANGELOG.md](./CHANGELOG.md).
 
 ### Versions 4.0.8–4.0.10 highlights
 

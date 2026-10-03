@@ -140,6 +140,14 @@ Crates.io uses the top-level `README.md`. Keep it accurate and include links to:
 - the project wiki or `docs/wiki/Home.md`
 - `CHANGELOG.md`
 
+For each release, add an entry to `CHANGELOG.md`, update the README's **Recent changelog
+milestones**, and update `docs/wiki/Changelogs.md` and any affected usage/reference pages.
+Keep the README introduction version-independent: do not add a “Current stable release”
+paragraph. Release versions belong in the changelog, milestones, and pinned build examples.
+Verify pinned CMake examples in README, Build-and-Configure, and Usage-C-Cpp together.
+Run `python3 -m unittest discover -s tests -p test_ci_release_contracts.py` to check these
+release-documentation requirements.
+
 The wiki source lives in `docs/wiki`. If external wiki repos are used, sync with:
 
 ```sh
@@ -160,6 +168,13 @@ version. The main crate can continue depending on an already-published macro-cra
 
 `pyproject.toml` declares `dynamic = ["version"]`; maturin and the release script read the Python
 package version from the root Cargo package version.
+
+## Verify publication
+
+A green workflow is not proof that packages were uploaded: upload jobs can tolerate
+errors. Check the exact version on crates.io and PyPI and inspect upload logs before
+announcing publication. If an upload failed, correct authentication or publisher settings
+and retry the missing artifacts; do not move an existing release tag.
 
 ## Final Sanity
 

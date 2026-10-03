@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.0.38
+
+- Treat `SEDS_IO` from C side-transmit callbacks as temporary backpressure in
+  both Router and Relay. Refused frames remain queued for retry instead of being
+  treated as permanent failures.
+- Keep refused frames in Relay's combined RX/TX service loop, matching its
+  TX-only retry behavior.
+- Document transport ownership: `SEDS_OK` means the transport accepted the frame;
+  it must preserve that accepted work. A full transport queue must refuse new
+  work with `SEDS_IO`, rather than discard an earlier accepted frame.
+- Add regressions for all five C side-callback variants, relay combined-loop
+  retries, and permanent-error handling. No wire-format change.
+
 ## 4.0.37
 
 - Fix memory-pressure recovery in both Router and Relay: expire incomplete side

@@ -1,5 +1,20 @@
 # Changelogs
 
+Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
+
+## Version 4.0.38 highlights
+
+- Treat `SEDS_IO` from C side-transmit callbacks as temporary backpressure in
+  both Router and Relay. Refused frames remain queued for retry instead of being
+  treated as permanent failures.
+- Keep refused frames in Relay's combined RX/TX service loop, matching its
+  TX-only retry behavior.
+- Document transport ownership: `SEDS_OK` means the transport accepted the frame;
+  it must preserve that accepted work. A full transport queue must refuse new
+  work with `SEDS_IO`, rather than discard an earlier accepted frame.
+- Add regressions for all five C side-callback variants, relay combined-loop
+  retries, and permanent-error handling. No wire-format change.
+
 ## Version 4.0.37 highlights
 
 - Fix memory-pressure recovery in both Router and Relay: expire incomplete side
@@ -14,6 +29,17 @@
 - Give Relay TX/RX a shared service deadline so short budgets cannot starve TX.
 - Add matching pressure, idle cleanup, malformed discovery, and short-budget
   regressions. Admission remains a headroom estimate, not an OOM guarantee.
+
+## Versions 4.0.35–4.0.36 highlights
+
+- Route packed transit traffic using borrowed metadata and reduce temporary schema
+  and fragment buffers in Router and Relay.
+- Add optional allocator-headroom admission and TX dispatch without fresh periodic
+  announcements; retained work can drain while new allocations are refused.
+- Recheck headroom before decoded payload allocation, including fragment reassembly
+  and decompression scratch space.
+- 4.0.35 remains a prerelease after a hardware soak exposed the missing decoded
+  allocation check; 4.0.36 includes that check and the earlier performance fixes.
 
 ## Version 4.0.34 highlights
 

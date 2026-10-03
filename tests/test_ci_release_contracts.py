@@ -11,10 +11,13 @@ class CiReleaseContracts(unittest.TestCase):
         manifest = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text())
         version = manifest["package"]["version"]
         readme = (REPO_ROOT / "README.md").read_text()
-        self.assertIn(f"Current stable release: **{version}**", readme)
-        self.assertIn(f"consumers use the `v{version}` Git tag", readme)
-        home = (REPO_ROOT / "docs/wiki/Home.md").read_text()
-        self.assertIn(f"The current release is v{version}.", home)
+        self.assertNotIn("Current stable release:", readme)
+        milestones = readme.split("## Recent changelog milestones", 1)[1]
+        self.assertIn(f"### Version {version} highlights", milestones)
+        changelog = (REPO_ROOT / "CHANGELOG.md").read_text()
+        self.assertIn(f"## {version}\n", changelog)
+        wiki = (REPO_ROOT / "docs/wiki/Changelogs.md").read_text()
+        self.assertIn(f"## Version {version} highlights", wiki)
         for name in ("README.md", "docs/wiki/Build-and-Configure.md", "docs/wiki/Usage-C-Cpp.md"):
             with self.subTest(document=name):
                 self.assertIn(f"GIT_TAG v{version}", (REPO_ROOT / name).read_text())

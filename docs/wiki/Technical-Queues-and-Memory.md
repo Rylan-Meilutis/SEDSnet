@@ -27,6 +27,19 @@ Key properties:
 
 This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded builds.
 
+## Transport backpressure
+
+A side TX callback returning `SEDS_IO` in C (Rust `TelemetryError::Io("side tx busy")`)
+refuses the frame temporarily. Router and Relay retain refused work for retry during
+later queue processing, including Relay's combined RX/TX service loop. Other callback
+errors are permanent failures.
+
+Returning `SEDS_OK` transfers responsibility for delivery to the transport. A driver
+must transmit or copy the borrowed callback data before returning, preserve accepted
+frames, and refuse new work when its own queue is full. SEDSnet cannot recover a frame
+that a driver accepts and silently discards. Retry retention still operates within the
+configured queue limits; it does not make overload lossless.
+
 ## Shared Queue Budget
 
 `MAX_QUEUE_BUDGET` is the overall router/relay queue budget, not a separate allowance for each
