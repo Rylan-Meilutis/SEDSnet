@@ -1,6 +1,7 @@
 # Compact packet store development validation
 
-This is an opt-in development candidate, not a 4.1.0 release or hardware qualification.
+The optional arena and indexed codec shipped in 4.1.0 as experimental features.
+The development results below are not a hardware qualification.
 
 On 2026-10-05 the default, compact arena, and compact compression Rust suites
 passed, along with minimal std, ARM embedded (plain and codec), and Python

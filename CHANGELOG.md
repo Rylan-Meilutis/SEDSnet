@@ -1,11 +1,13 @@
 # Changelog
 
-## Unreleased — planned 4.1.0
+## 4.1.0
 
 - Add opt-in handle-managed packet/frame arena with pin-aware compaction and fixed queue slabs.
 - Add indexed Zstd buffer storage and bounded field-range reads; retain plain storage if compression plus headers would grow it.
 - Bound codec memory before allocation using fixed Zstd contexts and reusable chunk-sized scratch; encode directly into the arena in two passes without a packet-sized temporary.
 - Add Rust/C initialization and build flags; existing defaults and wire format remain unchanged.
+- These features remain experimental and disabled by default. Compaction applies only to unpinned arena buffers; it does not defragment the application heap.
+- Native pressure and network churn soaks passed; seven-board ARM/Renode qualification remains incomplete. See [validation and limits](docs/compact-packet-validation.md).
 
 ## 4.0.38
 

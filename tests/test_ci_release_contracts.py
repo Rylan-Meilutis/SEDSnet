@@ -28,6 +28,13 @@ class CiReleaseContracts(unittest.TestCase):
         )
         self.assertIn("python3 publish_crates.py", workflow)
 
+    def test_release_gate_checks_experimental_storage(self) -> None:
+        publisher = (REPO_ROOT / "publish_crates.py").read_text()
+        self.assertIn(
+            'run(["python3", "build.py", "test", "compact-packet-compression"])',
+            publisher,
+        )
+
     def test_gitlab_tags_run_the_same_publish_gate(self) -> None:
         workflow = (REPO_ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
         self.assertIn("$CI_COMMIT_TAG =~ /^v/", workflow)

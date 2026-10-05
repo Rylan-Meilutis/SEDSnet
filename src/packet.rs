@@ -549,7 +549,7 @@ impl Packet {
     pub fn read_payload_range(&self, offset: usize, out: &mut [u8]) -> TelemetryResult<()> {
         #[cfg(feature = "compact-packet-store")]
         {
-            return self.payload.read_range(offset, out);
+            self.payload.read_range(offset, out)
         }
         #[cfg(not(feature = "compact-packet-store"))]
         {

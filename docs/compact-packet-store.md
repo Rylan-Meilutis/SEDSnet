@@ -1,5 +1,8 @@
 # Compact packet storage (opt-in)
 
+Experimental in 4.1.0; disabled by default. Enable only after checking the
+application memory budget and worst-case compaction/codec latency.
+
 `compact-packet-store` reserves a private payload arena and a fixed handle table.
 ThreadX scheduling and its allocator are unchanged. The arena's startup allocations
 still come from the application's allocator. This is not a software MMU for

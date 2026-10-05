@@ -147,8 +147,8 @@ mod compression_memory_pool_test {
 
     fn make_packet(payload: &[u8], ts: u64) -> Packet {
         Packet::new(
-            DataType::named("MESSAGE_DATA"),
-            &[DataEndpoint::named("SD_CARD")],
+            DataType::named("POOL_TEST_DATA"),
+            &[DataEndpoint::named("POOL_TEST_SINK")],
             "POOL_TEST",
             ts,
             Arc::<[u8]>::from(payload),
@@ -158,20 +158,22 @@ mod compression_memory_pool_test {
 
     #[test]
     fn compression_path_is_stable_under_limited_memory_pool() {
+        // Unique fixture names work with either a blank or preloaded schema;
+        // this test must not attempt to redefine the static SD_CARD type.
         sedsnet::config::register_endpoint_with_description(
-            "SD_CARD",
+            "POOL_TEST_SINK",
             "Compression test sink",
             false,
         )
         .unwrap();
         sedsnet::config::register_data_type_with_description(
-            "MESSAGE_DATA",
+            "POOL_TEST_DATA",
             "Compression memory fixture",
             sedsnet::MessageElement::Dynamic(
                 sedsnet::MessageDataType::Binary,
                 sedsnet::MessageClass::Data,
             ),
-            &[DataEndpoint::named("SD_CARD")],
+            &[DataEndpoint::named("POOL_TEST_SINK")],
             sedsnet::ReliableMode::None,
             50,
         )

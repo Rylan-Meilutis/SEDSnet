@@ -2,6 +2,13 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.1.0 highlights
+
+- Experimental opt-in packet/frame arena supports pin-aware compaction and fixed queue slabs.
+- Optional indexed Zstd storage reads individual field ranges with fixed contexts and bounded reusable scratch; compression is retained only when it saves space.
+- Existing default allocation, ThreadX scheduling, and wire format are unchanged. Application heap allocations remain outside the arena.
+- Native pressure and churn tests passed; full embedded network qualification remains incomplete. See [validation and limits](../compact-packet-validation.md).
+
 ## Version 4.0.38 highlights
 
 - Treat `SEDS_IO` from C side-transmit callbacks as temporary backpressure in

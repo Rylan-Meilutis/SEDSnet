@@ -107,7 +107,7 @@ operation, so its reserved bytes come out of the shared budget immediately. If o
 is idle, another can use more of the remaining budget; if several areas fill at once, older queued
 state is evicted so total queue-owned memory stays bounded.
 
-Optional [compact packet storage](docs/compact-packet-store.md) gives queued
+Experimental, opt-in [compact packet storage](docs/compact-packet-store.md) gives queued
 payloads and raw frames a private handle-managed arena. Unpinned small buffers
 can move; larger buffers and active views remain stable. Indexed Zstd buffers
 support bounded field reads without retaining a full decompressed copy. Both
@@ -189,6 +189,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 ---
 
 ## Recent changelog milestones
+
+### Version 4.1.0 highlights
+
+- Experimental opt-in packet/frame arena supports pin-aware compaction and fixed queue slabs.
+- Optional indexed Zstd storage reads individual field ranges with fixed contexts and bounded reusable scratch; compression is retained only when it saves space.
+- Existing default allocation, ThreadX scheduling, and wire format are unchanged. Application heap allocations remain outside the arena.
+- Native pressure and churn tests passed; full embedded network qualification remains incomplete. See [validation and limits](docs/compact-packet-validation.md).
 
 ### Version 4.0.38 highlights
 
@@ -542,7 +549,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.0.38
+    GIT_TAG v4.1.0
 )
 FetchContent_MakeAvailable(sedsnet)
 

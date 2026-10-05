@@ -798,6 +798,8 @@ def main() -> int:
         if not args.quick_tests:
             test_cmd.append("full")
         run(test_cmd)
+        # Check the opt-in arena/codec as well as the unchanged default build.
+        run(["python3", "build.py", "test", "compact-packet-compression"])
 
     if not args.skip_crates:
         if not args.skip_package:

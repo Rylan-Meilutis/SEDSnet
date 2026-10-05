@@ -199,8 +199,8 @@ impl PacketStore {
             });
         }
         let mut st = self.state.lock();
-        if source != 0 {
-            if let Some(i) = st.slots.iter().position(|s| {
+        if source != 0
+            && let Some(i) = st.slots.iter().position(|s| {
                 s.refs != 0
                     && !s.compressed
                     && s.source == source
@@ -211,17 +211,17 @@ impl PacketStore {
                             s.len,
                         )
                     } == bytes
-            }) {
-                st.slots[i].refs = st.slots[i]
-                    .refs
-                    .checked_add(1)
-                    .expect("packet handle overflow");
-                return Ok(StoredBytes {
-                    store: self.clone(),
-                    slot: Some(i),
-                    len: logical,
-                });
-            }
+            })
+        {
+            st.slots[i].refs = st.slots[i]
+                .refs
+                .checked_add(1)
+                .expect("packet handle overflow");
+            return Ok(StoredBytes {
+                store: self.clone(),
+                slot: Some(i),
+                len: logical,
+            });
         }
         let slot = st.reserve(bytes.len(), compressed, source)?;
         let offset = st.slots[slot].offset;
@@ -608,10 +608,10 @@ mod compression {
                     raw.len(),
                 )
             };
-            if let Ok(n) = zstd_result(n) {
-                if n < raw.len() {
-                    return Ok(n);
-                }
+            if let Ok(n) = zstd_result(n)
+                && n < raw.len()
+            {
+                return Ok(n);
             }
             scratch[..raw.len()].copy_from_slice(raw);
             Ok(raw.len())

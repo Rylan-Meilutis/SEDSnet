@@ -158,7 +158,7 @@ fn randomized_reuse_compaction_and_pinning_preserve_every_live_payload() {
         rng ^= rng << 13;
         rng ^= rng >> 17;
         rng ^= rng << 5;
-        if rng % 3 == 0 && !live.is_empty() {
+        if rng.is_multiple_of(3) && !live.is_empty() {
             let index = rng as usize % live.len();
             live.swap_remove(index);
         } else {
@@ -168,7 +168,7 @@ fn randomized_reuse_compaction_and_pinning_preserve_every_live_payload() {
                 live.push((h, expected));
             }
         }
-        if rng % 5 == 0 {
+        if rng.is_multiple_of(5) {
             store.compact();
         }
         for (h, expected) in &live {
@@ -424,7 +424,7 @@ fn bounded_codec_pressure_soak() {
     let mut input = [0; 4096];
     let mut field = [0; 12];
     let byte_at = |seed: u64, offset: usize| -> u8 {
-        if seed % 4 != 0 && offset / 128 % 2 == 0 {
+        if !seed.is_multiple_of(4) && (offset / 128).is_multiple_of(2) {
             (seed + (offset / 128) as u64) as u8
         } else {
             let mut x = seed
@@ -465,7 +465,7 @@ fn bounded_codec_pressure_soak() {
                 "field read retained a full decode"
             );
         }
-        if rounds % 64 == 0 {
+        if rounds.is_multiple_of(64) {
             // Refuse a request larger than the whole arena without corrupting
             // retained payloads or losing a pinned address, then keep draining.
             assert!(store.store(&[0; 131073]).is_err());
