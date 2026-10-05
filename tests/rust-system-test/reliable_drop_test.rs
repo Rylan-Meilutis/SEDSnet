@@ -3192,6 +3192,12 @@ mod reliable_drop_tests {
     #[test]
     #[ignore = "multi-minute deterministic soak: run explicitly with cargo test --test reliable_drop_test comprehensive_multinode_churn_soak_exercises_stack_features -- --ignored --nocapture"]
     fn comprehensive_multinode_churn_soak_exercises_stack_features() {
+        #[cfg(feature = "compact-packet-store")]
+        let arena = {
+            let arena = sedsnet::packet_store::PacketStore::new(512 * 1024, 4096, 512).unwrap();
+            sedsnet::packet_store::set_default_store(Some(arena.clone()));
+            arena
+        };
         ensure_common_test_schema();
         let topology = RocketTopology::new();
         let tick_count = std::env::var("SEDSNET_SOAK_TICKS")
@@ -3816,5 +3822,10 @@ mod reliable_drop_tests {
 
         let _ = sedsnet::config::remove_data_type(var_ty);
         let _ = sedsnet::config::remove_data_type(bytes_ty);
+        #[cfg(feature = "compact-packet-store")]
+        {
+            eprintln!("churn arena stats: {:?}", arena.stats());
+            sedsnet::packet_store::set_default_store(None);
+        }
     }
 }

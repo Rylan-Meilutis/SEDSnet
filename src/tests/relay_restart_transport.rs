@@ -141,12 +141,12 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let frames = tx
-            .encode_side_transport_frames(a, opts, raw.clone())
+            .encode_side_transport_frames(a, opts, (raw.clone()).into())
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
-            Some(raw)
+            Some(raw.into())
         );
     }
     let st = tx.state.lock();
@@ -197,16 +197,16 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let _ = tx
-            .encode_side_transport_frames(a, opts, raw.clone())
+            .encode_side_transport_frames(a, opts, (raw.clone()).into())
             .unwrap();
         // Lose the initial header (or restart the receiver), then send control.
         let frames = tx
-            .encode_side_transport_frames(a, opts, raw.clone())
+            .encode_side_transport_frames(a, opts, (raw.clone()).into())
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
-            Some(raw),
+            Some(raw.into()),
             "reliability control cannot depend on a possibly lost template"
         );
         assert!(
@@ -250,14 +250,14 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let initial = tx
-            .encode_side_transport_frames(side, opts, raw.clone())
+            .encode_side_transport_frames(side, opts, (raw.clone()).into())
             .unwrap()
             .collect::<Vec<_>>();
         tx.decode_side_transport_frame(side, &initial[0])
             .unwrap()
             .unwrap();
         let _ = tx
-            .encode_side_transport_frames(unrelated, opts, raw.clone())
+            .encode_side_transport_frames(unrelated, opts, (raw.clone()).into())
             .unwrap();
         let request = if schema_request {
             discovery::build_discovery_schema_request("GS", 2)
@@ -270,7 +270,7 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         let restarted = Relay::new(Box::new(|| 100));
         let rx = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts);
         let frames = tx
-            .encode_side_transport_frames(side, opts, raw.clone())
+            .encode_side_transport_frames(side, opts, (raw.clone()).into())
             .unwrap()
             .collect::<Vec<_>>();
         assert!(
@@ -281,7 +281,7 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         );
         assert_eq!(tx.state.lock().side_transport[&side].rx_template_count(), 1);
         let frames = tx
-            .encode_side_transport_frames(unrelated, opts, raw)
+            .encode_side_transport_frames(unrelated, opts, (raw).into())
             .unwrap()
             .collect::<Vec<_>>();
         let empty = Relay::new(Box::new(|| 100));
@@ -316,7 +316,7 @@ fn queue_service_expires_incomplete_transfers_without_new_fragments() {
             SideChunkAssembly {
                 last_seen_ms: 0,
                 total: 2,
-                received: [(0, retained)].into_iter().collect(),
+                received: [(0, retained.into())].into_iter().collect(),
             },
         );
     now.store(2000, core::sync::atomic::Ordering::Relaxed);
@@ -402,7 +402,7 @@ fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
         rx.decode_side_transport_frame(b, &ordinary).is_err(),
         "ordinary ingress must remain refused"
     );
-    for wire in [&raw, &full, &compact] {
+    for wire in [raw.as_ref(), full.as_ref(), compact.as_ref()] {
         let decoded = rx.decode_side_transport_frame(b, wire).unwrap().unwrap();
         assert_eq!(decoded, raw);
         let packet = wire_format::unpack_packet(&decoded).unwrap();

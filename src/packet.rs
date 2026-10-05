@@ -545,6 +545,23 @@ impl Packet {
         &self.payload
     }
 
+    /// Read one payload field/range without caching or retaining a full slice.
+    pub fn read_payload_range(&self, offset: usize, out: &mut [u8]) -> TelemetryResult<()> {
+        #[cfg(feature = "compact-packet-store")]
+        {
+            return self.payload.read_range(offset, out);
+        }
+        #[cfg(not(feature = "compact-packet-store"))]
+        {
+            let end = offset
+                .checked_add(out.len())
+                .filter(|&n| n <= self.data_size)
+                .ok_or(TelemetryError::Unpack("payload range out of bounds"))?;
+            out.copy_from_slice(&self.payload()[offset..end]);
+            Ok(())
+        }
+    }
+
     /// Return the optional inline wire shape preserved from unpacking.
     ///
     /// This is crate-visible because packing and routing need to keep the
@@ -1114,11 +1131,107 @@ impl core::fmt::Display for Packet {
 }
 
 impl ByteCost for Packet {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        self.payload.park_for_queue()
+    }
     #[inline]
     fn byte_cost(&self) -> usize {
         size_of::<Self>()
             + self.sender.len()
             + self.endpoints.len() * size_of::<DataEndpoint>()
             + self.payload.byte_cost()
+    }
+}
+
+/// A consumed packet with separately stored payload. No original full payload or
+/// decompressed cache remains. Legacy full-slice APIs are deliberately unavailable.
+#[cfg(feature = "compact-packet-store")]
+pub struct StoredPacket {
+    header: Packet,
+    payload: crate::packet_store::StoredBytes,
+}
+#[cfg(feature = "compact-packet-store")]
+impl StoredPacket {
+    pub fn data_type(&self) -> DataType {
+        self.header.data_type()
+    }
+    pub fn sender(&self) -> &str {
+        self.header.sender()
+    }
+    pub fn data_size(&self) -> usize {
+        self.payload.len()
+    }
+    pub fn stored_payload_size(&self) -> usize {
+        self.payload.stored_len()
+    }
+    pub fn payload_is_compressed(&self) -> bool {
+        self.payload.is_compressed()
+    }
+    pub fn pin_payload(&self) -> TelemetryResult<crate::packet_store::PinnedBytes> {
+        self.payload.pin()
+    }
+    pub fn read_payload_range(&self, offset: usize, out: &mut [u8]) -> TelemetryResult<()> {
+        self.payload.read_range(offset, out)
+    }
+    #[cfg(feature = "compact-packet-compression")]
+    pub fn read_payload_range_bounded(
+        &self,
+        codec: &mut crate::packet_store::BoundedPacketCodec,
+        offset: usize,
+        out: &mut [u8],
+    ) -> TelemetryResult<()> {
+        codec.read_range(&self.payload, offset, out)
+    }
+    #[cfg(feature = "compact-packet-compression")]
+    pub fn read_payload_range_with_codec(
+        &self,
+        codec: &mut crate::packet_store::PacketCodec,
+        offset: usize,
+        out: &mut [u8],
+        scratch: &mut [u8],
+    ) -> TelemetryResult<()> {
+        codec.read_range(&self.payload, offset, out, scratch)
+    }
+}
+#[cfg(feature = "compact-packet-store")]
+impl Packet {
+    pub fn into_stored(
+        mut self,
+        store: &Arc<crate::packet_store::PacketStore>,
+    ) -> TelemetryResult<StoredPacket> {
+        let payload = store.store(self.payload())?;
+        self.payload = StandardSmallPayload::new(&[]);
+        Ok(StoredPacket {
+            header: self,
+            payload,
+        })
+    }
+    #[cfg(feature = "compact-packet-compression")]
+    pub fn into_stored_bounded(
+        mut self,
+        store: &Arc<crate::packet_store::PacketStore>,
+        codec: &mut crate::packet_store::BoundedPacketCodec,
+    ) -> TelemetryResult<StoredPacket> {
+        let payload = codec.store(store, self.payload())?;
+        self.payload = StandardSmallPayload::new(&[]);
+        Ok(StoredPacket {
+            header: self,
+            payload,
+        })
+    }
+    #[cfg(feature = "compact-packet-compression")]
+    pub fn into_stored_compressed(
+        mut self,
+        store: &Arc<crate::packet_store::PacketStore>,
+        codec: &mut crate::packet_store::PacketCodec,
+        scratch: &mut [u8],
+    ) -> TelemetryResult<StoredPacket> {
+        let payload = codec.store(store, self.payload(), scratch)?;
+        self.payload = StandardSmallPayload::new(&[]);
+        Ok(StoredPacket {
+            header: self,
+            payload,
+        })
     }
 }

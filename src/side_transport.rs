@@ -24,14 +24,14 @@ pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMA
 /// An outgoing frame or lazily encoded chunks. Retains the source plus at most
 /// the current chunk instead of allocating every fragment before the first TX.
 pub(crate) struct SideTransportFrames {
-    frame: Arc<[u8]>,
+    frame: crate::SharedBytes,
     payload_budget: usize,
     transfer_id: u32,
     index: usize,
     total: usize,
 }
 impl SideTransportFrames {
-    pub fn single(frame: Arc<[u8]>) -> Self {
+    pub fn single(frame: crate::SharedBytes) -> Self {
         Self {
             frame,
             payload_budget: 0,
@@ -40,7 +40,11 @@ impl SideTransportFrames {
             total: 1,
         }
     }
-    pub fn split(frame: Arc<[u8]>, max_frame_bytes: usize, sender: &[u8]) -> TelemetryResult<Self> {
+    pub fn split(
+        frame: crate::SharedBytes,
+        max_frame_bytes: usize,
+        sender: &[u8],
+    ) -> TelemetryResult<Self> {
         if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
             return Err(TelemetryError::BadArg);
         }
@@ -69,7 +73,7 @@ impl SideTransportFrames {
     }
 }
 impl Iterator for SideTransportFrames {
-    type Item = Arc<[u8]>;
+    type Item = crate::SharedBytes;
     fn next(&mut self) -> Option<Self::Item> {
         if self.index == self.total {
             return None;
@@ -102,8 +106,8 @@ impl ExactSizeIterator for SideTransportFrames {}
 pub(crate) struct SideHeaderTemplate {
     pub(crate) hash: u64,
     pub(crate) base_flags: u8,
-    pub(crate) prefix: Arc<[u8]>,
-    pub(crate) between: Arc<[u8]>,
+    pub(crate) prefix: crate::SharedBytes,
+    pub(crate) between: crate::SharedBytes,
     pub(crate) reliable_flags: Option<u8>,
     pub(crate) reliable_compact: bool,
 }
@@ -181,13 +185,13 @@ pub(crate) fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
-pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> Arc<[u8]> {
+pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> crate::SharedBytes {
     wrap_side_transport_frame_parts(kind, &[body])
 }
 
 // Write body segments directly into the final allocation. This also lets a
 // chunk header stay on the stack instead of copying its payload into a Vec.
-pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> Arc<[u8]> {
+pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> crate::SharedBytes {
     let header = [b'S', b'D', b'T', kind];
     let mut hasher = Crc32Hasher::new();
     hasher.update(&header);
@@ -207,7 +211,7 @@ pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> Arc<
         slot.write(*value);
     }
     // SAFETY: header, all body segments and CRC fill the entire allocation.
-    unsafe { frame.assume_init() }
+    unsafe { (frame.assume_init()).into() }
 }
 
 pub(crate) fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
@@ -317,8 +321,8 @@ pub(crate) fn extract_side_header_template(
     let template = SideHeaderTemplate {
         hash,
         base_flags,
-        prefix,
-        between,
+        prefix: prefix.into(),
+        between: between.into(),
         reliable_flags,
         reliable_compact,
     };
@@ -339,7 +343,7 @@ pub(crate) fn reconstruct_side_compact_frame(
     body: &[u8],
     timestamp_mode: SideCompactTimestampMode,
     timestamp_base: Option<u64>,
-) -> TelemetryResult<(Arc<[u8]>, u64)> {
+) -> TelemetryResult<(crate::SharedBytes, u64)> {
     if body.is_empty() {
         return Err(TelemetryError::Unpack("short side compact frame"));
     }
@@ -409,7 +413,7 @@ pub(crate) fn reconstruct_side_compact_frame(
     raw.extend_from_slice(payload);
     let crc = crc32_bytes(&raw);
     raw.extend_from_slice(&crc.to_le_bytes());
-    Ok((Arc::from(raw), timestamp))
+    Ok(((Arc::<[u8]>::from(raw)).into(), timestamp))
 }
 
 /// Send a large plaintext packet as canonical chunks without assembling an
@@ -478,7 +482,7 @@ mod streamed_chunk_tests {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         for max_bytes in [32, 128, 1024, 4096] {
-            let expected = SideTransportFrames::split(raw.clone(), max_bytes, b"GB")
+            let expected = SideTransportFrames::split((raw.clone()).into(), max_bytes, b"GB")
                 .unwrap()
                 .collect::<Vec<_>>();
             let mut actual = Vec::new();
@@ -487,7 +491,10 @@ mod streamed_chunk_tests {
                 Ok(())
             })
             .unwrap();
-            assert_eq!(actual, expected);
+            assert_eq!(
+                actual.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
+                expected.iter().map(|b| b.as_ref()).collect::<Vec<_>>()
+            );
         }
         let mut calls = 0;
         let result = send_packet_chunks(&packet, 32, b"GB", |_| {
@@ -503,7 +510,7 @@ mod streamed_chunk_tests {
 pub(crate) struct SideChunkAssembly {
     pub(crate) last_seen_ms: u64,
     pub(crate) total: u16,
-    pub(crate) received: BTreeMap<u16, Arc<[u8]>>,
+    pub(crate) received: BTreeMap<u16, crate::SharedBytes>,
 }
 
 impl SideChunkAssembly {

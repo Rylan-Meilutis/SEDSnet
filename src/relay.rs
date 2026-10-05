@@ -34,7 +34,7 @@ mod compact_summary_tests {
             .unwrap();
             let raw = wire_format::pack_packet(&pkt);
             let frames = tx
-                .encode_side_transport_frames(a, opts, raw.clone())
+                .encode_side_transport_frames(a, opts, (raw.clone()).into())
                 .unwrap();
             assert_eq!(frames.len(), 1);
             encoded.push((raw, frames.into_iter().next().unwrap()));
@@ -346,7 +346,7 @@ pub struct RelaySide {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayItem {
-    Packed(Arc<[u8]>),
+    Packed(crate::SharedBytes),
     Packet(Arc<Packet>),
 }
 
@@ -359,6 +359,14 @@ struct RelayRxItem {
 }
 
 impl ByteCost for RelayRxItem {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        match &mut self.data {
+            RelayItem::Packet(packet) => Arc::make_mut(packet).park_for_queue()?,
+            RelayItem::Packed(bytes) => bytes.park_for_queue()?,
+        }
+        Ok(())
+    }
     fn byte_cost(&self) -> usize {
         match &self.data {
             RelayItem::Packed(bytes) => bytes.len(),
@@ -379,11 +387,19 @@ struct RelayTxItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RelayReplayItem {
     dst: RelaySideId,
-    bytes: Arc<[u8]>,
+    bytes: crate::SharedBytes,
     priority: u8,
 }
 
 impl ByteCost for RelayTxItem {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        match &mut self.data {
+            RelayItem::Packet(packet) => Arc::make_mut(packet).park_for_queue()?,
+            RelayItem::Packed(bytes) => bytes.park_for_queue()?,
+        }
+        Ok(())
+    }
     fn byte_cost(&self) -> usize {
         match &self.data {
             RelayItem::Packed(bytes) => bytes.len(),
@@ -393,6 +409,10 @@ impl ByteCost for RelayTxItem {
 }
 
 impl ByteCost for RelayReplayItem {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        self.bytes.park_for_queue()
+    }
     fn byte_cost(&self) -> usize {
         self.bytes.len()
     }
@@ -409,7 +429,7 @@ struct ReliableTxState {
 
 #[derive(Debug, Clone)]
 struct ReliableSent {
-    bytes: Arc<[u8]>,
+    bytes: crate::SharedBytes,
     last_send_ms: u64,
     retries: u32,
     queued: bool,
@@ -419,7 +439,7 @@ struct ReliableSent {
 #[derive(Debug, Clone)]
 struct ReliableRxState {
     expected_seq: u32,
-    buffered: BTreeMap<u32, Arc<[u8]>>,
+    buffered: BTreeMap<u32, crate::SharedBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -1004,7 +1024,7 @@ impl RelayInner {
         self.reliable_rx
             .values()
             .flat_map(|state| state.buffered.values())
-            .map(|bytes| size_of::<Arc<[u8]>>() + bytes.len())
+            .map(|bytes| size_of::<crate::SharedBytes>() + bytes.len())
             .sum()
     }
 
@@ -1036,7 +1056,7 @@ impl RelayInner {
             .sum()
     }
 
-    fn pop_reliable_rx_buffered(&mut self) -> Option<Arc<[u8]>> {
+    fn pop_reliable_rx_buffered(&mut self) -> Option<crate::SharedBytes> {
         let key = self
             .reliable_rx
             .iter()
@@ -1135,6 +1155,7 @@ impl RelayInner {
             > self.memory.max_queue_budget
         {
             let victim = self.largest_shared_queue().unwrap_or(preferred);
+            #[cfg(feature = "discovery")]
             if victim == RelayQueueKind::Discovery {
                 Self::queue_budget_warning("topology data is using the largest queue budget share");
             }
@@ -1210,12 +1231,13 @@ impl RelayInner {
         self.recent_rx.push_back(id)
     }
 
+    #[allow(unused_mut)]
     fn buffer_reliable_rx(
         &mut self,
         side: RelaySideId,
         ty: crate::DataType,
         seq: u32,
-        bytes: Arc<[u8]>,
+        mut bytes: crate::SharedBytes,
     ) -> TelemetryResult<()> {
         let key = Relay::reliable_key(side, ty);
         if self
@@ -1225,8 +1247,10 @@ impl RelayInner {
         {
             return Ok(());
         }
-        let cost = size_of::<Arc<[u8]>>() + bytes.len();
+        let cost = size_of::<crate::SharedBytes>() + bytes.len();
         self.make_shared_queue_room(cost, RelayQueueKind::ReliableRxBuffer)?;
+        #[cfg(feature = "compact-packet-store")]
+        bytes.park_for_queue()?;
         let rx_state = self
             .reliable_rx
             .entry(key)
@@ -2156,7 +2180,7 @@ impl Relay {
     fn send_reliable_raw_to_side(
         &self,
         side: RelaySideId,
-        bytes: Arc<[u8]>,
+        bytes: crate::SharedBytes,
     ) -> TelemetryResult<()> {
         let (handler, opts) = {
             let st = self.state.lock();
@@ -2206,6 +2230,7 @@ impl Relay {
         result
     }
 
+    #[allow(unused_mut)]
     fn send_reliable_to_side(&self, side: RelaySideId, data: RelayItem) -> TelemetryResult<()> {
         let ty = match &data {
             RelayItem::Packet(pkt) => pkt.data_type(),
@@ -2271,11 +2296,12 @@ impl Relay {
             (seq, flags)
         };
 
-        let bytes: Arc<[u8]> = match data {
-            RelayItem::Packet(pkt) => wire_format::pack_packet_with_reliable(
+        let mut bytes: crate::SharedBytes = match data {
+            RelayItem::Packet(pkt) => (wire_format::pack_packet_with_reliable(
                 &pkt,
                 wire_format::ReliableHeader { flags, seq, ack: 0 },
-            ),
+            ))
+            .into(),
             RelayItem::Packed(bytes) => {
                 let Some(rewritten) =
                     wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
@@ -2294,7 +2320,7 @@ impl Relay {
                     self.note_side_tx_success(side, ty, sent_bytes, 1);
                     return Ok(());
                 };
-                rewritten
+                (rewritten).into()
             }
         };
 
@@ -2310,6 +2336,11 @@ impl Relay {
         }
         self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
         self.note_side_tx_success(side, ty, sent_bytes, 1);
+
+        #[cfg(feature = "compact-packet-store")]
+        {
+            let _ = bytes.park_for_queue();
+        }
 
         {
             let mut st = self.state.lock();
@@ -2684,6 +2715,7 @@ impl Relay {
         target_side.filter(|side| self.route_allowed_locked(st, Some(exclude), Some(ty), *side))
     }
 
+    #[cfg(feature = "discovery")]
     fn filter_end_to_end_satisfied_sides_locked(
         &self,
         st: &RelayInner,
@@ -2750,6 +2782,18 @@ impl Relay {
             }
         }
         Ok(filtered)
+    }
+
+    #[cfg(not(feature = "discovery"))]
+    fn filter_end_to_end_satisfied_sides_locked(
+        &self,
+        _st: &RelayInner,
+        _data: &RelayItem,
+        sides: Vec<RelaySideId>,
+        _eps: &[crate::DataEndpoint],
+        _ty: crate::DataType,
+    ) -> TelemetryResult<Vec<RelaySideId>> {
+        Ok(sides)
     }
 
     #[cfg(feature = "discovery")]
@@ -4370,6 +4414,7 @@ impl Relay {
         self.queue_discovery_announce(true, false)
     }
 
+    #[cfg(feature = "discovery")]
     /// Broadcast that this relay is leaving so peers can prune topology immediately.
     pub fn announce_leave(&self) -> TelemetryResult<()> {
         let pkt = discovery::build_discovery_leave("relay", self.clock.now_ms())?;
@@ -4825,7 +4870,7 @@ impl Relay {
 
     /// Enqueue packed bytes that originated from `src` into the relay RX queue.
     ///
-    /// Note: `Arc::from(bytes)` allocates and copies `len` bytes into a new `Arc<[u8]>`.
+    /// Note: `Arc::from(bytes)` allocates and copies `len` bytes into a new `crate::SharedBytes`.
     /// This is still “fast enough” for many cases, but it is not allocation-free / ISR-safe.
     pub fn rx_packed_from_side(&self, src: RelaySideId, bytes: &[u8]) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(src)?;
@@ -4913,7 +4958,7 @@ impl Relay {
                 }
             }
         }
-        let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
+        let mut released_buffered: Vec<crate::SharedBytes> = Vec::new();
         if let RelayItem::Packed(bytes) = &item.data {
             let (_opts, handler_is_packed, hop_reliable_enabled) = {
                 let st = self.state.lock();
@@ -4987,7 +5032,7 @@ impl Relay {
                     if unordered {
                         self.queue_reliable_ack(item.src, frame.envelope.ty, hdr.seq)?;
                     } else {
-                        let mut release: Vec<Arc<[u8]>> = Vec::new();
+                        let mut release: Vec<crate::SharedBytes> = Vec::new();
                         let mut last_delivered = None;
                         let mut ack_old = None;
                         let mut request_missing = None;
@@ -5161,7 +5206,7 @@ impl Relay {
     fn split_side_transport_frame(
         &self,
         _side: RelaySideId,
-        frame: Arc<[u8]>,
+        frame: crate::SharedBytes,
         max_frame_bytes: usize,
     ) -> TelemetryResult<SideTransportFrames> {
         SideTransportFrames::split(frame, max_frame_bytes, self.sender_arc().as_bytes())
@@ -5171,7 +5216,7 @@ impl Relay {
         &self,
         side: RelaySideId,
         opts: RelaySideOptions,
-        raw: Arc<[u8]>,
+        raw: crate::SharedBytes,
     ) -> TelemetryResult<SideTransportFrames> {
         if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
             return Ok(SideTransportFrames::single(raw));
@@ -5340,11 +5385,11 @@ impl Relay {
         &self,
         side: RelaySideId,
         bytes: &[u8],
-    ) -> TelemetryResult<Option<Arc<[u8]>>> {
+    ) -> TelemetryResult<Option<crate::SharedBytes>> {
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             crate::memory_admission::check_receive(bytes)?;
-            return Ok(Some(Arc::from(bytes)));
+            return Ok(Some((Arc::<[u8]>::from(bytes)).into()));
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
@@ -5378,7 +5423,7 @@ impl Relay {
                             .note_side_transport_template_eviction();
                     }
                 }
-                Ok(Some(raw))
+                Ok(Some((raw).into()))
             }
             SIDE_TRANSPORT_KIND_COMPACT
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
@@ -5496,7 +5541,7 @@ impl Relay {
                         side_state.rx_chunks.remove(&transfer_id);
                         return Err(TelemetryError::Unpack("side chunk total mismatch"));
                     }
-                    entry.received.entry(index).or_insert(payload);
+                    entry.received.entry(index).or_insert((payload).into());
                     if entry.received.len() == usize::from(total) {
                         let entry = side_state
                             .rx_chunks
@@ -5586,7 +5631,7 @@ impl Relay {
                     return Ok(());
                 }
                 let owned = wire_format::pack_packet(pkt);
-                let frames = self.encode_side_transport_frames(side, opts, owned)?;
+                let frames = self.encode_side_transport_frames(side, opts, (owned).into())?;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
                     f(frame.as_ref())?;
@@ -5649,7 +5694,7 @@ impl Relay {
                         else {
                             return Ok(Some(RelayItem::Packed(bytes)));
                         };
-                        return Ok(Some(RelayItem::Packed(rewritten)));
+                        return Ok(Some(RelayItem::Packed((rewritten).into())));
                     }
                 }
                 Ok(Some(RelayItem::Packed(bytes)))

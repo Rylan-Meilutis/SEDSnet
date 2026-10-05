@@ -144,7 +144,17 @@ pub const STRING_PRECISION: usize = match option_env!("STRING_PRECISION") {
     None => 8,
 };
 
+#[cfg(not(feature = "compact-packet-store"))]
 sedsnet_macros::define_stack_payload!(env = "MAX_STACK_PAYLOAD", default = 64);
+#[cfg(feature = "compact-packet-store")]
+#[allow(dead_code)]
+mod compact_inline_limit {
+    sedsnet_macros::define_stack_payload!(env = "MAX_STACK_PAYLOAD", default = 64);
+}
+#[cfg(feature = "compact-packet-store")]
+pub use compact_inline_limit::STACK_PAYLOAD_SIZE;
+#[cfg(feature = "compact-packet-store")]
+pub type StandardSmallPayload = crate::small_payload::SmallPayload<STACK_PAYLOAD_SIZE>;
 
 pub const MAX_HANDLER_RETRIES: usize = match option_env!("MAX_HANDLER_RETRIES") {
     Some(val) => parse_usize(val),
@@ -3166,7 +3176,7 @@ pub(crate) fn try_get_message_meta(data_type: DataType) -> Option<MessageMeta> {
 
 #[cfg(not(feature = "std"))]
 pub fn get_message_meta(data_type: DataType) -> MessageMeta {
-    try_get_message_meta(data_type).unwrap_or( MessageMeta {
+    try_get_message_meta(data_type).unwrap_or(MessageMeta {
         name: "UNKNOWN_TYPE",
         description: "",
         element: MessageElement::Dynamic(MessageDataType::Binary, MessageClass::Data),

@@ -38,6 +38,8 @@ Options (can be combined where it makes sense):
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
+  compact-packet-store     Enable handle-managed packet arena and fixed queue slabs.
+  compact-packet-compression  Enable indexed Zstd arena buffers and range decoding.
   cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
   maturin-build           Run `maturin build`.
   maturin-develop         Run `maturin develop`.
@@ -883,6 +885,7 @@ def main(argv: list[str]) -> None:
     build_python = False
     build_timesync = False
     build_cryptography = False
+    compact_features = []
     build_wheel = False
     develop_wheel = False
     release_build = False
@@ -924,6 +927,8 @@ def main(argv: list[str]) -> None:
             print("Building with time sync helpers.")
             build_timesync = True
 
+        elif arg in ("compact-packet-store", "compact-packet-compression"):
+            compact_features.append(arg)
         elif arg == "cryptography":
             print("Building with cryptography provider APIs.")
             build_cryptography = True
@@ -1029,7 +1034,7 @@ def main(argv: list[str]) -> None:
     # ---- CHECK MODE: lint default + python + embedded variants ----
     if checks:
         _banner("CHECK MODE")
-        feature_parts = []
+        feature_parts = list(compact_features)
         if build_timesync:
             feature_parts.append("timesync")
         if build_cryptography:
@@ -1048,7 +1053,7 @@ def main(argv: list[str]) -> None:
     # ---- TEST MODE: also validate embedded + python builds ----
     if tests:
         _banner("TEST MODE")
-        feature_parts = ["timesync"]
+        feature_parts = ["timesync", *compact_features]
         if build_cryptography:
             feature_parts.append("cryptography")
         feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
@@ -1221,7 +1226,7 @@ def main(argv: list[str]) -> None:
 
     build_args: list[str] = []
     embedded_profile = False
-    feature_parts = []
+    feature_parts = list(compact_features)
     if build_timesync:
         feature_parts.append("timesync")
     if build_cryptography:

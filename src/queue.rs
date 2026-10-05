@@ -6,6 +6,10 @@ use alloc::collections::VecDeque;
 pub trait ByteCost {
     /// Approximate heap+payload memory attributable to this queued item.
     fn byte_cost(&self) -> usize;
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        Ok(())
+    }
 }
 
 /// Convert float multiplier to ratio (num, den).
@@ -33,7 +37,8 @@ fn float_to_ratio(mult: f64) -> (usize, usize) {
 ///   to `max_elems` and we never call `reserve*`, so it will not grow.
 /// - When the ring is full, we evict one item from the front before pushing.
 /// - `cur_bytes` is kept consistent for *all* removal paths.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[cfg_attr(not(feature = "compact-packet-store"), derive(Clone))]
 pub struct BoundedDeque<T> {
     q: VecDeque<T>,
     max_bytes: usize,
@@ -42,6 +47,23 @@ pub struct BoundedDeque<T> {
     grow_num: usize,
     grow_den: usize,
     fixed_capacity: bool,
+}
+
+#[cfg(feature = "compact-packet-store")]
+impl<T: Clone> Clone for BoundedDeque<T> {
+    fn clone(&self) -> Self {
+        let mut q = VecDeque::with_capacity(self.q.capacity());
+        q.extend(self.q.iter().cloned());
+        Self {
+            q,
+            max_bytes: self.max_bytes,
+            cur_bytes: self.cur_bytes,
+            max_elems: self.max_elems,
+            grow_num: self.grow_num,
+            grow_den: self.grow_den,
+            fixed_capacity: self.fixed_capacity,
+        }
+    }
 }
 
 impl<T: ByteCost> BoundedDeque<T> {
@@ -89,7 +111,11 @@ impl<T: ByteCost> BoundedDeque<T> {
         let min_cost = size_of::<T>().max(1);
         let max_elems = (max_bytes / min_cost).max(1);
         let starting_elems = starting_bytes / min_cost;
-        let start_cap = starting_elems.clamp(1, max_elems);
+        let start_cap = if cfg!(feature = "compact-packet-store") && grow_mult > 1.0 {
+            max_elems
+        } else {
+            starting_elems.clamp(1, max_elems)
+        };
 
         let (grow_num, grow_den) = float_to_ratio(grow_mult);
 
@@ -100,7 +126,7 @@ impl<T: ByteCost> BoundedDeque<T> {
             max_elems,
             grow_num,
             grow_den,
-            fixed_capacity: grow_mult == 1.0,
+            fixed_capacity: grow_mult == 1.0 || cfg!(feature = "compact-packet-store"),
         }
     }
 
@@ -337,7 +363,10 @@ impl<T: ByteCost> BoundedDeque<T> {
     /// Guarantees:
     /// - Never grows allocation beyond `max_elems` (no reserve calls; ring eviction).
     /// - Maintains `cur_bytes` consistency.
-    pub fn push_back(&mut self, v: T) -> TelemetryResult<()> {
+    #[allow(unused_mut)]
+    pub fn push_back(&mut self, mut v: T) -> TelemetryResult<()> {
+        #[cfg(feature = "compact-packet-store")]
+        v.park_for_queue()?;
         let cost = v.byte_cost();
         self.prepare_push_fifo(cost)?;
 
@@ -353,10 +382,13 @@ impl<T: ByteCost> BoundedDeque<T> {
     ///
     /// `priority_of` must return a larger value for higher-priority items.
     /// Items with equal priority preserve FIFO order.
-    pub fn push_back_prioritized<F>(&mut self, v: T, mut priority_of: F) -> TelemetryResult<()>
+    #[allow(unused_mut)]
+    pub fn push_back_prioritized<F>(&mut self, mut v: T, mut priority_of: F) -> TelemetryResult<()>
     where
         F: FnMut(&T) -> u8,
     {
+        #[cfg(feature = "compact-packet-store")]
+        v.park_for_queue()?;
         let cost = v.byte_cost();
         if cost > self.max_bytes {
             return Err(TelemetryError::PacketTooLarge(
@@ -673,5 +705,45 @@ mod tests {
 
         let retained_bytes: usize = q.iter().map(ByteCost::byte_cost).sum();
         assert_eq!(q.bytes_used(), retained_bytes);
+    }
+}
+
+#[cfg(all(test, feature = "compact-packet-store"))]
+mod arena_queue_tests {
+    use super::*;
+    use crate::packet_store::PacketStore;
+    use crate::small_payload::SmallPayload;
+    impl ByteCost for TestPayload {
+        fn byte_cost(&self) -> usize {
+            self.0.len()
+        }
+        fn park_for_queue(&mut self) -> TelemetryResult<()> {
+            self.0.park_in_store(&self.1)
+        }
+    }
+    #[derive(Clone)]
+    struct TestPayload(SmallPayload<4>, alloc::sync::Arc<PacketStore>);
+    #[test]
+    fn parking_releases_slice_pins_and_fixed_queue_clones_keep_capacity() {
+        let store = PacketStore::new(256, 8, 256).unwrap();
+        let mut q = BoundedDeque::new(256, 64, 2.0);
+        q.push_back(TestPayload(SmallPayload::new(&[4; 24]), store.clone()))
+            .unwrap();
+        assert_eq!(q.iter().next().unwrap().0.as_slice(), &[4; 24]);
+        assert_eq!(store.stats().pinned_bytes, 24);
+        let value = q.pop_front().unwrap();
+        q.push_back(value).unwrap();
+        assert_eq!(store.stats().pinned_bytes, 0);
+        let capacity = q.capacity();
+        let mut clone = q.clone();
+        for _ in 0..100 {
+            clone
+                .push_back(TestPayload(SmallPayload::new(&[5; 24]), store.clone()))
+                .ok();
+        }
+        assert_eq!(clone.capacity(), capacity);
+        drop(clone);
+        drop(q);
+        assert_eq!(store.stats().live_bytes, 0);
     }
 }

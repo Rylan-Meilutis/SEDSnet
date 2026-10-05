@@ -175,6 +175,10 @@ mod lock;
 mod macros;
 pub mod memory_admission;
 pub mod packet;
+mod shared_bytes;
+pub use shared_bytes::SharedBytes;
+#[cfg(feature = "compact-packet-store")]
+pub mod packet_store;
 mod queue;
 pub mod relay;
 pub mod router;

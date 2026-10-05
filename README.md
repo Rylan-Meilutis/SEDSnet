@@ -107,6 +107,12 @@ operation, so its reserved bytes come out of the shared budget immediately. If o
 is idle, another can use more of the remaining budget; if several areas fill at once, older queued
 state is evicted so total queue-owned memory stays bounded.
 
+Optional [compact packet storage](docs/compact-packet-store.md) gives queued
+payloads and raw frames a private handle-managed arena. Unpinned small buffers
+can move; larger buffers and active views remain stable. Indexed Zstd buffers
+support bounded field reads without retaining a full decompressed copy. Both
+features are opt-in and leave ThreadX scheduling and allocation unchanged.
+
 Embedded applications can additionally register `memory_admission::set_probe` (C:
 `seds_set_memory_admission_probe`) to reject incoming packed work and large schema
 operations before transient allocations. The allocation-free callback receives estimated

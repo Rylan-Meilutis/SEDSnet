@@ -25,6 +25,9 @@ compression = ["zstd-safe"]
 timesync = []
 discovery = []
 cryptography = []
+# Private handle-managed packet arena; leaves the application allocator unchanged.
+compact-packet-store = []
+compact-packet-compression = ["compact-packet-store", "compression", "zstd-safe/experimental"]
 
 [package.metadata.maturin]
 bindings = "pyo3"

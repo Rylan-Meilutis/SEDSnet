@@ -13,6 +13,56 @@ mod mega_library_system_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn ensure_common_test_schema() {
+        use sedsnet::config::{
+            data_type_definition_by_name, endpoint_definition_by_name,
+            register_data_type_with_description, register_endpoint_with_description,
+        };
+        use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            if endpoint_definition_by_name("RADIO").is_none() {
+                register_endpoint_with_description(
+                    "RADIO",
+                    "Radio or external link (telemetry uplink/downlink).",
+                    false,
+                )
+                .unwrap();
+            }
+            if endpoint_definition_by_name("SD_CARD").is_none() {
+                register_endpoint_with_description(
+                    "SD_CARD",
+                    "On-board storage (e.g. SD card / flash).",
+                    false,
+                )
+                .unwrap();
+            }
+            if data_type_definition_by_name("GPS_DATA").is_none() {
+                register_data_type_with_description(
+                    "GPS_DATA",
+                    "GPS data (typically 3x f32: latitude, longitude, altitude).",
+                    MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
+                    &[DataEndpoint::named("RADIO"), DataEndpoint::named("SD_CARD")],
+                    ReliableMode::Ordered,
+                    80,
+                )
+                .unwrap();
+            }
+            if data_type_definition_by_name("BATTERY_STATUS").is_none() {
+                register_data_type_with_description(
+                    "BATTERY_STATUS",
+                    "Battery status (e.g. voltage, current, etc.).",
+                    MessageElement::Static(2, MessageDataType::Float32, MessageClass::Data),
+                    &[DataEndpoint::named("RADIO"), DataEndpoint::named("SD_CARD")],
+                    ReliableMode::None,
+                    60,
+                )
+                .unwrap();
+            }
+        });
+    }
+
     fn zero_clock() -> Box<dyn Clock + Send + Sync> {
         Box::new(|| 0u64)
     }
@@ -45,6 +95,7 @@ mod mega_library_system_tests {
 
     #[test]
     fn multibus_relay_and_router_relay_mode_both_endpoints_exercised() {
+        ensure_common_test_schema();
         // -------------------------------
         // 1) Create the 3 buses
         // -------------------------------

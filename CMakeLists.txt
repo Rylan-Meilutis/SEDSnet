@@ -54,6 +54,8 @@ option(SEDSNET_ENABLE_C_WRAPPER
 option(SEDSNET_ENABLE_CPP_WRAPPER
     "Expose the optional header-only C++ convenience target sedsnet::cpp_wrapper"
     OFF)
+option(SEDSNET_COMPACT_PACKET_STORE "Enable private compactable packet arena" OFF)
+option(SEDSNET_COMPACT_PACKET_COMPRESSION "Enable indexed Zstd arena buffers" OFF)
 option(SEDSNET_ENABLE_CRYPTOGRAPHY
     "Enable cryptography provider APIs and define SEDS_ENABLE_CRYPTOGRAPHY for C/C++ users"
     ON)
@@ -149,6 +151,11 @@ endif ()
 if (NOT SEDSNET_SCHEMA_PATH STREQUAL "")
     set(RS_ARGS_STR "${RS_ARGS_STR} schema_path=${SEDSNET_SCHEMA_PATH}")
 endif ()
+if (SEDSNET_COMPACT_PACKET_COMPRESSION)
+    set(RS_ARGS_STR "${RS_ARGS_STR} compact-packet-compression")
+elseif (SEDSNET_COMPACT_PACKET_STORE)
+    set(RS_ARGS_STR "${RS_ARGS_STR} compact-packet-store")
+endif ()
 if (SEDSNET_ENABLE_CRYPTOGRAPHY)
     set(RS_ARGS_STR "${RS_ARGS_STR} cryptography")
 endif ()
@@ -196,6 +203,11 @@ if (NOT SEDSNET_MAX_RECENT_RX_IDS STREQUAL "")
 endif ()
 if (NOT SEDSNET_SCHEMA_PATH STREQUAL "")
     list(APPEND RS_ARGS_BOOTSTRAP "schema_path=${SEDSNET_SCHEMA_PATH}")
+endif ()
+if (SEDSNET_COMPACT_PACKET_COMPRESSION)
+    list(APPEND RS_ARGS_BOOTSTRAP "compact-packet-compression")
+elseif (SEDSNET_COMPACT_PACKET_STORE)
+    list(APPEND RS_ARGS_BOOTSTRAP "compact-packet-store")
 endif ()
 if (SEDSNET_ENABLE_CRYPTOGRAPHY)
     list(APPEND RS_ARGS_BOOTSTRAP "cryptography")
@@ -269,6 +281,9 @@ set_target_properties(sedsnet PROPERTIES
     IMPORTED_LOCATION_RELEASE "${RS_LIB_REL}"
     INTERFACE_INCLUDE_DIRECTORIES "${RS_INCLUDE}"
 )
+if (SEDSNET_COMPACT_PACKET_STORE OR SEDSNET_COMPACT_PACKET_COMPRESSION)
+    target_compile_definitions(sedsnet INTERFACE SEDS_ENABLE_COMPACT_PACKET_STORE=1)
+endif ()
 if (SEDSNET_ENABLE_CRYPTOGRAPHY)
     target_compile_definitions(sedsnet INTERFACE SEDS_ENABLE_CRYPTOGRAPHY=1)
 endif ()

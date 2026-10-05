@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — planned 4.1.0
+
+- Add opt-in handle-managed packet/frame arena with pin-aware compaction and fixed queue slabs.
+- Add indexed Zstd buffer storage and bounded field-range reads; retain plain storage if compression plus headers would grow it.
+- Bound codec memory before allocation using fixed Zstd contexts and reusable chunk-sized scratch; encode directly into the arena in two passes without a packet-sized temporary.
+- Add Rust/C initialization and build flags; existing defaults and wire format remain unchanged.
+
 ## 4.0.38
 
 - Treat `SEDS_IO` from C side-transmit callbacks as temporary backpressure in

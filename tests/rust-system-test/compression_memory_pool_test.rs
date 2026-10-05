@@ -158,6 +158,24 @@ mod compression_memory_pool_test {
 
     #[test]
     fn compression_path_is_stable_under_limited_memory_pool() {
+        sedsnet::config::register_endpoint_with_description(
+            "SD_CARD",
+            "Compression test sink",
+            false,
+        )
+        .unwrap();
+        sedsnet::config::register_data_type_with_description(
+            "MESSAGE_DATA",
+            "Compression memory fixture",
+            sedsnet::MessageElement::Dynamic(
+                sedsnet::MessageDataType::Binary,
+                sedsnet::MessageClass::Data,
+            ),
+            &[DataEndpoint::named("SD_CARD")],
+            sedsnet::ReliableMode::None,
+            50,
+        )
+        .unwrap();
         // Warm-up outside the cap to initialize one-time internals.
         let warm = make_packet(&[b'W'; 128], 0);
         let wire = wire_format::pack_packet(&warm);

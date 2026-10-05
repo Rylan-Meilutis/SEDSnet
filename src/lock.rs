@@ -81,6 +81,11 @@ where
 impl<T> RouterMutex<T> {
     /// Create a new `RouterMutex` wrapping the given value.
     #[inline]
+    #[cfg(feature = "compact-packet-store")]
+    pub const fn constant(v: T) -> Self {
+        Self(std::sync::Mutex::new(v))
+    }
+
     pub fn new(v: T) -> Self {
         Self(std::sync::Mutex::new(v))
     }
@@ -149,6 +154,11 @@ impl<T> Drop for RouterMutexGuard<'_, T> {
 impl<T> RouterMutex<T> {
     /// Create a new `RouterMutex` wrapping the given value.
     #[inline]
+    #[cfg(feature = "compact-packet-store")]
+    pub const fn constant(v: T) -> Self {
+        Self(core::cell::UnsafeCell::new(v))
+    }
+
     pub fn new(v: T) -> Self {
         Self(core::cell::UnsafeCell::new(v))
     }

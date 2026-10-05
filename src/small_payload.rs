@@ -29,12 +29,16 @@ pub enum SmallPayload<const INLINE: usize> {
     ///
     /// Stores the bytes in a reference-counted slice.
     Heap(Arc<[u8]>),
+    #[cfg(feature = "compact-packet-store")]
+    Managed(crate::packet_store::ParkedPayload),
 }
 
 /// Helper type wrapping the uninitialized inline buffer.
 #[derive(Clone)]
 pub struct InlineBuf<const N: usize> {
     buf: [MaybeUninit<u8>; N],
+    #[cfg(feature = "compact-packet-store")]
+    initialized: u8,
 }
 
 impl<const N: usize> InlineBuf<N> {
@@ -70,7 +74,14 @@ impl<const N: usize> InlineBuf<N> {
             }
         }
 
-        (InlineBuf { buf }, data.len() as u8)
+        (
+            InlineBuf {
+                buf,
+                #[cfg(feature = "compact-packet-store")]
+                initialized: data.len() as u8,
+            },
+            data.len() as u8,
+        )
     }
 
     /// View the first `len` bytes as an initialized slice.
@@ -80,6 +91,11 @@ impl<const N: usize> InlineBuf<N> {
     /// initialized by `from_slice`.
     #[inline]
     pub fn as_slice(&self, len: u8) -> &[u8] {
+        #[cfg(feature = "compact-packet-store")]
+        assert!(
+            len <= self.initialized,
+            "inline slice exceeds initialized bytes"
+        );
         let len = len as usize;
         // SAFETY:
         // - `self.buf.as_ptr()` points to `N` contiguous `MaybeUninit<u8>`.
@@ -100,7 +116,7 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
     /// - Otherwise, the bytes are stored in an `Arc<[u8]>`.
     #[inline]
     pub fn new(data: &[u8]) -> Self {
-        if data.len() <= INLINE {
+        if data.len() <= INLINE && data.len() <= u8::MAX as usize {
             let (buf, len) = InlineBuf::<INLINE>::from_slice(data);
             Self::Inline { len, buf }
         } else {
@@ -116,7 +132,7 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
     /// fragmented embedded heaps.
     #[inline]
     pub fn from_arc(data: Arc<[u8]>) -> Self {
-        if data.len() <= INLINE {
+        if data.len() <= INLINE && data.len() <= u8::MAX as usize {
             let (buf, len) = InlineBuf::<INLINE>::from_slice(&data);
             Self::Inline { len, buf }
         } else {
@@ -130,6 +146,8 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         match self {
             SmallPayload::Inline { len, .. } => *len as usize,
             SmallPayload::Heap(a) => a.len() + size_of::<Arc<[u8]>>(),
+            #[cfg(feature = "compact-packet-store")]
+            SmallPayload::Managed(a) => a.len(),
         }
     }
 
@@ -139,6 +157,8 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         match self {
             SmallPayload::Inline { len, buf } => buf.as_slice(*len),
             SmallPayload::Heap(arc) => arc,
+            #[cfg(feature = "compact-packet-store")]
+            SmallPayload::Managed(a) => a.as_slice(),
         }
     }
 
@@ -155,6 +175,8 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
                 Arc::from(buf.as_slice(*len))
             }
             SmallPayload::Heap(arc) => arc.clone(),
+            #[cfg(feature = "compact-packet-store")]
+            SmallPayload::Managed(a) => Arc::from(a.as_slice()),
         }
     }
 
@@ -164,7 +186,49 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         match self {
             SmallPayload::Inline { len, .. } => *len as usize,
             SmallPayload::Heap(a) => a.len(),
+            #[cfg(feature = "compact-packet-store")]
+            SmallPayload::Managed(a) => a.len(),
         }
+    }
+
+    #[cfg(feature = "compact-packet-store")]
+    pub(crate) fn park_for_queue(&mut self) -> crate::TelemetryResult<()> {
+        if let Self::Managed(payload) = self {
+            payload.park();
+            return Ok(());
+        }
+        if let Some(store) = crate::packet_store::default_store() {
+            self.park_in_store(&store)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "compact-packet-store")]
+    pub(crate) fn park_in_store(
+        &mut self,
+        store: &Arc<crate::packet_store::PacketStore>,
+    ) -> crate::TelemetryResult<()> {
+        match self {
+            Self::Managed(payload) => payload.park(),
+            Self::Heap(bytes) => {
+                let handle = store.store_shared(bytes)?;
+                *self = Self::Managed(crate::packet_store::ParkedPayload::new(handle));
+            }
+            Self::Inline { .. } => {}
+        }
+        Ok(())
+    }
+    /// Copy a field/range into caller storage without permanently pinning it.
+    pub fn read_range(&self, offset: usize, out: &mut [u8]) -> crate::TelemetryResult<()> {
+        #[cfg(feature = "compact-packet-store")]
+        if let Self::Managed(payload) = self {
+            return payload.read_range(offset, out);
+        }
+        let end = offset
+            .checked_add(out.len())
+            .filter(|&n| n <= self.len())
+            .ok_or(crate::TelemetryError::Unpack("payload range out of bounds"))?;
+        out.copy_from_slice(&self.as_slice()[offset..end]);
+        Ok(())
     }
 
     /// Returns `true` if the payload is stored inline on the stack.
@@ -186,6 +250,8 @@ impl<const INLINE: usize> fmt::Debug for SmallPayload<INLINE> {
             Self::Inline { len, .. } => {
                 write!(f, "SmallPayload::Inline({} bytes)", len)
             }
+            #[cfg(feature = "compact-packet-store")]
+            Self::Managed(a) => a.fmt(f),
             Self::Heap(a) => {
                 write!(f, "SmallPayload::Heap({} bytes)", a.len())
             }
@@ -261,5 +327,57 @@ mod tests {
         let payload = SmallPayload::<64>::from_arc(Arc::from([1, 2, 3]));
         assert!(payload.is_inline());
         assert_eq!(payload.as_slice(), [1, 2, 3]);
+    }
+}
+
+impl<const INLINE: usize> AsRef<[u8]> for SmallPayload<INLINE> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl<const INLINE: usize> From<Arc<[u8]>> for SmallPayload<INLINE> {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::from_arc(bytes)
+    }
+}
+impl<const INLINE: usize> From<alloc::vec::Vec<u8>> for SmallPayload<INLINE> {
+    fn from(bytes: alloc::vec::Vec<u8>) -> Self {
+        Self::from_arc(Arc::from(bytes))
+    }
+}
+impl<const INLINE: usize> From<&[u8]> for SmallPayload<INLINE> {
+    fn from(bytes: &[u8]) -> Self {
+        Self::new(bytes)
+    }
+}
+impl<const INLINE: usize, const N: usize> From<[u8; N]> for SmallPayload<INLINE> {
+    fn from(bytes: [u8; N]) -> Self {
+        Self::new(&bytes)
+    }
+}
+
+impl<const INLINE: usize> From<SmallPayload<INLINE>> for Arc<[u8]> {
+    fn from(bytes: SmallPayload<INLINE>) -> Self {
+        bytes.to_arc()
+    }
+}
+
+#[cfg(all(test, feature = "compact-packet-store"))]
+mod inline_view_safety {
+    use super::*;
+    #[test]
+    #[should_panic(expected = "inline slice exceeds initialized bytes")]
+    fn altered_inline_length_cannot_expose_uninitialized_bytes() {
+        let mut payload = SmallPayload::<64>::new(&[1]);
+        if let SmallPayload::Inline { len, .. } = &mut payload {
+            *len = 64;
+        }
+        let _ = payload.as_slice();
+    }
+    #[test]
+    fn large_inline_configuration_spills_lengths_not_representable_by_u8() {
+        let payload = SmallPayload::<512>::new(&[9; 256]);
+        assert_eq!(payload.as_slice(), &[9; 256]);
+        assert!(!payload.is_inline());
     }
 }

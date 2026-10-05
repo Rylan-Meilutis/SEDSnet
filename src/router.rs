@@ -249,7 +249,9 @@ mod chunk_assembly_memory_tests {
         let payload: Vec<u8> = (0..3652).map(|i| (i % 251) as u8).collect();
         let mut assembly = SideChunkAssembly::default();
         for (index, chunk) in payload.chunks(56).enumerate().rev() {
-            assembly.received.insert(index as u16, Arc::from(chunk));
+            assembly
+                .received
+                .insert(index as u16, (Arc::<[u8]>::from(chunk)).into());
         }
         assembly.total = assembly.received.len() as u16;
         let out = assembly.assemble().unwrap();
@@ -266,9 +268,13 @@ mod chunk_assembly_memory_tests {
             total: 2,
             ..Default::default()
         };
-        assembly.received.insert(0, Arc::from([1u8]));
+        assembly
+            .received
+            .insert(0, (Arc::<[u8]>::from([1u8])).into());
         assert!(assembly.clone().assemble().is_err());
-        assembly.received.insert(2, Arc::from([2u8]));
+        assembly
+            .received
+            .insert(2, (Arc::<[u8]>::from([2u8])).into());
         assert!(assembly.assemble().is_err());
     }
 }
@@ -434,7 +440,18 @@ impl Default for CompactTimestampOmissionPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouterItem {
     Packet(Packet),
-    Packed(Arc<[u8]>),
+    Packed(crate::SharedBytes),
+}
+
+#[cfg(feature = "compact-packet-store")]
+impl RouterItem {
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        match self {
+            Self::Packet(packet) => packet.park_for_queue()?,
+            Self::Packed(bytes) => bytes.park_for_queue()?,
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,34 +474,48 @@ enum RouterTxItem {
     },
     ReliableReplay {
         dst: RouterSideId,
-        bytes: Arc<[u8]>,
+        bytes: crate::SharedBytes,
     },
 }
 
 impl ByteCost for RouterRxItem {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        self.data.park_for_queue()
+    }
     #[inline]
     fn byte_cost(&self) -> usize {
         match &self.data {
             RouterItem::Packet(pkt) => pkt.byte_cost(),
-            RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+            RouterItem::Packed(bytes) => size_of::<crate::SharedBytes>() + bytes.len(),
         }
     }
 }
 
 impl ByteCost for RouterTxItem {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        match self {
+            Self::Broadcast(item) | Self::ToSide { data: item, .. } => item.park_for_queue(),
+            Self::ReliableReplay { bytes, .. } => bytes.park_for_queue(),
+            _ => Ok(()),
+        }
+    }
     #[inline]
     fn byte_cost(&self) -> usize {
         match self {
             RouterTxItem::Broadcast(data) => match data {
                 RouterItem::Packet(pkt) => pkt.byte_cost(),
-                RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+                RouterItem::Packed(bytes) => size_of::<crate::SharedBytes>() + bytes.len(),
             },
             RouterTxItem::EndToEndReplay { .. } => size_of::<u64>(),
             RouterTxItem::ToSide { data, .. } => match data {
                 RouterItem::Packet(pkt) => pkt.byte_cost(),
-                RouterItem::Packed(bytes) => size_of::<Arc<[u8]>>() + bytes.len(),
+                RouterItem::Packed(bytes) => size_of::<crate::SharedBytes>() + bytes.len(),
             },
-            RouterTxItem::ReliableReplay { bytes, .. } => size_of::<Arc<[u8]>>() + bytes.len(),
+            RouterTxItem::ReliableReplay { bytes, .. } => {
+                size_of::<crate::SharedBytes>() + bytes.len()
+            }
         }
     }
 }
@@ -507,6 +538,10 @@ const MAX_PRIORITY_BURST: u8 = 8;
 
 /// ByteCost implementation for TxQueued.
 impl ByteCost for TxQueued {
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue(&mut self) -> TelemetryResult<()> {
+        self.item.park_for_queue()
+    }
     /// Byte cost is the cost of the inner item plus one bool.
     #[inline]
     fn byte_cost(&self) -> usize {
@@ -534,7 +569,7 @@ struct ReliableTxState {
 
 #[derive(Debug, Clone)]
 struct ReliableSent {
-    bytes: Arc<[u8]>,
+    bytes: crate::SharedBytes,
     last_send_ms: u64,
     retries: u32,
     queued: bool,
@@ -556,7 +591,7 @@ struct EndToEndReliableSent {
 #[derive(Debug, Clone)]
 struct ReliableRxState {
     expected_seq: u32,
-    buffered: BTreeMap<u32, Arc<[u8]>>,
+    buffered: BTreeMap<u32, crate::SharedBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -1142,7 +1177,15 @@ pub(crate) const fn endpoint_is_router_internal(endpoint: DataEndpoint) -> bool 
     if matches!(endpoint, DataEndpoint::TimeSync) {
         return true;
     }
-    discovery::is_discovery_endpoint(endpoint)
+    #[cfg(feature = "discovery")]
+    {
+        discovery::is_discovery_endpoint(endpoint)
+    }
+    #[cfg(not(feature = "discovery"))]
+    {
+        let _ = endpoint;
+        false
+    }
 }
 
 impl EndpointHandler {
@@ -1750,7 +1793,7 @@ pub(crate) fn encode_slice_le<T: LeBytes>(data: &[T]) -> Arc<[u8]> {
 
 /// Build an error payload for `TelemetryError` packets, respecting the
 /// static/dynamic sizing rules from `message_meta`.
-fn make_error_payload(msg: &str) -> Arc<[u8]> {
+fn make_error_payload(msg: &str) -> crate::SharedBytes {
     let meta = message_meta(DataType::TelemetryError);
     match meta.element {
         MessageElement::Static(_, _, _) => {
@@ -1761,9 +1804,9 @@ fn make_error_payload(msg: &str) -> Arc<[u8]> {
             if n > 0 {
                 buf[..n].copy_from_slice(&bytes[..n]);
             }
-            Arc::from(buf)
+            (Arc::<[u8]>::from(buf)).into()
         }
-        MessageElement::Dynamic(_, _) => Arc::from(msg.as_bytes()),
+        MessageElement::Dynamic(_, _) => (Arc::<[u8]>::from(msg.as_bytes())).into(),
     }
 }
 
@@ -2018,7 +2061,7 @@ impl RouterInner {
         self.reliable_rx
             .values()
             .flat_map(|state| state.buffered.values())
-            .map(|bytes| size_of::<Arc<[u8]>>() + bytes.len())
+            .map(|bytes| size_of::<crate::SharedBytes>() + bytes.len())
             .sum()
     }
 
@@ -2194,12 +2237,13 @@ impl RouterInner {
         self.recent_rx.push_back(id)
     }
 
+    #[allow(unused_mut)]
     fn buffer_reliable_rx(
         &mut self,
         side: RouterSideId,
         ty: DataType,
         seq: u32,
-        bytes: Arc<[u8]>,
+        mut bytes: crate::SharedBytes,
     ) -> TelemetryResult<()> {
         let key = Router::reliable_key(side, ty);
         if self
@@ -2209,8 +2253,10 @@ impl RouterInner {
         {
             return Ok(());
         }
-        let cost = size_of::<Arc<[u8]>>() + bytes.len();
+        let cost = size_of::<crate::SharedBytes>() + bytes.len();
         self.make_shared_queue_room(cost, crate::transport_priority(ty))?;
+        #[cfg(feature = "compact-packet-store")]
+        bytes.park_for_queue()?;
         let rx_state = self
             .reliable_rx
             .entry(key)
@@ -2404,6 +2450,11 @@ const fn discovery_is_hop_local_advertisement(ty: DataType) -> bool {
             | DataType::DiscoveryAddress
             | DataType::DiscoveryLinkCapabilities
     )
+}
+
+#[cfg(not(feature = "discovery"))]
+const fn discovery_is_hop_local_advertisement(_ty: DataType) -> bool {
+    false
 }
 
 impl Debug for Router {
@@ -3369,10 +3420,10 @@ impl Router {
         sender != "RELAY" && !Self::is_end_to_end_ack_sender(sender)
     }
 
-    fn encode_end_to_end_reliable_ack(packet_id: u64) -> Arc<[u8]> {
+    fn encode_end_to_end_reliable_ack(packet_id: u64) -> crate::SharedBytes {
         let mut payload = Vec::with_capacity(8);
         payload.extend_from_slice(&packet_id.to_le_bytes());
-        Arc::from(payload)
+        (Arc::<[u8]>::from(payload)).into()
     }
 
     fn encode_p2p_payload(
@@ -3381,7 +3432,7 @@ impl Router {
         src_port: P2pPort,
         dst_port: P2pPort,
         payload: &[u8],
-    ) -> TelemetryResult<Arc<[u8]>> {
+    ) -> TelemetryResult<crate::SharedBytes> {
         let host_len = u16::try_from(src_hostname.len())
             .map_err(|_| TelemetryError::Pack("p2p hostname too long"))?;
         let payload_len = u32::try_from(payload.len())
@@ -3440,7 +3491,7 @@ impl Router {
         destination_stream_id: P2pStreamId,
         sequence: u32,
         payload: &[u8],
-    ) -> TelemetryResult<Arc<[u8]>> {
+    ) -> TelemetryResult<crate::SharedBytes> {
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| TelemetryError::Pack("p2p stream payload too long"))?;
         let mut out = Vec::with_capacity(22usize.saturating_add(payload.len()));
@@ -3530,7 +3581,7 @@ impl Router {
         frame: &P2pStreamDecoded<'_>,
     ) -> TelemetryResult<()> {
         let mut events: Vec<PendingP2pStreamEvent> = Vec::new();
-        let mut reply: Option<(AddressBookEntry, P2pPort, P2pPort, Arc<[u8]>)> = None;
+        let mut reply: Option<(AddressBookEntry, P2pPort, P2pPort, crate::SharedBytes)> = None;
         {
             let mut st = self.state.lock();
             if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK == 0 {
@@ -4106,6 +4157,7 @@ impl Router {
         }
     }
 
+    #[allow(unused_mut)]
     fn register_end_to_end_reliable_tx(&self, data: &RouterItem) -> TelemetryResult<bool> {
         let packet_id = Self::get_hash(data);
         let now_ms = self.clock.now_ms();
@@ -4136,13 +4188,16 @@ impl Router {
                 .end_to_end_reliable_tx
                 .values()
                 .any(|sent| sent.ordered_type == ordered_type);
+        let mut retained = data.clone();
+        #[cfg(feature = "compact-packet-store")]
+        retained.park_for_queue()?;
         Self::remember_end_to_end_reliable_tx_locked(&mut st, packet_id);
         st.end_to_end_reliable_tx.insert(
             packet_id,
             EndToEndReliableSent {
                 ordered_type,
                 waiting_for_predecessor,
-                data: data.clone(),
+                data: retained,
                 pending_destinations,
                 tracked_destinations,
                 last_send_ms: now_ms,
@@ -4366,7 +4421,7 @@ impl Router {
             message_meta(DataType::ReliableAck).endpoints_ref(),
             ack_sender.as_str(),
             self.packet_timestamp_ms(),
-            Self::encode_end_to_end_reliable_ack(packet_id),
+            (Self::encode_end_to_end_reliable_ack(packet_id)).into(),
         )?;
         let local_sender = self.sender_arc();
         // Keep the acknowledging owner first for compatibility. The second
@@ -4649,20 +4704,21 @@ impl Router {
         &self,
         pkt: &Packet,
         reliable: Option<wire_format::ReliableHeader>,
-    ) -> TelemetryResult<Arc<[u8]>> {
+    ) -> TelemetryResult<crate::SharedBytes> {
         #[cfg(feature = "cryptography")]
         if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
-            return wire_format::pack_packet_with_wire_contract_e2e(
+            return (wire_format::pack_packet_with_wire_contract_e2e(
                 pkt,
                 reliable,
                 pkt.wire_shape(),
                 pkt.wire_target_senders(),
                 e2e,
-            );
+            ))
+            .map(Into::into);
         }
         Ok(match reliable {
-            Some(hdr) => wire_format::pack_packet_with_reliable(pkt, hdr),
-            None => wire_format::pack_packet(pkt),
+            Some(hdr) => (wire_format::pack_packet_with_reliable(pkt, hdr)).into(),
+            None => (wire_format::pack_packet(pkt)).into(),
         })
     }
 
@@ -4673,27 +4729,29 @@ impl Router {
         reliable: Option<wire_format::ReliableHeader>,
         shape: Option<MessageElement>,
         target_senders: &[u64],
-    ) -> TelemetryResult<Arc<[u8]>> {
+    ) -> TelemetryResult<crate::SharedBytes> {
         #[cfg(feature = "cryptography")]
         if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
-            return wire_format::pack_packet_with_wire_contract_e2e(
+            return (wire_format::pack_packet_with_wire_contract_e2e(
                 pkt,
                 reliable,
                 shape,
                 target_senders,
                 e2e,
-            );
+            ))
+            .map(Into::into);
         }
         wire_format::pack_packet_with_wire_contract(pkt, reliable, shape, target_senders)
+            .map(Into::into)
     }
 
     #[cfg(feature = "cryptography")]
     #[inline]
     fn prepare_packed_for_remote(
         &self,
-        bytes: Arc<[u8]>,
+        bytes: crate::SharedBytes,
         reliable_override: Option<Option<wire_format::ReliableHeader>>,
-    ) -> TelemetryResult<Arc<[u8]>> {
+    ) -> TelemetryResult<crate::SharedBytes> {
         let frame = wire_format::peek_frame_info(bytes.as_ref())?;
         if frame.ack_only() || self.e2e_seal_config_for_type(frame.envelope.ty).is_none() {
             return Ok(bytes);
@@ -6702,7 +6760,7 @@ impl Router {
     fn send_reliable_raw_to_side(
         &self,
         side: RouterSideId,
-        bytes: Arc<[u8]>,
+        bytes: crate::SharedBytes,
         relayed: bool,
     ) -> TelemetryResult<()> {
         let handler = {
@@ -6769,6 +6827,7 @@ impl Router {
         }
     }
 
+    #[allow(unused_mut)]
     fn send_reliable_to_side(
         &self,
         side: RouterSideId,
@@ -6849,7 +6908,7 @@ impl Router {
             (seq, flags)
         };
 
-        let bytes: Arc<[u8]> = match data {
+        let mut bytes: crate::SharedBytes = match data {
             RouterItem::Packet(pkt) => self.pack_packet_for_router(
                 &pkt,
                 Some(wire_format::ReliableHeader { flags, seq, ack: 0 }),
@@ -6900,7 +6959,7 @@ impl Router {
                         self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
                         return Ok(());
                     };
-                    rewritten
+                    (rewritten).into()
                 }
                 #[cfg(not(feature = "cryptography"))]
                 {
@@ -6942,7 +7001,7 @@ impl Router {
                         self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
                         return Ok(());
                     };
-                    rewritten
+                    rewritten.into()
                 }
             }
         };
@@ -6971,6 +7030,11 @@ impl Router {
         self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
         self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
 
+        #[cfg(feature = "compact-packet-store")]
+        {
+            let _ = bytes.park_for_queue();
+        }
+
         {
             let mut st = self.state.lock();
             let tx_state = self.reliable_tx_state_mut(&mut st, side, ty);
@@ -6993,7 +7057,7 @@ impl Router {
     fn split_side_transport_frame(
         &self,
         _side: RouterSideId,
-        frame: Arc<[u8]>,
+        frame: crate::SharedBytes,
         max_frame_bytes: usize,
     ) -> TelemetryResult<SideTransportFrames> {
         SideTransportFrames::split(frame, max_frame_bytes, self.sender_arc().as_bytes())
@@ -7003,7 +7067,7 @@ impl Router {
         &self,
         side: RouterSideId,
         opts: RouterSideOptions,
-        raw: Arc<[u8]>,
+        raw: crate::SharedBytes,
     ) -> TelemetryResult<SideTransportFrames> {
         if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
             return Ok(SideTransportFrames::single(raw));
@@ -7234,12 +7298,12 @@ impl Router {
         &self,
         side: RouterSideId,
         bytes: &[u8],
-    ) -> TelemetryResult<Option<Arc<[u8]>>> {
+    ) -> TelemetryResult<Option<crate::SharedBytes>> {
         // Reclaim abandoned transfers before admission, even when new work is refused.
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             crate::memory_admission::check_receive(bytes)?;
-            return Ok(Some(Arc::from(bytes)));
+            return Ok(Some((Arc::<[u8]>::from(bytes)).into()));
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
@@ -7287,7 +7351,7 @@ impl Router {
                             .note_side_transport_template_eviction();
                     }
                 }
-                Ok(Some(raw))
+                Ok(Some((raw).into()))
             }
             SIDE_TRANSPORT_KIND_COMPACT
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
@@ -7409,7 +7473,7 @@ impl Router {
                         side_state.rx_chunks.remove(&transfer_id);
                         return Err(TelemetryError::Unpack("side chunk total mismatch"));
                     }
-                    entry.received.entry(index).or_insert(payload);
+                    entry.received.entry(index).or_insert((payload).into());
                     if entry.received.len() == usize::from(total) {
                         let entry = side_state
                             .rx_chunks
@@ -7632,7 +7696,7 @@ impl Router {
                         else {
                             return Ok(Some(RouterItem::Packed(bytes)));
                         };
-                        return Ok(Some(RouterItem::Packed(rewritten)));
+                        return Ok(Some(RouterItem::Packed((rewritten).into())));
                     }
                 }
                 Ok(Some(RouterItem::Packed(bytes)))
@@ -8698,7 +8762,7 @@ impl Router {
             &[DataEndpoint::Discovery],
             local.hostname.as_ref(),
             self.packet_timestamp_ms(),
-            payload,
+            (payload).into(),
         )?;
         let target = Self::sender_hash(dst.hostname.as_ref());
         let item = self.attach_wire_contract_to_item(RouterItem::Packet(pkt.clone()), &[target])?;
@@ -10167,7 +10231,7 @@ impl Router {
             &recipients,
             sender.as_ref(),
             self.packet_timestamp_ms(),
-            payload,
+            (payload).into(),
         )?;
 
         self.emit_internal_tx(
@@ -10449,7 +10513,7 @@ impl Router {
     #[inline]
     pub fn rx_packed_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed(Arc::from(bytes));
+        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -10467,7 +10531,7 @@ impl Router {
     #[inline]
     pub fn rx_packed_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed(Arc::from(bytes));
+        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: None,
@@ -10574,7 +10638,7 @@ impl Router {
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed(Arc::from(bytes));
+        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: Some(side),
@@ -10650,7 +10714,7 @@ impl Router {
 
         let item_for_ctx: &RouterItem = match (data, pkt_for_ctx) {
             (Some(d), _) => {
-                owned_tmp = Some(RouterItem::Packed(Arc::from(d)));
+                owned_tmp = Some(RouterItem::Packed((Arc::<[u8]>::from(d)).into()));
                 owned_tmp.as_ref().unwrap()
             }
             (None, Some(pkt)) => {
@@ -10749,7 +10813,7 @@ impl Router {
             &recipients,
             &env.sender.clone(),
             env.timestamp_ms,
-            payload,
+            (payload).into(),
         )?;
         self.emit_internal_tx(
             RouterTxItem::Broadcast(RouterItem::Packet(error_pkt)),
@@ -10889,7 +10953,7 @@ impl Router {
                 }
             }
         }
-        let mut released_buffered: Vec<Arc<[u8]>> = Vec::new();
+        let mut released_buffered: Vec<crate::SharedBytes> = Vec::new();
         if let (Some(src), RouterItem::Packed(bytes)) = (item.src, &item.data) {
             let (_opts, handler_is_packed, hop_reliable_enabled) = {
                 let st = self.state.lock();
@@ -10966,7 +11030,7 @@ impl Router {
                                 called_from_queue,
                             )?;
                         } else {
-                            let mut release: Vec<Arc<[u8]>> = Vec::new();
+                            let mut release: Vec<crate::SharedBytes> = Vec::new();
                             let mut last_delivered = None;
                             let mut ack_old = None;
                             let mut request_missing = None;
@@ -11929,7 +11993,7 @@ impl Router {
             return self.rx_packed_queue(bytes);
         }
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed(Arc::from(bytes));
+        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
         let item = RouterRxItem {
             src: None,
             priority: Self::router_item_priority(&data)?,
@@ -12022,9 +12086,9 @@ impl Router {
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
-            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(pkt)));
+            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed((pkt).into())));
         }
-        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packed(pkt)))
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packed((pkt).into())))
     }
 
     // ---------- PUBLIC API: TX queue ----------
@@ -12042,7 +12106,7 @@ impl Router {
     pub fn tx_packed_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
-        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(data)))
+        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed((data).into())))
     }
 
     // ---------- PUBLIC API: logging ----------

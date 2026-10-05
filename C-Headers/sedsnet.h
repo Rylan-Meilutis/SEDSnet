@@ -23,6 +23,18 @@ extern "C" {
  * to reject work with SEDS_IO before allocating. Must not call SEDSnet; NULL
  * disables it. Includes scratch headroom beyond queue byte limits. */
 typedef bool (*SedsMemoryAdmissionProbe)(size_t additional_bytes, size_t largest_allocation);
+#ifdef SEDS_ENABLE_COMPACT_PACKET_STORE
+/* Configure once before worker startup; 0 capacity disables future parking.
+ * Returns SEDS_OK / SEDS_IO. Existing handles remain valid after replacement. */
+int32_t seds_packet_store_configure(size_t capacity, size_t handles, size_t movable_limit);
+void seds_packet_store_compact(void);
+typedef struct SedsPacketStoreStats {
+    size_t capacity, live_bytes, largest_gap, live_handles, pinned_bytes;
+    size_t moves, rejected, reserved_bytes;
+} SedsPacketStoreStats;
+int32_t seds_packet_store_stats(SedsPacketStoreStats *out);
+#endif
+
 void seds_set_memory_admission_probe(SedsMemoryAdmissionProbe probe);
 size_t seds_memory_admission_rejected(void);
 
