@@ -306,30 +306,6 @@ impl<const INLINE: usize> ByteCost for SmallPayload<INLINE> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SmallPayload;
-    use alloc::sync::Arc;
-
-    #[test]
-    fn from_arc_reuses_large_payload_allocation() {
-        let original: Arc<[u8]> = Arc::from([0x5a; 65]);
-        let retained = original.clone();
-        let payload = SmallPayload::<64>::from_arc(original);
-        let SmallPayload::Heap(stored) = payload else {
-            panic!("large payload must use heap storage");
-        };
-        assert!(Arc::ptr_eq(&stored, &retained));
-    }
-
-    #[test]
-    fn from_arc_keeps_small_payload_inline() {
-        let payload = SmallPayload::<64>::from_arc(Arc::from([1, 2, 3]));
-        assert!(payload.is_inline());
-        assert_eq!(payload.as_slice(), [1, 2, 3]);
-    }
-}
-
 impl<const INLINE: usize> AsRef<[u8]> for SmallPayload<INLINE> {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
@@ -379,5 +355,29 @@ mod inline_view_safety {
         let payload = SmallPayload::<512>::new(&[9; 256]);
         assert_eq!(payload.as_slice(), &[9; 256]);
         assert!(!payload.is_inline());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SmallPayload;
+    use alloc::sync::Arc;
+
+    #[test]
+    fn from_arc_reuses_large_payload_allocation() {
+        let original: Arc<[u8]> = Arc::from([0x5a; 65]);
+        let retained = original.clone();
+        let payload = SmallPayload::<64>::from_arc(original);
+        let SmallPayload::Heap(stored) = payload else {
+            panic!("large payload must use heap storage");
+        };
+        assert!(Arc::ptr_eq(&stored, &retained));
+    }
+
+    #[test]
+    fn from_arc_keeps_small_payload_inline() {
+        let payload = SmallPayload::<64>::from_arc(Arc::from([1, 2, 3]));
+        assert!(payload.is_inline());
+        assert_eq!(payload.as_slice(), [1, 2, 3]);
     }
 }

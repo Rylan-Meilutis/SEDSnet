@@ -211,7 +211,7 @@ pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> crat
         slot.write(*value);
     }
     // SAFETY: header, all body segments and CRC fill the entire allocation.
-    unsafe { (frame.assume_init()).into() }
+    unsafe { crate::shared_bytes::convert(frame.assume_init()) }
 }
 
 pub(crate) fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
@@ -321,8 +321,8 @@ pub(crate) fn extract_side_header_template(
     let template = SideHeaderTemplate {
         hash,
         base_flags,
-        prefix: prefix.into(),
-        between: between.into(),
+        prefix: crate::shared_bytes::convert(prefix),
+        between: crate::shared_bytes::convert(between),
         reliable_flags,
         reliable_compact,
     };
@@ -413,7 +413,10 @@ pub(crate) fn reconstruct_side_compact_frame(
     raw.extend_from_slice(payload);
     let crc = crc32_bytes(&raw);
     raw.extend_from_slice(&crc.to_le_bytes());
-    Ok(((Arc::<[u8]>::from(raw)).into(), timestamp))
+    Ok((
+        crate::shared_bytes::convert(Arc::<[u8]>::from(raw)),
+        timestamp,
+    ))
 }
 
 /// Send a large plaintext packet as canonical chunks without assembling an
@@ -482,9 +485,13 @@ mod streamed_chunk_tests {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         for max_bytes in [32, 128, 1024, 4096] {
-            let expected = SideTransportFrames::split((raw.clone()).into(), max_bytes, b"GB")
-                .unwrap()
-                .collect::<Vec<_>>();
+            let expected = SideTransportFrames::split(
+                crate::shared_bytes::convert(raw.clone()),
+                max_bytes,
+                b"GB",
+            )
+            .unwrap()
+            .collect::<Vec<_>>();
             let mut actual = Vec::new();
             send_packet_chunks(&packet, max_bytes, b"GB", |chunk| {
                 actual.push(Arc::<[u8]>::from(chunk));

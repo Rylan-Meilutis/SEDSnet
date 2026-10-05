@@ -251,7 +251,7 @@ fn queue_service_expires_incomplete_transfers_without_new_fragments() {
             SideChunkAssembly {
                 last_seen_ms: 0,
                 total: 2,
-                received: [(0, retained.into())].into_iter().collect(),
+                received: [(0, crate::shared_bytes::convert(retained))].into_iter().collect(),
             },
         );
     now.store(2000, Ordering::Relaxed);

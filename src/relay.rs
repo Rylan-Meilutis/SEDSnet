@@ -34,7 +34,7 @@ mod compact_summary_tests {
             .unwrap();
             let raw = wire_format::pack_packet(&pkt);
             let frames = tx
-                .encode_side_transport_frames(a, opts, (raw.clone()).into())
+                .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
                 .unwrap();
             assert_eq!(frames.len(), 1);
             encoded.push((raw, frames.into_iter().next().unwrap()));
@@ -2297,11 +2297,12 @@ impl Relay {
         };
 
         let mut bytes: crate::SharedBytes = match data {
-            RelayItem::Packet(pkt) => (wire_format::pack_packet_with_reliable(
-                &pkt,
-                wire_format::ReliableHeader { flags, seq, ack: 0 },
-            ))
-            .into(),
+            RelayItem::Packet(pkt) => {
+                crate::shared_bytes::convert(wire_format::pack_packet_with_reliable(
+                    &pkt,
+                    wire_format::ReliableHeader { flags, seq, ack: 0 },
+                ))
+            }
             RelayItem::Packed(bytes) => {
                 let Some(rewritten) =
                     wire_format::rewrite_reliable_header_owned(bytes.as_ref(), flags, seq, 0)?
@@ -2320,7 +2321,7 @@ impl Relay {
                     self.note_side_tx_success(side, ty, sent_bytes, 1);
                     return Ok(());
                 };
-                (rewritten).into()
+                crate::shared_bytes::convert(rewritten)
             }
         };
 
@@ -5389,7 +5390,9 @@ impl Relay {
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             crate::memory_admission::check_receive(bytes)?;
-            return Ok(Some((Arc::<[u8]>::from(bytes)).into()));
+            return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(
+                bytes,
+            ))));
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
@@ -5423,7 +5426,7 @@ impl Relay {
                             .note_side_transport_template_eviction();
                     }
                 }
-                Ok(Some((raw).into()))
+                Ok(Some(crate::shared_bytes::convert(raw)))
             }
             SIDE_TRANSPORT_KIND_COMPACT
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
@@ -5541,7 +5544,10 @@ impl Relay {
                         side_state.rx_chunks.remove(&transfer_id);
                         return Err(TelemetryError::Unpack("side chunk total mismatch"));
                     }
-                    entry.received.entry(index).or_insert((payload).into());
+                    entry
+                        .received
+                        .entry(index)
+                        .or_insert(crate::shared_bytes::convert(payload));
                     if entry.received.len() == usize::from(total) {
                         let entry = side_state
                             .rx_chunks
@@ -5631,7 +5637,11 @@ impl Relay {
                     return Ok(());
                 }
                 let owned = wire_format::pack_packet(pkt);
-                let frames = self.encode_side_transport_frames(side, opts, (owned).into())?;
+                let frames = self.encode_side_transport_frames(
+                    side,
+                    opts,
+                    crate::shared_bytes::convert(owned),
+                )?;
                 let mut sent_bytes = 0usize;
                 for frame in frames {
                     f(frame.as_ref())?;
@@ -5694,7 +5704,9 @@ impl Relay {
                         else {
                             return Ok(Some(RelayItem::Packed(bytes)));
                         };
-                        return Ok(Some(RelayItem::Packed((rewritten).into())));
+                        return Ok(Some(RelayItem::Packed(crate::shared_bytes::convert(
+                            rewritten,
+                        ))));
                     }
                 }
                 Ok(Some(RelayItem::Packed(bytes)))

@@ -249,9 +249,10 @@ mod chunk_assembly_memory_tests {
         let payload: Vec<u8> = (0..3652).map(|i| (i % 251) as u8).collect();
         let mut assembly = SideChunkAssembly::default();
         for (index, chunk) in payload.chunks(56).enumerate().rev() {
-            assembly
-                .received
-                .insert(index as u16, (Arc::<[u8]>::from(chunk)).into());
+            assembly.received.insert(
+                index as u16,
+                crate::shared_bytes::convert(Arc::<[u8]>::from(chunk)),
+            );
         }
         assembly.total = assembly.received.len() as u16;
         let out = assembly.assemble().unwrap();
@@ -270,11 +271,11 @@ mod chunk_assembly_memory_tests {
         };
         assembly
             .received
-            .insert(0, (Arc::<[u8]>::from([1u8])).into());
+            .insert(0, crate::shared_bytes::convert(Arc::<[u8]>::from([1u8])));
         assert!(assembly.clone().assemble().is_err());
         assembly
             .received
-            .insert(2, (Arc::<[u8]>::from([2u8])).into());
+            .insert(2, crate::shared_bytes::convert(Arc::<[u8]>::from([2u8])));
         assert!(assembly.assemble().is_err());
     }
 }
@@ -1804,9 +1805,11 @@ fn make_error_payload(msg: &str) -> crate::SharedBytes {
             if n > 0 {
                 buf[..n].copy_from_slice(&bytes[..n]);
             }
-            (Arc::<[u8]>::from(buf)).into()
+            crate::shared_bytes::convert(Arc::<[u8]>::from(buf))
         }
-        MessageElement::Dynamic(_, _) => (Arc::<[u8]>::from(msg.as_bytes())).into(),
+        MessageElement::Dynamic(_, _) => {
+            crate::shared_bytes::convert(Arc::<[u8]>::from(msg.as_bytes()))
+        }
     }
 }
 
@@ -3423,7 +3426,7 @@ impl Router {
     fn encode_end_to_end_reliable_ack(packet_id: u64) -> crate::SharedBytes {
         let mut payload = Vec::with_capacity(8);
         payload.extend_from_slice(&packet_id.to_le_bytes());
-        (Arc::<[u8]>::from(payload)).into()
+        crate::shared_bytes::convert(Arc::<[u8]>::from(payload))
     }
 
     fn encode_p2p_payload(
@@ -4421,7 +4424,7 @@ impl Router {
             message_meta(DataType::ReliableAck).endpoints_ref(),
             ack_sender.as_str(),
             self.packet_timestamp_ms(),
-            (Self::encode_end_to_end_reliable_ack(packet_id)).into(),
+            crate::shared_bytes::convert(Self::encode_end_to_end_reliable_ack(packet_id)),
         )?;
         let local_sender = self.sender_arc();
         // Keep the acknowledging owner first for compatibility. The second
@@ -4714,11 +4717,13 @@ impl Router {
                 pkt.wire_target_senders(),
                 e2e,
             ))
-            .map(Into::into);
+            .map(crate::shared_bytes::convert);
         }
         Ok(match reliable {
-            Some(hdr) => (wire_format::pack_packet_with_reliable(pkt, hdr)).into(),
-            None => (wire_format::pack_packet(pkt)).into(),
+            Some(hdr) => {
+                crate::shared_bytes::convert(wire_format::pack_packet_with_reliable(pkt, hdr))
+            }
+            None => crate::shared_bytes::convert(wire_format::pack_packet(pkt)),
         })
     }
 
@@ -4739,10 +4744,10 @@ impl Router {
                 target_senders,
                 e2e,
             ))
-            .map(Into::into);
+            .map(crate::shared_bytes::convert);
         }
         wire_format::pack_packet_with_wire_contract(pkt, reliable, shape, target_senders)
-            .map(Into::into)
+            .map(crate::shared_bytes::convert)
     }
 
     #[cfg(feature = "cryptography")]
@@ -6959,7 +6964,7 @@ impl Router {
                         self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
                         return Ok(());
                     };
-                    (rewritten).into()
+                    crate::shared_bytes::convert(rewritten)
                 }
                 #[cfg(not(feature = "cryptography"))]
                 {
@@ -7303,7 +7308,9 @@ impl Router {
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             crate::memory_admission::check_receive(bytes)?;
-            return Ok(Some((Arc::<[u8]>::from(bytes)).into()));
+            return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(
+                bytes,
+            ))));
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
@@ -7351,7 +7358,7 @@ impl Router {
                             .note_side_transport_template_eviction();
                     }
                 }
-                Ok(Some((raw).into()))
+                Ok(Some(crate::shared_bytes::convert(raw)))
             }
             SIDE_TRANSPORT_KIND_COMPACT
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
@@ -7473,7 +7480,10 @@ impl Router {
                         side_state.rx_chunks.remove(&transfer_id);
                         return Err(TelemetryError::Unpack("side chunk total mismatch"));
                     }
-                    entry.received.entry(index).or_insert((payload).into());
+                    entry
+                        .received
+                        .entry(index)
+                        .or_insert(crate::shared_bytes::convert(payload));
                     if entry.received.len() == usize::from(total) {
                         let entry = side_state
                             .rx_chunks
@@ -7696,7 +7706,9 @@ impl Router {
                         else {
                             return Ok(Some(RouterItem::Packed(bytes)));
                         };
-                        return Ok(Some(RouterItem::Packed((rewritten).into())));
+                        return Ok(Some(RouterItem::Packed(crate::shared_bytes::convert(
+                            rewritten,
+                        ))));
                     }
                 }
                 Ok(Some(RouterItem::Packed(bytes)))
@@ -8762,7 +8774,7 @@ impl Router {
             &[DataEndpoint::Discovery],
             local.hostname.as_ref(),
             self.packet_timestamp_ms(),
-            (payload).into(),
+            crate::shared_bytes::convert(payload),
         )?;
         let target = Self::sender_hash(dst.hostname.as_ref());
         let item = self.attach_wire_contract_to_item(RouterItem::Packet(pkt.clone()), &[target])?;
@@ -10231,7 +10243,7 @@ impl Router {
             &recipients,
             sender.as_ref(),
             self.packet_timestamp_ms(),
-            (payload).into(),
+            crate::shared_bytes::convert(payload),
         )?;
 
         self.emit_internal_tx(
@@ -10513,7 +10525,7 @@ impl Router {
     #[inline]
     pub fn rx_packed_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
+        let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
@@ -10531,7 +10543,7 @@ impl Router {
     #[inline]
     pub fn rx_packed_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
+        let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: None,
@@ -10638,7 +10650,7 @@ impl Router {
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
+        let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
         self.isr_rx_queue.push_back_prioritized(RouterRxItem {
             src: Some(side),
@@ -10714,7 +10726,9 @@ impl Router {
 
         let item_for_ctx: &RouterItem = match (data, pkt_for_ctx) {
             (Some(d), _) => {
-                owned_tmp = Some(RouterItem::Packed((Arc::<[u8]>::from(d)).into()));
+                owned_tmp = Some(RouterItem::Packed(crate::shared_bytes::convert(
+                    Arc::<[u8]>::from(d),
+                )));
                 owned_tmp.as_ref().unwrap()
             }
             (None, Some(pkt)) => {
@@ -10813,7 +10827,7 @@ impl Router {
             &recipients,
             &env.sender.clone(),
             env.timestamp_ms,
-            (payload).into(),
+            crate::shared_bytes::convert(payload),
         )?;
         self.emit_internal_tx(
             RouterTxItem::Broadcast(RouterItem::Packet(error_pkt)),
@@ -11993,7 +12007,7 @@ impl Router {
             return self.rx_packed_queue(bytes);
         }
         crate::memory_admission::check_receive(bytes)?;
-        let data = RouterItem::Packed((Arc::<[u8]>::from(bytes)).into());
+        let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let item = RouterRxItem {
             src: None,
             priority: Self::router_item_priority(&data)?,
@@ -12086,9 +12100,13 @@ impl Router {
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
-            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed((pkt).into())));
+            return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(
+                crate::shared_bytes::convert(pkt),
+            )));
         }
-        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packed((pkt).into())))
+        self.tx_item(RouterTxItem::Broadcast(RouterItem::Packed(
+            crate::shared_bytes::convert(pkt),
+        )))
     }
 
     // ---------- PUBLIC API: TX queue ----------
@@ -12106,7 +12124,9 @@ impl Router {
     pub fn tx_packed_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
-        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed((data).into())))
+        self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(
+            crate::shared_bytes::convert(data),
+        )))
     }
 
     // ---------- PUBLIC API: logging ----------

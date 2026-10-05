@@ -31,12 +31,12 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let frames = tx
-            .encode_side_transport_frames(a, opts, (raw.clone()).into())
+            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
-            Some(raw.into())
+            Some(crate::shared_bytes::convert(raw))
         );
     }
     let st = tx.state.lock();
@@ -87,16 +87,16 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let _ = tx
-            .encode_side_transport_frames(a, opts, (raw.clone()).into())
+            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
             .unwrap();
         // Lose the initial header (or restart the receiver), then send control.
         let frames = tx
-            .encode_side_transport_frames(a, opts, (raw.clone()).into())
+            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(
             rx.decode_side_transport_frame(b, &frames[0]).unwrap(),
-            Some(raw.into()),
+            Some(crate::shared_bytes::convert(raw)),
             "reliability control cannot depend on a possibly lost template"
         );
         assert!(
@@ -150,14 +150,14 @@ fn check_restarting_peer_header(schema_request: bool) {
     let packet = Packet::new(ty, &[endpoint], "AB", 50, Arc::<[u8]>::from([0u8; 12])).unwrap();
     // The peer knew this template before its process restarted.
     let initial = tx
-        .encode_side_transport_frames(side, opts, (wire_format::pack_packet(&packet)).into())
+        .encode_side_transport_frames(side, opts, crate::shared_bytes::convert(wire_format::pack_packet(&packet)))
         .unwrap()
         .collect::<Vec<_>>();
     tx.decode_side_transport_frame(side, &initial[0])
         .unwrap()
         .unwrap();
     let _ = tx
-        .encode_side_transport_frames(unrelated, opts, (wire_format::pack_packet(&packet)).into())
+        .encode_side_transport_frames(unrelated, opts, crate::shared_bytes::convert(wire_format::pack_packet(&packet)))
         .unwrap();
     let restarted = Router::new(RouterConfig::default());
     let rx_side = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts);
@@ -169,7 +169,7 @@ fn check_restarting_peer_header(schema_request: bool) {
     .unwrap();
     tx.rx_from_side(&request, side).unwrap();
     let frames = tx
-        .encode_side_transport_frames(side, opts, (wire_format::pack_packet(&packet)).into())
+        .encode_side_transport_frames(side, opts, crate::shared_bytes::convert(wire_format::pack_packet(&packet)))
         .unwrap()
         .collect::<Vec<_>>();
     assert!(
@@ -185,7 +185,7 @@ fn check_restarting_peer_header(schema_request: bool) {
         "incoming dictionaries must survive a transmit refresh"
     );
     let unrelated_frames = tx
-        .encode_side_transport_frames(unrelated, opts, (wire_format::pack_packet(&packet)).into())
+        .encode_side_transport_frames(unrelated, opts, crate::shared_bytes::convert(wire_format::pack_packet(&packet)))
         .unwrap()
         .collect::<Vec<_>>();
     let empty = Router::new(RouterConfig::default());
@@ -257,7 +257,7 @@ fn discovery_refresh_survives_a_missed_transport_template() {
     for timestamp in [1000, 6000] {
         let packet = discovery::build_discovery_announce("GB", timestamp, &[]).unwrap();
         let frames = tx
-            .encode_side_transport_frames(tx_side, opts, (wire_format::pack_packet(&packet)).into())
+            .encode_side_transport_frames(tx_side, opts, crate::shared_bytes::convert(wire_format::pack_packet(&packet)))
             .unwrap()
             .collect::<Vec<_>>();
         if timestamp == 1000 {
@@ -290,7 +290,7 @@ fn compact_loss_must_not_change_packet_identity() {
         .unwrap();
         let raw = wire_format::pack_packet(&pkt);
         let frames = tx
-            .encode_side_transport_frames(a, opts, (raw.clone()).into())
+            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(frames.len(), 1);
