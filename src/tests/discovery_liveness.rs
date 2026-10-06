@@ -425,17 +425,21 @@ fn known_discovery_survives_snapshot_memory_pressure() {
     let packets = sent.lock().unwrap();
     let pings = packets
         .iter()
-        .filter(|pkt| pkt.data_type() == crate::DataType::DiscoveryAnnounce)
+        .filter(|pkt| {
+            matches!(
+                pkt.data_type(),
+                crate::DataType::DiscoveryAnnounce | crate::DataType::DiscoveryAddress
+            )
+        })
         .count();
     assert!(
         (20..=60).contains(&pings),
         "keepalives must be bounded but outlive the 30-second route TTL: {pings}"
     );
-    assert!(
-        packets
-            .iter()
-            .all(|pkt| pkt.data_type() == crate::DataType::DiscoveryAnnounce)
-    );
+    assert!(packets.iter().all(|pkt| matches!(
+        pkt.data_type(),
+        crate::DataType::DiscoveryAnnounce | crate::DataType::DiscoveryAddress
+    )));
     drop(packets);
     let before = node.state.lock().discovery_routes[&side].clone();
     let unknown = discovery::build_discovery_announce("UNKNOWN", 300_001, &[]).unwrap();
@@ -466,5 +470,85 @@ fn known_discovery_survives_snapshot_memory_pressure() {
     assert!(
         !st.discovery_routes.contains_key(&side),
         "a silent peer must still expire"
+    );
+}
+
+#[test]
+fn compact_address_bootstrap_survives_full_snapshot_refusal() {
+    crate::tests::ensure_common_test_schema();
+    extern "C" fn summaries_only(additional: usize, _: usize) -> bool {
+        additional < 8192
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let node = Router::new_with_clock(RouterConfig::new([]).with_sender("GB"), Box::new(|| 1));
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let output = sent.clone();
+    let side = node.add_side_packet("CAN", |_| Ok(()));
+    let upstream = node.add_side_packet("UART", move |packet| {
+        output.lock().unwrap().push(packet.clone());
+        Ok(())
+    });
+    {
+        let mut st = node.state.lock();
+        st.discovery_side_throttle
+            .entry(upstream)
+            .or_default()
+            .has_sent_full = true;
+    }
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(summaries_only));
+    for (i, name) in ["AB", "VB", "DAQ"].into_iter().enumerate() {
+        let ad = discovery::AddressAdvertisement {
+            hostname: name.into(),
+            address: 42 + i as u32,
+            requested_address: 42 + i as u32,
+            mode: discovery::ADDRESS_MODE_REQUESTED,
+            state: discovery::ADDRESS_STATE_REQUEST,
+            birth_ms: 1,
+            owner_hash: 42 + i as u64,
+            reachable_endpoints: vec![crate::DataEndpoint::named("RADIO")],
+            reachable_network_variables: vec![],
+            reachable_timesync_sources: vec![],
+            link_capabilities: RouterSideOptions::default().link_capabilities(),
+        };
+        let packet = discovery::build_discovery_address(name, 1, &ad).unwrap();
+        node.learn_discovery_packet(&packet, Some(side), true)
+            .unwrap();
+        let st = node.state.lock();
+        assert!(st.discovery_routes[&side].announcers.contains_key(name));
+    }
+    assert_eq!(
+        node.state.lock().discovery_routes[&side].announcers.len(),
+        3
+    );
+    node.queue_discovery_announce(false, true).unwrap();
+    node.process_tx_queue().unwrap();
+    let packets = sent.lock().unwrap();
+    let summary = packets
+        .iter()
+        .find(|packet| packet.data_type() == crate::DataType::DiscoveryAddress)
+        .expect("compact reachability must reach GroundStation without a full snapshot");
+    assert!(
+        discovery::decode_discovery_address(summary)
+            .unwrap()
+            .reachable_endpoints
+            .contains(&crate::DataEndpoint::named("RADIO"))
+    );
+    assert!(
+        packets
+            .iter()
+            .all(|packet| packet.data_type() != crate::DataType::DiscoveryTopology)
+    );
+    drop(packets);
+    let unknown = discovery::build_discovery_announce("UNKNOWN", 1, &[]).unwrap();
+    assert!(
+        node.learn_discovery_packet(&unknown, Some(side), true)
+            .is_err(),
+        "full discovery admission remains guarded"
     );
 }

@@ -5816,7 +5816,72 @@ impl Router {
             if !due {
                 continue;
             }
-            let pkt = discovery::build_discovery_announce(sender.as_ref(), now, &[])?;
+            // Propagate newly learned reachability even when the full topology
+            // cannot fit. Build only a split-horizon summary, never a graph.
+            let summary = {
+                let st = self.state.lock();
+                let extra = st
+                    .discovery_routes
+                    .iter()
+                    .filter(|(id, _)| **id != side)
+                    .fold(0usize, |total, (_, route)| {
+                        total
+                            .saturating_add(route.reachable.len().saturating_mul(32))
+                            .saturating_add(
+                                route.reachable_network_variables.len().saturating_mul(32),
+                            )
+                            .saturating_add(
+                                route
+                                    .reachable_timesync_sources
+                                    .iter()
+                                    .map(|source| source.len().saturating_add(32).saturating_mul(4))
+                                    .sum::<usize>(),
+                            )
+                    });
+                if crate::memory_admission::check(4096usize.saturating_add(extra), 2048).is_ok() {
+                    let opts = st.sides[side].as_ref().expect("checked above").opts;
+                    let mut endpoints = self.local_discovery_endpoints(&st);
+                    let mut variables =
+                        self.advertised_network_variables_for_link_locked(&st, now, Some(side));
+                    let mut sources = self.local_discovery_timesync_sources(now);
+                    for (&route_side, route) in &st.discovery_routes {
+                        if route_side == side {
+                            continue;
+                        }
+                        for peer in route.announcers.values() {
+                            if now.saturating_sub(peer.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS {
+                                endpoints.extend(peer.reachable.iter().copied());
+                                sources.extend(peer.reachable_timesync_sources.iter().cloned());
+                            }
+                        }
+                    }
+                    endpoints.retain(|ep| {
+                        !discovery::is_discovery_endpoint(*ep)
+                            && (opts.link_local_enabled || !ep.is_link_local_only())
+                    });
+                    endpoints.sort_unstable();
+                    endpoints.dedup();
+                    variables.sort_unstable();
+                    variables.dedup();
+                    sources.sort_unstable();
+                    sources.dedup();
+                    Some((endpoints, variables, sources, opts.link_capabilities()))
+                } else {
+                    None
+                }
+            };
+            let pkt = if let Some((endpoints, variables, sources, capabilities)) = summary {
+                let address = self.local_address_advertisement(
+                    endpoints,
+                    variables,
+                    sources,
+                    capabilities,
+                    discovery::ADDRESS_STATE_REQUEST,
+                );
+                discovery::build_discovery_address(sender.as_ref(), now, &address)?
+            } else {
+                discovery::build_discovery_announce(sender.as_ref(), now, &[])?
+            };
             self.emit_internal_tx(
                 RouterTxItem::ToSide {
                     src: None,
@@ -6298,8 +6363,30 @@ impl Router {
         if self.refresh_known_discovery_liveness(pkt, side)? {
             return Ok(true);
         }
+        // A compact address summary does not clone the complete topology or
+        // schema. Account for its ingress-side aggregates instead; charging
+        // every new peer for a full snapshot can prevent restart recovery.
+        let retained_summary = if pkt.data_type() == DataType::DiscoveryAddress {
+            self.state
+                .lock()
+                .discovery_routes
+                .get(&side)
+                .map_or(0, |route| {
+                    RouterInner::discovery_route_byte_cost(side, route)
+                })
+        } else {
+            0
+        };
+        let scratch = if pkt.data_type() == DataType::DiscoveryAddress {
+            4096usize.saturating_add(retained_summary)
+        } else {
+            8192
+        };
         crate::memory_admission::check(
-            pkt.payload().len().saturating_mul(4).saturating_add(8192),
+            pkt.payload()
+                .len()
+                .saturating_mul(4)
+                .saturating_add(scratch),
             pkt.payload().len().saturating_mul(2).max(2048),
         )?;
         if pkt.data_type() == DataType::DiscoveryAddress {

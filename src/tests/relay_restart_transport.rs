@@ -700,3 +700,51 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         "a silent peer must still expire"
     );
 }
+
+#[test]
+fn compact_address_bootstrap_survives_full_snapshot_refusal() {
+    crate::tests::ensure_common_test_schema();
+    extern "C" fn summaries_only(additional: usize, _: usize) -> bool {
+        additional < 8192
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let node = Relay::new_with_config(RelayConfig::default().with_sender("GB"), Box::new(|| 1));
+    let side = node.add_side_packet("CAN", |_| Ok(()));
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(summaries_only));
+    for (i, name) in ["AB", "VB", "DAQ"].into_iter().enumerate() {
+        let ad = discovery::AddressAdvertisement {
+            hostname: name.into(),
+            address: 42 + i as u32,
+            requested_address: 42 + i as u32,
+            mode: discovery::ADDRESS_MODE_REQUESTED,
+            state: discovery::ADDRESS_STATE_REQUEST,
+            birth_ms: 1,
+            owner_hash: 42 + i as u64,
+            reachable_endpoints: vec![crate::DataEndpoint::named("RADIO")],
+            reachable_network_variables: vec![],
+            reachable_timesync_sources: vec![],
+            link_capabilities: RelaySideOptions::default().link_capabilities(),
+        };
+        let packet = discovery::build_discovery_address(name, 1, &ad).unwrap();
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+            .unwrap();
+        let st = node.state.lock();
+        assert!(st.discovery_routes[&side].announcers.contains_key(name));
+    }
+    assert_eq!(
+        node.state.lock().discovery_routes[&side].announcers.len(),
+        3
+    );
+    let unknown = discovery::build_discovery_announce("UNKNOWN", 1, &[]).unwrap();
+    assert!(
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(unknown)))
+            .is_err(),
+        "full discovery admission remains guarded"
+    );
+}

@@ -3716,8 +3716,28 @@ impl Relay {
         if self.refresh_known_discovery_liveness(&pkt, src)? {
             return Ok(());
         }
+        // A compact address summary does not clone the complete topology or
+        // schema. Account for its ingress-side aggregates instead; charging
+        // every new peer for a full snapshot can prevent restart recovery.
+        let retained_summary = if pkt.data_type() == crate::DataType::DiscoveryAddress {
+            self.state
+                .lock()
+                .discovery_routes
+                .get(&src)
+                .map_or(0, RelayInner::discovery_route_byte_cost)
+        } else {
+            0
+        };
+        let scratch = if pkt.data_type() == crate::DataType::DiscoveryAddress {
+            4096usize.saturating_add(retained_summary)
+        } else {
+            8192
+        };
         crate::memory_admission::check(
-            pkt.payload().len().saturating_mul(4).saturating_add(8192),
+            pkt.payload()
+                .len()
+                .saturating_mul(4)
+                .saturating_add(scratch),
             pkt.payload().len().saturating_mul(2).max(2048),
         )?;
         let now_ms = self.clock.now_ms();
