@@ -198,10 +198,24 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
             return Ok(());
         }
         if let Some(store) = crate::packet_store::default_store() {
-            self.park_in_store(&store)?;
+            self.park_for_queue_in_store(&store)?;
         }
         Ok(())
     }
+    #[cfg(feature = "compact-packet-store")]
+    fn park_for_queue_in_store(
+        &mut self,
+        store: &Arc<crate::packet_store::PacketStore>,
+    ) -> crate::TelemetryResult<()> {
+        match self.park_in_store(store) {
+            // Queue parking is an optimization. The heap Arc already owns
+            // these bytes; retaining it needs no allocation or extra copy.
+            // Normal queue budgets/admission still bound retained traffic.
+            Err(crate::TelemetryError::Io("memory pressure")) => Ok(()),
+            other => other,
+        }
+    }
+
     #[cfg(feature = "compact-packet-store")]
     pub(crate) fn park_in_store(
         &mut self,
@@ -379,5 +393,31 @@ mod tests {
         let payload = SmallPayload::<64>::from_arc(Arc::from([1, 2, 3]));
         assert!(payload.is_inline());
         assert_eq!(payload.as_slice(), [1, 2, 3]);
+    }
+}
+
+#[cfg(all(test, feature = "compact-packet-store"))]
+mod queue_parking_tests {
+    use super::*;
+    #[test]
+    fn queue_parking_keeps_owned_heap_when_arena_cannot_fit() {
+        for (capacity, handles, fill) in [(16, 2, false), (256, 1, true)] {
+            let store = crate::packet_store::PacketStore::new(capacity, handles, 512).unwrap();
+            let held = fill.then(|| store.store(&[9; 128]).unwrap());
+            let bytes: Arc<[u8]> = Arc::from([7; 80]);
+            let pointer = bytes.as_ptr();
+            let mut payload = SmallPayload::<16>::Heap(bytes);
+            payload.park_for_queue_in_store(&store).unwrap();
+            assert!(matches!(payload, SmallPayload::Heap(_)));
+            assert_eq!(
+                payload.as_slice().as_ptr(),
+                pointer,
+                "fallback must retain the existing allocation"
+            );
+            assert_eq!(payload.as_slice(), &[7; 80]);
+            if let Some(held) = held {
+                assert_eq!(&*held.pin().unwrap(), &[9; 128]);
+            }
+        }
     }
 }

@@ -2,6 +2,13 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.1.3 highlights
+
+- Recover end-to-end ACKs on a two-sided bridge after bounded return-route cache churn, including older ACKs without an original-publisher identity. Ambiguous paths remain refused and disabled routes remain disabled.
+- Recognize compact ACK identities in standalone Relay, preserve final ACKs on links without hop reliability, and use the frozen publisher identity after return-cache eviction.
+- Keep an already-owned heap payload when optional queue parking cannot fit it in the arena. No extra allocation or payload copy is made; normal queue/admission limits still apply. Explicit PacketStore insertion remains strict and bounded.
+- Add router/relay cache-churn, selective return-path, and arena-exhaustion ownership regressions. Wire format and scheduler/allocator defaults are unchanged.
+
 ## Version 4.1.2 highlights
 
 - Protect retained routes from queue pressure. Admit new peer/topology changes transactionally, leaving existing reachability unchanged if metadata cannot fit.

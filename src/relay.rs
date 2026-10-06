@@ -1,3 +1,6 @@
+#[cfg(all(test, feature = "discovery"))]
+#[path = "tests/relay_ack_recovery.rs"]
+mod ack_recovery_tests;
 use crate::side_transport::{
     SIDE_TRANSPORT_FLAG_PACKET_NONCE, SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT,
     SIDE_TRANSPORT_KIND_COMPACT_DELTA, SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP,
@@ -1894,6 +1897,16 @@ impl Relay {
             .map(Self::sender_hash)
     }
 
+    fn end_to_end_ack_sender_hash(pkt: &Packet) -> Option<u64> {
+        if pkt.data_type() != crate::DataType::ReliableAck {
+            return None;
+        }
+        pkt.wire_target_senders()
+            .first()
+            .copied()
+            .or_else(|| Self::decode_end_to_end_ack_sender_hash(pkt.sender()))
+    }
+
     #[cfg(feature = "discovery")]
     fn is_end_to_end_destination_sender(&self, sender: &str) -> bool {
         sender != self.sender_arc().as_ref() && !Self::is_end_to_end_ack_sender(sender)
@@ -1910,9 +1923,7 @@ impl Relay {
     fn reliable_control_target_packet_id(data: &RelayItem) -> TelemetryResult<Option<u64>> {
         match data {
             RelayItem::Packet(pkt) => {
-                if pkt.data_type() != crate::DataType::ReliableAck
-                    || !Self::is_end_to_end_ack_sender(pkt.sender())
-                {
+                if Self::end_to_end_ack_sender_hash(pkt).is_none() {
                     return Ok(None);
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
@@ -1927,9 +1938,7 @@ impl Relay {
                     return Ok(None);
                 }
                 let pkt = wire_format::unpack_packet(bytes.as_ref())?;
-                if pkt.data_type() != crate::DataType::ReliableAck
-                    || !Self::is_end_to_end_ack_sender(pkt.sender())
-                {
+                if Self::end_to_end_ack_sender_hash(&pkt).is_none() {
                     return Ok(None);
                 }
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
@@ -2486,7 +2495,34 @@ impl Relay {
                     }
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
-                return Ok(RemoteSidePlan::Target(Vec::new()));
+                let eligible = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), false);
+                let original = target_senders.get(1..).unwrap_or(&[]);
+                let exact: Vec<_> = eligible
+                    .iter()
+                    .copied()
+                    .filter(|side| {
+                        !original.is_empty()
+                            && Self::side_matches_target_senders_locked(
+                                &st,
+                                *side,
+                                original,
+                                self.clock.now_ms(),
+                            )
+                    })
+                    .collect();
+                if !exact.is_empty() {
+                    return Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
+                        &mut st,
+                        Some(exclude),
+                        exact,
+                        RouteSelectionOrigin::Discovered,
+                    )));
+                }
+                return Ok(RemoteSidePlan::Target(if eligible.len() == 1 {
+                    eligible
+                } else {
+                    Vec::new()
+                }));
             }
             let restrict_link_local = Self::endpoints_are_link_local_only(&eps);
             let discovered_origin = if is_reliable_type(ty) {
@@ -2682,7 +2718,12 @@ impl Relay {
                 if let Some(side) = target_side {
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
-                return Ok(RemoteSidePlan::Target(Vec::new()));
+                let sides = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), false);
+                return Ok(RemoteSidePlan::Target(if sides.len() == 1 {
+                    sides
+                } else {
+                    Vec::new()
+                }));
             }
             let sides = self.eligible_side_ids_locked(&st, Some(exclude), Some(ty), false);
             Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(
@@ -5264,13 +5305,11 @@ impl Relay {
                         | crate::DataType::ReliablePartialAck
                         | crate::DataType::ReliablePacketRequest
                 ) {
-                    if pkt.data_type() == crate::DataType::ReliableAck
-                        && Self::is_end_to_end_ack_sender(pkt.sender())
+                    if Self::end_to_end_ack_sender_hash(pkt).is_some()
                         && Self::decode_end_to_end_reliable_ack(pkt.payload()).is_ok()
                     {
                         if let Ok(packet_id) = Self::decode_end_to_end_reliable_ack(pkt.payload())
-                            && let Some(sender_hash) =
-                                Self::decode_end_to_end_ack_sender_hash(pkt.sender())
+                            && let Some(sender_hash) = Self::end_to_end_ack_sender_hash(pkt)
                         {
                             let mut st = self.state.lock();
                             Self::note_end_to_end_acked_destination_locked(
@@ -5926,6 +5965,13 @@ impl Relay {
                         | crate::DataType::ReliablePartialAck
                         | crate::DataType::ReliablePacketRequest
                 ) {
+                    // Hop reliability can be disabled on a physical bridge,
+                    // but the publisher's end-to-end ACK must still cross it.
+                    if Self::end_to_end_ack_sender_hash(&pkt).is_some()
+                        && Self::decode_end_to_end_reliable_ack(pkt.payload()).is_ok()
+                    {
+                        return Ok(Some(RelayItem::Packet(pkt)));
+                    }
                     return Ok(None);
                 }
                 Ok(Some(RelayItem::Packet(pkt)))

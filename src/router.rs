@@ -5128,6 +5128,20 @@ impl Router {
                         matches,
                     ),
                 ))
+            } else if preferred_packet_id.is_some() {
+                // Older ACKs carry only the acknowledging owner, and an
+                // unresolved compact sender may also lack a discoverable
+                // publisher identity. After the bounded return cache churns,
+                // a two-sided bridge still has one unambiguous return path.
+                // Respect route/side policy and never flood a multi-way relay.
+                let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
+                Ok(RemoteSidePlan::Target(
+                    if exclude.is_some() && sides.len() == 1 {
+                        sides
+                    } else {
+                        Vec::new()
+                    },
+                ))
             } else if prefer_best_overlap {
                 Ok(RemoteSidePlan::Target(Vec::new()))
             } else {
@@ -5168,7 +5182,14 @@ impl Router {
                 {
                     return Ok(RemoteSidePlan::Target(vec![side]));
                 }
-                return Ok(RemoteSidePlan::Target(Vec::new()));
+                let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
+                return Ok(RemoteSidePlan::Target(
+                    if exclude.is_some() && sides.len() == 1 {
+                        sides
+                    } else {
+                        Vec::new()
+                    },
+                ));
             }
             let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
             Ok(RemoteSidePlan::Target(self.apply_route_selection_locked(

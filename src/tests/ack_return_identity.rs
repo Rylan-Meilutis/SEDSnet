@@ -474,3 +474,80 @@ fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
         assert_eq!(packet.data_type(), crate::DataType::ReliableAck);
     }
 }
+
+#[test]
+fn legacy_ack_recovers_after_return_cache_churn_on_two_side_bridge() {
+    crate::tests::ensure_common_test_schema();
+    for packed in [false, true] {
+        for extra_side in [false, true] {
+            let router =
+                Router::new_with_clock(RouterConfig::new([]).with_sender("GB"), Box::new(|| 0));
+            let forwarded = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+            let output = forwarded.clone();
+            let uart = router.add_side_packed("uart", move |bytes| {
+                output.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            });
+            let can = router.add_side_packed("can", |_| Ok(()));
+            if extra_side {
+                router.add_side_packed("other", |_| Ok(()));
+            }
+            router
+                .rx_from_side(
+                    &discovery::build_discovery_announce("GS", 0, &[DataEndpoint::named("RADIO")])
+                        .unwrap(),
+                    uart,
+                )
+                .unwrap();
+            router.process_all_queues().unwrap();
+            forwarded.lock().unwrap().clear();
+            let packet_id = 1234u64;
+            router.note_reliable_return_route(uart, packet_id);
+            for index in 0..runtime_reliable_max_return_routes().max(1) {
+                router.note_reliable_return_route(can, 10000 + index as u64);
+            }
+            assert!(
+                !router
+                    .state
+                    .lock()
+                    .reliable_return_routes
+                    .contains_key(&packet_id)
+            );
+            let ack = Packet::new(
+                DataType::ReliableAck,
+                &[DataEndpoint::Discovery],
+                "E2EACK:VB",
+                1,
+                Arc::<[u8]>::from(packet_id.to_le_bytes()),
+            )
+            .unwrap();
+            let raw = wire_format::pack_packet_with_wire_contract(
+                &ack,
+                None,
+                None,
+                &[Router::sender_hash("VB")],
+            )
+            .unwrap();
+            if packed {
+                router.rx_packed_from_side(&raw, can).unwrap();
+            } else {
+                router
+                    .rx_from_side(&wire_format::unpack_packet(&raw).unwrap(), can)
+                    .unwrap();
+            }
+            router.process_all_queues().unwrap();
+            let count = forwarded
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|bytes| wire_format::unpack_packet(bytes).ok())
+                .filter(|p| p.data_type() == DataType::ReliableAck)
+                .count();
+            assert_eq!(
+                count,
+                usize::from(!extra_side),
+                "recover only an unambiguous bridge path"
+            );
+        }
+    }
+}

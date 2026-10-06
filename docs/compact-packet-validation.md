@@ -47,3 +47,9 @@ SEDSNET_SOAK_TICKS=2400 cargo test --release --features compact-packet-compressi
   --test reliable_drop_test comprehensive_multinode_churn_soak_exercises_stack_features \
   -- --ignored --nocapture
 ```
+
+## Queue parking and gateway headroom
+
+Queue parking is optional: since 4.1.3, an exhausted arena leaves an existing heap Arc in place without another allocation or copy. Explicit arena/codec storage APIs still reject exhaustion. Queue limits and allocator admission continue to bound ownership.
+
+Gateway hardware with an 8 KiB/64-handle arena reserved 10 KiB even when empty and lost downstream communications under discovery pressure. Disabling the arena restored DAQ and valve telemetry. Gateway uses normal heap packet storage with TLSF for recovery; the smaller experimental gateway arena still requires hardware qualification. This is not proof that either configuration is lossless or safe from every long-duration failure.
