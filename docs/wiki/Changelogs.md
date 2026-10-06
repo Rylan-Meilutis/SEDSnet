@@ -2,6 +2,14 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.1.1 highlights
+
+- Drop queued telemetry before evicting learned routes when discovery metadata grows; apply the policy to Router and Relay.
+- Refuse incoming Relay work rather than erase the routes required to deliver it; discard lower-priority queued work first.
+- Refresh existing unchanged discovery summaries without cloning topology. During allocator pressure, bounded small keepalives preserve established routes while full snapshots remain guarded.
+- Keep new peers, changed endpoint/identity claims, metadata growth, and silent-peer expiry subject to normal bounds.
+- Add Router/Relay regressions for route eviction, five-minute memory-pressure liveness, unknown/changed claim refusal, and genuine peer expiry. Wire format and allocator/scheduler defaults are unchanged.
+
 ## Version 4.1.0 highlights
 
 - Experimental opt-in packet/frame arena supports pin-aware compaction and fixed queue slabs.

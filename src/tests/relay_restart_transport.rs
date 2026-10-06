@@ -257,7 +257,11 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
             .unwrap()
             .unwrap();
         let _ = tx
-            .encode_side_transport_frames(unrelated, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                unrelated,
+                opts,
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap();
         let request = if schema_request {
             discovery::build_discovery_schema_request("GS", 2)
@@ -316,7 +320,9 @@ fn queue_service_expires_incomplete_transfers_without_new_fragments() {
             SideChunkAssembly {
                 last_seen_ms: 0,
                 total: 2,
-                received: [(0, crate::shared_bytes::convert(retained))].into_iter().collect(),
+                received: [(0, crate::shared_bytes::convert(retained))]
+                    .into_iter()
+                    .collect(),
             },
         );
     now.store(2000, core::sync::atomic::Ordering::Relaxed);
@@ -485,4 +491,212 @@ fn malformed_discovery_preserves_retained_relay_routes() {
             .is_err()
     );
     assert_eq!(relay.state.lock().discovery_routes[&side], route);
+}
+
+#[test]
+fn discovery_growth_drops_telemetry_before_live_routes() {
+    crate::tests::ensure_common_test_schema();
+    let relay = Relay::new(Box::new(|| 1));
+    let side = relay.add_side_packed("CAN", |_| Ok(()));
+    let endpoint = crate::DataEndpoint::named("RADIO");
+    let mut route = DiscoverySideState {
+        reachable: vec![endpoint],
+        ..Default::default()
+    };
+    for name in ["AB", "VB"] {
+        route.announcers.insert(
+            name.into(),
+            DiscoverySenderState {
+                last_seen_ms: 1,
+                reachable: vec![endpoint],
+                advertised_reachable: vec![endpoint],
+                ..Default::default()
+            },
+        );
+    }
+    let mut st = relay.state.lock();
+    st.discovery_routes.insert(side, route.clone());
+    st.push_tx(RelayTxItem {
+        src: None,
+        dst: side,
+        data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 512]))),
+        priority: 1,
+    })
+    .unwrap();
+    st.push_tx(RelayTxItem {
+        src: None,
+        dst: side,
+        data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 32]))),
+        priority: 255,
+    })
+    .unwrap();
+    st.memory.max_queue_budget = st.shared_queue_bytes_used();
+    // Simulate new discovery metadata arriving while the shared queue is full.
+    st.discovery_routes
+        .get_mut(&side)
+        .unwrap()
+        .reachable_timesync_sources
+        .push("x".repeat(128));
+    let expected = st.discovery_routes[&side].clone();
+    st.fit_discovery_budget();
+    assert_eq!(
+        st.discovery_routes.get(&side),
+        Some(&expected),
+        "a telemetry backlog erased AB and VB routes"
+    );
+    assert!(st.shared_queue_bytes_used() <= st.memory.max_queue_budget);
+    assert_eq!(st.tx_queue.len(), 1);
+    assert_eq!(
+        st.tx_queue.lowest_priority(|item| item.priority),
+        Some(255),
+        "discard low-priority telemetry before control"
+    );
+}
+
+#[test]
+fn incoming_relay_packet_cannot_evict_the_only_live_route() {
+    crate::tests::ensure_common_test_schema();
+    let relay = Relay::new(Box::new(|| 1));
+    let side = relay.add_side_packed("CAN", |_| Ok(()));
+    let endpoint = crate::DataEndpoint::named("RADIO");
+    let mut route = DiscoverySideState {
+        reachable: vec![endpoint],
+        ..Default::default()
+    };
+    for name in ["AB", "VB"] {
+        route.announcers.insert(
+            name.into(),
+            DiscoverySenderState {
+                last_seen_ms: 1,
+                reachable: vec![endpoint],
+                advertised_reachable: vec![endpoint],
+                ..Default::default()
+            },
+        );
+    }
+    let mut st = relay.state.lock();
+    st.discovery_routes.insert(side, route.clone());
+    st.memory.max_queue_budget = st.shared_queue_bytes_used() + 64;
+    assert!(st.make_shared_queue_room(128, RelayQueueKind::Tx).is_err());
+    assert_eq!(st.discovery_routes.get(&side), Some(&route));
+}
+
+#[test]
+fn known_discovery_survives_snapshot_memory_pressure() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(core::sync::atomic::AtomicU64::new(1));
+    let clock = now.clone();
+    let node = Relay::new_with_config(
+        RelayConfig::default().with_sender("GB"),
+        Box::new(move || clock.load(core::sync::atomic::Ordering::Relaxed)),
+    );
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let output = sent.clone();
+    let side = node.add_side_packet("CAN", move |pkt| {
+        output.lock().unwrap().push(pkt.clone());
+        Ok(())
+    });
+    let endpoint = crate::DataEndpoint::named("RADIO");
+    let ad = discovery::AddressAdvertisement {
+        hostname: "AB".into(),
+        address: 42,
+        requested_address: 42,
+        mode: discovery::ADDRESS_MODE_REQUESTED,
+        state: discovery::ADDRESS_STATE_REQUEST,
+        birth_ms: 1,
+        owner_hash: 42,
+        reachable_endpoints: vec![endpoint],
+        reachable_network_variables: vec![],
+        reachable_timesync_sources: vec![],
+        link_capabilities: RelaySideOptions::default().link_capabilities(),
+    };
+    let baseline = discovery::build_discovery_address("AB", 1, &ad).unwrap();
+    node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(baseline)))
+        .unwrap();
+    {
+        let mut st = node.state.lock();
+        let peer = st
+            .discovery_routes
+            .get_mut(&side)
+            .unwrap()
+            .announcers
+            .get_mut("AB")
+            .unwrap();
+        peer.has_full_topology = true;
+        peer.has_schema = true;
+        let throttle = st.discovery_side_throttle.entry(side).or_default();
+        throttle.has_sent_full = true;
+        throttle.next_ping_ms = 0;
+    }
+    extern "C" fn only_small_work(additional: usize, _: usize) -> bool {
+        additional <= 4096
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(only_small_work));
+    for ms in (5_000..=300_000).step_by(5_000) {
+        now.store(ms, core::sync::atomic::Ordering::Relaxed);
+        let repeated = discovery::build_discovery_address("AB", ms, &ad).unwrap();
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(repeated)))
+            .unwrap();
+        let ping = discovery::build_discovery_announce("AB", ms, &[]).unwrap();
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(ping)))
+            .unwrap();
+        node.queue_discovery_announce(false, true).unwrap();
+        node.process_tx_queue().unwrap();
+        let st = node.state.lock();
+        let peer = &st.discovery_routes[&side].announcers["AB"];
+        assert_eq!(peer.last_seen_ms, ms);
+        assert_eq!(peer.advertised_reachable, vec![endpoint]);
+    }
+    let packets = sent.lock().unwrap();
+    let pings = packets
+        .iter()
+        .filter(|pkt| pkt.data_type() == crate::DataType::DiscoveryAnnounce)
+        .count();
+    assert!(
+        (20..=60).contains(&pings),
+        "keepalives must be bounded but outlive the 30-second route TTL: {pings}"
+    );
+    assert!(
+        packets
+            .iter()
+            .all(|pkt| pkt.data_type() == crate::DataType::DiscoveryAnnounce)
+    );
+    drop(packets);
+    let before = node.state.lock().discovery_routes[&side].clone();
+    let unknown = discovery::build_discovery_announce("UNKNOWN", 300_001, &[]).unwrap();
+    assert!(
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(unknown)))
+            .is_err()
+    );
+    let mut changed = ad.clone();
+    changed
+        .reachable_endpoints
+        .push(crate::DataEndpoint::named("SD_CARD"));
+    let update = discovery::build_discovery_address("AB", 300_001, &changed).unwrap();
+    assert!(
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(update)))
+            .is_err()
+    );
+    assert_eq!(
+        node.state.lock().discovery_routes[&side],
+        before,
+        "pressure liveness must not admit new peers or changed endpoint claims"
+    );
+    now.store(
+        300_000 + discovery::DISCOVERY_ROUTE_TTL_MS + 1,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    let mut st = node.state.lock();
+    Relay::prune_discovery_routes_locked(&mut st, now.load(core::sync::atomic::Ordering::Relaxed));
+    assert!(
+        !st.discovery_routes.contains_key(&side),
+        "a silent peer must still expire"
+    );
 }

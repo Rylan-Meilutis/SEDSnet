@@ -1068,18 +1068,6 @@ impl RelayInner {
             .map(|(_, v)| v)
     }
 
-    fn pop_shared_queue_item(&mut self, preferred: RelayQueueKind) -> bool {
-        match preferred {
-            RelayQueueKind::Rx => self.rx_queue.pop_front().is_some(),
-            RelayQueueKind::Tx => self.tx_queue.pop_front().is_some(),
-            RelayQueueKind::Replay => self.replay_queue.pop_front().is_some(),
-            RelayQueueKind::Recent => self.recent_rx.pop_front().is_some(),
-            RelayQueueKind::ReliableRxBuffer => self.pop_reliable_rx_buffered().is_some(),
-            #[cfg(feature = "discovery")]
-            RelayQueueKind::Discovery => self.pop_discovery_route(),
-        }
-    }
-
     #[cfg(feature = "discovery")]
     fn pop_discovery_route(&mut self) -> bool {
         let Some((&side, _)) = self
@@ -1094,56 +1082,37 @@ impl RelayInner {
         true
     }
 
-    fn largest_shared_queue(&self) -> Option<RelayQueueKind> {
-        let candidates = [
+    fn pop_lowest_packet_queue_item(&mut self) -> bool {
+        let victim = [
             (
                 RelayQueueKind::Rx,
-                self.rx_queue.bytes_used(),
-                self.rx_queue.len(),
+                self.rx_queue.lowest_priority(|item| item.priority),
             ),
             (
                 RelayQueueKind::Tx,
-                self.tx_queue.bytes_used(),
-                self.tx_queue.len(),
+                self.tx_queue.lowest_priority(|item| item.priority),
             ),
             (
                 RelayQueueKind::Replay,
-                self.replay_queue.bytes_used(),
-                self.replay_queue.len(),
+                self.replay_queue.lowest_priority(|item| item.priority),
             ),
-            (RelayQueueKind::Recent, 0, 0),
-            (
-                RelayQueueKind::ReliableRxBuffer,
-                self.reliable_rx_buffered_bytes(),
-                self.reliable_rx_buffer_len(),
-            ),
-            #[cfg(feature = "discovery")]
-            (
-                RelayQueueKind::Discovery,
-                self.discovery_bytes_used(),
-                self.discovery_routes.len(),
-            ),
-        ];
-        candidates
-            .into_iter()
-            .filter(|(_, bytes, len)| *bytes > 0 && *len > 0)
-            .max_by_key(|(kind, bytes, _)| {
-                (
-                    *bytes,
-                    if *kind == RelayQueueKind::ReliableRxBuffer {
-                        0
-                    } else {
-                        1
-                    },
-                )
-            })
-            .map(|(kind, _, _)| kind)
+        ]
+        .into_iter()
+        .filter_map(|(kind, priority)| priority.map(|priority| (kind, priority)))
+        .min_by_key(|(_, priority)| *priority)
+        .map(|(kind, _)| kind);
+        match victim {
+            Some(RelayQueueKind::Rx) => self.rx_queue.pop_lowest_priority().is_some(),
+            Some(RelayQueueKind::Tx) => self.tx_queue.pop_lowest_priority().is_some(),
+            Some(RelayQueueKind::Replay) => self.replay_queue.pop_lowest_priority().is_some(),
+            _ => false,
+        }
     }
 
     fn make_shared_queue_room(
         &mut self,
         incoming_cost: usize,
-        preferred: RelayQueueKind,
+        _preferred: RelayQueueKind,
     ) -> TelemetryResult<()> {
         if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
@@ -1154,12 +1123,10 @@ impl RelayInner {
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
-            let victim = self.largest_shared_queue().unwrap_or(preferred);
-            #[cfg(feature = "discovery")]
-            if victim == RelayQueueKind::Discovery {
-                Self::queue_budget_warning("topology data is using the largest queue budget share");
-            }
-            if !self.pop_shared_queue_item(victim) && !self.pop_shared_queue_item(preferred) {
+            // Incoming work cannot evict the routes required to deliver it.
+            // Prefer low-priority packets; refuse admission once only metadata
+            // remains rather than treating topology as an ordinary queue.
+            if !self.pop_lowest_packet_queue_item() && self.pop_reliable_rx_buffered().is_none() {
                 return Err(TelemetryError::PacketTooLarge(
                     "Item exceeds maximum shared queue budget",
                 ));
@@ -1179,6 +1146,10 @@ impl RelayInner {
     #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
         while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
+            if self.pop_lowest_packet_queue_item() || self.pop_reliable_rx_buffered().is_some() {
+                continue;
+            }
+            // Metadata alone still has to remain bounded.
             if !self.pop_discovery_route() {
                 break;
             }
@@ -3234,6 +3205,113 @@ impl Relay {
     }
 
     #[cfg(feature = "discovery")]
+    fn refresh_known_discovery_liveness(
+        &self,
+        pkt: &Packet,
+        side: RelaySideId,
+    ) -> TelemetryResult<bool> {
+        let empty_ping =
+            pkt.data_type() == crate::DataType::DiscoveryAnnounce && pkt.payload().is_empty();
+        if !empty_ping && pkt.data_type() != crate::DataType::DiscoveryAddress {
+            return Ok(false);
+        }
+        crate::memory_admission::check(
+            1024 + pkt.payload().len().saturating_mul(4),
+            pkt.payload().len().saturating_mul(2).max(128),
+        )?;
+        let mut address = if empty_ping {
+            None
+        } else {
+            Some(discovery::decode_discovery_address(pkt)?)
+        };
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if let Some(ad) = &mut address {
+            let link_local = st
+                .sides
+                .get(side)
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|entry| entry.opts.link_local_enabled);
+            if !link_local {
+                ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
+            }
+        }
+        let canonical;
+        let sender = if let Some(ad) = &address {
+            ad.hostname.as_str()
+        } else {
+            canonical = Self::canonical_sender_locked(&st, pkt.sender());
+            canonical.as_str()
+        };
+        let Some(route) = st.discovery_routes.get_mut(&side) else {
+            return Ok(false);
+        };
+        let Some(peer) = route.announcers.get_mut(sender) else {
+            return Ok(false);
+        };
+        if let Some(ad) = &address
+            && (peer.advertised_address != Some(ad.address)
+                || peer.advertised_reachable != ad.reachable_endpoints
+                || peer.advertised_reachable_timesync_sources != ad.reachable_timesync_sources)
+        {
+            return Ok(false);
+        }
+        // A liveness update cannot add ownership, change identity, or enlarge
+        // discovery state. Leave new/changed summaries behind the full guard.
+        peer.last_seen_ms = now;
+        route.last_seen_ms = route.last_seen_ms.max(now);
+
+        Ok(true)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn queue_pressure_keepalives(
+        &self,
+        requested_side: Option<RelaySideId>,
+    ) -> TelemetryResult<()> {
+        let now = self.clock.now_ms();
+        let sender = self.sender_arc();
+        crate::memory_admission::check(
+            1024 + sender.len().saturating_mul(4),
+            sender.len().max(256),
+        )?;
+        let side_count = self.state.lock().sides.len();
+        for side in 0..side_count {
+            let due = {
+                let st = self.state.lock();
+                requested_side.is_none_or(|wanted| wanted == side)
+                    && st.sides[side].is_some()
+                    && self.route_allowed_locked(
+                        &st,
+                        None,
+                        Some(crate::DataType::DiscoveryAnnounce),
+                        side,
+                    )
+                    && st
+                        .discovery_side_throttle
+                        .get(&side)
+                        .is_some_and(|throttle| {
+                            throttle.has_sent_full && now >= throttle.next_ping_ms
+                        })
+            };
+            if !due {
+                continue;
+            }
+            let pkt = discovery::build_discovery_announce(sender.as_ref(), now, &[])?;
+            self.state.lock().push_tx(RelayTxItem {
+                src: None,
+                dst: side,
+                data: RelayItem::Packet(Arc::new(pkt)),
+                priority: 255,
+            })?;
+            if let Some(throttle) = self.state.lock().discovery_side_throttle.get_mut(&side) {
+                throttle.next_ping_ms = now.saturating_add(discovery::DISCOVERY_SLOW_INTERVAL_MS);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
     fn queue_discovery_announce_on_side(
         &self,
         include_schema: bool,
@@ -3244,7 +3322,12 @@ impl Relay {
         let _ = include_schema;
         // Snapshot construction may clone several route/schema summaries.
         // Refuse background work before it competes with retained TX buffers.
-        crate::memory_admission::check(8192, 2048)?;
+        if let Err(err) = crate::memory_admission::check(8192, 2048) {
+            if !include_schema && matches!(err, TelemetryError::Io("memory pressure")) {
+                return self.queue_pressure_keepalives(requested_side);
+            }
+            return Err(err);
+        }
         let now_ms = self.clock.now_ms();
         let per_side = {
             let mut st = self.state.lock();
@@ -3630,6 +3713,9 @@ impl Relay {
             }
         };
 
+        if self.refresh_known_discovery_liveness(&pkt, src)? {
+            return Ok(());
+        }
         crate::memory_admission::check(
             pkt.payload().len().saturating_mul(4).saturating_add(8192),
             pkt.payload().len().saturating_mul(2).max(2048),
@@ -5390,9 +5476,7 @@ impl Relay {
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             crate::memory_admission::check_receive(bytes)?;
-            return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(
-                bytes,
-            ))));
+            return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes))));
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {

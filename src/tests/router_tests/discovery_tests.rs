@@ -2533,9 +2533,14 @@ fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
                 round * 10 + idx as u64,
                 &[round as f32, idx as f32, (round + idx as u64) as f32],
             );
+            // Retained discovery may leave no room for new telemetry. Reject
+            // it explicitly rather than erasing live routes to admit a packet.
             assert!(
-                queued.is_ok(),
-                "{label}: telemetry admission failed at round {round}: {queued:?}; layout={}",
+                matches!(
+                    queued,
+                    Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
+                ),
+                "{label}: unexpected telemetry admission failure at round {round}: {queued:?}; layout={}",
                 router.export_memory_layout_json()
             );
             let pkt = Packet::from_f32_slice(
@@ -2545,8 +2550,12 @@ fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
                 10_000 + round * 10 + idx as u64,
             )
             .unwrap();
-            router.rx_queue(pkt).unwrap();
-            queued_inputs += 2;
+            let received = router.rx_queue(pkt);
+            assert!(matches!(
+                received,
+                Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
+            ));
+            queued_inputs += u64::from(queued.is_ok()) + u64::from(received.is_ok());
 
             if round % 15 == 0 {
                 assert_pool(label, router, budget, queued_inputs);

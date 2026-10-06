@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.1.1
+
+- Drop queued telemetry before evicting learned routes when discovery metadata grows; apply the policy to Router and Relay.
+- Refuse incoming Relay work rather than erase the routes required to deliver it; discard lower-priority queued work first.
+- Refresh existing unchanged discovery summaries without cloning topology. During allocator pressure, bounded small keepalives preserve established routes while full snapshots remain guarded.
+- Keep new peers, changed endpoint/identity claims, metadata growth, and silent-peer expiry subject to normal bounds.
+- Add Router/Relay regressions for route eviction, five-minute memory-pressure liveness, unknown/changed claim refusal, and genuine peer expiry. Wire format and allocator/scheduler defaults are unchanged.
+
 ## 4.1.0
 
 - Add opt-in handle-managed packet/frame arena with pin-aware compaction and fixed queue slabs.

@@ -2186,6 +2186,14 @@ impl RouterInner {
     #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
         while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
+            // Discovery growth must discard queued work before reachability.
+            // Evicting a whole side here forgets every downstream command route.
+            if let Some(victim) = self.lower_priority_shared_queue(u8::MAX)
+                && self.pop_shared_queue_item(victim)
+            {
+                continue;
+            }
+            // Metadata alone still has to remain bounded.
             if !self.pop_discovery_route() {
                 break;
             }
@@ -5699,6 +5707,133 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
+    fn refresh_known_discovery_liveness(
+        &self,
+        pkt: &Packet,
+        side: RouterSideId,
+    ) -> TelemetryResult<bool> {
+        let empty_ping =
+            pkt.data_type() == crate::DataType::DiscoveryAnnounce && pkt.payload().is_empty();
+        if !empty_ping && pkt.data_type() != crate::DataType::DiscoveryAddress {
+            return Ok(false);
+        }
+        crate::memory_admission::check(
+            1024 + pkt.payload().len().saturating_mul(4),
+            pkt.payload().len().saturating_mul(2).max(128),
+        )?;
+        let mut address = if empty_ping {
+            None
+        } else {
+            Some(discovery::decode_discovery_address(pkt)?)
+        };
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if let Some(ad) = &mut address {
+            let link_local = st
+                .sides
+                .get(side)
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|entry| entry.opts.link_local_enabled);
+            if !link_local {
+                ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
+            }
+            let Some(entry) = st.address_book.get(ad.hostname.as_str()) else {
+                return Ok(false);
+            };
+            if entry.address != ad.address
+                || entry.requested_address != ad.requested_address
+                || entry.mode != Self::address_mode_from_code(ad.mode, ad.requested_address)
+                || entry.birth_ms != ad.birth_ms
+                || entry.owner_hash != ad.owner_hash
+            {
+                return Ok(false);
+            }
+        }
+        let canonical;
+        let sender = if let Some(ad) = &address {
+            ad.hostname.as_str()
+        } else {
+            canonical = Self::canonical_sender_locked(&st, pkt.sender());
+            canonical.as_str()
+        };
+        let Some(route) = st.discovery_routes.get_mut(&side) else {
+            return Ok(false);
+        };
+        let Some(peer) = route.announcers.get_mut(sender) else {
+            return Ok(false);
+        };
+        if let Some(ad) = &address
+            && (peer.advertised_address != Some(ad.address)
+                || peer.advertised_reachable != ad.reachable_endpoints
+                || peer.advertised_reachable_timesync_sources != ad.reachable_timesync_sources
+                || peer.reachable_network_variables != ad.reachable_network_variables
+                || peer.link_capabilities != Some(ad.link_capabilities))
+        {
+            return Ok(false);
+        }
+        // A liveness update cannot add ownership, change identity, or enlarge
+        // discovery state. Leave new/changed summaries behind the full guard.
+        peer.last_seen_ms = now;
+        route.last_seen_ms = route.last_seen_ms.max(now);
+        if let Some(ad) = &address
+            && let Some(entry) = st.address_book.get_mut(ad.hostname.as_str())
+        {
+            entry.last_seen_ms = now;
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn queue_pressure_keepalives(
+        &self,
+        requested_side: Option<RouterSideId>,
+    ) -> TelemetryResult<()> {
+        let now = self.clock.now_ms();
+        let sender = self.sender_arc();
+        crate::memory_admission::check(
+            1024 + sender.len().saturating_mul(4),
+            sender.len().max(256),
+        )?;
+        let side_count = self.state.lock().sides.len();
+        for side in 0..side_count {
+            let due = {
+                let st = self.state.lock();
+                requested_side.is_none_or(|wanted| wanted == side)
+                    && st.sides[side].is_some()
+                    && self.route_allowed_locked(
+                        &st,
+                        None,
+                        Some(crate::DataType::DiscoveryAnnounce),
+                        side,
+                    )
+                    && st
+                        .discovery_side_throttle
+                        .get(&side)
+                        .is_some_and(|throttle| {
+                            throttle.has_sent_full && now >= throttle.next_ping_ms
+                        })
+            };
+            if !due {
+                continue;
+            }
+            let pkt = discovery::build_discovery_announce(sender.as_ref(), now, &[])?;
+            self.emit_internal_tx(
+                RouterTxItem::ToSide {
+                    src: None,
+                    dst: side,
+                    data: RouterItem::Packet(pkt),
+                },
+                true,
+                true,
+            )?;
+            if let Some(throttle) = self.state.lock().discovery_side_throttle.get_mut(&side) {
+                throttle.next_ping_ms = now.saturating_add(discovery::DISCOVERY_SLOW_INTERVAL_MS);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
     fn emit_discovery_snapshot(
         &self,
         called_from_queue: bool,
@@ -5726,7 +5861,12 @@ impl Router {
     ) -> TelemetryResult<()> {
         // Snapshot construction may clone several route/schema summaries.
         // Refuse background work before it competes with retained TX buffers.
-        crate::memory_admission::check(8192, 2048)?;
+        if let Err(err) = crate::memory_admission::check(8192, 2048) {
+            if !include_schema && matches!(err, TelemetryError::Io("memory pressure")) {
+                return self.queue_pressure_keepalives(requested_side);
+            }
+            return Err(err);
+        }
         let now_ms = self.clock.now_ms();
         let per_side = {
             let mut st = self.state.lock();
@@ -6155,6 +6295,9 @@ impl Router {
         let Some(side) = src else {
             return Ok(true);
         };
+        if self.refresh_known_discovery_liveness(pkt, side)? {
+            return Ok(true);
+        }
         crate::memory_admission::check(
             pkt.payload().len().saturating_mul(4).saturating_add(8192),
             pkt.payload().len().saturating_mul(2).max(2048),
@@ -7308,9 +7451,7 @@ impl Router {
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
             crate::memory_admission::check_receive(bytes)?;
-            return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(
-                bytes,
-            ))));
+            return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes))));
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
