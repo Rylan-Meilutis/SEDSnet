@@ -641,6 +641,16 @@ fn known_discovery_survives_snapshot_memory_pressure() {
     crate::memory_admission::set_probe(Some(only_small_work));
     for ms in (5_000..=300_000).step_by(5_000) {
         now.store(ms, core::sync::atomic::Ordering::Relaxed);
+        // A restart request invalidates the TX baseline. A refused full reply
+        // must not disable small liveness traffic for the rest of the run.
+        if ms == 150_000 {
+            node.state
+                .lock()
+                .discovery_side_throttle
+                .entry(side)
+                .or_default()
+                .has_sent_full = false;
+        }
         let repeated = discovery::build_discovery_address("AB", ms, &ad).unwrap();
         node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(repeated)))
             .unwrap();
@@ -655,6 +665,12 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         assert_eq!(peer.advertised_reachable, vec![endpoint]);
     }
     let packets = sent.lock().unwrap();
+    assert!(
+        packets
+            .last()
+            .is_some_and(|packet| packet.timestamp() >= 295_000),
+        "a refused restart baseline must not permanently stop keepalives"
+    );
     let pings = packets
         .iter()
         .filter(|pkt| pkt.data_type() == crate::DataType::DiscoveryAnnounce)

@@ -5809,9 +5809,7 @@ impl Router {
                     && st
                         .discovery_side_throttle
                         .get(&side)
-                        .is_some_and(|throttle| {
-                            throttle.has_sent_full && now >= throttle.next_ping_ms
-                        })
+                        .is_none_or(|throttle| now >= throttle.next_ping_ms)
             };
             if !due {
                 continue;
@@ -5891,9 +5889,12 @@ impl Router {
                 true,
                 true,
             )?;
-            if let Some(throttle) = self.state.lock().discovery_side_throttle.get_mut(&side) {
-                throttle.next_ping_ms = now.saturating_add(discovery::DISCOVERY_SLOW_INTERVAL_MS);
-            }
+            self.state
+                .lock()
+                .discovery_side_throttle
+                .entry(side)
+                .or_default()
+                .next_ping_ms = now.saturating_add(discovery::DISCOVERY_SLOW_INTERVAL_MS);
         }
         Ok(())
     }

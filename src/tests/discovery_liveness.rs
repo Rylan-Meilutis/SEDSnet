@@ -409,6 +409,16 @@ fn known_discovery_survives_snapshot_memory_pressure() {
     crate::memory_admission::set_probe(Some(only_small_work));
     for ms in (5_000..=300_000).step_by(5_000) {
         now.store(ms, core::sync::atomic::Ordering::Relaxed);
+        // A restart request invalidates the TX baseline. A refused full reply
+        // must not disable small liveness traffic for the rest of the run.
+        if ms == 150_000 {
+            node.state
+                .lock()
+                .discovery_side_throttle
+                .entry(side)
+                .or_default()
+                .has_sent_full = false;
+        }
         let repeated = discovery::build_discovery_address("AB", ms, &ad).unwrap();
         node.learn_discovery_packet(&repeated, Some(side), true)
             .unwrap();
@@ -423,6 +433,12 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         assert_eq!(peer.advertised_reachable, vec![endpoint]);
     }
     let packets = sent.lock().unwrap();
+    assert!(
+        packets
+            .last()
+            .is_some_and(|packet| packet.timestamp() >= 295_000),
+        "a refused restart baseline must not permanently stop keepalives"
+    );
     let pings = packets
         .iter()
         .filter(|pkt| {
@@ -489,17 +505,10 @@ fn compact_address_bootstrap_survives_full_snapshot_refusal() {
     let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
     let output = sent.clone();
     let side = node.add_side_packet("CAN", |_| Ok(()));
-    let upstream = node.add_side_packet("UART", move |packet| {
+    let _upstream = node.add_side_packet("UART", move |packet| {
         output.lock().unwrap().push(packet.clone());
         Ok(())
     });
-    {
-        let mut st = node.state.lock();
-        st.discovery_side_throttle
-            .entry(upstream)
-            .or_default()
-            .has_sent_full = true;
-    }
     let _reset = Reset;
     crate::memory_admission::set_probe(Some(summaries_only));
     for (i, name) in ["AB", "VB", "DAQ"].into_iter().enumerate() {
