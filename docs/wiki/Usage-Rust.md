@@ -480,8 +480,8 @@ Router and relay queue-backed state shares one active memory budget per instance
 `RouterConfig::with_memory_config(...)` or `RelayConfig::with_memory_config(...)` to set the active
 budget at runtime. RX work, TX work, recent packet IDs, reliable buffers/replay state, and discovery
 topology all draw from that budget. Recent packet ID caches preallocate their final storage and
-reserve that byte cost immediately. If the remaining budget is exhausted, older queued state is
-evicted; discovery topology eviction emits a warning in `std` builds.
+reserve that byte cost immediately. Queue admission reclaims lower-priority queued packets. Schema updates can reclaim queued packets
+first; existing routes are protected, and metadata that still exceeds capacity is refused transactionally.
 
 Use `router.export_memory_layout_json()` or `relay.export_memory_layout_json()` when profiling a
 running node. The JSON reports shared allocated/used bytes plus per-area used/allocated bytes for

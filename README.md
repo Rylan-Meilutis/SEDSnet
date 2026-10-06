@@ -190,6 +190,14 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.1.2 highlights
+
+- Protect retained routes from queue pressure. Admit new peer/topology changes transactionally, leaving existing reachability unchanged if metadata cannot fit.
+- Give schema admission first claim on reclaimable RX/TX/replay queues, dropping lowest-priority packets first. Heap decode admission also reclaims queued work before refusing an update. Existing routes, schema, and active reliable receive buffers remain bounded and protected.
+- Resume partially accepted chunked side sends at the first refused fragment in Router and Relay, instead of flooding a bounded CAN/serial queue with repeated prefixes. Use four bounded transfer cursors per active chunked side; no duplicate payload storage is retained.
+- Keep large fragmented frames self-describing so dictionary changes cannot change their identity during retry. Genuine pauses past the receiver assembly timeout restart the transfer.
+- Add Router/Relay regressions for schema queue reclamation, transactional metadata refusal, and one-fragment-per-dispatch transport backpressure. Wire format and allocator/scheduler defaults are unchanged.
+
 ### Version 4.1.1 highlights
 
 - Drop queued telemetry before evicting learned routes when discovery metadata grows; apply the policy to Router and Relay.
@@ -558,7 +566,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.1.1
+    GIT_TAG v4.1.2
 )
 FetchContent_MakeAvailable(sedsnet)
 

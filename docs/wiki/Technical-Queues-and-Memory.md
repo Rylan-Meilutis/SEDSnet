@@ -32,7 +32,9 @@ This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded
 A side TX callback returning `SEDS_IO` in C (Rust `TelemetryError::Io("side tx busy")`)
 refuses the frame temporarily. Router and Relay retain refused work for retry during
 later queue processing, including Relay's combined RX/TX service loop. Other callback
-errors are permanent failures.
+errors are permanent failures. Fragmented sends retain a bounded cursor and resume at the
+first refused fragment. Four transfers can be paused per side; a pause beyond the receiver
+assembly timeout restarts the transfer. Accepted prefixes are not replayed on each busy retry.
 
 Returning `SEDS_OK` transfers responsibility for delivery to the transport. A driver
 must transmit or copy the borrowed callback data before returning, preserve accepted
@@ -59,12 +61,13 @@ The budget is shared dynamically across:
 
 If TX is busy and RX is quiet, TX can use most of the budget that is not already reserved by the
 recent-ID cache. If RX later becomes the pressure point, RX can take available budget back. When
-multiple areas fill at the same time, eviction comes from the largest queue-backed area first so the
-total stays under `MAX_QUEUE_BUDGET`.
+multiple packet queues fill, the lowest-priority eligible queued packet is reclaimed first.
+Schema admission can reclaim any queued packet, lowest priority first, before refusing an update.
 
-Discovery topology also counts against this budget. In `std` builds, the router/relay emits a
-warning when discovery/topology entries have to be evicted because the shared queue budget is
-exhausted.
+Discovery topology counts against this budget, but incoming traffic cannot evict retained routes.
+New peer/topology changes and schema merges are checked before committing. If queued packets
+cannot free enough space, the update is refused and existing metadata remains intact. Active
+reliable receive buffers and the reserved recent-ID cache are not eviction victims.
 
 Runtime JSON schema files are decoded incrementally through a 512-byte default read buffer. The
 buffer can be changed at build time with `SCHEMA_JSON_CHUNK_BYTES`; `no_std` builds use generated
@@ -128,8 +131,8 @@ constructor arguments); this does not require rebuilding a packaged host library
 
 ## Tuning guidance
 
-- Increase `MAX_QUEUE_BUDGET` if you see dropped packets, reliable buffer eviction, or topology
-  eviction warnings under bursty traffic.
+- Increase `MAX_QUEUE_BUDGET` within available RAM if you see packet drops or metadata admission
+  refusals after queued packets have been reclaimed.
 - Increase `MAX_RECENT_RX_IDS` if you have many duplicates across links. This cache is
   preallocated, so increasing it reserves more of `MAX_QUEUE_BUDGET` immediately.
 - Reduce `QUEUE_GROW_STEP` if you want smaller memory spikes.
@@ -138,8 +141,8 @@ constructor arguments); this does not require rebuilding a packaged host library
 
 - If a single item exceeds `MAX_QUEUE_BUDGET`, it is rejected.
 - If the shared queue budget is full, older queued state is evicted to make room.
-- If discovery topology consumes too much of the budget, older topology entries can be evicted and
-  a warning is emitted in `std` builds.
+- If new discovery metadata cannot fit after queue reclamation, it is refused while existing routes
+  remain intact. Genuine silent-peer expiry and leave messages still remove routes.
 - If JSON input or its resulting schema exceeds its limit, registration fails and leaves the prior
   registry unchanged.
 - If handlers are slow, RX queues may accumulate and evict earlier items.

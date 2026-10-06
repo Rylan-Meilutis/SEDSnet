@@ -506,6 +506,7 @@ struct DiscoverySideState {
 
 #[derive(Clone, Debug, Default)]
 struct SideTransportState {
+    tx_chunk_progress: Option<Box<crate::side_transport::SideTxProgress>>,
     tx_template_ids: BTreeMap<u64, u32>,
     tx_templates: BTreeMap<u64, SideHeaderTemplate>,
     tx_last_timestamps: BTreeMap<u32, u64>,
@@ -940,8 +941,6 @@ enum RelayQueueKind {
     Replay,
     Recent,
     ReliableRxBuffer,
-    #[cfg(feature = "discovery")]
-    Discovery,
 }
 
 impl RelayInner {
@@ -1068,21 +1067,7 @@ impl RelayInner {
             .map(|(_, v)| v)
     }
 
-    #[cfg(feature = "discovery")]
-    fn pop_discovery_route(&mut self) -> bool {
-        let Some((&side, _)) = self
-            .discovery_routes
-            .iter()
-            .min_by_key(|(_, route)| route.last_seen_ms)
-        else {
-            return false;
-        };
-        self.discovery_routes.remove(&side);
-        Self::queue_budget_warning("topology route evicted because shared queue budget is full");
-        true
-    }
-
-    fn pop_lowest_packet_queue_item(&mut self) -> bool {
+    fn pop_lowest_packet_queue_item(&mut self, below: usize) -> bool {
         let victim = [
             (
                 RelayQueueKind::Rx,
@@ -1099,6 +1084,7 @@ impl RelayInner {
         ]
         .into_iter()
         .filter_map(|(kind, priority)| priority.map(|priority| (kind, priority)))
+        .filter(|(_, priority)| usize::from(*priority) < below)
         .min_by_key(|(_, priority)| *priority)
         .map(|(kind, _)| kind);
         match victim {
@@ -1126,7 +1112,8 @@ impl RelayInner {
             // Incoming work cannot evict the routes required to deliver it.
             // Prefer low-priority packets; refuse admission once only metadata
             // remains rather than treating topology as an ordinary queue.
-            if !self.pop_lowest_packet_queue_item() && self.pop_reliable_rx_buffered().is_none() {
+            if !self.pop_lowest_packet_queue_item(256) && self.pop_reliable_rx_buffered().is_none()
+            {
                 return Err(TelemetryError::PacketTooLarge(
                     "Item exceeds maximum shared queue budget",
                 ));
@@ -1136,23 +1123,48 @@ impl RelayInner {
         Ok(())
     }
 
-    #[inline]
-    fn queue_budget_warning(msg: &str) {
-        #[cfg(feature = "std")]
-        eprintln!("sedsnet queue budget warning: {msg}");
-        let _ = msg;
+    #[cfg(feature = "discovery")]
+    fn schema_growth_budget(&self) -> usize {
+        // Queued packets are reclaimable. Existing reachability and active
+        // reliable reassembly remain protected when admitting a new schema.
+        let protected = self
+            .recent_rx
+            .max_bytes()
+            .saturating_add(self.discovery_bytes_used())
+            .saturating_add(self.reliable_rx_buffered_bytes());
+        self.memory.max_queue_budget.saturating_sub(protected)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn commit_discovery_route(
+        &mut self,
+        side: RelaySideId,
+        route: DiscoverySideState,
+    ) -> TelemetryResult<()> {
+        let previous = self
+            .discovery_routes
+            .get(&side)
+            .map_or(0, Self::discovery_route_byte_cost);
+        let incoming = Self::discovery_route_byte_cost(&route);
+        let growth = incoming.saturating_sub(previous);
+        while self.shared_queue_bytes_used().saturating_add(growth) > self.memory.max_queue_budget {
+            if !self.pop_lowest_packet_queue_item(256) {
+                return Err(TelemetryError::Io("shared priority queue saturated"));
+            }
+        }
+        self.discovery_routes.insert(side, route);
+        Ok(())
     }
 
     #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
         while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
-            if self.pop_lowest_packet_queue_item() || self.pop_reliable_rx_buffered().is_some() {
+            if self.pop_lowest_packet_queue_item(256) {
                 continue;
             }
-            // Metadata alone still has to remain bounded.
-            if !self.pop_discovery_route() {
-                break;
-            }
+            // Live routes are protected. Growth is admitted transactionally;
+            // external registry/config changes cannot justify erasing routes.
+            break;
         }
     }
 
@@ -2173,10 +2185,12 @@ impl Relay {
             RelayTxHandlerFn::Packed(f) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                 let mut sent_bytes = 0usize;
-                for frame in frames {
-                    f(frame.as_ref())?;
+                self.send_side_frames_resumable(side, frames, |frame| {
+                    f(frame)?;
                     sent_bytes = sent_bytes.saturating_add(frame.len());
-                }
+
+                    Ok(())
+                })?;
                 self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
                 self.note_side_tx_success(side, ty, sent_bytes, 1);
                 return Ok(());
@@ -2284,10 +2298,12 @@ impl Relay {
                     let started_ms = self.clock.now_ms();
                     let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                     let mut sent_bytes = 0usize;
-                    for frame in frames {
-                        f(frame.as_ref())?;
+                    self.send_side_frames_resumable(side, frames, |frame| {
+                        f(frame)?;
                         sent_bytes = sent_bytes.saturating_add(frame.len());
-                    }
+
+                        Ok(())
+                    })?;
                     self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
                     self.note_side_tx_success(side, ty, sent_bytes, 1);
                     return Ok(());
@@ -2302,10 +2318,12 @@ impl Relay {
         let started_ms = self.clock.now_ms();
         let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
         let mut sent_bytes = 0usize;
-        for frame in frames {
-            f(frame.as_ref())?;
+        self.send_side_frames_resumable(side, frames, |frame| {
+            f(frame)?;
             sent_bytes = sent_bytes.saturating_add(frame.len());
-        }
+
+            Ok(())
+        })?;
         self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
         self.note_side_tx_success(side, ty, sent_bytes, 1);
 
@@ -3720,7 +3738,14 @@ impl Relay {
         // A compact address summary does not clone the complete topology or
         // schema. Account for its ingress-side aggregates instead; charging
         // every new peer for a full snapshot can prevent restart recovery.
-        let retained_summary = if pkt.data_type() == crate::DataType::DiscoveryAddress {
+        let retained_summary = if matches!(
+            pkt.data_type(),
+            crate::DataType::DiscoveryAddress
+                | crate::DataType::DiscoveryTopology
+                | crate::DataType::DiscoveryAnnounce
+                | crate::DataType::DiscoveryTimeSyncSources
+                | crate::DataType::ManagedVariableRequest
+        ) {
             self.state
                 .lock()
                 .discovery_routes
@@ -3732,15 +3757,23 @@ impl Relay {
         let scratch = if pkt.data_type() == crate::DataType::DiscoveryAddress {
             4096usize.saturating_add(retained_summary)
         } else {
-            8192
+            8192usize.saturating_add(retained_summary)
         };
-        crate::memory_admission::check(
-            pkt.payload()
-                .len()
-                .saturating_mul(4)
-                .saturating_add(scratch),
-            pkt.payload().len().saturating_mul(2).max(2048),
-        )?;
+        let decode_bytes = pkt
+            .payload()
+            .len()
+            .saturating_mul(4)
+            .saturating_add(scratch);
+        let largest_block = pkt.payload().len().saturating_mul(2).max(2048);
+        while let Err(err) = crate::memory_admission::check(decode_bytes, largest_block) {
+            if !matches!(err, TelemetryError::Io("memory pressure")) {
+                return Err(err);
+            }
+            let mut st = self.state.lock();
+            if !st.pop_lowest_packet_queue_item(256) {
+                return Err(err);
+            }
+        }
         let now_ms = self.clock.now_ms();
         if matches!(
             pkt.data_type(),
@@ -3768,17 +3801,14 @@ impl Relay {
         }
         if pkt.data_type() == crate::DataType::DiscoverySchema {
             let snapshot = discovery::decode_discovery_schema(&pkt)?;
-            let incoming_cost = crate::config::owned_schema_byte_cost(&snapshot);
             let mut st = self.state.lock();
-            st.make_shared_queue_room(incoming_cost, RelayQueueKind::Discovery)?;
-            let budget = st.memory.max_queue_budget;
-            drop(st);
+            let budget = st.schema_growth_budget();
             let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
             if report.changed() {
-                let mut st = self.state.lock();
                 st.fit_discovery_budget();
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
+            drop(st);
             self.note_schema_received(src, pkt.sender());
             return Ok(());
         }
@@ -3866,7 +3896,7 @@ impl Relay {
                 }
             }
         }
-        let mut route = core::mem::take(st.discovery_routes.entry(src).or_default());
+        let mut route = st.discovery_routes.get(&src).cloned().unwrap_or_default();
         if pkt.sender() != announcer_id {
             route.announcers.remove(pkt.sender());
         }
@@ -3966,8 +3996,7 @@ impl Relay {
         sender_state.last_seen_ms = now_ms;
         route.announcers.insert(announcer_id, sender_state);
         Self::recompute_discovery_side_state(&mut route);
-        st.discovery_routes.insert(src, route);
-        st.fit_discovery_budget();
+        st.commit_discovery_route(src, route)?;
         if changed {
             Self::note_discovery_topology_change_locked(&mut st, now_ms);
         }
@@ -5311,6 +5340,58 @@ impl Relay {
         Ok(())
     }
 
+    fn run_side_chunk_transfer<T>(
+        &self,
+        side: RelaySideId,
+        key: u64,
+        send: impl FnOnce(&mut usize) -> TelemetryResult<T>,
+    ) -> TelemetryResult<T> {
+        let mut next = {
+            let mut st = self.state.lock();
+            let transport = st
+                .side_transport
+                .get_mut(&side)
+                .ok_or(TelemetryError::BadArg)?;
+            if transport.tx_chunk_progress.is_none() {
+                crate::memory_admission::check(
+                    512,
+                    core::mem::size_of::<crate::side_transport::SideTxProgress>(),
+                )?;
+                transport.tx_chunk_progress =
+                    Some(Box::new(crate::side_transport::SideTxProgress::default()));
+            }
+            transport
+                .tx_chunk_progress
+                .as_mut()
+                .expect("initialized")
+                .begin(key, self.clock.now_ms())?
+        };
+        let result = send(&mut next);
+        if let Some(progress) = self
+            .state
+            .lock()
+            .side_transport
+            .get_mut(&side)
+            .and_then(|transport| transport.tx_chunk_progress.as_mut())
+        {
+            progress.finish(key, next, self.clock.now_ms(), &result);
+        }
+        result
+    }
+
+    fn send_side_frames_resumable(
+        &self,
+        side: RelaySideId,
+        mut frames: SideTransportFrames,
+        mut send: impl FnMut(&[u8]) -> TelemetryResult<()>,
+    ) -> TelemetryResult<()> {
+        if frames.len() == 1 {
+            return frames.send_resuming(&mut 0, send);
+        }
+        let key = frames.progress_key();
+        self.run_side_chunk_transfer(side, key, |next| frames.send_resuming(next, &mut send))
+    }
+
     fn split_side_transport_frame(
         &self,
         _side: RelaySideId,
@@ -5330,6 +5411,17 @@ impl Relay {
             return Ok(SideTransportFrames::single(raw));
         }
         let raw_len = raw.len();
+        if opts.max_frame_bytes != 0 && raw_len > opts.max_frame_bytes {
+            // Canonical bytes keep a partially accepted transfer independent
+            // of dictionary churn while other traffic is serviced.
+            let frames = self.split_side_transport_frame(side, raw, opts.max_frame_bytes)?;
+            let mut st = self.state.lock();
+            let stats = st.side_runtime_stats.entry(side).or_default();
+            stats.note_side_transport_full(raw_len, frames.wire_len());
+            stats.note_side_transport_chunks(frames.len());
+            return Ok(frames);
+        }
+
         let mut compact_payload_len = None;
         let mut used_compact = false;
         let used_timestamp_delta = false;
@@ -5700,10 +5792,12 @@ impl Relay {
             (RelayTxHandlerFn::Packed(f), RelayItem::Packed(bytes)) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
                 let mut sent_bytes = 0usize;
-                for frame in frames {
-                    f(frame.as_ref())?;
+                self.send_side_frames_resumable(side, frames, |frame| {
+                    f(frame)?;
                     sent_bytes = sent_bytes.saturating_add(frame.len());
-                }
+
+                    Ok(())
+                })?;
                 self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
                 self.note_side_tx_success(side, ty, sent_bytes, 1);
                 return Ok(());
@@ -5716,12 +5810,19 @@ impl Relay {
                     && opts.max_frame_bytes != 0
                     && pkt.payload().len() > opts.max_frame_bytes
                 {
-                    let result = crate::side_transport::send_packet_chunks(
-                        pkt,
-                        opts.max_frame_bytes,
-                        self.sender_arc().as_bytes(),
-                        |frame| f(frame),
+                    let key = crate::packet::hash_bytes_u64(
+                        pkt.packet_id(),
+                        &opts.max_frame_bytes.to_le_bytes(),
                     );
+                    let result = self.run_side_chunk_transfer(side, key, |next| {
+                        crate::side_transport::send_packet_chunks(
+                            pkt,
+                            opts.max_frame_bytes,
+                            self.sender_arc().as_bytes(),
+                            next,
+                            |frame| f(frame),
+                        )
+                    });
                     let (raw_len, wire_len, chunks) = match result {
                         Ok(stats) => stats,
                         Err(err) => {
@@ -5748,10 +5849,12 @@ impl Relay {
                     crate::shared_bytes::convert(owned),
                 )?;
                 let mut sent_bytes = 0usize;
-                for frame in frames {
-                    f(frame.as_ref())?;
+                self.send_side_frames_resumable(side, frames, |frame| {
+                    f(frame)?;
                     sent_bytes = sent_bytes.saturating_add(frame.len());
-                }
+
+                    Ok(())
+                })?;
                 self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
                 self.note_side_tx_success(side, ty, sent_bytes, 1);
                 return Ok(());

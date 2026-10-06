@@ -2431,6 +2431,7 @@ fn discovery_topology_counts_against_shared_queue_budget() {
     let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
     let side = router.add_side_packed("link", |_bytes| Ok(()));
 
+    let mut refused = 0;
     for idx in 0..128 {
         let boards = vec![TopologyBoardNode {
             sender_id: format!("REMOTE_BOARD_{idx}_{}", "x".repeat(512)),
@@ -2440,12 +2441,29 @@ fn discovery_topology_counts_against_shared_queue_budget() {
         }];
         let sender = format!("SRC_{idx}");
         let pkt = build_discovery_topology(&sender, idx as u64, &boards).unwrap();
-        router.rx_from_side(&pkt, side).unwrap();
+        match router.rx_from_side(&pkt, side) {
+            Ok(()) => {}
+            Err(TelemetryError::Io("shared priority queue saturated")) => refused += 1,
+            other => panic!("unexpected topology admission result: {other:?}"),
+        }
     }
 
     assert!(
         router.debug_shared_queue_bytes_used() <= crate::config::MAX_QUEUE_BUDGET,
         "discovery topology state must be part of the shared queue budget"
+    );
+    assert!(refused > 0, "excess metadata must be refused");
+    assert!(
+        router
+            .export_topology()
+            .routes
+            .iter()
+            .any(|route| route.side_id == side
+                && route
+                    .announcers
+                    .iter()
+                    .any(|peer| peer.sender_id == "SRC_0")),
+        "new topology must not erase a retained peer"
     );
 }
 
@@ -2526,7 +2544,11 @@ fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
             build_discovery_topology(&format!("DISCOVERY_SRC_{round}"), round, &topology).unwrap();
 
         for (idx, (label, router, side)) in nodes.iter().enumerate() {
-            router.rx_from_side(&topology_pkt, *side).unwrap();
+            let learned = router.rx_from_side(&topology_pkt, *side);
+            assert!(matches!(
+                learned,
+                Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
+            ));
             max_discovery_seen[idx] = max_discovery_seen[idx].max(discovery_bytes(router));
             let queued = router.log_queue_ts(
                 DataType::named("GPS_DATA"),

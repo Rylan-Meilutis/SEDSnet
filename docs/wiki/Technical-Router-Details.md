@@ -175,8 +175,9 @@ All router queue-backed state shares one dynamic `MAX_QUEUE_BUDGET`: RX work, TX
 packet IDs, reliable buffers/replay state, and discovery route/topology state. Recent packet ID
 caches preallocate their final storage and reserve that byte cost immediately. The relay uses the
 same budget model for its RX/TX/replay queues, recent IDs, reliable buffers, and discovery
-topology. When the budget is under pressure, older queued state is evicted; discovery topology
-eviction emits a warning in `std` builds.
+topology. Schema admission reclaims queued packets in priority order before refusing an update.
+Existing routes are never eviction victims of incoming traffic; oversized metadata changes
+are refused transactionally. Silent-peer expiry and explicit leave messages still remove routes.
 
 ## Error handling and retries
 

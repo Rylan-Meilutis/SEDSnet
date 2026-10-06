@@ -129,9 +129,9 @@ The router and relay can queue work. This lets you:
 
 Queues are bounded by one shared `MAX_QUEUE_BUDGET` per router or relay. RX work, TX work,
 recent packet IDs, reliable buffers/replay state, and learned discovery topology all draw from that
-same budget. Recent packet ID caches reserve their final storage up front. If the remaining budget
-is exhausted, older queued state is evicted; discovery topology evictions emit warnings in builds
-that support standard error output.
+same budget. Recent packet ID caches reserve their final storage up front. Queue pressure reclaims lower-priority packets; schema admission can
+reclaim queued packets first. Existing routes remain protected. Metadata that cannot fit after
+reclamation is refused without replacing retained state.
 
 ## Compression
 

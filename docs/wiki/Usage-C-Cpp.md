@@ -70,7 +70,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.1.1
+    GIT_TAG v4.1.2
 )
 FetchContent_MakeAvailable(sedsnet)
 
@@ -700,8 +700,8 @@ Router and relay queue-backed state shares one active memory budget. The package
 `seds_router_new_with_memory(...)` or `seds_relay_new_with_memory(...)` to choose per-instance
 limits at runtime. RX work, TX work, recent packet IDs, reliable buffers/replay state, and discovery
 topology all draw from the active budget. Recent packet ID caches preallocate their final storage
-and reserve that byte cost immediately. Discovery topology eviction emits a warning in `std`
-builds.
+and reserve that byte cost immediately. Schema updates reclaim queued packets first, while existing routes are
+protected. Metadata that still exceeds capacity is refused transactionally.
 
 `seds_router_export_memory_layout(...)` and `seds_relay_export_memory_layout(...)` return JSON with
 shared allocated/used bytes and per-area queue, reliable-buffer, schema, discovery, and

@@ -764,3 +764,199 @@ fn compact_address_bootstrap_survives_full_snapshot_refusal() {
         "full discovery admission remains guarded"
     );
 }
+
+#[test]
+fn chunked_schema_resumes_after_transport_backpressure() {
+    crate::tests::ensure_common_test_schema();
+    for packed_input in [false, true] {
+        let allowance = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let callback_allowance = allowance.clone();
+        let accepted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_accepted = accepted.clone();
+        let node = Relay::new_with_config(RelayConfig::default().with_sender("GB"), Box::new(|| 1));
+        let side = node.add_side_packed_with_options(
+            "bounded CAN",
+            move |bytes| {
+                if callback_allowance
+                    .try_update(
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_err()
+                {
+                    return Err(crate::TelemetryError::Io("CAN queue full"));
+                }
+                callback_accepted
+                    .lock()
+                    .unwrap()
+                    .push(Arc::<[u8]>::from(bytes));
+                Ok(())
+            },
+            RelaySideOptions::default().with_small_packet_transport(128),
+        );
+        let packet = crate::packet::Packet::new(
+            crate::DataType::DiscoverySchema,
+            &[crate::DataEndpoint::Discovery],
+            "GB",
+            100,
+            Arc::from((0..3600).map(|i| (i % 251) as u8).collect::<Vec<_>>()),
+        )
+        .unwrap();
+        let raw = crate::wire_format::pack_packet(&packet);
+        let expected = crate::side_transport::SideTransportFrames::split(
+            crate::shared_bytes::convert(raw.clone()),
+            128,
+            b"GB",
+        )
+        .unwrap()
+        .collect::<Vec<_>>();
+        let item = if packed_input {
+            RelayItem::Packed(crate::shared_bytes::convert(raw))
+        } else {
+            RelayItem::Packet(Arc::new(packet))
+        };
+        let handler = node.state.lock().sides[side]
+            .as_ref()
+            .unwrap()
+            .tx_handler
+            .clone();
+        let mut complete = false;
+        for _ in 0..100 {
+            allowance.store(1, core::sync::atomic::Ordering::Relaxed);
+            match node.call_tx_handler(side, &handler, &item) {
+                Ok(()) => {
+                    complete = true;
+                    break;
+                }
+                Err(crate::TelemetryError::Io(_)) => {}
+                other => panic!("unexpected chunk dispatch result: {other:?}"),
+            }
+        }
+        assert!(
+            complete,
+            "partial acceptance must complete instead of replaying chunk zero forever"
+        );
+        let received = accepted.lock().unwrap();
+        assert_eq!(
+            received
+                .iter()
+                .map(|frame| frame.as_ref())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|frame| frame.as_ref())
+                .collect::<Vec<_>>(),
+            "every accepted chunk is sent once, in order, with one transfer identity"
+        );
+    }
+}
+
+#[test]
+fn new_peer_and_schema_cannot_evict_existing_routes() {
+    crate::tests::ensure_common_test_schema();
+    let node = Relay::new_with_config(RelayConfig::default().with_sender("GB"), Box::new(|| 1));
+    let side = node.add_side_packet("CAN", |_| Ok(()));
+    let ad = discovery::AddressAdvertisement {
+        hostname: "AB".into(),
+        address: 42,
+        requested_address: 42,
+        mode: discovery::ADDRESS_MODE_REQUESTED,
+        state: discovery::ADDRESS_STATE_REQUEST,
+        birth_ms: 1,
+        owner_hash: 42,
+        reachable_endpoints: vec![crate::DataEndpoint::named("RADIO")],
+        reachable_network_variables: vec![],
+        reachable_timesync_sources: vec![],
+        link_capabilities: RelaySideOptions::default().link_capabilities(),
+    };
+    let packet = discovery::build_discovery_address("AB", 1, &ad).unwrap();
+    node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+        .unwrap();
+    let before = {
+        let mut st = node.state.lock();
+        st.memory.max_queue_budget = st.shared_queue_bytes_used() + 64;
+        st.discovery_routes[&side].clone()
+    };
+    let mut new_peer = ad.clone();
+    new_peer.hostname = "VB".into();
+    new_peer.address = 43;
+    new_peer.requested_address = 43;
+    new_peer.owner_hash = 43;
+    let packet = discovery::build_discovery_address("VB", 2, &new_peer).unwrap();
+    assert!(
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+            .is_err()
+    );
+    assert_eq!(node.state.lock().discovery_routes[&side], before);
+    let schema_before = crate::config::schema_bytes_used();
+    let schema = crate::config::OwnedRuntimeSchemaSnapshot {
+        endpoints: vec![crate::config::OwnedEndpointDefinition {
+            id: crate::DataEndpoint(8888),
+            name: "PROTECTED_ROUTE_PRESSURE_ENDPOINT".into(),
+            description: "x".repeat(4096),
+            link_local_only: false,
+        }],
+        types: vec![],
+    };
+    let packet =
+        discovery::build_discovery_schema_from_owned_snapshot("NEW_BOARD", 3, schema).unwrap();
+    assert!(
+        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+            .is_err()
+    );
+    assert_eq!(
+        crate::config::schema_bytes_used(),
+        schema_before,
+        "a refused schema must leave the registry unchanged"
+    );
+    let st = node.state.lock();
+    assert_eq!(st.discovery_routes[&side], before);
+    assert!(st.shared_queue_bytes_used() <= st.memory.max_queue_budget);
+}
+
+#[test]
+fn schema_reclaims_queued_data_before_refusing_update() {
+    crate::tests::ensure_common_test_schema();
+    let node = Relay::new(Box::new(|| 1));
+    let side = node.add_side_packed("CAN", |_| Ok(()));
+    {
+        let mut st = node.state.lock();
+        st.push_tx(RelayTxItem {
+            src: None,
+            dst: side,
+            data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(vec![
+                0;
+                2048
+            ]))),
+            priority: 254,
+        })
+        .unwrap();
+        st.memory.max_queue_budget = st.shared_queue_bytes_used();
+    }
+    let schema = crate::config::OwnedRuntimeSchemaSnapshot {
+        endpoints: vec![crate::config::OwnedEndpointDefinition {
+            id: crate::DataEndpoint(8891),
+            name: "SCHEMA_RECLAIM_relay".into(),
+            description: "x".repeat(512),
+            link_local_only: false,
+        }],
+        types: vec![],
+    };
+    let packet =
+        discovery::build_discovery_schema_from_owned_snapshot("NEW_BOARD", 3, schema).unwrap();
+    node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+        .unwrap();
+    let st = node.state.lock();
+    assert!(
+        st.tx_queue.is_empty(),
+        "queued data must give way to the new schema"
+    );
+    assert!(st.shared_queue_bytes_used() <= st.memory.max_queue_budget);
+    assert_eq!(
+        crate::DataEndpoint::try_from_u32(8891),
+        Some(crate::DataEndpoint(8891))
+    );
+    drop(st);
+    crate::config::remove_endpoint(crate::DataEndpoint(8891)).unwrap();
+}
