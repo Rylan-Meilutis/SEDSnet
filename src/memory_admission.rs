@@ -45,23 +45,25 @@ pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
     if PROBE.load(Ordering::Relaxed).is_null() {
         return Ok(());
     }
-    // Keep a smaller admission requirement for ACKs that can release retained
-    // replay buffers. Side wrappers are classified after their header is decoded.
+    // Keep smaller admission for ACKs that release replay buffers and short
+    // discovery keepalives that preserve the return path. Side wrappers are classified after their header is decoded.
     let ack = crate::wire_format::peek_routing_frame_info(bytes)
         .ok()
         .is_some_and(|frame| {
             frame.ack_only()
                 || matches!(
                     frame.envelope.ty,
-                    crate::DataType::ReliableAck | crate::DataType::ReliablePartialAck
+                    crate::DataType::ReliableAck
+                        | crate::DataType::ReliablePartialAck
+                        | crate::DataType::DiscoveryAnnounce
                 )
         });
     check_frame(bytes.len(), ack)
 }
 
 pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {
-    // Only small control frames use the reserved ACK headroom. An oversized
-    // or malformed ACK must not bypass ordinary allocation admission.
+    // Only small control frames use reserved headroom. An oversized
+    // or malformed control frame must not bypass ordinary allocation admission.
     if ack && len <= 128 {
         check(512, len.saturating_add(32))
     } else {

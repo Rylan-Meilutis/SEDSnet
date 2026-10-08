@@ -366,3 +366,7 @@ Discovery and internal router state share the dynamic `MAX_QUEUE_BUDGET` with RX
 recent-ID caches, reliable replay/out-of-order buffers, and topology state. See
 [Technical-Queues-and-Memory](Technical-Queues-and-Memory) for the budget model and eviction
 behavior.
+
+## Liveness under allocator pressure
+
+CRC-valid self-describing ingress frames refresh only an already-discovered peer on that ingress side, without allocating or changing its retained schema/reachability. This happens before payload admission so refused telemetry cannot expire a physically live return path. Unknown or ambiguous sources and invalid frames do not refresh routes; a silent peer still expires at the usual TTL. Small discovery announcements use bounded control headroom, and pressure keepalives remain rate-limited. Large snapshots and changed metadata continue through normal admission.

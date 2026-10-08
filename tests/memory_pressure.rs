@@ -7,6 +7,26 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+struct CountingAllocator;
+std::thread_local! {
+    static ALLOCATION_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = ALLOCATION_COUNT.try_with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static ALLOW: AtomicBool = AtomicBool::new(true);
 extern "C" fn probe(_additional: usize, _largest: usize) -> bool {
@@ -210,4 +230,92 @@ fn full_arena_keeps_owned_heap_work_and_dispatch_recovers() {
     assert_eq!(output.load(Ordering::Relaxed), 5);
     drop(router);
     assert_eq!(store.stats().live_bytes, 0);
+}
+
+#[test]
+fn live_return_route_survives_refused_ingress_but_invalid_or_wrong_side_does_not() {
+    use sedsnet::discovery::{DISCOVERY_ROUTE_TTL_MS, TopologyBoardNode, build_discovery_topology};
+    use sedsnet::relay::Relay;
+    use std::sync::atomic::AtomicU64;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("LIVE_RETURN", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "LIVE_RETURN_VALUE",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let clock = Arc::new(AtomicU64::new(0));
+    let tick = clock.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::default(),
+        Box::new(move || tick.load(Ordering::Relaxed)),
+    );
+    let tick = clock.clone();
+    let relay = Relay::new(Box::new(move || tick.load(Ordering::Relaxed)));
+    let side = router.add_side_packed("uart", |_| Ok(()));
+    let other = router.add_side_packed("other", |_| Ok(()));
+    let relay_side = relay.add_side_packed("uart", |_| Ok(()));
+    let relay_other = relay.add_side_packed("other", |_| Ok(()));
+    let discovery = build_discovery_topology(
+        "LIVE_GS",
+        0,
+        &[TopologyBoardNode {
+            sender_id: "LIVE_GS".into(),
+            reachable_endpoints: vec![ep],
+            reachable_timesync_sources: vec![],
+            connections: vec![],
+        }],
+    )
+    .unwrap();
+    router.rx_from_side(&discovery, side).unwrap();
+    relay.rx_from_side(relay_side, discovery).unwrap();
+    relay.process_all_queues().unwrap();
+    assert!(!router.export_topology().routes.is_empty());
+    assert!(!relay.export_topology().routes.is_empty());
+    let packet = Packet::new(ty, &[ep], "LIVE_GS", 1, Arc::from(1f32.to_le_bytes())).unwrap();
+    let wire = sedsnet::wire_format::pack_packet(&packet);
+    let foreign = Packet::new(ty, &[ep], "UNKNOWN_GS", 1, Arc::from(1f32.to_le_bytes())).unwrap();
+    let foreign = sedsnet::wire_format::pack_packet(&foreign);
+    let mut corrupt = wire.to_vec();
+    let end = corrupt.len() - 1;
+    corrupt[end] ^= 1;
+    ALLOW.store(false, Ordering::Relaxed);
+    sedsnet::memory_admission::set_probe(Some(probe));
+    for now in [10_000, 20_000, 30_000, 40_000, 50_000, 60_000] {
+        clock.store(now, Ordering::Relaxed);
+        ALLOCATION_COUNT.with(|count| count.set(Some(0)));
+        let router_result = router.rx_packed_queue_from_side(&wire, side);
+        let relay_result = relay.rx_packed_from_side(relay_side, &wire);
+        let allocations = ALLOCATION_COUNT.with(|count| count.replace(None).unwrap());
+        assert!(router_result.is_err());
+        assert!(relay_result.is_err());
+        assert_eq!(allocations, 0, "pressure liveness refresh allocated");
+        router.poll_discovery().ok();
+        relay.poll_discovery().ok();
+        assert!(
+            !router.export_topology().routes.is_empty(),
+            "live router return route expired"
+        );
+        assert!(
+            !relay.export_topology().routes.is_empty(),
+            "live relay return route expired"
+        );
+    }
+    // Neither a bad CRC, a different ingress nor an unknown source keeps this peer alive.
+    clock.store(60_000 + DISCOVERY_ROUTE_TTL_MS + 1, Ordering::Relaxed);
+    for bytes in [&corrupt[..], foreign.as_ref()] {
+        router.rx_packed_queue_from_side(bytes, side).ok();
+        relay.rx_packed_from_side(relay_side, bytes).ok();
+    }
+    router.rx_packed_queue_from_side(&wire, other).ok();
+    relay.rx_packed_from_side(relay_other, &wire).ok();
+    router.poll_discovery().ok();
+    relay.poll_discovery().ok();
+    assert!(router.export_topology().routes.is_empty());
+    assert!(relay.export_topology().routes.is_empty());
 }

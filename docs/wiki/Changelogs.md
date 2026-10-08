@@ -2,6 +2,12 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.1.4 highlights
+
+- Preserve existing ingress-peer routes when CRC-valid traffic arrives under allocator pressure, before refusing payload admission. Refresh only a known peer on its learned side; invalid frames, unknown sources, ambiguous addresses and traffic on another side do not extend its lifetime.
+- Keep small discovery announcements within bounded control headroom, including pressure keepalive construction. Oversized announcements and metadata growth retain normal admission checks.
+- Apply both fixes to Router and standalone Relay. Add allocation-counted route-expiry regressions, genuine-silence/invalid-ingress checks and rate-limited keepalive tests. Wire format, application allocator and scheduler defaults are unchanged.
+
 ## Version 4.1.3 highlights
 
 - Recover end-to-end ACKs on a two-sided bridge after bounded return-route cache churn, including older ACKs without an original-publisher identity. Ambiguous paths remain refused and disabled routes remain disabled.

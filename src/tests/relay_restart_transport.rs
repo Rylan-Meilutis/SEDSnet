@@ -960,3 +960,44 @@ fn schema_reclaims_queued_data_before_refusing_update() {
     drop(st);
     crate::config::remove_endpoint(crate::DataEndpoint(8891)).unwrap();
 }
+
+#[test]
+fn keepalive_fits_reserved_control_headroom() {
+    crate::tests::ensure_common_test_schema();
+    let node = Relay::new_with_config(RelayConfig::default().with_sender("RF"), Box::new(|| 5000));
+    let sent = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let output = sent.clone();
+    let side = node.add_side_packet("UART", move |pkt| {
+        if pkt.data_type() == crate::DataType::DiscoveryAnnounce && pkt.payload().is_empty() {
+            output.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    node.state
+        .lock()
+        .discovery_side_throttle
+        .entry(side)
+        .or_default()
+        .has_sent_full = true;
+    extern "C" fn control_only(additional: usize, _: usize) -> bool {
+        additional <= 512
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(control_only));
+    node.queue_discovery_announce(false, true).unwrap();
+    node.process_tx_queue().unwrap();
+    assert_eq!(sent.load(core::sync::atomic::Ordering::Relaxed), 1);
+    node.queue_discovery_announce(false, true).unwrap();
+    node.process_tx_queue().unwrap();
+    assert_eq!(
+        sent.load(core::sync::atomic::Ordering::Relaxed),
+        1,
+        "keepalives were not rate limited"
+    );
+}

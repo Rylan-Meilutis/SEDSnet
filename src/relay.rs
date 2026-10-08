@@ -3275,7 +3275,11 @@ impl Relay {
             return Ok(false);
         }
         crate::memory_admission::check(
-            1024 + pkt.payload().len().saturating_mul(4),
+            if empty_ping {
+                512
+            } else {
+                1024 + pkt.payload().len().saturating_mul(4)
+            },
             pkt.payload().len().saturating_mul(2).max(128),
         )?;
         let mut address = if empty_ping {
@@ -3331,7 +3335,7 @@ impl Relay {
         let now = self.clock.now_ms();
         let sender = self.sender_arc();
         crate::memory_admission::check(
-            1024 + sender.len().saturating_mul(4),
+            256 + sender.len().saturating_mul(4),
             sender.len().max(256),
         )?;
         let side_count = self.state.lock().sides.len();
@@ -5620,6 +5624,34 @@ impl Relay {
         }
     }
 
+    // A validated frame from a previously discovered direct peer proves that
+    // its link is alive, even when allocation admission refuses its payload.
+    // Update existing timestamps only: no allocation, schema merge or new route.
+    #[cfg(feature = "discovery")]
+    fn refresh_ingress_peer_liveness(&self, side: RelaySideId, bytes: &[u8]) {
+        let Ok(frame) = wire_format::peek_routing_frame_info(bytes) else {
+            return;
+        };
+        let address = frame.envelope.source_address;
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        let Some(route) = st.discovery_routes.get_mut(&side) else {
+            return;
+        };
+        let mut matches = route.announcers.iter_mut().filter(|(name, peer)| {
+            sender_address_u32(name) == address || peer.advertised_address == Some(address)
+        });
+        let Some((_, peer)) = matches.next() else {
+            return;
+        };
+        // A numeric collision must be resolved by discovery, never guessed.
+        if matches.next().is_some() {
+            return;
+        }
+        peer.last_seen_ms = now;
+        route.last_seen_ms = route.last_seen_ms.max(now);
+    }
+
     fn decode_side_transport_frame(
         &self,
         side: RelaySideId,
@@ -5627,6 +5659,8 @@ impl Relay {
     ) -> TelemetryResult<Option<crate::SharedBytes>> {
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
+            #[cfg(feature = "discovery")]
+            self.refresh_ingress_peer_liveness(side, bytes);
             crate::memory_admission::check_receive(bytes)?;
             return Ok(Some(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes))));
         };
@@ -5635,6 +5669,8 @@ impl Relay {
                 let mut off = 0usize;
                 let template_id = u32::try_from(read_uleb128_local(body, &mut off)?)
                     .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+                #[cfg(feature = "discovery")]
+                self.refresh_ingress_peer_liveness(side, &body[off..]);
                 crate::memory_admission::check_receive(&body[off..])?;
                 let raw = Arc::<[u8]>::from(&body[off..]);
                 if let Ok((template, _, _, _, timestamp, _, _, _)) =
