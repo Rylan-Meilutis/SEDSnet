@@ -9,6 +9,9 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 - Retain sparse destination lists and reliable-header presence on the wire so partial-schema convergence cannot reinterpret queued packets or acknowledgements. Use fixed 32-bit C identity types, including on toolchains with short enums. This migration requires a coordinated rebuild; subsequent compatible schema additions do not require gateway reflashing.
 - Admit compact queue backing storage fallibly at startup and retain a smaller fixed ring when fragmented memory cannot fit the requested ring. Defer queued-producer discovery work to network maintenance and reduce embedded calendar and queue-ratio overhead.
 - Preserve known ingress routes and ACK/control ownership under pressure in both Router and standalone Relay. Add allocation, reconnect, schema-convergence and C ABI regressions. Packet arenas remain opt-in and do not replace the application allocator or scheduler.
+- Decode variable integers with native-width shifts on Cortex-M, reject overflowing encodings, and distinguish bounded small reliable byte controls in optional application memory admission without lowering their working estimate.
+- Allow Python Router callbacks to inspect the originating router or return a reply without an outer-lock deadlock; expose canonical identity helpers in the bindings.
+
 
 ## Version 4.1.3 highlights
 
