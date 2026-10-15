@@ -19,7 +19,9 @@ use crate::config::StandardSmallPayload;
 use crate::packet::{hash_bytes_u64, sender_address_u32};
 #[cfg(feature = "std")]
 use alloc::collections::BTreeMap;
-use alloc::{sync::Arc, vec, vec::Vec};
+#[cfg(feature = "cryptography")]
+use alloc::vec;
+use alloc::{sync::Arc, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::sync::{Mutex, OnceLock};
