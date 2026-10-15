@@ -27,6 +27,20 @@ Key properties:
 
 This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded builds.
 
+## Optional admission work classes
+
+The extended application probe receives the complete allocation estimate and a
+work class. General work retains conservative decoder scratch; cached transit
+requires warmed routing, transport, and statistics metadata. Small protected
+work is limited to CRC-valid, uncompressed/unencrypted reliable byte messages:
+known fixed UInt8 shape of at most 16 elements, queue priority at least 200,
+frame at most 128 bytes, and at most three destinations and sender targets.
+Any inline shape must also be fixed UInt8 with at most 16 elements. Normal
+frame decoding and validation still run. This class does not lower the byte
+estimate or provide an allocation guarantee; applications can allow it to use
+reserved control headroom. Legacy probes receive the original estimate without
+this classification. Both Router and standalone Relay use the same checks.
+
 ## Transport backpressure
 
 A side TX callback returning `SEDS_IO` in C (Rust `TelemetryError::Io("side tx busy")`)

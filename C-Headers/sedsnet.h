@@ -37,9 +37,12 @@ int32_t seds_packet_store_stats(SedsPacketStoreStats *out);
 
 void seds_set_memory_admission_probe(SedsMemoryAdmissionProbe probe);
 /* Optional extended admission: 0=general/cold work, 1=fully cached small
- * packed transit. The legacy callback and default behavior are unchanged. */
+ * packed transit, 2=bounded protected byte controls. Estimates remain the
+ * full working requirement; the application selects spare headroom. The legacy
+ * callback and default behavior are unchanged. */
 #define SEDS_MEMORY_WORK_GENERAL 0U
 #define SEDS_MEMORY_WORK_CACHED_TRANSIT 1U
+#define SEDS_MEMORY_WORK_SMALL_PROTECTED 2U
 typedef bool (*SedsMemoryAdmissionProbeV2)(size_t additional_bytes, size_t largest_allocation, uint32_t work);
 void seds_set_memory_admission_probe_v2(SedsMemoryAdmissionProbeV2 probe);
 

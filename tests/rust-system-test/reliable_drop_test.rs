@@ -1757,19 +1757,33 @@ mod reliable_drop_tests {
             ..RelaySideOptions::default()
         };
 
-        let gs_trunk = gs.add_side_packed_with_options("trunk", trunk_bus.tx_handler(0), side_opts.clone());
-        let gw_trunk =
-            gw.add_side_packed_with_options("trunk", trunk_bus.tx_handler(1), relay_side_opts.clone());
-        let rf_trunk =
-            rf.add_side_packed_with_options("trunk", trunk_bus.tx_handler(2), relay_side_opts.clone());
+        let gs_trunk =
+            gs.add_side_packed_with_options("trunk", trunk_bus.tx_handler(0), side_opts.clone());
+        let gw_trunk = gw.add_side_packed_with_options(
+            "trunk",
+            trunk_bus.tx_handler(1),
+            relay_side_opts.clone(),
+        );
+        let rf_trunk = rf.add_side_packed_with_options(
+            "trunk",
+            trunk_bus.tx_handler(2),
+            relay_side_opts.clone(),
+        );
 
-        let gw_child =
-            gw.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts.clone());
-        let actuator_side =
-            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts.clone());
+        let gw_child = gw.add_side_packed_with_options(
+            "gw_bus",
+            gw_bus.tx_handler(0),
+            relay_side_opts.clone(),
+        );
+        let actuator_side = actuator.add_side_packed_with_options(
+            "gw_bus",
+            gw_bus.tx_handler(1),
+            side_opts.clone(),
+        );
         let valve_side =
             valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts.clone());
-        let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts.clone());
+        let daq_side =
+            daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts.clone());
 
         let rf_child =
             rf.add_side_packed_with_options("rf_bus", rf_bus.tx_handler(0), relay_side_opts);
@@ -2029,8 +2043,11 @@ mod reliable_drop_tests {
         );
         let gw_child =
             gateway.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts);
-        let actuator_side =
-            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts.clone());
+        let actuator_side = actuator.add_side_packed_with_options(
+            "gw_bus",
+            gw_bus.tx_handler(1),
+            side_opts.clone(),
+        );
         let valve_side =
             valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts.clone());
         let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts);
@@ -2278,8 +2295,11 @@ mod reliable_drop_tests {
         );
         let gw_child =
             gateway.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts);
-        let actuator_side =
-            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts.clone());
+        let actuator_side = actuator.add_side_packed_with_options(
+            "gw_bus",
+            gw_bus.tx_handler(1),
+            side_opts.clone(),
+        );
         let valve_side =
             valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts.clone());
         let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts);

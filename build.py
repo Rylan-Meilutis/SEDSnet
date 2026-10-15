@@ -1098,6 +1098,12 @@ def main(argv: list[str]) -> None:
 
         next_step = 5
 
+        # These regressions inspect a compiled flash catalog. Do not depend on
+        # an ignored telemetry_config.json left by an earlier application build.
+        # Fileless registration is covered separately by isolated process tests;
+        # the production cross-build below retains the caller's original env.
+        embedded_test_env = env.copy()
+        embedded_test_env["SEDSNET_EMBEDDED_SCHEMA_PATH"] = str(repo_root / "telemetry_config.test.json")
         run_cmd(
             [
                 "cargo",
@@ -1110,7 +1116,7 @@ def main(argv: list[str]) -> None:
                 "embedded_memory_behavior_test",
                 "--test", "embedded_schema_memory",
             ],
-            env=env,
+            env=embedded_test_env,
             repo_root=repo_root,
             title=f"{next_step}/{total_steps} cargo test (hosted no_std memory behavior)",
             release_build=release_build,

@@ -223,18 +223,7 @@ pub(crate) fn crc32_bytes(data: &[u8]) -> u32 {
 }
 
 pub(crate) fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
-    let mut result = 0u64;
-    let mut shift = 0u32;
-    for _ in 0..10 {
-        let byte = *buf.get(*off).ok_or(TelemetryError::Unpack("short read"))?;
-        *off += 1;
-        result |= u64::from(byte & 0x7F) << shift;
-        if (byte & 0x80) == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-    }
-    Err(TelemetryError::Unpack("uleb128 too long"))
+    crate::varint::read_u64(buf, off)
 }
 
 pub(crate) fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {

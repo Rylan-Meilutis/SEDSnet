@@ -128,9 +128,20 @@ fn schema_default_endpoints_omit_wire_bitmap_but_custom_endpoints_keep_it() {
 
     let default_wire = wire_format::pack_packet(&default_pkt);
     let subset_wire = wire_format::pack_packet(&subset_pkt);
-    assert_ne!(default_wire[0] & 0x80, 0, "application destinations stay explicit during schema convergence");
-    assert_ne!(subset_wire[0] & 0x80, 0, "sparse destinations use a compact list");
-    assert!(subset_wire.len() < default_wire.len(), "removing a destination must shorten the header");
+    assert_ne!(
+        default_wire[0] & 0x80,
+        0,
+        "application destinations stay explicit during schema convergence"
+    );
+    assert_ne!(
+        subset_wire[0] & 0x80,
+        0,
+        "sparse destinations use a compact list"
+    );
+    assert!(
+        subset_wire.len() < default_wire.len(),
+        "removing a destination must shorten the header"
+    );
 
     let default_round = wire_format::unpack_packet(&default_wire).unwrap();
     let subset_round = wire_format::unpack_packet(&subset_wire).unwrap();

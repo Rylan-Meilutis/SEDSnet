@@ -1388,10 +1388,12 @@ fn packed_side_chunking_reassembles_for_fixed_size_links() {
     // Deterministic ASCII noise remains large after compression; a repeated
     // character can now fit one frame after the endpoint-header reduction.
     let mut state = 0x12345678u32;
-    let payload = (0..180).map(|_| {
-        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-        32 + ((state >> 24) % 95) as u8
-    }).collect::<Vec<_>>();
+    let payload = (0..180)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            32 + ((state >> 24) % 95) as u8
+        })
+        .collect::<Vec<_>>();
     let pkt = Packet::new(
         DataType::TelemetryError,
         &[DataEndpoint::named("SD_CARD")],

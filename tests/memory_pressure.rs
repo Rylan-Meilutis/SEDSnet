@@ -1904,3 +1904,81 @@ fn topology_updates_move_new_nodes_and_do_not_clone_retained_graphs() {
     ));
     assert!(retained.is_empty());
 }
+
+static SMALL_CONTROL_ACCEPTS: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn only_small_control(additional: usize, largest: usize, work: u32) -> bool {
+    let allowed = work == sedsnet::memory_admission::WORK_SMALL_PROTECTED
+        && (2048..=2432).contains(&additional)
+        && largest <= 160;
+    if allowed {
+        SMALL_CONTROL_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+    }
+    allowed
+}
+
+#[test]
+fn bounded_reliable_control_uses_reserved_admission_in_router_and_relay() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("SMALL_CONTROL_SINK", "", false).unwrap();
+    let make = |name, size, priority, reliability| {
+        register_data_type_with_description(
+            name,
+            "",
+            MessageElement::Static(size, MessageDataType::UInt8, MessageClass::Data),
+            &[ep],
+            reliability,
+            priority,
+        )
+        .unwrap()
+    };
+    let control = make("SMALL_CONTROL_VALID", 2, 200, ReliableMode::Ordered);
+    let bulk = make("SMALL_CONTROL_BULK", 2, 199, ReliableMode::Ordered);
+    let large = make("SMALL_CONTROL_LARGE", 256, 255, ReliableMode::Ordered);
+    let unreliable = make("SMALL_CONTROL_UNRELIABLE", 2, 255, ReliableMode::None);
+    let wire = |ty, size| {
+        sedsnet::wire_format::pack_packet(
+            &Packet::new(ty, &[ep], "CONTROL_SOURCE", 1, Arc::from(vec![1u8; size])).unwrap(),
+        )
+        .to_vec()
+    };
+    let good = wire(control, 2);
+    let mut bad_crc = good.clone();
+    *bad_crc.last_mut().unwrap() ^= 1;
+    let mut compressed = good.clone();
+    compressed[0] |= 1;
+    let n = compressed.len();
+    let crc = crc32fast::hash(&compressed[..n - 4]);
+    compressed[n - 4..].copy_from_slice(&crc.to_le_bytes());
+    let mut encrypted = good.clone();
+    encrypted[0] |= 0x10;
+    let n = encrypted.len();
+    let crc = crc32fast::hash(&encrypted[..n - 4]);
+    encrypted[n - 4..].copy_from_slice(&crc.to_le_bytes());
+    let rejected = [
+        wire(bulk, 2),
+        wire(large, 256),
+        wire(unreliable, 2),
+        bad_crc,
+        compressed,
+        encrypted,
+    ];
+    let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+    let side = router.add_side_packed("control-in", |_| Ok(()));
+    let relay = sedsnet::relay::Relay::new(Box::new(|| 0));
+    let relay_side = relay.add_side_packed("control-in", |_| Ok(()));
+    SMALL_CONTROL_ACCEPTS.store(0, Ordering::Relaxed);
+    sedsnet::memory_admission::set_probe_v2(Some(only_small_control));
+    router.rx_packed_queue_from_side(&good, side).unwrap();
+    relay.rx_packed_from_side(relay_side, &good).unwrap();
+    assert_eq!(SMALL_CONTROL_ACCEPTS.load(Ordering::Relaxed), 2);
+    for frame in rejected {
+        assert!(router.rx_packed_queue_from_side(&frame, side).is_err());
+        assert!(relay.rx_packed_from_side(relay_side, &frame).is_err());
+    }
+    assert_eq!(SMALL_CONTROL_ACCEPTS.load(Ordering::Relaxed), 2);
+    // A legacy callback still gets the original conservative estimate.
+    sedsnet::memory_admission::set_probe(Some(probe));
+    ALLOW.store(false, Ordering::Relaxed);
+    assert!(router.rx_packed_queue_from_side(&good, side).is_err());
+}

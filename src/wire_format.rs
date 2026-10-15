@@ -147,18 +147,7 @@ where
 /// Decode a ULEB128-encoded `u64` from the given reader.
 #[inline]
 fn read_uleb128(r: &mut ByteReader) -> Result<u64, TelemetryError> {
-    let mut result: u64 = 0;
-    let mut shift = 0u32;
-    // u64 fits in at most 10 ULEB128 bytes.
-    for _ in 0..10 {
-        let b = r.read_bytes(1)?[0];
-        result |= ((b & 0x7F) as u64) << shift;
-        if (b & 0x80) == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-    }
-    Err(TelemetryError::Unpack("uleb128 too long"))
+    crate::varint::read_u64(r.buf, &mut r.off)
 }
 
 /// Compute the encoded length (in bytes) of a ULEB128-encoded `u64`.

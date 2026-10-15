@@ -171,7 +171,10 @@ Automatic identities derive from canonical wire names, independently of file
 order, local catalog subsets, or registration order. Rust callers can use
 `DataEndpoint::identity(name)` and `DataType::identity(name)` before the referenced
 definition arrives. C callers use `seds_endpoint_identity` and
-`seds_dtype_identity`, then the registration APIs. Explicit numeric registrations
+`seds_dtype_identity`, then the registration APIs. Python callers use
+`endpoint_identity(name)` and `data_type_identity(name)` before calling
+`register_endpoint` / `register_data_type`; these helpers do not register or
+allocate metadata. Explicit numeric registrations
 must use consistent identities across nodes. Name/hash collisions are detected
 rather than treated as two equivalent definitions.
 
@@ -249,4 +252,5 @@ Every type declares one required field: `"reliable": "Off"`, `"Ordered"`, or
 and preserves sequence; `Unordered` acknowledges delivery without ordering.
 Boolean `reliable` values and `reliable_mode` declarations are no longer accepted.
 Update application, board, and host schema files together. Runtime metadata
-stores one enum; the binary discovery schema and packet wire format are unchanged.
+stores one enum. Its numeric binary encoding is unchanged; the separate 4.2.0
+identity/header migration still requires the coordinated rebuild described above.

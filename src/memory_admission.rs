@@ -16,6 +16,10 @@ pub type MemoryAdmissionProbe = extern "C" fn(usize, usize) -> bool;
 pub type MemoryAdmissionProbeV2 = extern "C" fn(usize, usize, u32) -> bool;
 pub const WORK_GENERAL: u32 = 0;
 pub const WORK_CACHED_TRANSIT: u32 = 1;
+/// Small, CRC-validated, uncompressed reliable traffic with known fixed byte shape
+/// and protected queue priority. Estimates are unchanged; an application may
+/// reserve less idle headroom for this work than for ordinary data/schema work.
+pub const WORK_SMALL_PROTECTED: u32 = 2;
 static PROBE_V2: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static PROBE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static REJECTED: AtomicUsize = AtomicUsize::new(0);
@@ -103,29 +107,65 @@ pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
     }
     // Keep smaller admission for ACKs that release replay buffers and short
     // discovery keepalives that preserve the return path. Side wrappers are classified after their header is decoded.
-    let ack = crate::wire_format::peek_routing_frame_info(bytes)
-        .ok()
-        .is_some_and(|frame| {
-            frame.ack_only()
-                || matches!(
-                    frame.envelope.ty,
-                    crate::DataType::ReliableAck
-                        | crate::DataType::ReliablePartialAck
-                        | crate::DataType::DiscoveryAnnounce
+    let frame = crate::wire_format::peek_routing_frame_info(bytes).ok();
+    let ack = frame.as_ref().is_some_and(|frame| {
+        frame.ack_only()
+            || matches!(
+                frame.envelope.ty,
+                crate::DataType::ReliableAck
+                    | crate::DataType::ReliablePartialAck
+                    | crate::DataType::DiscoveryAnnounce
+            )
+    });
+    if !ack
+        && supports_work_kinds()
+        && bytes.len() <= 128
+        && bytes.first().is_some_and(|flags| flags & 0x11 == 0)
+        && frame.as_ref().is_some_and(|frame| {
+            let Some(meta) = crate::config::try_get_message_meta(frame.envelope.ty) else {
+                return false;
+            };
+            let crate::MessageElement::Static(count, crate::MessageDataType::UInt8, _) =
+                meta.element
+            else {
+                return false;
+            };
+            meta.priority >= 200
+                && frame.reliable.is_some()
+                && count <= 16
+                && matches!(
+                    frame.envelope.wire_shape,
+                    None | Some(crate::MessageElement::Static(
+                        0..=16,
+                        crate::MessageDataType::UInt8,
+                        _
+                    ))
                 )
-        });
+                && bytes.get(1).is_some_and(|count| *count <= 3)
+                && frame.envelope.target_senders().len() <= 3
+        })
+    {
+        // Keep the complete conservative allocation estimate. This is a
+        // scheduling classification, never permission to skip normal decoding.
+        return check_frame_kind(bytes.len(), false, WORK_SMALL_PROTECTED);
+    }
     check_frame(bytes.len(), ack)
 }
 
 pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {
+    check_frame_kind(len, ack, WORK_GENERAL)
+}
+#[inline(never)]
+fn check_frame_kind(len: usize, ack: bool, work: u32) -> TelemetryResult<()> {
     // Only small control frames use reserved headroom. An oversized
     // or malformed control frame must not bypass ordinary allocation admission.
     if ack && len <= 128 {
         check(512, len.saturating_add(32))
     } else {
-        check(
+        check_work(
             len.saturating_mul(3).saturating_add(2048),
             len.saturating_add(32),
+            work,
         )
     }
 }

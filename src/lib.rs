@@ -187,6 +187,7 @@ mod small_payload;
 mod small_sort;
 #[cfg(feature = "timesync")]
 pub mod timesync;
+mod varint;
 pub mod wire_format;
 // ============================================================================
 //  Schema-derived global constants
