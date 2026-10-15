@@ -1,6 +1,6 @@
 [package]
 name = "sedsnet_macros"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
 description = "Compile-time helper macros for SEDSnet embedded configuration."
@@ -14,8 +14,8 @@ categories = ["embedded", "no-std"]
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1.0.106"
-quote = "1.0.45"
-syn = { version = "2.0.117", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "3.0.9", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

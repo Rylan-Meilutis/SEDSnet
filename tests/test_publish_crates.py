@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,7 +23,8 @@ class PublishCratesTests(unittest.TestCase):
                 if exact_version_available:
                     expected.append(publish_crates.MAIN_MANIFEST)
                 self.assertEqual([call.args[0] for call in publish.call_args_list], expected)
-                version.assert_any_call("sedsnet_macros", "2.1.0")
+                version.assert_any_call("sedsnet_macros", tomllib.loads(
+                    publish_crates.MACROS_MANIFEST.read_text())["package"]["version"])
 
     def test_pypi_artifacts_from_dir_finds_nested_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

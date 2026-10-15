@@ -190,6 +190,10 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.2.1 highlights
+
+- Refresh CRC32, JSON, Zstd and Python bindings to current compatible versions; use Syn 3 and macro crate 2.1.1. PyO3 stays on 0.29.3 to retain Python 3.8 support. Wire format and application APIs are unchanged.
+
 ### Version 4.2.0 highlights
 
 - Use one reliability enum (`Off`, `Ordered`, `Unordered`) throughout schema loading, code generation, bindings and the editor; macros update to 2.1.0.

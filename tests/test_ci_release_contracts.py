@@ -37,7 +37,7 @@ class CiReleaseContracts(unittest.TestCase):
 
     def test_release_upload_is_safe_to_retry_after_manual_publication(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("skip-existing: true", workflow)
+        self.assertEqual(workflow.count("skip-existing: true"), 1)
 
     def test_gitlab_tags_run_the_same_publish_gate(self) -> None:
         workflow = (REPO_ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")

@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.2.1
+
+- Refresh CRC32, Serde JSON, Zstd bindings, proc-macro parsing and Python binding dependencies. Update Syn to 3 and the macro crate to 2.1.1. Keep PyO3 on the newest 0.29 patch because 0.30 removes the promised Python 3.8 ABI. No wire or application API changes.
+
 ## 4.2.0
 
 - Decode ULEB128 with native-width shifts on 32-bit targets, avoiding variable
