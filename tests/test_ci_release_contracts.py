@@ -35,6 +35,10 @@ class CiReleaseContracts(unittest.TestCase):
             publisher,
         )
 
+    def test_release_upload_is_safe_to_retry_after_manual_publication(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("skip-existing: true", workflow)
+
     def test_gitlab_tags_run_the_same_publish_gate(self) -> None:
         workflow = (REPO_ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
         self.assertIn("$CI_COMMIT_TAG =~ /^v/", workflow)

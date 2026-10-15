@@ -844,7 +844,7 @@ def main() -> int:
             )
             return 0
         else:
-            if not cargo_search(macro_name):
+            if not crate_version_exists(macro_name, macro_version):
                 print(
                     "\nSkipping main crate dry-run publish because crates.io cannot resolve "
                     f"{macro_name} v{macro_version} until it is actually published."
@@ -855,7 +855,7 @@ def main() -> int:
                     f"\n{macro_name} is already visible in crates.io; dry-running main crate too."
                 )
 
-        if args.publish or cargo_search(macro_name):
+        if args.publish or crate_version_exists(macro_name, macro_version):
             if not args.skip_package:
                 cargo_package(MAIN_MANIFEST, allow_dirty=args.allow_dirty)
 

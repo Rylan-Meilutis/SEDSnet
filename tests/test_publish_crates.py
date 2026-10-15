@@ -9,6 +9,21 @@ import publish_crates
 
 
 class PublishCratesTests(unittest.TestCase):
+    def test_dry_run_requires_the_exact_macro_version_before_main_package(self) -> None:
+        for exact_version_available in (False, True):
+            with self.subTest(available=exact_version_available), \
+                 mock.patch.object(sys, "argv", ["publish_crates.py", "--skip-tests", "--skip-package"]), \
+                 mock.patch.object(publish_crates, "require_clean_tree"), \
+                 mock.patch.object(publish_crates, "cargo_search", return_value=True), \
+                 mock.patch.object(publish_crates, "crate_version_exists", return_value=exact_version_available) as version, \
+                 mock.patch.object(publish_crates, "cargo_publish", return_value=publish_crates.PUBLISH_DRY_RUN_OK) as publish:
+                self.assertEqual(publish_crates.main(), 0)
+                expected = [publish_crates.MACROS_MANIFEST]
+                if exact_version_available:
+                    expected.append(publish_crates.MAIN_MANIFEST)
+                self.assertEqual([call.args[0] for call in publish.call_args_list], expected)
+                version.assert_any_call("sedsnet_macros", "2.1.0")
+
     def test_pypi_artifacts_from_dir_finds_nested_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
