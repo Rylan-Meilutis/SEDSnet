@@ -56,6 +56,7 @@ def run_python_system_suite() -> SystemSuiteResult:
 
     ground = seds.Router(
         hostname="py-system-ground",
+        handlers=[(radio, lambda packet: None, None)],
         address_mode=2,
         requested_address=0x400001,
         timesync_enabled=True,
@@ -77,6 +78,7 @@ def run_python_system_suite() -> SystemSuiteResult:
     )
     payload = seds.Router(
         hostname="py-system-payload",
+        handlers=[(storage, lambda packet: None, None)],
         address_mode=0,
         timesync_enabled=True,
         timesync_role=0,

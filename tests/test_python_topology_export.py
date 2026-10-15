@@ -35,6 +35,18 @@ class PythonTopologyExportTests(unittest.TestCase):
             payload,
         )
 
+    def publish_peer_topology(self, receive) -> None:
+        # An empty legacy announce proves liveness, not receipt of a topology
+        # graph. Exercise the production full-snapshot builder for graph tests.
+        packets = []
+        peer = seds.Router(hostname="REMOTE_NODE")
+        peer.add_side_packet("test-wire", packets.append)
+        peer.announce_discovery()
+        peer.process_all_queues()
+        self.assertTrue(packets)
+        for packet in packets:
+            receive(packet)
+
     def assert_topology_shape(self, topology: dict, local_sender: str) -> None:
         self.assertIn("routers", topology)
         self.assertIn("routes", topology)
@@ -163,14 +175,14 @@ class PythonTopologyExportTests(unittest.TestCase):
     def test_router_export_topology_exposes_graph_shape(self) -> None:
         router = seds.Router()
         side_id = router.add_side_packet("UPLINK", lambda pkt: None)
-        router.receive_packet_from_side(side_id, self.make_discovery_announce("REMOTE_NODE"))
+        self.publish_peer_topology(lambda packet: router.receive_packet_from_side(side_id, packet))
 
         self.assert_topology_shape(router.export_topology(), "TEST_PLATFORM")
 
     def test_relay_export_topology_exposes_graph_shape(self) -> None:
         relay = seds.Relay()
         side_id = relay.add_side_packet("UPLINK", lambda pkt: None)
-        relay.rx_packet_from_side(side_id, self.make_discovery_announce("REMOTE_NODE"))
+        self.publish_peer_topology(lambda packet: relay.rx_packet_from_side(side_id, packet))
         relay.process_all_queues()
 
         self.assert_topology_shape(relay.export_topology(), "RELAY")

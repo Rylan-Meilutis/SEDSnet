@@ -32,7 +32,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
 use std::collections::BTreeMap;
-use std::sync::{Arc as SArc, Mutex, OnceLock};
+use std::sync::{Arc as SArc, OnceLock};
 
 #[cfg(feature = "timesync")]
 use crate::timesync::{TimeSyncConfig, TimeSyncRole};
@@ -61,7 +61,7 @@ use crate::{
     wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
 };
 
-static GLOBAL_ROUTER_SINGLETON: OnceLock<SArc<Mutex<Router>>> = OnceLock::new();
+static GLOBAL_ROUTER_SINGLETON: OnceLock<SArc<Router>> = OnceLock::new();
 type EndpointHandlerBundle = (Vec<EndpointHandler>, Vec<Py<PyAny>>, Vec<Py<PyAny>>);
 
 // ===========================================================================
@@ -323,14 +323,11 @@ fn normalize_f32_payload_for_type(ty: DataType, vals: &mut Vec<f32>) -> PyResult
     Ok(())
 }
 
-fn with_router_lock<T>(
-    inner: &SArc<Mutex<Router>>,
+fn with_router<T>(
+    inner: &SArc<Router>,
     f: impl FnOnce(&Router) -> TelemetryResult<T>,
 ) -> PyResult<T> {
-    let rtr = inner
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
-    f(&rtr).map_err(py_err_from)
+    f(inner.as_ref()).map_err(py_err_from)
 }
 
 fn dispatch_log_slice<T: LeBytes + Copy>(
@@ -983,13 +980,14 @@ impl Clock for PyClock {
 
 /// Python-visible router wrapper.
 ///
-/// The underlying `Router` is protected by a `Mutex` for host-side
-/// concurrency. Python callbacks for TX, packet handlers, and
-/// packed handlers are kept alive in this object.
+/// The underlying `Router` provides its own thread-safe internal locking.
+/// Do not hold a wrapper mutex across callbacks: Python callbacks may inspect
+/// the originating router or synchronously deliver replies through it.
+/// Python callbacks are kept alive in this object.
 #[pyclass(name = "Router")]
 pub struct PyRouter {
-    // Host-side concurrency: protect the Router with a Mutex and share via Arc.
-    inner: SArc<Mutex<Router>>,
+    // Share the internally synchronized router without serializing callbacks.
+    inner: SArc<Router>,
     _pkt_cbs: Vec<Py<PyAny>>,
     _ser_cbs: Vec<Py<PyAny>>,
     _side_cbs: Vec<Option<Py<PyAny>>>,
@@ -1110,7 +1108,7 @@ impl PyRouter {
             queue_grow_step,
         )?;
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
-        let arc = SArc::new(Mutex::new(router));
+        let arc = SArc::new(router);
 
         GLOBAL_ROUTER_SINGLETON
             .set(arc.clone())
@@ -1198,7 +1196,7 @@ impl PyRouter {
         let router = build_router_with_optional_clock(py, cfg, now_keep.as_ref());
 
         Ok(Self {
-            inner: SArc::new(Mutex::new(router)),
+            inner: SArc::new(router),
             _pkt_cbs: keep_pkt,
             _ser_cbs: keep_ser,
             _side_cbs: Vec::new(),
@@ -1209,18 +1207,12 @@ impl PyRouter {
 
     #[getter]
     fn sender_id(&self) -> PyResult<String> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         Ok(rtr.sender().to_string())
     }
 
     fn set_sender_id(&self, sender_id: &str) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_sender(sender_id);
         Ok(())
     }
@@ -1229,10 +1221,7 @@ impl PyRouter {
     /// restores topology-based election; time-sync leadership is unchanged.
     #[pyo3(signature = (hostname=None))]
     fn set_preferred_discovery_master(&self, hostname: Option<&str>) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_preferred_discovery_master(hostname);
         Ok(())
     }
@@ -1253,28 +1242,19 @@ impl PyRouter {
             }),
             _ => return Err(PyValueError::new_err("bad address_mode")),
         };
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_address_assignment(mode).map_err(py_err_from)?;
         Ok(())
     }
 
     #[getter]
     fn current_address(&self) -> PyResult<u32> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         Ok(rtr.current_address())
     }
 
     fn resolve_hostname(&self, py: Python<'_>, hostname: &str) -> PyResult<Option<Py<PyAny>>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         let Some(entry) = rtr.resolve_hostname(hostname) else {
             return Ok(None);
         };
@@ -1295,10 +1275,7 @@ impl PyRouter {
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let bytes: &[u8] = payload.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.send_p2p_to_hostname(hostname, dst_port, src_port, bytes)
             .map_err(py_err_from)
     }
@@ -1311,10 +1288,7 @@ impl PyRouter {
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let bytes: &[u8] = payload.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.send_p2p_to_address(address, dst_port, src_port, bytes)
             .map_err(py_err_from)
     }
@@ -1322,10 +1296,7 @@ impl PyRouter {
     fn bind_p2p_port(&mut self, py: Python<'_>, port: u16, callback: Py<PyAny>) -> PyResult<()> {
         let cb_keep = callback.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.bind_p2p_port(port, move |msg| {
             Python::attach(|py| {
                 let meta = PyDict::new(py);
@@ -1353,10 +1324,7 @@ impl PyRouter {
     }
 
     fn clear_p2p_port(&self, port: u16) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_p2p_port(port);
         Ok(())
     }
@@ -1369,10 +1337,7 @@ impl PyRouter {
     ) -> PyResult<()> {
         let cb_keep = callback.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.bind_p2p_stream_port(port, move |event| {
             Python::attach(|py| {
                 let meta = PyDict::new(py);
@@ -1408,10 +1373,7 @@ impl PyRouter {
     }
 
     fn clear_p2p_stream_port(&self, port: u16) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_p2p_stream_port(port);
         Ok(())
     }
@@ -1422,10 +1384,7 @@ impl PyRouter {
         dst_port: u16,
         src_port: u16,
     ) -> PyResult<u32> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.open_p2p_stream_to_hostname(hostname, dst_port, src_port)
             .map_err(py_err_from)
     }
@@ -1436,36 +1395,24 @@ impl PyRouter {
         dst_port: u16,
         src_port: u16,
     ) -> PyResult<u32> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.open_p2p_stream_to_address(address, dst_port, src_port)
             .map_err(py_err_from)
     }
 
     fn send_p2p_stream(&self, stream_id: u32, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = payload.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.send_p2p_stream(stream_id, bytes).map_err(py_err_from)
     }
 
     fn close_p2p_stream(&self, stream_id: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.close_p2p_stream(stream_id).map_err(py_err_from)
     }
 
     fn reset_p2p_stream(&self, stream_id: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.reset_p2p_stream(stream_id).map_err(py_err_from)
     }
 
@@ -1484,10 +1431,7 @@ impl PyRouter {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
 
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
 
         let opts = RouterSideOptions {
             reliable_enabled,
@@ -1543,10 +1487,7 @@ impl PyRouter {
             compact_header_target_bytes,
             max_side_transport_templates,
         );
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         let id = rtr.add_side_packed_with_options(
             name,
             move |bytes| {
@@ -1581,10 +1522,7 @@ impl PyRouter {
         let cb_keep = tx.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
 
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
 
         let opts = RouterSideOptions {
             reliable_enabled,
@@ -1620,10 +1558,7 @@ impl PyRouter {
     }
 
     fn remove_side(&mut self, side_id: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.remove_side(side_id as usize).map_err(py_err_from)?;
         if let Some(slot) = self._side_cbs.get_mut(side_id as usize) {
             *slot = None;
@@ -1632,28 +1567,19 @@ impl PyRouter {
     }
 
     fn set_side_ingress_enabled(&self, side_id: u32, enabled: bool) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_side_ingress_enabled(side_id as usize, enabled)
             .map_err(py_err_from)
     }
 
     fn set_side_egress_enabled(&self, side_id: u32, enabled: bool) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_side_egress_enabled(side_id as usize, enabled)
             .map_err(py_err_from)
     }
 
     fn set_route(&self, src_side_id: Option<u32>, dst_side_id: u32, enabled: bool) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_route(
             src_side_id.map(|id| id as usize),
             dst_side_id as usize,
@@ -1663,10 +1589,7 @@ impl PyRouter {
     }
 
     fn clear_route(&self, src_side_id: Option<u32>, dst_side_id: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_route(src_side_id.map(|id| id as usize), dst_side_id as usize)
             .map_err(py_err_from)
     }
@@ -1678,10 +1601,7 @@ impl PyRouter {
         dst_side_id: u32,
         enabled: bool,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_typed_route(
             src_side_id.map(|id| id as usize),
             dtype_from_u32(ty).map_err(py_err_from)?,
@@ -1697,10 +1617,7 @@ impl PyRouter {
         ty: u32,
         dst_side_id: u32,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_typed_route(
             src_side_id.map(|id| id as usize),
             dtype_from_u32(ty).map_err(py_err_from)?,
@@ -1716,19 +1633,13 @@ impl PyRouter {
             2 => RouteSelectionMode::Failover,
             _ => return Err(PyValueError::new_err("invalid route selection mode")),
         };
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_source_route_mode(src_side_id.map(|id| id as usize), mode)
             .map_err(py_err_from)
     }
 
     fn clear_source_route_mode(&self, src_side_id: Option<u32>) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_source_route_mode(src_side_id.map(|id| id as usize))
             .map_err(py_err_from)
     }
@@ -1739,10 +1650,7 @@ impl PyRouter {
         dst_side_id: u32,
         weight: u32,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_route_weight(
             src_side_id.map(|id| id as usize),
             dst_side_id as usize,
@@ -1752,10 +1660,7 @@ impl PyRouter {
     }
 
     fn clear_route_weight(&self, src_side_id: Option<u32>, dst_side_id: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_route_weight(src_side_id.map(|id| id as usize), dst_side_id as usize)
             .map_err(py_err_from)
     }
@@ -1766,10 +1671,7 @@ impl PyRouter {
         dst_side_id: u32,
         priority: u32,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_route_priority(
             src_side_id.map(|id| id as usize),
             dst_side_id as usize,
@@ -1779,10 +1681,7 @@ impl PyRouter {
     }
 
     fn clear_route_priority(&self, src_side_id: Option<u32>, dst_side_id: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.clear_route_priority(src_side_id.map(|id| id as usize), dst_side_id as usize)
             .map_err(py_err_from)
     }
@@ -1794,10 +1693,7 @@ impl PyRouter {
     fn transmit_message(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
         let pkt_ref: PyRef<PyPacket> = packet.extract()?;
 
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
 
         rtr.tx(pkt_ref.inner.clone()).map_err(py_err_from)
     }
@@ -1805,10 +1701,7 @@ impl PyRouter {
     fn transmit_message_queue(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
         let pkt_ref: PyRef<PyPacket> = packet.extract()?;
 
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
 
         rtr.tx_queue(pkt_ref.inner.clone()).map_err(py_err_from)
     }
@@ -1817,10 +1710,7 @@ impl PyRouter {
         let bytes: &[u8] = data.extract()?;
         let arc: AArc<[u8]> = AArc::from(bytes);
 
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
 
         rtr.tx_packed(arc).map_err(py_err_from)
     }
@@ -1833,29 +1723,20 @@ impl PyRouter {
         let bytes: &[u8] = data.extract()?;
         let arc: AArc<[u8]> = AArc::from(bytes);
 
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
 
         rtr.tx_packed_queue(arc).map_err(py_err_from)
     }
 
     fn receive_packed(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_packed(bytes).map_err(py_err_from)
     }
 
     fn receive_packet(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
         let pkt_ref: PyRef<PyPacket> = packet.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx(&pkt_ref.inner).map_err(py_err_from)
     }
 
@@ -1870,29 +1751,20 @@ impl PyRouter {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_packed_from_side(bytes, side_id as usize)
             .map_err(py_err_from)
     }
 
     fn receive_packed_queue(&self, _py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_packed_queue(bytes).map_err(py_err_from)
     }
 
     fn receive_packet_queue(&self, _py: Python<'_>, packet: &Bound<'_, PyAny>) -> PyResult<()> {
         let pkt_ref: PyRef<PyPacket> = packet.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_queue(pkt_ref.inner.clone()).map_err(py_err_from)
     }
 
@@ -1903,10 +1775,7 @@ impl PyRouter {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let bytes: &[u8] = data.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_packed_queue_from_side(bytes, side_id as usize)
             .map_err(py_err_from)
     }
@@ -1918,10 +1787,7 @@ impl PyRouter {
         packet: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let pkt_ref: PyRef<PyPacket> = packet.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_from_side(&pkt_ref.inner, side_id as usize)
             .map_err(py_err_from)
     }
@@ -1933,10 +1799,7 @@ impl PyRouter {
         packet: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let pkt_ref: PyRef<PyPacket> = packet.extract()?;
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.rx_queue_from_side(pkt_ref.inner.clone(), side_id as usize)
             .map_err(py_err_from)
     }
@@ -1958,7 +1821,7 @@ impl PyRouter {
         let mut buf: Vec<u8> = data.extract::<&[u8]>()?.to_vec();
 
         normalize_u8_payload_for_type(ty, &mut buf);
-        with_router_lock(&self.inner, |rtr| {
+        with_router(&self.inner, |rtr| {
             dispatch_log_slice::<u8>(rtr, ty, timestamp_ms, queue, &buf)
         })
     }
@@ -1976,7 +1839,7 @@ impl PyRouter {
         let mut vals: Vec<f32> = values.extract()?;
 
         normalize_f32_payload_for_type(ty, &mut vals)?;
-        with_router_lock(&self.inner, |rtr| {
+        with_router(&self.inner, |rtr| {
             dispatch_log_slice::<f32>(rtr, ty, timestamp_ms, queue, &vals)
         })
     }
@@ -2025,7 +1888,7 @@ impl PyRouter {
         let ts = timestamp_ms;
 
         if elem_size == 1 && elem_kind == EK_UNSIGNED {
-            return with_router_lock(&self.inner, |rtr| {
+            return with_router(&self.inner, |rtr| {
                 dispatch_log_slice::<u8>(rtr, ty, ts, queue, &bytes)
             });
         }
@@ -2041,7 +1904,7 @@ impl PyRouter {
                 let mut v: Vec<$T> = Vec::with_capacity(cnt);
                 vectorize_data::<$T>(bytes.as_ptr(), cnt, elem_size, &mut v)
                     .map_err(|_| PyValueError::new_err("vectorize failed"))?;
-                with_router_lock(&self.inner, |rtr| {
+                with_router(&self.inner, |rtr| {
                     dispatch_log_slice::<$T>(rtr, ty, ts, queue, &v)
                 })
             }};
@@ -2068,10 +1931,7 @@ impl PyRouter {
 
     #[cfg(feature = "timesync")]
     fn poll_timesync(&self) -> PyResult<bool> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.poll_timesync().map_err(py_err_from)
     }
 
@@ -2104,10 +1964,7 @@ impl PyRouter {
             2 => TimeSyncRole::Auto,
             _ => return Err(PyValueError::new_err("bad timesync role")),
         };
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         if enabled {
             rtr.set_timesync_config(Some(TimeSyncConfig {
                 role,
@@ -2126,46 +1983,31 @@ impl PyRouter {
 
     #[cfg(feature = "discovery")]
     fn announce_discovery(&self) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.announce_discovery().map_err(py_err_from)
     }
 
     #[cfg(feature = "discovery")]
     fn announce_leave(&self) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.announce_leave().map_err(py_err_from)
     }
 
     #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.poll_discovery().map_err(py_err_from)
     }
 
     #[cfg(feature = "discovery")]
     fn export_topology(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         topology_snapshot_to_pydict(py, rtr.export_topology())
     }
 
     #[cfg(feature = "discovery")]
     fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.client_stats(sender_id)
             .map(|stats| client_stats_snapshot_to_pydict(py, stats))
             .transpose()
@@ -2173,19 +2015,13 @@ impl PyRouter {
 
     #[cfg(feature = "discovery")]
     fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         runtime_stats_snapshot_to_pydict(py, rtr.export_runtime_stats())
     }
 
     #[cfg(feature = "discovery")]
     fn enable_network_variable(&self, ty: u32, can_read: bool, can_write: bool) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.enable_network_variable(
             DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
             NetworkVariablePermissions {
@@ -2205,10 +2041,7 @@ impl PyRouter {
     ) -> PyResult<()> {
         let cb_keep = callback.clone_ref(py);
         let cb_for_closure = cb_keep.clone_ref(py);
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.on_network_variable_update(
             DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
             move |pkt: &Packet| {
@@ -2232,30 +2065,21 @@ impl PyRouter {
 
     #[cfg(feature = "discovery")]
     fn set_network_variable(&self, pkt: &PyPacket) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_network_variable(pkt.inner.clone())
             .map_err(py_err_from)
     }
 
     #[cfg(feature = "discovery")]
     fn seed_managed_variable(&self, pkt: &PyPacket) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.seed_managed_variable(pkt.inner.clone())
             .map_err(py_err_from)
     }
 
     #[cfg(feature = "discovery")]
     fn request_managed_variable(&self, ty: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.request_managed_variable(
             DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
         )
@@ -2268,10 +2092,7 @@ impl PyRouter {
         ty: u32,
         stale_after_ms: Option<u64>,
     ) -> PyResult<Option<PyPacket>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         Ok(rtr
             .get_network_variable(
                 DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
@@ -2283,10 +2104,7 @@ impl PyRouter {
 
     #[cfg(feature = "discovery")]
     fn cached_network_variable(&self, ty: u32) -> PyResult<Option<PyPacket>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         Ok(rtr
             .get_cached_network_variable(
                 DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
@@ -2296,28 +2114,19 @@ impl PyRouter {
     }
 
     fn export_memory_layout_json(&self) -> PyResult<String> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         Ok(rtr.export_memory_layout_json())
     }
 
     #[cfg(feature = "timesync")]
     fn network_time_ms(&self) -> PyResult<Option<u64>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         Ok(rtr.network_time_ms())
     }
 
     #[cfg(feature = "timesync")]
     fn network_time(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         let Some(reading) = rtr.network_time() else {
             return Ok(None);
         };
@@ -2371,10 +2180,7 @@ impl PyRouter {
         second: Option<u8>,
         nanosecond: Option<u32>,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_time(crate::timesync::PartialNetworkTime {
             year,
             month,
@@ -2389,30 +2195,21 @@ impl PyRouter {
 
     #[cfg(feature = "timesync")]
     fn set_local_network_date(&self, year: i32, month: u8, day: u8) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_date(year, month, day);
         Ok(())
     }
 
     #[cfg(feature = "timesync")]
     fn set_local_network_time_hm(&self, hour: u8, minute: u8) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_time_hm(hour, minute);
         Ok(())
     }
 
     #[cfg(feature = "timesync")]
     fn set_local_network_time_hms(&self, hour: u8, minute: u8, second: u8) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_time_hms(hour, minute, second);
         Ok(())
     }
@@ -2425,10 +2222,7 @@ impl PyRouter {
         second: u8,
         millisecond: u16,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_time_hms_millis(hour, minute, second, millisecond);
         Ok(())
     }
@@ -2441,10 +2235,7 @@ impl PyRouter {
         second: u8,
         nanosecond: u32,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_time_hms_nanos(hour, minute, second, nanosecond);
         Ok(())
     }
@@ -2459,10 +2250,7 @@ impl PyRouter {
         minute: u8,
         second: u8,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_datetime(year, month, day, hour, minute, second);
         Ok(())
     }
@@ -2479,10 +2267,7 @@ impl PyRouter {
         second: u8,
         millisecond: u16,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_datetime_millis(year, month, day, hour, minute, second, millisecond);
         Ok(())
     }
@@ -2499,10 +2284,7 @@ impl PyRouter {
         second: u8,
         nanosecond: u32,
     ) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.set_local_network_datetime_nanos(year, month, day, hour, minute, second, nanosecond);
         Ok(())
     }
@@ -2512,87 +2294,57 @@ impl PyRouter {
     // ------------------------------------------------------------------------
 
     fn process_send_queue(&self) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.process_tx_queue().map_err(py_err_from)
     }
 
     fn process_received_queue(&self) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.process_rx_queue().map_err(py_err_from)
     }
 
     fn process_all_queues(&self) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.process_all_queues().map_err(py_err_from)
     }
 
     fn clear_rx_queue(&self) {
-        if let Ok(r) = self.inner.lock() {
-            r.clear_rx_queue();
-        }
+        self.inner.clear_rx_queue();
     }
 
     fn clear_tx_queue(&self) {
-        if let Ok(r) = self.inner.lock() {
-            r.clear_tx_queue();
-        }
+        self.inner.clear_tx_queue();
     }
 
     fn clear_queues(&self) {
-        if let Ok(r) = self.inner.lock() {
-            r.clear_queues();
-        }
+        self.inner.clear_queues();
     }
 
     fn process_tx_queue_with_timeout(&self, timeout_ms: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.process_tx_queue_with_timeout(timeout_ms)
             .map_err(py_err_from)
     }
 
     fn process_rx_queue_with_timeout(&self, timeout_ms: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.process_rx_queue_with_timeout(timeout_ms)
             .map_err(py_err_from)
     }
 
     fn process_all_queues_with_timeout(&self, timeout_ms: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.process_all_queues_with_timeout(timeout_ms)
             .map_err(py_err_from)
     }
 
     fn periodic(&self, timeout_ms: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.periodic(timeout_ms).map_err(py_err_from)
     }
 
     fn periodic_no_timesync(&self, timeout_ms: u32) -> PyResult<()> {
-        let rtr = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("router poisoned"))?;
+        let rtr = self.inner.as_ref();
         rtr.periodic_no_timesync(timeout_ms).map_err(py_err_from)
     }
 }

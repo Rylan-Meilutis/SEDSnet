@@ -2,6 +2,8 @@
 
 ## 4.2.0
 
+- Share the internally synchronized Rust Router directly in Python instead of holding an additional mutex across callbacks. A callback can inspect its originating router or deliver a synchronous reply without deadlocking. A bounded subprocess regression times out against the old wheel and passes after repair; the installed Python system suite exercises the real callback/endpoint/discovery path. Expose canonical endpoint/type identity helpers in Python and include matching type stubs.
+
 - Restore reliable data retry forwarding after return-route cache churn in both Router and Relay. Relearning an evicted route must not restart the replay timer while RX deduplication still retains the packet. Packet and packed regressions reproduce the suppression before repair and verify retry delivery plus immediate-echo suppression afterward.
 
 - Honor the selected external bundled-schema file in combined hosted/embedded builds, matching no_std generation. Process-isolated tests cover hosted, fileless embedded, and hosted-plus-embedded producers/receivers in both directions.
