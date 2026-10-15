@@ -447,7 +447,7 @@ fn clear_queues_prevents_further_processing() {
     // Clearing should drop both queues before any processing.
     r.clear_queues();
 
-    r.process_all_queues().unwrap();
+    r.drain_queues_with_timeout(0).unwrap();
     assert_eq!(
         tx_count.load(Ordering::SeqCst),
         0,

@@ -15,17 +15,23 @@ pub trait ByteCost {
 /// Convert float multiplier to ratio (num, den).
 #[inline]
 fn float_to_ratio(mult: f64) -> (usize, usize) {
-    // Clamp to sane range
-    let mult = mult.clamp(1.01, 16.0);
-
     const DEN: usize = 1024;
-
-    // Convert using truncation + guarantee progress
-    let num = (mult * DEN as f64) as usize;
-
-    // Ensure strictly > 1.0 growth
-    let num = num.max(DEN + 1);
-
+    // Multiplication by 1024 changes only the binary exponent. Decode the
+    // bounded positive range directly instead of linking software f64 math
+    // on Cortex-M. Preserve the former clamp/truncation and NaN behavior.
+    if mult.is_nan() {
+        return (DEN + 1, DEN);
+    }
+    let bits = mult.to_bits();
+    let num = if bits >> 63 != 0 || bits < 1.01f64.to_bits() {
+        1034
+    } else if bits >= 16.0f64.to_bits() {
+        16 * DEN
+    } else {
+        let exponent = ((bits >> 52) & 0x7ff) as u32 - 1023;
+        let significand = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+        (significand >> (42 - exponent)) as usize
+    };
     (num, DEN)
 }
 
@@ -33,8 +39,8 @@ fn float_to_ratio(mult: f64) -> (usize, usize) {
 ///
 /// Policy:
 /// - Byte budget is enforced by evicting from the front until the new item fits.
-/// - Element capacity is a **hard cap**: the underlying `VecDeque` is pre-allocated
-///   to `max_elems` and we never call `reserve*`, so it will not grow.
+/// - `max_elems` is a hard cap. Fixed queues keep their initial allocation;
+///   dynamic queues grow fallibly and reuse a slot if growth is refused.
 /// - When the ring is full, we evict one item from the front before pushing.
 /// - `cur_bytes` is kept consistent for *all* removal paths.
 #[derive(Debug)]
@@ -66,8 +72,39 @@ impl<T: Clone> Clone for BoundedDeque<T> {
     }
 }
 
+// Admit queue storage before allocation. Fragmented board startup may fit a
+// smaller fixed ring even when the requested full compact ring cannot fit.
+#[inline(never)]
+fn admitted_initial_capacity(mut capacity: usize, item_bytes: usize) -> usize {
+    while capacity != 0 {
+        // The constructor bounds capacity by max_bytes / item_bytes;
+        // retry only halves it, so multiplication cannot overflow.
+        let bytes = (capacity * item_bytes).saturating_add(64);
+        if crate::memory_admission::check(bytes, bytes).is_ok() {
+            return capacity;
+        }
+        capacity /= 2;
+    }
+    0
+}
+
+fn allocate_initial_ring<T>(mut capacity: usize, item_bytes: usize) -> VecDeque<T> {
+    let mut ring = VecDeque::new();
+    loop {
+        capacity = admitted_initial_capacity(capacity, item_bytes);
+        if capacity == 0 || ring.try_reserve_exact(capacity).is_ok() {
+            break;
+        }
+        capacity /= 2;
+    }
+    ring
+}
+
 impl<T: ByteCost> BoundedDeque<T> {
     fn prepare_push_fifo(&mut self, cost: usize) -> TelemetryResult<()> {
+        if self.q.capacity() == 0 {
+            return Err(TelemetryError::Io("queue unavailable"));
+        }
         if cost > self.max_bytes {
             return Err(TelemetryError::PacketTooLarge(
                 "Item exceeds maximum byte budget",
@@ -82,7 +119,10 @@ impl<T: ByteCost> BoundedDeque<T> {
             let _ = self.pop_front();
         }
 
-        self.ensure_room_for_one();
+        if !self.ensure_room_for_one() {
+            // Reuse existing storage when allocator headroom refuses growth.
+            let _ = self.pop_front();
+        }
         Ok(())
     }
 
@@ -120,7 +160,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         let (grow_num, grow_den) = float_to_ratio(grow_mult);
 
         Self {
-            q: VecDeque::with_capacity(start_cap),
+            q: allocate_initial_ring(start_cap, min_cost),
             max_bytes,
             cur_bytes: 0,
             max_elems,
@@ -187,7 +227,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.max_elems
     }
 
-    /// Underlying `VecDeque` capacity (should stay == `max_elems`).
+    /// Underlying `VecDeque` capacity, bounded by `max_elems`.
     #[allow(dead_code)]
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -203,39 +243,57 @@ impl<T: ByteCost> BoundedDeque<T> {
 
     /// Pop in priority order while guaranteeing bounded service for an item
     /// already waiting at the lowest queued priority.
+    #[cfg(test)]
     pub fn pop_front_fair<F>(
         &mut self,
         priority_burst: &mut u8,
         max_priority_burst: u8,
-        mut priority_of: F,
+        priority_of: F,
     ) -> Option<T>
     where
         F: FnMut(&T) -> u8,
     {
-        let front_priority = self.q.front().map(&mut priority_of)?;
-        let lowest_priority = self
-            .q
-            .iter()
-            .map(&mut priority_of)
-            .min()
-            .unwrap_or(front_priority);
+        self.pop_front_fair_if(priority_burst, max_priority_burst, priority_of, |_| true)
+    }
 
-        if front_priority > lowest_priority && *priority_burst >= max_priority_burst {
-            let oldest_lowest = self
-                .q
-                .iter()
-                .position(|item| priority_of(item) == lowest_priority)
-                .expect("minimum queue priority must exist");
-            *priority_burst = 0;
-            self.remove_pos(oldest_lowest)
-        } else {
-            if front_priority > lowest_priority {
-                *priority_burst = priority_burst.saturating_add(1);
-            } else {
-                *priority_burst = 0;
+    /// Preserve priority fairness while leaving deferred work in owned storage.
+    pub(crate) fn pop_front_fair_if<F, G>(
+        &mut self,
+        priority_burst: &mut u8,
+        max_priority_burst: u8,
+        mut priority_of: F,
+        mut eligible: G,
+    ) -> Option<T>
+    where
+        F: FnMut(&T) -> u8,
+        G: FnMut(&T) -> bool,
+    {
+        let selected = {
+            let mut ready = self.q.iter().enumerate().filter(|(_, item)| eligible(item));
+            let (front, first) = ready.next()?;
+            let front_priority = priority_of(first);
+            let mut lowest = front;
+            let mut lowest_priority = front_priority;
+            for (index, item) in ready {
+                let priority = priority_of(item);
+                if priority < lowest_priority {
+                    lowest = index;
+                    lowest_priority = priority;
+                }
             }
-            self.pop_front()
-        }
+            if front_priority > lowest_priority && *priority_burst >= max_priority_burst {
+                *priority_burst = 0;
+                lowest
+            } else {
+                if front_priority > lowest_priority {
+                    *priority_burst = priority_burst.saturating_add(1);
+                } else {
+                    *priority_burst = 0;
+                }
+                front
+            }
+        };
+        self.remove_pos(selected)
     }
 
     /// Pop from back, updating byte count.
@@ -301,12 +359,12 @@ impl<T: ByteCost> BoundedDeque<T> {
     ///
     /// Multiplicative growth: new_cap = ceil(cap * grow_num / grow_den), capped at max_elems.
     /// Always guarantees progress by forcing target_cap >= cap + 1 when growing.
-    fn ensure_room_for_one(&mut self) {
+    fn ensure_room_for_one(&mut self) -> bool {
         let len = self.q.len();
         let cap = self.q.capacity();
 
         if len < cap {
-            return;
+            return true;
         }
 
         // A multiplier of exactly 1.0 deliberately disables live queue
@@ -314,19 +372,19 @@ impl<T: ByteCost> BoundedDeque<T> {
         // applies the existing priority/FIFO eviction policy when full.
         if self.fixed_capacity {
             let _ = self.pop_front();
-            return;
+            return true;
         }
 
         // Hard length cap: ring eviction.
         if len >= self.max_elems {
             let _ = self.pop_front();
-            return;
+            return true;
         }
 
         // If we've reached the cap (or allocator rounded capacity above it), don't grow.
         if cap >= self.max_elems {
             let _ = self.pop_front();
-            return;
+            return true;
         }
 
         // ---- multiplicative growth ----
@@ -349,19 +407,28 @@ impl<T: ByteCost> BoundedDeque<T> {
         // Reserve exactly the delta from current capacity to requested capacity.
         let add = target_cap.saturating_sub(cap);
         if add > 0 {
-            self.q.reserve_exact(add);
+            // Reallocation temporarily holds both old and new buffers. Probe
+            // the complete new allocation before touching the allocator, then
+            // use fallible reservation so fragmentation cannot trigger OOM.
+            let bytes = target_cap.saturating_mul(size_of::<T>()).saturating_add(32);
+            if crate::memory_admission::check(bytes, bytes).is_err()
+                || self.q.try_reserve_exact(add).is_err()
+            {
+                return false;
+            }
         } else {
             // Shouldn't happen due to max(cap+1), but keep it safe.
             let _ = self.pop_front();
         }
 
         debug_assert!(self.q.len() < self.q.capacity());
+        true
     }
 
     /// Push to back, evicting from front as needed to stay within byte budget.
     ///
     /// Guarantees:
-    /// - Never grows allocation beyond `max_elems` (no reserve calls; ring eviction).
+    /// - Never grows allocation beyond `max_elems`; refused growth reuses a slot.
     /// - Maintains `cur_bytes` consistency.
     #[allow(unused_mut)]
     pub fn push_back(&mut self, mut v: T) -> TelemetryResult<()> {
@@ -370,9 +437,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         let cost = v.byte_cost();
         self.prepare_push_fifo(cost)?;
 
-        // At this point, push cannot require a reallocation because:
-        // - capacity was pre-allocated to max_elems
-        // - len < max_elems (or we just evicted)
+        // The growth/eviction pass has already made a slot available.
         self.q.push_back(v);
         self.cur_bytes = self.cur_bytes.saturating_add(cost);
         Ok(())
@@ -389,6 +454,9 @@ impl<T: ByteCost> BoundedDeque<T> {
     {
         #[cfg(feature = "compact-packet-store")]
         v.park_for_queue()?;
+        if self.q.capacity() == 0 {
+            return Err(TelemetryError::Io("queue unavailable"));
+        }
         let cost = v.byte_cost();
         if cost > self.max_bytes {
             return Err(TelemetryError::PacketTooLarge(
@@ -427,7 +495,18 @@ impl<T: ByteCost> BoundedDeque<T> {
             let _ = self.pop_back();
         }
 
-        self.ensure_room_for_one();
+        if !self.ensure_room_for_one() {
+            // Preserve protected ACK ordering and higher-priority ownership
+            // when growing the backing ring is refused. Otherwise discard the
+            // lowest-priority item and admit into the already allocated slot.
+            let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
+            if tail_priority > new_priority
+                || (new_priority == 254 && tail_priority == new_priority)
+            {
+                return Err(TelemetryError::Io("priority queue saturated"));
+            }
+            let _ = self.pop_back();
+        }
 
         let insert_at = self
             .q
@@ -745,5 +824,213 @@ mod arena_queue_tests {
         drop(clone);
         drop(q);
         assert_eq!(store.stats().live_bytes, 0);
+    }
+}
+
+#[cfg(all(test, not(feature = "compact-packet-store")))]
+mod growth_tests {
+    use super::*;
+    struct Item {
+        id: u8,
+        cost: usize,
+        priority: u8,
+    }
+    impl ByteCost for Item {
+        fn byte_cost(&self) -> usize {
+            self.cost
+        }
+    }
+    extern "C" fn refuse_growth(_: usize, _: usize) -> bool {
+        false
+    }
+    struct ProbeReset;
+    impl Drop for ProbeReset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    #[test]
+    fn refused_growth_reuses_storage_without_evicting_protected_acks() {
+        let mut q = BoundedDeque::new(1024, size_of::<Item>(), 1.25);
+        assert_eq!(q.q.capacity(), 1);
+        q.push_back_prioritized(
+            Item {
+                id: 1,
+                cost: 17,
+                priority: 10,
+            },
+            |i| i.priority,
+        )
+        .unwrap();
+        crate::memory_admission::set_probe(Some(refuse_growth));
+        let _reset = ProbeReset;
+        q.push_back_prioritized(
+            Item {
+                id: 2,
+                cost: 19,
+                priority: 254,
+            },
+            |i| i.priority,
+        )
+        .unwrap();
+        assert_eq!(q.q.capacity(), 1);
+        assert_eq!(q.bytes_used(), 19);
+        assert_eq!(q.q.front().unwrap().id, 2);
+        assert!(
+            q.push_back_prioritized(
+                Item {
+                    id: 3,
+                    cost: 23,
+                    priority: 254
+                },
+                |i| i.priority
+            )
+            .is_err()
+        );
+        assert_eq!(q.bytes_used(), 19);
+        assert_eq!(q.q.front().unwrap().id, 2);
+        assert!(
+            q.push_back_prioritized(
+                Item {
+                    id: 4,
+                    cost: 23,
+                    priority: 10
+                },
+                |i| i.priority
+            )
+            .is_err()
+        );
+        assert_eq!(q.q.front().unwrap().id, 2);
+        crate::memory_admission::set_probe(None);
+        q.push_back_prioritized(
+            Item {
+                id: 5,
+                cost: 23,
+                priority: 254,
+            },
+            |i| i.priority,
+        )
+        .unwrap();
+        assert!(q.q.capacity() > 1);
+        assert_eq!(q.bytes_used(), 42);
+        assert_eq!(q.pop_front().unwrap().id, 2);
+        assert_eq!(q.pop_front().unwrap().id, 5);
+    }
+    #[test]
+    fn refused_fifo_growth_remains_bounded_and_recovers() {
+        let mut q = BoundedDeque::new(1024, size_of::<Item>(), 1.25);
+        q.push_back(Item {
+            id: 1,
+            cost: 17,
+            priority: 10,
+        })
+        .unwrap();
+        crate::memory_admission::set_probe(Some(refuse_growth));
+        let _reset = ProbeReset;
+        q.push_back(Item {
+            id: 2,
+            cost: 23,
+            priority: 10,
+        })
+        .unwrap();
+        assert_eq!(q.q.capacity(), 1);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.bytes_used(), 23);
+        assert_eq!(q.q.front().unwrap().id, 2);
+        crate::memory_admission::set_probe(None);
+        q.push_back(Item {
+            id: 3,
+            cost: 29,
+            priority: 10,
+        })
+        .unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.bytes_used(), 52);
+    }
+}
+
+#[cfg(test)]
+mod startup_admission_tests {
+    use super::*;
+
+    #[cfg(feature = "compact-packet-store")]
+    extern "C" fn fragmented_startup(additional: usize, largest: usize) -> bool {
+        additional <= 8192 && largest <= 8192
+    }
+    extern "C" fn deny_storage(_: usize, _: usize) -> bool {
+        false
+    }
+    struct ProbeReset;
+    impl Drop for ProbeReset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "compact-packet-store")]
+    fn compact_startup_ring_respects_fragmented_heap_admission() {
+        crate::memory_admission::set_probe(Some(fragmented_startup));
+        let _reset = ProbeReset;
+        let mut queue = BoundedDeque::<u64>::new(12288, 1024, 1.25);
+        assert!(queue.capacity() > 0);
+        assert!(queue.capacity() * size_of::<u64>() + 64 <= 8192);
+        let capacity = queue.capacity();
+        crate::memory_admission::set_probe(Some(deny_storage));
+        for value in 0..capacity * 2 {
+            queue.push_back(value as u64).unwrap();
+        }
+        assert_eq!(queue.capacity(), capacity);
+        assert_eq!(queue.len(), capacity);
+        assert_eq!(queue.bytes_used(), capacity * size_of::<u64>());
+    }
+
+    #[test]
+    fn denied_startup_storage_rejects_fifo_and_priority_without_growth() {
+        crate::memory_admission::set_probe(Some(deny_storage));
+        let _reset = ProbeReset;
+        let mut queue = BoundedDeque::<u64>::new(4096, 512, 1.25);
+        assert_eq!(queue.capacity(), 0);
+        assert!(queue.push_back(1).is_err());
+        assert!(queue.push_back_prioritized(2, |_| 254).is_err());
+        assert!(queue.is_empty());
+        assert_eq!(queue.bytes_used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod growth_ratio_tests {
+    #[test]
+    fn integer_ratio_matches_float_clamp_and_truncation() {
+        let check = |value: f64| {
+            let previous = ((value.clamp(1.01, 16.0) * 1024.0) as usize).max(1025);
+            assert_eq!(super::float_to_ratio(value), (previous, 1024), "{value:?}");
+        };
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            1.01,
+            1.25,
+            2.0,
+            16.0,
+            17.0,
+        ] {
+            check(value);
+        }
+        for index in 0..10000 {
+            check(index as f64 / 500.0);
+        }
+        for value in [1.01f64, 1.25, 2.0, 4.0, 8.0, 16.0] {
+            for adjustment in [-1i64, 0, 1] {
+                check(f64::from_bits(
+                    value.to_bits().wrapping_add_signed(adjustment),
+                ));
+            }
+        }
     }
 }

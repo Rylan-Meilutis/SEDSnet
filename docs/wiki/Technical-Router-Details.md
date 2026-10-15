@@ -48,7 +48,7 @@ Sides also carry link scope in their options:
 - `link_local_enabled: false` (default): normal network-capable side.
 - `link_local_enabled: true`: software-bus / IPC side for link-local-only endpoints.
 
-Reliable delivery (`reliable: true` / `reliable_mode` in the schema) is only applied when:
+Reliable delivery (`reliable: Ordered` or `reliable: Unordered` in the schema) is only applied when:
 
 - the router config enables reliable (`RouterConfig::with_reliable_enabled(true)`), and
 - the side is marked reliable (`RouterSideOptions { reliable_enabled: true }`), and

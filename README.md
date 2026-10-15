@@ -190,11 +190,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
-### Version 4.1.4 highlights
+### Version 4.2.0 highlights
 
-- Preserve existing ingress-peer routes when CRC-valid traffic arrives under allocator pressure, before refusing payload admission. Refresh only a known peer on its learned side; invalid frames, unknown sources, ambiguous addresses and traffic on another side do not extend its lifetime.
-- Keep small discovery announcements within bounded control headroom, including pressure keepalive construction. Oversized announcements and metadata growth retain normal admission checks.
-- Apply both fixes to Router and standalone Relay. Add allocation-counted route-expiry regressions, genuine-silence/invalid-ingress checks and rate-limited keepalive tests. Wire format, application allocator and scheduler defaults are unchanged.
+- Use one reliability enum (`Off`, `Ordered`, `Unordered`) throughout schema loading, code generation, bindings and the editor; macros update to 2.1.0.
+- Merge compatible runtime and compiled schema fragments using canonical name-based IDs. Registration works without a schema file, including on embedded nodes; destinations may be declared before their endpoint definitions.
+- Retain sparse destination lists and reliable-header presence on the wire so partial-schema convergence cannot reinterpret queued packets or acknowledgements. Use fixed 32-bit C identity types, including on toolchains with short enums. This migration requires a coordinated rebuild; subsequent compatible schema additions do not require gateway reflashing.
+- Admit compact queue backing storage fallibly at startup and retain a smaller fixed ring when fragmented memory cannot fit the requested ring. Defer queued-producer discovery work to network maintenance and reduce embedded calendar and queue-ratio overhead.
+- Preserve known ingress routes and ACK/control ownership under pressure in both Router and standalone Relay. Add allocation, reconnect, schema-convergence and C ABI regressions. Packet arenas remain opt-in and do not replace the application allocator or scheduler.
 
 ### Version 4.1.3 highlights
 
@@ -377,7 +379,7 @@ Full release history: [CHANGELOG.md](./CHANGELOG.md).
 
 - Introduced internal router-side tracking so most applications can use the plain RX APIs and only
   opt into side-aware ingress when they actually need it.
-- Added TCP-like reliable delivery for schema types marked `reliable` or `reliable_mode`, with
+- Added TCP-like reliable delivery for schema types declaring `reliable: Ordered` or `reliable: Unordered`, with
   ACKs, retransmits, and optional ordering.
 - This established the modern router/reliability model that later releases expanded.
 - Full changelog: [v2.4.0...v3.0.0](https://github.com/Rylan-Meilutis/sedsnet/compare/v2.4.0...v3.0.0)
@@ -579,7 +581,7 @@ set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     sedsnet
     GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet.git
-    GIT_TAG v4.1.4
+    GIT_TAG main
 )
 FetchContent_MakeAvailable(sedsnet)
 

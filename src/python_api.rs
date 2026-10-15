@@ -37,8 +37,8 @@ use std::sync::{Arc as SArc, Mutex, OnceLock};
 #[cfg(feature = "timesync")]
 use crate::timesync::{TimeSyncConfig, TimeSyncRole};
 use crate::{
-    MAX_VALUE_DATA_ENDPOINT, MAX_VALUE_DATA_TYPE, MAX_VALUE_ROUTE_SELECTION_MODE, MessageElement,
-    RouteSelectionMode, TelemetryError, TelemetryResult,
+    MAX_VALUE_ROUTE_SELECTION_MODE, MessageElement, RouteSelectionMode, TelemetryError,
+    TelemetryResult,
     config::{
         DataEndpoint, DataType, RuntimeMemoryConfig, RuntimeTuningConfig, data_type_definition,
         data_type_definition_by_name, data_type_exists, e2e_encryption_policy_from_code,
@@ -50,14 +50,14 @@ use crate::{
         remove_endpoint_by_name, runtime_device_identifier, runtime_tuning_config,
         set_runtime_device_identifier, set_runtime_tuning_config,
     },
-    get_message_name, get_needed_message_size, message_meta,
+    get_needed_message_size, message_meta,
     packet::Packet,
     relay::{Relay, RelayConfig, RelaySideOptions},
     router::{
         AddressAssignmentMode, Clock, EndpointHandler, LeBytes, NetworkVariablePermissions, Router,
         RouterConfig, RouterE2eEncryptionMode, RouterSideOptions, SideTransportProfile,
     },
-    try_enum_from_i32, try_enum_from_u32,
+    try_enum_from_i32,
     wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
 };
 
@@ -3205,6 +3205,17 @@ pub fn make_packet(
     Ok(Py::new(py, PyPacket { inner: pkt })?.into_any())
 }
 
+/// Canonical wire identity, without registering or allocating schema metadata.
+#[pyfunction(name = "endpoint_identity")]
+pub fn endpoint_identity_py(name: &str) -> u32 {
+    DataEndpoint::identity(name).as_u32()
+}
+
+#[pyfunction(name = "data_type_identity")]
+pub fn data_type_identity_py(name: &str) -> u32 {
+    DataType::identity(name).as_u32()
+}
+
 #[pyfunction(name = "endpoint_exists")]
 pub fn endpoint_exists_py(endpoint: u32) -> bool {
     endpoint_exists(DataEndpoint(endpoint))
@@ -3444,6 +3455,8 @@ pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_runtime_device_identifier_py, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_tuning_config_py, m)?)?;
     m.add_function(wrap_pyfunction!(set_runtime_tuning_config_py, m)?)?;
+    m.add_function(wrap_pyfunction!(endpoint_identity_py, m)?)?;
+    m.add_function(wrap_pyfunction!(data_type_identity_py, m)?)?;
     m.add_function(wrap_pyfunction!(endpoint_exists_py, m)?)?;
     m.add_function(wrap_pyfunction!(data_type_exists_py, m)?)?;
     m.add_function(wrap_pyfunction!(register_endpoint_py, m)?)?;
@@ -3469,12 +3482,9 @@ pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         let dt_dict = PyDict::new(py);
         dt_dict.set_item("__module__", &mod_name)?;
 
-        for v in 0..=MAX_VALUE_DATA_TYPE {
-            if let Some(e) = try_enum_from_u32::<DataType>(v) {
-                let name = get_message_name(e);
-                dt_dict.set_item(name.as_ref(), v)?;
-                m.add(name.as_ref(), v)?;
-            }
+        for definition in crate::config::known_data_types() {
+            dt_dict.set_item(&definition.name, definition.id.0)?;
+            m.add(&definition.name, definition.id.0)?;
         }
         let dt_enum = int_enum.call1(("DataType", dt_dict))?;
         m.add("DataType", dt_enum)?;
@@ -3484,12 +3494,9 @@ pub fn sedsnet(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         let ep_dict = PyDict::new(py);
         ep_dict.set_item("__module__", &mod_name)?;
-        for v in 0..=MAX_VALUE_DATA_ENDPOINT {
-            if let Some(e) = try_enum_from_u32::<DataEndpoint>(v) {
-                let name = e.as_str();
-                ep_dict.set_item(name.as_ref(), v)?;
-                m.add(name.as_ref(), v)?;
-            }
+        for definition in crate::config::known_endpoints() {
+            ep_dict.set_item(&definition.name, definition.id.0)?;
+            m.add(&definition.name, definition.id.0)?;
         }
         let ep_enum = int_enum.call1(("DataEndpoint", ep_dict))?;
         m.add("DataEndpoint", ep_enum)?;

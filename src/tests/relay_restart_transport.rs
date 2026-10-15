@@ -128,8 +128,8 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         max_side_transport_templates: 0,
         ..RelaySideOptions::default().with_small_packet_transport(0)
     };
-    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts);
-    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     for index in 0..32 {
         let packet = Packet::new(
             ty,
@@ -141,7 +141,11 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let frames = tx
-            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                a,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -185,8 +189,8 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         let tx = Relay::new(Box::new(|| 0));
         let rx = Relay::new(Box::new(|| 0));
         let opts = RelaySideOptions::default().with_small_packet_transport(0);
-        let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts);
-        let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+        let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+        let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let packet = Packet::new(
             ty,
             crate::message_meta(ty).endpoints_ref(),
@@ -197,7 +201,11 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let _ = tx
-            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                a,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap();
         // Lose the initial header (or restart the receiver), then send control.
         let frames = tx
@@ -238,8 +246,8 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
     for schema_request in [false, true] {
         let tx = Relay::new(Box::new(|| 100));
         let opts = RelaySideOptions::default().with_small_packet_transport(0);
-        let side = tx.add_side_packed_with_options("uart", |_| Ok(()), opts);
-        let unrelated = tx.add_side_packed_with_options("radio", |_| Ok(()), opts);
+        let side = tx.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
+        let unrelated = tx.add_side_packed_with_options("radio", |_| Ok(()), opts.clone());
         let packet = Packet::new(
             ty,
             &[crate::DataEndpoint::named("RADIO")],
@@ -250,7 +258,11 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let initial = tx
-            .encode_side_transport_frames(side, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                side,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap()
             .collect::<Vec<_>>();
         tx.decode_side_transport_frame(side, &initial[0])
@@ -259,7 +271,7 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         let _ = tx
             .encode_side_transport_frames(
                 unrelated,
-                opts,
+                opts.clone(),
                 crate::shared_bytes::convert(raw.clone()),
             )
             .unwrap();
@@ -272,9 +284,13 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         tx.learn_discovery_item(side, &RelayItem::Packet(Arc::new(request)))
             .unwrap();
         let restarted = Relay::new(Box::new(|| 100));
-        let rx = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts);
+        let rx = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
         let frames = tx
-            .encode_side_transport_frames(side, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                side,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap()
             .collect::<Vec<_>>();
         assert!(
@@ -285,7 +301,11 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
         );
         assert_eq!(tx.state.lock().side_transport[&side].rx_template_count(), 1);
         let frames = tx
-            .encode_side_transport_frames(unrelated, opts, crate::shared_bytes::convert(raw))
+            .encode_side_transport_frames(
+                unrelated,
+                opts.clone(),
+                crate::shared_bytes::convert(raw),
+            )
             .unwrap()
             .collect::<Vec<_>>();
         let empty = Relay::new(Box::new(|| 100));
@@ -448,6 +468,7 @@ fn short_budget_still_dispatches_retained_relay_tx() {
             dst: side,
             data: RelayItem::Packet(Arc::new(packet)),
             priority: 255,
+            retry_after_ms: 0,
         })
         .unwrap();
     relay.process_all_queues_with_timeout(1).unwrap();
@@ -521,6 +542,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         dst: side,
         data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 512]))),
         priority: 1,
+        retry_after_ms: 0,
     })
     .unwrap();
     st.push_tx(RelayTxItem {
@@ -528,6 +550,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         dst: side,
         data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 32]))),
         priority: 255,
+        retry_after_ms: 0,
     })
     .unwrap();
     st.memory.max_queue_budget = st.shared_queue_bytes_used();
@@ -629,7 +652,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         throttle.next_ping_ms = 0;
     }
     extern "C" fn only_small_work(additional: usize, _: usize) -> bool {
-        additional <= 4096
+        additional < 2048
     }
     struct Reset;
     impl Drop for Reset {
@@ -930,6 +953,7 @@ fn schema_reclaims_queued_data_before_refusing_update() {
                 2048
             ]))),
             priority: 254,
+            retry_after_ms: 0,
         })
         .unwrap();
         st.memory.max_queue_budget = st.shared_queue_bytes_used();
@@ -999,5 +1023,262 @@ fn keepalive_fits_reserved_control_headroom() {
         sent.load(core::sync::atomic::Ordering::Relaxed),
         1,
         "keepalives were not rate limited"
+    );
+}
+
+#[test]
+fn relay_busy_transport_retains_work_and_services_healthy_side() {
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(0));
+    let read_clock = now.clone();
+    let relay = Relay::new(Box::new(move || read_clock.load(Ordering::Relaxed)));
+    let blocked = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let flag = blocked.clone();
+    let count = attempts.clone();
+    let opts = RelaySideOptions {
+        reliable_enabled: false,
+        ..Default::default()
+    };
+    let busy = relay.add_side_packet_with_options(
+        "busy",
+        move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            if flag.load(Ordering::Relaxed) {
+                Err(TelemetryError::Io("side tx busy"))
+            } else {
+                Ok(())
+            }
+        },
+        opts.clone(),
+    );
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let healthy_count = delivered.clone();
+    let healthy = relay.add_side_packet_with_options(
+        "healthy",
+        move |_| {
+            healthy_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+        opts,
+    );
+    relay.clear_tx_queue();
+    let packet = Arc::new(crate::discovery::build_discovery_schema_request("GS", 0).unwrap());
+    for dst in [busy, healthy] {
+        relay
+            .state
+            .lock()
+            .push_tx(RelayTxItem {
+                src: None,
+                dst,
+                data: RelayItem::Packet(packet.clone()),
+                priority: 255,
+                retry_after_ms: 0,
+            })
+            .unwrap();
+    }
+    relay.drain_queues_with_timeout(0).unwrap();
+    assert_eq!(delivered.load(Ordering::Relaxed), 1);
+    let first = attempts.load(Ordering::Relaxed);
+    assert!(first > 0);
+    for _ in 0..100 {
+        relay.drain_queues_with_timeout(0).unwrap();
+    }
+    assert_eq!(attempts.load(Ordering::Relaxed), first);
+    blocked.store(false, Ordering::Relaxed);
+    now.store(1, Ordering::Relaxed);
+    relay.drain_queues_with_timeout(0).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), first + 1);
+    assert_eq!(delivered.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn rejected_first_template_frame_is_retried_self_describing() {
+    crate::tests::ensure_common_test_schema();
+    let ty = crate::config::register_data_type_with_description(
+        "RELAY_BUSY_FIRST_TEMPLATE",
+        "",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[crate::DataEndpoint::named("RADIO")],
+        crate::ReliableMode::None,
+        1,
+    )
+    .unwrap();
+    let tx = Relay::new(Box::new(|| 0u64));
+    let rx = Relay::new(Box::new(|| 0u64));
+    let opts = RelaySideOptions::default().with_small_packet_transport(0);
+    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+    let packet = Packet::new(
+        ty,
+        &[crate::DataEndpoint::named("RADIO")],
+        "BUSY_PEER",
+        1,
+        crate::shared_bytes::convert(Arc::<[u8]>::from([42u8])),
+    )
+    .unwrap();
+    let raw = wire_format::pack_packet(&packet);
+    // No byte of the dictionary bootstrap reaches the receiver.
+    let first = tx
+        .encode_side_transport_frames(a, opts.clone(), crate::shared_bytes::convert(raw.clone()))
+        .unwrap();
+    assert!(
+        tx.send_side_frames_resumable(a, first, |_| Err(TelemetryError::Io("side tx busy")))
+            .is_err()
+    );
+    let retry = tx
+        .encode_side_transport_frames(a, opts.clone(), crate::shared_bytes::convert(raw.clone()))
+        .unwrap();
+    let mut received = None;
+    tx.send_side_frames_resumable(a, retry, |frame| {
+        assert_eq!(
+            frame[3], SIDE_TRANSPORT_KIND_FULL,
+            "retry requires the unaccepted dictionary bootstrap"
+        );
+        received = rx.decode_side_transport_frame(b, frame)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(received, Some(crate::shared_bytes::convert(raw.clone())));
+    // Compression resumes once a full frame has actually been accepted.
+    let next = tx
+        .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
+        .unwrap();
+    tx.send_side_frames_resumable(a, next, |frame| {
+        assert_eq!(frame[3], SIDE_TRANSPORT_KIND_COMPACT);
+        assert_eq!(
+            rx.decode_side_transport_frame(b, frame)?,
+            Some(crate::shared_bytes::convert(raw.clone()))
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn relay_tx_service_consumes_queued_receipt_before_retry() {
+    crate::tests::ensure_common_test_schema();
+    let ep = crate::DataEndpoint::named("RADIO");
+    let ty = crate::config::register_data_type_with_description(
+        "RELAY_QUEUED_RECEIPT",
+        "",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[ep],
+        crate::ReliableMode::Ordered,
+        1,
+    )
+    .unwrap();
+    let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let relay = Relay::new(Box::new(move || {
+        clock.load(core::sync::atomic::Ordering::Relaxed)
+    }));
+    let side = relay.add_side_packed_with_options(
+        "CAN",
+        |_| Ok(()),
+        RelaySideOptions {
+            reliable_enabled: true,
+            ..Default::default()
+        },
+    );
+    let packet = Packet::new(ty, &[ep], "PEER", 1, Arc::<[u8]>::from([42u8])).unwrap();
+    let mut sent = BTreeMap::new();
+    sent.insert(
+        1,
+        ReliableSent {
+            bytes: crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
+            last_send_ms: 0,
+            retries: 0,
+            queued: false,
+            partial_acked: false,
+        },
+    );
+    relay.state.lock().reliable_tx.insert(
+        (side, ty.as_u32()),
+        ReliableTxState {
+            next_seq: 2,
+            sent_order: VecDeque::from([1]),
+            sent,
+        },
+    );
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&ty.as_u32().to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    let ack = Packet::new(
+        crate::DataType::ReliableAck,
+        &[crate::DataEndpoint::TelemetryError],
+        "PEER",
+        2,
+        Arc::<[u8]>::from(payload),
+    )
+    .unwrap();
+    relay
+        .rx_packed_from_side(side, &wire_format::pack_packet(&ack))
+        .unwrap();
+    now.store(
+        runtime_reliable_retransmit_ms(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    relay.process_tx_queue_with_timeout(1).unwrap();
+    assert!(
+        relay.state.lock().reliable_tx[&(side, ty.as_u32())]
+            .sent
+            .is_empty(),
+        "TX service must read an already-queued ACK before replaying data"
+    );
+}
+
+#[test]
+fn receipt_budget_does_not_starve_transmit() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let count = Arc::new(AtomicUsize::new(0));
+    let accepted = count.clone();
+    let node = Relay::new(Box::new(move || clock.fetch_add(1, Ordering::Relaxed)));
+    let side = node.add_side_packed("wire", move |_| {
+        accepted.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    node.clear_queues();
+    let packet = Packet::new(
+        crate::DataType::ReliableAck,
+        &[crate::DataEndpoint::TelemetryError],
+        "E2EACK:PEER",
+        1,
+        Arc::<[u8]>::from([0u8; 8]),
+    )
+    .unwrap();
+    node.state
+        .lock()
+        .push_tx(RelayTxItem {
+            src: None,
+            dst: side,
+            data: RelayItem::Packet(Arc::new(packet.clone())),
+            priority: 250,
+            retry_after_ms: 0,
+        })
+        .unwrap();
+    node.rx_packed_from_side(
+        side,
+        &wire_format::pack_packet(
+            &Packet::new(
+                crate::DataType::ReliableAck,
+                &[crate::DataEndpoint::TelemetryError],
+                "RX_PEER",
+                2,
+                Arc::<[u8]>::from([0u8; 8]),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    node.drain_queues_with_timeout(1).unwrap();
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "control RX exhausting its cooperative budget must still allow one queued TX"
     );
 }

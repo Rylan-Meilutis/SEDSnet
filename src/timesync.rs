@@ -244,11 +244,11 @@ impl NetworkTime {
             return None;
         }
 
-        let secs = unix_ns.div_euclid(1_000_000_000);
+        let secs = u64::try_from(unix_ns / 1_000_000_000).ok()?;
         let nanos = unix_ns.rem_euclid(1_000_000_000) as u32;
-        let days = secs.div_euclid(86_400) as i64;
-        let sod = secs.rem_euclid(86_400) as u32;
-        let (year, month, day) = civil_from_days(days);
+        let days = secs / 86_400;
+        let sod = (secs % 86_400) as u32;
+        let (year, month, day) = civil_from_days(days)?;
 
         Some(Self {
             year,
@@ -549,27 +549,33 @@ pub(crate) fn advance_network_time(base: NetworkTime, elapsed_ns: u64) -> Option
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = year - (month <= 2) as i32;
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
+    let mut era = year.div_euclid(400);
+    let mut yoe = year.rem_euclid(400) - (month <= 2) as i32;
+    if yoe < 0 {
+        era -= 1;
+        yoe += 400;
+    }
     let mp = month as i32 + if month > 2 { -3 } else { 9 };
     let doy = (153 * mp + 2) / 5 + day as i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe - 719_468) as i64
+    era as i64 * 146_097 + doe as i64 - 719_468
 }
 
-fn civil_from_days(mut z: i64) -> (i32, u32, u32) {
+fn civil_from_days(mut z: u64) -> Option<(i32, u32, u32)> {
     z += 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
+    let era = z / 146_097;
+    // A Gregorian era contains exactly 146097 days. Its remaining
+    // arithmetic fits in 32 bits, avoiding repeated software i64 divisions
+    // on Cortex-M while retaining the full representable year range.
+    let doe = (z - era * 146_097) as u32;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i32 + era as i32 * 400;
+    let y = yoe as u64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let y = y + (m <= 2) as i32;
-    (y, m as u32, d as u32)
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = i32::try_from(y + (m <= 2) as u64).ok()?;
+    Some((y, m, d))
 }
 
 /// Tracks remote time sources and performs leader/source selection decisions.
@@ -901,4 +907,62 @@ pub fn decode_timesync_response(pkt: &Packet) -> TelemetryResult<TimeSyncRespons
         t2_ms: vals[2],
         t3_ms: vals[3],
     })
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::NetworkTime;
+
+    #[test]
+    fn calendar_roundtrips_era_and_year_boundaries() {
+        for year in [1970, 1999, 2000, 2024, 2100, 2400, 9999, i32::MAX] {
+            for (month, day) in [(1, 1), (2, 28), (3, 1), (12, 31)] {
+                let expected = NetworkTime {
+                    year,
+                    month,
+                    day,
+                    hour: 23,
+                    minute: 59,
+                    second: 59,
+                    nanosecond: 999_999_999,
+                };
+                assert_eq!(
+                    NetworkTime::from_unix_ns(expected.as_unix_ns().unwrap()),
+                    Some(expected)
+                );
+            }
+        }
+        let leap = NetworkTime {
+            year: 2024,
+            month: 2,
+            day: 29,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            nanosecond: 123,
+        };
+        assert_eq!(
+            NetworkTime::from_unix_ns(leap.as_unix_ns().unwrap()),
+            Some(leap)
+        );
+        assert_eq!(NetworkTime::from_unix_ns(0).unwrap().year, 1970);
+    }
+
+    #[test]
+    fn out_of_range_calendar_timestamps_are_rejected_without_wraparound() {
+        assert_eq!(NetworkTime::from_unix_ns(-1), None);
+        assert_eq!(NetworkTime::from_unix_ns(i128::MAX), None);
+        let last = NetworkTime {
+            year: i32::MAX,
+            month: 12,
+            day: 31,
+            hour: 23,
+            minute: 59,
+            second: 59,
+            nanosecond: 999_999_999,
+        }
+        .as_unix_ns()
+        .unwrap();
+        assert_eq!(NetworkTime::from_unix_ns(last + 1), None);
+    }
 }

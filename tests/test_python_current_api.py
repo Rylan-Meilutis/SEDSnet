@@ -49,6 +49,25 @@ class PythonCurrentApiTests(unittest.TestCase):
             )
         cls.state_ty = int(seds.data_type_info_by_name("PY_API_STATE_9203")["id"])
 
+    def test_canonical_runtime_identities_before_registration(self) -> None:
+        self.assertEqual(seds.endpoint_identity("RADIO"), 101)
+        self.assertEqual(seds.data_type_identity("HEARTBEAT"), 106)
+        name = "PY_API_CANONICAL_UNDECLARED_ENDPOINT"
+        type_name = "PY_API_CANONICAL_RUNTIME_FLOW"
+        ep = seds.endpoint_identity(name)
+        ty = seds.data_type_identity(type_name)
+        self.assertFalse(seds.endpoint_exists(ep))
+        self.assertFalse(seds.data_type_exists(ty))
+        # An unresolved destination may be declared by another node later.
+        seds.register_data_type(ty, type_name, True, 1, 2, 0, [ep], reliable=2)
+        seds.register_endpoint(ep, name)
+        self.assertEqual(seds.endpoint_info_by_name(name)["id"], ep)
+        info = seds.data_type_info_by_name(type_name)
+        self.assertEqual(info["id"], ty)
+        self.assertEqual(info["endpoints"], [ep])
+        self.assertEqual(info["reliable"], 2)
+        self.assertNotIn("reliable_mode", info)
+
     def test_runtime_config_memory_and_network_variable_api(self) -> None:
         seds.set_runtime_device_identifier("PY_API_DEFAULT")
         self.assertEqual(seds.runtime_device_identifier(), "PY_API_DEFAULT")
@@ -103,19 +122,31 @@ class PythonCurrentApiTests(unittest.TestCase):
             lambda meta, payload: received.append((dict(meta), bytes(payload))),
         )
 
-        server.add_side_packet("to-client", lambda pkt: client.receive_packet_from_side(0, pkt))
-        client.add_side_packet("to-server", lambda pkt: server.receive_packet_from_side(0, pkt))
+        # Model transport ownership: callbacks accept a frame, then the peer
+        # receives it after the sender returns. Inline peer dispatch recursively
+        # reentered the Python Router mutex through discovery replies and hung.
+        to_client, to_server = [], []
+        server.add_side_packet("to-client", to_client.append)
+        client.add_side_packet("to-server", to_server.append)
+
+        def pump():
+            for _ in range(64):
+                while to_client:
+                    client.receive_packet_queue_from_side(0, to_client.pop(0))
+                while to_server:
+                    server.receive_packet_queue_from_side(0, to_server.pop(0))
+                server.process_all_queues()
+                client.process_all_queues()
+                if not to_client and not to_server:
+                    return
+            self.fail("packet transport did not quiesce")
 
         server.announce_discovery()
         client.announce_discovery()
-        server.process_all_queues()
-        client.process_all_queues()
-        server.process_all_queues()
-        client.process_all_queues()
+        pump()
 
         client.send_p2p_to_address(0x10203060, 8080, 49152, b"GET /status HTTP/1.1\r\n\r\n")
-        client.process_all_queues()
-        server.process_all_queues()
+        pump()
 
         self.assertEqual(received[0][1], b"GET /status HTTP/1.1\r\n\r\n")
         self.assertEqual(received[0][0]["destination_port"], 8080)

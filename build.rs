@@ -1,3 +1,5 @@
+#[path = "src/schema_identity.rs"]
+mod schema_identity;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -36,10 +38,20 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
         .expect("schema types must be an array");
 
     let mut endpoint_ids = HashMap::new();
+    let mut endpoint_identity_names = HashMap::new();
+    let mut type_identity_names = HashMap::new();
+    let mut endpoints = endpoints.iter().collect::<Vec<_>>();
+    endpoints
+        .sort_unstable_by_key(|value| schema_identity::endpoint_id(required_str(value, "name")));
+    let mut types = types.iter().collect::<Vec<_>>();
+    types.sort_unstable_by_key(|value| schema_identity::type_id(required_str(value, "name")));
     generated.push_str("const EMBEDDED_SCHEMA_ENDPOINTS: &[EndpointDefinition] = &[\n");
-    for (index, endpoint) in endpoints.iter().enumerate() {
-        let id = 100_u32 + u32::try_from(index).expect("too many schema endpoints");
+    for endpoint in endpoints {
         let name = required_str(endpoint, "name");
+        let id = schema_identity::endpoint_id(name);
+        if let Some(previous) = endpoint_identity_names.insert(id, name) {
+            assert_eq!(previous, name, "endpoint identity collision");
+        }
         let rust_name = endpoint["rust"].as_str().unwrap_or(name);
         let link_local = endpoint["link_local_only"].as_bool().unwrap_or(false)
             || endpoint["broadcast_mode"].as_str() == Some("Never");
@@ -55,9 +67,12 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
     generated.push_str("];\n");
 
     generated.push_str("const EMBEDDED_SCHEMA_TYPES: &[DataTypeDefinition] = &[\n");
-    for (index, ty) in types.iter().enumerate() {
-        let id = 100_u32 + u32::try_from(index).expect("too many schema types");
+    for ty in types {
         let name = required_str(ty, "name");
+        let id = schema_identity::type_id(name);
+        if let Some(previous) = type_identity_names.insert(id, name) {
+            assert_eq!(previous, name, "type identity collision");
+        }
         let class = match required_str(ty, "class") {
             "Data" => "MessageClass::Data",
             "Error" => "MessageClass::Error",
@@ -91,14 +106,15 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
             "Dynamic" => format!("MessageElement::Dynamic({data_type}, {class})"),
             other => panic!("unsupported message element kind `{other}`"),
         };
-        let reliable = match ty["reliable_mode"].as_str() {
-            Some("Ordered") => "ReliableMode::Ordered",
-            Some("Unordered") => "ReliableMode::Unordered",
-            Some("None") | None if ty["reliable"].as_bool().unwrap_or(false) => {
-                "ReliableMode::Ordered"
-            }
-            Some("None") | None => "ReliableMode::None",
-            Some(other) => panic!("unsupported reliable mode `{other}`"),
+        assert!(
+            ty.get("reliable_mode").is_none(),
+            "use a single reliable field"
+        );
+        let reliable = match required_str(ty, "reliable") {
+            "Off" => "ReliableMode::None",
+            "Ordered" => "ReliableMode::Ordered",
+            "Unordered" => "ReliableMode::Unordered",
+            other => panic!("unsupported reliability `{other}`"),
         };
         let e2e = match ty["e2e_encryption"].as_str().unwrap_or("PreferOff") {
             "PreferOff" | "prefer_off" | "off" | "false" => "E2eEncryptionPolicy::PreferOff",
@@ -115,7 +131,8 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
                 let name = endpoint.as_str().expect("type endpoint must be a string");
                 let id = endpoint_ids
                     .get(name)
-                    .unwrap_or_else(|| panic!("unknown endpoint `{name}`"));
+                    .copied()
+                    .unwrap_or_else(|| schema_identity::endpoint_id(name));
                 format!("DataEndpoint({id})")
             })
             .collect::<Vec<_>>()
@@ -136,9 +153,19 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(sedsnet_has_telemetry_config_json)");
     println!("cargo:rerun-if-changed=telemetry_config.json");
-    let schema_path = Path::new("telemetry_config.json");
+    println!("cargo:rerun-if-changed=src/schema_identity.rs");
+    println!("cargo:rerun-if-env-changed=SEDSNET_EMBEDDED_SCHEMA_PATH");
+    let schema_override = std::env::var_os("SEDSNET_EMBEDDED_SCHEMA_PATH").map(PathBuf::from);
+    let schema_path = schema_override
+        .as_deref()
+        .unwrap_or(Path::new("telemetry_config.json"));
+    println!("cargo:rerun-if-changed={}", schema_path.display());
     if schema_path.is_file() {
         println!("cargo:rustc-cfg=sedsnet_has_telemetry_config_json");
+        println!(
+            "cargo:rustc-env=SEDSNET_BUNDLED_SCHEMA_PATH={}",
+            schema_path.canonicalize().expect("schema path").display()
+        );
     }
     let output_path =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("embedded_schema.rs");

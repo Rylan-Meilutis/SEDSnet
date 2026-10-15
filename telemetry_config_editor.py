@@ -54,7 +54,7 @@ DATA_TYPE_OPTIONS = [
 MESSAGE_CLASS_OPTIONS = ["Data", "Error", "Warning"]
 BROADCAST_MODE_OPTIONS = ["Always", "Never", "Default"]
 ELEMENT_KIND_OPTIONS = ["Static", "Dynamic"]
-RELIABLE_MODE_OPTIONS = ["None", "Ordered", "Unordered"]
+RELIABLE_MODE_OPTIONS = ["Off", "Ordered", "Unordered"]
 SCHEMA_SCOPE_BASE = "base"
 SCHEMA_SCOPE_IPC = "ipc"
 MAX_TYPE_PRIORITY = 255
@@ -164,11 +164,8 @@ def _endpoint_row_text(ep: Dict[str, Any]) -> str:
 
 
 def _type_row_text(ty: Dict[str, Any]) -> str:
-    rel_mode = ty.get("reliable_mode", "")
-    if not rel_mode or rel_mode == "None":
-        rel = " [R]" if bool(ty.get("reliable", False)) else ""
-    else:
-        rel = f" [Rel:{rel_mode}]"
+    rel_mode = ty["reliable"]
+    rel = "" if rel_mode == "Off" else f" [Rel:{rel_mode}]"
     priority = int(ty.get("priority", 0) or 0)
     prio = f" [Prio:{priority}]" if priority > 0 else ""
     return f"{ty.get('rust', '')}  [{ty.get('name', '')}]{rel}{prio}"
@@ -558,7 +555,7 @@ class TelemetryConfigEditor(tk.Tk):
         new_kind = (self.ty_kind_var.get() or "Static").strip()
         new_dtype = (self.ty_dtype_var.get() or DATA_TYPE_OPTIONS[0]).strip()
         new_doc = self.ty_doc_text.get("1.0", tk.END).strip()
-        new_reliable_mode = (self.ty_reliable_mode_var.get() or "None").strip()
+        new_reliable_mode = (self.ty_reliable_mode_var.get() or "Off").strip()
         new_priority_s = (self.ty_priority_var.get() or "0").strip()
 
         if new_rust and _is_reserved_telemetry_error(new_rust):
@@ -603,8 +600,7 @@ class TelemetryConfigEditor(tk.Tk):
             ty["rust"] = new_rust
             ty["name"] = rust_ident_to_schema_name(new_rust)
         ty["doc"] = new_doc
-        ty["reliable_mode"] = new_reliable_mode
-        ty["reliable"] = new_reliable_mode != "None"
+        ty["reliable"] = new_reliable_mode
         ty["priority"] = new_priority
         ty["class"] = new_class
         ty["element"] = element
@@ -852,7 +848,7 @@ class TelemetryConfigEditor(tk.Tk):
         self.ty_count_entry.grid(row=4, column=1, sticky="nw", padx=(10, 0), pady=(10, 0))
 
         ttk.Label(right, text="Reliable mode:").grid(row=5, column=0, sticky="w", pady=(10, 0))
-        self.ty_reliable_mode_var = tk.StringVar(value="None")
+        self.ty_reliable_mode_var = tk.StringVar(value="Off")
         self.ty_reliable_mode_combo = ttk.Combobox(
             right,
             textvariable=self.ty_reliable_mode_var,
@@ -1267,14 +1263,9 @@ class TelemetryConfigEditor(tk.Tk):
                 if cnti < 0:
                     raise RuntimeError(f"types[{i}].element.count must be >= 0, got {cnti}")
 
-            if "reliable" in ty and not isinstance(ty.get("reliable"), bool):
-                raise RuntimeError(f"types[{i}].reliable must be a boolean")
-            if "reliable_mode" in ty:
-                rm = ty.get("reliable_mode")
-                if not isinstance(rm, str) or rm not in RELIABLE_MODE_OPTIONS:
-                    raise RuntimeError(
-                        f"types[{i}].reliable_mode must be one of {RELIABLE_MODE_OPTIONS}, got {rm!r}"
-                    )
+            rm = ty.get("reliable")
+            if "reliable_mode" in ty or rm not in RELIABLE_MODE_OPTIONS:
+                raise RuntimeError(f"types[{i}].reliable must be one of {RELIABLE_MODE_OPTIONS}")
             priority = ty.get("priority", 0)
             try:
                 priority_i = int(priority)
@@ -1332,7 +1323,7 @@ class TelemetryConfigEditor(tk.Tk):
             self.ty_kind_var.set("Static")
             self.ty_dtype_var.set(DATA_TYPE_OPTIONS[0])
             self.ty_count_var.set("1")
-            self.ty_reliable_mode_var.set("None")
+            self.ty_reliable_mode_var.set("Off")
             self.ty_priority_var.set("0")
             self.ty_doc_text.configure(state="normal")
             self.ty_doc_text.delete("1.0", tk.END)
@@ -1411,8 +1402,7 @@ class TelemetryConfigEditor(tk.Tk):
                 "rust": rust,
                 "name": rust_ident_to_schema_name(rust),
                 "doc": "",
-                "reliable": False,
-                "reliable_mode": "None",
+                "reliable": "Off",
                 "priority": 0,
                 "class": "Data",
                 "element": {"kind": "Static", "data_type": "Float32", "count": 1},
@@ -1464,11 +1454,7 @@ class TelemetryConfigEditor(tk.Tk):
             dt = el.get("data_type", DATA_TYPE_OPTIONS[0]) or DATA_TYPE_OPTIONS[0]
             self.ty_kind_var.set(kind if kind in ELEMENT_KIND_OPTIONS else "Static")
             self.ty_dtype_var.set(dt if dt in DATA_TYPE_OPTIONS else DATA_TYPE_OPTIONS[0])
-            reliable_mode = ty.get("reliable_mode", "")
-            if not reliable_mode:
-                reliable_mode = "Ordered" if bool(ty.get("reliable", False)) else "None"
-            if reliable_mode not in RELIABLE_MODE_OPTIONS:
-                reliable_mode = "None"
+            reliable_mode = ty["reliable"]
             self.ty_reliable_mode_var.set(reliable_mode)
             self.ty_priority_var.set(str(int(ty.get("priority", 0) or 0)))
 

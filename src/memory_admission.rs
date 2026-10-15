@@ -11,15 +11,36 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 /// are used, and must not call back into SEDSnet. Arguments are estimated total
 /// additional bytes and the largest required contiguous allocation.
 pub type MemoryAdmissionProbe = extern "C" fn(usize, usize) -> bool;
+/// Extended probe distinguishes bounded cached transit from general work.
+/// General work retains the conservative decoder/metadata scratch contract.
+pub type MemoryAdmissionProbeV2 = extern "C" fn(usize, usize, u32) -> bool;
+pub const WORK_GENERAL: u32 = 0;
+pub const WORK_CACHED_TRANSIT: u32 = 1;
+static PROBE_V2: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static PROBE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static REJECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// Install a process-wide admission probe, or `None` to disable it.
 pub fn set_probe(probe: Option<MemoryAdmissionProbe>) {
+    PROBE_V2.store(core::ptr::null_mut(), Ordering::Release);
     PROBE.store(
         probe.map_or(core::ptr::null_mut(), |f| f as *mut ()),
         Ordering::Release,
     );
+}
+/// Install an extended probe at startup, replacing the legacy probe.
+pub fn set_probe_v2(probe: Option<MemoryAdmissionProbeV2>) {
+    PROBE.store(core::ptr::null_mut(), Ordering::Release);
+    PROBE_V2.store(
+        probe.map_or(core::ptr::null_mut(), |f| f as *mut ()),
+        Ordering::Release,
+    );
+}
+pub(crate) fn supports_work_kinds() -> bool {
+    !PROBE_V2.load(Ordering::Relaxed).is_null()
+}
+fn has_probe() -> bool {
+    supports_work_kinds() || !PROBE.load(Ordering::Relaxed).is_null()
 }
 /// Number of operations rejected by the probe, wrapping at usize::MAX.
 pub fn rejected_operations() -> usize {
@@ -27,14 +48,49 @@ pub fn rejected_operations() -> usize {
 }
 
 pub(crate) fn check(additional_bytes: usize, largest_allocation: usize) -> TelemetryResult<()> {
-    let ptr = PROBE.load(Ordering::Acquire);
-    if ptr.is_null() {
+    check_work(additional_bytes, largest_allocation, WORK_GENERAL)
+}
+fn check_work(
+    additional_bytes: usize,
+    largest_allocation: usize,
+    work: u32,
+) -> TelemetryResult<()> {
+    let extended = PROBE_V2.load(Ordering::Acquire);
+    let allowed = if !extended.is_null() {
+        // SAFETY: only this exact function-pointer signature is installed.
+        let probe: MemoryAdmissionProbeV2 = unsafe { core::mem::transmute(extended) };
+        probe(additional_bytes, largest_allocation, work)
+    } else {
+        let ptr = PROBE.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: legacy callbacks retain their original signature/contract.
+        let probe: MemoryAdmissionProbe = unsafe { core::mem::transmute(ptr) };
+        probe(additional_bytes, largest_allocation)
+    };
+    if allowed {
         return Ok(());
     }
-    // SAFETY: only function pointers of this exact signature are stored. Their
-    // code remains valid even when a different probe is concurrently installed.
-    let probe: MemoryAdmissionProbe = unsafe { core::mem::transmute(ptr) };
-    if probe(additional_bytes, largest_allocation) {
+    REJECTED.fetch_add(1, Ordering::Relaxed);
+    Err(TelemetryError::Io("memory pressure"))
+}
+/// Only used after verifying cached routing, statistics and transport metadata.
+pub(crate) fn check_cached_transit(len: usize) -> TelemetryResult<()> {
+    // Snapshot the extended callback once. If a legacy probe replaces it
+    // concurrently, never pass the smaller requirement to that legacy probe.
+    let ptr = PROBE_V2.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return check_frame(len, false);
+    }
+    // SAFETY: installed callbacks have this signature and remain valid while
+    // in-flight admission checks complete, including across replacement.
+    let probe: MemoryAdmissionProbeV2 = unsafe { core::mem::transmute(ptr) };
+    if probe(
+        1024usize.saturating_add(len.saturating_mul(2)),
+        256,
+        WORK_CACHED_TRANSIT,
+    ) {
         return Ok(());
     }
     REJECTED.fetch_add(1, Ordering::Relaxed);
@@ -42,7 +98,7 @@ pub(crate) fn check(additional_bytes: usize, largest_allocation: usize) -> Telem
 }
 
 pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
-    if PROBE.load(Ordering::Relaxed).is_null() {
+    if !has_probe() {
         return Ok(());
     }
     // Keep smaller admission for ACKs that release replay buffers and short
@@ -78,6 +134,11 @@ pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_set_memory_admission_probe(probe: Option<MemoryAdmissionProbe>) {
     set_probe(probe);
+}
+/// C ABI for [`set_probe_v2`]. NULL disables both probe variants.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_memory_admission_probe_v2(probe: Option<MemoryAdmissionProbeV2>) {
+    set_probe_v2(probe);
 }
 /// C ABI for [`rejected_operations`].
 #[unsafe(no_mangle)]

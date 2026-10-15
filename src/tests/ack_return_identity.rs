@@ -18,8 +18,8 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         max_side_transport_templates: 0,
         ..RouterSideOptions::default().with_small_packet_transport(0)
     };
-    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts);
-    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     for index in 0..32 {
         let packet = Packet::new(
             ty,
@@ -31,7 +31,11 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let frames = tx
-            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                a,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -75,8 +79,8 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         let tx = Router::new(RouterConfig::default());
         let rx = Router::new(RouterConfig::default());
         let opts = RouterSideOptions::default().with_small_packet_transport(0);
-        let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts);
-        let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+        let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+        let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let packet = Packet::new(
             ty,
             crate::message_meta(ty).endpoints_ref(),
@@ -87,7 +91,11 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
         .unwrap();
         let raw = wire_format::pack_packet(&packet);
         let _ = tx
-            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                a,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap();
         // Lose the initial header (or restart the receiver), then send control.
         let frames = tx
@@ -139,8 +147,8 @@ fn check_restarting_peer_header(schema_request: bool) {
     });
     let tx = Router::new_with_clock(RouterConfig::new([]).with_sender("GB"), Box::new(|| 100u64));
     let opts = RouterSideOptions::default().with_small_packet_transport(0);
-    let side = tx.add_side_packed_with_options("uart", |_| Ok(()), opts);
-    let unrelated = tx.add_side_packed_with_options("radio", |_| Ok(()), opts);
+    let side = tx.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
+    let unrelated = tx.add_side_packed_with_options("radio", |_| Ok(()), opts.clone());
     let endpoint = DataEndpoint::named("RADIO");
     tx.rx_from_side(
         &discovery::build_discovery_announce("GS", 1, &[endpoint]).unwrap(),
@@ -152,7 +160,7 @@ fn check_restarting_peer_header(schema_request: bool) {
     let initial = tx
         .encode_side_transport_frames(
             side,
-            opts,
+            opts.clone(),
             crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
         )
         .unwrap()
@@ -163,12 +171,12 @@ fn check_restarting_peer_header(schema_request: bool) {
     let _ = tx
         .encode_side_transport_frames(
             unrelated,
-            opts,
+            opts.clone(),
             crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
         )
         .unwrap();
     let restarted = Router::new(RouterConfig::default());
-    let rx_side = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts);
+    let rx_side = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
     let request = if schema_request {
         discovery::build_discovery_schema_request("GS", 2)
     } else {
@@ -179,7 +187,7 @@ fn check_restarting_peer_header(schema_request: bool) {
     let frames = tx
         .encode_side_transport_frames(
             side,
-            opts,
+            opts.clone(),
             crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
         )
         .unwrap()
@@ -199,7 +207,7 @@ fn check_restarting_peer_header(schema_request: bool) {
     let unrelated_frames = tx
         .encode_side_transport_frames(
             unrelated,
-            opts,
+            opts.clone(),
             crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
         )
         .unwrap()
@@ -268,14 +276,14 @@ fn discovery_refresh_survives_a_missed_transport_template() {
     let tx = Router::new(RouterConfig::default());
     let rx = Router::new(RouterConfig::default());
     let opts = RouterSideOptions::default().with_small_packet_transport(512);
-    let tx_side = tx.add_side_packed_with_options("can", |_| Ok(()), opts);
-    let rx_side = rx.add_side_packed_with_options("can", |_| Ok(()), opts);
+    let tx_side = tx.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
+    let rx_side = rx.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     for timestamp in [1000, 6000] {
         let packet = discovery::build_discovery_announce("GB", timestamp, &[]).unwrap();
         let frames = tx
             .encode_side_transport_frames(
                 tx_side,
-                opts,
+                opts.clone(),
                 crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
             )
             .unwrap()
@@ -297,8 +305,8 @@ fn compact_loss_must_not_change_packet_identity() {
     let tx = Router::new_with_clock(RouterConfig::new([]).with_sender("VB"), Box::new(|| 0u64));
     let rx = Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), Box::new(|| 0u64));
     let opts = RouterSideOptions::default().with_small_packet_transport(0);
-    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts);
-    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
+    let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+    let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     for (index, timestamp) in [10000, 10010, 10020].into_iter().enumerate() {
         let pkt = Packet::new(
             DataType::named("GPS_DATA"),
@@ -310,7 +318,11 @@ fn compact_loss_must_not_change_packet_identity() {
         .unwrap();
         let raw = wire_format::pack_packet(&pkt);
         let frames = tx
-            .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
+            .encode_side_transport_frames(
+                a,
+                opts.clone(),
+                crate::shared_bytes::convert(raw.clone()),
+            )
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(frames.len(), 1);
@@ -549,5 +561,86 @@ fn legacy_ack_recovers_after_return_cache_churn_on_two_side_bridge() {
                 "recover only an unambiguous bridge path"
             );
         }
+    }
+}
+
+#[test]
+fn reliable_data_retry_survives_return_route_cache_churn() {
+    crate::tests::ensure_common_test_schema();
+    for packed in [false, true] {
+        let now = Arc::new(core::sync::atomic::AtomicU64::new(10_000));
+        let clock = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GB"),
+            Box::new(move || clock.load(core::sync::atomic::Ordering::Relaxed)),
+        );
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let output = forwarded.clone();
+        let uart = router.add_side_packed("uart", move |bytes| {
+            output.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        });
+        let can = router.add_side_packed("can", |_| Ok(()));
+        let ep = DataEndpoint::named("RADIO");
+        router
+            .rx_from_side(
+                &discovery::build_discovery_announce("GS", 0, &[ep]).unwrap(),
+                uart,
+            )
+            .unwrap();
+        router.process_all_queues().unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            "RETURN_CACHE_RETRY_DATA",
+            "",
+            crate::MessageElement::Static(
+                1,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[ep],
+            crate::ReliableMode::Ordered,
+            200,
+        )
+        .unwrap();
+        let packet = Packet::new(ty, &[ep], "VB", 1, Arc::<[u8]>::from([1])).unwrap();
+        let raw = wire_format::pack_packet_with_wire_contract(
+            &packet,
+            None,
+            None,
+            &[Router::sender_hash("GS")],
+        )
+        .unwrap();
+        let deliver = || {
+            if packed {
+                router.rx_packed_from_side(&raw, can).unwrap();
+            } else {
+                router
+                    .rx_from_side(&wire_format::unpack_packet(&raw).unwrap(), can)
+                    .unwrap();
+            }
+            router.process_all_queues().unwrap();
+        };
+        let count = || {
+            forwarded
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|b| wire_format::unpack_packet(b).ok())
+                .filter(|p| p.data_type() == ty)
+                .count()
+        };
+        deliver();
+        assert_eq!(count(), 1);
+        now.fetch_add(
+            runtime_reliable_retransmit_ms(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        for index in 0..runtime_reliable_max_return_routes().max(1) {
+            router.note_reliable_return_route(can, 10000 + index as u64);
+        }
+        deliver();
+        assert_eq!(count(), 2, "cache churn must not restart the retry delay");
+        deliver();
+        assert_eq!(count(), 2, "immediate echoes remain suppressed");
     }
 }

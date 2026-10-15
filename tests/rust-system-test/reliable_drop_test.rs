@@ -249,7 +249,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                side_opts,
+                side_opts.clone(),
             );
             let gs_rf_side = gs.add_side_packed_with_options(
                 "rf",
@@ -272,7 +272,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                relay_side_opts,
+                relay_side_opts.clone(),
             );
             let gw_ab_side = gw.add_side_packed_with_options(
                 "ab",
@@ -294,7 +294,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                leaf_relay_side_opts,
+                leaf_relay_side_opts.clone(),
             );
             let gw_daq_side = gw.add_side_packed_with_options(
                 "daq",
@@ -305,7 +305,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                leaf_relay_side_opts,
+                leaf_relay_side_opts.clone(),
             );
 
             let rf_gs_side = rf.add_side_packed_with_options(
@@ -328,7 +328,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                leaf_relay_side_opts,
+                leaf_relay_side_opts.clone(),
             );
             let rf_fc_side = rf.add_side_packed_with_options(
                 "fc",
@@ -362,7 +362,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                leaf_side_opts,
+                leaf_side_opts.clone(),
             );
             let daq_side = daq.add_side_packed_with_options(
                 "gw",
@@ -373,7 +373,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                leaf_side_opts,
+                leaf_side_opts.clone(),
             );
             let power_side = power.add_side_packed_with_options(
                 "rf",
@@ -384,7 +384,7 @@ mod reliable_drop_tests {
                         Ok(())
                     }
                 },
-                leaf_side_opts,
+                leaf_side_opts.clone(),
             );
             let flight_side = flight.add_side_packed_with_options(
                 "rf",
@@ -845,7 +845,7 @@ mod reliable_drop_tests {
                 q.lock().unwrap().push_back(b.to_vec());
                 Ok(())
             },
-            opts,
+            opts.clone(),
         );
         let q = back.clone();
         let gs = gateway.add_side_packed_with_options(
@@ -854,7 +854,7 @@ mod reliable_drop_tests {
                 q.lock().unwrap().push_back(b.to_vec());
                 Ok(())
             },
-            opts,
+            opts.clone(),
         );
         let q = down.clone();
         let gd = gateway.add_side_packed_with_options(
@@ -863,7 +863,7 @@ mod reliable_drop_tests {
                 q.lock().unwrap().push_back(b.to_vec());
                 Ok(())
             },
-            opts,
+            opts.clone(),
         );
         let q = ack.clone();
         let ds = dest.add_side_packed_with_options(
@@ -1488,7 +1488,7 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            reliable_side_opts,
+            reliable_side_opts.clone(),
         );
         let gw_gs_side = gw.add_side_packed_with_options(
             "gs",
@@ -1499,7 +1499,7 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            reliable_relay_opts,
+            reliable_relay_opts.clone(),
         );
         let gw_ab_side = gw.add_side_packed_with_options(
             "ab",
@@ -1532,7 +1532,7 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            topo_relay_opts,
+            topo_relay_opts.clone(),
         );
         let daq_side = daq.add_side_packed_with_options(
             "gw",
@@ -1543,7 +1543,7 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            topo_side_opts,
+            topo_side_opts.clone(),
         );
         let gw_fc_side = gw.add_side_packed_with_options(
             "fc",
@@ -1757,24 +1757,24 @@ mod reliable_drop_tests {
             ..RelaySideOptions::default()
         };
 
-        let gs_trunk = gs.add_side_packed_with_options("trunk", trunk_bus.tx_handler(0), side_opts);
+        let gs_trunk = gs.add_side_packed_with_options("trunk", trunk_bus.tx_handler(0), side_opts.clone());
         let gw_trunk =
-            gw.add_side_packed_with_options("trunk", trunk_bus.tx_handler(1), relay_side_opts);
+            gw.add_side_packed_with_options("trunk", trunk_bus.tx_handler(1), relay_side_opts.clone());
         let rf_trunk =
-            rf.add_side_packed_with_options("trunk", trunk_bus.tx_handler(2), relay_side_opts);
+            rf.add_side_packed_with_options("trunk", trunk_bus.tx_handler(2), relay_side_opts.clone());
 
         let gw_child =
-            gw.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts);
+            gw.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts.clone());
         let actuator_side =
-            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts);
+            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts.clone());
         let valve_side =
-            valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts);
-        let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts);
+            valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts.clone());
+        let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts.clone());
 
         let rf_child =
             rf.add_side_packed_with_options("rf_bus", rf_bus.tx_handler(0), relay_side_opts);
         let power_side =
-            power.add_side_packed_with_options("rf_bus", rf_bus.tx_handler(1), side_opts);
+            power.add_side_packed_with_options("rf_bus", rf_bus.tx_handler(1), side_opts.clone());
         let flight_side =
             flight.add_side_packed_with_options("rf_bus", rf_bus.tx_handler(2), side_opts);
 
@@ -2030,9 +2030,9 @@ mod reliable_drop_tests {
         let gw_child =
             gateway.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts);
         let actuator_side =
-            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts);
+            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts.clone());
         let valve_side =
-            valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts);
+            valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts.clone());
         let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts);
 
         gateway
@@ -2263,7 +2263,7 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            side_opts,
+            side_opts.clone(),
         );
         let uplink = gateway.add_side_packed_with_options(
             "uplink",
@@ -2274,14 +2274,14 @@ mod reliable_drop_tests {
                     Ok(())
                 }
             },
-            relay_side_opts,
+            relay_side_opts.clone(),
         );
         let gw_child =
             gateway.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(0), relay_side_opts);
         let actuator_side =
-            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts);
+            actuator.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(1), side_opts.clone());
         let valve_side =
-            valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts);
+            valve.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(2), side_opts.clone());
         let daq_side = daq.add_side_packed_with_options("gw_bus", gw_bus.tx_handler(3), side_opts);
 
         gateway

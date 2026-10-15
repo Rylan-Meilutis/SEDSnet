@@ -49,3 +49,17 @@ python-source = "python-files"
 include = [
     "python-files/sedsnet/sedsnet.pyi",
 ]
+# Keep source archives clean even when built from an exported tree without .git.
+exclude = [
+    "venv/**",
+    ".venv/**",
+    "**/__pycache__/**",
+    "**/target/**",
+    "**/build/**",
+    "**/cmake-build*/**",
+    "dist/**",
+    "inspection/**",
+    ".sedsnet-release.toml",
+    "telemetry_config.json",
+    "**/.DS_Store",
+]

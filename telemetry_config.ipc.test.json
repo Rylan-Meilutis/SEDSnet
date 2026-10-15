@@ -18,7 +18,6 @@
       },
       "endpoints": [
         "SoftwareBus"
-      ]
-    }
+      ], "reliable": "Off"}
   ]
 }

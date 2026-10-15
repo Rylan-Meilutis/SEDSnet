@@ -5,6 +5,9 @@
 //! registry. Applications may seed the registry from JSON at startup, or add
 //! endpoints/types as the network announces them.
 
+#[path = "schema_identity.rs"]
+mod schema_identity;
+
 use crate::{
     E2eEncryptionPolicy, EndpointMeta, MessageClass, MessageDataType, MessageElement, MessageMeta,
     ReliableMode, TelemetryError, TelemetryResult, parse_f64, parse_strings, parse_usize,
@@ -430,6 +433,11 @@ impl Default for RuntimeMemoryConfig {
 pub struct DataEndpoint(pub u32);
 
 impl DataEndpoint {
+    /// Stable identity for a name, including a definition supplied later by another node.
+    pub const fn identity(name: &str) -> Self {
+        Self(schema_identity::endpoint_id(name))
+    }
+
     pub const TIME_SYNC: Self = Self(200);
     pub const DISCOVERY: Self = Self(201);
     pub const TELEMETRY_ERROR: Self = Self(202);
@@ -455,9 +463,37 @@ impl DataEndpoint {
         }
     }
 
-    #[inline]
+    #[cfg_attr(feature = "std", inline)]
+    #[cfg_attr(not(feature = "std"), inline(never))]
     pub fn try_named(name: &str) -> Option<Self> {
-        endpoint_definition_by_name(name).map(|def| def.id)
+        #[cfg(feature = "std")]
+        {
+            registry()
+                .lock()
+                .expect("schema registry poisoned")
+                .endpoints
+                .iter()
+                .find(|(_, meta)| meta.name.as_ref() == name)
+                .map(|(id, _)| *id)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            embedded_overlay_endpoint_by_name(name)
+                .or_else(|| {
+                    EMBEDDED_BUILTIN_ENDPOINTS
+                        .iter()
+                        .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
+                        .find(|def| {
+                            def.name == name
+                                && endpoint_visible_at(
+                                    **def,
+                                    EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire),
+                                )
+                        })
+                        .copied()
+                })
+                .map(|def| def.id)
+        }
     }
 
     #[inline]
@@ -490,6 +526,11 @@ impl core::fmt::Debug for DataEndpoint {
 pub struct DataType(pub u32);
 
 impl DataType {
+    /// Stable identity for a name, including a definition supplied later by another node.
+    pub const fn identity(name: &str) -> Self {
+        Self(schema_identity::type_id(name))
+    }
+
     pub const TELEMETRY_ERROR: Self = Self(0);
     pub const RELIABLE_ACK: Self = Self(1);
     pub const RELIABLE_PACKET_REQUEST: Self = Self(2);
@@ -563,9 +604,37 @@ impl DataType {
         }
     }
 
-    #[inline]
+    #[cfg_attr(feature = "std", inline)]
+    #[cfg_attr(not(feature = "std"), inline(never))]
     pub fn try_named(name: &str) -> Option<Self> {
-        data_type_definition_by_name(name).map(|def| def.id)
+        #[cfg(feature = "std")]
+        {
+            registry()
+                .lock()
+                .expect("schema registry poisoned")
+                .types
+                .iter()
+                .find(|(_, meta)| meta.name.as_ref() == name)
+                .map(|(id, _)| *id)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            embedded_overlay_type_by_name(name)
+                .or_else(|| {
+                    EMBEDDED_BUILTIN_TYPES
+                        .iter()
+                        .chain(EMBEDDED_SCHEMA_TYPES.iter())
+                        .find(|def| {
+                            def.name == name
+                                && type_visible_at(
+                                    **def,
+                                    EMBEDDED_TYPE_HEAD.load(Ordering::Acquire),
+                                )
+                        })
+                        .copied()
+                })
+                .map(|def| def.id)
+        }
     }
 
     #[inline]
@@ -1068,11 +1137,6 @@ impl Registry {
         {
             return Err(TelemetryError::BadArg);
         }
-        for ep in &def.endpoints {
-            if !self.endpoints.iter().any(|(id, _)| id == ep) {
-                return Err(TelemetryError::BadArg);
-            }
-        }
         self.next_type_id = self.next_type_id.max(def.id.0.saturating_add(1));
         self.types.push((
             def.id,
@@ -1145,7 +1209,8 @@ impl Registry {
         if endpoint_def_equivalent(&existing_def, &def) {
             return SchemaMergeDecision::Unchanged;
         }
-        if endpoint_winner(&existing_def, &def) == def {
+        let def = merge_endpoint_metadata(&existing_def, &def);
+        if !endpoint_def_equivalent(&existing_def, &def) {
             self.endpoints[idx] = (
                 def.id,
                 EndpointMeta {
@@ -1206,7 +1271,8 @@ impl Registry {
         if type_def_equivalent(&existing_def, &def) {
             return SchemaMergeDecision::Unchanged;
         }
-        if type_winner(&existing_def, &def) == def {
+        let def = merge_type_metadata(&existing_def, &def);
+        if !type_def_equivalent(&existing_def, &def) {
             self.types[idx] = (
                 def.id,
                 MessageMeta {
@@ -1228,13 +1294,17 @@ impl Registry {
     }
 }
 
-fn endpoint_schema_byte_cost(name_len: usize, description_len: usize) -> usize {
+const fn endpoint_schema_byte_cost(name_len: usize, description_len: usize) -> usize {
     size_of::<(DataEndpoint, EndpointMeta)>()
         .saturating_add(name_len)
         .saturating_add(description_len)
 }
 
-fn type_schema_byte_cost(name_len: usize, description_len: usize, endpoint_count: usize) -> usize {
+const fn type_schema_byte_cost(
+    name_len: usize,
+    description_len: usize,
+    endpoint_count: usize,
+) -> usize {
     size_of::<(DataType, MessageMeta)>()
         .saturating_add(name_len)
         .saturating_add(description_len)
@@ -1277,7 +1347,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
     sedsnet_has_telemetry_config_json
 ))]
 fn bundled_schema_snapshot() -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
-    schema_snapshot_from_json_bytes(include_bytes!("../telemetry_config.json"))
+    schema_snapshot_from_json_bytes(include_bytes!(env!("SEDSNET_BUNDLED_SCHEMA_PATH")))
 }
 
 #[cfg(feature = "std")]
@@ -1309,7 +1379,7 @@ pub fn register_endpoint_with_description(
     link_local_only: bool,
 ) -> TelemetryResult<DataEndpoint> {
     let mut reg = registry().lock().expect("schema registry poisoned");
-    let id = DataEndpoint(reg.next_endpoint_id);
+    let id = DataEndpoint(schema_identity::endpoint_id(name));
     reg.register_owned_endpoint(OwnedEndpointDefinition {
         id,
         name: name.to_string(),
@@ -1409,7 +1479,7 @@ pub fn register_data_type_with_description_and_e2e_encryption(
     e2e_encryption: E2eEncryptionPolicy,
 ) -> TelemetryResult<DataType> {
     let mut reg = registry().lock().expect("schema registry poisoned");
-    let id = DataType(reg.next_type_id);
+    let id = DataType(schema_identity::type_id(name));
     reg.register_owned_type(OwnedDataTypeDefinition {
         id,
         name: name.to_string(),
@@ -1601,19 +1671,11 @@ fn merge_owned_schema_snapshot_locked(
         }
     }
     for ty in snapshot.types {
-        if ty
-            .endpoints
-            .iter()
-            .all(|ep| reg.endpoints.iter().any(|(known_ep, _)| known_ep == ep))
-        {
-            match reg.merge_type_definition(ty) {
-                SchemaMergeDecision::Added => report.types_added += 1,
-                SchemaMergeDecision::ReplacedLocal => report.types_replaced += 1,
-                SchemaMergeDecision::KeptLocal => report.types_kept += 1,
-                SchemaMergeDecision::Unchanged => {}
-            }
-        } else {
-            report.types_kept += 1;
+        match reg.merge_type_definition(ty) {
+            SchemaMergeDecision::Added => report.types_added += 1,
+            SchemaMergeDecision::ReplacedLocal => report.types_replaced += 1,
+            SchemaMergeDecision::KeptLocal => report.types_kept += 1,
+            SchemaMergeDecision::Unchanged => {}
         }
     }
     report
@@ -1805,21 +1867,17 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-#[cfg(feature = "std")]
 fn endpoint_fingerprint(def: &OwnedEndpointDefinition) -> u64 {
     let mut h = 0x4550_4445_4600_0001;
     h = hash_u32(h, def.id.0);
     h = hash_bytes(h, def.name.as_bytes());
-    h = hash_bytes(h, def.description.as_bytes());
     hash_u8(h, def.link_local_only as u8)
 }
 
-#[cfg(feature = "std")]
 fn type_fingerprint(def: &OwnedDataTypeDefinition) -> u64 {
     let mut h = 0x5459_4445_4600_0001;
     h = hash_u32(h, def.id.0);
     h = hash_bytes(h, def.name.as_bytes());
-    h = hash_bytes(h, def.description.as_bytes());
     h = hash_message_element(h, def.element);
     h = hash_u8(h, reliable_code(def.reliable));
     h = hash_u8(h, def.priority);
@@ -1996,7 +2054,6 @@ pub fn remove_data_type_by_name(name: &str) -> TelemetryResult<bool> {
     }
 }
 
-#[cfg(feature = "std")]
 fn endpoint_def_equivalent(a: &OwnedEndpointDefinition, b: &OwnedEndpointDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
@@ -2004,7 +2061,6 @@ fn endpoint_def_equivalent(a: &OwnedEndpointDefinition, b: &OwnedEndpointDefinit
         && a.link_local_only == b.link_local_only
 }
 
-#[cfg(feature = "std")]
 fn type_def_equivalent(a: &OwnedDataTypeDefinition, b: &OwnedDataTypeDefinition) -> bool {
     a.id == b.id
         && a.name == b.name
@@ -2016,7 +2072,6 @@ fn type_def_equivalent(a: &OwnedDataTypeDefinition, b: &OwnedDataTypeDefinition)
         && a.e2e_encryption == b.e2e_encryption
 }
 
-#[cfg(feature = "std")]
 fn endpoint_winner(
     a: &OwnedEndpointDefinition,
     b: &OwnedEndpointDefinition,
@@ -2026,7 +2081,6 @@ fn endpoint_winner(
     if a_key <= b_key { a.clone() } else { b.clone() }
 }
 
-#[cfg(feature = "std")]
 fn type_winner(
     a: &OwnedDataTypeDefinition,
     b: &OwnedDataTypeDefinition,
@@ -2034,6 +2088,64 @@ fn type_winner(
     let a_key = (type_fingerprint(a), a.id.0, a.name.as_str());
     let b_key = (type_fingerprint(b), b.id.0, b.name.as_str());
     if a_key <= b_key { a.clone() } else { b.clone() }
+}
+
+// Compatible partial catalogs contribute destinations rather than choosing
+// one node's incomplete list. Wire layouts/reliability remain a single
+// deterministic definition when incompatible declarations conflict.
+fn merge_endpoint_metadata(
+    a: &OwnedEndpointDefinition,
+    b: &OwnedEndpointDefinition,
+) -> OwnedEndpointDefinition {
+    if a.id == b.id && a.name != b.name {
+        let placeholder = |def: &OwnedEndpointDefinition| {
+            def.name
+                .strip_prefix("ENDPOINT_")
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+                == Some(def.id.0)
+        };
+        if placeholder(a) && !placeholder(b) {
+            return b.clone();
+        }
+        if placeholder(b) && !placeholder(a) {
+            return a.clone();
+        }
+    }
+    if a.id != b.id || a.name != b.name {
+        return endpoint_winner(a, b);
+    }
+    let mut merged = a.clone();
+    merged.link_local_only |= b.link_local_only;
+    merged
+}
+fn merge_type_metadata(
+    a: &OwnedDataTypeDefinition,
+    b: &OwnedDataTypeDefinition,
+) -> OwnedDataTypeDefinition {
+    if a.id != b.id
+        || a.name != b.name
+        || a.element != b.element
+        || a.reliable != b.reliable
+        || a.e2e_encryption != b.e2e_encryption
+    {
+        return type_winner(a, b);
+    }
+    let mut merged = a.clone();
+    for endpoint in &b.endpoints {
+        if !merged.endpoints.contains(endpoint) {
+            merged.endpoints.push(*endpoint);
+        }
+    }
+    for index in 1..merged.endpoints.len() {
+        let mut cursor = index;
+        while cursor > 0 && merged.endpoints[cursor - 1] > merged.endpoints[cursor] {
+            merged.endpoints.swap(cursor - 1, cursor);
+            cursor -= 1;
+        }
+    }
+    merged.endpoints.dedup();
+    merged.priority = merged.priority.max(b.priority);
+    merged
 }
 
 pub(crate) fn message_data_type_code(dt: MessageDataType) -> u8 {
@@ -2131,83 +2243,187 @@ pub(crate) fn e2e_encryption_policy_from_code(code: u8) -> Option<E2eEncryptionP
 }
 
 #[cfg(not(feature = "std"))]
-pub fn register_endpoint(_name: &str, _link_local_only: bool) -> TelemetryResult<DataEndpoint> {
-    Err(TelemetryError::BadArg)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn register_endpoint_with_description(
-    _name: &str,
-    _description: &str,
-    _link_local_only: bool,
-) -> TelemetryResult<DataEndpoint> {
-    Err(TelemetryError::BadArg)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn register_endpoint_definition(_def: EndpointDefinition) -> TelemetryResult<()> {
-    Err(TelemetryError::BadArg)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn register_endpoint_id(
-    _id: DataEndpoint,
-    _name: &str,
-    _link_local_only: bool,
-) -> TelemetryResult<DataEndpoint> {
-    Err(TelemetryError::BadArg)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn register_endpoint_id_with_description(
-    _id: DataEndpoint,
-    _name: &str,
-    _description: &str,
-    _link_local_only: bool,
-) -> TelemetryResult<DataEndpoint> {
-    Err(TelemetryError::BadArg)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn ensure_endpoint_id(
-    id: DataEndpoint,
-    _link_local_only: bool,
-) -> TelemetryResult<DataEndpoint> {
-    if endpoint_exists(id) {
-        Ok(id)
-    } else {
-        Err(TelemetryError::BadArg)
-    }
+pub fn register_endpoint(name: &str, link_local_only: bool) -> TelemetryResult<DataEndpoint> {
+    register_endpoint_with_description(name, "", link_local_only)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn register_data_type(
-    _name: &str,
-    _element: MessageElement,
-    _endpoints: &[DataEndpoint],
-    _reliable: ReliableMode,
-    _priority: u8,
+    name: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
 ) -> TelemetryResult<DataType> {
-    Err(TelemetryError::BadArg)
+    register_data_type_with_description(name, "", element, endpoints, reliable, priority)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn register_data_type_with_description(
-    _name: &str,
-    _description: &str,
-    _element: MessageElement,
-    _endpoints: &[DataEndpoint],
-    _reliable: ReliableMode,
-    _priority: u8,
+    name: &str,
+    description: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
 ) -> TelemetryResult<DataType> {
-    Err(TelemetryError::BadArg)
+    register_data_type_with_description_and_e2e_encryption(
+        name,
+        description,
+        element,
+        endpoints,
+        reliable,
+        priority,
+        E2eEncryptionPolicy::PreferOff,
+    )
 }
 
 #[cfg(not(feature = "std"))]
-pub fn register_data_type_definition(_def: DataTypeDefinition) -> TelemetryResult<()> {
-    Err(TelemetryError::BadArg)
+pub fn register_data_type_id(
+    id: DataType,
+    name: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
+) -> TelemetryResult<DataType> {
+    register_data_type_id_with_description(id, name, "", element, endpoints, reliable, priority)
 }
 
+#[cfg(not(feature = "std"))]
+pub fn register_data_type_id_with_description(
+    id: DataType,
+    name: &str,
+    description: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
+) -> TelemetryResult<DataType> {
+    register_data_type_id_with_description_and_e2e_encryption(
+        id,
+        name,
+        description,
+        element,
+        endpoints,
+        reliable,
+        priority,
+        E2eEncryptionPolicy::PreferOff,
+    )
+}
+
+#[cfg(not(feature = "std"))]
+pub fn register_endpoint_with_description(
+    name: &str,
+    description: &str,
+    link_local_only: bool,
+) -> TelemetryResult<DataEndpoint> {
+    register_endpoint_id_with_description(
+        DataEndpoint(schema_identity::endpoint_id(name)),
+        name,
+        description,
+        link_local_only,
+    )
+}
+#[cfg(not(feature = "std"))]
+pub fn register_endpoint_id(
+    id: DataEndpoint,
+    name: &str,
+    link_local_only: bool,
+) -> TelemetryResult<DataEndpoint> {
+    register_endpoint_id_with_description(id, name, "", link_local_only)
+}
+#[cfg(not(feature = "std"))]
+pub fn register_endpoint_definition(def: EndpointDefinition) -> TelemetryResult<()> {
+    register_endpoint_id_with_description(def.id, def.name, def.description, def.link_local_only)
+        .map(|_| ())
+}
+#[cfg(not(feature = "std"))]
+pub fn register_endpoint_id_with_description(
+    id: DataEndpoint,
+    name: &str,
+    description: &str,
+    link_local_only: bool,
+) -> TelemetryResult<DataEndpoint> {
+    let def = OwnedEndpointDefinition {
+        id,
+        name: name.into(),
+        description: description.into(),
+        link_local_only,
+    };
+    unsafe { telemetry_lock() };
+    let result = (|| {
+        if let Some(existing) = endpoint_definition(id) {
+            return if existing == def {
+                Ok(id)
+            } else {
+                Err(TelemetryError::BadArg)
+            };
+        }
+        if embedded_endpoint_name_exists(name) {
+            return Err(TelemetryError::BadArg);
+        }
+        let cost = embedded_endpoint_allocation_cost(&def);
+        if schema_bytes_used().saturating_add(cost) > MAX_QUEUE_BUDGET {
+            return Err(TelemetryError::PacketTooLarge(
+                "Schema exceeds maximum shared queue budget",
+            ));
+        }
+        crate::memory_admission::check(cost.saturating_add(512), cost)?;
+        push_embedded_endpoint(def);
+        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(cost, Ordering::Relaxed);
+        Ok(id)
+    })();
+    unsafe { telemetry_unlock() };
+    result
+}
+#[cfg(not(feature = "std"))]
+pub fn ensure_endpoint_id(
+    id: DataEndpoint,
+    link_local_only: bool,
+) -> TelemetryResult<DataEndpoint> {
+    if endpoint_exists(id) {
+        Ok(id)
+    } else {
+        register_endpoint_id(id, &alloc::format!("ENDPOINT_{}", id.0), link_local_only)
+    }
+}
+#[cfg(not(feature = "std"))]
+#[allow(clippy::too_many_arguments)]
+pub fn register_data_type_with_description_and_e2e_encryption(
+    name: &str,
+    description: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
+    e2e_encryption: E2eEncryptionPolicy,
+) -> TelemetryResult<DataType> {
+    register_data_type_id_with_description_and_e2e_encryption(
+        DataType(schema_identity::type_id(name)),
+        name,
+        description,
+        element,
+        endpoints,
+        reliable,
+        priority,
+        e2e_encryption,
+    )
+}
+#[cfg(not(feature = "std"))]
+pub fn register_data_type_definition(def: DataTypeDefinition) -> TelemetryResult<()> {
+    register_data_type_id_with_description_and_e2e_encryption(
+        def.id,
+        def.name,
+        def.description,
+        def.element,
+        def.endpoints,
+        def.reliable,
+        def.priority,
+        def.e2e_encryption,
+    )
+    .map(|_| ())
+}
 #[cfg(not(feature = "std"))]
 pub fn set_data_type_e2e_encryption_policy(
     _ty: DataType,
@@ -2215,45 +2431,53 @@ pub fn set_data_type_e2e_encryption_policy(
 ) -> TelemetryResult<()> {
     Err(TelemetryError::BadArg)
 }
-
-#[cfg(not(feature = "std"))]
-pub fn register_data_type_id(
-    _id: DataType,
-    _name: &str,
-    _element: MessageElement,
-    _endpoints: &[DataEndpoint],
-    _reliable: ReliableMode,
-    _priority: u8,
-) -> TelemetryResult<DataType> {
-    Err(TelemetryError::BadArg)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn register_data_type_id_with_description(
-    _id: DataType,
-    _name: &str,
-    _description: &str,
-    _element: MessageElement,
-    _endpoints: &[DataEndpoint],
-    _reliable: ReliableMode,
-    _priority: u8,
-) -> TelemetryResult<DataType> {
-    Err(TelemetryError::BadArg)
-}
-
 #[cfg(not(feature = "std"))]
 #[allow(clippy::too_many_arguments)]
 pub fn register_data_type_id_with_description_and_e2e_encryption(
-    _id: DataType,
-    _name: &str,
-    _description: &str,
-    _element: MessageElement,
-    _endpoints: &[DataEndpoint],
-    _reliable: ReliableMode,
-    _priority: u8,
-    _e2e_encryption: E2eEncryptionPolicy,
+    id: DataType,
+    name: &str,
+    description: &str,
+    element: MessageElement,
+    endpoints: &[DataEndpoint],
+    reliable: ReliableMode,
+    priority: u8,
+    e2e_encryption: E2eEncryptionPolicy,
 ) -> TelemetryResult<DataType> {
-    Err(TelemetryError::BadArg)
+    let def = OwnedDataTypeDefinition {
+        id,
+        name: name.into(),
+        description: description.into(),
+        element,
+        endpoints: endpoints.to_vec(),
+        reliable,
+        priority,
+        e2e_encryption,
+    };
+    unsafe { telemetry_lock() };
+    let result = (|| {
+        if let Some(existing) = data_type_definition(id) {
+            return if existing == def {
+                Ok(id)
+            } else {
+                Err(TelemetryError::BadArg)
+            };
+        }
+        if embedded_type_name_exists(name) {
+            return Err(TelemetryError::BadArg);
+        }
+        let cost = embedded_type_allocation_cost(&def);
+        if schema_bytes_used().saturating_add(cost) > MAX_QUEUE_BUDGET {
+            return Err(TelemetryError::PacketTooLarge(
+                "Schema exceeds maximum shared queue budget",
+            ));
+        }
+        crate::memory_admission::check(cost.saturating_add(512), cost)?;
+        push_embedded_type(def);
+        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(cost, Ordering::Relaxed);
+        Ok(id)
+    })();
+    unsafe { telemetry_unlock() };
+    result
 }
 
 #[cfg(not(feature = "std"))]
@@ -2523,7 +2747,9 @@ fn embedded_overlay_endpoint(id: DataEndpoint) -> Option<EndpointDefinition> {
         // SAFETY: published nodes and their referenced fields are immutable
         // and intentionally live until reboot.
         let current = unsafe { &*node };
-        if current.def.id == id {
+        if current.def.id == id
+            && endpoint_visible_at(current.def, EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire))
+        {
             return Some(current.def);
         }
         node = current.next;
@@ -2538,7 +2764,9 @@ fn embedded_overlay_type(id: DataType) -> Option<DataTypeDefinition> {
         // SAFETY: published nodes and their referenced fields are immutable
         // and intentionally live until reboot.
         let current = unsafe { &*node };
-        if current.def.id == id {
+        if current.def.id == id
+            && type_visible_at(current.def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
+        {
             return Some(current.def);
         }
         node = current.next;
@@ -2551,7 +2779,9 @@ fn embedded_overlay_endpoint_by_name(name: &str) -> Option<EndpointDefinition> {
     let mut node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
     while !node.is_null() {
         let current = unsafe { &*node };
-        if current.def.name == name {
+        if current.def.name == name
+            && endpoint_visible_at(current.def, EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire))
+        {
             return Some(current.def);
         }
         node = current.next;
@@ -2564,7 +2794,9 @@ fn embedded_overlay_type_by_name(name: &str) -> Option<DataTypeDefinition> {
     let mut node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
     while !node.is_null() {
         let current = unsafe { &*node };
-        if current.def.name == name {
+        if current.def.name == name
+            && type_visible_at(current.def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
+        {
             return Some(current.def);
         }
         node = current.next;
@@ -2574,38 +2806,35 @@ fn embedded_overlay_type_by_name(name: &str) -> Option<DataTypeDefinition> {
 
 #[cfg(not(feature = "std"))]
 fn embedded_endpoint_name_exists(name: &str) -> bool {
-    if embedded_overlay_endpoint_by_name(name).is_some() {
-        return true;
-    }
-    for def in EMBEDDED_BUILTIN_ENDPOINTS {
-        if def.name == name {
-            return true;
-        }
-    }
-    for def in EMBEDDED_SCHEMA_ENDPOINTS {
-        if def.name == name {
-            return true;
-        }
-    }
-    false
+    DataEndpoint::try_named(name).is_some()
 }
 
 #[cfg(not(feature = "std"))]
 fn embedded_type_name_exists(name: &str) -> bool {
-    if embedded_overlay_type_by_name(name).is_some() {
-        return true;
-    }
-    for def in EMBEDDED_BUILTIN_TYPES {
-        if def.name == name {
-            return true;
+    DataType::try_named(name).is_some()
+}
+
+#[cfg(not(feature = "std"))]
+fn endpoint_visible_at(def: EndpointDefinition, mut head: *mut EmbeddedEndpointNode) -> bool {
+    while !head.is_null() {
+        let current = unsafe { &*head };
+        if current.def.id == def.id || current.def.name == def.name {
+            return current.def == def;
         }
+        head = current.next;
     }
-    for def in EMBEDDED_SCHEMA_TYPES {
-        if def.name == name {
-            return true;
+    true
+}
+#[cfg(not(feature = "std"))]
+fn type_visible_at(def: DataTypeDefinition, mut head: *mut EmbeddedTypeNode) -> bool {
+    while !head.is_null() {
+        let current = unsafe { &*head };
+        if current.def.id == def.id || current.def.name == def.name {
+            return current.def == def;
         }
+        head = current.next;
     }
-    false
+    true
 }
 
 #[cfg(not(feature = "std"))]
@@ -2634,23 +2863,35 @@ fn own_embedded_type(def: DataTypeDefinition) -> OwnedDataTypeDefinition {
 
 #[cfg(not(feature = "std"))]
 fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
-    let mut endpoints: Vec<OwnedEndpointDefinition> = embedded_static_endpoints()
-        .into_iter()
-        .map(own_embedded_endpoint)
-        .collect();
-    let mut endpoint_node = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
-    while !endpoint_node.is_null() {
-        endpoints.push(own_embedded_endpoint(unsafe { (*endpoint_node).def }));
-        endpoint_node = unsafe { (*endpoint_node).next };
+    let endpoint_head = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
+    let type_head = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
+    let mut endpoints = Vec::new();
+    for def in embedded_static_endpoints() {
+        if endpoint_visible_at(def, endpoint_head) {
+            endpoints.push(own_embedded_endpoint(def));
+        }
     }
-    let mut types: Vec<OwnedDataTypeDefinition> = embedded_static_data_types()
-        .into_iter()
-        .map(own_embedded_type)
-        .collect();
-    let mut type_node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
-    while !type_node.is_null() {
-        types.push(own_embedded_type(unsafe { (*type_node).def }));
-        type_node = unsafe { (*type_node).next };
+    let mut node = endpoint_head;
+    while !node.is_null() {
+        let current = unsafe { &*node };
+        if endpoint_visible_at(current.def, endpoint_head) {
+            endpoints.push(own_embedded_endpoint(current.def));
+        }
+        node = current.next;
+    }
+    let mut types = Vec::new();
+    for def in embedded_static_data_types() {
+        if type_visible_at(def, type_head) {
+            types.push(own_embedded_type(def));
+        }
+    }
+    let mut node = type_head;
+    while !node.is_null() {
+        let current = unsafe { &*node };
+        if type_visible_at(current.def, type_head) {
+            types.push(own_embedded_type(current.def));
+        }
+        node = current.next;
     }
     OwnedRuntimeSchemaSnapshot { endpoints, types }
 }
@@ -2717,54 +2958,54 @@ pub(crate) fn encode_embedded_schema_payload() -> TelemetryResult<Arc<[u8]>> {
         }
     }
 
-    let static_endpoint_count = EMBEDDED_BUILTIN_ENDPOINTS.len() + EMBEDDED_SCHEMA_ENDPOINTS.len();
-    let mut learned_endpoint_count = 0usize;
     let endpoint_head = EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire);
-    let mut endpoint_node = endpoint_head;
-    while !endpoint_node.is_null() {
-        learned_endpoint_count += 1;
-        endpoint_node = unsafe { (*endpoint_node).next };
-    }
-    let static_type_count = EMBEDDED_BUILTIN_TYPES.len() + EMBEDDED_SCHEMA_TYPES.len();
-    let mut learned_type_count = 0usize;
     let type_head = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
-    let mut type_node = type_head;
-    while !type_node.is_null() {
-        learned_type_count += 1;
-        type_node = unsafe { (*type_node).next };
-    }
-
-    // Capture immutable overlay heads once so both passes encode the same schema,
-    // even if another caller publishes additional definitions in the meantime.
-    let encode = |payload: &mut SchemaWriter<'_>| {
-        payload.extend_from_slice(&3u32.to_le_bytes());
-        payload.extend_from_slice(
-            &((static_endpoint_count + learned_endpoint_count) as u32).to_le_bytes(),
-        );
+    let endpoints = |visit: &mut dyn FnMut(EndpointDefinition)| {
         for def in EMBEDDED_BUILTIN_ENDPOINTS
             .iter()
             .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
         {
-            push_endpoint(payload, *def);
+            if endpoint_visible_at(*def, endpoint_head) {
+                visit(*def);
+            }
         }
-        let mut endpoint_node = endpoint_head;
-        while !endpoint_node.is_null() {
-            push_endpoint(payload, unsafe { (*endpoint_node).def });
-            endpoint_node = unsafe { (*endpoint_node).next };
+        let mut node = endpoint_head;
+        while !node.is_null() {
+            let current = unsafe { &*node };
+            if endpoint_visible_at(current.def, endpoint_head) {
+                visit(current.def);
+            }
+            node = current.next;
         }
-
-        payload.extend_from_slice(&((static_type_count + learned_type_count) as u32).to_le_bytes());
+    };
+    let types = |visit: &mut dyn FnMut(DataTypeDefinition)| {
         for def in EMBEDDED_BUILTIN_TYPES
             .iter()
             .chain(EMBEDDED_SCHEMA_TYPES.iter())
         {
-            push_type(payload, *def);
+            if type_visible_at(*def, type_head) {
+                visit(*def);
+            }
         }
-        let mut type_node = type_head;
-        while !type_node.is_null() {
-            push_type(payload, unsafe { (*type_node).def });
-            type_node = unsafe { (*type_node).next };
+        let mut node = type_head;
+        while !node.is_null() {
+            let current = unsafe { &*node };
+            if type_visible_at(current.def, type_head) {
+                visit(current.def);
+            }
+            node = current.next;
         }
+    };
+    let mut endpoint_count = 0u32;
+    endpoints(&mut |_| endpoint_count += 1);
+    let mut type_count = 0u32;
+    types(&mut |_| type_count += 1);
+    let encode = |payload: &mut SchemaWriter<'_>| {
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&endpoint_count.to_le_bytes());
+        endpoints(&mut |def| push_endpoint(payload, def));
+        payload.extend_from_slice(&type_count.to_le_bytes());
+        types(&mut |def| push_type(payload, def));
     };
     let mut count = SchemaWriter {
         bytes: None,
@@ -2773,7 +3014,7 @@ pub(crate) fn encode_embedded_schema_payload() -> TelemetryResult<Arc<[u8]>> {
     encode(&mut count);
     crate::memory_admission::check(count.len.saturating_add(512), count.len.saturating_add(32))?;
     let mut payload = Arc::<[u8]>::new_uninit_slice(count.len);
-    let bytes = Arc::get_mut(&mut payload).expect("new schema is exclusively owned");
+    let bytes = Arc::get_mut(&mut payload).unwrap();
     let mut writer = SchemaWriter {
         bytes: Some(bytes),
         len: 0,
@@ -2827,26 +3068,37 @@ fn embedded_type_allocation_cost(def: &OwnedDataTypeDefinition) -> usize {
         )
 }
 
+// Runtime and generated schemas use the same name-based wire identities.
+// A schema subset or reordered file cannot change another definition's ID.
 #[cfg(not(feature = "std"))]
-fn embedded_static_schema_cost() -> usize {
+#[inline(never)]
+fn compiled_type_definition(id: DataType) -> Option<DataTypeDefinition> {
+    EMBEDDED_BUILTIN_TYPES
+        .iter()
+        .find(|def| def.id == id)
+        .copied()
+        .or_else(|| {
+            EMBEDDED_SCHEMA_TYPES
+                .binary_search_by_key(&id.0, |def| def.id.0)
+                .ok()
+                .map(|index| EMBEDDED_SCHEMA_TYPES[index])
+        })
+        .filter(|def| type_visible_at(*def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
+}
+#[cfg(not(feature = "std"))]
+#[inline(never)]
+fn compiled_endpoint_definition(id: DataEndpoint) -> Option<EndpointDefinition> {
     EMBEDDED_BUILTIN_ENDPOINTS
         .iter()
-        .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-        .map(|def| endpoint_schema_byte_cost(def.name.len(), def.description.len()))
-        .sum::<usize>()
-        .saturating_add(
-            EMBEDDED_BUILTIN_TYPES
-                .iter()
-                .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                .map(|def| {
-                    type_schema_byte_cost(
-                        def.name.len(),
-                        def.description.len(),
-                        def.endpoints.len(),
-                    )
-                })
-                .sum::<usize>(),
-        )
+        .find(|def| def.id == id)
+        .copied()
+        .or_else(|| {
+            EMBEDDED_SCHEMA_ENDPOINTS
+                .binary_search_by_key(&id.0, |def| def.id.0)
+                .ok()
+                .map(|index| EMBEDDED_SCHEMA_ENDPOINTS[index])
+        })
+        .filter(|def| endpoint_visible_at(*def, EMBEDDED_ENDPOINT_HEAD.load(Ordering::Acquire)))
 }
 
 #[cfg(not(feature = "std"))]
@@ -2922,92 +3174,78 @@ pub fn merge_owned_schema_snapshot_with_budget(
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
     unsafe { telemetry_lock() };
-    let mut report = SchemaMergeReport {
-        endpoints_added: 0,
-        endpoints_replaced: 0,
-        endpoints_kept: 0,
-        types_added: 0,
-        types_replaced: 0,
-        types_kept: 0,
-    };
-    // Validate the complete decoded snapshot before publishing anything. The
-    // second pass moves accepted definitions straight into the append-only
-    // overlay, avoiding duplicate change vectors on constrained targets.
-    let mut added_bytes = 0usize;
-    for incoming in &snapshot.endpoints {
-        if !endpoint_exists(incoming.id) && !embedded_endpoint_name_exists(&incoming.name) {
-            added_bytes = added_bytes.saturating_add(embedded_endpoint_allocation_cost(incoming));
-        }
-    }
-    for incoming in &snapshot.types {
-        let mut endpoints_available = true;
-        for endpoint in &incoming.endpoints {
-            let mut supplied = endpoint_exists(*endpoint);
-            if !supplied {
-                for definition in &snapshot.endpoints {
-                    if definition.id == *endpoint {
-                        supplied = true;
-                        break;
-                    }
-                }
+    let result = (|| {
+        let mut report = SchemaMergeReport {
+            endpoints_added: 0,
+            endpoints_replaced: 0,
+            endpoints_kept: 0,
+            types_added: 0,
+            types_replaced: 0,
+            types_kept: 0,
+        };
+        let mut endpoints = Vec::new();
+        let mut types = Vec::new();
+        let mut added_bytes = 0usize;
+        for incoming in snapshot.endpoints {
+            let existing = endpoint_definition(incoming.id)
+                .or_else(|| endpoint_definition_by_name(&incoming.name));
+            let merged = if let Some(existing) = &existing {
+                merge_endpoint_metadata(existing, &incoming)
+            } else {
+                incoming
+            };
+            if existing
+                .as_ref()
+                .is_some_and(|existing| endpoint_def_equivalent(existing, &merged))
+            {
+                continue;
             }
-            if !supplied {
-                endpoints_available = false;
-                break;
+            if existing.is_some() {
+                report.endpoints_replaced += 1;
+            } else {
+                report.endpoints_added += 1;
             }
+            added_bytes = added_bytes.saturating_add(embedded_endpoint_allocation_cost(&merged));
+            endpoints.push(merged);
         }
-        if endpoints_available
-            && !data_type_exists(incoming.id)
-            && !embedded_type_name_exists(&incoming.name)
-        {
-            added_bytes = added_bytes.saturating_add(embedded_type_allocation_cost(incoming));
-        }
-    }
-    let projected_bytes = embedded_static_schema_cost()
-        .saturating_add(EMBEDDED_SCHEMA_OWNED_BYTES.load(Ordering::Relaxed))
-        .saturating_add(added_bytes);
-    if projected_bytes > max_schema_bytes {
-        unsafe { telemetry_unlock() };
-        return Err(TelemetryError::PacketTooLarge(
-            "Schema exceeds maximum shared queue budget",
-        ));
-    }
-    let mut committed_bytes = 0usize;
-    for incoming in snapshot.endpoints {
-        if !endpoint_exists(incoming.id) && !embedded_endpoint_name_exists(&incoming.name) {
-            committed_bytes =
-                committed_bytes.saturating_add(embedded_endpoint_allocation_cost(&incoming));
-            push_embedded_endpoint(incoming);
-            report.endpoints_added += 1;
-        } else {
-            report.endpoints_kept += 1;
-        }
-    }
-    for incoming in snapshot.types {
-        let mut endpoints_available = true;
-        for endpoint in &incoming.endpoints {
-            if !endpoint_exists(*endpoint) {
-                endpoints_available = false;
-                break;
+        for incoming in snapshot.types {
+            let existing = data_type_definition(incoming.id)
+                .or_else(|| data_type_definition_by_name(&incoming.name));
+            let merged = if let Some(existing) = &existing {
+                merge_type_metadata(existing, &incoming)
+            } else {
+                incoming
+            };
+            if existing
+                .as_ref()
+                .is_some_and(|existing| type_def_equivalent(existing, &merged))
+            {
+                continue;
             }
+            if existing.is_some() {
+                report.types_replaced += 1;
+            } else {
+                report.types_added += 1;
+            }
+            added_bytes = added_bytes.saturating_add(embedded_type_allocation_cost(&merged));
+            types.push(merged);
         }
-        if endpoints_available
-            && !data_type_exists(incoming.id)
-            && !embedded_type_name_exists(&incoming.name)
-        {
-            committed_bytes =
-                committed_bytes.saturating_add(embedded_type_allocation_cost(&incoming));
-            push_embedded_type(incoming);
-            report.types_added += 1;
-        } else {
-            report.types_kept += 1;
+        if schema_bytes_used().saturating_add(added_bytes) > max_schema_bytes {
+            return Err(TelemetryError::PacketTooLarge(
+                "Schema exceeds maximum shared queue budget",
+            ));
         }
-    }
-    if committed_bytes != 0 {
-        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(committed_bytes, Ordering::Relaxed);
-    }
+        for definition in endpoints {
+            push_embedded_endpoint(definition);
+        }
+        for definition in types {
+            push_embedded_type(definition);
+        }
+        EMBEDDED_SCHEMA_OWNED_BYTES.fetch_add(added_bytes, Ordering::Relaxed);
+        Ok(report)
+    })();
     unsafe { telemetry_unlock() };
-    Ok(report)
+    result
 }
 
 #[cfg(not(feature = "std"))]
@@ -3037,78 +3275,42 @@ pub fn schema_fingerprint() -> u64 {
 
 #[cfg(not(feature = "std"))]
 pub fn schema_bytes_used() -> usize {
-    embedded_static_schema_cost()
-        .saturating_add(EMBEDDED_SCHEMA_OWNED_BYTES.load(Ordering::Relaxed))
+    // Report RAM retained by learned definitions, excluding flash tables.
+    EMBEDDED_SCHEMA_OWNED_BYTES.load(Ordering::Relaxed)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn endpoint_exists(ep: DataEndpoint) -> bool {
-    embedded_overlay_endpoint(ep).is_some()
-        || EMBEDDED_BUILTIN_ENDPOINTS
-            .iter()
-            .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-            .any(|def| def.id == ep)
+    embedded_overlay_endpoint(ep).is_some() || compiled_endpoint_definition(ep).is_some()
 }
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_exists(ty: DataType) -> bool {
-    embedded_overlay_type(ty).is_some()
-        || EMBEDDED_BUILTIN_TYPES
-            .iter()
-            .chain(EMBEDDED_SCHEMA_TYPES.iter())
-            .any(|def| def.id == ty)
+    embedded_overlay_type(ty).is_some() || compiled_type_definition(ty).is_some()
 }
 
 #[cfg(not(feature = "std"))]
 pub fn endpoint_definition(ep: DataEndpoint) -> Option<OwnedEndpointDefinition> {
     embedded_overlay_endpoint(ep)
-        .or_else(|| {
-            EMBEDDED_BUILTIN_ENDPOINTS
-                .iter()
-                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-                .find(|def| def.id == ep)
-                .copied()
-        })
+        .or_else(|| compiled_endpoint_definition(ep))
         .map(own_embedded_endpoint)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_definition(ty: DataType) -> Option<OwnedDataTypeDefinition> {
     embedded_overlay_type(ty)
-        .or_else(|| {
-            EMBEDDED_BUILTIN_TYPES
-                .iter()
-                .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                .find(|def| def.id == ty)
-                .copied()
-        })
+        .or_else(|| compiled_type_definition(ty))
         .map(own_embedded_type)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn endpoint_definition_by_name(name: &str) -> Option<OwnedEndpointDefinition> {
-    embedded_overlay_endpoint_by_name(name)
-        .or_else(|| {
-            EMBEDDED_BUILTIN_ENDPOINTS
-                .iter()
-                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-                .find(|def| def.name == name)
-                .copied()
-        })
-        .map(own_embedded_endpoint)
+    DataEndpoint::try_named(name).and_then(endpoint_definition)
 }
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_definition_by_name(name: &str) -> Option<OwnedDataTypeDefinition> {
-    embedded_overlay_type_by_name(name)
-        .or_else(|| {
-            EMBEDDED_BUILTIN_TYPES
-                .iter()
-                .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                .find(|def| def.name == name)
-                .copied()
-        })
-        .map(own_embedded_type)
+    DataType::try_named(name).and_then(data_type_definition)
 }
 
 #[cfg(not(feature = "std"))]
@@ -3132,15 +3334,10 @@ pub fn remove_data_type_by_name(_name: &str) -> TelemetryResult<bool> {
 }
 
 #[cfg(not(feature = "std"))]
+#[inline(never)]
 pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
     embedded_overlay_endpoint(endpoint_type)
-        .or_else(|| {
-            EMBEDDED_BUILTIN_ENDPOINTS
-                .iter()
-                .chain(EMBEDDED_SCHEMA_ENDPOINTS.iter())
-                .find(|def| def.id == endpoint_type)
-                .copied()
-        })
+        .or_else(|| compiled_endpoint_definition(endpoint_type))
         .map(|def| EndpointMeta {
             name: def.name,
             description: def.description,
@@ -3154,15 +3351,10 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 }
 
 #[cfg(not(feature = "std"))]
+#[inline(never)]
 pub(crate) fn try_get_message_meta(data_type: DataType) -> Option<MessageMeta> {
     embedded_overlay_type(data_type)
-        .or_else(|| {
-            EMBEDDED_BUILTIN_TYPES
-                .iter()
-                .chain(EMBEDDED_SCHEMA_TYPES.iter())
-                .find(|def| def.id == data_type)
-                .copied()
-        })
+        .or_else(|| compiled_type_definition(data_type))
         .map(|def| MessageMeta {
             name: def.name,
             description: def.description,
@@ -3170,11 +3362,12 @@ pub(crate) fn try_get_message_meta(data_type: DataType) -> Option<MessageMeta> {
             endpoints: def.endpoints,
             reliable: def.reliable,
             priority: def.priority,
-            e2e_encryption: E2eEncryptionPolicy::PreferOff,
+            e2e_encryption: def.e2e_encryption,
         })
 }
 
 #[cfg(not(feature = "std"))]
+#[inline(never)]
 pub fn get_message_meta(data_type: DataType) -> MessageMeta {
     try_get_message_meta(data_type).unwrap_or(MessageMeta {
         name: "UNKNOWN_TYPE",
@@ -3292,18 +3485,17 @@ struct JsonEndpoint {
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonType {
-    rust: Option<String>,
+    #[serde(rename = "rust")]
+    _rust: Option<String>,
     name: String,
     #[serde(default, alias = "doc")]
     description: Option<String>,
     class: String,
     element: JsonElement,
     endpoints: Vec<String>,
-    #[serde(default)]
-    reliable: Option<bool>,
-    #[serde(default)]
-    reliable_mode: Option<String>,
+    reliable: ReliableMode,
     #[serde(default)]
     priority: Option<u8>,
     #[serde(default)]
@@ -3375,8 +3567,7 @@ impl StreamingSchemaState<'_> {
 
     fn add_endpoint(&mut self, ep: JsonEndpoint) -> TelemetryResult<()> {
         let rust_name = ep.rust.unwrap_or_else(|| ep.name.clone());
-        let id =
-            known_endpoint_compat_id(&rust_name).unwrap_or(DataEndpoint(self.reg.next_endpoint_id));
+        let id = DataEndpoint(schema_identity::endpoint_id(&ep.name));
         let existed = self.reg.endpoints.iter().any(|(known, _)| *known == id);
         let description = ep.description.unwrap_or_default();
         let retained = if existed {
@@ -3402,7 +3593,6 @@ impl StreamingSchemaState<'_> {
     }
 
     fn add_type(&mut self, ty: JsonType) -> TelemetryResult<()> {
-        let rust_name = ty.rust.unwrap_or_else(|| ty.name.clone());
         let endpoints = ty
             .endpoints
             .iter()
@@ -3418,10 +3608,10 @@ impl StreamingSchemaState<'_> {
                             .find(|(_, meta)| meta.name.as_ref() == name.as_str())
                             .map(|(id, _)| *id)
                     })
-                    .ok_or(TelemetryError::BadArg)
+                    .unwrap_or_else(|| DataEndpoint::identity(name))
             })
-            .collect::<TelemetryResult<Vec<_>>>()?;
-        let id = known_type_compat_id(&rust_name).unwrap_or(DataType(self.reg.next_type_id));
+            .collect::<Vec<_>>();
+        let id = DataType(schema_identity::type_id(&ty.name));
         let existed = self.reg.types.iter().any(|(known, _)| *known == id);
         let description = ty.description.unwrap_or_default();
         if !existed {
@@ -3442,13 +3632,7 @@ impl StreamingSchemaState<'_> {
                 MessageElement::Dynamic(parse_message_data_type(&data_type)?, class)
             }
         };
-        let reliable = match ty.reliable_mode.as_deref() {
-            Some("Ordered") => ReliableMode::Ordered,
-            Some("Unordered") => ReliableMode::Unordered,
-            Some("None") | None if ty.reliable.unwrap_or(false) => ReliableMode::Ordered,
-            Some("None") | None => ReliableMode::None,
-            _ => return Err(TelemetryError::BadArg),
-        };
+        let reliable = ty.reliable;
         self.reg.register_owned_type(OwnedDataTypeDefinition {
             id,
             name: ty.name,
@@ -3677,11 +3861,7 @@ fn json_config_to_snapshot(
         let link_local = link_local_overlay
             || ep.link_local_only.unwrap_or(false)
             || matches!(ep.broadcast_mode.as_deref(), Some("Never"));
-        let id = known_endpoint_compat_id(&rust_name).unwrap_or_else(|| {
-            let id = DataEndpoint(next_endpoint_id);
-            next_endpoint_id = next_endpoint_id.saturating_add(1);
-            id
-        });
+        let id = DataEndpoint(schema_identity::endpoint_id(&ep.name));
         next_endpoint_id = next_endpoint_id.max(id.0.saturating_add(1));
         endpoints.push(OwnedEndpointDefinition {
             id,
@@ -3694,7 +3874,6 @@ fn json_config_to_snapshot(
 
     let mut types = Vec::with_capacity(cfg.types.len());
     for ty in cfg.types {
-        let rust_name = ty.rust.clone().unwrap_or_else(|| ty.name.clone());
         let endpoints_for_type: Vec<DataEndpoint> = ty
             .endpoints
             .iter()
@@ -3703,14 +3882,10 @@ fn json_config_to_snapshot(
                     .iter()
                     .find(|(ep_name, _)| ep_name == name)
                     .map(|(_, id)| *id)
-                    .ok_or(TelemetryError::BadArg)
+                    .unwrap_or_else(|| DataEndpoint::identity(name))
             })
-            .collect::<TelemetryResult<Vec<_>>>()?;
-        let id = known_type_compat_id(&rust_name).unwrap_or_else(|| {
-            let id = DataType(next_type_id);
-            next_type_id = next_type_id.saturating_add(1);
-            id
-        });
+            .collect::<Vec<_>>();
+        let id = DataType(schema_identity::type_id(&ty.name));
         next_type_id = next_type_id.max(id.0.saturating_add(1));
         let class = parse_message_class(&ty.class)?;
         let element = match ty.element {
@@ -3723,18 +3898,7 @@ fn json_config_to_snapshot(
                 MessageElement::Dynamic(parse_message_data_type(&data_type)?, class)
             }
         };
-        let reliable = match ty.reliable_mode.as_deref() {
-            Some("Ordered") => ReliableMode::Ordered,
-            Some("Unordered") => ReliableMode::Unordered,
-            Some("None") | None => {
-                if ty.reliable.unwrap_or(false) {
-                    ReliableMode::Ordered
-                } else {
-                    ReliableMode::None
-                }
-            }
-            _ => return Err(TelemetryError::BadArg),
-        };
+        let reliable = ty.reliable;
         types.push(OwnedDataTypeDefinition {
             id,
             name: ty.name,
@@ -3769,31 +3933,6 @@ fn register_owned_schema_snapshot_into(
         reg.register_owned_type(ty)?;
     }
     Ok(())
-}
-
-#[cfg(feature = "serde")]
-fn known_endpoint_compat_id(name: &str) -> Option<DataEndpoint> {
-    match name {
-        "SdCard" => Some(DataEndpoint(100)),
-        "Radio" => Some(DataEndpoint(101)),
-        "SoftwareBus" => Some(DataEndpoint(102)),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "serde")]
-fn known_type_compat_id(name: &str) -> Option<DataType> {
-    match name {
-        "GpsData" => Some(DataType(100)),
-        "ImuData" => Some(DataType(101)),
-        "BatteryStatus" => Some(DataType(102)),
-        "SystemStatus" => Some(DataType(103)),
-        "BarometerData" => Some(DataType(104)),
-        "MessageData" => Some(DataType(105)),
-        "Heartbeat" => Some(DataType(106)),
-        "IpcMessage" => Some(DataType(107)),
-        _ => None,
-    }
 }
 
 #[cfg(feature = "serde")]
@@ -3927,7 +4066,8 @@ mod memory_regression_tests {
                 "name": "MEMORY_ROLLBACK_TYPE",
                 "class": "NotAClass",
                 "element": {"kind": "Dynamic", "data_type": "UInt8"},
-                "endpoints": ["MemoryRollbackEndpoint"]
+                "endpoints": ["MemoryRollbackEndpoint"],
+                "reliable": "Off"
             }]
         }"#;
 
@@ -3958,7 +4098,8 @@ mod memory_regression_tests {
                 "name": "SINGLE_BYTE_READER_TYPE",
                 "class": "Data",
                 "element": {"kind": "Dynamic", "data_type": "Binary"},
-                "endpoints": ["SingleByteReaderEndpoint"]
+                "endpoints": ["SingleByteReaderEndpoint"],
+                "reliable": "Off"
             }]
         }"#;
 

@@ -2966,6 +2966,40 @@ pub extern "C" fn seds_dtype_exists(ty: u32) -> bool {
     data_type_exists(DataType(ty))
 }
 
+/// Derive an order-independent identity without requiring local registration.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_endpoint_identity(
+    name: *const c_char,
+    name_len: usize,
+    out: *mut u32,
+) -> i32 {
+    if name.is_null() || name_len == 0 || out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
+    let Ok(name) = from_utf8(bytes) else {
+        return status_from_err(TelemetryError::InvalidUtf8);
+    };
+    unsafe {
+        *out = DataEndpoint::identity(name).0;
+    }
+    0
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_dtype_identity(name: *const c_char, name_len: usize, out: *mut u32) -> i32 {
+    if name.is_null() || name_len == 0 || out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let bytes = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(name), name_len) };
+    let Ok(name) = from_utf8(bytes) else {
+        return status_from_err(TelemetryError::InvalidUtf8);
+    };
+    unsafe {
+        *out = DataType::identity(name).0;
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_endpoint_register(
     endpoint: u32,
@@ -3443,9 +3477,24 @@ pub extern "C" fn seds_relay_new_with_memory(
     user: *mut c_void,
     memory: *const SedsRuntimeMemoryConfig,
 ) -> *mut SedsRelay {
-    let clock = FfiClock {
-        cb: now_ms_cb,
-        user_addr: user as usize,
+    let clock: Box<dyn Clock + Send + Sync> = if now_ms_cb.is_some() {
+        Box::new(FfiClock {
+            cb: now_ms_cb,
+            user_addr: user as usize,
+        })
+    } else {
+        #[cfg(feature = "std")]
+        {
+            let start = std::time::Instant::now();
+            Box::new(move || start.elapsed().as_millis() as u64)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Box::new(FfiClock {
+                cb: None,
+                user_addr: user as usize,
+            })
+        }
     };
     let Ok(memory) = runtime_memory_from_ffi(memory) else {
         return ptr::null_mut();
@@ -3454,7 +3503,7 @@ pub extern "C" fn seds_relay_new_with_memory(
     let Ok(cfg) = RelayConfig::default().with_memory_config(memory) else {
         return ptr::null_mut();
     };
-    let relay = Relay::new_with_config(cfg, Box::new(clock));
+    let relay = Relay::new_with_config(cfg, clock);
     Box::into_raw(Box::new(SedsRelay {
         inner: Arc::new(relay),
     }))
@@ -4365,6 +4414,16 @@ pub extern "C" fn seds_relay_process_all_queues_with_timeout(
     ok_or_status(relay.process_all_queues_with_timeout(timeout_ms))
 }
 
+/// Drain queued work; the application must poll periodic maintenance separately.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_drain_queues_with_timeout(r: *mut SedsRelay, timeout_ms: u32) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let relay = unsafe { &(*r).inner };
+    ok_or_status(relay.drain_queues_with_timeout(timeout_ms))
+}
+
 // ============================================================================
 //  Internal logging helper: dispatch queue vs immediate, with optional ts
 // ============================================================================
@@ -4923,6 +4982,19 @@ pub extern "C" fn seds_router_process_all_queues_with_timeout(
     }
     let router = unsafe { &(*r).inner };
     ok_or_status(router.process_all_queues_with_timeout(timeout_ms))
+}
+
+/// Drain queued work; the application must poll periodic maintenance separately.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_drain_queues_with_timeout(
+    r: *mut SedsRouter,
+    timeout_ms: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    ok_or_status(router.drain_queues_with_timeout(timeout_ms))
 }
 
 // ============================================================================
@@ -5762,14 +5834,25 @@ mod tests {
     #[test]
     fn c_side_backpressure_retains_router_packet_until_transport_accepts() {
         crate::tests::ensure_common_test_schema();
+        extern "C" fn clock(user: *mut c_void) -> u64 {
+            unsafe { (*(user as *const AtomicU64)).load(Ordering::SeqCst) }
+        }
+        let now = AtomicU64::new(0);
         for kind in 0..3 {
+            now.store(0, Ordering::SeqCst);
             let probe = BackpressureProbe {
                 busy: core::sync::atomic::AtomicBool::new(true),
                 delivered: AtomicUsize::new(0),
             };
             let user = &probe as *const _ as *mut c_void;
             let mut handle = SedsRouter {
-                inner: Arc::new(Router::new(RouterConfig::default())),
+                inner: Arc::new(Router::new_with_clock(
+                    RouterConfig::default(),
+                    Box::new(FfiClock {
+                        cb: Some(clock),
+                        user_addr: &now as *const _ as usize,
+                    }),
+                )),
             };
             let r = &mut handle as *mut SedsRouter;
             let side = match kind {
@@ -5810,6 +5893,7 @@ mod tests {
             );
             assert_eq!(probe.delivered.load(Ordering::SeqCst), 0);
             probe.busy.store(false, Ordering::SeqCst);
+            now.store(1, Ordering::SeqCst);
             handle.inner.process_tx_queue().unwrap();
             assert!(
                 probe.delivered.load(Ordering::SeqCst) > 0,
@@ -5821,6 +5905,10 @@ mod tests {
     #[test]
     fn c_side_backpressure_retains_relay_packet_until_transport_accepts() {
         crate::tests::ensure_common_test_schema();
+        extern "C" fn clock(user: *mut c_void) -> u64 {
+            unsafe { (*(user as *const AtomicU64)).load(Ordering::SeqCst) }
+        }
+        let now = AtomicU64::new(0);
         for kind in 0..2 {
             let ingress = BackpressureProbe {
                 busy: core::sync::atomic::AtomicBool::new(false),
@@ -5830,7 +5918,8 @@ mod tests {
                 busy: core::sync::atomic::AtomicBool::new(false),
                 delivered: AtomicUsize::new(0),
             };
-            let r = seds_relay_new(None, core::ptr::null_mut());
+            now.store(0, Ordering::SeqCst);
+            let r = seds_relay_new(Some(clock), &now as *const _ as *mut c_void);
             let a = seds_relay_add_side_packed(
                 r,
                 core::ptr::null(),
@@ -5879,6 +5968,7 @@ mod tests {
             );
             assert_eq!(egress.delivered.load(Ordering::SeqCst), 0);
             egress.busy.store(false, Ordering::SeqCst);
+            now.store(1, Ordering::SeqCst);
             assert_eq!(seds_relay_process_all_queues(r), 0);
             assert!(
                 egress.delivered.load(Ordering::SeqCst) > 0,

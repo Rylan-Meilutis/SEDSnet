@@ -267,7 +267,7 @@ pub fn normalize_topology_boards(boards: &mut Vec<TopologyBoardNode>) {
         board
             .reachable_endpoints
             .retain(|ep| !is_router_control_endpoint(*ep));
-        board.reachable_endpoints.sort_unstable();
+        crate::small_sort::sort(&mut board.reachable_endpoints);
         board.reachable_endpoints.dedup();
         sort_dedup_strings(&mut board.reachable_timesync_sources);
         board.connections.retain(|peer| peer != &board.sender_id);
@@ -299,31 +299,46 @@ pub fn topology_links_from_boards(boards: &[TopologyBoardNode]) -> Vec<TopologyL
 
 /// Merges board topology views keyed by sender ID.
 pub fn merge_topology_boards(dst: &mut Vec<TopologyBoardNode>, src: &[TopologyBoardNode]) {
-    let mut merged: BTreeMap<String, TopologyBoardNode> = dst
-        .iter()
-        .cloned()
-        .map(|board| (board.sender_id.clone(), board))
-        .collect();
-    for board in src {
-        let entry = merged
-            .entry(board.sender_id.clone())
-            .or_insert_with(|| TopologyBoardNode {
-                sender_id: board.sender_id.clone(),
-                reachable_endpoints: Vec::new(),
-                reachable_timesync_sources: Vec::new(),
-                connections: Vec::new(),
-            });
-        entry
-            .reachable_endpoints
-            .extend(board.reachable_endpoints.iter().copied());
-        entry
-            .reachable_timesync_sources
-            .extend(board.reachable_timesync_sources.iter().cloned());
-        entry.connections.extend(board.connections.iter().cloned());
+    // Reuse retained nodes. Building a BTreeMap from cloned nodes briefly
+    // duplicated the complete topology (plus a second copy of each key),
+    // exhausting constrained bridges during incremental discovery updates.
+    // Preserve the old map's last-wins behavior for duplicate destination IDs.
+    let mut index = 0;
+    while index < dst.len() {
+        if dst[index + 1..]
+            .iter()
+            .any(|node| node.sender_id == dst[index].sender_id)
+        {
+            dst.remove(index);
+        } else {
+            index += 1;
+        }
     }
-    let mut out: Vec<TopologyBoardNode> = merged.into_values().collect();
-    normalize_topology_boards(&mut out);
-    *dst = out;
+    for board in src {
+        if let Some(entry) = dst
+            .iter_mut()
+            .find(|node| node.sender_id == board.sender_id)
+        {
+            for endpoint in &board.reachable_endpoints {
+                if !entry.reachable_endpoints.contains(endpoint) {
+                    entry.reachable_endpoints.push(*endpoint);
+                }
+            }
+            for source in &board.reachable_timesync_sources {
+                if !entry.reachable_timesync_sources.contains(source) {
+                    entry.reachable_timesync_sources.push(source.clone());
+                }
+            }
+            for connection in &board.connections {
+                if !entry.connections.contains(connection) {
+                    entry.connections.push(connection.clone());
+                }
+            }
+        } else {
+            dst.push(board.clone());
+        }
+    }
+    normalize_topology_boards(dst);
 }
 
 /// Summarizes a board topology list into aggregated endpoint and time-source reachability.
@@ -331,10 +346,18 @@ pub fn summarize_topology_boards(boards: &[TopologyBoardNode]) -> (Vec<DataEndpo
     let mut reachable_endpoints = Vec::new();
     let mut reachable_timesync_sources = Vec::new();
     for board in boards {
-        reachable_endpoints.extend(board.reachable_endpoints.iter().copied());
-        reachable_timesync_sources.extend(board.reachable_timesync_sources.iter().cloned());
+        for endpoint in &board.reachable_endpoints {
+            if !is_router_control_endpoint(*endpoint) && !reachable_endpoints.contains(endpoint) {
+                reachable_endpoints.push(*endpoint);
+            }
+        }
+        for source in &board.reachable_timesync_sources {
+            if !reachable_timesync_sources.contains(source) {
+                reachable_timesync_sources.push(source.clone());
+            }
+        }
     }
-    reachable_endpoints.sort_unstable();
+    crate::small_sort::sort(&mut reachable_endpoints);
     reachable_endpoints.dedup();
     reachable_endpoints.retain(|ep| !is_router_control_endpoint(*ep));
     sort_dedup_strings(&mut reachable_timesync_sources);
@@ -380,7 +403,7 @@ pub fn decode_discovery_payload(payload: &[u8]) -> TelemetryResult<Vec<DataEndpo
         }
         endpoints.push(ep);
     }
-    endpoints.sort_unstable();
+    crate::small_sort::sort(&mut endpoints);
     endpoints.dedup();
     Ok(endpoints)
 }
@@ -393,7 +416,7 @@ pub fn build_discovery_timesync_sources<S: AsRef<str>>(
 ) -> TelemetryResult<Packet> {
     let mut payload = Vec::new();
     let mut deduped: Vec<&str> = sources.iter().map(|s| s.as_ref()).collect();
-    deduped.sort_unstable();
+    crate::small_sort::sort(&mut deduped);
     deduped.dedup();
 
     payload.extend_from_slice(&(deduped.len() as u32).to_le_bytes());
@@ -506,7 +529,7 @@ pub fn build_discovery_address(
     encode_string(&mut payload, &ad.hostname)?;
     let mut endpoints = ad.reachable_endpoints.clone();
     endpoints.retain(|ep| !is_discovery_endpoint(*ep));
-    endpoints.sort_unstable();
+    crate::small_sort::sort(&mut endpoints);
     endpoints.dedup();
     let endpoint_count = u32::try_from(endpoints.len())
         .map_err(|_| TelemetryError::Pack("discovery address endpoint count"))?;
@@ -515,7 +538,7 @@ pub fn build_discovery_address(
         payload.extend_from_slice(&ep.as_u32().to_le_bytes());
     }
     let mut network_variables = ad.reachable_network_variables.clone();
-    network_variables.sort_unstable();
+    crate::small_sort::sort(&mut network_variables);
     network_variables.dedup();
     let network_variable_count = u32::try_from(network_variables.len())
         .map_err(|_| TelemetryError::Pack("discovery address network variable count"))?;
@@ -603,7 +626,7 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
             reachable_endpoints.push(ep);
         }
     }
-    reachable_endpoints.sort_unstable();
+    crate::small_sort::sort(&mut reachable_endpoints);
     reachable_endpoints.dedup();
     let mut reachable_network_variables = Vec::new();
     if version >= 2 {
@@ -630,7 +653,7 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
                 reachable_network_variables.push(ty);
             }
         }
-        reachable_network_variables.sort_unstable();
+        crate::small_sort::sort(&mut reachable_network_variables);
         reachable_network_variables.dedup();
     }
     let source_count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
@@ -761,6 +784,160 @@ pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryRes
     Ok(out)
 }
 
+type TopologyScratchPeer<'a> = (
+    &'a str,
+    &'a [DataEndpoint],
+    &'a [String],
+    &'a [TopologyBoardNode],
+);
+
+/// Conservative scratch for the unique topology union, without constructing
+/// an owned graph. Include vector growth and the caller's concurrent copies.
+pub(crate) fn topology_snapshot_scratch<'a>(
+    sender: &str,
+    local_endpoints: usize,
+    variables: usize,
+    graph_copies: usize,
+    include_wire: bool,
+    peers: impl Iterator<Item = TopologyScratchPeer<'a>> + Clone,
+) -> (usize, usize) {
+    topology_snapshot_scratch_impl(
+        sender,
+        local_endpoints,
+        variables,
+        graph_copies,
+        include_wire,
+        &|index| peers.clone().nth(index),
+    )
+}
+
+#[inline(never)]
+fn topology_snapshot_scratch_impl<'a>(
+    sender: &str,
+    local_endpoints: usize,
+    variables: usize,
+    graph_copies: usize,
+    include_wire: bool,
+    peer_at: &dyn Fn(usize) -> Option<TopologyScratchPeer<'a>>,
+) -> (usize, usize) {
+    // One calculation body avoids duplicating nested iterator chains for every
+    // caller's routing-table iterator; access remains borrowed and allocation-free.
+    let peers = core::iter::from_fn({
+        let mut index = 0usize;
+        move || {
+            let peer = peer_at(index);
+            index = index.saturating_add(1);
+            peer
+        }
+    });
+    #[derive(Clone, Copy)]
+    struct View<'a> {
+        name: &'a str,
+        endpoints: &'a [DataEndpoint],
+        sources: &'a [String],
+        connections: &'a [String],
+        backlink: bool,
+    }
+    let node_size = core::mem::size_of::<TopologyBoardNode>();
+    let string_size = core::mem::size_of::<String>();
+    let mut nodes = 1usize;
+    let mut graph = node_size
+        .saturating_add(sender.len().saturating_mul(2))
+        .saturating_add(local_endpoints.saturating_add(1).saturating_mul(4))
+        .saturating_add(string_size);
+    let mut wire = 24usize
+        .saturating_add(sender.len().saturating_mul(2))
+        .saturating_add(local_endpoints.saturating_add(1).saturating_mul(4));
+    for (index, (name, _, _, _)) in peers.clone().enumerate() {
+        if name != sender && !peers.clone().take(index).any(|(old, _, _, _)| old == name) {
+            graph = graph.saturating_add(string_size).saturating_add(name.len());
+            wire = wire.saturating_add(4).saturating_add(name.len());
+        }
+    }
+    // Mirror the union used by merge_topology_boards without creating owned
+    // scratch. Overlapping peer catalogs retain each node and field only once.
+    let views = peers.flat_map(|(name, endpoints, sources, boards)| {
+        core::iter::once(View {
+            name,
+            endpoints,
+            sources,
+            connections: &[],
+            backlink: true,
+        })
+        .filter(move |_| boards.is_empty())
+        .chain(boards.iter().map(move |board| View {
+            name: &board.sender_id,
+            endpoints: &board.reachable_endpoints,
+            sources: &board.reachable_timesync_sources,
+            connections: &board.connections,
+            backlink: board.sender_id == name,
+        }))
+    });
+    for (index, node) in views.clone().enumerate() {
+        let prior = || {
+            views
+                .clone()
+                .take(index)
+                .filter(|old| old.name == node.name)
+        };
+        if node.name != sender && prior().next().is_none() {
+            nodes = nodes.saturating_add(1);
+            graph = graph
+                .saturating_add(node_size)
+                .saturating_add(node.name.len());
+            wire = wire.saturating_add(20).saturating_add(node.name.len());
+        }
+        for endpoint in node.endpoints {
+            if !prior().any(|old| old.endpoints.contains(endpoint)) {
+                graph = graph.saturating_add(4);
+                wire = wire.saturating_add(4);
+            }
+        }
+        for source in node.sources {
+            if !prior().any(|old| old.sources.contains(source)) {
+                graph = graph
+                    .saturating_add(string_size)
+                    .saturating_add(source.len());
+                wire = wire.saturating_add(4).saturating_add(source.len());
+            }
+        }
+        for connection in node.connections {
+            if connection != node.name
+                && !prior().any(|old| {
+                    old.connections.contains(connection) || (old.backlink && connection == sender)
+                })
+            {
+                graph = graph
+                    .saturating_add(string_size)
+                    .saturating_add(connection.len());
+                wire = wire.saturating_add(4).saturating_add(connection.len());
+            }
+        }
+        if node.backlink
+            && node.name != sender
+            && !node.connections.iter().any(|value| value == sender)
+            && !prior()
+                .any(|old| old.backlink || old.connections.iter().any(|value| value == sender))
+        {
+            graph = graph
+                .saturating_add(string_size)
+                .saturating_add(sender.len());
+            wire = wire.saturating_add(4).saturating_add(sender.len());
+        }
+    }
+    let grow = |bytes: usize| bytes.checked_next_power_of_two().unwrap_or(usize::MAX);
+    let largest = 1024usize
+        .max(grow(nodes).saturating_mul(node_size))
+        .max(if include_wire { grow(wire) } else { 0 });
+    // Election and per-side serialization run in separate phases. Account for
+    // the live graph copies in this phase, plus geometric vector growth;
+    // packet headers, statistics and queue bookkeeping have separate headroom.
+    let additional = 2048usize
+        .saturating_add(graph.saturating_mul(graph_copies))
+        .saturating_add(variables.saturating_mul(32));
+    (additional, largest)
+}
+
 /// Builds a discovery packet advertising the sender's current board/edge topology graph.
 pub fn build_discovery_topology(
     sender: &str,
@@ -819,6 +996,48 @@ pub struct DiscoveryTopologyUpdate {
     pub incremental: bool,
     pub boards: Vec<TopologyBoardNode>,
     pub removed: Vec<String>,
+}
+
+/// Applies a decoded, normalized full graph or node delta without copying the
+/// retained graph merely to detect changes. Replacement nodes own their buffers.
+pub fn apply_topology_update(
+    retained: &mut Vec<TopologyBoardNode>,
+    update: DiscoveryTopologyUpdate,
+) -> bool {
+    if !update.incremental {
+        if *retained == update.boards {
+            return false;
+        }
+        *retained = update.boards;
+        return true;
+    }
+    let old_len = retained.len();
+    retained.retain(|board| {
+        !update.removed.iter().any(|id| id == &board.sender_id)
+            || update
+                .boards
+                .iter()
+                .any(|replacement| replacement.sender_id == board.sender_id)
+    });
+    let mut changed = old_len != retained.len();
+    for board in update.boards {
+        if let Some(old) = retained
+            .iter_mut()
+            .find(|old| old.sender_id == board.sender_id)
+        {
+            if *old != board {
+                *old = board;
+                changed = true;
+            }
+        } else {
+            retained.push(board);
+            changed = true;
+        }
+    }
+    if changed {
+        normalize_topology_boards(retained);
+    }
+    changed
 }
 
 /// Computes the minimal named-node delta from one normalized graph to another.
@@ -1121,9 +1340,26 @@ fn skip_string(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telem
     Ok(())
 }
 
+#[cfg(any(not(feature = "std"), test))]
+fn borrowed_schema_string<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    label: &'static str,
+) -> TelemetryResult<&'a str> {
+    let len = read_u32(payload, cursor, label)? as usize;
+    let end = cursor
+        .checked_add(len)
+        .ok_or(TelemetryError::Unpack(label))?;
+    let bytes = payload
+        .get(*cursor..end)
+        .ok_or(TelemetryError::Unpack(label))?;
+    *cursor = end;
+    core::str::from_utf8(bytes).map_err(|_| TelemetryError::Unpack(label))
+}
+
 /// Checks a version-3 schema payload without allocating any owned strings or
 /// vectors. Embedded routers use this before the full decoder so repeated
-/// snapshots made entirely of compiled/previously learned IDs do not create a
+/// snapshots equivalent to compiled/previously learned definitions do not create a
 /// large transient heap burst merely to discard every decoded definition.
 #[cfg(any(not(feature = "std"), test))]
 pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> TelemetryResult<bool> {
@@ -1144,9 +1380,14 @@ pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> Telemet
             &mut cursor,
             "discovery schema endpoint id",
         )?);
-        all_known &= crate::config::endpoint_exists(id);
-        let _ = read_u8(payload, &mut cursor, "discovery schema endpoint flags")?;
-        skip_string(payload, &mut cursor, "discovery schema endpoint name")?;
+        let known = crate::config::endpoint_exists(id);
+        let meta = crate::config::get_endpoint_meta(id);
+        let link_local_only =
+            read_u8(payload, &mut cursor, "discovery schema endpoint flags")? != 0;
+        let name = borrowed_schema_string(payload, &mut cursor, "discovery schema endpoint name")?;
+        all_known &= known
+            && AsRef::<str>::as_ref(&meta.name) == name
+            && (!link_local_only || meta.link_local_only);
         skip_string(
             payload,
             &mut cursor,
@@ -1160,22 +1401,28 @@ pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> Telemet
     }
     for _ in 0..type_count {
         let id = DataType(read_u32(payload, &mut cursor, "discovery schema type id")?);
-        all_known &= crate::config::data_type_exists(id);
-        skip_string(payload, &mut cursor, "discovery schema type name")?;
+        let meta = crate::config::try_get_message_meta(id);
+        let name = borrowed_schema_string(payload, &mut cursor, "discovery schema type name")?;
         skip_string(payload, &mut cursor, "discovery schema type description")?;
         let element_kind = read_u8(payload, &mut cursor, "discovery schema element kind")?;
         if element_kind > 1 {
             return Err(TelemetryError::Unpack("discovery schema element kind"));
         }
-        let _ = read_u32(payload, &mut cursor, "discovery schema element count")?;
-        message_data_type_from_code(read_u8(payload, &mut cursor, "discovery schema data type")?)
-            .ok_or(TelemetryError::Unpack("discovery schema data type"))?;
-        message_class_from_code(read_u8(payload, &mut cursor, "discovery schema class")?)
-            .ok_or(TelemetryError::Unpack("discovery schema class"))?;
-        reliable_from_code(read_u8(payload, &mut cursor, "discovery schema reliable")?)
-            .ok_or(TelemetryError::Unpack("discovery schema reliable"))?;
-        let _ = read_u8(payload, &mut cursor, "discovery schema priority")?;
-        e2e_encryption_policy_from_code(read_u8(
+        let count = read_u32(payload, &mut cursor, "discovery schema element count")? as usize;
+        let data_type = message_data_type_from_code(read_u8(
+            payload,
+            &mut cursor,
+            "discovery schema data type",
+        )?)
+        .ok_or(TelemetryError::Unpack("discovery schema data type"))?;
+        let class =
+            message_class_from_code(read_u8(payload, &mut cursor, "discovery schema class")?)
+                .ok_or(TelemetryError::Unpack("discovery schema class"))?;
+        let reliable =
+            reliable_from_code(read_u8(payload, &mut cursor, "discovery schema reliable")?)
+                .ok_or(TelemetryError::Unpack("discovery schema reliable"))?;
+        let priority = read_u8(payload, &mut cursor, "discovery schema priority")?;
+        let encryption = e2e_encryption_policy_from_code(read_u8(
             payload,
             &mut cursor,
             "discovery schema e2e cryptography",
@@ -1188,8 +1435,27 @@ pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> Telemet
                 "discovery schema type endpoint count",
             ));
         }
+        let element = if element_kind == 0 {
+            MessageElement::Static(count, data_type, class)
+        } else {
+            MessageElement::Dynamic(data_type, class)
+        };
+        all_known &= meta.as_ref().is_some_and(|meta| {
+            AsRef::<str>::as_ref(&meta.name) == name
+                && meta.element == element
+                && meta.reliable == reliable
+                && meta.priority >= priority
+                && meta.e2e_encryption == encryption
+        });
         for _ in 0..endpoint_count {
-            let _ = read_u32(payload, &mut cursor, "discovery schema type endpoint")?;
+            let ep = DataEndpoint(read_u32(
+                payload,
+                &mut cursor,
+                "discovery schema type endpoint",
+            )?);
+            all_known &= meta
+                .as_ref()
+                .is_some_and(|meta| meta.endpoints.contains(&ep));
         }
     }
     if cursor != payload.len() {
@@ -1566,6 +1832,18 @@ pub fn decode_discovery_schema_payload(
     Ok(OwnedRuntimeSchemaSnapshot { endpoints, types })
 }
 
+/// An unchanged catalog can reuse a queued/in-progress transfer. Timestamp and
+/// nonce intentionally differ on repeated announcements; routing contracts do
+/// not. Changed metadata, sender or destination must still replace the snapshot.
+pub(crate) fn same_schema_snapshot(existing: &Packet, incoming: &Packet) -> bool {
+    existing.data_type() == DataType::DiscoverySchema
+        && incoming.data_type() == DataType::DiscoverySchema
+        && existing.sender() == incoming.sender()
+        && existing.endpoints() == incoming.endpoints()
+        && existing.wire_target_senders() == incoming.wire_target_senders()
+        && existing.payload() == incoming.payload()
+}
+
 #[cfg(test)]
 mod bounded_decode_tests {
     use super::{
@@ -1578,14 +1856,16 @@ mod bounded_decode_tests {
     use crate::{DataEndpoint, DataType};
 
     #[test]
-    fn known_schema_ids_are_detected_without_owned_decode() {
+    fn equivalent_schema_definitions_are_detected_without_owned_decode() {
         fn one_endpoint(id: DataEndpoint) -> Vec<u8> {
             let mut payload = Vec::new();
             payload.extend_from_slice(&3u32.to_le_bytes());
             payload.extend_from_slice(&1u32.to_le_bytes());
             payload.extend_from_slice(&id.0.to_le_bytes());
             payload.push(0);
-            payload.extend_from_slice(&0u32.to_le_bytes());
+            let meta = crate::config::get_endpoint_meta(id);
+            payload.extend_from_slice(&(meta.name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(meta.name.as_bytes());
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload
@@ -1599,6 +1879,29 @@ mod bounded_decode_tests {
             !discovery_schema_payload_is_fully_known(&one_endpoint(DataEndpoint(u32::MAX - 7),))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn reused_ids_with_changed_schema_are_not_treated_as_known() {
+        let schema = crate::config::export_schema();
+        let original =
+            super::build_discovery_schema_from_owned_snapshot("test", 1, schema.clone()).unwrap();
+        assert!(discovery_schema_payload_is_fully_known(original.payload()).unwrap());
+        for change in 0..4 {
+            let mut updated = schema.clone();
+            match change {
+                0 => updated.endpoints[0].name.push_str("_CHANGED"),
+                1 => updated.endpoints[0].link_local_only = !updated.endpoints[0].link_local_only,
+                2 => updated.types[0].name.push_str("_CHANGED"),
+                _ => updated.types[0].endpoints.push(DataEndpoint(u32::MAX - 7)),
+            }
+            let packet =
+                super::build_discovery_schema_from_owned_snapshot("test", 2, updated).unwrap();
+            assert!(
+                !discovery_schema_payload_is_fully_known(packet.payload()).unwrap(),
+                "change {change} was silently ignored"
+            );
+        }
     }
 
     #[test]

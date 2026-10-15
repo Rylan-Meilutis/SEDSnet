@@ -4,6 +4,7 @@ import os
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 import telemetry_config_editor as editor
 
@@ -34,12 +35,31 @@ class TelemetryConfigEditorPathTests(unittest.TestCase):
         ):
             self.assertEqual(editor.find_ipc_schema_json(), absolute)
 
+    def test_editor_accepts_one_enum_and_rejects_legacy_dual_fields(self):
+        ty = {"rust": "TestValue", "name": "TEST_VALUE", "class": "Data",
+              "element": {"kind": "Static", "data_type": "Float32", "count": 1},
+              "endpoints": ["TestEp"], "reliable": "Off"}
+        obj = {"endpoints": [{"rust": "TestEp", "name": "TEST_EP"}], "types": [ty]}
+        fake = SimpleNamespace(config_objs={editor.SCHEMA_SCOPE_BASE: obj,
+                                           editor.SCHEMA_SCOPE_IPC: {"endpoints": [], "types": []}})
+        for mode in editor.RELIABLE_MODE_OPTIONS:
+            ty["reliable"] = mode
+            editor.TelemetryConfigEditor.validate_current_config(fake, editor.SCHEMA_SCOPE_BASE)
+        for mode in [False, True, "None", "bad"]:
+            ty["reliable"] = mode
+            with self.assertRaises(RuntimeError):
+                editor.TelemetryConfigEditor.validate_current_config(fake, editor.SCHEMA_SCOPE_BASE)
+        ty["reliable"] = "Off"
+        ty["reliable_mode"] = "Unordered"
+        with self.assertRaises(RuntimeError):
+            editor.TelemetryConfigEditor.validate_current_config(fake, editor.SCHEMA_SCOPE_BASE)
+
     def test_type_row_text_includes_priority_when_nonzero(self) -> None:
         row = editor._type_row_text(
             {
                 "rust": "GpsData",
                 "name": "GPS_DATA",
-                "reliable_mode": "None",
+                "reliable": "Off",
                 "priority": 7,
             }
         )

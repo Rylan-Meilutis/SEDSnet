@@ -143,7 +143,7 @@ JSON shape:
       "rust": "GpsData",
       "name": "GPS_DATA",
       "description": "GPS data",
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "priority": 80,
       "class": "Data",
       "element": { "kind": "Static", "data_type": "Float32", "count": 3 },
@@ -162,27 +162,45 @@ Notes:
 
 ## Network Schema Sync
 
-Discovery includes schema advertisements. When nodes connect, they can exchange
-the current endpoint/type list and merge compatible definitions.
+A schema file is an optional seed. Hosted and embedded nodes can register
+endpoints and data types at runtime, announce their definitions, and learn
+complementary catalogs through routers or relays. A gateway does not need a
+compiled copy of a new application's schema to forward it.
 
-Embedded/no-std nodes keep their generated local schema in flash and retain only
-network-learned additions or deterministic conflict winners in a bounded RAM
-overlay. They do not duplicate the compiled schema into RAM. Schema packets are
-forwarded across router sides, so a newly attached node's definitions converge
-through the network without reflashing existing firmware.
+Automatic identities derive from canonical wire names, independently of file
+order, local catalog subsets, or registration order. Rust callers can use
+`DataEndpoint::identity(name)` and `DataType::identity(name)` before the referenced
+definition arrives. C callers use `seds_endpoint_identity` and
+`seds_dtype_identity`, then the registration APIs. Explicit numeric registrations
+must use consistent identities across nodes. Name/hash collisions are detected
+rather than treated as two equivalent definitions.
 
-Merge behavior:
+Compatible definitions contribute the union of destinations and the higher
+priority. Link-local restrictions are preserved. Incompatible definitions use
+the same deterministic conflict rule in hosted and embedded contexts; optional
+descriptions do not decide functional conflicts. A new incompatible application
+message layout should use a distinct versioned wire name. References to remote
+endpoints may arrive before their endpoint definitions. External JSON references
+use canonical wire names; Rust aliases apply within their defining document.
 
-- new endpoint/type definitions are added
-- equivalent definitions are kept
-- ID/name conflicts are resolved deterministically so nodes converge on the same
-  winner
-- data types with missing endpoint dependencies are skipped until those
-  endpoints are known
+Application frames retain explicit destination lists, so a partial sender's
+one-destination packet is not reinterpreted as a receiver's larger merged list.
+Sparse lists use variable-length numeric IDs rather than a fixed 32-byte bitmap;
+dense legacy-range sets can still use the bitmap representation. Reliable-header
+presence is carried in the frame. Receipt identity uses numeric wire identities
+and remains stable when missing names/definitions are subsequently learned.
 
-Direct local registration remains stricter than network merge. If local code
-tries to register an existing data type with a different shape, registration
-returns `BadArg`.
+Embedded nodes retain generated definitions in flash and learned/updated
+immutable overlays in RAM. Only retained RAM consumes the shared schema budget.
+The entire proposed merge is budget checked before publication; queue pressure
+must not remove existing schema definitions. Superseded immutable records remain
+charged to that budget until reboot so borrowed readers remain safe. Repeated
+identical or already-covered schema fragments do not grow retained memory.
+
+The identity and header changes require an initial coordinated rebuild of network
+participants. Subsequent compatible schema additions and destination changes are
+learned at runtime without reflashing existing gateways. The mixed-system linked
+qualification and long soak remain required before release.
 
 ## Memory Budgeting
 
@@ -223,3 +241,12 @@ For v4 deployments:
 - Treat data type shape changes as incompatible unless you intentionally create
   a new type ID/name.
 - Budget for schema memory if you expect many dynamic endpoints/types.
+
+### Reliability declaration
+
+Every type declares one required field: `"reliable": "Off"`, `"Ordered"`, or
+`"Unordered"`. `Off` sends best-effort samples; `Ordered` acknowledges delivery
+and preserves sequence; `Unordered` acknowledges delivery without ordering.
+Boolean `reliable` values and `reliable_mode` declarations are no longer accepted.
+Update application, board, and host schema files together. Runtime metadata
+stores one enum; the binary discovery schema and packet wire format are unchanged.

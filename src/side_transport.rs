@@ -14,6 +14,7 @@ pub(crate) const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
 pub(crate) const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
 pub(crate) const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
 pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
+pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT: u8 = 0x80;
 pub(crate) const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
 pub(crate) const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize =
     3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
@@ -63,6 +64,10 @@ impl SideTransportFrames {
             index: 0,
             total,
         })
+    }
+    pub(crate) fn bootstraps_template(&self) -> bool {
+        self.frame.starts_with(SIDE_TRANSPORT_MAGIC)
+            && self.frame.get(3) == Some(&SIDE_TRANSPORT_KIND_FULL)
     }
     pub(crate) fn progress_key(&self) -> u64 {
         hash_bytes_u64(
@@ -135,6 +140,13 @@ pub(crate) struct SideHeaderTemplate {
 }
 
 impl SideHeaderTemplate {
+    pub(crate) fn data_type(&self) -> Option<DataType> {
+        // The retained prefix begins with endpoint count, then type ULEB128.
+        let mut off = 1;
+        let id = u32::try_from(read_uleb128_local(&self.prefix, &mut off).ok()?).ok()?;
+        DataType::try_from_u32(id)
+    }
+
     pub(crate) fn is_ack(&self) -> bool {
         if self
             .reliable_flags
@@ -152,6 +164,38 @@ impl SideHeaderTemplate {
             })
     }
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct SideHeaderTemplateView<'a> {
+    pub(crate) hash: u64,
+    pub(crate) base_flags: u8,
+    pub(crate) prefix: &'a [u8],
+    pub(crate) between: &'a [u8],
+    pub(crate) reliable_flags: Option<u8>,
+    pub(crate) reliable_compact: bool,
+}
+impl SideHeaderTemplateView<'_> {
+    pub(crate) fn into_owned(self) -> SideHeaderTemplate {
+        SideHeaderTemplate {
+            hash: self.hash,
+            base_flags: self.base_flags,
+            prefix: crate::shared_bytes::convert(Arc::<[u8]>::from(self.prefix)),
+            between: crate::shared_bytes::convert(Arc::<[u8]>::from(self.between)),
+            reliable_flags: self.reliable_flags,
+            reliable_compact: self.reliable_compact,
+        }
+    }
+}
+type SideTemplateViewExtract<'a> = (
+    SideHeaderTemplateView<'a>,
+    DataType,
+    u8,
+    u64,
+    u64,
+    u16,
+    Option<(u32, u32)>,
+    &'a [u8],
+);
 
 type SideTemplateExtract<'a> = (
     SideHeaderTemplate,
@@ -261,6 +305,22 @@ pub(crate) fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Opti
 pub(crate) fn extract_side_header_template(
     bytes: &[u8],
 ) -> TelemetryResult<SideTemplateExtract<'_>> {
+    let (view, ty, flags, size, timestamp, nonce, reliable, payload) =
+        extract_side_header_template_view(bytes)?;
+    Ok((
+        view.into_owned(),
+        ty,
+        flags,
+        size,
+        timestamp,
+        nonce,
+        reliable,
+        payload,
+    ))
+}
+pub(crate) fn extract_side_header_template_view(
+    bytes: &[u8],
+) -> TelemetryResult<SideTemplateViewExtract<'_>> {
     if bytes.len() < wire_format::CRC32_BYTES + 4 {
         return Err(TelemetryError::Unpack("short buffer"));
     }
@@ -271,12 +331,12 @@ pub(crate) fn extract_side_header_template(
         .get(off)
         .ok_or(TelemetryError::Unpack("short prelude"))?;
     off += 1;
+    let nep = *data
+        .get(off)
+        .ok_or(TelemetryError::Unpack("short prelude"))? as usize;
     off += 1; // NEP
     let ty_u64 = read_uleb128_local(data, &mut off)?;
     let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
-    if ty_u32 > crate::MAX_VALUE_DATA_TYPE {
-        return Err(TelemetryError::Unpack("bad data type"));
-    }
     let ty = DataType(ty_u32);
     let data_size_off = off;
     let data_size = read_uleb128_local(data, &mut off)?;
@@ -299,6 +359,22 @@ pub(crate) fn extract_side_header_template(
         return Err(TelemetryError::Unpack("short buffer"));
     }
     off += endpoint_bitmap_bytes;
+    if flags & SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT != 0 {
+        if endpoint_bitmap_bytes != 0 {
+            return Err(TelemetryError::Unpack("ambiguous endpoint encoding"));
+        }
+        let mut previous = None;
+        for _ in 0..nep {
+            let id = u32::try_from(read_uleb128_local(data, &mut off)?)
+                .map_err(|_| TelemetryError::Unpack("endpoint too large"))?;
+            if previous.is_some_and(|previous| id <= previous) {
+                return Err(TelemetryError::Unpack(
+                    "endpoint list is not unique and sorted",
+                ));
+            }
+            previous = Some(id);
+        }
+    }
     if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
         let contract_len = usize::try_from(read_uleb128_local(data, &mut off)?)
             .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
@@ -326,25 +402,25 @@ pub(crate) fn extract_side_header_template(
         return Err(TelemetryError::Unpack("short buffer"));
     }
     let payload = &data[payload_off..];
-    let prefix = Arc::<[u8]>::from(&data[1..data_size_off]);
+    let prefix = &data[1..data_size_off];
     let between_end = reliable_span
         .map(|(rel_off, _, _)| rel_off)
         .unwrap_or(payload_off);
-    let between = Arc::<[u8]>::from(&data[between_start..between_end]);
+    let between = &data[between_start..between_end];
     let base_flags =
         flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
     let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
     hash = hash_bytes_u64(hash, &[base_flags]);
-    hash = hash_bytes_u64(hash, &prefix);
-    hash = hash_bytes_u64(hash, &between);
+    hash = hash_bytes_u64(hash, prefix);
+    hash = hash_bytes_u64(hash, between);
     if let Some(rel_flags) = reliable_flags {
         hash = hash_bytes_u64(hash, &[rel_flags]);
     }
-    let template = SideHeaderTemplate {
+    let template = SideHeaderTemplateView {
         hash,
         base_flags,
-        prefix: crate::shared_bytes::convert(prefix),
-        between: crate::shared_bytes::convert(between),
+        prefix,
+        between,
         reliable_flags,
         reliable_compact,
     };
@@ -362,6 +438,7 @@ pub(crate) fn extract_side_header_template(
 
 pub(crate) fn reconstruct_side_compact_frame(
     template: &SideHeaderTemplate,
+    flags: u8,
     body: &[u8],
     timestamp_mode: SideCompactTimestampMode,
     timestamp_base: Option<u64>,
@@ -370,8 +447,6 @@ pub(crate) fn reconstruct_side_compact_frame(
         return Err(TelemetryError::Unpack("short side compact frame"));
     }
     let mut off = 0usize;
-    let flags = body[off];
-    off += 1;
     if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
         != template.base_flags
     {
@@ -606,6 +681,54 @@ pub(crate) struct SideChunkAssembly {
 }
 
 impl SideChunkAssembly {
+    pub(crate) fn make_room(
+        chunks: &mut BTreeMap<u32, SideChunkAssembly>,
+        transfer_id: u32,
+        index: u16,
+        total: u16,
+        payload_len: usize,
+        budget: usize,
+    ) -> TelemetryResult<()> {
+        let cost = payload_len.saturating_add(64);
+        if usize::from(total) > budget / 64 || cost > budget {
+            chunks.remove(&transfer_id);
+            return Err(TelemetryError::PacketTooLarge("side chunk receive budget"));
+        }
+        if chunks
+            .get(&transfer_id)
+            .is_some_and(|a| a.received.contains_key(&index))
+        {
+            return Ok(());
+        }
+        let mut buffered: usize = chunks
+            .values()
+            .flat_map(|a| a.received.values())
+            .map(|p| p.len().saturating_add(64))
+            .sum();
+        while buffered.saturating_add(cost) > budget {
+            // Reclaim unrelated incomplete transfers before discarding the one
+            // receiving a new fragment. Completed schemas/routes are untouched.
+            let victim = chunks
+                .iter()
+                .filter(|(id, _)| **id != transfer_id)
+                .min_by_key(|(id, a)| (a.last_seen_ms, **id))
+                .map(|(id, _)| *id);
+            let Some(victim) = victim else {
+                chunks.remove(&transfer_id);
+                return Err(TelemetryError::PacketTooLarge("side chunk receive budget"));
+            };
+            if let Some(removed) = chunks.remove(&victim) {
+                let freed: usize = removed
+                    .received
+                    .values()
+                    .map(|p| p.len().saturating_add(64))
+                    .sum();
+                buffered = buffered.saturating_sub(freed);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn assemble(self) -> TelemetryResult<Vec<u8>> {
         if self.received.len() != usize::from(self.total) {
             return Err(TelemetryError::Unpack("side chunk gap"));

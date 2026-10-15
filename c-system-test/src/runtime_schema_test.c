@@ -222,7 +222,7 @@ int main(void)
         "\"name\":\"C_RUNTIME_JSON_TYPE\","
         "\"description\":\"C JSON type\","
         "\"priority\":23,"
-        "\"reliable_mode\":\"Unordered\","
+        "\"reliable\":\"Unordered\","
         "\"class\":\"Data\","
         "\"element\":{\"kind\":\"Static\",\"data_type\":\"Float32\",\"count\":1},"
         "\"endpoints\":[\"CRuntimeJsonEp\"]"

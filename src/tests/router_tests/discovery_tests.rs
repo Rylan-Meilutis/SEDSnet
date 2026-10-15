@@ -935,7 +935,7 @@ fn discovered_endpoint_routes_reliably_back_across_a_two_sided_gateway() {
             }
             Ok(())
         },
-        opts,
+        opts.clone(),
     );
     let gs_c = gs.clone();
     let gs_from_gateway_c = gs_from_gateway.clone();
@@ -962,7 +962,7 @@ fn discovered_endpoint_routes_reliably_back_across_a_two_sided_gateway() {
             }
             Ok(())
         },
-        opts,
+        opts.clone(),
     );
     let gateway_c = gateway.clone();
     let gateway_from_valve_c = gateway_from_valve.clone();
@@ -1065,7 +1065,7 @@ fn managed_variable_reaches_every_owner_behind_a_two_sided_router() {
     rf.add_side_packed_with_options(
         "radio",
         move |bytes| gs_c.rx_packed_from_side(bytes, 0),
-        reliable,
+        reliable.clone(),
     );
     let power_c = power.clone();
     let flight_c = flight.clone();
@@ -1075,7 +1075,7 @@ fn managed_variable_reaches_every_owner_behind_a_two_sided_router() {
             power_c.rx_packed_from_side(bytes, 0)?;
             flight_c.rx_packed_from_side(bytes, 0)
         },
-        best_effort,
+        best_effort.clone(),
     );
     let rf_c = rf.clone();
     let _gs_radio = gs.add_side_packed_with_options(
@@ -1091,7 +1091,7 @@ fn managed_variable_reaches_every_owner_behind_a_two_sided_router() {
             rf_c.rx_packed_from_side(bytes, 1)?;
             flight_c.rx_packed_from_side(bytes, 0)
         },
-        best_effort,
+        best_effort.clone(),
     );
     let rf_c = rf.clone();
     let power_c = power.clone();
@@ -1297,7 +1297,7 @@ fn topology_requests_use_elected_master_and_late_joiners_get_fresh_topology() {
             }
             Ok(())
         },
-        opts,
+        opts.clone(),
     );
 
     let a_for_b = a.clone();
@@ -1310,7 +1310,7 @@ fn topology_requests_use_elected_master_and_late_joiners_get_fresh_topology() {
             }
             Ok(())
         },
-        opts,
+        opts.clone(),
     );
     *b_ingress_from_a.lock().unwrap() = Some(b_to_a);
     *a_ingress_from_b.lock().unwrap() = Some(_a_to_b);
@@ -1334,7 +1334,7 @@ fn topology_requests_use_elected_master_and_late_joiners_get_fresh_topology() {
             }
             Ok(())
         },
-        opts,
+        opts.clone(),
     );
 
     let b_for_c = b.clone();
@@ -2320,7 +2320,20 @@ fn in_flight_end_to_end_destinations_survive_runtime_data_type_removal() {
     )
     .unwrap();
     let packet_id = pkt.packet_id();
-    router.tx(pkt).unwrap();
+    // This best-effort schema requests a receipt explicitly. Ordinary
+    // best-effort telemetry must not acquire tracking implicitly; the frozen
+    // contract must still survive removal of its runtime schema definition.
+    let wire = wire_format::pack_packet_with_wire_contract(
+        &pkt,
+        None,
+        Some(crate::message_meta(custom_ty).element),
+        &[crate::packet::hash_bytes_u64(
+            0x517C_C1B7_2722_0A95,
+            b"DEST_A",
+        )],
+    )
+    .unwrap();
+    router.tx_packed(wire).unwrap();
     assert_eq!(
         router.debug_end_to_end_pending_destination_count(packet_id),
         Some(1)
@@ -4801,7 +4814,9 @@ fn router_exports_runtime_stats_with_route_and_type_details() {
         seen_a_c.fetch_add(1, Ordering::SeqCst);
         now_a.fetch_add(1, Ordering::SeqCst);
         if retry_budget_c.fetch_add(1, Ordering::SeqCst) < 2 {
-            return Err(TelemetryError::Io("side tx busy"));
+            // Exercise ordinary immediate handler retries. Explicit transport
+            // backpressure is deferred and has its own queue/fairness tests.
+            return Err(TelemetryError::Io("transient handler error"));
         }
         Ok(())
     });
@@ -7902,5 +7917,333 @@ fn ingress_without_matching_route_does_not_spill_to_only_other_link() {
             .unwrap()
             .iter()
             .any(|p| p.data_type() == routed.data_type())
+    );
+}
+
+#[test]
+fn non_owner_relay_translates_downstream_ack_to_original_contract() {
+    ensure_managed_variable_test_schema();
+    let ep = DataEndpoint::named("ACTUATOR_BOARD");
+    let ty = register_data_type_with_description(
+        "RELAY_ONLY_ORDERED_VARIABLE",
+        "owner behind a non-owning relay",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::Ordered,
+        1,
+    )
+    .unwrap();
+    let now_ms = Arc::new(AtomicU64::new(0));
+    let source = Router::new_with_clock(
+        RouterConfig::default().with_sender("GS"),
+        Box::new(SharedClock {
+            now_ms: now_ms.clone(),
+        }),
+    );
+    let relay = Router::new_with_clock(
+        RouterConfig::default().with_sender("RF"),
+        Box::new(SharedClock {
+            now_ms: now_ms.clone(),
+        }),
+    );
+    let child = Router::new_with_clock(
+        RouterConfig::default().with_sender("FC"),
+        Box::new(SharedClock {
+            now_ms: now_ms.clone(),
+        }),
+    );
+    source
+        .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+        .unwrap();
+    child
+        .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+        .unwrap();
+    let forward = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let downstream = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let child_acks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let upstream = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let capture = |queue: Arc<Mutex<Vec<Vec<u8>>>>| {
+        move |bytes: &[u8]| {
+            queue.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+    };
+    let source_side = source.add_side_packed("radio", capture(forward.clone()));
+    let relay_up = relay.add_side_packed("radio", capture(upstream.clone()));
+    let relay_down = relay.add_side_packed("can", capture(downstream.clone()));
+    let child_side = child.add_side_packed("can", capture(child_acks.clone()));
+    let advertisement = |name: &str, address: u32| {
+        crate::discovery::build_discovery_address(
+            name,
+            0,
+            &crate::discovery::AddressAdvertisement {
+                hostname: name.into(),
+                address,
+                requested_address: address,
+                mode: crate::discovery::ADDRESS_MODE_STATIC,
+                state: crate::discovery::ADDRESS_STATE_APPROVED,
+                birth_ms: 0,
+                owner_hash: address as u64,
+                reachable_endpoints: vec![],
+                reachable_network_variables: vec![ty],
+                reachable_timesync_sources: vec![],
+                link_capabilities: crate::discovery::LinkCapabilities {
+                    version: 1,
+                    flags: 0,
+                    profile: crate::discovery::LINK_PROFILE_CANONICAL,
+                    max_frame_bytes: 0,
+                    compact_header_target_bytes: 0,
+                    max_side_transport_templates: 0,
+                },
+            },
+        )
+        .unwrap()
+    };
+    source
+        .rx_from_side(&advertisement("RF", 1), source_side)
+        .unwrap();
+    relay
+        .rx_from_side(&advertisement("FC", 2), relay_down)
+        .unwrap();
+    forward.lock().unwrap().clear();
+    downstream.lock().unwrap().clear();
+    child_acks.lock().unwrap().clear();
+    upstream.lock().unwrap().clear();
+    source
+        .set_network_variable(
+            Packet::new(ty, &[ep], "GS", 100, 1.0_f32.to_le_bytes().to_vec().into()).unwrap(),
+        )
+        .unwrap();
+    source.process_all_queues().unwrap();
+    assert_eq!(
+        source
+            .export_runtime_stats()
+            .reliable
+            .end_to_end_pending_destination_count,
+        1
+    );
+    let originals: Vec<_> = forward.lock().unwrap().drain(..).collect();
+    for frame in &originals {
+        relay.rx_packed_from_side(frame, relay_up).unwrap();
+    }
+    relay.process_all_queues().unwrap();
+    // Merely queuing a forwarded value must not acknowledge its delivery.
+    assert_eq!(
+        source
+            .export_runtime_stats()
+            .reliable
+            .end_to_end_pending_destination_count,
+        1
+    );
+    for frame in downstream.lock().unwrap().drain(..) {
+        child.rx_packed_from_side(&frame, child_side).unwrap();
+    }
+    child.process_all_queues().unwrap();
+    assert_eq!(
+        child
+            .cached_managed_variable(ty)
+            .unwrap()
+            .data_as_f32()
+            .unwrap(),
+        vec![1.0]
+    );
+    for frame in child_acks.lock().unwrap().drain(..) {
+        relay.rx_packed_from_side(&frame, relay_down).unwrap();
+    }
+    relay.process_all_queues().unwrap();
+    // Lose the first upstream receipt, then replay the publisher's packet.
+    upstream.lock().unwrap().clear();
+    now_ms.store(1500, Ordering::SeqCst);
+    for frame in &originals {
+        relay.rx_packed_from_side(frame, relay_up).unwrap();
+    }
+    relay.process_all_queues().unwrap();
+    for frame in downstream.lock().unwrap().drain(..) {
+        child.rx_packed_from_side(&frame, child_side).unwrap();
+    }
+    child.process_all_queues().unwrap();
+    for frame in child_acks.lock().unwrap().drain(..) {
+        relay.rx_packed_from_side(&frame, relay_down).unwrap();
+    }
+    relay.process_all_queues().unwrap();
+    for frame in upstream.lock().unwrap().drain(..) {
+        source.rx_packed_from_side(&frame, source_side).unwrap();
+    }
+    source.process_all_queues().unwrap();
+    assert_eq!(
+        source
+            .export_runtime_stats()
+            .reliable
+            .end_to_end_pending_destination_count,
+        0
+    );
+    assert!(
+        relay.debug_reliable_return_route_count()
+            <= crate::config::runtime_reliable_max_return_routes()
+    );
+}
+
+#[test]
+fn explicit_queue_drains_do_not_generate_periodic_discovery() {
+    ensure_topology_test_schema();
+    let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+    let router_sent = Arc::new(AtomicUsize::new(0));
+    let observed = router_sent.clone();
+    router.add_side_packet("wire", move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    for _ in 0..10 {
+        router.drain_queues_with_timeout(1).unwrap();
+    }
+    assert_eq!(router_sent.load(Ordering::Relaxed), 0);
+    router.periodic(1).unwrap();
+    assert!(router_sent.load(Ordering::Relaxed) > 0);
+
+    let relay = Relay::new(zero_clock());
+    let relay_sent = Arc::new(AtomicUsize::new(0));
+    let observed = relay_sent.clone();
+    relay.add_side_packet("wire", move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    for _ in 0..10 {
+        relay.drain_queues_with_timeout(1).unwrap();
+    }
+    assert_eq!(relay_sent.load(Ordering::Relaxed), 0);
+    relay.periodic(1).unwrap();
+    assert!(relay_sent.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn bounded_discovery_drain_yields_before_routing_remaining_announcements() {
+    ensure_topology_test_schema();
+    let router = Router::new_with_clock(RouterConfig::default(), StepClock::new_box(0, 1));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let observed = sent.clone();
+    let side = router.add_side_packet("wire", move |packet| {
+        if packet.data_type() == DataType::named("GPS_DATA") {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    for sender in ["FIRST", "SECOND", "THIRD"] {
+        router
+            .rx_queue_from_side(
+                build_discovery_announce(sender, 0, &[DataEndpoint::named("RADIO")]).unwrap(),
+                side,
+            )
+            .unwrap();
+    }
+    router
+        .tx_queue(
+            Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[1.0, 2.0, 3.0],
+                &[DataEndpoint::named("RADIO")],
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    router.drain_queues_with_timeout(1).unwrap();
+    assert_eq!(router.export_topology().routes[0].announcers.len(), 1);
+    assert_eq!(sent.load(Ordering::Relaxed), 0);
+    // Unbounded drains retain the discovery-before-data ordering and finish.
+    router.drain_queues_with_timeout(0).unwrap();
+    assert_eq!(router.export_topology().routes[0].announcers.len(), 3);
+    assert_eq!(sent.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn queued_schema_request_defers_response_transmission_to_tx_service() {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let output = sent.clone();
+    let router =
+        Router::new_with_clock(RouterConfig::new([]).with_hostname("BRIDGE"), zero_clock());
+    let side = router.add_side_packet("requester", move |_packet: &Packet| {
+        output.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    let request = Packet::new(
+        DataType::DiscoverySchemaRequest,
+        &[DataEndpoint::Discovery],
+        "RECOVERING",
+        1,
+        Arc::from([]),
+    )
+    .unwrap();
+    let wire = wire_format::pack_packet(&request);
+    router.rx_packed_queue_from_side(&wire, side).unwrap();
+    router.process_rx_queue_with_timeout(0).unwrap();
+    assert_eq!(
+        sent.load(Ordering::Relaxed),
+        0,
+        "schema RX recursively sent a full response burst"
+    );
+    router.dispatch_tx_queue_with_timeout(0).unwrap();
+    assert!(
+        sent.load(Ordering::Relaxed) > 0,
+        "deferring schema TX must not discard the recovery response"
+    );
+}
+
+#[test]
+fn busy_transport_yields_without_spinning_or_blocking_healthy_side() {
+    use core::sync::atomic::AtomicU64;
+    ensure_topology_test_schema();
+    let now = Arc::new(AtomicU64::new(0));
+    let read_clock = now.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::default(),
+        Box::new(move || read_clock.load(Ordering::Relaxed)),
+    );
+    let blocked = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let busy = blocked.clone();
+    let calls = attempts.clone();
+    router.add_side_packet("busy", move |packet| {
+        if packet.data_type() != DataType::DiscoverySchemaRequest {
+            return Ok(());
+        }
+        let count = calls.fetch_add(1, Ordering::Relaxed);
+        // Fail the old spin deterministically, even when its clock is frozen.
+        if count > 32 {
+            return Err(TelemetryError::BadArg);
+        }
+        if busy.load(Ordering::Relaxed) {
+            Err(TelemetryError::Io("side tx busy"))
+        } else {
+            Ok(())
+        }
+    });
+    let healthy = Arc::new(AtomicUsize::new(0));
+    let delivered = healthy.clone();
+    router.add_side_packet("healthy", move |packet| {
+        if packet.data_type() == DataType::DiscoverySchemaRequest {
+            delivered.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    router
+        .tx_queue(crate::discovery::build_discovery_schema_request("GS", 0).unwrap())
+        .unwrap();
+    router.dispatch_tx_queue_with_timeout(0).unwrap();
+    assert_eq!(healthy.load(Ordering::Relaxed), 1);
+    let first_attempts = attempts.load(Ordering::Relaxed);
+    assert!(first_attempts > 0 && first_attempts <= MAX_HANDLER_RETRIES + 1);
+    // More drain calls in the same millisecond must not busy-spin either.
+    for _ in 0..100 {
+        router.dispatch_tx_queue_with_timeout(0).unwrap();
+    }
+    assert_eq!(attempts.load(Ordering::Relaxed), first_attempts);
+    blocked.store(false, Ordering::Relaxed);
+    now.store(1, Ordering::Relaxed);
+    router.dispatch_tx_queue_with_timeout(0).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), first_attempts + 1);
+    assert_eq!(
+        healthy.load(Ordering::Relaxed),
+        1,
+        "successful sides must not be replayed"
     );
 }

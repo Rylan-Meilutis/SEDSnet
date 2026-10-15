@@ -36,12 +36,21 @@ int32_t seds_packet_store_stats(SedsPacketStoreStats *out);
 #endif
 
 void seds_set_memory_admission_probe(SedsMemoryAdmissionProbe probe);
+/* Optional extended admission: 0=general/cold work, 1=fully cached small
+ * packed transit. The legacy callback and default behavior are unchanged. */
+#define SEDS_MEMORY_WORK_GENERAL 0U
+#define SEDS_MEMORY_WORK_CACHED_TRANSIT 1U
+typedef bool (*SedsMemoryAdmissionProbeV2)(size_t additional_bytes, size_t largest_allocation, uint32_t work);
+void seds_set_memory_admission_probe_v2(SedsMemoryAdmissionProbeV2 probe);
+
 size_t seds_memory_admission_rejected(void);
 
 /* =================================================================
    Public built-in enums / constants. User schema entries are registered at runtime.
    ================================================================= */
-typedef enum SedsDataType {
+/* Registry identities have a fixed 32-bit ABI, including with -fshort-enums. */
+typedef uint32_t SedsDataType;
+enum {
   /* Time source announce (priority, time_ms). */
   SEDS_DT_TIME_SYNC_ANNOUNCE = 4,
   /* Time sync request (seq, t1_ms). */
@@ -70,16 +79,17 @@ typedef enum SedsDataType {
   SEDS_DT_DISCOVERY_LINK_CAPABILITIES = 16,
   /* Built-in TelemetryError */
   SEDS_DT_TELEMETRY_ERROR = 0,
-} SedsDataType;
+};
 
-typedef enum SedsDataEndpoint {
+typedef uint32_t SedsDataEndpoint;
+enum {
   /* SEDSnet time sync routing endpoint (internal, always forwarded). */
   SEDS_EP_TIME_SYNC = 200,
   /* SEDSnet discovery control endpoint for internal route advertisements. */
   SEDS_EP_DISCOVERY = 201,
   /* SEDSnet error endpoint for internal error packets. */
   SEDS_EP_TELEMETRY_ERROR = 202,
-} SedsDataEndpoint;
+};
 
 typedef enum SedsResult {
   SEDS_OK = 0,
@@ -1058,6 +1068,11 @@ SedsResult seds_router_clear_route_priority(SedsRouter * r, int32_t src_side_id,
 int32_t seds_dtype_expected_size(SedsDataType ty);
 bool seds_endpoint_exists(uint32_t endpoint);
 bool seds_dtype_exists(uint32_t ty);
+/* Stable wire identities for runtime declarations and unresolved references.
+ * These do not register a definition and work with or without a schema seed. */
+SedsResult seds_endpoint_identity(const char *name, size_t name_len, uint32_t *out_id);
+SedsResult seds_dtype_identity(const char *name, size_t name_len, uint32_t *out_id);
+
 SedsResult seds_endpoint_register(uint32_t endpoint, const char * name, size_t name_len, bool link_local_only);
 SedsResult seds_endpoint_register_ex(uint32_t endpoint,
                                      const char * name,
@@ -1190,6 +1205,9 @@ SedsResult seds_router_process_rx_queue_with_timeout(SedsRouter * r, uint32_t ti
 
 /** @brief Process TX and RX queues for up to @p timeout_ms (0 drains fully). */
 SedsResult seds_router_process_all_queues_with_timeout(SedsRouter * r, uint32_t timeout_ms);
+
+/* Drain queued RX/TX without periodic announcements; poll maintenance separately. */
+SedsResult seds_router_drain_queues_with_timeout(SedsRouter * r, uint32_t timeout_ms);
 
 /** @brief Process TX and RX queues until empty. */
 SedsResult seds_router_process_all_queues(SedsRouter * r);
@@ -1331,7 +1349,8 @@ void seds_owned_header_free(SedsOwnedHeader * h);
 /**
  * @brief Create a new relay instance.
  *
- * @param now_ms_cb  Optional monotonic clock callback (may be NULL).
+ * @param now_ms_cb  Monotonic clock callback. NULL uses an internal clock on
+ *                   std builds; no_std clients must provide an advancing clock.
  * @param user       Opaque user pointer passed back into @p now_ms_cb.
  *
  * @return Non-NULL relay handle on success; NULL on failure.
@@ -1654,6 +1673,9 @@ SedsResult seds_relay_process_tx_queue_with_timeout(SedsRelay * r, uint32_t time
  * recursively drive nested relay TX on the same stack.
  */
 SedsResult seds_relay_process_all_queues_with_timeout(SedsRelay * r, uint32_t timeout_ms);
+
+/* Drain queued RX/TX without periodic announcements; poll maintenance separately. */
+SedsResult seds_relay_drain_queues_with_timeout(SedsRelay * r, uint32_t timeout_ms);
 
 #if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 typedef SedsResult (* SedsCryptoSealFn)(

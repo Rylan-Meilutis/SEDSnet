@@ -348,6 +348,14 @@ struct JsonEndpoint {
 }
 
 #[derive(Debug, serde::Deserialize)]
+enum JsonReliability {
+    Off,
+    Ordered,
+    Unordered,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonType {
     /// Rust enum variant, e.g. "GpsData"
     rust: String,
@@ -356,10 +364,7 @@ struct JsonType {
     #[serde(default)]
     doc: Option<String>,
 
-    #[serde(default)]
-    reliable: Option<bool>,
-    #[serde(default)]
-    reliable_mode: Option<String>,
+    reliable: JsonReliability,
     #[serde(default)]
     priority: Option<u8>,
 
@@ -661,19 +666,12 @@ fn msg_class_token(name: &str) -> proc_macro2::TokenStream {
     quote!(MessageClass::#id)
 }
 
-fn reliable_mode_token(mode: &str) -> Result<proc_macro2::TokenStream, String> {
-    let mode_lc = mode.to_ascii_lowercase();
-    let ts = match mode_lc.as_str() {
-        "none" => quote!(crate::ReliableMode::None),
-        "ordered" => quote!(crate::ReliableMode::Ordered),
-        "unordered" => quote!(crate::ReliableMode::Unordered),
-        _ => {
-            return Err(format!(
-                "invalid reliable_mode: {mode:?} (expected \"None\", \"Ordered\", or \"Unordered\")"
-            ));
-        }
-    };
-    Ok(ts)
+fn reliable_token(mode: &JsonReliability) -> proc_macro2::TokenStream {
+    match mode {
+        JsonReliability::Off => quote!(crate::ReliableMode::None),
+        JsonReliability::Ordered => quote!(crate::ReliableMode::Ordered),
+        JsonReliability::Unordered => quote!(crate::ReliableMode::Unordered),
+    }
 }
 
 #[proc_macro]
@@ -957,19 +955,7 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
     let ty_meta_arms = cfg.types.iter().map(|ty| {
         let rust_id = syn::Ident::new(&ty.rust, Span::call_site());
         let name = &ty.name;
-        let reliable_mode = match &ty.reliable_mode {
-            Some(mode) => match reliable_mode_token(mode) {
-                Ok(ts) => ts,
-                Err(e) => return syn::Error::new(Span::call_site(), e).to_compile_error(),
-            },
-            None => {
-                if ty.reliable.unwrap_or(false) {
-                    quote!(crate::ReliableMode::Ordered)
-                } else {
-                    quote!(crate::ReliableMode::None)
-                }
-            }
-        };
+        let reliable_mode = reliable_token(&ty.reliable);
 
         let class_ts = msg_class_token(&ty.class);
         let priority = ty.priority.unwrap_or(0);
@@ -1127,8 +1113,7 @@ mod tests {
             rust: rust.to_string(),
             name: name.to_string(),
             doc: None,
-            reliable: Some(false),
-            reliable_mode: Some("None".to_string()),
+            reliable: JsonReliability::Off,
             priority: Some(0),
             element: JsonElement::Dynamic {
                 data_type: "String".to_string(),

@@ -41,13 +41,13 @@ These functions pack and unpack SEDSnet protocol frames.
 ```text
 [FLAGS: u8]
     bit0: payload compressed
-    bit1: reserved
+    bit1: reliable header present
     bit2: wire contract present
     bit3: packet nonce present
     bit4: E2E encrypted payload wrapper present
     bit5: endpoint bitmap present
     bit6: reliable header uses compact varint form
-    bit7: reserved
+    bit7: explicit endpoint ID list present
 [NEP: u8]                         // number of selected endpoints
 VARINT(ty: u32 as u64)            // ULEB128
 VARINT(data_size: u64)            // logical payload size after decompression
@@ -55,9 +55,10 @@ VARINT(timestamp_ms: u64)
 [VARINT(nonce: u16 as u64)]       // only when bit3 is set
 VARINT(src_addr: u32 as u64)      // assigned/discovered source address
 [ENDPOINT_BITMAP]                 // only when bit5 is set
+[ENDPOINT_IDS: NEP ULEB128 IDs]    // only when bit7 is set
 [VARINT(contract_len: u64)]       // only when bit2 is set
 [WIRE_CONTRACT_BYTES]
-[RELIABLE_HEADER]                 // present for reliable schema types or when contract says so
+[RELIABLE_HEADER]                 // when bit1 or the wire contract says so
 PAYLOAD_BYTES                     // raw/compressed, or E2E wrapper around those bytes
 [CRC32: u32 LE]                   // checksum of every prior byte in the frame
 ```
@@ -67,11 +68,13 @@ PAYLOAD_BYTES                     // raw/compressed, or E2E wrapper around those
 Top-level frame flags:
 
 - `0x01`: payload compressed
+- `0x02`: reliable header present
 - `0x04`: wire contract present
 - `0x08`: packet nonce present
 - `0x10`: payload bytes are wrapped by the feature-gated E2E cryptography provider
 - `0x20`: endpoint bitmap present
 - `0x40`: reliable header uses compact varint form
+- `0x80`: explicit sorted unique endpoint ID list present
 
 When `0x10` is set, routing metadata remains visible, but the payload region is:
 
@@ -102,26 +105,23 @@ Reliable-header flags:
 ACK-only reliable control frames are emitted by the router or relay reliable layer. They are not
 valid application `Packet` values and are consumed before normal packet unpacking.
 
-## Endpoint bitmap
+## Explicit destinations and endpoint bitmap
 
-`NEP` is the number of selected endpoints for the frame.
+`NEP` counts selected destinations. Application types retain their destination set on the wire,
+including when it equals the sender's current schema. A complementary schema merge must not
+redirect an already queued packet to new destinations.
 
-When flag `0x20` is clear, no endpoint bitmap bytes are present. The endpoint set is the default
-endpoint set from the local data type metadata for `ty`, expanded in ascending endpoint-ID order,
-and `NEP` must match that set size.
+With `0x80`, `NEP` sorted unique ULEB128 endpoint IDs follow the source address. This representation
+supports sparse name-based IDs and references whose endpoint definitions arrive later. Zero
+entries are permitted for ACK-only control frames. Other empty application frames are rejected.
 
-When flag `0x20` is set, a fixed-width endpoint bitmap follows `src_addr`. This form is used for
-custom endpoint sets, subsets, ACK-only reliable control frames, wire-contract frames, and frames
-whose endpoints cannot be inferred from the data type metadata.
+With `0x20`, a 32-byte bitmap represents endpoint IDs below 256. The flags are mutually exclusive;
+the encoder chooses the smaller representation. The fixed bitmap width never grows with the
+largest runtime ID. Its popcount must equal `NEP`.
 
-- `EP_BITMAP_BITS = MAX_VALUE_DATA_ENDPOINT + 1`
-- `EP_BITMAP_BYTES = ceil(EP_BITMAP_BITS / 8)`
-
-Bitmap packing is LSB-first within each byte. `NEP` is the popcount of the bitmap and is used as a
-sanity check during decode.
-
-The bitmap width is stable for a given build. Adding or removing runtime schema entries does not
-change the bitmap width.
+With neither flag, destinations come from type metadata and `NEP` must match its unique count.
+This omission is restricted to internal control types whose schema cannot acquire destinations
+through application schema merging.
 
 ## Wire contract
 
@@ -166,8 +166,8 @@ list as an explicit destination set for the packed frame.
 
 ## Reliable header
 
-The reliable header appears after the optional wire contract for reliable schema types or when the
-wire contract says a reliable header is present.
+The reliable header appears after the optional wire contract when frame flag `0x02` or the
+contract declares its presence. Decoding does not infer header presence from receiver schema state.
 
 When top-level flag `0x40` is clear, the reliable header is the fixed 9-byte form:
 
@@ -334,11 +334,12 @@ High-level decode order:
 
 1. Verify CRC32.
 2. Parse the fixed prelude and varints.
-3. Resolve endpoints from the fixed-width endpoint bitmap when flag `0x20` is set, otherwise from
-   the default endpoint list in local data type metadata.
+3. Resolve the explicit endpoint list (`0x80`) or fixed-width bitmap (`0x20`).
+   Frames with neither flag use the metadata default for protocol control traffic.
 4. Resolve the source address to a sender name from discovery/config state.
 5. Decode the optional wire contract.
-6. Decode the reliable header if current schema or contract says it is present.
+6. Decode the reliable header when frame flag `0x02` or the wire contract declares it.
+   Receiver schema changes cannot add or remove an in-flight reliable header.
 7. Decode the payload bytes.
 8. Construct `Packet::new_with_wire_contract(...)`.
 

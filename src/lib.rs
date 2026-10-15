@@ -184,6 +184,7 @@ pub mod relay;
 pub mod router;
 mod side_transport;
 mod small_payload;
+mod small_sort;
 #[cfg(feature = "timesync")]
 pub mod timesync;
 pub mod wire_format;
@@ -201,7 +202,7 @@ pub const MAX_VALUE_DATA_TYPE: u32 = 4095;
 pub const MAX_VALUE_ROUTE_SELECTION_MODE: i32 = 2;
 
 impl ReprU32Enum for DataType {
-    const MAX: u32 = MAX_VALUE_DATA_TYPE;
+    const MAX: u32 = u32::MAX;
 
     #[inline]
     fn from_u32(x: u32) -> Option<Self> {
@@ -210,7 +211,7 @@ impl ReprU32Enum for DataType {
 }
 
 impl ReprU32Enum for DataEndpoint {
-    const MAX: u32 = MAX_VALUE_DATA_ENDPOINT;
+    const MAX: u32 = u32::MAX;
 
     #[inline]
     fn from_u32(x: u32) -> Option<Self> {
@@ -513,8 +514,10 @@ impl MessageElement {
 
 /// Reliable delivery mode for a data type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum ReliableMode {
     /// No reliable delivery/acknowledgement on the wire.
+    #[cfg_attr(feature = "serde", serde(rename = "Off"))]
     None,
     /// Reliable delivery with strict ordering.
     Ordered,

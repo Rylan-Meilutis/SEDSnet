@@ -91,7 +91,7 @@ pub struct Packet {
     wire_shape: Option<MessageElement>,
 
     /// Explicit destination sender hashes frozen into the wire-format contract.
-    wire_target_senders: Arc<[u64]>,
+    wire_target_senders: Option<Arc<[u64]>>,
 }
 
 // ============================================================================
@@ -140,6 +140,14 @@ pub fn hash_bytes_u64(mut h: u64, bytes: &[u8]) -> u64 {
 /// canonical wire header never has to carry the sender string.
 #[inline]
 pub(crate) fn sender_address_u32(sender: &str) -> u32 {
+    // Unresolved wire senders retain their numeric identity through repacking
+    // and receipts. Hashing the alias text would invent a different sender.
+    if let Some(address) = sender
+        .strip_prefix("@addr:")
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        return address;
+    }
     let raw = hash_bytes_u64(0xA6D3_8C21_4B7F_19E5, sender.as_bytes()) as u32;
     if raw == 0 { 1 } else { raw }
 }
@@ -249,7 +257,7 @@ impl Packet {
         }
     }
 
-    /// Create a packet while preserving wire-contract metadata from a decoded frame.
+    /// Test helper for constructing frozen wire-contract metadata from borrowed inputs.
     ///
     /// This constructor is used by unpacking paths that may carry a
     /// migration-safe wire contract. The contract can supply:
@@ -279,6 +287,7 @@ impl Packet {
     ///   incompatible with the effective schema element.
     #[inline]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn new_with_wire_contract(
         ty: DataType,
         endpoints: &[DataEndpoint],
@@ -304,6 +313,37 @@ impl Packet {
             timestamp,
             nonce,
             payload: StandardSmallPayload::from_arc(payload),
+            wire_shape,
+            wire_target_senders: (!wire_target_senders.is_empty()).then_some(wire_target_senders),
+        })
+    }
+
+    /// Preserve already-owned wire metadata rather than allocating a second copy.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_owned_wire_contract(
+        ty: DataType,
+        endpoints: Arc<[DataEndpoint]>,
+        sender: Arc<str>,
+        timestamp: u64,
+        nonce: u16,
+        payload: StandardSmallPayload,
+        wire_shape: Option<MessageElement>,
+        wire_target_senders: Option<Arc<[u64]>>,
+    ) -> TelemetryResult<Self> {
+        if endpoints.is_empty() {
+            return Err(TelemetryError::EmptyEndpoints);
+        }
+        let element = wire_shape.unwrap_or(message_meta(ty).element);
+        Self::validate_payload_against_element(element, &payload)?;
+        Ok(Self {
+            ty,
+            data_size: payload.len(),
+            sender,
+            endpoints,
+            timestamp,
+            nonce,
+            payload,
             wire_shape,
             wire_target_senders,
         })
@@ -363,15 +403,15 @@ impl Packet {
         nonce: u16,
         payload: Arc<[u8]>,
     ) -> TelemetryResult<Self> {
-        Self::new_with_wire_contract(
+        Self::new_with_owned_wire_contract(
             ty,
-            endpoints,
-            sender,
+            Arc::from(endpoints),
+            Arc::from(sender),
             timestamp,
             nonce,
-            payload,
+            StandardSmallPayload::from_arc(payload),
             None,
-            Arc::<[u64]>::from([]),
+            None,
         )
     }
 
@@ -426,18 +466,30 @@ impl Packet {
         // not packet-header identity.
         h = hash_bytes_u64(h, &sender_address_u32(self.sender.as_ref()).to_le_bytes());
 
-        // Logical type as string
-        h = hash_bytes_u64(h, get_message_name(self.ty).as_bytes());
+        // Wire identity must not change when an incomplete schema is learned.
+        h = hash_bytes_u64(h, &self.ty.0.to_le_bytes());
 
-        // Endpoints (as their string names)
-        for ep in self.endpoints.iter() {
-            h = hash_bytes_u64(h, ep.as_str().as_bytes());
+        // The wire carries an endpoint set, in ascending ID order. Input
+        // declaration order and duplicate destinations must not change the
+        // receipt ID. The common decoded/sorted path needs no normalization.
+        if self
+            .endpoints
+            .windows(2)
+            .all(|pair| pair[0].as_u32() < pair[1].as_u32())
+        {
+            for ep in self.endpoints.iter() {
+                h = hash_bytes_u64(h, &ep.0.to_le_bytes());
+            }
+        } else {
+            for ep in crate::wire_format::unique_sorted_endpoints(&self.endpoints) {
+                h = hash_bytes_u64(h, &ep.0.to_le_bytes());
+            }
         }
 
         // Timestamp + data_size as bytes
         h = hash_bytes_u64(h, &self.timestamp.to_le_bytes());
         h = hash_bytes_u64(h, &self.nonce.to_le_bytes());
-        h = hash_bytes_u64(h, &self.data_size.to_le_bytes());
+        h = hash_bytes_u64(h, &(self.data_size as u64).to_le_bytes());
 
         // Payload bytes
         h = hash_bytes_u64(h, self.payload());
@@ -578,7 +630,7 @@ impl Packet {
     /// contract when the packet was packed.
     #[inline]
     pub(crate) fn wire_target_senders(&self) -> &[u64] {
-        &self.wire_target_senders
+        self.wire_target_senders.as_deref().unwrap_or(&[])
     }
 
     /// Override the packet nonce while keeping the rest of the packet intact.

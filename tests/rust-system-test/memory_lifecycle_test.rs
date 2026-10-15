@@ -134,7 +134,8 @@ const LIFECYCLE_SCHEMA: &[u8] = br#"{
         "description": "temporary allocator lifecycle type",
         "class": "Data",
         "element": {"kind": "Dynamic", "data_type": "Binary"},
-        "endpoints": ["MemoryLifecycleEndpoint"]
+        "endpoints": ["MemoryLifecycleEndpoint"],
+        "reliable": "Off"
     }]
 }"#;
 
@@ -149,7 +150,8 @@ const INVALID_LIFECYCLE_SCHEMA: &[u8] = br#"{
         "name": "MEMORY_FAILED_TYPE",
         "class": "InvalidClass",
         "element": {"kind": "Dynamic", "data_type": "Binary"},
-        "endpoints": ["MemoryFailedEndpoint"]
+        "endpoints": ["MemoryFailedEndpoint"],
+        "reliable": "Off"
     }]
 }"#;
 

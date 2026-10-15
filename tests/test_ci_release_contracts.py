@@ -20,7 +20,7 @@ class CiReleaseContracts(unittest.TestCase):
         self.assertIn(f"## Version {version} highlights", wiki)
         for name in ("README.md", "docs/wiki/Build-and-Configure.md", "docs/wiki/Usage-C-Cpp.md"):
             with self.subTest(document=name):
-                self.assertIn(f"GIT_TAG v{version}", (REPO_ROOT / name).read_text())
+                self.assertIn("GIT_TAG main", (REPO_ROOT / name).read_text())
 
     def test_github_ci_uses_publish_script_as_release_gate(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yaml").read_text(

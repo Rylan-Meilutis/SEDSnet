@@ -17,7 +17,7 @@
       "name": "GPS_DATA",
       "doc": "GPS data (typically 3\u00d7 f32: latitude, longitude, altitude).",
       "priority": 80,
-      "reliable_mode": "Ordered",
+      "reliable": "Ordered",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -43,8 +43,7 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ]
-    },
+      ], "reliable": "Off"},
     {
       "rust": "BatteryStatus",
       "name": "BATTERY_STATUS",
@@ -59,8 +58,7 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ]
-    },
+      ], "reliable": "Off"},
     {
       "rust": "SystemStatus",
       "name": "SYSTEM_STATUS",
@@ -73,8 +71,7 @@
       },
       "endpoints": [
         "SdCard"
-      ]
-    },
+      ], "reliable": "Off"},
     {
       "rust": "BarometerData",
       "name": "BAROMETER_DATA",
@@ -88,8 +85,7 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ]
-    },
+      ], "reliable": "Off"},
     {
       "rust": "MessageData",
       "name": "MESSAGE_DATA",
@@ -102,8 +98,7 @@
       "endpoints": [
         "SdCard",
         "Radio"
-      ]
-    },
+      ], "reliable": "Off"},
     {
       "rust": "Heartbeat",
       "name": "HEARTBEAT",
@@ -118,7 +113,6 @@
       "endpoints": [
         "SdCard",
         "Radio"
-      ]
-    }
+      ], "reliable": "Off"}
   ]
 }

@@ -187,7 +187,7 @@ fn runtime_json_bytes_and_file_seed_schema_metadata() {
                         "name": "SCHEMA_JSON_BYTES_TYPE_9001",
                         "description": "json bytes type",
                         "priority": 77,
-                        "reliable": true,
+                        "reliable": "Ordered",
                         "class": "Data",
                         "element": { "kind": "Static", "data_type": "UInt8", "count": 4 },
                         "endpoints": ["SchemaJsonBytesEp9001"]
@@ -224,7 +224,7 @@ fn runtime_json_bytes_and_file_seed_schema_metadata() {
                         "name": "SCHEMA_JSON_FILE_TYPE_9002",
                         "doc": "json file type",
                         "priority": 12,
-                        "reliable_mode": "Unordered",
+                        "reliable": "Unordered",
                         "class": "Error",
                         "element": { "kind": "Dynamic", "data_type": "String" },
                         "endpoints": ["SchemaJsonFileEp9002"]

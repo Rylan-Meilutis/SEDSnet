@@ -154,7 +154,7 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
         // Drain newly queued advertisements without running timeout/retry
         // maintenance: keep the original pending ACK outstanding throughout.
         loop {
-            let queued = Router::pop_transmit_queue_locked(&mut rf.state.lock());
+            let queued = Router::pop_transmit_queue_locked(&mut rf.state.lock(), rf.clock.now_ms());
             let Some(queued) = queued else {
                 break;
             };
@@ -314,6 +314,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         },
         ignore_local: true,
         priority: 1,
+        retry_after_ms: 0,
     })
     .unwrap();
     st.push_transmit(TxQueued {
@@ -324,6 +325,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         },
         ignore_local: true,
         priority: 255,
+        retry_after_ms: 0,
     })
     .unwrap();
     st.memory.max_queue_budget = st.shared_queue_bytes_used();
@@ -397,7 +399,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         throttle.next_ping_ms = 0;
     }
     extern "C" fn only_small_work(additional: usize, _: usize) -> bool {
-        additional <= 4096
+        additional < 2048
     }
     struct Reset;
     impl Drop for Reset {
@@ -490,7 +492,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
 }
 
 #[test]
-fn compact_address_bootstrap_survives_full_snapshot_refusal() {
+fn compact_address_and_topology_bootstrap_fit_bounded_headroom() {
     crate::tests::ensure_common_test_schema();
     extern "C" fn summaries_only(additional: usize, _: usize) -> bool {
         additional < 8192
@@ -548,11 +550,17 @@ fn compact_address_bootstrap_survives_full_snapshot_refusal() {
             .reachable_endpoints
             .contains(&crate::DataEndpoint::named("RADIO"))
     );
-    assert!(
-        packets
-            .iter()
-            .all(|packet| packet.data_type() != crate::DataType::DiscoveryTopology)
-    );
+    let topology = packets
+        .iter()
+        .find(|packet| packet.data_type() == crate::DataType::DiscoveryTopology)
+        .expect("a schema-free topology must fit the bounded recovery headroom");
+    let boards = discovery::decode_discovery_topology(topology).unwrap();
+    for name in ["AB", "VB", "DAQ", "GB"] {
+        assert!(
+            boards.iter().any(|board| board.sender_id == name),
+            "missing {name}"
+        );
+    }
     drop(packets);
     let unknown = discovery::build_discovery_announce("UNKNOWN", 1, &[]).unwrap();
     assert!(
@@ -730,6 +738,7 @@ fn schema_reclaims_queued_data_before_refusing_update() {
             },
             ignore_local: true,
             priority: 254,
+            retry_after_ms: 0,
         })
         .unwrap();
         st.memory.max_queue_budget = st.shared_queue_bytes_used();
@@ -799,5 +808,64 @@ fn keepalive_fits_reserved_control_headroom() {
         sent.load(core::sync::atomic::Ordering::Relaxed),
         1,
         "keepalives were not rate limited"
+    );
+}
+
+#[test]
+fn discovery_snapshot_reclaims_telemetry_but_preserves_commands_and_acks() {
+    crate::tests::ensure_common_test_schema();
+    static REFUSALS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    extern "C" fn scratch_after_reclaim(additional: usize, _: usize) -> bool {
+        additional < 2048 || REFUSALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst) >= 2
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let node = Router::new_with_clock(RouterConfig::new([]).with_sender("GB"), Box::new(|| 1));
+    let side = node.add_side_packet("CAN", |_| Ok(()));
+    for priority in [1, 2, 200, 254, 255] {
+        node.state
+            .lock()
+            .push_transmit(TxQueued {
+                item: RouterTxItem::ToSide {
+                    src: None,
+                    dst: side,
+                    data: RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(
+                        [0; 32],
+                    ))),
+                },
+                ignore_local: true,
+                priority,
+                retry_after_ms: 0,
+            })
+            .unwrap();
+    }
+    REFUSALS.store(0, core::sync::atomic::Ordering::SeqCst);
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(scratch_after_reclaim));
+    node.queue_discovery_announce(false, true).unwrap();
+    let st = node.state.lock();
+    assert_eq!(
+        st.transmit_queue.lowest_priority(|item| item.priority),
+        Some(200)
+    );
+    for priority in [200, 254] {
+        assert_eq!(
+            st.transmit_queue
+                .iter()
+                .filter(|item| item.priority == priority)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        st.transmit_queue.iter().any(|item| matches!(
+            &item.item, RouterTxItem::ToSide { data: RouterItem::Packet(pkt), .. }
+                if pkt.data_type() == DataType::DiscoveryAddress
+        )),
+        "scratch refusal left a late-joining valve without a return-route baseline"
     );
 }
