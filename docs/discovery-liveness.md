@@ -1,18 +1,31 @@
 # Discovery liveness and pending acknowledgements
 
 Discovery retains endpoint ownership and downstream topology between updates.
-A peer's discovery lease is refreshed by received advertisements or keepalives;
-ordinary application packets do not prove that all destinations behind a bridge
-are still reachable. The current lease is 30 seconds of the router's monotonic
-clock, not network UTC.
+A peer's discovery lease is refreshed by validated frames from that known
+sender, including ordinary application data and empty keepalives. Traffic from
+one CAN peer does not renew a different peer. A bridge's retained downstream
+routes change through explicit advertisements and withdrawals. The current
+lease is 30 seconds of the router's monotonic clock, not network UTC.
 
-A pending reliable topology/schema packet must not suppress all discovery on
-that side. While its hop acknowledgement is outstanding, routers and relays
-send an unreliable, empty discovery keepalive at a bounded 15-second interval
-(subject to the normal discovery polling cadence). Empty keepalives refresh
+Stable networks do not periodically retransmit route summaries, schemas, or
+full topology snapshots. Bootstrap, a new peer, changed reachability, and explicit
+recovery requests trigger advertisements. Missing baselines and schemas retain
+bounded recovery retries; topology changes retain bounded incremental repeats.
+
+A pending reliable topology/schema packet must not suppress liveness on that
+side. Routers and relays send an unreliable, empty discovery keepalive at a
+bounded 15-second interval (subject to the normal discovery polling cadence). Empty keepalives refresh
 the announcer's lease without clearing its learned endpoints. They do not
 resend the topology baseline, acknowledge it, or trigger application fanout.
 Explicit topology withdrawals and actual peer silence still remove routes.
+
+No-op polls check pending work and liveness deadlines before requesting snapshot
+scratch memory. They do not reserve metadata scratch or evict queued telemetry.
+Compact frames can renew a known sender from their validated wrapper and retained
+header without expanding the payload; allocation refusal does not erase that
+liveness. Unknown templates and corrupt wrappers do not renew a peer. Keepalive
+deadlines also account for successful transmission, preventing catch-up bursts
+after a link delays queued work.
 
 This matters on shared CAN: a leaf can keep hearing Power Board while losing
 RF's GroundStation route. The bus is live, but Power's advertisement does not

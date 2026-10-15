@@ -156,9 +156,9 @@ use crate::diagnostics::{
 #[cfg(feature = "discovery")]
 use crate::discovery::{
     self, ClientStatsSnapshot, DISCOVERY_INCREMENTAL_RETRY_COUNT, DISCOVERY_ROUTE_TTL_MS,
-    DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS, DISCOVERY_SLOW_LINK_PING_INTERVAL_MS,
-    DiscoveryCadenceState, TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute,
-    TopologyBoardNode, TopologySideRoute, TopologySnapshot,
+    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState,
+    TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
+    TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::{hash_bytes_u64, sender_address_u32};
 use crate::queue::{BoundedDeque, ByteCost};
@@ -714,11 +714,21 @@ struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
     next_schema_request_ms: u64,
     next_ping_ms: u64,
-    next_full_ms: u64,
+    // Scheduled and accepted sends differ when a constrained link is backed up.
+    last_liveness_tx_ms: u64,
     pending_incremental: bool,
     incremental_retries_remaining: u8,
     has_sent_full: bool,
     last_topology: Vec<TopologyBoardNode>,
+}
+
+#[cfg(feature = "discovery")]
+impl DiscoverySideThrottleState {
+    fn liveness_due(&self, now_ms: u64) -> bool {
+        now_ms >= self.next_ping_ms
+            && now_ms.saturating_sub(self.last_liveness_tx_ms)
+                >= DISCOVERY_SLOW_LINK_PING_INTERVAL_MS
+    }
 }
 
 #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -2713,6 +2723,13 @@ impl Router {
         attempts: usize,
     ) {
         let mut st = self.state.lock();
+        #[cfg(feature = "discovery")]
+        if ty == crate::DataType::DiscoveryAnnounce
+            && !relayed
+            && let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
+        {
+            throttle.last_liveness_tx_ms = self.clock.now_ms();
+        }
         let entry = st.side_runtime_stats.entry(side).or_default();
         entry.note_tx(ty, bytes, relayed, attempts.saturating_sub(1));
     }
@@ -5499,21 +5516,16 @@ impl Router {
         // Propagate route changes immediately without restarting discovery or
         // resending the complete topology graph. DiscoveryAddress replaces the
         // prior compact route summary, so additions and removals converge while
-        // the infrequent full snapshot remains available as loss recovery.
+        // explicit baseline requests remain available as loss recovery.
         for side_id in st
             .sides
             .iter()
             .enumerate()
             .filter_map(|(side_id, side)| side.as_ref().map(|_| side_id))
         {
-            st.discovery_side_throttle
-                .entry(side_id)
-                .or_default()
-                .pending_incremental = true;
-            st.discovery_side_throttle
-                .entry(side_id)
-                .or_default()
-                .incremental_retries_remaining = DISCOVERY_INCREMENTAL_RETRY_COUNT;
+            let throttle = st.discovery_side_throttle.entry(side_id).or_default();
+            throttle.pending_incremental = true;
+            throttle.incremental_retries_remaining = DISCOVERY_INCREMENTAL_RETRY_COUNT;
         }
         // Make the first incremental control frame self-describing. This is a
         // small header refresh, not a topology reset, and prevents a restarted
@@ -5928,7 +5940,7 @@ impl Router {
         discovery::elect_discovery_master(self.sender_arc().as_ref(), &boards)
     }
 
-    #[cfg(feature = "discovery")]
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
     #[inline]
     fn side_is_slow_control_link_locked(
         st: &RouterInner,
@@ -5938,7 +5950,7 @@ impl Router {
         st.adaptive_route_stats.get(&side_id).is_some_and(|stats| {
             let recent_slow = stats.last_slow_observed_ms > 0
                 && now_ms.saturating_sub(stats.last_slow_observed_ms)
-                    <= DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS;
+                    <= discovery::DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS;
             stats.sample_count > 0
                 && ((stats.estimated_bandwidth_bps > 0
                     && stats.estimated_bandwidth_bps <= CONTROL_SLOW_LINK_CAPACITY_BPS)
@@ -5952,13 +5964,11 @@ impl Router {
         side_id: RouterSideId,
         now_ms: u64,
     ) -> Option<DiscoveryAdvertiseLevel> {
-        let slow = Self::side_is_slow_control_link_locked(st, side_id, now_ms);
         let throttle = st.discovery_side_throttle.entry(side_id).or_default();
-        if !throttle.has_sent_full || now_ms >= throttle.next_full_ms {
+        if !throttle.has_sent_full {
             throttle.has_sent_full = true;
             throttle.pending_incremental = false;
             throttle.incremental_retries_remaining = 0;
-            throttle.next_full_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS);
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::Full);
         }
@@ -5968,17 +5978,13 @@ impl Router {
             throttle.pending_incremental = throttle.incremental_retries_remaining > 0;
             return Some(DiscoveryAdvertiseLevel::Incremental);
         }
-        if slow && now_ms >= throttle.next_ping_ms {
+        // Stable links carry only a small liveness announcement. Route and
+        // schema snapshots are emitted on changes or explicit recovery requests.
+        if throttle.liveness_due(now_ms) {
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::MinimalPing);
         }
-        if slow {
-            None
-        } else {
-            // A compact address summary refreshes route TTLs without carrying
-            // the full topology graph or schema.
-            Some(DiscoveryAdvertiseLevel::Incremental)
-        }
+        None
     }
 
     #[cfg(all(feature = "discovery", feature = "timesync"))]
@@ -6419,7 +6425,7 @@ impl Router {
                 // bounded, unreliable keepalive independently of its ACK.
                 let level = if discovery_in_flight {
                     let throttle = st.discovery_side_throttle.entry(side_id).or_default();
-                    if now_ms < throttle.next_ping_ms {
+                    if !throttle.liveness_due(now_ms) {
                         None
                     } else {
                         throttle.next_ping_ms =
@@ -6795,14 +6801,17 @@ impl Router {
                     return false;
                 }
                 let _ = side;
-                !st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
+                let in_flight = st.reliable_tx.iter().any(|((pending_side, ty), tx_state)| {
                     *pending_side == side_id
                         && !tx_state.sent.is_empty()
                         && DataType::try_from_u32(*ty).is_some_and(discovery::is_discovery_type)
-                }) || st
-                    .discovery_side_throttle
+                });
+                st.discovery_side_throttle
                     .get(&side_id)
-                    .is_none_or(|throttle| now_ms >= throttle.next_ping_ms)
+                    .is_none_or(|throttle| {
+                        (!in_flight && (!throttle.has_sent_full || throttle.pending_incremental))
+                            || throttle.liveness_due(now_ms)
+                    })
             });
             if st.sides.is_empty() || !has_any {
                 return Ok(recovering);
@@ -8174,21 +8183,30 @@ impl Router {
             return;
         };
         let address = frame.envelope.source_address;
+        self.refresh_peer_liveness(side, address);
+    }
+
+    #[cfg(feature = "discovery")]
+    #[cfg_attr(not(feature = "std"), inline(never))]
+    fn refresh_peer_liveness(&self, side: RouterSideId, address: u32) {
         let now = self.clock.now_ms();
         let mut st = self.state.lock();
         let Some(route) = st.discovery_routes.get_mut(&side) else {
             return;
         };
-        let mut matches = route.announcers.iter_mut().filter(|(name, peer)| {
-            sender_address_u32(name) == address || peer.advertised_address == Some(address)
-        });
-        let Some((_, peer)) = matches.next() else {
+        let mut found = None;
+        for (name, peer) in &mut route.announcers {
+            if peer.advertised_address == Some(address) || sender_address_u32(name) == address {
+                // Ambiguous numeric identities must be resolved by discovery.
+                if found.is_some() {
+                    return;
+                }
+                found = Some(peer);
+            }
+        }
+        let Some(peer) = found else {
             return;
         };
-        // A numeric collision must be resolved by discovery, never guessed.
-        if matches.next().is_some() {
-            return;
-        }
         peer.last_seen_ms = now;
         route.last_seen_ms = route.last_seen_ms.max(now);
     }
@@ -8439,6 +8457,12 @@ impl Router {
                 let Some(template) = template else {
                     return Ok(None);
                 };
+                // The wrapper CRC and known template identify this peer even
+                // if payload allocation is refused. No payload copy is needed.
+                #[cfg(feature = "discovery")]
+                if let Some(address) = template.source_address() {
+                    self.refresh_peer_liveness(side, address);
+                }
                 let reconstructed_bound = body
                     .len()
                     .saturating_add(template.prefix.len())
@@ -12397,6 +12421,10 @@ impl Router {
         match &item.data {
             RouterItem::Packet(pkt) => {
                 pkt.validate()?;
+                #[cfg(feature = "discovery")]
+                if let Some(side) = item.src {
+                    self.refresh_peer_liveness(side, sender_address_u32(pkt.sender()));
+                }
 
                 if self.handle_internal_reliable_packet(pkt, item.src, called_from_queue)? {
                     return Ok(());

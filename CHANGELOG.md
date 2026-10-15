@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.2.2
+
+- Stop periodic route-summary and full-topology broadcasts on stable links in Router and Relay. Retain small empty liveness announcements, change-triggered updates, reliable delivery, and requested baseline/schema recovery. Refresh known-peer liveness from validated native and packed application traffic without adding ownership or renewing unrelated peers.
+
+- Return from no-op discovery polls before snapshot admission, so idle maintenance cannot evict queued data for an advertisement that is not due. Count compact-frame liveness from validated retained header identity before payload admission, and space keepalives using their successful send time to avoid delayed-send bursts.
+
 ## 4.2.1
 
 - Refresh CRC32, Serde JSON, Zstd bindings, proc-macro parsing and Python binding dependencies. Update Syn to 3 and the macro crate to 2.1.1. Keep PyO3 on the newest 0.29 patch because 0.30 removes the promised Python 3.8 ABI. No wire or application API changes.

@@ -6574,10 +6574,16 @@ mod tests {
 
         now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
         assert_eq!(seds_router_poll_discovery(router, &mut did_queue), 0);
-        assert!(did_queue);
+        assert!(!did_queue);
         assert_eq!(seds_router_process_tx_queue(router), 0);
-        // Cadence refreshes use one compact address update; full topology and
-        // schema are reserved for bootstrap/recovery.
+        // Stable cadence does not resend addresses/topology/schema.
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        now_ms.store(
+            crate::discovery::DISCOVERY_SLOW_LINK_PING_INTERVAL_MS,
+            Ordering::SeqCst,
+        );
+        assert_eq!(seds_router_poll_discovery(router, &mut did_queue), 0);
+        assert_eq!(seds_router_process_tx_queue(router), 0);
         assert_eq!(hits.load(Ordering::SeqCst), 4);
 
         seds_router_free(router);

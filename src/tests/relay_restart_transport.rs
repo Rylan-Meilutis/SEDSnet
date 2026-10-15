@@ -1282,3 +1282,323 @@ fn receipt_budget_does_not_starve_transmit() {
         "control RX exhausting its cooperative budget must still allow one queued TX"
     );
 }
+
+#[test]
+fn stable_network_sends_liveness_without_periodic_route_or_schema_refresh() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let output = Arc::new(std::sync::Mutex::new(Vec::<Packet>::new()));
+    let sent = output.clone();
+    let node = Relay::new_with_config(
+        RelayConfig::new().with_sender("STABLE"),
+        Box::new(move || clock.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+    let stable = node.add_side_packet("stable", move |pkt| {
+        sent.lock().unwrap().push(pkt.clone());
+        Ok(())
+    });
+    let baseline = discovery::build_discovery_topology(
+        "PEER",
+        0,
+        &[discovery::TopologyBoardNode {
+            sender_id: "PEER".into(),
+            reachable_endpoints: vec![crate::DataEndpoint::named("RADIO")],
+            reachable_timesync_sources: vec![],
+            connections: vec!["STABLE".into()],
+        }],
+    )
+    .unwrap();
+    let schema = discovery::build_discovery_schema("PEER", 0).unwrap();
+    node.rx_from_side(stable, baseline).unwrap();
+    node.rx_from_side(stable, schema).unwrap();
+    node.process_rx_queue().unwrap();
+
+    node.announce_discovery().unwrap();
+    node.process_tx_queue().unwrap();
+    output.lock().unwrap().clear();
+    for ms in (1_000..=300_000).step_by(1_000) {
+        now.store(ms, std::sync::atomic::Ordering::Relaxed);
+        if ms % 10_000 == 0 {
+            let alive = discovery::build_discovery_announce("PEER", ms, &[]).unwrap();
+            node.rx_from_side(stable, alive).unwrap();
+            node.process_rx_queue().unwrap();
+        }
+        node.poll_discovery().unwrap();
+        node.process_tx_queue().unwrap();
+    }
+    let frames = output.lock().unwrap();
+    assert!(
+        (14..=20).contains(&frames.len()),
+        "expected bounded liveness only: {}",
+        frames.len()
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|pkt| pkt.data_type() == crate::DataType::DiscoveryAnnounce
+                && pkt.payload().is_empty()),
+        "unchanged routes must not be broadcast again, even after 120 seconds"
+    );
+    drop(frames);
+    let new_side = node.add_side_packet("new_link", |_| Ok(()));
+    let newcomer =
+        discovery::build_discovery_announce("NEW", 300_000, &[crate::DataEndpoint::named("RADIO")])
+            .unwrap();
+    node.rx_from_side(new_side, newcomer).unwrap();
+    node.process_rx_queue().unwrap();
+    node.poll_discovery().unwrap();
+    node.process_tx_queue().unwrap();
+    assert!(
+        output
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|pkt| pkt.data_type() == crate::DataType::DiscoveryTopology),
+        "adding a link must still advertise changed topology"
+    );
+}
+
+#[test]
+fn ordinary_native_and_packed_traffic_renew_only_the_matching_peer() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let node = Relay::new_with_config(
+        RelayConfig::new().with_sender("GS"),
+        Box::new(move || clock.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+    let side = node.add_side_packet("CAN", |_| Ok(()));
+    for name in ["LIVE", "SILENT"] {
+        let pkt =
+            discovery::build_discovery_announce(name, 0, &[crate::DataEndpoint::named("RADIO")])
+                .unwrap();
+        node.rx_from_side(side, pkt).unwrap();
+        node.process_rx_queue().unwrap();
+    }
+    let ty = crate::DataType::named("GPS_DATA");
+    for i in 1..=18 {
+        now.store(i * 10_000, std::sync::atomic::Ordering::Relaxed);
+        let packet = Packet::new(
+            ty,
+            &[crate::DataEndpoint::named("RADIO")],
+            "LIVE",
+            i * 10_000,
+            vec![0; 12].into(),
+        )
+        .unwrap();
+        if i % 2 == 0 {
+            node.rx_from_side(side, packet.clone()).unwrap();
+            node.process_rx_queue().unwrap();
+        } else {
+            node.rx_packed_from_side(side, &crate::wire_format::pack_packet(&packet))
+                .unwrap();
+            node.process_rx_queue().unwrap();
+        }
+        node.poll_discovery().unwrap();
+        let st = node.state.lock();
+        let route = st
+            .discovery_routes
+            .get(&side)
+            .expect("active ingress retained");
+        assert_eq!(route.announcers["LIVE"].last_seen_ms, i * 10_000);
+        if i >= 4 {
+            assert!(
+                !route.announcers.contains_key("SILENT"),
+                "one peer's traffic cannot renew another peer"
+            );
+        }
+    }
+    now.store(211_000, std::sync::atomic::Ordering::Relaxed);
+    node.poll_discovery().unwrap();
+    assert!(
+        !node
+            .state
+            .lock()
+            .discovery_routes
+            .get(&side)
+            .is_some_and(|r| r.announcers.contains_key("LIVE")),
+        "actual silence must expire the route"
+    );
+}
+
+#[test]
+fn delayed_liveness_send_does_not_cause_an_immediate_refresh_burst() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sent = count.clone();
+    let node = Relay::new_with_config(
+        RelayConfig::new().with_sender("LATE"),
+        Box::new(move || clock.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+    node.add_side_packet("busy", move |pkt| {
+        if pkt.data_type() == crate::DataType::DiscoveryAnnounce {
+            sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    node.announce_discovery().unwrap();
+    node.process_tx_queue().unwrap();
+    now.store(20_000, std::sync::atomic::Ordering::Relaxed);
+    node.poll_discovery().unwrap();
+    now.store(30_000, std::sync::atomic::Ordering::Relaxed);
+    node.process_tx_queue().unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    now.store(35_000, std::sync::atomic::Ordering::Relaxed);
+    node.poll_discovery().unwrap();
+    node.process_tx_queue().unwrap();
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "queued timestamp is not the successful transmission time"
+    );
+    now.store(45_000, std::sync::atomic::Ordering::Relaxed);
+    node.poll_discovery().unwrap();
+    node.process_tx_queue().unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+fn compact_frames_refresh_live_peer_at_ingress_without_dispatch() {
+    crate::tests::ensure_common_test_schema();
+    let ty = crate::config::register_data_type_with_description(
+        "COMPACT_LIVENESS_RELAY_TEST",
+        "compact ingress test",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[crate::DataEndpoint::named("RADIO")],
+        crate::ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    struct RemoveTestType(crate::DataType);
+    impl Drop for RemoveTestType {
+        fn drop(&mut self) {
+            let _ = crate::config::remove_data_type(self.0);
+        }
+    }
+    let _remove_type = RemoveTestType(ty);
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let node = Relay::new_with_config(
+        RelayConfig::new().with_sender("GS"),
+        Box::new(move || clock.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+    let source = Relay::new_with_config(RelayConfig::new().with_sender("LIVE"), Box::new(|| 0));
+    let opts = RelaySideOptions {
+        header_template_enabled: true,
+        max_frame_bytes: 0,
+        ..Default::default()
+    };
+    let side = node.add_side_packed_with_options("CAN", |_| Ok(()), opts.clone());
+    let tx = source.add_side_packed_with_options("CAN", |_| Ok(()), opts.clone());
+    let announcement =
+        discovery::build_discovery_announce("LIVE", 0, &[crate::DataEndpoint::named("RADIO")])
+            .unwrap();
+    node.rx_from_side(side, announcement).unwrap();
+    node.process_rx_queue().unwrap();
+    let mut compact = 0;
+    let mut last_compact = None;
+    for i in 1..=600 {
+        now.store(i * 100, std::sync::atomic::Ordering::Relaxed);
+        let pkt = Packet::new(
+            ty,
+            &[crate::DataEndpoint::named("RADIO")],
+            "LIVE",
+            i * 100,
+            vec![0; 1].into(),
+        )
+        .unwrap();
+        let raw = crate::shared_bytes::convert(wire_format::pack_packet(&pkt));
+        let frames = source
+            .encode_side_transport_frames(tx, opts.clone(), raw)
+            .unwrap();
+        for frame in frames {
+            let (kind, _) = parse_side_transport_wrapper(&frame)
+                .unwrap()
+                .expect("header templates enabled");
+            if kind == SIDE_TRANSPORT_KIND_COMPACT {
+                compact += 1;
+                last_compact = Some(frame.clone());
+            }
+            node.decode_side_transport_frame(side, &frame).unwrap();
+        }
+        assert_eq!(
+            node.state.lock().discovery_routes[&side].announcers["LIVE"].last_seen_ms,
+            i * 100,
+            "compact data must count even if forwarding bypasses the normal RX dispatcher"
+        );
+    }
+    assert!(
+        compact > 500,
+        "fixture must exercise actual compact frames: {compact}"
+    );
+    let last = last_compact.expect("compact fixture");
+    now.store(61_000, std::sync::atomic::Ordering::Relaxed);
+    let mut corrupt = last.to_vec();
+    *corrupt.last_mut().unwrap() ^= 1;
+    assert!(node.decode_side_transport_frame(side, &corrupt).is_err());
+    assert_eq!(
+        node.state.lock().discovery_routes[&side].announcers["LIVE"].last_seen_ms,
+        60_000,
+        "bad CRC is not liveness"
+    );
+    extern "C" fn refuse_payload(_: usize, _: usize) -> bool {
+        false
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let _reset = Reset;
+    crate::memory_admission::set_probe(Some(refuse_payload));
+    assert!(node.decode_side_transport_frame(side, &last).is_err());
+    assert_eq!(
+        node.state.lock().discovery_routes[&side].announcers["LIVE"].last_seen_ms,
+        61_000,
+        "allocation refusal must not turn a live known peer into a stale route"
+    );
+}
+
+#[test]
+fn stable_noop_poll_does_not_reserve_scratch_or_shed_data() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let node = Relay::new_with_config(
+        RelayConfig::new().with_sender("QUIET"),
+        Box::new(move || clock.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+    node.add_side_packet("quiet", |_| Ok(()));
+    node.announce_discovery().unwrap();
+    node.process_tx_queue().unwrap();
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    extern "C" fn count_and_refuse(_: usize, _: usize) -> bool {
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::memory_admission::set_probe(None);
+        }
+    }
+    let _reset = Reset;
+    CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::memory_admission::set_probe(Some(count_and_refuse));
+    for ms in 1_000..10_000 {
+        now.store(ms, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !node.poll_discovery().unwrap(),
+            "no metadata is due before liveness deadline"
+        );
+    }
+    assert_eq!(
+        CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a no-op must not reserve snapshot memory or evict queued traffic"
+    );
+}

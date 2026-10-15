@@ -94,9 +94,11 @@ int main(void)
 
     usleep(300000);
 
+    const unsigned bootstrap_packets = state.tx_packets;
     assert(seds_router_poll_discovery(r, &did_queue) == SEDS_OK);
-    assert(did_queue);
+    assert(!did_queue);
     assert(seds_router_process_tx_queue_with_timeout(r, 5U) == SEDS_OK);
+    assert(state.tx_packets == bootstrap_packets);
 
     assert(state.tx_packets >= 2U);
     int32_t topology_len = seds_router_export_topology_len(r);

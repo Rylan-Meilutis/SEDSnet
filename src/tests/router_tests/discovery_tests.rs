@@ -3327,6 +3327,8 @@ fn router_unacked_discovery_blocks_only_the_affected_side() {
     assert!(reliable_first > 0);
     assert!(best_effort_first > 0);
 
+    // A real topology change must propagate despite another side waiting for an ACK.
+    router.add_side_packet("new_side", |_pkt| Ok(()));
     now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
     assert!(router.poll_discovery().unwrap());
     // Drain only the newly queued snapshot; do not turn this routing
@@ -3403,6 +3405,8 @@ fn relay_unacked_discovery_blocks_only_the_affected_side() {
     assert!(reliable_first > 0);
     assert!(best_effort_first > 0);
 
+    // A real topology change must propagate despite another side waiting for an ACK.
+    relay.add_side_packet("new_side", |_pkt| Ok(()));
     now_ms.store(DISCOVERY_FAST_INTERVAL_MS, Ordering::SeqCst);
     assert!(relay.poll_discovery().unwrap());
     now_ms.store(0, Ordering::SeqCst);
@@ -4325,7 +4329,7 @@ fn link_probe_samples_seed_adaptive_capacity_without_sending_probe_frames() {
 }
 
 #[test]
-fn slow_links_get_minimal_discovery_pings_between_full_refreshes() {
+fn slow_links_get_only_liveness_between_topology_changes() {
     ensure_topology_test_schema();
 
     let now_ms = Arc::new(AtomicU64::new(5_000));
@@ -4360,7 +4364,7 @@ fn slow_links_get_minimal_discovery_pings_between_full_refreshes() {
 
     seen.lock().unwrap().clear();
     now_ms.store(10_000, Ordering::SeqCst);
-    assert!(router.poll_discovery().unwrap());
+    assert!(!router.poll_discovery().unwrap());
     router.process_tx_queue().unwrap();
     assert!(
         seen.lock().unwrap().is_empty(),
@@ -4669,7 +4673,7 @@ fn newly_discovered_variable_owner_gets_only_the_cached_latest_value() {
 }
 
 #[test]
-fn relay_slow_links_get_minimal_discovery_pings_between_full_refreshes() {
+fn relay_slow_links_get_only_liveness_between_topology_changes() {
     let now_ms = Arc::new(AtomicU64::new(5_000));
     let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_c = seen.clone();

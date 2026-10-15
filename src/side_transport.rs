@@ -140,6 +140,14 @@ pub(crate) struct SideHeaderTemplate {
 }
 
 impl SideHeaderTemplate {
+    /// Sender identity belongs to the retained, validated full header. Reading
+    /// it requires no payload expansion, new cached fields or CRC pass.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn source_address(&self) -> Option<u32> {
+        let mut off = 0;
+        u32::try_from(read_uleb128_local(&self.between, &mut off).ok()?).ok()
+    }
+
     pub(crate) fn data_type(&self) -> Option<DataType> {
         // The retained prefix begins with endpoint count, then type ULEB128.
         let mut off = 1;

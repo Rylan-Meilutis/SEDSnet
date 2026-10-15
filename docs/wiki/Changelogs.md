@@ -2,6 +2,10 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.2.2 highlights
+
+- Stop periodic route-summary and full-topology broadcasts on stable Router and Relay links. Retain small liveness announcements, known-sender application activity, topology-change updates, and requested baseline/schema recovery.
+
 ## Version 4.2.1 highlights
 
 - Refresh CRC32, JSON, Zstd and Python bindings to current compatible versions; use Syn 3 and macro crate 2.1.1. PyO3 stays on 0.29.3 to retain Python 3.8 support. Wire format and application APIs are unchanged.
