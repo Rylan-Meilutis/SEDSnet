@@ -224,13 +224,16 @@ def cargo_publish(
         cmd.append("--dry-run")
     if allow_dirty:
         cmd.append("--allow-dirty")
+    env = cargo_env()
     if token:
-        cmd.extend(["--token", token])
+        # Command lines are printed and may also appear in process listings.
+        # Pass credentials only through Cargo's supported environment variable.
+        env["CARGO_REGISTRY_TOKEN"] = token
     if not publish:
-        run(cmd, env=cargo_env())
+        run(cmd, env=env)
         return PUBLISH_DRY_RUN_OK
 
-    result = run_optional(cmd, env=cargo_env(), timeout_s=timeout_s)
+    result = run_optional(cmd, env=env, timeout_s=timeout_s)
     print(result.stdout, end="")
     if result.returncode == 0:
         return PUBLISH_PUBLISHED
