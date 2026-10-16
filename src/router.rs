@@ -8862,7 +8862,7 @@ impl Router {
                 });
                 let ack = template.is_ack();
                 #[cfg(any(feature = "std", feature = "fair-admission"))]
-                let fair_incoming = crate::admission_fairness::compact_incoming(&template);
+                let mut fair_incoming = None;
                 #[cfg(any(feature = "std", feature = "fair-admission"))]
                 let mut fair_victim = None;
                 loop {
@@ -8881,7 +8881,10 @@ impl Router {
                             // allocation as canonical ingress. Otherwise they
                             // never reach the canonical admission/reclaim path.
                             #[cfg(any(feature = "std", feature = "fair-admission"))]
-                            if let Some((incoming, priority)) = fair_incoming
+                            if let Some((incoming, priority)) =
+                                *fair_incoming.get_or_insert_with(|| {
+                                    crate::admission_fairness::compact_incoming(&template)
+                                })
                                 && self.reclaim_for_incoming(incoming, priority, &mut fair_victim)
                             {
                                 continue;
