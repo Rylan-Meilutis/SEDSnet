@@ -2080,3 +2080,69 @@ fn bounded_reliable_control_uses_reserved_admission_in_router_and_relay() {
     ALLOW.store(false, Ordering::Relaxed);
     assert!(router.rx_packed_queue_from_side(&good, side).is_err());
 }
+
+#[test]
+fn topology_encoding_does_not_clone_normalized_graph_strings() {
+    use sedsnet::discovery::{
+        TopologyBoardNode, build_discovery_topology, build_discovery_topology_delta,
+        decode_discovery_topology_update, normalize_topology_boards,
+    };
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("TOPOLOGY_CODEC_ALLOC_DEST", "", false).unwrap();
+    build_discovery_topology("WARMUP", 0, &[]).unwrap();
+    for count in [4, 32, 128] {
+        let mut graph = (0..count)
+            .map(|index| TopologyBoardNode {
+                sender_id: format!("BOARD_{index:03}"),
+                reachable_endpoints: vec![ep],
+                reachable_timesync_sources: vec!["GPS_A".into(), "GPS_B".into()],
+                connections: vec!["EDGE_A".into(), "EDGE_B".into()],
+            })
+            .collect::<Vec<_>>();
+        normalize_topology_boards(&mut graph);
+        let original = graph.clone();
+        let removed = vec!["REMOVED_B".into(), "REMOVED_A".into()];
+        for delta in [false, true] {
+            ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+            let packet = if delta {
+                build_discovery_topology_delta("GB", 1, &graph, &removed)
+            } else {
+                build_discovery_topology("GB", 1, &graph)
+            }
+            .unwrap();
+            let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+            println!("topology nodes={count} delta={delta} allocations={allocations}");
+            assert!(
+                allocations <= 8,
+                "graph codec allocated {allocations} times: nodes={count}, delta={delta}"
+            );
+            let decoded = decode_discovery_topology_update(&packet).unwrap();
+            assert_eq!(decoded.boards, original);
+            assert_eq!(decoded.incremental, delta);
+            assert_eq!(
+                decoded.removed,
+                if delta {
+                    vec!["REMOVED_A", "REMOVED_B"]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(graph, original, "encoding mutated its borrowed graph");
+        }
+        // Noncanonical public inputs keep the existing normalization behavior.
+        let canonical = build_discovery_topology("GB", 1, &graph).unwrap();
+        graph.reverse();
+        for board in &mut graph {
+            board.connections.reverse();
+            board.connections.push(board.sender_id.clone());
+            board.connections.push("EDGE_A".into());
+            board.reachable_timesync_sources.reverse();
+            board.reachable_timesync_sources.push("GPS_A".into());
+            board.reachable_endpoints.push(ep);
+        }
+        graph.push(graph[0].clone());
+        let normalized = build_discovery_topology("GB", 1, &graph).unwrap();
+        assert_eq!(normalized.payload(), canonical.payload());
+    }
+}

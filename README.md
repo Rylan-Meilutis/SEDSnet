@@ -192,6 +192,9 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.2.3 highlights
 
+- Borrow normalized topology graphs during full/delta serialization instead of
+  cloning their strings or creating a temporary full packet for a delta.
+
 - Reclaim redundant message types within a busy sender's backlog before its
   slower report types. Keep temporary arbitration bounded and preserve protected
   controls in both routers and standalone relays.

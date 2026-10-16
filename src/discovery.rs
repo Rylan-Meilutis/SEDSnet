@@ -938,47 +938,122 @@ fn topology_snapshot_scratch_impl<'a>(
     (additional, largest)
 }
 
+// Advertisers already normalize their graphs. Borrow those buffers instead of
+// duplicating every node/string just to serialize them again. Public unsorted
+// inputs retain the original normalization behavior.
+#[inline(never)]
+fn topology_payload(
+    boards: &[TopologyBoardNode],
+    removed: Option<&[String]>,
+) -> TelemetryResult<Vec<u8>> {
+    let canonical = boards
+        .windows(2)
+        .all(|pair| pair[0].sender_id < pair[1].sender_id)
+        && boards.iter().all(|board| {
+            board
+                .reachable_endpoints
+                .iter()
+                .all(|ep| !is_router_control_endpoint(*ep))
+                && board
+                    .reachable_endpoints
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                && board
+                    .reachable_timesync_sources
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                && board
+                    .connections
+                    .iter()
+                    .all(|peer| peer != &board.sender_id)
+                && board.connections.windows(2).all(|pair| pair[0] < pair[1])
+        });
+    let mut owned = Vec::new();
+    let normalized = if canonical {
+        boards
+    } else {
+        owned.extend_from_slice(boards);
+        normalize_topology_boards(&mut owned);
+        &owned
+    };
+    let board_count = normalized.len();
+    let mut length = 4usize;
+    let mut add = |bytes: usize| {
+        length = length.saturating_add(bytes);
+    };
+    for board in normalized {
+        add(16);
+        add(board.sender_id.len());
+        add(board.reachable_endpoints.len().saturating_mul(4));
+        for value in board
+            .reachable_timesync_sources
+            .iter()
+            .chain(&board.connections)
+        {
+            add(4);
+            add(value.len());
+        }
+    }
+    if let Some(removed) = removed {
+        add(8);
+        for value in removed {
+            add(4);
+            add(value.len());
+        }
+    }
+    let mut payload = Vec::new();
+    if canonical {
+        // Saturation becomes a fallible capacity error, never wrapped growth.
+        payload
+            .try_reserve_exact(length)
+            .map_err(|_| TelemetryError::Io("memory pressure"))?;
+    } else {
+        // Preserve the legacy fallback peak: consume normalized owned nodes
+        // as the payload grows instead of retaining another full graph.
+        owned.reverse();
+    }
+    if removed.is_some() {
+        payload.extend_from_slice(&DISCOVERY_TOPOLOGY_DELTA_MARKER.to_le_bytes());
+    }
+    payload.extend_from_slice(&(board_count as u32).to_le_bytes());
+    for original in boards.iter().take(board_count) {
+        let owned_board = owned.pop();
+        let board = owned_board.as_ref().unwrap_or(original);
+        encode_string(&mut payload, &board.sender_id)?;
+
+        payload.extend_from_slice(&(board.reachable_endpoints.len() as u32).to_le_bytes());
+        for ep in &board.reachable_endpoints {
+            payload.extend_from_slice(&ep.as_u32().to_le_bytes());
+        }
+
+        payload.extend_from_slice(&(board.reachable_timesync_sources.len() as u32).to_le_bytes());
+        for source in &board.reachable_timesync_sources {
+            encode_string(&mut payload, source)?;
+        }
+
+        payload.extend_from_slice(&(board.connections.len() as u32).to_le_bytes());
+        for peer in &board.connections {
+            encode_string(&mut payload, peer)?;
+        }
+    }
+
+    if let Some(removed) = removed {
+        payload.extend_from_slice(&(removed.len() as u32).to_le_bytes());
+        for sender_id in removed {
+            encode_string(&mut payload, sender_id)?;
+        }
+    }
+    debug_assert_eq!(payload.len(), length);
+    Ok(payload)
+}
+
 /// Builds a discovery packet advertising the sender's current board/edge topology graph.
 pub fn build_discovery_topology(
     sender: &str,
     timestamp_ms: u64,
     boards: &[TopologyBoardNode],
 ) -> TelemetryResult<Packet> {
-    let mut payload = Vec::new();
-    let mut normalized = boards.to_vec();
-    normalize_topology_boards(&mut normalized);
-
-    payload.extend_from_slice(&(normalized.len() as u32).to_le_bytes());
-    for board in normalized {
-        let sender_bytes = board.sender_id.as_bytes();
-        let sender_len = u32::try_from(sender_bytes.len())
-            .map_err(|_| TelemetryError::Pack("discovery topology sender id too long"))?;
-        payload.extend_from_slice(&sender_len.to_le_bytes());
-        payload.extend_from_slice(sender_bytes);
-
-        payload.extend_from_slice(&(board.reachable_endpoints.len() as u32).to_le_bytes());
-        for ep in board.reachable_endpoints {
-            payload.extend_from_slice(&ep.as_u32().to_le_bytes());
-        }
-
-        payload.extend_from_slice(&(board.reachable_timesync_sources.len() as u32).to_le_bytes());
-        for source in board.reachable_timesync_sources {
-            let bytes = source.as_bytes();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| TelemetryError::Pack("discovery topology source id too long"))?;
-            payload.extend_from_slice(&len.to_le_bytes());
-            payload.extend_from_slice(bytes);
-        }
-
-        payload.extend_from_slice(&(board.connections.len() as u32).to_le_bytes());
-        for peer in board.connections {
-            let bytes = peer.as_bytes();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| TelemetryError::Pack("discovery topology connection id too long"))?;
-            payload.extend_from_slice(&len.to_le_bytes());
-            payload.extend_from_slice(bytes);
-        }
-    }
+    let payload = topology_payload(boards, None)?;
 
     Packet::new(
         DataType::DiscoveryTopology,
@@ -1065,14 +1140,7 @@ pub fn build_discovery_topology_delta(
     boards: &[TopologyBoardNode],
     removed: &[String],
 ) -> TelemetryResult<Packet> {
-    let full = build_discovery_topology(sender, timestamp_ms, boards)?;
-    let mut payload = Vec::with_capacity(full.payload().len() + 8 + removed.len() * 8);
-    payload.extend_from_slice(&DISCOVERY_TOPOLOGY_DELTA_MARKER.to_le_bytes());
-    payload.extend_from_slice(full.payload());
-    payload.extend_from_slice(&(removed.len() as u32).to_le_bytes());
-    for sender_id in removed {
-        encode_string(&mut payload, sender_id)?;
-    }
+    let payload = topology_payload(boards, Some(removed))?;
     Packet::new(
         DataType::DiscoveryTopology,
         &[DataEndpoint::Discovery],

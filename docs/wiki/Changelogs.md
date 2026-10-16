@@ -4,6 +4,13 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 
 ## Version 4.2.3 highlights
 
+- Serialize normalized topology graphs by borrowing their nodes and strings;
+  reserve the encoded payload once. Encode deltas directly instead of creating
+  an intermediate full packet. Preserve legacy normalization for other callers
+  and the existing wire layout. This removes the extra graph clone captured in
+  a gateway allocation-panic stack; allocation regressions hold full/delta
+  encoding to four allocations for normalized graphs with 4–128 nodes.
+
 - Release a link's obsolete incremental-topology copy when its peer requests a
   full baseline, before admitting replacement snapshot scratch. Preserve learned
   routes, schemas and other links. Router and Relay allocation-ledger regressions
