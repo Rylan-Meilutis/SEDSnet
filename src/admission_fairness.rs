@@ -136,17 +136,19 @@ impl Loads {
 }
 /// No classification or scratch work until the bounded queue needs a victim.
 /// Internal controls retain the ordinary priority selector.
-pub(crate) fn queue_victim<T, O, P>(
+pub(crate) fn queue_victim<T, O, P, S>(
     queue: &crate::queue::BoundedDeque<T>,
     incoming: &T,
     owner: O,
     priority: P,
+    stream: S,
     selected: &mut Option<u32>,
 ) -> Option<usize>
 where
     T: crate::queue::ByteCost,
     O: Fn(&T) -> Option<u32>,
     P: Fn(&T) -> u8,
+    S: Fn(&T) -> Option<u32>,
 {
     let Some(incoming_owner) = owner(incoming) else {
         return queue.len().checked_sub(1);
@@ -167,10 +169,31 @@ where
         *selected = Some(victim);
         victim
     };
+    let mut streams = Loads::new();
+    for item in queue.iter() {
+        if priority(item) <= incoming_priority
+            && owner(item) == Some(victim)
+            && let Some(ty) = stream(item)
+        {
+            streams.record(ty, item.byte_cost());
+        }
+    }
+    // Reuse the bounded selector within the selected owner: repeated message
+    // types yield first, then this incoming type's previous value, then the
+    // ordinary priority fallback. No per-type reservation is retained.
+    let stream_victim = streams.queue_victim(
+        (victim == incoming_owner)
+            .then(|| stream(incoming))
+            .flatten(),
+    );
     queue
         .iter()
         .enumerate()
-        .filter(|(_, item)| priority(item) <= incoming_priority && owner(item) == Some(victim))
+        .filter(|(_, item)| {
+            priority(item) <= incoming_priority
+                && owner(item) == Some(victim)
+                && stream_victim.is_none_or(|ty| stream(item) == Some(ty))
+        })
         .min_by_key(|(index, item)| (priority(item), *index))
         .map(|(index, _)| index)
 }

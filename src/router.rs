@@ -2102,6 +2102,26 @@ impl RouterInner {
         }
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_stream(data: &RouterItem) -> Option<u32> {
+        match data {
+            RouterItem::Packet(packet) => Some(packet.data_type().as_u32()),
+            RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
+                wire_format::scheduling_type(view).map(|ty| ty.as_u32())
+            })
+            .ok()
+            .flatten(),
+        }
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn tx_bulk_stream(item: &TxQueued) -> Option<u32> {
+        match &item.item {
+            RouterTxItem::Broadcast(data) | RouterTxItem::ToSide { data, .. } => {
+                Self::bulk_stream(data)
+            }
+            _ => None,
+        }
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn bulk_loads(&self, priority: u8) -> crate::admission_fairness::Loads {
         let mut loads = crate::admission_fairness::Loads::new();
         for item in self.received_queue.iter() {
@@ -2125,7 +2145,30 @@ impl RouterInner {
         self.bulk_loads(priority).dominant_other(incoming)
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
-    fn reclaim_bulk_from(&mut self, owner: u32, priority: u8) -> bool {
+    fn reclaim_bulk_from(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+    ) -> bool {
+        let mut streams = crate::admission_fairness::Loads::new();
+        for item in self.received_queue.iter() {
+            if item.priority <= priority
+                && Self::fair_bulk_owner(&item.data, item.priority) == Some(owner)
+                && let Some(ty) = Self::bulk_stream(&item.data)
+            {
+                streams.record(ty, item.byte_cost());
+            }
+        }
+        for item in self.transmit_queue.iter() {
+            if item.priority <= priority
+                && Self::tx_bulk_owner(item) == Some(owner)
+                && let Some(ty) = Self::tx_bulk_stream(item)
+            {
+                streams.record(ty, item.byte_cost());
+            }
+        }
+        let stream = streams.queue_victim(incoming_stream);
         let rx = self
             .received_queue
             .iter()
@@ -2133,6 +2176,7 @@ impl RouterInner {
             .filter(|(_, item)| {
                 item.priority <= priority
                     && Self::fair_bulk_owner(&item.data, item.priority) == Some(owner)
+                    && stream.is_none_or(|ty| Self::bulk_stream(&item.data) == Some(ty))
             })
             .min_by_key(|(index, item)| (item.priority, *index))
             .map(|(index, item)| (index, item.priority));
@@ -2141,7 +2185,9 @@ impl RouterInner {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.priority <= priority && Self::tx_bulk_owner(item) == Some(owner)
+                item.priority <= priority
+                    && Self::tx_bulk_owner(item) == Some(owner)
+                    && stream.is_none_or(|ty| Self::tx_bulk_stream(item) == Some(ty))
             })
             .min_by_key(|(index, item)| (item.priority, *index))
             .map(|(index, item)| (index, item.priority));
@@ -2339,7 +2385,13 @@ impl RouterInner {
                         .queue_victim(incoming)
                 });
                 if let Some(victim) = victim
-                    && self.reclaim_bulk_from(victim, incoming_priority.min(199))
+                    && self.reclaim_bulk_from(
+                        victim,
+                        incoming_priority.min(199),
+                        (incoming == Some(victim))
+                            .then(|| _incoming.and_then(Self::bulk_stream))
+                            .flatten(),
+                    )
                 {
                     continue;
                 }
@@ -2422,6 +2474,7 @@ impl RouterInner {
                             _incoming,
                             |item| Self::fair_bulk_owner(&item.data, item.priority),
                             |item| item.priority,
+                            |item| Self::bulk_stream(&item.data),
                             &mut fair_victim,
                         )
                     }
@@ -2498,6 +2551,7 @@ impl RouterInner {
                             _incoming,
                             Self::tx_bulk_owner,
                             |item| item.priority,
+                            Self::tx_bulk_stream,
                             &mut fair_victim,
                         )
                     }
@@ -8757,7 +8811,7 @@ impl Router {
             *victim = Some((owner, priority));
             (owner, priority)
         };
-        st.reclaim_bulk_from(owner, priority)
+        st.reclaim_bulk_from(owner, priority, None)
     }
     fn admit_received_frame(&self, side: RouterSideId, bytes: &[u8]) -> TelemetryResult<()> {
         if !crate::memory_admission::has_probe() {
@@ -14728,6 +14782,136 @@ mod bounded_fair_queue_tests {
                     retained,
                     "small report was displaced: tx={tx}, slow_last={slow_last}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn slow_stream_survives_same_board_fast_stream_bursts() {
+        let ep = crate::config::register_endpoint("ROUTER_STREAM_QUEUE_DEST", false).unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            "ROUTER_STREAM_QUEUE_FAST",
+            "",
+            crate::MessageElement::Static(
+                64,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[ep],
+            crate::ReliableMode::None,
+            0,
+        )
+        .unwrap();
+        let slow_ty = crate::config::register_data_type_with_description(
+            "ROUTER_STREAM_QUEUE_SLOW",
+            "",
+            crate::MessageElement::Static(
+                64,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[ep],
+            crate::ReliableMode::None,
+            0,
+        )
+        .unwrap();
+        for mode in 0..3 {
+            for tx in [false, true] {
+                for slow_last in [false, true] {
+                    let node = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+                    let make = |sender| {
+                        let packet = Packet::new(
+                            if sender == "SLOW" { slow_ty } else { ty },
+                            &[ep],
+                            "SAME_BOARD",
+                            1,
+                            Arc::<[u8]>::from([1; 64]),
+                        )
+                        .unwrap();
+                        if mode == 1 {
+                            RouterItem::Packet(packet)
+                        } else {
+                            RouterItem::Packed(crate::shared_bytes::convert(
+                                wire_format::pack_packet(&packet),
+                            ))
+                        }
+                    };
+                    let rx = |data| RouterRxItem {
+                        src: None,
+                        data,
+                        priority: 0,
+                    };
+                    let tx_item = |data| TxQueued {
+                        item: RouterTxItem::Broadcast(data),
+                        ignore_local: true,
+                        priority: 0,
+                        retry_after_ms: 0,
+                    };
+                    let mut st = node.state.lock();
+                    st.memory.max_queue_budget = usize::MAX;
+                    if mode == 0 {
+                        if tx {
+                            st.transmit_queue =
+                                BoundedDeque::new(8192, 3 * size_of::<TxQueued>(), 1.0);
+                        } else {
+                            st.received_queue =
+                                BoundedDeque::new(8192, 3 * size_of::<RouterRxItem>(), 1.0);
+                        }
+                    } else if mode == 1 {
+                        let cost = if tx {
+                            tx_item(make("SLOW")).byte_cost()
+                                + 2 * tx_item(make("FAST")).byte_cost()
+                        } else {
+                            rx(make("SLOW")).byte_cost() + 2 * rx(make("FAST")).byte_cost()
+                        };
+                        if tx {
+                            st.transmit_queue = BoundedDeque::new(cost, cost, 2.0);
+                        } else {
+                            st.received_queue = BoundedDeque::new(cost, cost, 2.0);
+                        }
+                    }
+                    let order = if slow_last {
+                        ["FAST", "FAST", "SLOW"]
+                    } else {
+                        ["SLOW", "FAST", "FAST"]
+                    };
+                    for (index, sender) in order
+                        .into_iter()
+                        .chain(core::iter::repeat_n("FAST", 32))
+                        .enumerate()
+                    {
+                        if mode == 2 && index == 3 {
+                            st.memory.max_queue_budget = st.shared_queue_bytes_used();
+                        }
+                        if tx {
+                            st.push_transmit(tx_item(make(sender))).unwrap();
+                        } else {
+                            st.push_received(rx(make(sender))).unwrap();
+                        }
+                    }
+                    let is_slow = |data: &RouterItem| match data {
+                        RouterItem::Packet(p) => p.data_type() == slow_ty,
+                        RouterItem::Packed(b) => {
+                            wire_format::scheduling_type(b.as_ref()) == Some(slow_ty)
+                        }
+                    };
+                    let retained = if tx {
+                        st.transmit_queue.iter().any(|item| {
+                            let data = match &item.item {
+                                RouterTxItem::Broadcast(data)
+                                | RouterTxItem::ToSide { data, .. } => data,
+                                _ => return false,
+                            };
+                            is_slow(data)
+                        })
+                    } else {
+                        st.received_queue.iter().any(|item| is_slow(&item.data))
+                    };
+                    assert!(
+                        retained,
+                        "slow stream displaced: mode={mode}, tx={tx}, slow_last={slow_last}"
+                    );
+                }
             }
         }
     }

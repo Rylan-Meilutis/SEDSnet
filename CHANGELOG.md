@@ -2,6 +2,12 @@
 
 ## 4.2.3
 
+- Within the selected bulk sender, reclaim repeated message types before its
+  slower types' only queued report, and replace that type's older value when
+  possible. Apply this to RX, TX and shared-byte pressure in Router and Relay;
+  use bounded temporary catalogs without retained stream reservations. Native
+  regressions reproduce same-board pressure bursts displacing battery reports.
+
 - Apply dominant-sender fairness at bounded RX/TX byte, slot and refused-growth
   limits, as well as heap admission. A fast producer replaces its own queued
   backlog before another peer's sole report. Keep priority checks, reliable/frozen
