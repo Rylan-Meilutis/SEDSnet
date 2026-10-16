@@ -190,6 +190,23 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.2.3 highlights
+
+- Queued receipts retain their selected destination even after return-cache
+  eviction; Router and standalone Relay have cache-churn regressions.
+
+- Preserve queued ACK return paths against reflected packets during the retry window,
+  while retaining alternate-path learning after expiry or side disablement.
+- Preserve registered managed-control scheduling and bounded protected admission
+  through threaded receive queues and transport retries.
+
+- Frozen delivery contracts remain independently decodable, including managed
+  values declared best effort in the schema. Transport priority no longer depends
+  on delivering a header-template bootstrap first.
+- On-demand pending-delivery diagnostics expose owner hashes and retry/queue
+  state without copying packet payloads.
+- Regressions cover numeric embedded ACK senders and frozen-owner controls.
+
 ### Version 4.2.2 highlights
 
 - Make Router and Relay discovery change driven: stable links carry only empty liveness announcements, with no periodic route or full-topology rebroadcasts. Validated application traffic renews only its known sender; silent peers still expire. Bootstrap, topology changes and explicit recovery retain their existing delivery and retry behavior.

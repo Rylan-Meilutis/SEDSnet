@@ -819,6 +819,7 @@ fn discovery_master_election_uses_deterministic_tiebreaks_and_fails_over() {
 
 #[test]
 fn unknown_remote_endpoint_does_not_flood_without_discovery_route() {
+    crate::tests::ensure_common_test_schema();
     ensure_topology_test_schema();
 
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -851,6 +852,7 @@ fn unknown_remote_endpoint_does_not_flood_without_discovery_route() {
 
 #[test]
 fn unknown_remote_endpoint_does_not_fallback_to_single_side_after_topology_exists() {
+    crate::tests::ensure_common_test_schema();
     ensure_topology_test_schema();
 
     let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1508,6 +1510,7 @@ fn type_stats(
 
 #[test]
 fn router_uses_discovery_routes_for_outbound_packets() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -2213,6 +2216,7 @@ fn end_to_end_expiry_clears_unordered_but_does_not_ack_ordered_data() {
 
 #[test]
 fn in_flight_end_to_end_destinations_survive_topology_reachability_changes() {
+    crate::tests::ensure_common_test_schema();
     let router = Router::new_with_clock(
         RouterConfig::default().with_sender("SRC"),
         StepClock::new_box(0, 0),
@@ -2275,6 +2279,7 @@ fn in_flight_end_to_end_destinations_survive_topology_reachability_changes() {
 
 #[test]
 fn in_flight_end_to_end_destinations_survive_runtime_data_type_removal() {
+    crate::tests::ensure_common_test_schema();
     use crate::config::{register_data_type_with_description, remove_data_type_by_name};
     use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
@@ -2349,6 +2354,7 @@ fn in_flight_end_to_end_destinations_survive_runtime_data_type_removal() {
 
 #[test]
 fn explicit_target_contract_skips_wrong_local_router_delivery() {
+    crate::tests::ensure_common_test_schema();
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_c = hits.clone();
     let router = Router::new_with_clock(
@@ -2391,6 +2397,7 @@ fn explicit_target_contract_skips_wrong_local_router_delivery() {
 
 #[test]
 fn reliable_router_state_stays_bounded_under_unacked_traffic() {
+    crate::tests::ensure_common_test_schema();
     let router = Router::new_with_clock(
         RouterConfig::default().with_sender("SRC"),
         StepClock::new_box(0, 0),
@@ -2660,6 +2667,7 @@ fn queued_packed_discovery_learns_routes_for_locally_handled_endpoints() {
 
 #[test]
 fn queued_packet_discovery_updates_route_table_after_full_queue_drain() {
+    crate::tests::ensure_common_test_schema();
     let router = Router::new_with_clock(
         RouterConfig::new(vec![EndpointHandler::new_packet_handler(
             DataEndpoint::named("SD_CARD"),
@@ -2700,6 +2708,7 @@ fn queued_packet_discovery_updates_route_table_after_full_queue_drain() {
 
 #[test]
 fn queued_packed_discovery_timesync_sources_update_route_table_after_full_queue_drain() {
+    crate::tests::ensure_common_test_schema();
     let router = Router::new_with_clock(
         RouterConfig::new(vec![EndpointHandler::new_packet_handler(
             DataEndpoint::named("SD_CARD"),
@@ -2743,6 +2752,7 @@ fn queued_packed_discovery_timesync_sources_update_route_table_after_full_queue_
 
 #[test]
 fn queued_packed_discovery_from_same_sender_is_ignored_and_local_endpoint_does_not_flood() {
+    crate::tests::ensure_common_test_schema();
     use crate::config::DEVICE_IDENTIFIER;
 
     let seen_remote: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2983,6 +2993,7 @@ fn relay_runtime_routes_support_asymmetric_and_ingress_only_links() {
 
 #[test]
 fn relay_can_disable_ingress_for_a_side() {
+    crate::tests::ensure_common_test_schema();
     let relay = Relay::new(zero_clock());
     let side = relay.add_side_packet("A", |_pkt: &Packet| -> TelemetryResult<()> { Ok(()) });
     relay.set_side_ingress_enabled(side, false).unwrap();
@@ -3165,6 +3176,7 @@ fn relay_remove_side_stops_transmit_and_rejects_removed_ingress() {
 
 #[test]
 fn relay_remove_side_updates_discovery_routes_and_announces_remaining_topology() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -3512,6 +3524,7 @@ fn discovery_leave_prunes_client_topology_and_stats_immediately() {
 
 #[test]
 fn router_remove_side_stops_transmit_and_rejects_removed_ingress() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -3550,6 +3563,7 @@ fn router_remove_side_stops_transmit_and_rejects_removed_ingress() {
 
 #[test]
 fn router_remove_side_updates_discovery_routes_and_announces_remaining_topology() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -4109,6 +4123,7 @@ fn explicit_ingress_fanout_crosses_both_router_egress_sides() {
 
 #[test]
 fn router_typed_routes_still_respect_base_route_disables() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -4146,6 +4161,7 @@ fn router_typed_routes_still_respect_base_route_disables() {
 
 #[test]
 fn router_weighted_route_mode_splits_discovered_paths_by_weight() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -4200,6 +4216,7 @@ fn router_weighted_route_mode_splits_discovered_paths_by_weight() {
 
 #[test]
 fn router_discovery_defaults_to_adaptive_load_balancing() {
+    crate::tests::ensure_common_test_schema();
     ensure_topology_test_schema();
 
     let now_ms = Arc::new(AtomicU64::new(0));
@@ -5234,6 +5251,7 @@ fn relay_runtime_stats_track_tx_failures_and_retries() {
 
 #[test]
 fn router_failover_route_mode_switches_when_preferred_path_expires() {
+    crate::tests::ensure_common_test_schema();
     let now_ms = Arc::new(AtomicU64::new(0));
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -5313,6 +5331,7 @@ fn router_failover_route_mode_switches_when_preferred_path_expires() {
 
 #[test]
 fn router_weighted_route_mode_falls_back_to_remaining_path_when_other_path_expires() {
+    crate::tests::ensure_common_test_schema();
     let now_ms = Arc::new(AtomicU64::new(0));
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -5390,6 +5409,7 @@ fn router_weighted_route_mode_falls_back_to_remaining_path_when_other_path_expir
 
 #[test]
 fn router_failover_route_mode_switches_when_preferred_side_is_removed() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -5454,6 +5474,7 @@ fn router_failover_route_mode_switches_when_preferred_side_is_removed() {
 
 #[test]
 fn relay_weighted_route_mode_splits_discovered_paths_by_weight() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -5511,6 +5532,7 @@ fn relay_weighted_route_mode_splits_discovered_paths_by_weight() {
 
 #[test]
 fn relay_failover_route_mode_switches_when_preferred_path_expires() {
+    crate::tests::ensure_common_test_schema();
     let now_ms = Arc::new(AtomicU64::new(0));
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -5589,6 +5611,7 @@ fn relay_failover_route_mode_switches_when_preferred_path_expires() {
 
 #[test]
 fn relay_weighted_route_mode_falls_back_to_remaining_path_when_other_path_expires() {
+    crate::tests::ensure_common_test_schema();
     let now_ms = Arc::new(AtomicU64::new(0));
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -5668,6 +5691,7 @@ fn relay_weighted_route_mode_falls_back_to_remaining_path_when_other_path_expire
 
 #[test]
 fn relay_failover_route_mode_switches_when_preferred_side_is_removed() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -5741,6 +5765,7 @@ fn relay_failover_route_mode_switches_when_preferred_side_is_removed() {
 
 #[test]
 fn router_can_disable_ingress_for_a_side() {
+    crate::tests::ensure_common_test_schema();
     let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
     let side = router.add_side_packet("A", |_pkt: &Packet| -> TelemetryResult<()> { Ok(()) });
     router.set_side_ingress_enabled(side, false).unwrap();
@@ -5832,6 +5857,7 @@ fn router_periodic_can_skip_timesync_but_still_dispatch_discovery() {
 #[cfg(feature = "timesync")]
 #[test]
 fn queued_timesync_packets_precede_normal_telemetry() {
+    crate::tests::ensure_common_test_schema();
     let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_c = seen.clone();
 
@@ -5871,6 +5897,7 @@ fn queued_timesync_packets_precede_normal_telemetry() {
 #[cfg(feature = "discovery")]
 #[test]
 fn queued_discovery_packets_precede_normal_telemetry() {
+    crate::tests::ensure_common_test_schema();
     let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_c = seen.clone();
 
@@ -5989,6 +6016,7 @@ fn relay_exports_aggregated_topology() {
 
 #[test]
 fn relay_periodic_dispatches_discovery() {
+    crate::tests::ensure_common_test_schema();
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_c = seen_a.clone();
@@ -6024,6 +6052,7 @@ fn relay_periodic_dispatches_discovery() {
 
 #[test]
 fn relay_end_to_end_acked_holders_clear_when_discovered_holder_expires() {
+    crate::tests::ensure_common_test_schema();
     let now_ms = Arc::new(AtomicU64::new(0));
     let relay = Relay::new(Box::new(SharedClock {
         now_ms: now_ms.clone(),
@@ -6064,6 +6093,7 @@ fn relay_end_to_end_acked_holders_clear_when_discovered_holder_expires() {
 
 #[test]
 fn relay_keeps_forwarding_to_unacked_destinations_after_reachability_changes() {
+    crate::tests::ensure_common_test_schema();
     let seen: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_c = seen.clone();
     let relay = Relay::new(zero_clock());
@@ -6131,6 +6161,7 @@ fn relay_keeps_forwarding_to_unacked_destinations_after_reachability_changes() {
 
 #[test]
 fn reliable_relay_state_stays_bounded_under_unacked_traffic() {
+    crate::tests::ensure_common_test_schema();
     let relay = Relay::new(zero_clock());
     let side = relay.add_side_packet("A", |_pkt: &Packet| -> TelemetryResult<()> { Ok(()) });
 
@@ -7223,7 +7254,11 @@ fn router_runtime_memory_budget_caps_queued_state() {
 #[test]
 fn relay_runtime_memory_budget_caps_queued_state() {
     crate::tests::ensure_common_test_schema();
-    let memory = crate::config::RuntimeMemoryConfig::new(8192, 8, 512, 1.5).unwrap();
+    // The shared ceiling includes the process-wide registered schema. Other
+    // tests legitimately add types before this runs; retain an 8 KiB queue
+    // allowance above that existing metadata instead of requiring its eviction.
+    let budget = crate::config::schema_bytes_used().saturating_add(8192);
+    let memory = crate::config::RuntimeMemoryConfig::new(budget, 8, 512, 1.5).unwrap();
     let relay_cfg = crate::relay::RelayConfig::default()
         .with_memory_config(memory)
         .unwrap();
@@ -7245,7 +7280,7 @@ fn relay_runtime_memory_budget_caps_queued_state() {
     let json: serde_json::Value = serde_json::from_str(&relay.export_memory_layout_json()).unwrap();
     let used = json["shared_queue_bytes_used"].as_u64().unwrap();
     let allocated = json["shared_queue_bytes_allocated"].as_u64().unwrap();
-    assert_eq!(allocated, 8192);
+    assert_eq!(allocated, budget as u64);
     assert!(
         used <= allocated,
         "relay queued state exceeded runtime memory budget: used={used} allocated={allocated}"

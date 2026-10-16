@@ -54,6 +54,7 @@ fn concrete_len_for_test(ty: DataType) -> usize {
 /// (for both static and dynamic payload kinds).
 #[test]
 fn packet_validate_rejects_empty_endpoints_and_size_mismatch() {
+    crate::tests::ensure_common_test_schema();
     let ty = DataType::named("GPS_DATA");
     let need = concrete_len_for_test(ty);
 
@@ -103,6 +104,7 @@ fn enum_conversion_bounds_and_rejections() {
 /// `packet_wire_size` must match the length of the packed output.
 #[test]
 fn packet_wire_size_matches_packed_len() {
+    crate::tests::ensure_common_test_schema();
     let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let pkt = Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 9)
         .unwrap();
@@ -284,6 +286,7 @@ fn compact_reliable_ack_and_owned_rewrite_roundtrip() {
 /// payload and just pass the raw bytes.
 #[test]
 fn packed_only_handlers_do_not_unpack() {
+    crate::tests::ensure_common_test_schema();
     let pkt = Packet::from_f32_slice(
         DataType::named("GPS_DATA"),
         &[1.0, 2.0, 3.0],
@@ -314,6 +317,7 @@ fn packed_only_handlers_do_not_unpack() {
 /// - each endpoint handler is invoked exactly once.
 #[test]
 fn packet_handlers_trigger_single_unpack_and_fan_out() {
+    crate::tests::ensure_common_test_schema();
     let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let pkt = Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 5)
         .unwrap();
@@ -347,6 +351,7 @@ fn packet_handlers_trigger_single_unpack_and_fan_out() {
 /// avoid serializing at all and never call TX.
 #[test]
 fn send_avoids_packing_when_only_local_packet_handlers_exist() {
+    crate::tests::ensure_common_test_schema();
     let tx_called = StdArc::new(AtomicUsize::new(0));
     let txc = tx_called.clone();
     let tx = move |bytes: &[u8]| -> TelemetryResult<()> {
@@ -384,6 +389,7 @@ fn send_avoids_packing_when_only_local_packet_handlers_exist() {
 /// packet handlers exactly once.
 #[test]
 fn receive_direct_packet_invokes_handlers() {
+    crate::tests::ensure_common_test_schema();
     let called = StdArc::new(AtomicUsize::new(0));
     let c = called.clone();
     let handler =
@@ -413,6 +419,7 @@ fn receive_direct_packet_invokes_handlers() {
 /// and doesn’t grow without bound.
 #[test]
 fn error_payload_is_truncated_to_meta_size() {
+    crate::tests::ensure_common_test_schema();
     let failing_tx = |_b: &[u8]| -> TelemetryResult<()> { Err(TelemetryError::Io("boom")) };
 
     let captured = StdArc::new(Mutex::new(String::new()));

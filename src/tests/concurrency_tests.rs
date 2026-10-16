@@ -39,6 +39,7 @@ fn router_is_send_and_sync() {
 /// a single drain must deliver all packets to the handler exactly once.
 #[test]
 fn concurrent_rx_queue_is_thread_safe() {
+    crate::tests::ensure_common_test_schema();
     const THREADS: usize = 4;
     const ITERS_PER_THREAD: usize = 50;
     let total = THREADS * ITERS_PER_THREAD;
@@ -94,6 +95,7 @@ fn concurrent_rx_queue_is_thread_safe() {
 /// and all queued packets should eventually be processed once.
 #[test]
 fn rtos_like_ingress_and_processing_no_deadlock() {
+    crate::tests::ensure_common_test_schema();
     const THREADS: usize = 4;
     const ITERS_PER_THREAD: usize = 80;
     let total = THREADS * ITERS_PER_THREAD;
@@ -161,6 +163,7 @@ fn rtos_like_ingress_and_processing_no_deadlock() {
 /// thread drains queues. Ensures side-tagged queue ingress remains stable.
 #[test]
 fn rtos_like_side_ingress_and_processing_no_deadlock() {
+    crate::tests::ensure_common_test_schema();
     const THREADS: usize = 4;
     const ITERS_PER_THREAD: usize = 60;
     let total = THREADS * ITERS_PER_THREAD;
@@ -248,6 +251,7 @@ fn rtos_like_side_ingress_and_processing_no_deadlock() {
 /// new work) without deadlocking queue processing.
 #[test]
 fn handler_can_reenter_router_without_deadlock() {
+    crate::tests::ensure_common_test_schema();
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -333,6 +337,7 @@ fn handler_can_reenter_router_without_deadlock() {
 /// wire buffer; each call should fan out once to the handler.
 #[test]
 fn concurrent_receive_packed_is_thread_safe() {
+    crate::tests::ensure_common_test_schema();
     const THREADS: usize = 4;
     const ITERS_PER_THREAD: usize = 50;
     let total = THREADS * ITERS_PER_THREAD;
@@ -391,6 +396,7 @@ fn concurrent_receive_packed_is_thread_safe() {
 /// local handler.
 #[test]
 fn concurrent_logging_and_processing_is_thread_safe() {
+    crate::tests::ensure_common_test_schema();
     use std::thread;
 
     const ITERS: usize = 200;
@@ -462,6 +468,7 @@ fn concurrent_logging_and_processing_is_thread_safe() {
 /// that all work is eventually processed exactly once.
 #[test]
 fn concurrent_log_receive_and_process_mix_is_thread_safe() {
+    crate::tests::ensure_common_test_schema();
     use std::thread;
 
     const LOG_ITERS: usize = 100;

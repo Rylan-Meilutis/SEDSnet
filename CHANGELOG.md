@@ -1,5 +1,35 @@
 # Changelog
 
+## 4.2.3
+
+- Retain the selected return side in queued Router receipts so packet-id cache
+  eviction and reflected data cannot redirect an already queued ACK. Verify the
+  same behavior in standalone Relay, which already queues a destination side.
+- Remove a repeated reliable-frame/schema classification after the canonical
+  encode path has already selected those frames, reducing CPU work and flash.
+
+- Prevent a reflected data packet from redirecting a queued ACK in Router and
+  Relay. Preserve the original live ingress during the retry window; permit
+  alternate-path learning after that window or when the old side is disabled.
+  Add queued-radio-receipt and failover regressions without extra retained state.
+
+- Preserve registered managed-value service priority in threaded receive queues
+  and service them ahead of bulk work. Bounded fixed-byte managed controls use
+  the existing protected admission class even when application-schema priority
+  is low; retain the full working estimate, CRC/shape bounds and allocator checks.
+
+- Preserve managed-value service priority through Router backpressure retries and
+  preserve the original queued priority through both Relay drain APIs.
+
+- Keep packets with frozen delivery destinations independent of header-template
+  dictionaries, including managed values whose schema uses best-effort delivery.
+  This allows transport schedulers to prioritize them without reordering dependent
+  templates, and avoids retaining unused dictionary entries for these controls.
+- Add an on-demand Rust snapshot of pending reliable transmissions, including
+  destination hashes, retries and queue state, without decoding or copying payloads.
+- Cover captured embedded gateway receipts with numeric sender identities and
+  best-effort-schema controls with frozen owners in regression tests.
+
 ## 4.2.2
 
 - Stop periodic route-summary and full-topology broadcasts on stable links in Router and Relay. Retain small empty liveness announcements, change-triggered updates, reliable delivery, and requested baseline/schema recovery. Refresh known-peer liveness from validated native and packed application traffic without adding ownership or renewing unrelated peers.

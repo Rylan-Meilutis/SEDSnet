@@ -26,16 +26,33 @@ pub(crate) fn ensure_common_test_schema() {
             register_endpoint_with_description("SD_CARD", "test sd endpoint", false)
                 .expect("register SD_CARD")
         });
-        if DataType::try_named("GPS_DATA").is_none() {
-            register_data_type_with_description(
+        for (name, count, data_type, reliable) in [
+            (
                 "GPS_DATA",
-                "test gps data type",
-                MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
-                &[radio, sd_card],
+                3,
+                MessageDataType::Float32,
+                ReliableMode::Ordered,
+            ),
+            ("IMU_DATA", 6, MessageDataType::Float32, ReliableMode::None),
+            (
+                "BATTERY_STATUS",
+                2,
+                MessageDataType::Float32,
                 ReliableMode::None,
-                1,
-            )
-            .expect("register GPS_DATA");
+            ),
+            ("HEARTBEAT", 0, MessageDataType::NoData, ReliableMode::None),
+        ] {
+            if DataType::try_named(name).is_none() {
+                register_data_type_with_description(
+                    name,
+                    "shared test fixture",
+                    MessageElement::Static(count, data_type, MessageClass::Data),
+                    &[radio, sd_card],
+                    reliable,
+                    1,
+                )
+                .expect("register common test type");
+            }
         }
     });
 }
@@ -305,6 +322,7 @@ unsafe fn copy_telemetry_packet_raw(
 /// Ensures `to_hex_string()` matches exactly the expected legacy format.
 #[test]
 fn helpers_packet_hex_to_string() {
+    crate::tests::ensure_common_test_schema();
     let pkt = fake_telemetry_packet_bytes();
     let got = pkt.to_hex_string();
     let expect = "Type: GPS_DATA, Data Size: 12, Sender: TEST_PLATFORM, Endpoints: [SD_CARD, RADIO], Timestamp: 1123581321 (312h 06m 21s 321ms), Data (hex): 0x00 0x00 0x98 0x41 0x00 0x00 0x04 0x42 0x00 0x00 0x50 0x42";
@@ -350,6 +368,7 @@ fn router_and_relay_side_churn_reclaims_names_and_reuses_slots() {
 /// Exercises `copy_telemetry_packet_raw` for null, self-copy, and deep copy.
 #[test]
 fn helpers_copy_telemetry_packet() {
+    crate::tests::ensure_common_test_schema();
     // (1) null dest → error
     let src = fake_telemetry_packet_bytes();
     let st = unsafe { copy_telemetry_packet_raw(core::ptr::null_mut(), &src as *const _) };

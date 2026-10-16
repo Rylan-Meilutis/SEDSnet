@@ -133,6 +133,19 @@ pub struct ReliableRuntimeStats {
     pub end_to_end_acked_cache_count: usize,
 }
 
+/// On-demand metadata for an outstanding reliable transmission. Payloads are
+/// neither decoded nor copied; destination identifiers are sender hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReliablePendingStats {
+    pub packet_id: u64,
+    pub data_type: DataType,
+    pub pending_destinations: Vec<u64>,
+    pub retries: u32,
+    pub queued: bool,
+    pub waiting_for_predecessor: bool,
+    pub last_send_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryRuntimeStats {
     pub route_count: usize,

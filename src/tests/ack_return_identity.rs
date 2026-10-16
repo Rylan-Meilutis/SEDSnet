@@ -644,3 +644,109 @@ fn reliable_data_retry_survives_return_route_cache_churn() {
         assert_eq!(count(), 2, "immediate echoes remain suppressed");
     }
 }
+
+#[test]
+fn can_echo_cannot_redirect_a_queued_radio_receipt() {
+    queued_radio_receipt_survives_echo(false);
+}
+
+#[test]
+fn queued_radio_receipt_survives_return_cache_eviction_and_echo() {
+    queued_radio_receipt_survives_echo(true);
+}
+
+fn queued_radio_receipt_survives_echo(churn: bool) {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let ep = DataEndpoint::named("RADIO");
+    let ty = crate::config::register_data_type_with_description(
+        "RADIO_QUEUED_ACK_ECHO",
+        "",
+        MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[ep],
+        crate::ReliableMode::Ordered,
+        16,
+    )
+    .unwrap();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::new([]).with_sender("RF"),
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    );
+    router
+        .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+        .unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_c = ready.clone();
+    let radio_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let radio_c = radio_frames.clone();
+    let radio = router.add_side_packed("radio", move |wire| {
+        if !ready_c.load(Ordering::Relaxed) {
+            return Err(TelemetryError::Io("side tx busy"));
+        }
+        radio_c.lock().unwrap().push(wire.to_vec());
+        Ok(())
+    });
+    let can_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let can_c = can_frames.clone();
+    let can = router.add_side_packed("can", move |wire| {
+        can_c.lock().unwrap().push(wire.to_vec());
+        Ok(())
+    });
+    router.clear_queues();
+    let packet = Packet::new(ty, &[ep], "GS", 123, Arc::<[u8]>::from([1])).unwrap();
+    let id = packet.packet_id();
+    let RouterItem::Packed(wire) = router
+        .attach_wire_contract_to_item(
+            RouterItem::Packet(packet),
+            &[Router::sender_hash("RF"), Router::sender_hash("GB")],
+        )
+        .unwrap()
+    else {
+        panic!("expected canonical wire");
+    };
+    router.rx_packed_queue_from_side(&wire, radio).unwrap();
+    router.process_rx_queue().unwrap();
+    // The application update has arrived, but the receipt awaits radio space.
+    if churn {
+        for index in 0..runtime_reliable_max_return_routes().max(1) {
+            router.note_reliable_return_route(can, 10000 + index as u64);
+        }
+        assert!(!router.state.lock().reliable_return_routes.contains_key(&id));
+    }
+    router.rx_packed_queue_from_side(&wire, can).unwrap();
+    router.process_rx_queue().unwrap();
+    ready.store(true, Ordering::Relaxed);
+    now.store(1, Ordering::Relaxed);
+    router.process_all_queues_with_timeout(0).unwrap();
+    let is_receipt = |wire: &Vec<u8>| {
+        wire_format::unpack_packet(wire).is_ok_and(|p| {
+            p.data_type() == DataType::ReliableAck && p.payload() == id.to_le_bytes()
+        })
+    };
+    assert!(
+        radio_frames.lock().unwrap().iter().any(is_receipt),
+        "receipt must reach the original radio source"
+    );
+    if !churn {
+        assert!(
+            !can_frames.lock().unwrap().iter().any(is_receipt),
+            "a reflected data packet must not steal its ACK return path"
+        );
+    }
+    now.store(runtime_reliable_retransmit_ms() + 1, Ordering::Relaxed);
+    router.rx_packed_from_side(&wire, can).unwrap();
+    assert_eq!(
+        router.state.lock().reliable_return_routes[&id].side,
+        can,
+        "a timed retry may relearn another path even while the old side stays configured"
+    );
+    router.set_side_egress_enabled(can, false).unwrap();
+    router.rx_packed_from_side(&wire, radio).unwrap();
+    assert_eq!(
+        router.state.lock().reliable_return_routes[&id].side,
+        radio,
+        "explicitly disabling the original path permits alternate ingress recovery"
+    );
+}

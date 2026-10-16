@@ -519,6 +519,7 @@ fn advertise_side(relay: &Relay, side: usize, sender: &str, endpoint: DataEndpoi
 /// and never loop back to the source.
 #[test]
 fn relay_basic_fan_out() {
+    crate::tests::ensure_common_test_schema();
     let relay = Arc::new(Relay::new(zero_clock()));
 
     // Three sides: A, B, C
@@ -655,6 +656,7 @@ fn relay_clear_queues_drops_pending_work() {
 /// leaving additional work for a later drain.
 #[test]
 fn relay_timeout_limits_work_per_call() {
+    crate::tests::ensure_common_test_schema();
     // Step clock: each now_ms() call advances by 10ms.
     let clock = StepClock::new_box(0, 10);
     let relay = Relay::new(clock);
@@ -707,6 +709,7 @@ fn relay_timeout_limits_work_per_call() {
 /// deliver all frames after a full drain.
 #[test]
 fn relay_concurrent_rx_is_thread_safe() {
+    crate::tests::ensure_common_test_schema();
     use std::thread;
 
     const THREADS: usize = 4;

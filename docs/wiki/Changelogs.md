@@ -2,6 +2,23 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.2.3 highlights
+
+- Queued receipts retain their selected destination even after return-cache
+  eviction; Router and standalone Relay have cache-churn regressions.
+
+- Preserve queued ACK return paths against reflected packets during the retry window,
+  while retaining alternate-path learning after expiry or side disablement.
+- Preserve registered managed-control scheduling and bounded protected admission
+  through threaded receive queues and transport retries.
+
+- Retain service/control scheduling priority when Router or Relay retries a busy
+  transport, including managed values with low application-schema priority.
+
+- Keep frozen-owner delivery contracts independent of header dictionaries,
+  including best-effort-schema managed values. Add payload-free pending-delivery
+  diagnostics and regressions for captured numeric-sender embedded ACKs.
+
 ## Version 4.2.2 highlights
 
 - Stop periodic route-summary and full-topology broadcasts on stable Router and Relay links. Retain small liveness announcements, known-sender application activity, topology-change updates, and requested baseline/schema recovery.

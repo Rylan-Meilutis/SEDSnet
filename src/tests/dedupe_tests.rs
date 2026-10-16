@@ -64,6 +64,7 @@ fn advertise_side(relay: &Relay, side: usize, sender: &str) {
 /// deliver it once to local handlers.
 #[test]
 fn router_rx_packed_deduplicates_identical_frames() {
+    crate::tests::ensure_common_test_schema();
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_c = hits.clone();
 
@@ -104,6 +105,7 @@ fn router_rx_packed_deduplicates_identical_frames() {
 /// deduped (i.e. dedupe is not time-window based).
 #[test]
 fn router_rx_packed_dedup_persists_across_time_advance() {
+    crate::tests::ensure_common_test_schema();
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_c = hits.clone();
 
@@ -144,6 +146,7 @@ fn router_rx_packed_dedup_persists_across_time_advance() {
 /// each other.
 #[test]
 fn router_rx_packed_does_not_dedupe_different_frames() {
+    crate::tests::ensure_common_test_schema();
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_c = hits.clone();
 

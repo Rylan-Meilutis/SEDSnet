@@ -19,6 +19,7 @@ fn advertise_side(relay: &Relay, side: usize) {
 
 #[test]
 fn relay_reliable_seq_advances_with_ack() {
+    crate::tests::ensure_common_test_schema();
     let relay = Arc::new(Relay::new(zero_clock()));
 
     relay.add_side_packed_with_options(
@@ -253,6 +254,7 @@ fn relay_reliable_retransmit_across_chain_preserves_order() {
 
 #[test]
 fn relay_reliable_reorders_out_of_order_frames() {
+    crate::tests::ensure_common_test_schema();
     let relay = Arc::new(Relay::new(zero_clock()));
 
     relay.add_side_packed_with_options(
@@ -341,6 +343,7 @@ fn relay_reliable_reorders_out_of_order_frames() {
 
 #[test]
 fn relay_reliable_sender_does_not_block_while_waiting_for_ack() {
+    crate::tests::ensure_common_test_schema();
     let relay = Arc::new(Relay::new(zero_clock()));
 
     relay.add_side_packed_with_options(

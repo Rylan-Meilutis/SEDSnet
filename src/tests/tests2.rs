@@ -17,6 +17,7 @@ use std::vec::Vec;
 /// bytes round-trip exactly.
 #[test]
 fn pack_roundtrip_gps() {
+    crate::tests::ensure_common_test_schema();
     // GPS: 3 * f32
     let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let pkt = Packet::from_f32_slice(
@@ -43,6 +44,7 @@ fn pack_roundtrip_gps() {
 /// Verify `header_string()` format for a simple GPS packet.
 #[test]
 fn header_string_matches_expectation() {
+    crate::tests::ensure_common_test_schema();
     let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let pkt = Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.0, 3.0], endpoints, 0)
         .unwrap();
@@ -56,6 +58,7 @@ fn header_string_matches_expectation() {
 /// Ensure `to_string()` includes the float values and the general header.
 #[test]
 fn packet_to_string_formats_floats() {
+    crate::tests::ensure_common_test_schema();
     let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let pkt = Packet::from_f32_slice(DataType::named("GPS_DATA"), &[1.0, 2.5, 3.25], endpoints, 0)
         .unwrap();
@@ -73,6 +76,7 @@ fn packet_to_string_formats_floats() {
 /// local handler decoding f32 payload.
 #[test]
 fn router_sends_and_receives() {
+    crate::tests::ensure_common_test_schema();
     use crate::router::{Router, RouterConfig};
 
     // capture spaces
@@ -128,6 +132,7 @@ fn router_sends_and_receives() {
 
 #[test]
 fn router_load_balancing_smoke_exercises_public_runtime_controls() {
+    crate::tests::ensure_common_test_schema();
     use crate::RouteSelectionMode;
     use crate::discovery::build_discovery_announce;
     use crate::router::{Router, RouterConfig};
@@ -473,6 +478,7 @@ impl TestBus {
 /// consumes them from its receive queue and delivers to a local handler.
 #[test]
 fn queued_roundtrip_between_two_routers() {
+    crate::tests::ensure_common_test_schema();
     // --- Set up a TX router that only sends (no local endpoints) ---
     let (bus, tx_fn) = TestBus::new();
     let box_clock_tx = StepClock::new_default_box();
@@ -534,6 +540,7 @@ fn queued_roundtrip_between_two_routers() {
 /// own TX back into its RX queue.
 #[test]
 fn queued_self_delivery_via_receive_queue() {
+    crate::tests::ensure_common_test_schema();
     let (bus, tx_fn) = TestBus::new();
     let box_clock = StepClock::new_default_box();
 

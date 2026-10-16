@@ -46,6 +46,7 @@ fn ensure_reliable_test_schema() {
 
 #[test]
 fn reliable_retransmit_delivers_once() {
+    crate::tests::ensure_common_test_schema();
     ensure_reliable_test_schema();
     let rx_hits = Arc::new(AtomicUsize::new(0));
     let rx_hits_c = rx_hits.clone();
@@ -232,6 +233,7 @@ fn direct_tx_handler_failure_emits_error_without_queue_drain() {
 
 #[test]
 fn concurrent_side_tx_busy_is_queued_for_retry() {
+    crate::tests::ensure_common_test_schema();
     let tx_hits = Arc::new(AtomicUsize::new(0));
     let tx_hits_c = tx_hits.clone();
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -293,6 +295,7 @@ fn concurrent_side_tx_busy_is_queued_for_retry() {
 
 #[test]
 fn partial_ack_is_emitted_and_still_allows_requested_replay() {
+    crate::tests::ensure_common_test_schema();
     let sent_frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let sent_frames_c = sent_frames.clone();
     let sender = Router::new_with_clock(
@@ -569,6 +572,7 @@ fn reliable_ordered_delivers_in_order() {
 
 #[test]
 fn reliable_sender_does_not_block_while_waiting_for_ack() {
+    crate::tests::ensure_common_test_schema();
     let sent: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let sent_c = sent.clone();
 
@@ -619,6 +623,7 @@ fn reliable_sender_does_not_block_while_waiting_for_ack() {
 
 #[test]
 fn reliable_disabled_skips_ack() {
+    crate::tests::ensure_common_test_schema();
     let rx_hits = Arc::new(AtomicUsize::new(0));
     let rx_hits_c = rx_hits.clone();
     let handler = EndpointHandler::new_packet_handler(

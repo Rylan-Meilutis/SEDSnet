@@ -29,6 +29,7 @@ fn user_cannot_register_timesync_endpoint_handler() {
 /// cause the router to forward it by default.
 #[test]
 fn relay_mode_retransmits_when_remote_endpoint_present() {
+    crate::tests::ensure_common_test_schema();
     static TX_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn transmit(_bytes: &[u8]) -> TelemetryResult<()> {
@@ -127,6 +128,7 @@ fn queued_packed_ingress_retries_side_tx_and_relays_between_router_sides() {
 /// Explicit route disables should suppress remote forwarding.
 #[test]
 fn disabled_route_prevents_retransmit_on_receive() {
+    crate::tests::ensure_common_test_schema();
     use crate::router::RouterConfig;
 
     static TX_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -159,6 +161,7 @@ fn disabled_route_prevents_retransmit_on_receive() {
 /// and only delivered to local handlers once.
 #[test]
 fn receive_dedupes_identical_packed_frames() {
+    crate::tests::ensure_common_test_schema();
     use crate::router::RouterConfig;
 
     let hits = Arc::new(AtomicUsize::new(0));
@@ -189,6 +192,7 @@ fn receive_dedupes_identical_packed_frames() {
 /// should still deliver the raw bytes.
 #[test]
 fn rx_packed_delivers_to_packed_handlers() {
+    crate::tests::ensure_common_test_schema();
     use crate::router::RouterConfig;
 
     let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));

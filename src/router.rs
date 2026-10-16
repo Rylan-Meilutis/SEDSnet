@@ -2994,6 +2994,11 @@ impl Router {
     }
 
     fn queued_rx_item_is_control(item: &RouterRxItem) -> bool {
+        // Registered managed values keep their application type on the wire,
+        // but their queued service class must match their transmission class.
+        if item.priority == crate::transport_priority(DataType::ManagedVariableValue) {
+            return true;
+        }
         let ty = match &item.data {
             RouterItem::Packet(pkt) => Some(pkt.data_type()),
             RouterItem::Packed(bytes) => wire_format::scheduling_type(bytes.as_ref()),
@@ -3891,7 +3896,7 @@ impl Router {
         Ok(())
     }
 
-    /// Record the side that most recently led toward `packet_id`.
+    /// Record the original live ingress for `packet_id`, preserving it across echoes.
     ///
     /// End-to-end reliable acknowledgements should return only toward the
     /// source-side that originated the data flow, not be flooded everywhere.
@@ -3901,17 +3906,36 @@ impl Router {
         // A retry can remain in RX dedupe after its smaller return-path cache
         // entry was evicted. Relearning that path must not restart the replay
         // delay on every retry, or sustained cache churn suppresses it forever.
-        let last_replay_ms = if st.recent_rx.contains(&packet_id) {
-            self.clock
-                .now_ms()
-                .saturating_sub(runtime_reliable_retransmit_ms())
+        let now = self.clock.now_ms();
+        let retry_ms = runtime_reliable_retransmit_ms();
+        let duplicate = st.recent_rx.contains(&packet_id);
+        let last_replay_ms = if duplicate {
+            now.saturating_sub(retry_ms)
         } else {
-            self.clock.now_ms()
+            now
         };
+        // A reflected copy is not evidence that the original publisher
+        // moved. Keep the first live ingress during the current retry
+        // window, otherwise an echo can redirect an already queued ACK into
+        // the downstream bus. A retry-window expiry or disabled/removed side
+        // still permits alternate-path recovery without explicit operator action.
+        let replace_side = !duplicate
+            || st
+                .reliable_return_routes
+                .get(&packet_id)
+                .is_none_or(|route| {
+                    now.saturating_sub(route.last_replay_ms) >= retry_ms
+                        || !Self::side_ref(&st, route.side)
+                            .is_ok_and(|side| side.opts.egress_enabled)
+                });
         Self::remember_reliable_return_route_locked(&mut st, packet_id);
         st.reliable_return_routes
             .entry(packet_id)
-            .and_modify(|route| route.side = side)
+            .and_modify(|route| {
+                if replace_side {
+                    route.side = side;
+                }
+            })
             .or_insert(ReliableReturnRouteState {
                 side,
                 last_replay_ms,
@@ -4638,7 +4662,24 @@ impl Router {
                 original_sender_hash,
             ],
         )?;
-        self.emit_internal_tx(RouterTxItem::Broadcast(ack), true, called_from_queue)
+        // Freeze a known return side in the queued receipt itself. Its bounded
+        // packet-id cache can churn before dispatch; an echoed data frame must
+        // not redirect an ACK which already has a valid destination.
+        let return_side = {
+            let st = self.state.lock();
+            st.reliable_return_routes
+                .get(&packet_id)
+                .map(|route| route.side)
+        };
+        let item = match return_side {
+            Some(dst) => RouterTxItem::ToSide {
+                src: None,
+                dst,
+                data: ack,
+            },
+            None => RouterTxItem::Broadcast(ack),
+        };
+        self.emit_internal_tx(item, true, called_from_queue)
     }
 
     fn emit_internal_tx(
@@ -4730,6 +4771,15 @@ impl Router {
             RouterItem::Packed(bytes) => wire_format::peek_routing_envelope(bytes.as_ref())?.ty,
         };
         Ok(crate::scheduler_priority(ty))
+    }
+
+    fn item_service_priority(&self, data: &RouterItem) -> TelemetryResult<u8> {
+        let ty = Self::item_data_type(data)?;
+        if self.is_managed_variable_type(ty) {
+            Ok(crate::transport_priority(DataType::ManagedVariableValue))
+        } else {
+            Ok(crate::scheduler_priority(ty))
+        }
     }
 
     #[inline]
@@ -7925,6 +7975,12 @@ impl Router {
             };
             let reliable = is_reliable_type(frame.envelope.ty)
                 || frame.reliable.is_some()
+                // Managed-variable delivery freezes destination owners even
+                // when the application schema itself is best effort. Its
+                // end-to-end receipt must not depend on a lossy dictionary
+                // bootstrap, and transports must be able to prioritize it
+                // independently of queued schema/template frames.
+                || frame.envelope.target_senders().len() != 0
                 || matches!(
                     frame.envelope.ty,
                     crate::DataType::ReliableAck
@@ -7961,32 +8017,8 @@ impl Router {
         let wrapped = if opts.header_template_enabled {
             let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
                 extract_side_header_template_view(raw.as_ref())?;
-            // Reliable frames never use dictionary compression. Send the native,
-            // self-describing wire packet without allocating/retaining an unused
-            // template on either peer. Raw packets are accepted by both decoders.
-            if is_reliable_type(_ty)
-                || reliable_seq_ack.is_some()
-                || matches!(
-                    _ty,
-                    DataType::ReliableAck
-                        | DataType::ReliablePartialAck
-                        | DataType::ReliablePacketRequest
-                )
-            {
-                let frames = if opts.max_frame_bytes != 0 && raw_len > opts.max_frame_bytes {
-                    self.split_side_transport_frame(side, raw, opts.max_frame_bytes)?
-                } else {
-                    SideTransportFrames::single(raw)
-                };
-                let wire_len = frames.wire_len();
-                let mut st = self.state.lock();
-                let stats = st.side_runtime_stats.entry(side).or_default();
-                stats.note_side_transport_full(raw_len, wire_len);
-                if frames.len() > 1 {
-                    stats.note_side_transport_chunks(frames.len());
-                }
-                return Ok(frames);
-            }
+            // Reliable and frozen-owner packets already returned above.
+            // Classify once per encode rather than repeating a schema lookup.
             let (template_id, use_compact, _previous_timestamp) = {
                 let mut st = self.state.lock();
                 /* Keep the sender's compact dictionary within the smallest
@@ -8318,19 +8350,26 @@ impl Router {
         Ok(false)
     }
     fn admit_received_frame(&self, side: RouterSideId, bytes: &[u8]) -> TelemetryResult<()> {
+        if !crate::memory_admission::has_probe() {
+            return Ok(());
+        }
         if crate::memory_admission::supports_work_kinds()
             && self.cached_transit_ready(side, bytes)?
         {
             crate::memory_admission::check_cached_transit(bytes.len())
         } else {
+            let managed = wire_format::scheduling_type(bytes)
+                .is_some_and(|ty| self.is_managed_variable_type(ty));
             let mut protected = None;
             loop {
-                match crate::memory_admission::check_receive(bytes) {
+                match crate::memory_admission::check_receive_with_role(bytes, managed) {
                     Err(TelemetryError::Io("memory pressure")) => {
                         let protected = *protected.get_or_insert_with(|| {
                             wire_format::peek_routing_frame_info(bytes)
                                 .ok()
-                                .is_some_and(|frame| message_priority(frame.envelope.ty) >= 200)
+                                .is_some_and(|frame| {
+                                    managed || message_priority(frame.envelope.ty) >= 200
+                                })
                         });
                         if !protected {
                             return Err(TelemetryError::Io("memory pressure"));
@@ -8471,9 +8510,9 @@ impl Router {
                 // Wrapper CRC and the retained full template are validated
                 // before compact reconstruction. Preserve the same control
                 // priority as canonical ingress while reclaiming only bulk.
-                let protected = template
-                    .data_type()
-                    .is_some_and(|ty| message_priority(ty) >= 200);
+                let protected = template.data_type().is_some_and(|ty| {
+                    message_priority(ty) >= 200 || self.is_managed_variable_type(ty)
+                });
                 let ack = template.is_ack();
                 loop {
                     match crate::memory_admission::check_frame(reconstructed_bound, ack) {
@@ -10898,6 +10937,27 @@ impl Router {
         })
     }
 
+    /// Snapshot outstanding reliable deliveries for diagnostics. Allocates
+    /// metadata bounded by the existing pending window; never clones payloads
+    /// or changes retry timing. Not needed in the normal dispatch hot path.
+    pub fn export_reliable_pending_stats(&self) -> Vec<crate::diagnostics::ReliablePendingStats> {
+        let st = self.state.lock();
+        st.end_to_end_reliable_tx
+            .iter()
+            .filter_map(|(&packet_id, sent)| {
+                Some(crate::diagnostics::ReliablePendingStats {
+                    packet_id,
+                    data_type: Self::item_data_type(&sent.data).ok()?,
+                    pending_destinations: sent.pending_destinations.keys().copied().collect(),
+                    retries: sent.retries,
+                    queued: sent.queued,
+                    waiting_for_predecessor: sent.waiting_for_predecessor,
+                    last_send_ms: sent.last_send_ms,
+                })
+            })
+            .collect()
+    }
+
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
         let now_ms = self.clock.now_ms();
         let isr_rx = self.isr_rx_queue.snapshot().unwrap_or((0, 0));
@@ -11611,11 +11671,11 @@ impl Router {
         retry_after_ms: u64,
     ) -> TelemetryResult<()> {
         let priority = match &item {
-            RouterTxItem::Broadcast(data) => Self::router_item_priority(data)?,
+            RouterTxItem::Broadcast(data) => self.item_service_priority(data)?,
             RouterTxItem::EndToEndReplay { .. } => {
                 Self::router_item_priority_bumped(DataType::ReliableAck)
             }
-            RouterTxItem::ToSide { data, .. } => Self::router_item_priority(data)?,
+            RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
             RouterTxItem::ReliableReplay { bytes, .. } => {
                 let ty = wire_format::peek_routing_envelope(bytes.as_ref())?.ty;
                 Self::router_item_priority_bumped(ty)
@@ -11680,7 +11740,7 @@ impl Router {
     pub fn rx_packed_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
-        let priority = Self::router_item_priority(&data)?;
+        let priority = self.item_service_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
             src: None,
@@ -11711,7 +11771,7 @@ impl Router {
     pub fn rx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
         pkt.validate()?;
         let data = RouterItem::Packet(pkt);
-        let priority = Self::router_item_priority(&data)?;
+        let priority = self.item_service_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
             src: None,
@@ -11743,7 +11803,7 @@ impl Router {
         self.ensure_side_ingress_enabled(side)?;
         pkt.validate()?;
         let data = RouterItem::Packet(pkt);
-        let priority = Self::router_item_priority(&data)?;
+        let priority = self.item_service_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
             src: Some(side),
@@ -11782,7 +11842,7 @@ impl Router {
             return Ok(());
         };
         let data = RouterItem::Packed(decoded);
-        let priority = Self::router_item_priority(&data)?;
+        let priority = self.item_service_priority(&data)?;
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
             src: Some(side),
@@ -13714,6 +13774,14 @@ mod queued_schema_identity_tests {
                     queued: false,
                 },
             );
+            let snapshot = router.export_reliable_pending_stats();
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot[0].packet_id, id);
+            assert_eq!(snapshot[0].data_type, ty);
+            assert_eq!(snapshot[0].pending_destinations, vec![owner]);
+            assert_eq!(snapshot[0].retries, runtime_reliable_max_retries());
+            assert!(!snapshot[0].queued);
+            assert!(!snapshot[0].waiting_for_predecessor);
             let ack = Packet::new_with_wire_contract(
                 DataType::ReliableAck,
                 message_meta(DataType::ReliableAck).endpoints_ref(),
@@ -13736,6 +13804,177 @@ mod queued_schema_identity_tests {
                 .drain_queues_with_timeout(1)
                 .expect("a received ACK must be processed before cancelling its ordered delivery");
             assert!(!router.state.lock().end_to_end_reliable_tx.contains_key(&id));
+            assert!(router.export_reliable_pending_stats().is_empty());
+        }
+    }
+    #[test]
+    fn embedded_gateway_receipt_with_numeric_sender_clears_host_pending_owner() {
+        crate::tests::ensure_common_test_schema();
+        // Captured after the actual gateway UART and Pico mailbox. The owner
+        // hash is carried in the contract, because the ACK sender is numeric.
+        let bytes = [
+            0x0c, 0x01, 0x01, 0x08, 0xd4, 0xe5, 0xea, 0xb6, 0xb7, 0x33, 0xff, 0x90, 0x02, 0xb4,
+            0xe6, 0xdd, 0x94, 0x07, 0x14, 0x03, 0x44, 0x02, 0x02, 0x06, 0x25, 0xd2, 0x59, 0x1b,
+            0xbb, 0xfc, 0xa7, 0x5f, 0x43, 0x92, 0x9e, 0x12, 0xbb, 0xfc, 0xa7, 0x26, 0xa2, 0xa0,
+            0xbe, 0x39, 0x65, 0xe2, 0xd8, 0x61, 0x68, 0x22, 0xfd,
+        ];
+        let ack = wire_format::unpack_packet(&bytes).unwrap();
+        let owner = Router::sender_hash("GB");
+        assert_eq!(Router::end_to_end_ack_sender_hash(&ack), Some(owner));
+        let id = Router::decode_end_to_end_reliable_ack(ack.payload()).unwrap();
+        let router = Router::new(RouterConfig::new([]).with_hostname("GS"));
+        let side = router.add_side_packed("Pico", |_| Ok(()));
+        let data = ack.clone();
+        router.state.lock().end_to_end_reliable_tx.insert(
+            id,
+            EndToEndReliableSent {
+                ordered_type: None,
+                waiting_for_predecessor: false,
+                data: RouterItem::Packet(data),
+                pending_destinations: BTreeMap::from([(owner, side)]),
+                tracked_destinations: true,
+                last_send_ms: 0,
+                retries: 0,
+                queued: false,
+            },
+        );
+        router.rx_packed_queue_from_side(&bytes, side).unwrap();
+        router.drain_queues_with_timeout(1).unwrap();
+        assert!(router.export_reliable_pending_stats().is_empty());
+    }
+
+    #[test]
+    fn frozen_delivery_contract_bypasses_dictionary_even_for_best_effort_schema() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = crate::config::register_data_type_with_description(
+            "MANAGED_CONTROL_WITH_FROZEN_OWNERS",
+            "",
+            MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[ep],
+            crate::ReliableMode::None,
+            16,
+        )
+        .unwrap();
+        let router = Router::new(RouterConfig::new([]).with_hostname("GS"));
+        let opts = RouterSideOptions::default().with_template_transport();
+        let side = router.add_side_packed_with_options("radio", |_| Ok(()), opts.clone());
+        let packet = Packet::new_with_wire_contract(
+            ty,
+            &[ep],
+            "GS",
+            1,
+            1,
+            Arc::<[u8]>::from([1u8]),
+            None,
+            Arc::from([Router::sender_hash("RF")]),
+        )
+        .unwrap();
+        let raw = wire_format::pack_packet(&packet);
+        assert!(
+            !wire_format::peek_routing_frame_info(&raw)
+                .unwrap()
+                .envelope
+                .is_reliable
+        );
+        for _ in 0..3 {
+            let frames = router
+                .encode_side_transport_frames(
+                    side,
+                    opts.clone(),
+                    crate::shared_bytes::convert(raw.clone()),
+                )
+                .unwrap();
+            let mut count = 0;
+            router
+                .send_side_frames_resumable(side, frames, |bytes| {
+                    assert_eq!(
+                        bytes,
+                        raw.as_ref(),
+                        "delivery contract must remain independently decodable"
+                    );
+                    count += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn managed_receive_queues_keep_service_priority_with_low_schema_priority() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = crate::config::register_data_type_with_description(
+            "MANAGED_RX_SERVICE_PRIORITY",
+            "",
+            MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[ep],
+            crate::ReliableMode::None,
+            16,
+        )
+        .unwrap();
+        let router = Router::new(RouterConfig::new([]).with_hostname("RF"));
+        router
+            .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        let side = router.add_side_packed("radio", |_| Ok(()));
+        router.clear_queues();
+        let packet = Packet::new(ty, &[ep], "GS", 1, Arc::<[u8]>::from([1])).unwrap();
+        let wire = wire_format::pack_packet(&packet);
+        router.rx_queue(packet.clone()).unwrap();
+        router.rx_queue_from_side(packet.clone(), side).unwrap();
+        router.rx_packed_queue(&wire).unwrap();
+        router.rx_packed_queue_from_side(&wire, side).unwrap();
+        for _ in 0..4 {
+            let queued = router
+                .pop_next_queued_control_rx_item()
+                .unwrap()
+                .expect("registered managed controls must precede queued bulk work");
+            assert_eq!(
+                queued.priority,
+                crate::transport_priority(DataType::ManagedVariableValue)
+            );
+        }
+        assert!(router.pop_next_queued_control_rx_item().unwrap().is_none());
+    }
+
+    #[test]
+    fn managed_value_keeps_service_priority_after_side_backpressure() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = crate::config::register_data_type_with_description(
+            "MANAGED_RETRY_SERVICE_PRIORITY",
+            "",
+            MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[ep],
+            crate::ReliableMode::None,
+            16,
+        )
+        .unwrap();
+        let router = Router::new(RouterConfig::new([]).with_hostname("GS"));
+        router
+            .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+            .unwrap();
+        let side = router.add_side_packed("radio", |_| Err(TelemetryError::Io("side tx busy")));
+        let packet = Packet::new(ty, &[ep], "GS", 1, Arc::<[u8]>::from([1])).unwrap();
+        let item = RouterItem::Packet(packet);
+        for queued in [
+            RouterTxItem::Broadcast(item.clone()),
+            RouterTxItem::ToSide {
+                src: None,
+                dst: side,
+                data: item.clone(),
+            },
+        ] {
+            router.tx_queue_item_for_retry(queued, true).unwrap();
+            let queued = router.state.lock().transmit_queue.pop_front().unwrap();
+            assert_eq!(
+                queued.priority,
+                crate::transport_priority(DataType::ManagedVariableValue),
+                "a busy side must not demote managed controls to bulk application priority"
+            );
+            assert!(queued.retry_after_ms > 0);
         }
     }
     #[test]

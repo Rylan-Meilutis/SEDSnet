@@ -75,6 +75,7 @@ fn tx_counter(
 /// clock, and local handlers see all packets.
 #[test]
 fn process_all_queues_timeout_zero_drains_fully() {
+    crate::tests::ensure_common_test_schema();
     let tx_count = Arc::new(AtomicUsize::new(0));
     let tx = tx_counter(tx_count.clone());
 
@@ -126,6 +127,7 @@ fn process_all_queues_timeout_zero_drains_fully() {
 /// one iteration (at most one TX and one RX).
 #[test]
 fn process_all_queues_respects_nonzero_timeout_budget_one_receive_one_send() {
+    crate::tests::ensure_common_test_schema();
     let tx_count = Arc::new(AtomicUsize::new(0));
     let tx = tx_counter(tx_count.clone());
 
@@ -243,6 +245,7 @@ fn process_all_queues_respects_nonzero_timeout_budget_two_receive_one_send() {
 /// wraps around, and that we still do at most one iteration.
 #[test]
 fn process_all_queues_handles_u64_wraparound() {
+    crate::tests::ensure_common_test_schema();
     let tx_count = Arc::new(AtomicUsize::new(0));
     let tx = tx_counter(tx_count.clone());
 
@@ -275,6 +278,7 @@ fn process_all_queues_handles_u64_wraparound() {
 #[cfg(feature = "discovery")]
 #[test]
 fn process_all_queues_timeout_does_not_starve_rx_after_slow_tx() {
+    crate::tests::ensure_common_test_schema();
     use crate::discovery::build_discovery_announce;
 
     struct ManualClock {

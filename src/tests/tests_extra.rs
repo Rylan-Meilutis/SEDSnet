@@ -67,6 +67,7 @@ fn unpack_header_only_short_buffer_fails() {
 /// Ensure header size is a valid prefix of the packed wire image.
 #[test]
 fn header_size_is_prefix_of_wire_image() {
+    crate::tests::ensure_common_test_schema();
     let pkt = Packet::from_f32_slice(
         DataType::named("GPS_DATA"),
         &[1.0, 2.0, 3.0],
@@ -106,6 +107,7 @@ fn rewrite_crc32(buf: &mut [u8]) {
 /// produces identical bytes (ULEB128 canonical form).
 #[test]
 fn packer_is_canonical_roundtrip() {
+    crate::tests::ensure_common_test_schema();
     use crate::config::{DataEndpoint, DataType};
     use crate::{packet::Packet, wire_format};
 
@@ -149,6 +151,7 @@ fn pack_unpack_roundtrip_matches_packet_identity() {
 /// when fields that are encoded as varints get larger.
 #[test]
 fn packer_varint_scalars_grow_as_expected() {
+    crate::tests::ensure_common_test_schema();
     use crate::config::{DataEndpoint, DataType};
     use crate::{packet::Packet, wire_format};
 
@@ -253,6 +256,7 @@ fn endpoints_bitpack_roundtrip_many_and_extremes() {
 /// unpacking agree on header fields and payload.
 #[test]
 fn peek_envelope_matches_full_parse_on_large_values() {
+    crate::tests::ensure_common_test_schema();
     use crate::config::{DataEndpoint, DataType};
     use crate::{packet::Packet, wire_format};
 
@@ -353,6 +357,7 @@ fn corrupt_endpoint_bits_yields_bad_endpoint_error() {
 /// that the computed wire size matches packed length.
 #[test]
 fn header_size_is_prefix_and_less_than_total() {
+    crate::tests::ensure_common_test_schema();
     use crate::config::{DataEndpoint, DataType};
     use crate::{packet::Packet, wire_format};
 
@@ -402,6 +407,7 @@ fn data_as_utf8_ref_trims_trailing_nuls() {
 /// After calling `clear_queues`, no pending TX/RX items should be processed.
 #[test]
 fn clear_queues_prevents_further_processing() {
+    crate::tests::ensure_common_test_schema();
     // Transmit "bus" that counts frames sent.
     let tx_count = Arc::new(AtomicUsize::new(0));
     let tx_count_c = tx_count.clone();
@@ -466,6 +472,7 @@ fn clear_queues_prevents_further_processing() {
 /// and that the final error is a `HandlerError`.
 #[test]
 fn local_handler_retry_attempts_are_three() {
+    crate::tests::ensure_common_test_schema();
     // This test assumes MAX_NUMBER_OF_RETRYS == 3 in router. If that constant changes,
     // update the expected count below.
     const EXPECTED_ATTEMPTS: usize = 3; // initial try + retries
@@ -514,6 +521,7 @@ fn local_handler_retry_attempts_are_three() {
 /// expected length and timestamp.
 #[test]
 fn from_f32_slice_builds_valid_packet() {
+    crate::tests::ensure_common_test_schema();
     let need = test_payload_len_for(DataType::named("GPS_DATA")) / 4; // f32 count
     assert_eq!(need, 3); // schema sanity
 
@@ -533,6 +541,7 @@ fn from_f32_slice_builds_valid_packet() {
 
 #[test]
 fn from_none_slice_builds_valid_packet() {
+    crate::tests::ensure_common_test_schema();
     let need = 0; // f32 count
     assert_eq!(need, 0); // schema sanity
 
@@ -648,6 +657,7 @@ fn heartbeat_reaches_each_independently_discovered_network_side() {
 /// encoded GPS packet.
 #[test]
 fn unpack_header_only_then_full_parse_matches() {
+    crate::tests::ensure_common_test_schema();
     // Build a normal packet then compare header-only vs full.
     let endpoints = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let pkt = Packet::from_f32_slice(
@@ -680,6 +690,7 @@ fn unpack_header_only_then_full_parse_matches() {
 /// endpoints (exact string validated by more specific tests).
 #[test]
 fn tx_failure_emits_error_to_local_endpoints() {
+    crate::tests::ensure_common_test_schema();
     // A transmitter that always fails.
     let failing_tx = |_bytes: &[u8]| -> TelemetryResult<()> { Err(TelemetryError::Io("boom")) };
 

@@ -165,6 +165,7 @@ mod timesync_system_test {
 
     #[test]
     fn timesync_offset_delay_and_timestamp_update() {
+        ensure_compression_test_schema();
         let req = build_timesync_request(1, 1_000).unwrap();
         let resp = build_timesync_response(1, 1_000, 1_010, 1_020).unwrap();
         let t4_ms = 1_030;

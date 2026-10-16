@@ -6,8 +6,24 @@ use std::sync::Arc;
 const FLAG_COMPRESSED_PAYLOAD: u8 = 0x01;
 
 fn make_message_packet(payload: &[u8], ts: u64) -> Packet {
+    crate::tests::ensure_common_test_schema();
+    static TYPE: std::sync::OnceLock<DataType> = std::sync::OnceLock::new();
+    let ty = *TYPE.get_or_init(|| {
+        crate::config::register_data_type_with_description(
+            "COMPRESSION_MEMORY_DATA",
+            "",
+            crate::MessageElement::Dynamic(
+                crate::MessageDataType::Binary,
+                crate::MessageClass::Data,
+            ),
+            &[DataEndpoint::named("SD_CARD")],
+            crate::ReliableMode::None,
+            50,
+        )
+        .unwrap()
+    });
     Packet::new(
-        DataType::named("MESSAGE_DATA"),
+        ty,
         &[DataEndpoint::named("SD_CARD")],
         "CMP_NODE",
         ts,

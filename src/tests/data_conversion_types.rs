@@ -9,6 +9,7 @@ use crate::{MAX_VALUE_DATA_TYPE, MessageDataType, TelemetryError, get_data_type}
 /// data_as_f32 should round-trip values written via from_f32_slice.
 #[test]
 fn data_as_f32_roundtrips_gps() {
+    crate::tests::ensure_common_test_schema();
     let eps = &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")];
     let src = [1.5_f32, -2.25, 3.0];
 
@@ -22,6 +23,7 @@ fn data_as_f32_roundtrips_gps() {
 /// must return TelemetryError::TypeMismatch.
 #[test]
 fn mismatched_typed_accessor_returns_type_mismatch() {
+    crate::tests::ensure_common_test_schema();
     let eps = &[DataEndpoint::named("SD_CARD")];
     let src = [1.0_f32, 2.0, 3.0];
 

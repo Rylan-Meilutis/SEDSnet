@@ -16,7 +16,7 @@ pub type MemoryAdmissionProbe = extern "C" fn(usize, usize) -> bool;
 pub type MemoryAdmissionProbeV2 = extern "C" fn(usize, usize, u32) -> bool;
 pub const WORK_GENERAL: u32 = 0;
 pub const WORK_CACHED_TRANSIT: u32 = 1;
-/// Small, CRC-validated, uncompressed reliable traffic with known fixed byte shape
+/// Small, CRC-validated, uncompressed reliable/managed traffic with known fixed byte shape
 /// and protected queue priority. Estimates are unchanged; an application may
 /// reserve less idle headroom for this work than for ordinary data/schema work.
 pub const WORK_SMALL_PROTECTED: u32 = 2;
@@ -43,7 +43,7 @@ pub fn set_probe_v2(probe: Option<MemoryAdmissionProbeV2>) {
 pub(crate) fn supports_work_kinds() -> bool {
     !PROBE_V2.load(Ordering::Relaxed).is_null()
 }
-fn has_probe() -> bool {
+pub(crate) fn has_probe() -> bool {
     supports_work_kinds() || !PROBE.load(Ordering::Relaxed).is_null()
 }
 /// Number of operations rejected by the probe, wrapping at usize::MAX.
@@ -102,6 +102,10 @@ pub(crate) fn check_cached_transit(len: usize) -> TelemetryResult<()> {
 }
 
 pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
+    check_receive_with_role(bytes, false)
+}
+
+pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryResult<()> {
     if !has_probe() {
         return Ok(());
     }
@@ -130,8 +134,8 @@ pub(crate) fn check_receive(bytes: &[u8]) -> TelemetryResult<()> {
             else {
                 return false;
             };
-            meta.priority >= 200
-                && frame.reliable.is_some()
+            (meta.priority >= 200 || managed)
+                && (frame.reliable.is_some() || frame.envelope.target_senders().len() != 0)
                 && count <= 16
                 && matches!(
                     frame.envelope.wire_shape,

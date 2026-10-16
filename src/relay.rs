@@ -2,6 +2,9 @@
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/relay_ack_recovery.rs"]
 mod ack_recovery_tests;
+#[cfg(all(test, feature = "std"))]
+#[path = "tests/relay_control_priority.rs"]
+mod control_priority_tests;
 #[cfg(test)]
 #[allow(clippy::duplicate_mod)]
 #[path = "tests/side_template_index.rs"]
@@ -1396,6 +1399,7 @@ impl Relay {
         RelayTxHandlerFn,
         RelaySideOptions,
         RelayItem,
+        u8,
     )> {
         let mut st = self.state.lock();
         let mut priority_burst = st.tx_priority_burst;
@@ -1408,7 +1412,16 @@ impl Relay {
         st.tx_priority_burst = priority_burst;
         if let Some(item) = item {
             let side = st.sides.get(item.dst).and_then(|side| side.clone());
-            side.map(|s| (item.src, item.dst, s.tx_handler, s.opts, item.data))
+            side.map(|s| {
+                (
+                    item.src,
+                    item.dst,
+                    s.tx_handler,
+                    s.opts,
+                    item.data,
+                    item.priority,
+                )
+            })
         } else {
             None
         }
@@ -2026,17 +2039,36 @@ impl Relay {
         // A retry can remain in RX dedupe after its smaller return-path cache
         // entry was evicted. Relearning that path must not restart the replay
         // delay on every retry, or sustained cache churn suppresses it forever.
-        let last_replay_ms = if st.recent_rx.contains(&packet_id) {
-            self.clock
-                .now_ms()
-                .saturating_sub(runtime_reliable_retransmit_ms())
+        let now = self.clock.now_ms();
+        let retry_ms = runtime_reliable_retransmit_ms();
+        let duplicate = st.recent_rx.contains(&packet_id);
+        let last_replay_ms = if duplicate {
+            now.saturating_sub(retry_ms)
         } else {
-            self.clock.now_ms()
+            now
         };
+        // A reflected copy is not evidence that the original publisher
+        // moved. Keep the first live ingress during the current retry
+        // window, otherwise an echo can redirect an already queued ACK into
+        // the downstream bus. A retry-window expiry or disabled/removed side
+        // still permits alternate-path recovery without explicit operator action.
+        let replace_side = !duplicate
+            || st
+                .reliable_return_routes
+                .get(&packet_id)
+                .is_none_or(|route| {
+                    now.saturating_sub(route.last_replay_ms) >= retry_ms
+                        || !Self::side_ref(&st, route.side)
+                            .is_ok_and(|side| side.opts.egress_enabled)
+                });
         Self::remember_reliable_return_route_locked(&mut st, packet_id);
         st.reliable_return_routes
             .entry(packet_id)
-            .and_modify(|route| route.side = side)
+            .and_modify(|route| {
+                if replace_side {
+                    route.side = side;
+                }
+            })
             .or_insert(ReliableReturnRouteState {
                 side,
                 last_replay_ms,
@@ -2046,7 +2078,7 @@ impl Relay {
     /// Refresh or insert `packet_id` in the bounded reliable return-route cache.
     ///
     /// The relay uses this cache to route end-to-end acknowledgements back
-    /// toward the source side that most recently forwarded the corresponding
+    /// toward the original live ingress of the corresponding
     /// reliable data packet.
     fn remember_reliable_return_route_locked(st: &mut RelayInner, packet_id: u64) {
         let cap = runtime_reliable_max_return_routes().max(1);
@@ -5783,6 +5815,7 @@ impl Relay {
             };
             let reliable = is_reliable_type(frame.envelope.ty)
                 || frame.reliable.is_some()
+                || frame.envelope.target_senders().len() != 0
                 || matches!(
                     frame.envelope.ty,
                     crate::DataType::ReliableAck
@@ -6571,7 +6604,7 @@ impl Relay {
                 }
                 continue;
             }
-            let Some((src, dst, handler, opts, data)) = self.pop_ready_tx_item() else {
+            let Some((src, dst, handler, opts, data, priority)) = self.pop_ready_tx_item() else {
                 break;
             };
             match self.send_tx_item(src, dst, handler, opts, data.clone()) {
@@ -6584,7 +6617,6 @@ impl Relay {
                     }
                 }
                 Err(e) if Self::is_side_tx_busy(&e) => {
-                    let priority = Self::relay_item_priority(&data)?;
                     let mut st = self.state.lock();
                     st.push_tx(RelayTxItem {
                         src,
@@ -6677,26 +6709,26 @@ impl Relay {
             }
 
             // Then send out TX
-            let sent_one = if let Some((src, dst, handler, opts, data)) = self.pop_ready_tx_item() {
-                match self.send_tx_item(src, dst, handler, opts, data.clone()) {
-                    Ok(sent) => sent,
-                    Err(error) if Self::is_side_tx_busy(&error) => {
-                        let priority = Self::relay_item_priority(&data)?;
-                        self.state.lock().push_tx(RelayTxItem {
-                            src,
-                            dst,
-                            data,
-                            priority,
-                            retry_after_ms: self.clock.now_ms().saturating_add(1),
-                        })?;
-                        did_any = true;
-                        false
+            let sent_one =
+                if let Some((src, dst, handler, opts, data, priority)) = self.pop_ready_tx_item() {
+                    match self.send_tx_item(src, dst, handler, opts, data.clone()) {
+                        Ok(sent) => sent,
+                        Err(error) if Self::is_side_tx_busy(&error) => {
+                            self.state.lock().push_tx(RelayTxItem {
+                                src,
+                                dst,
+                                data,
+                                priority,
+                                retry_after_ms: self.clock.now_ms().saturating_add(1),
+                            })?;
+                            did_any = true;
+                            false
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                false
-            };
+                } else {
+                    false
+                };
 
             if sent_one {
                 did_any = true;

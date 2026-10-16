@@ -86,7 +86,7 @@ fn unacknowledged_topology_does_not_silence_relay_liveness() {
         now.store(ms, Ordering::Relaxed);
         relay.poll_discovery().unwrap();
         // Hold the baseline ACK outstanding; drain only new advertisements.
-        while let Some((src, dst, handler, opts, item)) = relay.pop_ready_tx_item() {
+        while let Some((src, dst, handler, opts, item, _priority)) = relay.pop_ready_tx_item() {
             relay.send_tx_item(src, dst, handler, opts, item).unwrap();
         }
     }
