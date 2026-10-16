@@ -2077,6 +2077,74 @@ enum RouterQueueKind {
 }
 
 impl RouterInner {
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn fair_bulk_owner(data: &RouterItem, priority: u8) -> Option<u32> {
+        match data {
+            RouterItem::Packet(packet) => crate::admission_fairness::packet_owner(packet, priority),
+            RouterItem::Packed(bytes) => {
+                crate::admission_fairness::packed_owner(bytes.as_ref(), priority)
+            }
+        }
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn tx_bulk_owner(item: &TxQueued) -> Option<u32> {
+        match &item.item {
+            RouterTxItem::Broadcast(data) | RouterTxItem::ToSide { data, .. } => {
+                Self::fair_bulk_owner(data, item.priority)
+            }
+            _ => None,
+        }
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn competing_bulk_owner(&self, incoming: u32, priority: u8) -> Option<u32> {
+        let mut loads = crate::admission_fairness::Loads::new();
+        for item in self.received_queue.iter() {
+            if item.priority <= priority
+                && let Some(owner) = Self::fair_bulk_owner(&item.data, item.priority)
+            {
+                loads.record(owner, item.byte_cost());
+            }
+        }
+        for item in self.transmit_queue.iter() {
+            if item.priority <= priority
+                && let Some(owner) = Self::tx_bulk_owner(item)
+            {
+                loads.record(owner, item.byte_cost());
+            }
+        }
+        loads.dominant_other(incoming)
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn reclaim_bulk_from(&mut self, owner: u32, priority: u8) -> bool {
+        let rx = self
+            .received_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.priority <= priority
+                    && Self::fair_bulk_owner(&item.data, item.priority) == Some(owner)
+            })
+            .min_by_key(|(index, item)| (item.priority, *index))
+            .map(|(index, item)| (index, item.priority));
+        let tx = self
+            .transmit_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.priority <= priority && Self::tx_bulk_owner(item) == Some(owner)
+            })
+            .min_by_key(|(index, item)| (item.priority, *index))
+            .map(|(index, item)| (index, item.priority));
+        match (rx, tx) {
+            (Some((index, rp)), Some((_, tp))) if rp <= tp => {
+                self.received_queue.remove_pos(index).is_some()
+            }
+            (Some((index, _)), None) => self.received_queue.remove_pos(index).is_some(),
+            (_, Some((index, _))) => self.transmit_queue.remove_pos(index).is_some(),
+            _ => false,
+        }
+    }
+
     #[cfg(feature = "discovery")]
     fn topology_board_byte_cost(board: &TopologyBoardNode) -> usize {
         board
@@ -8010,6 +8078,37 @@ impl Router {
             }
         }
 
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        if opts.header_template_enabled && crate::memory_admission::supports_work_kinds() {
+            let (template, ..) = extract_side_header_template_view(raw.as_ref())?;
+            let cached = self
+                .state
+                .lock()
+                .side_transport
+                .get(&side)
+                .is_some_and(|transport| {
+                    transport.tx_template_ids.contains_key(&template.hash)
+                        && transport.tx_templates.contains_key(&template.hash)
+                });
+            if !cached
+                && matches!(
+                    crate::memory_admission::check_receive(raw.as_ref()),
+                    Err(TelemetryError::Io("memory pressure"))
+                )
+            {
+                // Compression is optional. Retain the canonical shared frame
+                // instead of allocating a dictionary entry under pressure.
+                // Oversized frames returned through the normal chunker above.
+                self.state
+                    .lock()
+                    .side_runtime_stats
+                    .entry(side)
+                    .or_default()
+                    .note_side_transport_full(raw_len, raw_len);
+                return Ok(SideTransportFrames::single(raw));
+            }
+        }
+
         let mut compact_payload_len = None;
         let mut used_compact = false;
         let used_timestamp_delta = false;
@@ -8340,6 +8439,21 @@ impl Router {
                         && transport.tx_templates.contains_key(&template.hash)
                 })
             {
+                // An optional compression entry may have been evicted while
+                // routing/statistics remain warm. Canonical forwarding needs
+                // no replacement entry, but must fit the transport and belong
+                // to an already discovered ingress peer.
+                #[cfg(any(feature = "std", feature = "fair-admission"))]
+                if (entry.opts.max_frame_bytes == 0 || bytes.len() <= entry.opts.max_frame_bytes)
+                    && st.discovery_routes.get(&side).is_some_and(|route| {
+                        route.announcers.iter().any(|(name, peer)| {
+                            peer.advertised_address == Some(frame.envelope.source_address)
+                                || sender_address_u32(name) == frame.envelope.source_address
+                        })
+                    })
+                {
+                    continue;
+                }
                 return Ok(false);
             }
         }
@@ -8349,14 +8463,45 @@ impl Router {
     fn cached_transit_ready(&self, _side: RouterSideId, _bytes: &[u8]) -> TelemetryResult<bool> {
         Ok(false)
     }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn reclaim_for_receive(&self, bytes: &[u8], victim: &mut Option<(u32, u8)>) -> bool {
+        let mut st = self.state.lock();
+        let (owner, priority) = if let Some(selected) = *victim {
+            selected
+        } else {
+            let Some((incoming, priority)) = crate::admission_fairness::incoming(bytes) else {
+                return false;
+            };
+            let Some(owner) = st.competing_bulk_owner(incoming, priority) else {
+                return false;
+            };
+            *victim = Some((owner, priority));
+            (owner, priority)
+        };
+        st.reclaim_bulk_from(owner, priority)
+    }
     fn admit_received_frame(&self, side: RouterSideId, bytes: &[u8]) -> TelemetryResult<()> {
         if !crate::memory_admission::has_probe() {
             return Ok(());
         }
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let mut fair_victim = None;
         if crate::memory_admission::supports_work_kinds()
             && self.cached_transit_ready(side, bytes)?
         {
-            crate::memory_admission::check_cached_transit(bytes.len())
+            let result = crate::memory_admission::check_cached_transit(bytes.len());
+            #[cfg(any(feature = "std", feature = "fair-admission"))]
+            let result = {
+                let mut result = result;
+                while matches!(result, Err(TelemetryError::Io("memory pressure"))) {
+                    if !self.reclaim_for_receive(bytes, &mut fair_victim) {
+                        break;
+                    }
+                    result = crate::memory_admission::check_cached_transit(bytes.len());
+                }
+                result
+            };
+            result
         } else {
             let managed = wire_format::scheduling_type(bytes)
                 .is_some_and(|ty| self.is_managed_variable_type(ty));
@@ -8372,6 +8517,10 @@ impl Router {
                                 })
                         });
                         if !protected {
+                            #[cfg(any(feature = "std", feature = "fair-admission"))]
+                            if self.reclaim_for_receive(bytes, &mut fair_victim) {
+                                continue;
+                            }
                             return Err(TelemetryError::Io("memory pressure"));
                         }
                         // Queue priority cannot help before the wire copy is

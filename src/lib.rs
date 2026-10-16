@@ -163,6 +163,8 @@ mod embedded_alloc {
 //  Portable core logic: modules
 // ============================================================================
 
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+mod admission_fairness;
 mod binding_options;
 mod c_api;
 pub mod config;

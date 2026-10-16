@@ -347,3 +347,15 @@ Bare-metal builds expect the following symbols to be provided by the host enviro
 - `void telemetry_panic_hook(const char *, size_t)`
 
 See [Usage-C-Cpp](Usage-C-Cpp) for an example stub implementation.
+
+### Fair admission under pressure
+
+Hosted builds use bounded stack-only arbitration when an application memory probe
+refuses best-effort ingress. Embedded bridges enable it with
+`python3 build.py embedded fair-admission release`, or CMake
+`SEDSNET_FAIR_ADMISSION=ON`. Flash-constrained leaf builds may leave it off.
+It reclaims queued bulk from a dominant competing sender and retries the complete
+admission estimate; it does not grow pools, lower safety reserves or evict routes,
+schema, reliable replay or protected controls. Arbitration scans queues only on
+refusal and keeps no resident per-peer catalog. More than 32 queued bulk origins
+falls back to refusal rather than guessing an eviction victim.

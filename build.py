@@ -38,6 +38,7 @@ Options (can be combined where it makes sense):
   embedded                Build for the embedded target (enables `embedded` feature).
   python                  Build with Python bindings (enables `python` feature).
   timesync                Build with time sync helpers (enables `timesync` feature).
+  fair-admission           Reclaim dominant bulk senders before refusing smaller peers.
   compact-packet-store     Enable handle-managed packet arena and fixed queue slabs.
   compact-packet-compression  Enable indexed Zstd arena buffers and range decoding.
   cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
@@ -927,7 +928,7 @@ def main(argv: list[str]) -> None:
             print("Building with time sync helpers.")
             build_timesync = True
 
-        elif arg in ("compact-packet-store", "compact-packet-compression"):
+        elif arg in ("compact-packet-store", "compact-packet-compression", "fair-admission"):
             compact_features.append(arg)
         elif arg == "cryptography":
             print("Building with cryptography provider APIs.")

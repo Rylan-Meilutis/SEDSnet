@@ -192,6 +192,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.2.3 highlights
 
+- Reclaim queued bulk from the dominant competing sender before refusing low-rate
+  reports under memory pressure; preserve controls and metadata. Hosted builds
+  include this cold path; embedded bridges enable `fair-admission`.
+  Warm bridge forwarding also survives optional header-cache eviction: under
+  pressure it sends canonical shared bytes without allocating a replacement
+  compression entry. Cold peers/types retain full admission checks.
+
 - Queued receipts retain their selected destination even after return-cache
   eviction; Router and standalone Relay have cache-churn regressions.
 

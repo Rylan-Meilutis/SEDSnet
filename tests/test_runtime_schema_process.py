@@ -15,7 +15,16 @@ class RuntimeSchemaProcessTests(unittest.TestCase):
             result = subprocess.run(["cargo", "test", "--test", "runtime_schema_process",
                 "--no-run", "--message-format=json", *extra], cwd=ROOT, env=environment,
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            diagnostics = []
+            for line in result.stdout.splitlines():
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    diagnostics.append(line)
+                    continue
+                if item.get("reason") == "compiler-message":
+                    diagnostics.append(item["message"].get("rendered", ""))
+            self.assertEqual(result.returncode, 0, result.stderr + "\n".join(diagnostics))
             for line in result.stdout.splitlines():
                 item = json.loads(line)
                 if item.get("reason") == "compiler-artifact" and item.get("executable"):

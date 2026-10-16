@@ -900,7 +900,8 @@ fn cached_bridge_forwards_in_small_fragments_without_admitting_cold_work() {
     .unwrap();
     let sent = Arc::new(AtomicUsize::new(0));
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-    let opts = RouterSideOptions::default().with_small_packet_transport(64);
+    let mut opts = RouterSideOptions::default().with_small_packet_transport(64);
+    opts.max_side_transport_templates = 1;
     let ingress = router.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let output = sent.clone();
     let egress = router.add_side_packed_with_options(
@@ -928,10 +929,37 @@ fn cached_bridge_forwards_in_small_fragments_without_admitting_cold_work() {
         )
         .unwrap();
     router.drain_queues_with_timeout(0).unwrap();
-    let packet =
-        |timestamp| Packet::from_f32_slice(ty, &[timestamp as f32], &[ep], timestamp).unwrap();
+    let packet = |timestamp| {
+        Packet::new(
+            ty,
+            &[ep],
+            "CACHED_SOURCE",
+            timestamp,
+            Arc::<[u8]>::from((timestamp as f32).to_le_bytes()),
+        )
+        .unwrap()
+    };
     let warm = sedsnet::wire_format::pack_packet(&packet(0));
     router.rx_packed_from_side(&warm, ingress).unwrap();
+    let announce = build_discovery_announce(packet(0).sender(), 0, &[]).unwrap();
+    router.rx_from_side(&announce, ingress).unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    // A different warm type evicts the one-entry optional TX dictionary.
+    // Only cached bounded work is admitted below; it must forward canonical
+    // bytes rather than allocate a replacement compression template.
+    let churn_ty = register_data_type_with_description(
+        "CACHED_FRAGMENT_CHURN",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let churn = Packet::from_f32_slice(churn_ty, &[0.0], &[ep], 0).unwrap();
+    router
+        .rx_packed_from_side(&sedsnet::wire_format::pack_packet(&churn), ingress)
+        .unwrap();
     let before = sent.load(Ordering::Relaxed);
     CACHED_ACCEPTS.store(0, Ordering::Relaxed);
     sedsnet::memory_admission::set_probe_v2(Some(fragmented_cached_probe));
@@ -954,6 +982,18 @@ fn cached_bridge_forwards_in_small_fragments_without_admitting_cold_work() {
     let discovery = build_discovery_announce("UNKNOWN_PEER", 99, &[]).unwrap();
     assert!(matches!(
         router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&discovery), ingress),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    let unknown = Packet::new(
+        ty,
+        &[ep],
+        "UNDISCOVERED_SOURCE",
+        99,
+        Arc::<[u8]>::from(0f32.to_le_bytes()),
+    )
+    .unwrap();
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&unknown), ingress),
         Err(TelemetryError::Io("memory pressure"))
     ));
     // A queue-time classification is not permission to decode later metadata.
@@ -987,7 +1027,9 @@ fn standalone_relay_uses_cached_scratch_and_rechecks_expired_routes() {
 }
 
 fn cached_relay_endpoint_count(endpoint_count: usize) {
-    use sedsnet::discovery::{TopologyBoardNode, build_discovery_topology};
+    use sedsnet::discovery::{
+        TopologyBoardNode, build_discovery_announce, build_discovery_topology,
+    };
     use sedsnet::relay::{Relay, RelaySideOptions};
     use std::sync::atomic::AtomicU64;
     let _lock = TEST_LOCK.lock().unwrap();
@@ -1020,7 +1062,8 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
     let clock = Arc::new(AtomicU64::new(0));
     let tick = clock.clone();
     let relay = Relay::new(Box::new(move || tick.load(Ordering::Relaxed)));
-    let opts = RelaySideOptions::default().with_small_packet_transport(64);
+    let mut opts = RelaySideOptions::default().with_small_packet_transport(64);
+    opts.max_side_transport_templates = 1;
     let ingress = relay.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let sent = Arc::new(AtomicUsize::new(0));
     let output = sent.clone();
@@ -1051,10 +1094,41 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
     relay.drain_queues_with_timeout(0).unwrap();
     let wire = |timestamp| {
         sedsnet::wire_format::pack_packet(
-            &Packet::from_f32_slice(ty, &[timestamp as f32], endpoints, timestamp).unwrap(),
+            &Packet::new(
+                ty,
+                endpoints,
+                "RELAY_SOURCE",
+                timestamp,
+                Arc::<[u8]>::from((timestamp as f32).to_le_bytes()),
+            )
+            .unwrap(),
         )
     };
     relay.rx_packed_from_side(ingress, &wire(0)).unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
+    relay
+        .rx_from_side(
+            ingress,
+            build_discovery_announce("RELAY_SOURCE", 0, &[]).unwrap(),
+        )
+        .unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
+    // A different warm type evicts the one-entry optional TX dictionary.
+    // Only cached bounded work is admitted below; it must forward canonical
+    // bytes rather than allocate a replacement compression template.
+    let churn_ty = register_data_type_with_description(
+        &format!("RELAY_CACHED_CHURN_{endpoint_count}"),
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        endpoints,
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let churn = Packet::from_f32_slice(churn_ty, &[0.0], endpoints, 0).unwrap();
+    relay
+        .rx_packed_from_side(ingress, &sedsnet::wire_format::pack_packet(&churn))
+        .unwrap();
     relay.drain_queues_with_timeout(0).unwrap();
     let before = sent.load(Ordering::Relaxed);
     sedsnet::memory_admission::set_probe_v2(Some(fragmented_cached_probe));
@@ -1065,6 +1139,18 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
         relay.drain_queues_with_timeout(0).unwrap();
     }
     assert_eq!(sent.load(Ordering::Relaxed) - before, 32);
+    let unknown = Packet::new(
+        ty,
+        endpoints,
+        "UNDISCOVERED_RELAY_SOURCE",
+        99,
+        Arc::<[u8]>::from(0f32.to_le_bytes()),
+    )
+    .unwrap();
+    assert!(matches!(
+        relay.rx_packed_from_side(ingress, &sedsnet::wire_format::pack_packet(&unknown)),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
     relay.rx_packed_from_side(ingress, &wire(100)).unwrap();
     clock.store(200_000, Ordering::Relaxed);
     assert!(matches!(
@@ -1241,6 +1327,18 @@ fn cached_multi_endpoint_bridge(endpoint_count: usize) {
     let discovery = build_discovery_announce("UNKNOWN_PEER", 99, &[]).unwrap();
     assert!(matches!(
         router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&discovery), ingress),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    let unknown = Packet::new(
+        ty,
+        &[ep],
+        "UNDISCOVERED_SOURCE",
+        99,
+        Arc::<[u8]>::from(0f32.to_le_bytes()),
+    )
+    .unwrap();
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&unknown), ingress),
         Err(TelemetryError::Io("memory pressure"))
     ));
     // A queue-time classification is not permission to decode later metadata.

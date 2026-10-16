@@ -2,6 +2,16 @@
 
 ## 4.2.3
 
+- Keep warm Router/Relay transit eligible after an optional TX header entry is evicted. Under memory pressure, forward the existing canonical shared frame instead of allocating replacement compression state. Require known ingress peers, warm type statistics, existing routes and a frame that fits the transport; cold work retains full admission checks.
+
+- On memory refusal, reclaim queued best-effort payloads from a competing
+  dominant sender before refusing a low-rate report. Preserve higher priorities,
+  reliable/frozen controls, schema, routes and active replay state. Router and
+  standalone Relay share bounded, allocation-free arbitration; a real-allocation
+  regression fails before repair and passes with heap and compact storage.
+  Hosted builds include this cold path; embedded bridges opt into `fair-admission`
+  (`SEDSNET_FAIR_ADMISSION`) without increasing retained RAM or lowering reserves.
+
 - Retain the selected return side in queued Router receipts so packet-id cache
   eviction and reflected data cannot redirect an already queued ACK. Verify the
   same behavior in standalone Relay, which already queues a destination side.

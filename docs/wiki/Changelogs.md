@@ -4,6 +4,12 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 
 ## Version 4.2.3 highlights
 
+- Keep warm Router/Relay transit eligible after an optional TX header entry is evicted. Under memory pressure, forward the existing canonical shared frame instead of allocating replacement compression state. Require known ingress peers, warm type statistics, existing routes and a frame that fits the transport; cold work retains full admission checks.
+
+- Reclaim queued bulk from the dominant competing sender before refusing low-rate
+  reports under memory pressure; preserve controls and metadata. Hosted builds
+  include this cold path; embedded bridges enable `fair-admission`.
+
 - Queued receipts retain their selected destination even after return-cache
   eviction; Router and standalone Relay have cache-churn regressions.
 

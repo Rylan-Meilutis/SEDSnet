@@ -31,7 +31,7 @@ class CiReleaseContracts(unittest.TestCase):
     def test_release_gate_checks_experimental_storage(self) -> None:
         publisher = (REPO_ROOT / "publish_crates.py").read_text()
         self.assertIn(
-            'run(["python3", "build.py", "test", "compact-packet-compression"])',
+            'run(["python3", "build.py", "test", "compact-packet-compression", "fair-admission"])',
             publisher,
         )
 
