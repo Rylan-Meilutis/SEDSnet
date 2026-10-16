@@ -3695,6 +3695,39 @@ pub extern "C" fn seds_router_export_runtime_stats(
     unsafe { write_str_to_buf(&json, buf, buf_len) }
 }
 
+/// Copy pending reliable metadata without heap scratch or changing delivery.
+/// Returns the total pending count (which can exceed capacity), or a negative
+/// SedsResult. Caller owns a valid, aligned writable array of `capacity` rows.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_copy_reliable_pending(
+    r: *mut SedsRouter,
+    first: usize,
+    rows: *mut crate::diagnostics::ReliablePendingRow,
+    capacity: usize,
+) -> i32 {
+    if r.is_null()
+        || (capacity != 0 && rows.is_null())
+        || capacity
+            > isize::MAX as usize / core::mem::size_of::<crate::diagnostics::ReliablePendingRow>()
+        || (!rows.is_null()
+            && !(rows as usize)
+                .is_multiple_of(core::mem::align_of::<crate::diagnostics::ReliablePendingRow>()))
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let out = if capacity == 0 {
+        &mut []
+    } else {
+        // SAFETY: pointer/length/alignment are checked above; caller guarantees
+        // the documented writable allocation and exclusive access to it.
+        unsafe { core::slice::from_raw_parts_mut(rows, capacity) }
+    };
+    let router = unsafe { &(*r).inner };
+    router
+        .copy_reliable_pending_stats(first, out)
+        .min(i32::MAX as usize) as i32
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_memory_layout_len(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -7654,5 +7687,50 @@ mod tests {
         assert_eq!(hits_d.hits.load(Ordering::SeqCst), 1);
 
         seds_relay_free(relay);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod pending_copy_contract_tests {
+    use super::*;
+    #[test]
+    fn caller_storage_contract_rejects_null_misaligned_and_oversized_arrays() {
+        use crate::diagnostics::ReliablePendingRow;
+        assert_eq!(core::mem::size_of::<ReliablePendingRow>(), 64);
+        let mut handle = SedsRouter {
+            inner: Arc::new(Router::new(RouterConfig::new([]))),
+        };
+        let r = &mut handle as *mut SedsRouter;
+        let mut row = ReliablePendingRow {
+            packet_id: 42,
+            ..Default::default()
+        };
+        let bad = status_from_err(TelemetryError::BadArg);
+        assert_eq!(
+            seds_router_copy_reliable_pending(ptr::null_mut(), 0, &mut row, 1),
+            bad
+        );
+        assert_eq!(
+            seds_router_copy_reliable_pending(r, 0, ptr::null_mut(), 1),
+            bad
+        );
+        let misaligned = (&mut row as *mut ReliablePendingRow)
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast();
+        assert_eq!(seds_router_copy_reliable_pending(r, 0, misaligned, 1), bad);
+        assert_eq!(
+            seds_router_copy_reliable_pending(r, 0, &mut row, isize::MAX as usize / 64 + 1),
+            bad
+        );
+        assert_eq!(
+            seds_router_copy_reliable_pending(r, 0, ptr::null_mut(), 0),
+            0
+        );
+        assert_eq!(
+            seds_router_copy_reliable_pending(r, usize::MAX, &mut row, 1),
+            0
+        );
+        assert_eq!(row, ReliablePendingRow::default());
     }
 }

@@ -774,6 +774,24 @@ int32_t seds_router_export_runtime_stats_len(SedsRouter * r);
  */
 SedsResult seds_router_export_runtime_stats(SedsRouter * r, char * buf, size_t buf_len);
 
+/** Allocation-free delivery summary. Flags: queued=1, waiting=2, proxy=4,
+ * tracked owners=8. pending_count may exceed the four copied owner hashes. */
+typedef struct SedsReliablePendingRow {
+    uint64_t packet_id;
+    uint64_t last_send_ms;
+    uint32_t data_type;
+    uint32_t pending_count;
+    uint32_t retries;
+    uint32_t flags;
+    uint64_t pending_owners[4];
+} SedsReliablePendingRow;
+/** Copy up to capacity rows starting at first into caller storage without
+ * allocating or changing delivery. Return the total pending count across all
+ * pages (possibly >capacity), or negative error.
+ * Zero capacity with NULL rows queries the count. Valid rows must be aligned
+ * and writable; unused output rows and owner slots are zeroed. */
+int32_t seds_router_copy_reliable_pending(SedsRouter *r, size_t first, SedsReliablePendingRow *rows, size_t capacity);
+
 /** @brief Return required buffer length for router memory-layout JSON. */
 int32_t seds_router_export_memory_layout_len(SedsRouter * r);
 

@@ -133,6 +133,22 @@ pub struct ReliableRuntimeStats {
     pub end_to_end_acked_cache_count: usize,
 }
 
+/// Fixed-size, allocation-free pending-delivery summary for constrained diagnostics.
+/// `pending_owners` contains at most four hashes; `pending_count` is the total.
+/// Flags: bit 0 queued, bit 1 waiting for predecessor, bit 2 proxy contract,
+/// bit 3 tracks explicit destination owners. Unused rows/owners are zeroed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReliablePendingRow {
+    pub packet_id: u64,
+    pub last_send_ms: u64,
+    pub data_type: u32,
+    pub pending_count: u32,
+    pub retries: u32,
+    pub flags: u32,
+    pub pending_owners: [u64; 4],
+}
+
 /// On-demand metadata for an outstanding reliable transmission. Payloads are
 /// neither decoded nor copied; destination identifiers are sender hashes.
 #[derive(Debug, Clone, PartialEq, Eq)]

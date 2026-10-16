@@ -11277,6 +11277,44 @@ impl Router {
         })
     }
 
+    /// Copy bounded metadata into caller storage without allocating. Returns
+    /// the total pending count across all pages. Copy begins at `first`; rows
+    /// outside the pending range and unused owner slots are zeroed.
+    pub fn copy_reliable_pending_stats(
+        &self,
+        first: usize,
+        rows: &mut [crate::diagnostics::ReliablePendingRow],
+    ) -> usize {
+        rows.fill(crate::diagnostics::ReliablePendingRow::default());
+        let st = self.state.lock();
+        for (row, (&id, sent)) in rows
+            .iter_mut()
+            .zip(st.end_to_end_reliable_tx.iter().skip(first))
+        {
+            row.packet_id = id;
+            row.last_send_ms = sent.last_send_ms;
+            row.data_type = Self::item_data_type(&sent.data).map_or(0, DataType::as_u32);
+            row.pending_count = sent.pending_destinations.len().min(u32::MAX as usize) as u32;
+            row.retries = sent.retries;
+            row.flags = u32::from(sent.queued)
+                | (u32::from(sent.waiting_for_predecessor) << 1)
+                | (u32::from(
+                    st.reliable_return_routes
+                        .get(&id)
+                        .is_some_and(|route| route.upstream_contract.is_some()),
+                ) << 2)
+                | (u32::from(sent.tracked_destinations) << 3);
+            for (out, owner) in row
+                .pending_owners
+                .iter_mut()
+                .zip(sent.pending_destinations.keys())
+            {
+                *out = *owner;
+            }
+        }
+        st.end_to_end_reliable_tx.len()
+    }
+
     /// Snapshot outstanding reliable deliveries for diagnostics. Allocates
     /// metadata bounded by the existing pending window; never clones payloads
     /// or changes retry timing. Not needed in the normal dispatch hot path.
