@@ -126,27 +126,14 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
         && bytes.len() <= 128
         && bytes.first().is_some_and(|flags| flags & 0x11 == 0)
         && frame.as_ref().is_some_and(|frame| {
-            let Some(meta) = crate::config::try_get_message_meta(frame.envelope.ty) else {
-                return false;
-            };
-            let crate::MessageElement::Static(count, crate::MessageDataType::UInt8, _) =
-                meta.element
-            else {
-                return false;
-            };
-            (meta.priority >= 200 || managed || frame.envelope.target_senders().len() != 0)
-                && (frame.reliable.is_some() || frame.envelope.target_senders().len() != 0)
-                && count <= 16
-                && matches!(
-                    frame.envelope.wire_shape,
-                    None | Some(crate::MessageElement::Static(
-                        0..=16,
-                        crate::MessageDataType::UInt8,
-                        _
-                    ))
-                )
-                && bytes.get(1).is_some_and(|count| *count <= 3)
-                && frame.envelope.target_senders().len() <= 3
+            protected_control_shape(
+                frame.envelope.ty,
+                bytes.get(1).copied().unwrap_or(u8::MAX) as usize,
+                frame.envelope.target_senders().len(),
+                frame.envelope.wire_shape,
+                frame.reliable.is_some(),
+                managed,
+            )
         })
     {
         // Keep the complete conservative allocation estimate. This is a
@@ -154,6 +141,43 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
         return check_frame_kind(bytes.len(), false, WORK_SMALL_PROTECTED);
     }
     check_frame(bytes.len(), ack)
+}
+
+/// Shared by ingress and the CRC-validated payload decoder. Keep the work
+/// class through both stages without trusting caller supplied priority alone.
+pub(crate) fn protected_control_shape(
+    ty: crate::DataType,
+    endpoints: usize,
+    owners: usize,
+    shape: Option<crate::MessageElement>,
+    reliable: bool,
+    managed: bool,
+) -> bool {
+    if endpoints > 3 || owners > 3 || (!reliable && owners == 0) {
+        return false;
+    }
+    let Some(meta) = crate::config::try_get_message_meta(ty) else {
+        return false;
+    };
+    (meta.priority >= 200 || managed || owners != 0)
+        && matches!(
+            meta.element,
+            crate::MessageElement::Static(0..=16, crate::MessageDataType::UInt8, _)
+        )
+        && matches!(
+            shape,
+            None | Some(crate::MessageElement::Static(
+                0..=16,
+                crate::MessageDataType::UInt8,
+                _
+            ))
+        )
+}
+
+/// Retain the complete ingress working estimate, including decoder/queue
+/// objects, when allocating a previously admitted small control payload.
+pub(crate) fn check_small_protected_decode(len: usize) -> TelemetryResult<()> {
+    check_frame_kind(len, false, WORK_SMALL_PROTECTED)
 }
 
 pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {

@@ -7254,6 +7254,7 @@ mod frozen_control_delivery_tests {
         }
         let _reset = Reset;
         crate::memory_admission::set_probe_v2(Some(protected_only));
+        assert_eq!(wire_format::unpack_packet(&bytes).unwrap().payload(), &[1]);
         relay.rx_packed_from_side(side, &bytes).unwrap();
         foreign
             .rx_packed_queue_from_side(&bytes, foreign_side)

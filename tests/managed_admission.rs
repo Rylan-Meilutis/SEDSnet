@@ -2,7 +2,10 @@
 use sedsnet::packet::Packet;
 use sedsnet::router::{NetworkVariablePermissions, Router, RouterConfig};
 use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 // A separate test process owns the global allocator probe.
 #[test]
@@ -22,6 +25,14 @@ fn low_schema_priority_managed_control_retains_bounded_reserved_admission() {
     router
         .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
         .unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let applied = effects.clone();
+    router
+        .on_network_variable_update(ty, move |_| {
+            applied.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
     let side = router.add_side_packed("uart", |_| Ok(()));
     let wire = sedsnet::wire_format::pack_packet(
         &Packet::new(ty, &endpoints, "GS", 1, Arc::<[u8]>::from([1])).unwrap(),
@@ -36,9 +47,12 @@ fn low_schema_priority_managed_control_retains_bounded_reserved_admission() {
         .unwrap();
     ordinary.clear_queues();
     extern "C" fn bounded_control_only(additional: usize, largest: usize, kind: u32) -> bool {
-        kind == sedsnet::memory_admission::WORK_SMALL_PROTECTED
+        (kind == sedsnet::memory_admission::WORK_SMALL_PROTECTED
             && (2048..=2432).contains(&additional)
-            && largest <= 160
+            && largest <= 160)
+            || (kind == sedsnet::memory_admission::WORK_GENERAL
+                && additional <= 512
+                && largest <= 160)
     }
     struct Reset;
     impl Drop for Reset {
@@ -57,6 +71,13 @@ fn low_schema_priority_managed_control_retains_bounded_reserved_admission() {
             .is_err(),
         "a low-priority type without a registered managed role cannot borrow the control reserve"
     );
+    let service = router.drain_queues_with_timeout(0);
+    assert_eq!(
+        effects.load(Ordering::Relaxed),
+        1,
+        "protected receive must remain protected through full payload decode and application: {service:?}"
+    );
+    service.unwrap();
     let mut corrupt = wire.to_vec();
     *corrupt.last_mut().unwrap() ^= 1;
     assert!(

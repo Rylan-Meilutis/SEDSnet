@@ -1208,6 +1208,10 @@ fn with_packet_frame_parts<T>(
 /// - [`TelemetryError::InvalidType`] if the type ID is not valid and the frame
 ///   does not carry enough inline shape information to keep decoding it.
 pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
+    unpack_packet_with_role(buf, false)
+}
+
+pub(crate) fn unpack_packet_with_role(buf: &[u8], managed: bool) -> Result<Packet, TelemetryError> {
     let data = verify_crc32(buf)?;
     if data.is_empty() {
         return Err(TelemetryError::Unpack("short prelude"));
@@ -1289,14 +1293,33 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
     let small_ack = matches!(ty, DataType::ReliableAck | DataType::ReliablePartialAck)
         && dsz <= 32
         && payload_copies == 1;
-    crate::memory_admission::check(
-        if small_ack {
-            512
-        } else {
-            dsz.saturating_mul(payload_copies).saturating_add(512)
-        },
-        dsz.saturating_add(32),
-    )?;
+    if crate::memory_admission::supports_work_kinds()
+        && !small_ack
+        && buf.len() <= 128
+        && flags & 0x11 == 0
+        && crate::memory_admission::protected_control_shape(
+            ty,
+            nep,
+            contract
+                .target_senders
+                .as_ref()
+                .map_or(0, |owners| owners.len()),
+            contract.shape,
+            reliable_hdr.is_some(),
+            managed,
+        )
+    {
+        crate::memory_admission::check_small_protected_decode(buf.len())?;
+    } else {
+        crate::memory_admission::check(
+            if small_ack {
+                512
+            } else {
+                dsz.saturating_mul(payload_copies).saturating_add(512)
+            },
+            dsz.saturating_add(32),
+        )?;
+    }
     // ----- Payload handling -----
     let payload: StandardSmallPayload = {
         #[cfg(feature = "cryptography")]

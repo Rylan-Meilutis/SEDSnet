@@ -42,6 +42,11 @@ frame decoding and validation still run. This class does not lower the byte
 estimate or provide an allocation guarantee; applications can allow it to use
 reserved control headroom. Legacy probes receive the original estimate without
 this classification. Both Router and standalone Relay use the same checks.
+The full decoder preserves this work class through payload allocation, using
+that same complete ingress estimate. Router supplies its registered managed
+role; standalone decoding derives the class from bounded frozen controls.
+Enqueue success alone is not proof that a frame can be decoded under pressure;
+the admission regression drains the queue and checks actual application delivery.
 
 ## Transport backpressure
 

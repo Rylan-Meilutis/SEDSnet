@@ -5073,6 +5073,14 @@ impl Router {
         }
     }
 
+    fn unpack_packet_for_role(&self, bytes: &[u8]) -> TelemetryResult<Packet> {
+        let managed = crate::memory_admission::supports_work_kinds()
+            && wire_format::scheduling_type(bytes).is_some_and(|ty| {
+                !is_internal_control_type(ty) && self.is_managed_variable_type(ty)
+            });
+        wire_format::unpack_packet_with_role(bytes, managed)
+    }
+
     fn item_data_type(data: &RouterItem) -> TelemetryResult<DataType> {
         match data {
             RouterItem::Packet(pkt) => Ok(pkt.data_type()),
@@ -5189,7 +5197,7 @@ impl Router {
             return Ok(bytes);
         }
         let reliable = reliable_override.unwrap_or(frame.reliable);
-        let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+        let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
         self.pack_packet_for_contract(
             &pkt,
             reliable,
@@ -5306,7 +5314,7 @@ impl Router {
         }
         let pkt = match &data {
             RouterItem::Packet(pkt) => pkt.clone(),
-            RouterItem::Packed(bytes) => wire_format::unpack_packet(bytes.as_ref())?,
+            RouterItem::Packed(bytes) => self.unpack_packet_for_role(bytes.as_ref())?,
         };
         let reliable = match &data {
             RouterItem::Packet(_) => None,
@@ -5805,7 +5813,7 @@ impl Router {
                 _ => Ok(None),
             },
             RouterItem::Packed(bytes) => {
-                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                 self.preferred_timesync_route_source(&RouterItem::Packet(pkt), ty)
             }
         }
@@ -7870,7 +7878,7 @@ impl Router {
                 return Ok(());
             }
             RouterTxHandlerFn::Packet(f) => {
-                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                 self.retry_with_attempts(runtime_max_handler_retries(), || f(&pkt))
             }
         };
@@ -9117,7 +9125,7 @@ impl Router {
                 return Ok(());
             }
             (RouterTxHandlerFn::Packet(f), RouterItem::Packed(bytes)) => {
-                let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                 self.retry_with_attempts(runtime_max_handler_retries(), || f(&pkt))
             }
         };
@@ -12586,7 +12594,7 @@ impl Router {
                     && !is_internal_control_type(env.ty)
                     && self.is_managed_variable_type(env.ty)
                 {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     self.remember_managed_variable_packet(&pkt)?;
                 }
@@ -12810,7 +12818,7 @@ impl Router {
                         self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
                     }
                     RouterItem::Packed(bytes) => {
-                        if let Ok(pkt) = wire_format::unpack_packet(bytes.as_ref())
+                        if let Ok(pkt) = self.unpack_packet_for_role(bytes.as_ref())
                             && (is_reliable_type(pkt.data_type())
                                 || !pkt.wire_target_senders().is_empty())
                             && pkt.sender() != local_sender.as_ref()
@@ -13038,7 +13046,7 @@ impl Router {
                         | DataType::ReliablePartialAck
                         | DataType::ReliablePacketRequest
                 ) {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     let handled =
                         self.handle_internal_reliable_packet(&pkt, item.src, called_from_queue)?;
@@ -13051,7 +13059,7 @@ impl Router {
                 }
 
                 if env.ty == DataType::P2pMessage {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     if self.item_targets_local_sender(&item.data)? {
                         self.dispatch_p2p_packet(&pkt)?;
@@ -13078,7 +13086,7 @@ impl Router {
                         | DataType::TimeSyncRequest
                         | DataType::TimeSyncResponse
                 ) {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     self.handle_internal_timesync_packet(&pkt, item.src, called_from_queue)?;
                     return Ok(());
@@ -13086,7 +13094,7 @@ impl Router {
 
                 #[cfg(feature = "discovery")]
                 if discovery::is_discovery_type(env.ty) {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     let _ = self.learn_discovery_packet(&pkt, item.src, called_from_queue)?;
                     if !discovery_is_hop_local_advertisement(env.ty)
@@ -13104,7 +13112,7 @@ impl Router {
                     .any(|ep| self.endpoint_has_packet_handler(ep));
 
                 let mut pkt_opt = if any_packet_needed {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     Some(pkt)
                 } else {
@@ -13136,7 +13144,7 @@ impl Router {
                                 ),
                                 EndpointHandlerFn::Packet(_) => {
                                     if pkt_opt.is_none() {
-                                        let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                                        let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                                         pkt.validate()?;
                                         pkt_opt = Some(pkt);
                                     }
@@ -13284,7 +13292,7 @@ impl Router {
                     .any(|ep| self.endpoint_has_packet_handler(ep));
 
                 let mut pkt_opt = if any_packet_needed {
-                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     Some(pkt)
                 } else {
@@ -13310,7 +13318,7 @@ impl Router {
                             }
                             EndpointHandlerFn::Packet(_) => {
                                 if pkt_opt.is_none() {
-                                    let pkt = wire_format::unpack_packet(bytes.as_ref())?;
+                                    let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                                     pkt.validate()?;
                                     pkt_opt = Some(pkt);
                                 }

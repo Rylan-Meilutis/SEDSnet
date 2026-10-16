@@ -2,6 +2,13 @@
 
 ## 4.2.3
 
+- Preserve small protected-control admission through full payload decoding,
+  including locally registered low-priority managed values and foreign frozen
+  contracts. Reuse the complete conservative ingress estimate rather than
+  reclassifying an admitted payload as ordinary work. A regression reproduces
+  successful enqueue followed by zero application callbacks under pressure;
+  the corrected path drains, applies once, and retains CRC/payload validation.
+
 - Retain bounded downstream delivery cohorts when an intermediate Router resolves
   a frozen next-hop contract. Wait for every child receipt before acknowledging
   the parent, including managed values whose schema reliability is Off. Pin
