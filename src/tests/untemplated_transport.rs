@@ -23,6 +23,33 @@ fn canonical_frame() -> crate::SharedBytes {
 }
 
 #[test]
+fn discovery_announcement_survives_receiver_restart_without_template_history() {
+    let sender = untemplated_test_node();
+    let opts = untemplated_test_options();
+    let side = sender.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+    for timestamp in 100..104 {
+        let packet =
+            crate::discovery::build_discovery_announce("DISCOVERY_SOURCE", timestamp, &[]).unwrap();
+        let raw: crate::SharedBytes =
+            crate::shared_bytes::convert(wire_format::pack_packet(&packet));
+        let mut frames = sender
+            .encode_side_transport_frames(side, opts.clone(), raw.clone())
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        // A restarted peer has no dictionary, even though the sender's link
+        // and discovery history survived. Its first announcement must work.
+        let receiver = untemplated_test_node();
+        let rx_side = receiver.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
+        let encoded = frames.next().unwrap();
+        let decoded = receiver
+            .decode_side_transport_frame(rx_side, encoded.as_ref())
+            .unwrap()
+            .expect("a cold peer must receive discovery without a template refresh");
+        assert_eq!(decoded.as_ref(), raw.as_ref());
+    }
+}
+
+#[test]
 fn zero_dictionary_keeps_canonical_bytes_and_rejects_bad_crc() {
     let node = untemplated_test_node();
     let mut opts = untemplated_test_options();
