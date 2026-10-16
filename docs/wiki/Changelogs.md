@@ -4,6 +4,10 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 
 ## Version 4.2.3 highlights
 
+- PyPI release uploads use an optional `PYPI_API_TOKEN` (or `MATURIN_PYPI_TOKEN`).
+  With neither secret configured, the job reports a notice and succeeds while
+  retaining built artifacts. Token-authenticated upload failures remain visible.
+
 - Retain bounded child delivery state across intermediate Router hops and ACK the
   parent only after the complete downstream cohort, including shared contracts
   targeting independent bridges. Consume late locally addressed receipts.

@@ -2,6 +2,10 @@
 
 ## 4.2.3
 
+- PyPI release uploads use an optional `PYPI_API_TOKEN` (or `MATURIN_PYPI_TOKEN`).
+  With neither secret configured, the job reports a notice and succeeds while
+  retaining built artifacts. Token-authenticated upload failures remain visible.
+
 - Apply dominant-sender bulk reclamation before compact-frame reconstruction,
   matching canonical ingress in Router and standalone Relay. Keep full scratch
   estimates and reserve checks; CRC-invalid, frozen and reliable traffic cannot

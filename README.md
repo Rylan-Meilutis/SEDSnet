@@ -192,6 +192,10 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.2.3 highlights
 
+- PyPI release uploads use an optional `PYPI_API_TOKEN` (or `MATURIN_PYPI_TOKEN`).
+  With neither secret configured, the job reports a notice and succeeds while
+  retaining built artifacts. Token-authenticated upload failures remain visible.
+
 - Intermediate routers retain the resolved downstream reader cohort and wait
   for every receipt before acknowledging a frozen parent contract, including
   contracts naming multiple independent bridges. Active aliases
