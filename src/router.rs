@@ -5253,22 +5253,31 @@ impl Router {
         data: &RouterItem,
         endpoints: &[DataEndpoint],
     ) -> TelemetryResult<bool> {
-        let targets = self.item_target_senders(data)?;
-        if targets.is_empty()
-            // A contract that already names downstream owners must remain byte-identical while
-            // crossing this router. Clearing it changes the packet ID and makes those owners'
-            // end-to-end ACKs impossible for the source to match. Re-resolve only the legacy
-            // single-next-hop form where this router is the sole frozen target.
-            || targets.len() != 1
-            || endpoints.iter().copied().any(|endpoint| {
+        // Inspect borrowed owners once. ACK contracts identify receipt owners,
+        // not managed-value proxies; unaddressed transit remains byte-identical.
+        let local_target = match data {
+            RouterItem::Packet(pkt) => {
+                if pkt.wire_target_senders().is_empty() || is_internal_control_type(pkt.data_type())
+                {
+                    return Ok(false);
+                }
+                pkt.wire_target_senders()
+                    .contains(&Self::sender_hash(self.sender_arc().as_ref()))
+            }
+            RouterItem::Packed(bytes) => {
+                let env = wire_format::peek_routing_envelope(bytes)?;
+                if env.target_senders().len() == 0 || is_internal_control_type(env.ty) {
+                    return Ok(false);
+                }
+                let local = Self::sender_hash(self.sender_arc().as_ref());
+                env.target_senders().any(|owner| owner == local)
+            }
+        };
+        Ok(local_target
+            && !endpoints.iter().copied().any(|endpoint| {
                 self.endpoint_has_packet_handler(endpoint)
                     || self.endpoint_has_packed_handler(endpoint)
-            })
-        {
-            return Ok(false);
-        }
-        let local_sender = self.sender_arc();
-        Ok(targets.contains(&Self::sender_hash(local_sender.as_ref())))
+            }))
     }
 
     fn clear_intermediate_hop_targets(
@@ -5276,9 +5285,19 @@ impl Router {
         data: RouterItem,
         called_from_queue: bool,
     ) -> TelemetryResult<Option<RouterItem>> {
-        // Only a sole frozen next-hop target can require contract rewriting.
+        // Every explicitly targeted proxy resolves its own downstream segment,
+        // including a publisher contract naming several independent bridges.
         // Ordinary broadcasts need no owned endpoint or target scratch.
-        if self.item_target_senders(&data)?.len() != 1 {
+        let has_targets = match &data {
+            RouterItem::Packet(pkt) => !pkt.wire_target_senders().is_empty(),
+            RouterItem::Packed(bytes) => {
+                wire_format::peek_routing_envelope(bytes)?
+                    .target_senders()
+                    .len()
+                    != 0
+            }
+        };
+        if !has_targets {
             return Ok(Some(data));
         }
         let (endpoints, _) = self.item_route_info(&data)?;
@@ -12482,7 +12501,9 @@ impl Router {
                 self.release_ordered_successors()?;
                 return Ok(targets_local_sender);
             }
-            return Ok(false);
+            // A late or duplicate receipt addressed to this publisher is
+            // complete locally; it must not leak onto another network side.
+            return Ok(targets_local_sender);
         }
 
         let vals = pkt.data_as_u32()?;

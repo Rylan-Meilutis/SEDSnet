@@ -11,8 +11,8 @@
 - Preserve bounded small frozen byte-control priority and protected admission
   through foreign Router/Relay hops that are not themselves managed readers.
   Keep full allocation estimates, CRC validation and existing queue limits.
-  Thirty-two routed data/receipt-loss cases cover one/two children, local/foreign
-  readers, two retry intervals, cache churn and CAN echoes; applications execute
+  Sixty-four routed data/receipt-loss cases cover one/two children, single/dual
+  proxy branches, local/foreign readers, two retry intervals, cache churn and CAN echoes; applications execute
   once and parent receipts wait for the complete downstream cohort.
 - Resolve best-overlap destination cohorts in one bounded map without a second
   candidate vector or owner-copy/filter pass, reducing allocation and CPU work.

@@ -193,7 +193,8 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 ### Version 4.2.3 highlights
 
 - Intermediate routers retain the resolved downstream reader cohort and wait
-  for every receipt before acknowledging a frozen parent contract. Active aliases
+  for every receipt before acknowledging a frozen parent contract, including
+  contracts naming multiple independent bridges. Active aliases
   survive cache churn; reflected packets retain their publisher identity and do
   not reapply a delivered managed value. Standalone relays retry frozen controls
   even when the application schema marks the value best effort.

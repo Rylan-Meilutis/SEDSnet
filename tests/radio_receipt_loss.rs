@@ -49,15 +49,20 @@ fn one_lost_radio_receipt_recovers_inside_the_configured_retry_window() {
             for drop_receipt in [false, true] {
                 for retry_ms in [500, 250] {
                     for extra_child in [false, true] {
-                        receipt_loss_case(
-                            saved,
-                            ep,
-                            ty,
-                            retry_ms,
-                            bridge_reader,
-                            drop_receipt,
-                            extra_child,
-                        );
+                        for extra_proxy in [false, true] {
+                            receipt_loss_case(
+                                saved,
+                                ep,
+                                ty,
+                                Scenario {
+                                    retry_ms,
+                                    bridge_reader,
+                                    drop_receipt,
+                                    extra_child,
+                                    extra_proxy,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -65,15 +70,28 @@ fn one_lost_radio_receipt_recovers_inside_the_configured_retry_window() {
     }
 }
 
-fn receipt_loss_case(
-    saved: sedsnet::config::RuntimeTuningConfig,
-    ep: sedsnet::config::DataEndpoint,
-    ty: sedsnet::config::DataType,
+#[derive(Clone, Copy, Debug)]
+struct Scenario {
     retry_ms: u32,
     bridge_reader: bool,
     drop_receipt: bool,
     extra_child: bool,
+    extra_proxy: bool,
+}
+
+fn receipt_loss_case(
+    saved: sedsnet::config::RuntimeTuningConfig,
+    ep: sedsnet::config::DataEndpoint,
+    ty: sedsnet::config::DataType,
+    case: Scenario,
 ) {
+    let Scenario {
+        retry_ms,
+        bridge_reader,
+        drop_receipt,
+        extra_child,
+        extra_proxy,
+    } = case;
     let mut tuning = saved;
     tuning.reliable_retransmit_ms = retry_ms;
     tuning.reliable_max_retries = 17;
@@ -82,11 +100,18 @@ fn receipt_loss_case(
     let now = Arc::new(AtomicU64::new(0));
     let frames = Arc::new(Mutex::new(Vec::<Frame>::new()));
     let effects = Arc::new(AtomicUsize::new(0));
-    let peer_names = if extra_child {
-        &["GS", "RF", "FC", "PB"][..]
+    let mut peer_names = vec!["GS", "RF", "FC"];
+    if extra_child {
+        peer_names.push("PB");
+    }
+    let proxy = if extra_proxy {
+        Some(peer_names.len())
     } else {
-        &["GS", "RF", "FC"][..]
+        None
     };
+    if extra_proxy {
+        peer_names.extend(["GW", "VB"]);
+    }
     let noise_ep = register_endpoint_with_description("RECEIPT_ROUTE_CHURN", "", false).unwrap();
     let noise_ty = register_data_type_with_description(
         "RECEIPT_ROUTE_CHURN_DATA",
@@ -115,7 +140,7 @@ fn receipt_loss_case(
         })
         .collect();
     for (index, node) in nodes.iter().enumerate() {
-        if index == 1 && !bridge_reader {
+        if (index == 1 && !bridge_reader) || Some(index) == proxy {
             continue;
         }
         node.enable_network_variable(
@@ -137,7 +162,10 @@ fn receipt_loss_case(
             })
             .unwrap();
     }
-    for node in nodes.iter().skip(2) {
+    for (index, node) in nodes.iter().enumerate().skip(2) {
+        if Some(index) == proxy {
+            continue;
+        }
         let effects = effects.clone();
         node.on_network_variable_update(ty, move |_| {
             effects.fetch_add(1, Ordering::Relaxed);
@@ -150,6 +178,14 @@ fn receipt_loss_case(
     let mut links = vec![(0, 1, 0, 50), (1, 0, 0, 50), (1, 2, 0, 10), (2, 1, 1, 10)];
     if extra_child {
         links.push((3, 1, 1, 10));
+    }
+    if let Some(proxy) = proxy {
+        links.extend([
+            (0, proxy, 0, 50),
+            (proxy, 0, 1, 50),
+            (proxy, proxy + 1, 0, 10),
+            (proxy + 1, proxy, 1, 10),
+        ]);
     }
     for (from, to, side, delay) in links {
         let queue = frames.clone();
@@ -190,6 +226,7 @@ fn receipt_loss_case(
                     return Ok(());
                 }
                 if from >= 2
+                    && Some(from) != proxy
                     && kind == sedsnet::config::DataType::ReliableAck
                     && tick.load(Ordering::Relaxed) >= 1000
                 {
@@ -264,9 +301,15 @@ fn receipt_loss_case(
                 .rx_packed_queue_from_side(&frame.bytes, frame.side)
                 .unwrap();
         }
-        for node in &nodes {
+        for (index, node) in nodes.iter().enumerate() {
             node.poll_discovery().unwrap();
-            node.drain_queues_with_timeout(0).unwrap();
+            node.drain_queues_with_timeout(0).unwrap_or_else(|error| {
+                panic!(
+                    "{} at {}: {error:?}",
+                    peer_names[index],
+                    now.load(Ordering::Relaxed)
+                )
+            });
         }
     }
     now.store(1000, Ordering::Relaxed);
@@ -281,6 +324,18 @@ fn receipt_loss_case(
     nodes[0]
         .set_network_variable(Packet::new(ty, &[ep], "GS", 1000, Arc::<[u8]>::from([1])).unwrap())
         .unwrap();
+    if extra_proxy {
+        assert_eq!(
+            nodes[0].export_reliable_pending_stats()[0]
+                .pending_destinations
+                .len(),
+            2,
+            "the publisher must freeze both next-hop proxy owners"
+        );
+    }
+    let expected_receipts =
+        (if extra_child { 3 } else { 1 }) | proxy.map_or(0, |index| 1 << (index - 1));
+    let expected_effects = (if extra_child { 2 } else { 1 }) + usize::from(extra_proxy);
     let mut completed = None;
     for ms in (0..=1500).step_by(10) {
         now.store(1000 + ms, Ordering::Relaxed);
@@ -291,7 +346,7 @@ fn receipt_loss_case(
             let noise = Packet::new(
                 noise_ty,
                 &[noise_ep],
-                "NOISE",
+                "GS",
                 1000 + ms,
                 Arc::<[u8]>::from([0]),
             )
@@ -314,19 +369,22 @@ fn receipt_loss_case(
                 .rx_packed_queue_from_side(&frame.bytes, frame.side)
                 .unwrap();
         }
-        for node in &nodes {
+        for (index, node) in nodes.iter().enumerate() {
             node.poll_discovery().unwrap();
-            node.drain_queues_with_timeout(0).unwrap();
+            node.drain_queues_with_timeout(0).unwrap_or_else(|error| {
+                panic!(
+                    "{} at {}: {error:?}",
+                    peer_names[index],
+                    now.load(Ordering::Relaxed)
+                )
+            });
         }
         if nodes[0].export_reliable_pending_stats().is_empty() {
             assert!(
-                child_receipts.load(Ordering::Relaxed) == if extra_child { 3 } else { 1 },
+                child_receipts.load(Ordering::Relaxed) == expected_receipts,
                 "bridge acknowledged before downstream receipt: bridge_reader={bridge_reader} drop_receipt={drop_receipt}"
             );
-            assert_eq!(
-                effects.load(Ordering::Relaxed),
-                if extra_child { 2 } else { 1 }
-            );
+            assert_eq!(effects.load(Ordering::Relaxed), expected_effects);
 
             completed = Some(ms);
             break;
@@ -340,7 +398,7 @@ fn receipt_loss_case(
     );
     assert_eq!(
         effects.load(Ordering::Relaxed),
-        if extra_child { 2 } else { 1 },
+        expected_effects,
         "receipt loss replayed the application effect"
     );
     assert_eq!(
@@ -361,6 +419,6 @@ fn receipt_loss_case(
         );
     }
     println!(
-        "routed recovery: bridge_reader={bridge_reader}, drop_receipt={drop_receipt}, retry={retry_ms} ms, completed={completed} ms"
+        "routed recovery: bridge_reader={bridge_reader}, extra_proxy={extra_proxy}, drop_receipt={drop_receipt}, retry={retry_ms} ms, completed={completed} ms"
     );
 }

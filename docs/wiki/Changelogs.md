@@ -5,7 +5,9 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 ## Version 4.2.3 highlights
 
 - Retain bounded child delivery state across intermediate Router hops and ACK the
-  parent only after the complete downstream cohort. Preserve active aliases,
+  parent only after the complete downstream cohort, including shared contracts
+  targeting independent bridges. Consume late locally addressed receipts.
+  Preserve active aliases,
   publisher identity and duplicate suppression under cache churn and CAN echoes.
 - Forward Off-schema frozen-contract retries through standalone Relay. Small
   frozen byte controls keep their scheduling and full protected-admission class
