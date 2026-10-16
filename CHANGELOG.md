@@ -2,6 +2,12 @@
 
 ## 4.2.3
 
+- Apply dominant-sender bulk reclamation before compact-frame reconstruction,
+  matching canonical ingress in Router and standalone Relay. Keep full scratch
+  estimates and reserve checks; CRC-invalid, frozen and reliable traffic cannot
+  become reclamation victims. A real-allocation pressure regression reproduces
+  low-rate telemetry refusal behind DAQ backlog and verifies both paths.
+
 - Preserve bounded frozen-control priority at Router physical callbacks,
   including foreign proxies and raw/hop retransmission paths. The routed-loss
   matrix verifies the priority delivered to the transport, in addition to

@@ -30,6 +30,25 @@ pub(crate) fn incoming(bytes: &[u8]) -> Option<(u32, u8)> {
     let priority = crate::scheduler_priority(ty);
     packed_owner(bytes, priority).map(|owner| (owner, priority))
 }
+/// The full retained header and wrapper CRC have already been validated.
+/// Classify before reconstruction allocates, using no new retained state.
+pub(crate) fn compact_incoming(
+    template: &crate::side_transport::SideHeaderTemplate,
+) -> Option<(u32, u8)> {
+    let ty = template.data_type()?;
+    let meta = crate::config::try_get_message_meta(ty)?;
+    let priority = crate::scheduler_priority(ty);
+    if !eligible(
+        ty,
+        priority,
+        meta.reliable != crate::ReliableMode::None || template.reliable_flags.is_some(),
+        template.base_flags & crate::side_transport::SIDE_TRANSPORT_FLAG_WIRE_CONTRACT != 0,
+    ) {
+        return None;
+    }
+    Some((template.source_address()?, priority))
+}
+
 fn eligible(ty: DataType, priority: u8, reliable: bool, frozen: bool) -> bool {
     // Unknown runtime fragments cannot allocate UNKNOWN_TYPE fallback metadata
     // while we are deciding which retained payload is safe to reclaim.
@@ -124,9 +143,20 @@ mod tests {
         assert!(packet_owner(&packet, 0).is_some());
         assert!(packed_owner(&wire_format::pack_packet(&packet), 0).is_some());
         assert!(packed_owner(&wire_format::pack_packet(&packet), 200).is_none());
+        let (template, ..) =
+            crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&packet))
+                .unwrap();
+        assert_eq!(
+            compact_incoming(&template),
+            Some((wire_format::source_address_for_sender("SOURCE"), 0))
+        );
         let packet = make(reliable);
         assert!(packet_owner(&packet, 0).is_none());
         assert!(packed_owner(&wire_format::pack_packet(&packet), 0).is_none());
+        let (template, ..) =
+            crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&packet))
+                .unwrap();
+        assert!(compact_incoming(&template).is_none());
         let frozen = Packet::new_with_wire_contract(
             plain,
             &[ep],
@@ -140,6 +170,10 @@ mod tests {
         .unwrap();
         assert!(packet_owner(&frozen, 0).is_none());
         assert!(packed_owner(&wire_format::pack_packet(&frozen), 0).is_none());
+        let (template, ..) =
+            crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&frozen))
+                .unwrap();
+        assert!(compact_incoming(&template).is_none());
     }
     #[test]
     fn unknown_large_membership_does_not_guess_an_eviction_victim() {

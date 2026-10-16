@@ -142,7 +142,7 @@ pub(crate) struct SideHeaderTemplate {
 impl SideHeaderTemplate {
     /// Sender identity belongs to the retained, validated full header. Reading
     /// it requires no payload expansion, new cached fields or CRC pass.
-    #[cfg(feature = "discovery")]
+    #[cfg(any(feature = "discovery", feature = "std", feature = "fair-admission"))]
     pub(crate) fn source_address(&self) -> Option<u32> {
         let mut off = 0;
         u32::try_from(read_uleb128_local(&self.between, &mut off).ok()?).ok()

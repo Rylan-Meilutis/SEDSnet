@@ -89,6 +89,7 @@ fn gateway_and_standalone_relay_reclaim_dominant_sender_before_refusing_valve_re
             .unwrap(),
         )
     };
+    compact_report_pressure(ep, ty);
     let wires: Vec<_> = (0..10).map(|i| make("DAQ", i + 1, 1.0)).collect();
     let rare = make("VALVE", 11, 2.0);
     let incoming = make("VALVE", 12, 3.0);
@@ -165,4 +166,117 @@ fn gateway_and_standalone_relay_reclaim_dominant_sender_before_refusing_valve_re
         REFUSED.load(Ordering::Relaxed) >= 2,
         "both paths must actually hit memory refusal before recovering"
     );
+}
+
+fn compact_report_pressure(ep: sedsnet::config::DataEndpoint, ty: sedsnet::config::DataType) {
+    use sedsnet::relay::RelaySideOptions;
+    use sedsnet::router::RouterSideOptions;
+    let packet = |sender: &str, timestamp, value: f32| {
+        Packet::new(
+            ty,
+            &[ep],
+            sender,
+            timestamp,
+            Arc::<[u8]>::from(value.to_le_bytes()),
+        )
+        .unwrap()
+    };
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let output = frames.clone();
+    let sender = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+    sender.add_side_packed_with_options(
+        "wire",
+        move |bytes| {
+            output.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        },
+        RouterSideOptions::default().with_small_packet_transport(128),
+    );
+    sender.tx(packet("VALVE_COMPACT", 0, 0.0)).unwrap();
+    sender.tx(packet("VALVE_COMPACT", 12, 3.0)).unwrap();
+    let mut frames = frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    let compact = frames.pop().unwrap();
+    let full = frames.pop().unwrap();
+    assert!(full.starts_with(b"SDT\x01"));
+    assert!(compact.starts_with(b"SDT\x02"));
+    let incoming = sedsnet::wire_format::pack_packet(&packet("VALVE_COMPACT", 12, 3.0));
+    let wires: Vec<_> = (0..10)
+        .map(|i| sedsnet::wire_format::pack_packet(&packet("DAQ_COMPACT", i + 1, 1.0)))
+        .collect();
+    let rare = sedsnet::wire_format::pack_packet(&packet("VALVE_COMPACT", 11, 2.0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let output = seen.clone();
+    let router = Router::new(RouterConfig::new([EndpointHandler::new_packet_handler(
+        ep,
+        move |p| {
+            output.lock().unwrap().push(p.data_as_f32()?[0]);
+            Ok(())
+        },
+    )]));
+    let side = router.add_side_packed_with_options(
+        "can",
+        |_| Ok(()),
+        RouterSideOptions::default().with_small_packet_transport(128),
+    );
+    router.rx_packed_from_side(&full, side).unwrap();
+    seen.lock().unwrap().clear();
+    for wire in &wires {
+        router.rx_packed_queue_from_side(wire, side).unwrap();
+    }
+    router.rx_packed_queue_from_side(&rare, side).unwrap();
+    let before = router.export_runtime_stats().queues.rx_len;
+    let reset = pressure(&incoming);
+    let mut corrupt = compact.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    assert!(router.rx_packed_queue_from_side(&corrupt, side).is_err());
+    assert_eq!(
+        router.export_runtime_stats().queues.rx_len,
+        before,
+        "bad wrapper CRC cannot reclaim backlog"
+    );
+    router.rx_packed_queue_from_side(&compact, side).expect(
+        "compact reconstruction must reclaim dominant bulk before refusing low-rate telemetry",
+    );
+    drop(reset);
+    router.process_all_queues().unwrap();
+    let values = seen.lock().unwrap();
+    assert!(values.contains(&2.0) && values.contains(&3.0));
+    assert!(values.iter().filter(|v| **v == 1.0).count() < 10);
+    drop(values);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let output = seen.clone();
+    let relay = Relay::new(Box::new(|| 0));
+    let input = relay.add_side_packed_with_options(
+        "can",
+        |_| Ok(()),
+        RelaySideOptions::default().with_small_packet_transport(128),
+    );
+    let output_side = relay.add_side_packet("pico", move |p| {
+        if p.data_type() == ty {
+            output.lock().unwrap().push(p.data_as_f32()?[0]);
+        }
+        Ok(())
+    });
+    relay.set_route(Some(input), output_side, true).unwrap();
+    relay.rx_packed_from_side(input, &full).unwrap();
+    relay.process_all_queues().unwrap();
+    seen.lock().unwrap().clear();
+    for wire in &wires {
+        relay.rx_packed_from_side(input, wire).unwrap();
+    }
+    relay.rx_packed_from_side(input, &rare).unwrap();
+    let before = relay.export_runtime_stats().queues.rx_len;
+    let reset = pressure(&incoming);
+    assert!(relay.rx_packed_from_side(input, &corrupt).is_err());
+    assert_eq!(relay.export_runtime_stats().queues.rx_len, before);
+    relay
+        .rx_packed_from_side(input, &compact)
+        .expect("standalone Relay must retain fair admission before compact expansion");
+    drop(reset);
+    relay.process_all_queues().unwrap();
+    let values = seen.lock().unwrap();
+    assert!(values.contains(&2.0) && values.contains(&3.0));
+    assert!(values.iter().filter(|v| **v == 1.0).count() < 10);
 }

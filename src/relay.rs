@@ -6272,13 +6272,22 @@ impl Relay {
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn reclaim_for_receive(&self, bytes: &[u8], victim: &mut Option<(u32, u8)>) -> bool {
+        let Some((incoming, priority)) = crate::admission_fairness::incoming(bytes) else {
+            return false;
+        };
+        self.reclaim_for_incoming(incoming, priority, victim)
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn reclaim_for_incoming(
+        &self,
+        incoming: u32,
+        priority: u8,
+        victim: &mut Option<(u32, u8)>,
+    ) -> bool {
         let mut st = self.state.lock();
         let (owner, priority) = if let Some(selected) = *victim {
             selected
         } else {
-            let Some((incoming, priority)) = crate::admission_fairness::incoming(bytes) else {
-                return false;
-            };
             let Some(owner) = st.competing_bulk_owner(incoming, priority) else {
                 return false;
             };
@@ -6442,6 +6451,10 @@ impl Relay {
                     .data_type()
                     .is_some_and(|ty| message_priority(ty) >= 200);
                 let ack = template.is_ack();
+                #[cfg(any(feature = "std", feature = "fair-admission"))]
+                let fair_incoming = crate::admission_fairness::compact_incoming(&template);
+                #[cfg(any(feature = "std", feature = "fair-admission"))]
+                let mut fair_victim = None;
                 loop {
                     match crate::memory_admission::check_frame(reconstructed_bound, ack) {
                         Err(TelemetryError::Io("memory pressure")) if protected => {
@@ -6450,6 +6463,18 @@ impl Relay {
                             if !reclaimed {
                                 return Err(TelemetryError::Io("memory pressure"));
                             }
+                        }
+                        Err(TelemetryError::Io("memory pressure")) => {
+                            // Compact reports need the same fairness before
+                            // allocation as canonical ingress. Otherwise they
+                            // never reach the canonical admission/reclaim path.
+                            #[cfg(any(feature = "std", feature = "fair-admission"))]
+                            if let Some((incoming, priority)) = fair_incoming
+                                && self.reclaim_for_incoming(incoming, priority, &mut fair_victim)
+                            {
+                                continue;
+                            }
+                            return Err(TelemetryError::Io("memory pressure"));
                         }
                         result => {
                             result?;
