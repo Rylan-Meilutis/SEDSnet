@@ -2,6 +2,10 @@
 
 ## 4.2.3
 
+- Add allocation-free, paginated pending-delivery diagnostics for Rust and C.
+  Callers provide bounded row storage; inspecting packet IDs, owner hashes and
+  retry state does not decode payloads or alter routing or retry timing.
+
 - Preserve small protected-control admission through full payload decoding,
   including locally registered low-priority managed values and foreign frozen
   contracts. Reuse the complete conservative ingress estimate rather than
