@@ -97,6 +97,26 @@ impl Loads {
         peer.bytes = peer.bytes.saturating_add(bytes);
         peer.count += 1;
     }
+    /// Queue limits must shed the dominant sender even when that sender is
+    /// the producer of the new frame. Otherwise its newest frame repeatedly
+    /// evicts the only report retained for a slower peer.
+    pub fn queue_victim(&self, incoming: Option<u32>) -> Option<u32> {
+        if self.overflow {
+            return None;
+        }
+        self.peers[..self.len]
+            .iter()
+            .filter(|peer| peer.count > 1)
+            .max_by_key(|peer| peer.bytes)
+            .map(|peer| peer.sender)
+            .or_else(|| {
+                incoming.filter(|source| {
+                    self.peers[..self.len]
+                        .iter()
+                        .any(|peer| peer.sender == *source)
+                })
+            })
+    }
     pub fn dominant_other(&self, incoming: u32) -> Option<u32> {
         // Beyond the bounded scratch catalog, refuse rather than guess which
         // peer owns the backlog. This is not a limit on network membership.
@@ -114,9 +134,66 @@ impl Loads {
             .map(|p| p.sender)
     }
 }
+/// No classification or scratch work until the bounded queue needs a victim.
+/// Internal controls retain the ordinary priority selector.
+pub(crate) fn queue_victim<T, O, P>(
+    queue: &crate::queue::BoundedDeque<T>,
+    incoming: &T,
+    owner: O,
+    priority: P,
+    selected: &mut Option<u32>,
+) -> Option<usize>
+where
+    T: crate::queue::ByteCost,
+    O: Fn(&T) -> Option<u32>,
+    P: Fn(&T) -> u8,
+{
+    let Some(incoming_owner) = owner(incoming) else {
+        return queue.len().checked_sub(1);
+    };
+    let incoming_priority = priority(incoming);
+    let victim = if let Some(owner) = *selected {
+        owner
+    } else {
+        let mut loads = Loads::new();
+        for item in queue.iter() {
+            if priority(item) <= incoming_priority
+                && let Some(source) = owner(item)
+            {
+                loads.record(source, item.byte_cost());
+            }
+        }
+        let victim = loads.queue_victim(Some(incoming_owner))?;
+        *selected = Some(victim);
+        victim
+    };
+    queue
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| priority(item) <= incoming_priority && owner(item) == Some(victim))
+        .min_by_key(|(index, item)| (priority(item), *index))
+        .map(|(index, _)| index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_queues_replace_dominant_producer_before_another_peers_only_report() {
+        let mut loads = Loads::new();
+        loads.record(1, 50);
+        loads.record(2, 100);
+        loads.record(2, 100);
+        assert_eq!(loads.queue_victim(Some(2)), Some(2));
+        assert_eq!(loads.queue_victim(Some(3)), Some(2));
+        assert_eq!(loads.queue_victim(None), Some(2));
+        let mut singles = Loads::new();
+        singles.record(1, 50);
+        assert_eq!(singles.queue_victim(Some(2)), None);
+        assert_eq!(singles.queue_victim(Some(1)), Some(1));
+        assert_eq!(singles.queue_victim(None), None);
+    }
+
     #[test]
     fn protected_and_frozen_packets_never_become_bulk_victims() {
         use alloc::sync::Arc;
@@ -183,6 +260,7 @@ mod tests {
             loads.record(source, 100);
         }
         assert_eq!(loads.dominant_other(100), None);
+        assert_eq!(loads.queue_victim(Some(100)), None);
     }
     #[test]
     fn largest_backlog_yields_without_sacrificing_another_peers_only_report() {

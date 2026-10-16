@@ -600,7 +600,7 @@ fn incoming_relay_packet_cannot_evict_the_only_live_route() {
     let mut st = relay.state.lock();
     st.discovery_routes.insert(side, route.clone());
     st.memory.max_queue_budget = st.shared_queue_bytes_used() + 64;
-    assert!(st.make_shared_queue_room(128, RelayQueueKind::Tx).is_err());
+    assert!(st.make_shared_queue_room(128, 0, None).is_err());
     assert_eq!(st.discovery_routes.get(&side), Some(&route));
 }
 

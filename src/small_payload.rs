@@ -162,6 +162,18 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         }
     }
 
+    #[cfg(all(
+        feature = "compact-packet-store",
+        any(feature = "std", feature = "fair-admission")
+    ))]
+    pub(crate) fn with_slice<R>(&self, read: impl FnOnce(&[u8]) -> R) -> crate::TelemetryResult<R> {
+        match self {
+            Self::Inline { len, buf } => Ok(read(buf.as_slice(*len))),
+            Self::Heap(bytes) => Ok(read(bytes)),
+            Self::Managed(payload) => payload.with_slice(read),
+        }
+    }
+
     /// Return the payload as an owned `Arc<[u8]>`.
     ///
     /// - For inline payloads this allocates a new `Arc<[u8]>`.

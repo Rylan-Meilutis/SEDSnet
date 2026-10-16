@@ -4,6 +4,14 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 
 ## Version 4.2.3 highlights
 
+- Apply dominant-sender fairness at bounded RX/TX byte, slot and refused-growth
+  limits, as well as heap admission. A fast producer replaces its own queued
+  backlog before another peer's sole report. Keep priority checks, reliable/frozen
+  controls and metadata protection. Router and standalone Relay regressions cover
+  small canonical frames, mixed producer bursts and shared-budget boundaries;
+  no per-peer retained state is added. Arena queue inspection uses scoped pins
+  so classification cannot strand movable payloads or invalidate consumer views.
+
 - PyPI release uploads use an optional `PYPI_API_TOKEN` (or `MATURIN_PYPI_TOKEN`).
   With neither secret configured, the job reports a notice and succeeds while
   retaining built artifacts. Token-authenticated upload failures remain visible.

@@ -441,6 +441,16 @@ impl ParkedPayload {
     pub fn is_empty(&self) -> bool {
         self.handle.is_empty()
     }
+    /// Internal inspection pins only for this call, preserving movability of
+    /// queued frames that have no ordinary full-slice consumer.
+    #[cfg(all(
+        feature = "compact-packet-store",
+        any(feature = "std", feature = "fair-admission")
+    ))]
+    pub(crate) fn with_slice<R>(&self, read: impl FnOnce(&[u8]) -> R) -> TelemetryResult<R> {
+        let view = self.handle.pin()?;
+        Ok(read(&view))
+    }
     pub fn as_slice(&self) -> &[u8] {
         let mut view = self.view.lock();
         if view.is_none() {

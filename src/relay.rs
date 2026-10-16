@@ -999,8 +999,6 @@ enum RelayQueueKind {
     Rx,
     Tx,
     Replay,
-    Recent,
-    ReliableRxBuffer,
 }
 
 impl RelayInner {
@@ -1008,13 +1006,15 @@ impl RelayInner {
     fn fair_bulk_owner(data: &RelayItem, priority: u8) -> Option<u32> {
         match data {
             RelayItem::Packet(packet) => crate::admission_fairness::packet_owner(packet, priority),
-            RelayItem::Packed(bytes) => {
-                crate::admission_fairness::packed_owner(bytes.as_ref(), priority)
-            }
+            RelayItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
+                crate::admission_fairness::packed_owner(view, priority)
+            })
+            .ok()
+            .flatten(),
         }
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
-    fn competing_bulk_owner(&self, incoming: u32, priority: u8) -> Option<u32> {
+    fn bulk_loads(&self, priority: u8) -> crate::admission_fairness::Loads {
         let mut loads = crate::admission_fairness::Loads::new();
         for item in self.rx_queue.iter() {
             if item.priority <= priority
@@ -1030,7 +1030,11 @@ impl RelayInner {
                 loads.record(owner, item.byte_cost());
             }
         }
-        loads.dominant_other(incoming)
+        loads
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn competing_bulk_owner(&self, incoming: u32, priority: u8) -> Option<u32> {
+        self.bulk_loads(priority).dominant_other(incoming)
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn reclaim_bulk_from(&mut self, owner: u32, priority: u8) -> bool {
@@ -1218,7 +1222,8 @@ impl RelayInner {
     fn make_shared_queue_room(
         &mut self,
         incoming_cost: usize,
-        _preferred: RelayQueueKind,
+        _incoming_priority: u8,
+        _incoming: Option<&RelayItem>,
     ) -> TelemetryResult<()> {
         if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
@@ -1226,9 +1231,30 @@ impl RelayInner {
             ));
         }
 
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let mut fair_victim = None;
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
+            #[cfg(any(feature = "std", feature = "fair-admission"))]
+            {
+                let incoming =
+                    _incoming.and_then(|data| Self::fair_bulk_owner(data, _incoming_priority));
+                let victim = *fair_victim.get_or_insert_with(|| {
+                    self.bulk_loads(_incoming_priority.min(199))
+                        .queue_victim(incoming)
+                });
+                if let Some(victim) = victim
+                    && self.reclaim_bulk_from(victim, _incoming_priority.min(199))
+                {
+                    continue;
+                }
+                if incoming.is_some() {
+                    // Best effort cannot replace another peer's sole report,
+                    // reliable replay, schema, or protected control.
+                    return Err(TelemetryError::Io("shared fair queue saturated"));
+                }
+            }
             // Incoming work cannot evict the routes required to deliver it.
             // Prefer low-priority packets; refuse admission once only metadata
             // remains rather than treating topology as an ordinary queue.
@@ -1289,9 +1315,33 @@ impl RelayInner {
     }
 
     fn push_rx(&mut self, item: RelayRxItem) -> TelemetryResult<()> {
-        self.make_shared_queue_room(item.byte_cost(), RelayQueueKind::Rx)?;
-        self.rx_queue
-            .push_back_prioritized(item, |queued| queued.priority)
+        self.make_shared_queue_room(item.byte_cost(), item.priority, Some(&item.data))?;
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        {
+            #[cfg(any(feature = "std", feature = "fair-admission"))]
+            let mut fair_victim = None;
+            self.rx_queue.push_back_prioritized_select(
+                item,
+                |queued| queued.priority,
+                |queue, _incoming| {
+                    #[cfg(any(feature = "std", feature = "fair-admission"))]
+                    {
+                        crate::admission_fairness::queue_victim(
+                            queue,
+                            _incoming,
+                            |item| Self::fair_bulk_owner(&item.data, item.priority),
+                            |item| item.priority,
+                            &mut fair_victim,
+                        )
+                    }
+                },
+            )
+        }
+        #[cfg(not(any(feature = "std", feature = "fair-admission")))]
+        {
+            self.rx_queue
+                .push_back_prioritized(item, |queued| queued.priority)
+        }
     }
 
     fn push_tx(&mut self, item: RelayTxItem) -> TelemetryResult<()> {
@@ -1324,13 +1374,37 @@ impl RelayInner {
                 });
             }
         }
-        self.make_shared_queue_room(item.byte_cost(), RelayQueueKind::Tx)?;
-        self.tx_queue
-            .push_back_prioritized(item, |queued| queued.priority)
+        self.make_shared_queue_room(item.byte_cost(), item.priority, Some(&item.data))?;
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        {
+            #[cfg(any(feature = "std", feature = "fair-admission"))]
+            let mut fair_victim = None;
+            self.tx_queue.push_back_prioritized_select(
+                item,
+                |queued| queued.priority,
+                |queue, _incoming| {
+                    #[cfg(any(feature = "std", feature = "fair-admission"))]
+                    {
+                        crate::admission_fairness::queue_victim(
+                            queue,
+                            _incoming,
+                            |item| Self::fair_bulk_owner(&item.data, item.priority),
+                            |item| item.priority,
+                            &mut fair_victim,
+                        )
+                    }
+                },
+            )
+        }
+        #[cfg(not(any(feature = "std", feature = "fair-admission")))]
+        {
+            self.tx_queue
+                .push_back_prioritized(item, |queued| queued.priority)
+        }
     }
 
     fn push_replay(&mut self, item: RelayReplayItem) -> TelemetryResult<()> {
-        self.make_shared_queue_room(item.byte_cost(), RelayQueueKind::Replay)?;
+        self.make_shared_queue_room(item.byte_cost(), item.priority, None)?;
         self.replay_queue
             .push_back_prioritized(item, |queued| queued.priority)
     }
@@ -1339,7 +1413,7 @@ impl RelayInner {
         while self.recent_rx.len() >= self.memory.max_recent_rx_ids {
             let _ = self.recent_rx.pop_front();
         }
-        self.make_shared_queue_room(0, RelayQueueKind::Recent)?;
+        self.make_shared_queue_room(0, 0, None)?;
         self.recent_rx.push_back(id)
     }
 
@@ -1360,7 +1434,7 @@ impl RelayInner {
             return Ok(());
         }
         let cost = size_of::<crate::SharedBytes>() + bytes.len();
-        self.make_shared_queue_room(cost, RelayQueueKind::ReliableRxBuffer)?;
+        self.make_shared_queue_room(cost, crate::transport_priority(ty), None)?;
         #[cfg(feature = "compact-packet-store")]
         bytes.park_for_queue()?;
         let rx_state = self
@@ -7399,6 +7473,184 @@ mod frozen_control_delivery_tests {
                     }),
                 "the endpoint receipt did not return through the relay"
             );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod bounded_fair_queue_tests {
+    use super::*;
+    #[test]
+    fn small_canonical_reports_survive_fast_senders_fixed_ring_bursts() {
+        let ep = crate::config::register_endpoint("RELAY_SMALL_QUEUE_DEST", false).unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            "RELAY_SMALL_QUEUE_REPORT",
+            "",
+            crate::MessageElement::Static(
+                4,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[ep],
+            crate::ReliableMode::None,
+            0,
+        )
+        .unwrap();
+        for tx in [false, true] {
+            for slow_last in [false, true] {
+                let node = Relay::new(Box::new(|| 0));
+                let make = |sender| {
+                    RelayItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(
+                        &Packet::new(ty, &[ep], sender, 1, Arc::<[u8]>::from([1; 4])).unwrap(),
+                    )))
+                };
+                let rx = |data| RelayRxItem {
+                    src: 0,
+                    data,
+                    priority: 0,
+                };
+                let tx_item = |data| RelayTxItem {
+                    src: None,
+                    dst: 1,
+                    data,
+                    priority: 0,
+                    retry_after_ms: 0,
+                };
+                let mut st = node.state.lock();
+                st.memory.max_queue_budget = usize::MAX;
+                if tx {
+                    st.tx_queue = BoundedDeque::new(8192, 3 * size_of::<RelayTxItem>(), 1.0);
+                } else {
+                    st.rx_queue = BoundedDeque::new(8192, 3 * size_of::<RelayRxItem>(), 1.0);
+                }
+                let order = if slow_last {
+                    ["FAST", "FAST", "SLOW"]
+                } else {
+                    ["SLOW", "FAST", "FAST"]
+                };
+                for sender in order.into_iter().chain(core::iter::repeat_n("FAST", 32)) {
+                    if tx {
+                        st.push_tx(tx_item(make(sender))).unwrap();
+                    } else {
+                        st.push_rx(rx(make(sender))).unwrap();
+                    }
+                }
+                let slow = wire_format::source_address_for_sender("SLOW");
+                let retained = if tx {
+                    st.tx_queue.iter().any(|item| {
+                        RelayInner::fair_bulk_owner(&item.data, item.priority) == Some(slow)
+                    })
+                } else {
+                    st.rx_queue.iter().any(|item| {
+                        RelayInner::fair_bulk_owner(&item.data, item.priority) == Some(slow)
+                    })
+                };
+                assert!(
+                    retained,
+                    "small report was displaced: tx={tx}, slow_last={slow_last}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_producer_preserves_slow_reports_at_each_queue_boundary() {
+        let ep = crate::config::register_endpoint("RELAY_QUEUE_FAIR_DEST", false).unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            "RELAY_QUEUE_FAIR_REPORT",
+            "",
+            crate::MessageElement::Static(
+                64,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[ep],
+            crate::ReliableMode::None,
+            0,
+        )
+        .unwrap();
+        for mode in 0..3 {
+            for tx in [false, true] {
+                for slow_last in [false, true] {
+                    for next_sender in ["FAST", "NEW_SLOW"] {
+                        let router = Relay::new(Box::new(|| 0));
+                        let make = |sender| {
+                            RelayItem::Packet(Arc::new(
+                                Packet::new(ty, &[ep], sender, 1, Arc::<[u8]>::from([1; 64]))
+                                    .unwrap(),
+                            ))
+                        };
+                        let rx = |data| RelayRxItem {
+                            src: 0,
+                            data,
+                            priority: 0,
+                        };
+                        let tx_item = |data| RelayTxItem {
+                            src: None,
+                            dst: 1,
+                            data,
+                            priority: 0,
+                            retry_after_ms: 0,
+                        };
+                        let order = if slow_last {
+                            ["FAST", "FAST", "SLOW"]
+                        } else {
+                            ["SLOW", "FAST", "FAST"]
+                        };
+                        let mut st = router.state.lock();
+                        st.memory.max_queue_budget = usize::MAX;
+                        let cost = if tx {
+                            order.iter().map(|s| tx_item(make(s)).byte_cost()).sum()
+                        } else {
+                            order.iter().map(|s| rx(make(s)).byte_cost()).sum()
+                        };
+                        if mode == 0 {
+                            if tx {
+                                st.tx_queue = BoundedDeque::new(cost, cost, 2.0);
+                            } else {
+                                st.rx_queue = BoundedDeque::new(cost, cost, 2.0);
+                            }
+                        } else if mode == 1 {
+                            if tx {
+                                st.tx_queue =
+                                    BoundedDeque::new(cost * 10, 3 * size_of::<RelayTxItem>(), 1.0);
+                            } else {
+                                st.rx_queue =
+                                    BoundedDeque::new(cost * 10, 3 * size_of::<RelayRxItem>(), 1.0);
+                            }
+                        }
+                        for sender in order {
+                            if tx {
+                                st.push_tx(tx_item(make(sender))).unwrap();
+                            } else {
+                                st.push_rx(rx(make(sender))).unwrap();
+                            }
+                        }
+                        if mode == 2 {
+                            st.memory.max_queue_budget = st.shared_queue_bytes_used();
+                        }
+                        if tx {
+                            st.push_tx(tx_item(make(next_sender))).unwrap_or_else(|error| panic!("admit error {error:?}: mode={mode} tx={tx} slow_last={slow_last} incoming={next_sender}"));
+                        } else {
+                            st.push_rx(rx(make(next_sender))).unwrap_or_else(|error| panic!("admit error {error:?}: mode={mode} tx={tx} slow_last={slow_last} incoming={next_sender}"));
+                        }
+                        let slow = wire_format::source_address_for_sender("SLOW");
+                        let retained = if tx {
+                            st.tx_queue.iter().any(|item| {
+                                RelayInner::fair_bulk_owner(&item.data, item.priority) == Some(slow)
+                            })
+                        } else {
+                            st.rx_queue.iter().any(|item| {
+                                RelayInner::fair_bulk_owner(&item.data, item.priority) == Some(slow)
+                            })
+                        };
+                        assert!(
+                            retained,
+                            "slow report evicted: mode={mode} tx={tx} slow_last={slow_last} incoming={next_sender}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

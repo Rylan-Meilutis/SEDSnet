@@ -520,6 +520,54 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.cur_bytes = self.cur_bytes.saturating_add(cost);
         Ok(())
     }
+    /// Apply a bounded cold-path selector before normal priority insertion.
+    /// Preparing all limits first prevents the insertion fallback from evicting
+    /// a different peer. Builds without fairness keep the original insertion.
+    #[cfg(any(feature = "std", feature = "fair-admission", test))]
+    #[allow(unused_mut)]
+    pub(crate) fn push_back_prioritized_select<F, V>(
+        &mut self,
+        mut v: T,
+        mut priority_of: F,
+        mut victim: V,
+    ) -> TelemetryResult<()>
+    where
+        F: FnMut(&T) -> u8,
+        V: FnMut(&Self, &T) -> Option<usize>,
+    {
+        #[cfg(feature = "compact-packet-store")]
+        v.park_for_queue()?;
+        if self.q.capacity() == 0 {
+            return Err(TelemetryError::Io("queue unavailable"));
+        }
+        let cost = v.byte_cost();
+        if cost > self.max_bytes {
+            return Err(TelemetryError::PacketTooLarge(
+                "Item exceeds maximum byte budget",
+            ));
+        }
+        let new_priority = priority_of(&v);
+        loop {
+            let limit = self.cur_bytes.saturating_add(cost) > self.max_bytes
+                || self.q.len() >= self.max_elems
+                || (self.fixed_capacity && self.q.len() >= self.q.capacity());
+            if !limit && self.ensure_room_for_one() {
+                break;
+            }
+            let index = victim(self, &v).ok_or(TelemetryError::Io("priority queue saturated"))?;
+            let old_priority = self
+                .q
+                .get(index)
+                .map(&mut priority_of)
+                .ok_or(TelemetryError::Io("priority queue saturated"))?;
+            if old_priority > new_priority || (new_priority == 254 && old_priority == new_priority)
+            {
+                return Err(TelemetryError::Io("priority queue saturated"));
+            }
+            let _ = self.remove_pos(index);
+        }
+        self.push_back_prioritized(v, priority_of)
+    }
 }
 
 #[cfg(test)]
@@ -1031,6 +1079,69 @@ mod growth_ratio_tests {
                     value.to_bits().wrapping_add_signed(adjustment),
                 ));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fair_selector_tests {
+    use super::*;
+    struct Item {
+        id: u8,
+        cost: usize,
+        priority: u8,
+    }
+    impl ByteCost for Item {
+        fn byte_cost(&self) -> usize {
+            self.cost
+        }
+    }
+    #[test]
+    fn custom_reclamation_cannot_override_priority_or_remove_invalid_indices() {
+        for selected in [None, Some(0), Some(999)] {
+            let mut queue = BoundedDeque::new(200, 200, 1.0);
+            queue
+                .push_back_prioritized(
+                    Item {
+                        id: 1,
+                        cost: 100,
+                        priority: 250,
+                    },
+                    |item| item.priority,
+                )
+                .unwrap();
+            queue
+                .push_back_prioritized(
+                    Item {
+                        id: 2,
+                        cost: 100,
+                        priority: 0,
+                    },
+                    |item| item.priority,
+                )
+                .unwrap();
+            assert!(
+                queue
+                    .push_back_prioritized_select(
+                        Item {
+                            id: 3,
+                            cost: 100,
+                            priority: 0
+                        },
+                        |item| item.priority,
+                        |_, _| selected
+                    )
+                    .is_err()
+            );
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue.bytes_used(), 200);
+            assert_eq!(
+                queue
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<alloc::vec::Vec<_>>(),
+                [1, 2]
+            );
         }
     }
 }
