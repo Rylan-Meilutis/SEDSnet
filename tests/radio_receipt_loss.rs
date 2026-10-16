@@ -192,10 +192,14 @@ fn receipt_loss_case(
         let tick = now.clone();
         let lost = lost.clone();
         let child_receipts = child_receipts.clone();
-        nodes[from].add_side_packed_with_options(
+        nodes[from].add_side_packed_with_priority_and_options(
             "wire",
-            move |bytes| {
-                let kind = sedsnet::wire_format::peek_envelope(bytes)?.ty;
+            move |bytes, priority| {
+                let routing = sedsnet::wire_format::peek_envelope(bytes)?;
+                let kind = routing.ty;
+                if kind == ty && !routing.target_senders.is_empty() {
+                    assert!(priority >= 254, "frozen control lost its class at physical callback: {from}->{to}, priority={priority}, {case:?}");
+                }
                 // A downstream CAN reflection must not reapply the proxy's
                 // own value or overwrite its retained upstream receipt route.
                 if from == 1 && to == 2 && kind == ty {

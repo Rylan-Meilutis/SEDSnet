@@ -2,6 +2,12 @@
 
 ## 4.2.3
 
+- Preserve bounded frozen-control priority at Router physical callbacks,
+  including foreign proxies and raw/hop retransmission paths. The routed-loss
+  matrix verifies the priority delivered to the transport, in addition to
+  queue admission and end-to-end receipts. Relay queue classification already
+  preserves the same frozen-control class.
+
 - Add allocation-free, paginated pending-delivery diagnostics for Rust and C.
   Callers provide bounded row storage; inspecting packet IDs, owner hashes and
   retry state does not decode payloads or alter routing or retry timing.

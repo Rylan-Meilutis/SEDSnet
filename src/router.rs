@@ -7844,10 +7844,8 @@ impl Router {
             return Err(TelemetryError::Io("side tx busy"));
         };
         let started_ms = self.clock.now_ms();
-        let ty = wire_format::peek_routing_envelope(bytes.as_ref())
-            .map(|env| env.ty)
-            .unwrap_or(DataType::ReliableAck);
-        let priority = self.effective_transport_priority(ty);
+        let (ty, priority) = Self::item_type_priority(&RouterItem::Packed(bytes.clone()))?;
+        let priority = priority.max(self.effective_transport_priority(ty));
         let result = match handler {
             packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)) => {
                 let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
@@ -7949,7 +7947,7 @@ impl Router {
                     .ty
             }
         };
-        let priority = self.effective_transport_priority(ty);
+        let priority = self.item_service_priority(&data)?;
 
         if !is_reliable_type(ty) {
             if let Some(adjusted) = self.adjust_reliable_for_side(opts, data, true)? {
@@ -8998,7 +8996,7 @@ impl Router {
             RouterItem::Packet(pkt) => pkt.data_type(),
             RouterItem::Packed(bytes) => wire_format::peek_routing_envelope(bytes.as_ref())?.ty,
         };
-        let priority = self.effective_transport_priority(ty);
+        let priority = self.item_service_priority(data)?;
         let result = match (handler, data) {
             (
                 packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)),
