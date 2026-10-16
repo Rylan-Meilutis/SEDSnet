@@ -7327,10 +7327,12 @@ impl Router {
                     self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
-                st.discovery_side_throttle
-                    .entry(side)
-                    .or_default()
-                    .has_sent_full = false;
+                let throttle = st.discovery_side_throttle.entry(side).or_default();
+                throttle.has_sent_full = false;
+                // A full reply cannot use the old incremental baseline. Drop
+                // that derived copy before admitting its replacement scratch;
+                // keep all learned routes, schemas and other links intact.
+                throttle.last_topology = Vec::new();
             }
             // Do not depend on the elected master answering a forwarded request.
             // A recovering neighbor must get our retained downstream baseline

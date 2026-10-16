@@ -2,6 +2,12 @@
 
 ## 4.2.3
 
+- Release a link's obsolete incremental-topology copy when its peer requests a
+  full baseline, before admitting replacement snapshot scratch. Preserve learned
+  routes, schemas and other links. Router and Relay allocation-ledger regressions
+  reproduce a cold receiver getting no named baseline under constrained headroom
+  and verify full recovery without exceeding the measured memory ceiling.
+
 - Within the selected bulk sender, reclaim repeated message types before its
   slower types' only queued report, and replace that type's older value when
   possible. Apply this to RX, TX and shared-byte pressure in Router and Relay;

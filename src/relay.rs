@@ -4288,12 +4288,14 @@ impl Relay {
             }
             // Like routers, relays retain a split-horizon baseline and must
             // answer a restarting neighbor without waiting for master election.
-            self.state
-                .lock()
-                .discovery_side_throttle
-                .entry(src)
-                .or_default()
-                .has_sent_full = false;
+            {
+                let mut st = self.state.lock();
+                let throttle = st.discovery_side_throttle.entry(src).or_default();
+                throttle.has_sent_full = false;
+                // A full reply replaces this derived delta baseline. Release
+                // it before snapshot admission, preserving live routing state.
+                throttle.last_topology = Vec::new();
+            }
             return self.queue_discovery_announce_on_side(
                 pkt.data_type() == crate::DataType::DiscoverySchemaRequest,
                 false,
