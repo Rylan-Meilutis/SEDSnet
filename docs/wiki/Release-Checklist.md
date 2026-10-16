@@ -37,10 +37,12 @@ python3 publish_crates.py --skip-tests --skip-package --publish \
 
 The first command runs the full test route and package dry-runs. Crate publishing and all wheel and
 sdist jobs wait for those checks to pass. The publish job then reuses the helper without repeating
-the completed tests and package checks, times out a stuck crates.io upload, and treats upload-side
-failures as non-fatal. GitHub PyPI trusted publishing uses the `pypi` environment claim; configure
-PyPI's trusted publisher to match the repository, `release.yml` workflow, tag refs, and that
-environment.
+the completed tests and package checks. GitHub PyPI publication uses an explicit API token from
+the `pypi` environment or repository secrets: `PYPI_API_TOKEN`, falling back to
+`MATURIN_PYPI_TOKEN`. Without either token, the job reports a notice and succeeds without
+downloading, pruning or uploading artifacts. It does not attempt an OIDC exchange. Built wheels
+and the source distribution remain available as workflow artifacts. With a token, genuine upload
+errors still fail the job; token authentication disables OIDC-backed attestations.
 
 The same helper has explicit PyPI opt-ins:
 
@@ -103,10 +105,11 @@ Pushing a tag matching `v*` starts the GitHub release workflow:
 - publishes `sedsnet_macros` and then `SEDSnet` to crates.io using `CARGO_REGISTRY_TOKEN`
 - builds PyPI wheels for Linux, macOS, and Windows
 - builds an sdist
-- publishes all Python artifacts to PyPI using trusted publishing
+- publishes Python artifacts when `PYPI_API_TOKEN` or `MATURIN_PYPI_TOKEN` is configured
+- skips PyPI publication successfully when neither secret is configured
 
-GitHub PyPI publishing expects the project to be configured as a PyPI trusted publisher for the
-release workflow.
+GitHub PyPI publishing uses token authentication; a PyPI trusted-publisher configuration is not
+required by this workflow. Keep the token in GitHub secrets, never in the repository.
 
 The GitLab pipeline also has tag-gated release jobs for Linux-only self-hosted runners:
 

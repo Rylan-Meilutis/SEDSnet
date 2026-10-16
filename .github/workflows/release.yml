@@ -169,24 +169,37 @@ jobs:
       - sdist
     permissions:
       contents: read
-      id-token: write
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN || secrets.MATURIN_PYPI_TOKEN }}
     steps:
+      - name: Skip PyPI publication without a token
+        if: env.PYPI_API_TOKEN == ''
+        run: echo '::notice::PyPI publication skipped; no PYPI_API_TOKEN or MATURIN_PYPI_TOKEN secret is configured. Built artifacts remain available.'
+
       - uses: actions/checkout@v4
+        if: env.PYPI_API_TOKEN != ''
 
       - name: Download wheel artifacts
+        if: env.PYPI_API_TOKEN != ''
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
       - name: Remove stale package artifacts
+        if: env.PYPI_API_TOKEN != ''
         run: |
           python3 publish_crates.py --skip-crates --skip-tests \
             --prune-pypi-artifacts --wheel-out dist
 
       - name: Publish to PyPI
+        if: env.PYPI_API_TOKEN != ''
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          user: __token__
+          password: ${{ env.PYPI_API_TOKEN }}
+          # Token authentication does not use OIDC-backed attestations.
+          attestations: false
           packages-dir: dist
           # Manual publication and a retried tag workflow may share artifacts.
           skip-existing: true
