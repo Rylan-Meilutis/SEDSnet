@@ -1397,12 +1397,37 @@ impl Relay {
     const END_TO_END_ACK_SENDER: &'static str = "E2EACK";
     const END_TO_END_ACK_PREFIX: &'static str = "E2EACK:";
 
-    fn relay_item_priority(data: &RelayItem) -> TelemetryResult<u8> {
-        let ty = match data {
-            RelayItem::Packet(pkt) => pkt.data_type(),
-            RelayItem::Packed(bytes) => wire_format::peek_routing_envelope(bytes.as_ref())?.ty,
+    fn item_type_priority(data: &RelayItem) -> TelemetryResult<(crate::DataType, u8)> {
+        let (ty, control) = match data {
+            RelayItem::Packet(pkt) => (
+                pkt.data_type(),
+                pkt.payload().len() <= 16
+                    && pkt.endpoints().len() <= 3
+                    && crate::small_frozen_control(
+                        pkt.data_type(),
+                        pkt.wire_target_senders().len(),
+                        pkt.wire_shape(),
+                    ),
+            ),
+            RelayItem::Packed(bytes) => {
+                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
+                let control = bytes.len() <= 128
+                    && bytes.first().is_some_and(|flags| flags & 0x11 == 0)
+                    && env.endpoints().take(4).count() <= 3
+                    && crate::small_frozen_control(
+                        env.ty,
+                        env.target_senders().len(),
+                        env.wire_shape,
+                    );
+                (env.ty, control)
+            }
         };
-        Ok(crate::scheduler_priority(ty))
+        let priority = crate::scheduler_priority(ty);
+        Ok((ty, if control { priority.max(254) } else { priority }))
+    }
+
+    fn relay_item_priority(data: &RelayItem) -> TelemetryResult<u8> {
+        Self::item_type_priority(data).map(|(_, priority)| priority)
     }
 
     #[inline]
@@ -4510,7 +4535,7 @@ impl Relay {
 
     fn should_forward_duplicate_reliable_item(&self, item: &RelayRxItem) -> TelemetryResult<bool> {
         let (_, ty) = self.item_route_info(&item.data)?;
-        if !is_reliable_type(ty)
+        if (!is_reliable_type(ty) && self.item_target_senders(&item.data)?.is_empty())
             || matches!(
                 ty,
                 crate::DataType::ReliableAck
@@ -5512,13 +5537,15 @@ impl Relay {
         }
         match &item.data {
             RelayItem::Packet(pkt) => {
-                if is_reliable_type(pkt.data_type()) && !is_internal_control_type(pkt.data_type()) {
+                if (is_reliable_type(pkt.data_type()) || !pkt.wire_target_senders().is_empty())
+                    && !is_internal_control_type(pkt.data_type())
+                {
                     self.note_reliable_return_route(item.src, pkt.packet_id());
                 }
             }
             RelayItem::Packed(bytes) => {
                 if let Ok(env) = wire_format::peek_routing_envelope(bytes.as_ref())
-                    && is_reliable_type(env.ty)
+                    && (is_reliable_type(env.ty) || env.target_senders().len() != 0)
                     && !is_internal_control_type(env.ty)
                     && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
                 {
@@ -7153,3 +7180,196 @@ fn untemplated_test_options() -> RelaySideOptions {
 #[allow(clippy::duplicate_mod)]
 #[path = "tests/untemplated_transport.rs"]
 mod untemplated_transport_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod frozen_control_delivery_tests {
+    use super::*;
+    use crate::router::{NetworkVariablePermissions, Router, RouterConfig, RouterSideOptions};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn control() -> Packet {
+        let ep = crate::config::register_endpoint("FROZEN_RELAY_CONTROL", false).unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            "FROZEN_RELAY_CONTROL",
+            "",
+            crate::MessageElement::Static(
+                1,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[ep],
+            crate::ReliableMode::None,
+            16,
+        )
+        .unwrap();
+        Packet::new_with_wire_contract(
+            ty,
+            &[ep],
+            "GS",
+            1,
+            7,
+            Arc::<[u8]>::from([1]),
+            None,
+            Arc::from([Relay::sender_hash("FC")]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn foreign_frozen_control_retains_priority_and_full_reserved_admission() {
+        let packet = control();
+        let bytes = wire_format::pack_packet(&packet);
+        let relay = Relay::new(Box::new(|| 0u64));
+        let side = relay.add_side_packed("radio", |_| Ok(()));
+        relay.rx_packed_from_side(side, &bytes).unwrap();
+        relay.clear_queues();
+        let foreign = Router::new(RouterConfig::new([]).with_sender("FOREIGN"));
+        let foreign_side = foreign.add_side_packed("radio", |_| Ok(()));
+        foreign
+            .rx_packed_queue_from_side(&bytes, foreign_side)
+            .unwrap();
+        foreign.clear_queues();
+        assert_eq!(
+            Relay::relay_item_priority(&RelayItem::Packet(Arc::new(packet))).unwrap(),
+            254
+        );
+        assert_eq!(
+            Relay::relay_item_priority(&RelayItem::Packed(crate::shared_bytes::convert(
+                bytes.clone()
+            )))
+            .unwrap(),
+            254
+        );
+        extern "C" fn protected_only(additional: usize, largest: usize, kind: u32) -> bool {
+            kind == crate::memory_admission::WORK_SMALL_PROTECTED
+                && (2048..=2432).contains(&additional)
+                && largest <= 160
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::memory_admission::set_probe_v2(None);
+            }
+        }
+        let _reset = Reset;
+        crate::memory_admission::set_probe_v2(Some(protected_only));
+        relay.rx_packed_from_side(side, &bytes).unwrap();
+        foreign
+            .rx_packed_queue_from_side(&bytes, foreign_side)
+            .unwrap();
+        let mut corrupt = bytes.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(relay.rx_packed_from_side(side, &corrupt).is_err());
+    }
+
+    #[test]
+    fn best_effort_schema_frozen_contract_retries_through_standalone_relay() {
+        let packet = control();
+        let bytes = wire_format::pack_packet(&packet);
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = now.clone();
+        let relay = Relay::new(Box::new(move || clock.load(Ordering::Relaxed)));
+        let upstream = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let output = upstream.clone();
+        let radio = relay.add_side_packed_with_options(
+            "radio",
+            move |bytes| {
+                output.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RelaySideOptions {
+                header_template_enabled: false,
+                reliable_enabled: false,
+                ..Default::default()
+            },
+        );
+        let downstream = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let output = downstream.clone();
+        let can = relay.add_side_packed_with_options(
+            "CAN",
+            move |bytes| {
+                output.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RelaySideOptions {
+                header_template_enabled: false,
+                reliable_enabled: false,
+                ..Default::default()
+            },
+        );
+        relay.set_route(Some(radio), can, true).unwrap();
+        relay.set_route(Some(can), radio, true).unwrap();
+        let child = Router::new(RouterConfig::new([]).with_sender("FC"));
+        child
+            .enable_network_variable(packet.data_type(), NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let count = effects.clone();
+        child
+            .on_network_variable_update(packet.data_type(), move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        let receipts = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let output = receipts.clone();
+        let child_side = child.add_side_packed_with_options(
+            "CAN",
+            move |bytes| {
+                output.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions {
+                header_template_enabled: false,
+                reliable_enabled: false,
+                ..Default::default()
+            },
+        );
+        relay.clear_queues();
+        child.clear_queues();
+        for attempt in 0..3 {
+            now.store(
+                u64::from(crate::config::runtime_tuning_config().reliable_retransmit_ms) * attempt,
+                Ordering::Relaxed,
+            );
+            relay.rx_packed_from_side(radio, &bytes).unwrap();
+            relay.drain_queues_with_timeout(0).unwrap();
+            let frames = core::mem::take(&mut *downstream.lock().unwrap());
+            let values: Vec<_> = frames
+                .into_iter()
+                .filter(|bytes| wire_format::peek_envelope(bytes).unwrap().ty == packet.data_type())
+                .collect();
+            assert!(
+                !values.is_empty(),
+                "frozen Off-schema retry was swallowed by relay dedupe"
+            );
+            if attempt == 0 {
+                continue;
+            } // The first data transmission is lost.
+            for bytes in values {
+                child.rx_packed_queue_from_side(&bytes, child_side).unwrap();
+            }
+            child.drain_queues_with_timeout(0).unwrap();
+            for bytes in core::mem::take(&mut *receipts.lock().unwrap()) {
+                relay.rx_packed_from_side(can, &bytes).unwrap();
+            }
+            relay.drain_queues_with_timeout(0).unwrap();
+            assert_eq!(
+                effects.load(Ordering::Relaxed),
+                1,
+                "receipt retry repeated application effect"
+            );
+            assert!(
+                core::mem::take(&mut *upstream.lock().unwrap())
+                    .iter()
+                    .any(|bytes| {
+                        let ack = wire_format::unpack_packet(bytes).unwrap();
+                        ack.data_type() == crate::DataType::ReliableAck
+                            && ack.payload() == packet.packet_id().to_le_bytes()
+                    }),
+                "the endpoint receipt did not return through the relay"
+            );
+        }
+    }
+}

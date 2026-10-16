@@ -192,6 +192,15 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.2.3 highlights
 
+- Intermediate routers retain the resolved downstream reader cohort and wait
+  for every receipt before acknowledging a frozen parent contract. Active aliases
+  survive cache churn; reflected packets retain their publisher identity and do
+  not reapply a delivered managed value. Standalone relays retry frozen controls
+  even when the application schema marks the value best effort.
+- Small frozen byte controls keep their scheduling/admission class through
+  foreign relays without registering a local managed reader. Existing memory
+  estimates, queue limits and CRC checks remain in force.
+
 - Reclaim queued bulk from the dominant competing sender before refusing low-rate
   reports under memory pressure; preserve controls and metadata. Hosted builds
   include this cold path; embedded bridges enable `fair-admission`.

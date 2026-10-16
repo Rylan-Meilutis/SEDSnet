@@ -2,6 +2,21 @@
 
 ## 4.2.3
 
+- Retain bounded downstream delivery cohorts when an intermediate Router resolves
+  a frozen next-hop contract. Wait for every child receipt before acknowledging
+  the parent, including managed values whose schema reliability is Off. Pin
+  active return aliases against unrelated cache churn and preserve publisher
+  packet identities so reflected frames remain deduplicated. Standalone Relay
+  also forwards retries of these Off-schema frozen contracts.
+- Preserve bounded small frozen byte-control priority and protected admission
+  through foreign Router/Relay hops that are not themselves managed readers.
+  Keep full allocation estimates, CRC validation and existing queue limits.
+  Thirty-two routed data/receipt-loss cases cover one/two children, local/foreign
+  readers, two retry intervals, cache churn and CAN echoes; applications execute
+  once and parent receipts wait for the complete downstream cohort.
+- Resolve best-overlap destination cohorts in one bounded map without a second
+  candidate vector or owner-copy/filter pass, reducing allocation and CPU work.
+
 - Keep warm Router/Relay transit eligible after an optional TX header entry is evicted. Under memory pressure, forward the existing canonical shared frame instead of allocating replacement compression state. Require known ingress peers, warm type statistics, existing routes and a frame that fits the transport; cold work retains full admission checks.
 
 - On memory refusal, reclaim queued best-effort payloads from a competing

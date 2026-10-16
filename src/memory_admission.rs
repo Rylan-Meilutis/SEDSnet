@@ -134,7 +134,7 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
             else {
                 return false;
             };
-            (meta.priority >= 200 || managed)
+            (meta.priority >= 200 || managed || frame.envelope.target_senders().len() != 0)
                 && (frame.reliable.is_some() || frame.envelope.target_senders().len() != 0)
                 && count <= 16
                 && matches!(

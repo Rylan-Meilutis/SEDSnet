@@ -33,8 +33,10 @@ The extended application probe receives the complete allocation estimate and a
 work class. General work retains conservative decoder scratch; cached transit
 requires warmed routing, transport, and statistics metadata. Small protected
 work is limited to CRC-valid, uncompressed/unencrypted reliable byte messages:
-known fixed UInt8 shape of at most 16 elements, queue priority at least 200,
-frame at most 128 bytes, and at most three destinations and sender targets.
+known fixed UInt8 shape of at most 16 elements, frame at most 128 bytes, and
+at most three destinations and sender targets. A schema priority of at least
+200, a registered managed role, or an explicit frozen delivery contract selects
+this class; a foreign relay need not register a local reader to preserve it.
 Any inline shape must also be fixed UInt8 with at most 16 elements. Normal
 frame decoding and validation still run. This class does not lower the byte
 estimate or provide an allocation guarantee; applications can allow it to use

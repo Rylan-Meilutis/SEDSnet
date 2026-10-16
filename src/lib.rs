@@ -691,8 +691,29 @@ pub fn transport_priority(ty: DataType) -> u8 {
     }
 }
 
-// Internal name retained so the router and relay code remain explicit about
-// where this priority is applied.
+/// Small frozen byte controls retain their delivery class across relays that
+/// are not local readers. Ordinary telemetry keeps its schema priority.
+#[inline]
+pub(crate) fn small_frozen_control(
+    ty: DataType,
+    owners: usize,
+    shape: Option<MessageElement>,
+) -> bool {
+    if !(1..=3).contains(&owners) {
+        return false;
+    }
+    config::try_get_message_meta(ty).is_some_and(|meta| {
+        matches!(
+            meta.element,
+            MessageElement::Static(0..=16, MessageDataType::UInt8, _)
+        ) && matches!(
+            shape,
+            None | Some(MessageElement::Static(0..=16, MessageDataType::UInt8, _))
+        )
+    })
+}
+
+// Internal scheduler name emphasizes where this priority is applied.
 #[inline]
 pub(crate) fn scheduler_priority(ty: DataType) -> u8 {
     transport_priority(ty)

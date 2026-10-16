@@ -4,6 +4,14 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 
 ## Version 4.2.3 highlights
 
+- Retain bounded child delivery state across intermediate Router hops and ACK the
+  parent only after the complete downstream cohort. Preserve active aliases,
+  publisher identity and duplicate suppression under cache churn and CAN echoes.
+- Forward Off-schema frozen-contract retries through standalone Relay. Small
+  frozen byte controls keep their scheduling and full protected-admission class
+  through foreign relays, without registering them as local variable readers.
+- Select bounded best-overlap cohorts without a temporary candidate vector.
+
 - Keep warm Router/Relay transit eligible after an optional TX header entry is evicted. Under memory pressure, forward the existing canonical shared frame instead of allocating replacement compression state. Require known ingress peers, warm type statistics, existing routes and a frame that fits the transport; cold work retains full admission checks.
 
 - Reclaim queued bulk from the dominant competing sender before refusing low-rate
