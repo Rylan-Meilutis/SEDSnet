@@ -192,6 +192,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.2.3 highlights
 
+- Reclaim redundant message types within a busy sender's backlog before its
+  slower report types. Keep temporary arbitration bounded and preserve protected
+  controls in both routers and standalone relays.
+- Release an obsolete per-link incremental-topology copy before rebuilding a
+  requested full baseline. Recover cold receivers with less working memory while
+  preserving learned routes and schemas.
+
 - Apply dominant-sender fairness at bounded RX/TX byte, slot and refused-growth
   limits, as well as heap admission. A fast producer replaces its own queued
   backlog before another peer's sole report. Keep priority checks, reliable/frozen
