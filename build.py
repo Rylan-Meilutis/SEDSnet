@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import argparse
 import re
 import shlex
 import stat
@@ -20,73 +21,42 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-def print_help(error: str | None = None) -> None:
-    out = sys.stderr if error else sys.stdout
-    if error:
-        print(f"error: {error}\n", file=out)
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "compact-packet-store", "compact-packet-compression")
 
-    print(
-        """Usage:
-  build.py [OPTIONS]
-
-Options (can be combined where it makes sense):
-  release                 Build in release mode.
-  check                   Run `cargo clippy` for default, python, and embedded feature variants with `-D warnings`.
-  test                    Run Rust tests, benchmark smoke, Python unittests, and validate python +
-  embedded builds when the cross C toolchain exists.
-  full                    With `test`, also run long-duration Rust tests marked `#[ignore]`.
-  embedded                Build for the embedded target (enables `embedded` feature).
-  python                  Build with Python bindings (enables `python` feature).
-  timesync                Build with time sync helpers (enables `timesync` feature).
-  fair-admission           Reclaim dominant bulk senders before refusing smaller peers.
-  compact-packet-store     Enable handle-managed packet arena and fixed queue slabs.
-  compact-packet-compression  Enable indexed Zstd arena buffers and range decoding.
-  cryptography             Enable cryptography provider APIs (Rust trait helpers + optional C callbacks).
-  maturin-build           Run `maturin build`.
-  maturin-develop         Run `maturin develop`.
-  maturin-install         Build wheel and install it with `uv pip install`.
-  maturin-login           Validate and store PyPI upload credentials in .sedsnet-release.toml.
-  target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
-  device_id=<id>          Set DEVICE_IDENTIFIER env var for the build.
-  static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
-  static_ipc_schema_path=<path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for runtime IPC overlay seeding.
-  max_queue_budget=<n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
-  max_recent_rx_ids=<n>   Set MAX_RECENT_RX_IDS for the preallocated recent-ID cache.
-
-New (compile-time env vars):
-  max_stack_payload=<n>   Set MAX_STACK_PAYLOAD for define_stack_payload!(env="MAX_STACK_PAYLOAD", ...).
-  env:KEY=VALUE           Set arbitrary environment variable(s) for the build (repeatable).
-                          Example: env:MAX_QUEUE_BUDGET=65536 env:QUEUE_GROW_STEP=2.0
-  env:SEDSNET_INSTALL_C_TOOLCHAIN_CMD="..."  Optional command used to auto-install
-                          cross C toolchain when embedded checks need it.
-  env:SEDSNET_EMBEDDED_CFLAGS_AUTO=0         Disable automatic size-oriented CFLAGS/defines
-                          injection for embedded C dependencies.
-  env:SEDSNET_TEST_RUNNER=auto|nextest|cargo Select Rust test runner for `build.py test`.
-                          `auto` uses cargo-nextest when installed and falls back to cargo test.
-                          `build.py test full` includes Rust tests marked `#[ignore]`, so future
-                          soak tests are included automatically.
-
-Special:
-  -h, --help, help        Show this help message and exit.
-
-Examples:
-  build.py release
-  build.py embedded release target=thumbv7em-none-eabihf
-  build.py python
-  build.py timesync
-  build.py check
-  build.py check release
-  build.py test
-  build.py test full
-  build.py test release
-  build.py maturin-build max_stack_payload=256
-  build.py maturin-login
-  build.py maturin-install max_recent_rx_ids=256 env:MAX_STACK_PAYLOAD=128
-""",
-        file=out,
-        end="",
-    )
-    sys.exit(1 if error else 0)
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build and validate SEDSnet with Cargo-style commands and flags.")
+    parser.add_argument("command", nargs="?", default="build", choices=("build", "check", "test", "maturin-build", "maturin-develop", "maturin-install", "maturin-login"), help="Action (default: build).")
+    parser.add_argument("--release", action="store_true", help="Use the release profile (release-embedded on embedded targets).")
+    parser.add_argument("--features", action="append", default=[], metavar="FEATURES", help="Comma/space-separated features; repeatable: " + ", ".join(FEATURE_OPTIONS))
+    parser.add_argument("--target", default="", help="Rust target triple (host by default).")
+    parser.add_argument("--device-id", default="", help="Compile-time DEVICE_IDENTIFIER.")
+    parser.add_argument("--full", action="store_true", help="Include ignored long-duration tests with test.")
+    parser.add_argument("--static-schema-path", help="Runtime registry seed JSON path.")
+    parser.add_argument("--static-ipc-schema-path", help="Runtime IPC overlay seed JSON path.")
+    for flag, description in (("max-stack-payload", "Maximum stack payload bytes"), ("max-queue-budget", "Shared router/relay queue budget bytes"), ("max-recent-rx-ids", "Preallocated recent packet-ID entries")):
+        parser.add_argument("--" + flag, type=int, help=description + ".")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="Build environment override; repeatable, e.g. --env QUEUE_GROW_STEP=1.25.")
+    args = parser.parse_args(argv)
+    args.features = list(dict.fromkeys(f for value in args.features for f in re.split(r"[,\s]+", value) if f))
+    unknown = set(args.features) - set(FEATURE_OPTIONS)
+    if unknown: parser.error("unsupported features: " + ", ".join(sorted(unknown)))
+    if "embedded" in args.features and "python" in args.features: parser.error("build embedded and python targets separately")
+    if args.full and args.command != "test": parser.error("--full requires test")
+    args.env_overrides = {}
+    for key in ("max_stack_payload", "max_queue_budget", "max_recent_rx_ids"):
+        value = getattr(args, key)
+        if value is not None:
+            if value <= 0: parser.error("--" + key.replace("_", "-") + " must be positive")
+            args.env_overrides[key.upper()] = str(value)
+    for flag, key in (("static_schema_path", "SEDSNET_STATIC_SCHEMA_PATH"), ("static_ipc_schema_path", "SEDSNET_STATIC_IPC_SCHEMA_PATH")):
+        if getattr(args, flag) is not None:
+            if not getattr(args, flag): parser.error("--" + flag.replace("_", "-") + " requires a path")
+            args.env_overrides[key] = getattr(args, flag)
+    for item in args.env:
+        key, separator, value = item.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key): parser.error("--env requires a valid KEY=VALUE")
+        args.env_overrides[key] = value
+    return args
 
 
 def _fmt_secs(s: float) -> str:
@@ -705,14 +675,14 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
         env[k] = new_val
 
     print(
-        "info: applied embedded CFLAGS defaults for size (override with env:CFLAGS... "
-        "or disable via env:SEDSNET_EMBEDDED_CFLAGS_AUTO=0)."
+        "info: applied embedded CFLAGS defaults for size (override with --env CFLAGS=... "
+        "or disable via --env SEDSNET_EMBEDDED_CFLAGS_AUTO=0)."
     )
 
 
 def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root: Path) -> None:
     run_cmd(
-        ["maturin", "build", *build_mode],
+        ["maturin", "build", *build_mode, *(["--target", target] if target else []), *(["--features", ",".join(feature_parts)] if feature_parts else [])],
         env=env,
         repo_root=repo_root,
         title="maturin build (wheel)",
@@ -878,137 +848,24 @@ def main(argv: list[str]) -> None:
     repo_root = Path(__file__).parent.resolve()
     os.chdir(repo_root)
 
+    args = parse_args(argv)
     build_mode: list[str] = []
-    checks = False
-    tests = False
-    test_full = False
-    build_embedded = False
-    build_python = False
-    build_timesync = False
-    build_cryptography = False
-    compact_features = []
-    build_wheel = False
-    develop_wheel = False
-    release_build = False
-    install_wheel = False
-    maturin_login = False
-    target = ""
-    device_id = ""
-    schema_path = ""
-    ipc_schema_path = ""
-
-    env_overrides: dict[str, str] = {}
-
-    for arg in argv:
-        if arg in ("-h", "--help", "help"):
-            print_help()
-
-        elif arg == "release":
-            print("Building release version.")
-            release_build = True
-
-        elif arg == "test":
-            tests = True
-
-        elif arg == "full":
-            test_full = True
-
-        elif arg == "check":
-            checks = True
-
-        elif arg == "embedded":
-            print("Building for Embedded target.")
-            build_embedded = True
-
-        elif arg == "python":
-            print("Building Python bindings.")
-            build_python = True
-
-        elif arg == "timesync":
-            print("Building with time sync helpers.")
-            build_timesync = True
-
-        elif arg in ("compact-packet-store", "compact-packet-compression", "fair-admission"):
-            compact_features.append(arg)
-        elif arg == "cryptography":
-            print("Building with cryptography provider APIs.")
-            build_cryptography = True
-
-        elif arg == "maturin-build":
-            print("Building Python wheel.")
-            build_wheel = True
-
-        elif arg == "maturin-develop":
-            print("Building and installing Python wheel in development mode.")
-            develop_wheel = True
-
-        elif arg == "maturin-install":
-            print("Installing Python wheel.")
-            install_wheel = True
-
-        elif arg == "maturin-login":
-            maturin_login = True
-
-        elif arg.startswith("target="):
-            target = arg.split("=", 1)[1]
-            print(f"Target set to: {target}")
-
-        elif arg.startswith("device_id="):
-            device_id = arg.split("=", 1)[1]
-            print(f"Device identifier set to: {device_id}")
-
-        elif arg.startswith("static_schema_path=") or arg.startswith("schema_path="):
-            schema_path = arg.split("=", 1)[1]
-            if not schema_path:
-                print_help("static_schema_path requires a value")
-            env_overrides["SEDSNET_STATIC_SCHEMA_PATH"] = schema_path
-
-        elif arg.startswith("static_ipc_schema_path=") or arg.startswith("ipc_schema_path="):
-            ipc_schema_path = arg.split("=", 1)[1]
-            if not ipc_schema_path:
-                print_help("static_ipc_schema_path requires a value")
-            env_overrides["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = ipc_schema_path
-
-        elif arg.startswith("max_stack_payload="):
-            v = arg.split("=", 1)[1].strip()
-            if not v:
-                print_help("max_stack_payload requires a value")
-            env_overrides["MAX_STACK_PAYLOAD"] = v
-
-        elif arg.startswith("max_queue_budget="):
-            v = arg.split("=", 1)[1].strip()
-            if not v:
-                print_help("max_queue_budget requires a value")
-            env_overrides["MAX_QUEUE_BUDGET"] = v
-
-        elif arg.startswith("max_queue_size="):
-            v = arg.split("=", 1)[1].strip()
-            if not v:
-                print_help("max_queue_size requires a value")
-            env_overrides["MAX_QUEUE_BUDGET"] = v
-
-        elif arg.startswith("max_recent_rx_ids="):
-            v = arg.split("=", 1)[1].strip()
-            if not v:
-                print_help("max_recent_rx_ids requires a value")
-            env_overrides["MAX_RECENT_RX_IDS"] = v
-
-        elif arg.startswith("env:"):
-            rest = arg[4:]
-            if "=" not in rest:
-                print_help("env:KEY=VALUE requires '='")
-            k, v = rest.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if not k:
-                print_help("env:KEY=VALUE requires a non-empty KEY")
-            env_overrides[k] = v
-
-        else:
-            print_help(f"Unknown option: {arg}")
-
-    if test_full and not tests:
-        print_help("full is only valid with test, e.g. `build.py test full`")
+    checks = args.command == "check"
+    tests = args.command == "test"
+    test_full = args.full
+    build_embedded = "embedded" in args.features
+    build_python = "python" in args.features
+    build_timesync = "timesync" in args.features
+    build_cryptography = "cryptography" in args.features
+    compact_features = [f for f in args.features if f in ("compact-packet-store", "compact-packet-compression", "fair-admission")]
+    build_wheel = args.command == "maturin-build"
+    develop_wheel = args.command == "maturin-develop"
+    release_build = args.release
+    install_wheel = args.command == "maturin-install"
+    maturin_login = args.command == "maturin-login"
+    target = args.target
+    device_id = args.device_id
+    env_overrides: dict[str, str] = args.env_overrides
 
     env = os.environ.copy()
     if device_id:
@@ -1288,7 +1145,7 @@ def main(argv: list[str]) -> None:
         return
 
     if build_python:
-        build_args = ["--features", f"python{feature_suffix}"]
+        build_args = ["--features", f"python{feature_suffix}", *(["--target", target] if target else [])]
         run_cmd(
             ["cargo", "build", *build_mode, *build_args],
             env=env,
@@ -1306,7 +1163,7 @@ def main(argv: list[str]) -> None:
 
     if build_wheel:
         run_cmd(
-            ["maturin", "build", *build_mode],
+            ["maturin", "build", *build_mode, *(["--target", target] if target else []), *(["--features", ",".join(feature_parts)] if feature_parts else [])],
             env=env,
             repo_root=repo_root,
             title="maturin build (wheel)",
@@ -1316,7 +1173,7 @@ def main(argv: list[str]) -> None:
 
     if develop_wheel:
         run_cmd(
-            ["maturin", "develop", *build_mode],
+            ["maturin", "develop", *build_mode, *(["--target", target] if target else []), *(["--features", ",".join(feature_parts)] if feature_parts else [])],
             env=env,
             repo_root=repo_root,
             title="maturin develop (installs into env)",

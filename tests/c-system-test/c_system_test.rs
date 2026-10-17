@@ -84,8 +84,9 @@ mod c_system_test {
         let mut prebuild = Command::new("python3");
         prebuild
             .arg("build.py")
-            .arg("timesync")
-            .arg("device_id=SYSTEM_TEST")
+            .arg("build")
+            .arg("--features=timesync")
+            .arg("--device-id=SYSTEM_TEST")
             .current_dir(&repo_root);
         if cfg!(target_os = "macos") {
             prebuild.env("MACOSX_DEPLOYMENT_TARGET", macos_deployment_target);

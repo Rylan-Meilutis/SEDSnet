@@ -57,7 +57,7 @@ What it demonstrates:
 
 Suggested first steps:
 
-1. Build Python bindings with `./build.py python` or `./build.py maturin-install`; see
+1. Build Python bindings with `./build.py build --features python` or `./build.py maturin-install`; see
    [build.py](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py).
 2. Run the example script.
 3. Inspect printed packets to see decoded values.

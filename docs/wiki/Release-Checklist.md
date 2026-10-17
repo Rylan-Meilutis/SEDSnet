@@ -8,7 +8,7 @@ Run the default and full test routes:
 
 ```sh
 python3 build.py test
-python3 build.py test full
+python3 build.py test --full
 ```
 
 Run package checks:

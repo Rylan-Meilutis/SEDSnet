@@ -463,13 +463,13 @@ Full release history: [CHANGELOG.md](./CHANGELOG.md).
 
 To build the library in a C project, just include the library as a submodule or subtree and link it in your
 cmakelists.txt as shown below.
-For other build systems, `build.py` can produce the Rust `rlib` and static library, plus a host
+For other build systems, `build.py build` can produce the Rust `rlib` and static library, plus a host
 `cdylib` when Python bindings are enabled. Link the artifact appropriate for your project.
 
 Building with python bindings can be done with the build script on posix systems:
 
 ```
-./build.py release maturin-develop
+./build.py maturin-develop --release
 ```
 
 Embedded builds produce a static library that can be linked to C code. Final flash use depends on
@@ -496,38 +496,38 @@ Rules that matter in practice:
 ### build.py usage
 
 ```
-./build.py [OPTIONS]
+./build.py build [OPTIONS]
 
 Options:
-  release                 Build in release mode.
+  --release               Build in release mode.
   check                   Run cargo clippy with -D warnings for default, python, and embedded builds.
   test                    Run the clippy checks, nextest/cargo tests, a stable Criterion benchmark smoke pass, and also validate python plus embedded builds when the cross C toolchain exists.
-  embedded                Build for the embedded target (enables embedded feature).
-  python                  Build with Python bindings (enables python feature).
-  timesync                Build with time sync helpers (enables timesync feature).
+  --features embedded     Build for the embedded target (enables embedded feature).
+  --features python       Build with Python bindings (enables python feature).
+  --features timesync     Build with time sync helpers (enables timesync feature).
   maturin-build           Run maturin build.
   maturin-develop         Run maturin develop.
   maturin-install         Build wheel and install it with uv pip install.
-  target=<triple>         Set Rust compilation target (e.g. target=thumbv7em-none-eabihf).
-  device_id=<id>          Set the packaged DEVICE_IDENTIFIER default for the build.
-  static_schema_path=<path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
-  static_ipc_schema_path=<path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for a runtime IPC/link-local seed.
-  max_queue_budget=<n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
-  max_recent_rx_ids=<n>   Set MAX_RECENT_RX_IDS for the preallocated recent-ID cache.
-  max_stack_payload=<n>   Set MAX_STACK_PAYLOAD for define_stack_payload!(env="MAX_STACK_PAYLOAD", ...).
-  env:KEY=VALUE           Set arbitrary environment variable(s) for the build (repeatable).
+  --target <triple>         Set Rust compilation target (e.g. --target thumbv7em-none-eabihf).
+  --device-id <id>          Set the packaged DEVICE_IDENTIFIER default for the build.
+  --static-schema-path <path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
+  --static-ipc-schema-path <path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for a runtime IPC/link-local seed.
+  --max-queue-budget <n>    Set MAX_QUEUE_BUDGET for the shared router/relay queue budget.
+  --max-recent-rx-ids <n>   Set MAX_RECENT_RX_IDS for the preallocated recent-ID cache.
+  --max-stack-payload <n>   Set MAX_STACK_PAYLOAD for define_stack_payload!(env="MAX_STACK_PAYLOAD", ...).
+  --env KEY=VALUE           Set arbitrary environment variable(s) for the build (repeatable).
 ```
 
 Examples:
 
 ```
-./build.py release
+./build.py build --release
 ./build.py check
-./build.py check release
-./build.py embedded release target=thumbv7em-none-eabihf device_id=FC
-./build.py python
-./build.py test release
-./build.py maturin-install max_recent_rx_ids=256 env:MAX_STACK_PAYLOAD=128
+./build.py check --release
+./build.py build --release --target thumbv7em-none-eabihf --device-id=FC --features embedded
+./build.py build --features python
+./build.py test --release
+./build.py maturin-install --max-recent-rx-ids=256 --env MAX_STACK_PAYLOAD=128
 ```
 
 ## Dependencies
@@ -767,9 +767,9 @@ set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
 ```bash
 # Host build
-./build.py release device_id=GROUND_STATION
+./build.py build --release --device-id=GROUND_STATION
 # Embedded build
-./build.py embedded release target=thumbv7em-none-eabihf device_id=FC
+./build.py build --release --target thumbv7em-none-eabihf --device-id=FC --features embedded
 ```
 
 ---

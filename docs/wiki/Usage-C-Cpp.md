@@ -502,7 +502,7 @@ void publish_state(SedsRouter *router, uint8_t state)
 
 ## Optional Cryptography Provider
 
-Enable the cryptography provider APIs with Cargo feature `cryptography`, build.py option `cryptography`, or
+Enable the cryptography provider APIs with Cargo feature `cryptography`, build.py option `--features cryptography`, or
 CMake option `SEDSNET_ENABLE_CRYPTOGRAPHY`. C/C++ builds receive the
 `SEDS_ENABLE_CRYPTOGRAPHY` define automatically when the CMake option is enabled.
 

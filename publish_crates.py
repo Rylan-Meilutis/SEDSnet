@@ -710,7 +710,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quick-tests",
         action="store_true",
-        help="Run python3 build.py test instead of python3 build.py test full.",
+        help="Run python3 build.py test instead of python3 build.py test --full.",
     )
     parser.add_argument(
         "--skip-package",
@@ -799,10 +799,10 @@ def main() -> int:
     if not args.skip_tests:
         test_cmd = ["python3", "build.py", "test"]
         if not args.quick_tests:
-            test_cmd.append("full")
+            test_cmd.append("--full")
         run(test_cmd)
         # Check the opt-in arena/codec as well as the unchanged default build.
-        run(["python3", "build.py", "test", "compact-packet-compression", "fair-admission"])
+        run(["python3", "build.py", "test", "--features", "compact-packet-compression,fair-admission"])
 
     if not args.skip_crates:
         if not args.skip_package:

@@ -17,13 +17,13 @@ a wrapper around Cargo and Maturin that:
 Examples:
 
 ```
-./build.py release
+./build.py build --release
 ./build.py check
-./build.py check release
-./build.py embedded release target=thumbv7em-none-eabihf device_id=FC
-./build.py python
-./build.py test release
-./build.py maturin-install max_recent_rx_ids=256 env:MAX_STACK_PAYLOAD=128
+./build.py check --release
+./build.py build --release --target thumbv7em-none-eabihf --device-id=FC --features embedded
+./build.py build --features python
+./build.py test --release
+./build.py maturin-install --max-recent-rx-ids=256 --env MAX_STACK_PAYLOAD=128
 ```
 
 Useful options:
@@ -37,16 +37,16 @@ Useful options:
     - `cargo build --features python`
     - `cargo build --no-default-features --target <embedded-target> --features embedded` when a matching cross C
       toolchain is available
-- `device_id=<id>` sets the packaged `DEVICE_IDENTIFIER` default for the build.
-- `static_schema_path=<path>` sets `SEDSNET_STATIC_SCHEMA_PATH` for runtime registry seeding.
-- `static_ipc_schema_path=<path>` sets `SEDSNET_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
-- `max_stack_payload=<n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
-- `env:SCHEMA_JSON_CHUNK_BYTES=<n>` selects the fixed host/std JSON file read buffer (512 bytes by
+- `--device-id <id>` sets the packaged `DEVICE_IDENTIFIER` default for the build.
+- `--static-schema-path <path>` sets `SEDSNET_STATIC_SCHEMA_PATH` for runtime registry seeding.
+- `--static-ipc-schema-path <path>` sets `SEDSNET_STATIC_IPC_SCHEMA_PATH` for a runtime IPC/link-local seed.
+- `--max-stack-payload <n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
+- `--env SCHEMA_JSON_CHUNK_BYTES=<n>` selects the fixed host/std JSON file read buffer (512 bytes by
   default). It does not apply to `no_std` builds, which allocate no file-read buffer.
 - `cryptography` is enabled by default and provides the cryptography provider APIs.
-- `env:KEY=VALUE` passes any compile-time env var used by
+- `--env KEY=VALUE` passes any compile-time env var used by
   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
-- `target=<triple>` sets the Rust target triple for embedded builds.
+- `--target <triple>` sets the Rust target triple for embedded builds.
 
 ## Cargo features
 
@@ -156,7 +156,7 @@ set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 build.py ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py)):
 
 ```
-./build.py release device_id=GROUND_STATION
+./build.py build --release --device-id=GROUND_STATION
 ```
 
 Runtime overrides:
@@ -173,7 +173,7 @@ Runtime overrides:
 Configuration values are read via `option_env!` in
 src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 You can set them via `.cargo/config.toml`,
-`build.py env:KEY=VALUE`, or CMake `SEDSNET_ENV_<KEY>` variables.
+`build.py build --env KEY=VALUE`, or CMake `SEDSNET_ENV_<KEY>` variables.
 
 These values are packaged defaults, not fixed board behavior for host/prebuilt builds. The active node can change
 identity, time-sync role, memory pool limits, retry/reliable queue limits, string/binary static sizing, float string
@@ -225,7 +225,7 @@ dynamically. The recent packet ID cache preallocates
 amount from the same budget.
 
 `MAX_QUEUE_SIZE` is still accepted as a legacy environment alias for the default budget, but new
-builds should use `MAX_QUEUE_BUDGET`, `build.py max_queue_budget=<n>`, or CMake
+builds should use `MAX_QUEUE_BUDGET`, `build.py build --max-queue-budget=<n>`, or CMake
 `SEDSNET_MAX_QUEUE_BUDGET` only when they want to change the packaged default.
 
 ## Runtime telemetry schema
@@ -321,7 +321,7 @@ Python bindings are built with `maturin`.
 
 Options:
 
-- `./build.py python` (develop build)
+- `./build.py build --features python` (develop build)
 - `./build.py maturin-build` (wheel)
 - `./build.py maturin-install` (build + install)
 
@@ -352,7 +352,7 @@ See [Usage-C-Cpp](Usage-C-Cpp) for an example stub implementation.
 
 Hosted builds use bounded stack-only arbitration when an application memory probe
 refuses best-effort ingress. Embedded bridges enable it with
-`python3 build.py embedded fair-admission release`, or CMake
+`python3 build.py build --release --features embedded,fair-admission`, or CMake
 `SEDSNET_FAIR_ADMISSION=ON`. Flash-constrained leaf builds may leave it off.
 It reclaims queued bulk from a dominant competing sender and retries the complete
 admission estimate; it does not grow pools, lower safety reserves or evict routes,

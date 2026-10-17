@@ -7,7 +7,7 @@ Python bindings are built with `pyo3` and `maturin`. The module name is `sedsnet
 Recommended in this repo:
 
 ```bash
-./build.py python
+./build.py build --features python
 ```
 
 Direct `maturin` is also supported:

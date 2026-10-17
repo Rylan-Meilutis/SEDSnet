@@ -104,7 +104,7 @@ If C system tests print warnings like "object file ... built for newer 'macOS' v
 
 ## Python import fails
 
-- Ensure you built the extension with `./build.py python` or `maturin develop`; see
+- Ensure you built the extension with `./build.py build --features python` or `maturin develop`; see
   [build.py](https://github.com/Rylan-Meilutis/sedsnet/blob/main/build.py).
 - Verify you are using the same Python interpreter/venv used for the build.
 - If runtime schema names are missing, seed/register the schema in that process; rebuilding is only

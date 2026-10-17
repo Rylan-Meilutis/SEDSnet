@@ -40,7 +40,7 @@ set(SEDSNET_SCHEMA_PATH "" CACHE STRING
 #   set(SEDSNET_ENV_QUEUE_GROW_STEP "2.0" CACHE STRING "" FORCE)
 # Prefer the dedicated cache variables above for MAX_QUEUE_BUDGET and MAX_RECENT_RX_IDS.
 #
-# These will be forwarded as build.py args: env:ENVKEY=VALUE
+# These will be forwarded as build.py args: --env ENVKEY=VALUE
 
 # ============================================================
 # Detect embedded build
@@ -124,103 +124,62 @@ if (NOT EXISTS "${RS_HEADER}")
 endif ()
 
 # ============================================================
-# Build.py args (for logging only)
+# Shared queue budget; retain the old CMake cache name as an input alias.
 # ============================================================
-set(RS_ARGS_STR "")
-if (SEDSNET_EMBEDDED_BUILD)
-    set(RS_ARGS_STR "${RS_ARGS_STR} embedded")
-endif ()
-if (NOT RUST_TRIPLE STREQUAL "")
-    set(RS_ARGS_STR "${RS_ARGS_STR} target=${RUST_TRIPLE}")
-endif ()
-if (NOT SEDSNET_DEVICE_IDENTIFIER STREQUAL "")
-    set(RS_ARGS_STR "${RS_ARGS_STR} device_id=${SEDSNET_DEVICE_IDENTIFIER}")
-endif ()
-if (NOT SEDSNET_MAX_STACK_PAYLOAD STREQUAL "")
-    set(RS_ARGS_STR "${RS_ARGS_STR} max_stack_payload=${SEDSNET_MAX_STACK_PAYLOAD}")
-endif ()
 set(_SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET "${SEDSNET_MAX_QUEUE_BUDGET}")
 if (_SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET STREQUAL "" AND NOT SEDSNET_MAX_QUEUE_SIZE STREQUAL "")
     set(_SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET "${SEDSNET_MAX_QUEUE_SIZE}")
-endif ()
-if (NOT _SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET STREQUAL "")
-    set(RS_ARGS_STR "${RS_ARGS_STR} max_queue_budget=${_SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET}")
-endif ()
-if (NOT SEDSNET_MAX_RECENT_RX_IDS STREQUAL "")
-    set(RS_ARGS_STR "${RS_ARGS_STR} max_recent_rx_ids=${SEDSNET_MAX_RECENT_RX_IDS}")
-endif ()
-if (NOT SEDSNET_SCHEMA_PATH STREQUAL "")
-    set(RS_ARGS_STR "${RS_ARGS_STR} schema_path=${SEDSNET_SCHEMA_PATH}")
-endif ()
-if (SEDSNET_COMPACT_PACKET_COMPRESSION)
-    set(RS_ARGS_STR "${RS_ARGS_STR} compact-packet-compression")
-elseif (SEDSNET_COMPACT_PACKET_STORE)
-    set(RS_ARGS_STR "${RS_ARGS_STR} compact-packet-store")
-endif ()
-if (SEDSNET_FAIR_ADMISSION)
-    set(RS_ARGS_STR "${RS_ARGS_STR} fair-admission")
-endif ()
-if (SEDSNET_ENABLE_CRYPTOGRAPHY)
-    set(RS_ARGS_STR "${RS_ARGS_STR} cryptography")
-endif ()
-
-if (SEDSNET_FORCE_RELEASE)
-    set(RS_ARGS_STR "${RS_ARGS_STR} release")
-else ()
-    # Show release in log string
-    set(RS_ARG_REL " $<$<CONFIG:Release>:release>")
-    set(RS_ARGS_STR "${RS_ARGS_STR} ${RS_ARG_REL}")
 endif ()
 
 # ============================================================
 # Configure-time args passed to build.py (list form)
 # ============================================================
-set(RS_ARGS_BOOTSTRAP "")
+set(RS_ARGS_BOOTSTRAP "build")
 
 if (SEDSNET_EMBEDDED_BUILD)
-    list(APPEND RS_ARGS_BOOTSTRAP "embedded")
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "embedded")
 endif ()
 
 if (NOT RUST_TRIPLE STREQUAL "")
-    list(APPEND RS_ARGS_BOOTSTRAP "target=${RUST_TRIPLE}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--target=${RUST_TRIPLE}")
 endif ()
 
 # NOTE: When using multi-config generators (VS/Xcode), CMAKE_BUILD_TYPE is empty.
 # We rely on the build step to rebuild as needed anyway; default to Debug.
 if (SEDSNET_FORCE_RELEASE OR CMAKE_BUILD_TYPE STREQUAL "Release")
-    list(APPEND RS_ARGS_BOOTSTRAP "release")
+    list(APPEND RS_ARGS_BOOTSTRAP "--release")
 endif ()
 
 if (NOT SEDSNET_DEVICE_IDENTIFIER STREQUAL "")
-    list(APPEND RS_ARGS_BOOTSTRAP "device_id=${SEDSNET_DEVICE_IDENTIFIER}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--device-id=${SEDSNET_DEVICE_IDENTIFIER}")
 endif ()
 
 # New: forward proc-macro env var
 if (NOT SEDSNET_MAX_STACK_PAYLOAD STREQUAL "")
-    list(APPEND RS_ARGS_BOOTSTRAP "max_stack_payload=${SEDSNET_MAX_STACK_PAYLOAD}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--max-stack-payload=${SEDSNET_MAX_STACK_PAYLOAD}")
 endif ()
 if (NOT _SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET STREQUAL "")
-    list(APPEND RS_ARGS_BOOTSTRAP "max_queue_budget=${_SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--max-queue-budget=${_SEDSNET_EFFECTIVE_MAX_QUEUE_BUDGET}")
 endif ()
 if (NOT SEDSNET_MAX_RECENT_RX_IDS STREQUAL "")
-    list(APPEND RS_ARGS_BOOTSTRAP "max_recent_rx_ids=${SEDSNET_MAX_RECENT_RX_IDS}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--max-recent-rx-ids=${SEDSNET_MAX_RECENT_RX_IDS}")
 endif ()
 if (NOT SEDSNET_SCHEMA_PATH STREQUAL "")
-    list(APPEND RS_ARGS_BOOTSTRAP "schema_path=${SEDSNET_SCHEMA_PATH}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--static-schema-path=${SEDSNET_SCHEMA_PATH}")
 endif ()
 if (SEDSNET_COMPACT_PACKET_COMPRESSION)
-    list(APPEND RS_ARGS_BOOTSTRAP "compact-packet-compression")
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "compact-packet-compression")
 elseif (SEDSNET_COMPACT_PACKET_STORE)
-    list(APPEND RS_ARGS_BOOTSTRAP "compact-packet-store")
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "compact-packet-store")
 endif ()
 if (SEDSNET_FAIR_ADMISSION)
-    list(APPEND RS_ARGS_BOOTSTRAP "fair-admission")
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "fair-admission")
 endif ()
 if (SEDSNET_ENABLE_CRYPTOGRAPHY)
-    list(APPEND RS_ARGS_BOOTSTRAP "cryptography")
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "cryptography")
 endif ()
 
-# New: forward arbitrary option_env config vars: SEDSNET_ENV_<KEY> => env:KEY=VALUE
+# New: forward arbitrary option_env config vars: SEDSNET_ENV_<KEY> => --env KEY=VALUE
 get_cmake_property(_all_cache_vars CACHE_VARIABLES)
 foreach (_v ${_all_cache_vars})
     if (_v MATCHES "^SEDSNET_ENV_(.+)$")
@@ -228,12 +187,12 @@ foreach (_v ${_all_cache_vars})
         # Value comes from the cache variable
         set(_env_val "${${_v}}")
         if (NOT _env_val STREQUAL "")
-            list(APPEND RS_ARGS_BOOTSTRAP "env:${_env_key}=${_env_val}")
-            # Also append to logging string
-            set(RS_ARGS_STR "${RS_ARGS_STR} env:${_env_key}=${_env_val}")
+            list(APPEND RS_ARGS_BOOTSTRAP "--env" "${_env_key}=${_env_val}")
         endif ()
     endif ()
 endforeach ()
+
+string(JOIN " " RS_ARGS_STR ${RS_ARGS_BOOTSTRAP})
 
 # Keep Rust staticlib object deployment target aligned with C/C++ link target on macOS.
 set(_RS_ENV_CMD ${CMAKE_COMMAND} -E env)
@@ -246,6 +205,7 @@ endif ()
 # ============================================================
 file(GLOB_RECURSE RS_SRC CONFIGURE_DEPENDS
     "${RUST_DIR}/src/*.rs"
+    "${RUST_DIR}/build.py"
     "${RUST_DIR}/build.rs"
     "${RUST_DIR}/Cargo.toml"
     "${RUST_DIR}/Cargo.lock"
@@ -298,10 +258,13 @@ endif ()
 add_dependencies(sedsnet sedsnet_build)
 
 # Security flags for embedded
-include(CheckLinkerFlag)
-include(CheckCCompilerFlag)
-check_linker_flag(C "-Wl,-z,noexecstack" HAVE_LD_NOEXECSTACK)
-check_c_compiler_flag("-Wa,--noexecstack" HAVE_AS_NOEXECSTACK)
+# Rust-only standalone builds have no enabled C compiler to probe.
+if (CMAKE_C_COMPILER_LOADED)
+    include(CheckLinkerFlag)
+    include(CheckCCompilerFlag)
+    check_linker_flag(C "-Wl,-z,noexecstack" HAVE_LD_NOEXECSTACK)
+    check_c_compiler_flag("-Wa,--noexecstack" HAVE_AS_NOEXECSTACK)
+endif ()
 
 if (SEDSNET_EMBEDDED_BUILD)
     target_compile_options(sedsnet INTERFACE -Wa,--noexecstack)
@@ -342,14 +305,16 @@ if (SEDSNET_ENABLE_CPP_WRAPPER)
     add_library(sedsnet::cpp_wrapper ALIAS sedsnet_cpp_wrapper)
 endif ()
 
-set(SEDSNET_LIB_DEBUG "${RS_LIB_DBG}" PARENT_SCOPE)
-set(SEDSNET_LIB_RELEASE "${RS_LIB_REL}" PARENT_SCOPE)
-set(SEDSNET_STATIC_LIB_DEBUG "${RS_STATIC_LIB_DBG}" PARENT_SCOPE)
-set(SEDSNET_STATIC_LIB_RELEASE "${RS_STATIC_LIB_REL}" PARENT_SCOPE)
-set(SEDSNET_SHARED_LIB_DEBUG "${RS_SHARED_LIB_DBG}" PARENT_SCOPE)
-set(SEDSNET_SHARED_LIB_RELEASE "${RS_SHARED_LIB_REL}" PARENT_SCOPE)
-set(SEDSNET_INCLUDE_DIR "${RS_INCLUDE}" PARENT_SCOPE)
-set(SEDSNET_C_WRAPPER_INCLUDE_DIR "${RUST_DIR}/c-wrapper" PARENT_SCOPE)
+if (NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(SEDSNET_LIB_DEBUG "${RS_LIB_DBG}" PARENT_SCOPE)
+    set(SEDSNET_LIB_RELEASE "${RS_LIB_REL}" PARENT_SCOPE)
+    set(SEDSNET_STATIC_LIB_DEBUG "${RS_STATIC_LIB_DBG}" PARENT_SCOPE)
+    set(SEDSNET_STATIC_LIB_RELEASE "${RS_STATIC_LIB_REL}" PARENT_SCOPE)
+    set(SEDSNET_SHARED_LIB_DEBUG "${RS_SHARED_LIB_DBG}" PARENT_SCOPE)
+    set(SEDSNET_SHARED_LIB_RELEASE "${RS_SHARED_LIB_REL}" PARENT_SCOPE)
+    set(SEDSNET_INCLUDE_DIR "${RS_INCLUDE}" PARENT_SCOPE)
+    set(SEDSNET_C_WRAPPER_INCLUDE_DIR "${RUST_DIR}/c-wrapper" PARENT_SCOPE)
+endif ()
 
 message(STATUS "sedsnet include dir: ${RS_INCLUDE}")
 message(STATUS "sedsnet debug lib:  ${RS_LIB_DBG}")

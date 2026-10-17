@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Use Cargo-style build commands and options: `build`, `check`, `test`,
+  `--release`, `--features`, `--target`, and named configuration flags.
+  Migrate CMake, C integration tests, release tooling, and usage documentation
+  together. Runtime APIs, wire format, and firmware build.py flags are unchanged.
+
 ## 4.2.3
 
 - Serialize normalized topology graphs by borrowing their nodes and strings;
