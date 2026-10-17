@@ -57,7 +57,7 @@ SEDSnet is platform-agnostic and can be used on any platform that supports Rust.
 to be used in embedded systems and used by a C program, but can also be used in desktop applications and other rust
 codebases.
 
-SEDSnet also supports python bindings via pyo3. to use you need maturin installed to build the python package.
+SEDSnet provides Python bindings for Python 3.9 and newer through PyO3. Install maturin to build the package. Wheels use the Python 3.9 stable ABI (`cp39-abi3`), retaining Python 3.9 and 3.10 compatibility while dropping Python 3.8.
 
 With the optional `discovery` feature, routers and relays can exchange built-in discovery packets, learn which
 endpoints are reachable through which sides, adapt the announce rate as the topology changes, and export a live topology

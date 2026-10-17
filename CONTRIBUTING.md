@@ -31,7 +31,7 @@ and testing rules, and how to submit changes.
 ## Development setup
 
 - Install Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- Install Python 3.8+ and a virtual environment:
+- Install Python 3.9+ and a virtual environment:
     - `python3 -m venv .venv && source .venv/bin/activate`
     - On Windows PowerShell: `py -3 -m venv .venv; .\.venv\Scripts\Activate.ps1`
     - Install Python build/test tools as needed: `python -m pip install maturin twine pytest`

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Upgrade PyO3 to 0.30.1 and require Python 3.9 or newer for Python bindings.
+  Build stable-ABI wheels from Python 3.9 (`cp39-abi3`), retaining Python 3.9
+  and 3.10 support while dropping Python 3.8. Embedded/Rust/C wire formats and APIs are unchanged.
+
 - Use Cargo-style build commands and options: `build`, `check`, `test`,
   `--release`, `--features`, `--target`, and named configuration flags.
   Migrate CMake, C integration tests, release tooling, and usage documentation
