@@ -1,0 +1,57 @@
+{
+  "date": "2026-10-19",
+  "scope": "Native C integration test harness only; no production firmware/runtime change",
+  "failure": {
+    "release_build": "passed",
+    "first_executable_signal": 11,
+    "cause": "NDEBUG removed assert(node_init(...)) setup calls; workers received uninitialized SimNode storage",
+    "capture": "Local LLDB Router::poll_timesync / seds_router_process_tx_queue_with_timeout null-derived accesses"
+  },
+  "fix": [
+    "Keep assertions enabled for all five C test targets in every configuration",
+    "Compile-time guard rejects disabled assertions",
+    "Register all five programs with CTest and bound execution time",
+    "Existing Rust/CI harness now uses Release and respects an explicit macOS deployment target; default 11.0"
+  ],
+  "checks": {
+    "release_ctest": [
+      {
+        "step": 0,
+        "exit": 0,
+        "wall_seconds": 13.401032916735858
+      },
+      {
+        "step": 1,
+        "exit": 0,
+        "wall_seconds": 35.73497787490487
+      },
+      {
+        "step": 2,
+        "exit": 0,
+        "wall_seconds": 3.321536375209689
+      }
+    ],
+    "rust_release_harness_gate": {
+      "test_target": "c-system-test",
+      "exit": 0,
+      "wall_seconds": 33.18643583264202
+    },
+    "assertion_guard": [
+      {
+        "flags": [
+          "-DNDEBUG"
+        ],
+        "exit": 1,
+        "assertion_guard_rejected_disabled_checks": true
+      },
+      {
+        "flags": [
+          "-DNDEBUG",
+          "-UNDEBUG"
+        ],
+        "exit": 0,
+        "assertion_guard_rejected_disabled_checks": false
+      }
+    ]
+  }
+}

@@ -1748,10 +1748,14 @@ pub fn schema_fingerprint() -> u64 {
 
 #[cfg(feature = "std")]
 pub fn schema_bytes_used() -> usize {
-    registry()
-        .lock()
-        .expect("schema registry poisoned")
-        .schema_byte_cost()
+    // A memory query must not initialize/allocate the hosted registry. Until
+    // the first schema operation, no registry heap storage is retained.
+    REGISTRY.get().map_or(0, |registry| {
+        registry
+            .lock()
+            .expect("schema registry poisoned")
+            .schema_byte_cost()
+    })
 }
 
 #[cfg(feature = "std")]

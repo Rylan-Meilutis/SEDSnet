@@ -71,3 +71,25 @@ target_link_libraries(c_system_multi_endpoint_topology_test PRIVATE sedsnet)
 target_include_directories(c_system_multi_endpoint_topology_test PRIVATE "${SEDSNET_INCLUDE_DIR}")
 target_link_libraries(c_system_runtime_schema_test PRIVATE sedsnet::c_wrapper)
 target_include_directories(c_system_runtime_schema_test PRIVATE "${SEDSNET_INCLUDE_DIR}")
+
+# These are test programs: NDEBUG must never remove their checks or setup calls.
+set(_SEDSNET_C_TEST_TARGETS
+    c_system_test
+    c_system_timesync_test
+    c_system_board_topology_timesync_test
+    c_system_multi_endpoint_topology_test
+    c_system_runtime_schema_test
+)
+include(CTest)
+foreach(_test IN LISTS _SEDSNET_C_TEST_TARGETS)
+    target_include_directories(${_test} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(MSVC)
+        target_compile_options(${_test} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${_test} PRIVATE -UNDEBUG)
+    endif()
+    if(BUILD_TESTING)
+        add_test(NAME ${_test} COMMAND ${_test})
+        set_tests_properties(${_test} PROPERTIES TIMEOUT 180)
+    endif()
+endforeach()

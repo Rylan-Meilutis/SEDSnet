@@ -84,11 +84,34 @@ impl SideTransportFrames {
             return Err(TelemetryError::BadArg);
         }
         self.index = *next;
-        while let Some(frame) = self.next() {
+        loop {
+            if !self.admits_next() {
+                return Err(TelemetryError::Io("memory pressure"));
+            }
+            let Some(frame) = self.next() else { break };
             send(frame.as_ref())?;
             *next = self.index;
         }
         Ok(())
+    }
+    // Keep one non-generic allocation boundary shared by router and relay
+    // handlers, instead of duplicating this preflight in every TX callback.
+    #[inline(never)]
+    fn admits_next(&self) -> bool {
+        if self.index < self.total && self.payload_budget != 0 {
+            // A TX callback may retain its chunk and exhaust contiguous space.
+            // Retry must leave the next index unchanged when admission fails.
+            let remaining = self.frame.len() - self.index * self.payload_budget;
+            let bytes = remaining
+                .min(self.payload_budget)
+                .saturating_add(SIDE_TRANSPORT_CHUNK_OVERHEAD);
+            return crate::memory_admission::check(
+                bytes.saturating_add(256),
+                bytes.saturating_add(32),
+            )
+            .is_ok();
+        }
+        true
     }
     pub fn wire_len(&self) -> usize {
         self.frame.len()
@@ -133,25 +156,34 @@ impl ExactSizeIterator for SideTransportFrames {}
 pub(crate) struct SideHeaderTemplate {
     pub(crate) hash: u64,
     pub(crate) base_flags: u8,
-    pub(crate) prefix: crate::SharedBytes,
-    pub(crate) between: crate::SharedBytes,
+    // Tiny immutable codec metadata never enters the movable packet arena.
+    // Keep both ranges in one shared allocation rather than two wide handles.
+    header: Arc<[u8]>,
+    prefix_len: usize,
     pub(crate) reliable_flags: Option<u8>,
     pub(crate) reliable_compact: bool,
 }
 
 impl SideHeaderTemplate {
+    pub(crate) fn prefix(&self) -> &[u8] {
+        &self.header[..self.prefix_len]
+    }
+    pub(crate) fn between(&self) -> &[u8] {
+        &self.header[self.prefix_len..]
+    }
+
     /// Sender identity belongs to the retained, validated full header. Reading
     /// it requires no payload expansion, new cached fields or CRC pass.
     #[cfg(any(feature = "discovery", feature = "std", feature = "fair-admission"))]
     pub(crate) fn source_address(&self) -> Option<u32> {
         let mut off = 0;
-        u32::try_from(read_uleb128_local(&self.between, &mut off).ok()?).ok()
+        u32::try_from(read_uleb128_local(self.between(), &mut off).ok()?).ok()
     }
 
     pub(crate) fn data_type(&self) -> Option<DataType> {
         // The retained prefix begins with endpoint count, then type ULEB128.
         let mut off = 1;
-        let id = u32::try_from(read_uleb128_local(&self.prefix, &mut off).ok()?).ok()?;
+        let id = u32::try_from(read_uleb128_local(self.prefix(), &mut off).ok()?).ok()?;
         DataType::try_from_u32(id)
     }
 
@@ -164,7 +196,7 @@ impl SideHeaderTemplate {
         }
         // Prefix is endpoint count followed by the canonical type ULEB128.
         let mut off = 1;
-        read_uleb128_local(&self.prefix, &mut off)
+        read_uleb128_local(self.prefix(), &mut off)
             .ok()
             .is_some_and(|ty| {
                 ty == u64::from(DataType::ReliableAck.as_u32())
@@ -187,8 +219,15 @@ impl SideHeaderTemplateView<'_> {
         SideHeaderTemplate {
             hash: self.hash,
             base_flags: self.base_flags,
-            prefix: crate::shared_bytes::convert(Arc::<[u8]>::from(self.prefix)),
-            between: crate::shared_bytes::convert(Arc::<[u8]>::from(self.between)),
+            // The exact-size slice iterator builds the Arc directly; no
+            // concatenation buffer doubles peak header scratch storage.
+            header: self
+                .prefix
+                .iter()
+                .chain(self.between.iter())
+                .copied()
+                .collect(),
+            prefix_len: self.prefix.len(),
             reliable_flags: self.reliable_flags,
             reliable_compact: self.reliable_compact,
         }
@@ -481,16 +520,17 @@ pub(crate) fn reconstruct_side_compact_frame(
         None
     };
     let payload = &body[off..];
-    let mut raw =
-        Vec::with_capacity(1 + template.prefix.len() + template.between.len() + payload.len() + 32);
+    let mut raw = Vec::with_capacity(
+        1 + template.prefix().len() + template.between().len() + payload.len() + 32,
+    );
     raw.push(flags);
-    raw.extend_from_slice(&template.prefix);
+    raw.extend_from_slice(template.prefix());
     write_uleb128_local(data_size, &mut raw);
     write_uleb128_local(timestamp, &mut raw);
     if let Some(nonce) = nonce {
         write_uleb128_local(nonce, &mut raw);
     }
-    raw.extend_from_slice(&template.between);
+    raw.extend_from_slice(template.between());
     if let Some(rel_flags) = template.reliable_flags {
         let (seq, ack) =
             reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
@@ -631,6 +671,56 @@ pub(crate) fn send_packet_chunks(
 mod streamed_chunk_tests {
     use super::*;
     #[test]
+    fn lazy_chunks_recheck_fragmentation_and_resume_without_skipping() {
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static ALLOW: AtomicBool = AtomicBool::new(true);
+        static LARGEST: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn probe(_: usize, largest: usize) -> bool {
+            LARGEST.store(largest, Ordering::Relaxed);
+            ALLOW.load(Ordering::Relaxed)
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::memory_admission::set_probe(None);
+            }
+        }
+        let source: crate::SharedBytes =
+            crate::shared_bytes::convert(Arc::<[u8]>::from(vec![0x55; 3000]));
+        let expected = SideTransportFrames::split(source.clone(), 1024, b"GB")
+            .unwrap()
+            .collect::<Vec<_>>();
+        let mut frames = SideTransportFrames::split(source, 1024, b"GB").unwrap();
+        let mut actual = Vec::new();
+        let mut next = 0;
+        ALLOW.store(true, Ordering::Relaxed);
+        crate::memory_admission::set_probe(Some(probe));
+        let _reset = Reset;
+        let result = frames.send_resuming(&mut next, |bytes| {
+            actual.push(Arc::<[u8]>::from(bytes));
+            // Retained TX data leaves only small holes before the next chunk.
+            ALLOW.store(false, Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(matches!(result, Err(TelemetryError::Io("memory pressure"))));
+        assert_eq!(next, 1);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(LARGEST.load(Ordering::Relaxed), 1056);
+        ALLOW.store(true, Ordering::Relaxed);
+        frames
+            .send_resuming(&mut next, |bytes| {
+                actual.push(Arc::<[u8]>::from(bytes));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            actual.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
+            expected.iter().map(|b| b.as_ref()).collect::<Vec<_>>()
+        );
+        assert_eq!(next, expected.len());
+    }
+
+    #[test]
     fn streamed_chunks_match_canonical_frame_and_stop_on_callback_error() {
         let packet = crate::packet::Packet::new(
             DataType::DiscoverySchema,
@@ -675,55 +765,108 @@ pub(crate) struct SideChunkAssembly {
     pub(crate) last_seen_ms: u64,
     pub(crate) total: u16,
     pub(crate) received: BTreeMap<u16, crate::SharedBytes>,
+    pub(crate) payload_bytes: u16,
 }
 
 impl SideChunkAssembly {
+    #[inline(never)]
+    pub(crate) fn oldest(chunks: &BTreeMap<u32, Self>, keep: Option<u32>) -> Option<(u32, u64)> {
+        let mut victim = None;
+        let mut time = u64::MAX;
+        // B-tree iteration already breaks equal-time ties by transfer ID.
+        for (&id, assembly) in chunks {
+            if keep != Some(id) && (victim.is_none() || assembly.last_seen_ms < time) {
+                victim = Some(id);
+                time = assembly.last_seen_ms;
+            }
+        }
+        victim.map(|id| (id, time))
+    }
+    /// Retained cost, inspected only when removing an assembly or seeding tests.
+    pub(crate) fn byte_cost(&self) -> usize {
+        let payload = if self.payload_bytes == u16::MAX {
+            self.received.values().map(|p| p.len()).sum::<usize>()
+        } else {
+            usize::from(self.payload_bytes)
+        };
+        payload.saturating_add(self.received.len().saturating_mul(64))
+    }
+    pub(crate) fn insert_with(
+        &mut self,
+        index: u16,
+        make: impl FnOnce() -> crate::SharedBytes,
+    ) -> usize {
+        if let alloc::collections::btree_map::Entry::Vacant(slot) = self.received.entry(index) {
+            let bytes = make();
+            let cost = bytes.len().saturating_add(64);
+            self.payload_bytes = self
+                .payload_bytes
+                .saturating_add(u16::try_from(bytes.len()).unwrap_or(u16::MAX));
+            slot.insert(bytes);
+            cost
+        } else {
+            0
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, index: u16, bytes: crate::SharedBytes) {
+        self.insert_with(index, || bytes);
+    }
+    #[inline(never)]
+    pub(crate) fn remove(
+        chunks: &mut BTreeMap<u32, Self>,
+        buffered: &mut usize,
+        id: u32,
+    ) -> Option<Self> {
+        let value = chunks.remove(&id)?;
+        *buffered = buffered.saturating_sub(value.byte_cost());
+        Some(value)
+    }
+    #[inline(never)]
+    pub(crate) fn expire(chunks: &mut BTreeMap<u32, Self>, buffered: &mut usize, now: u64) -> u32 {
+        let mut reclaimed = 0u32;
+        // Each link admits at most four assemblies. Reuse ordinary removal
+        // rather than linking a second B-tree deletion/retention iterator.
+        while let Some(id) = chunks.iter().find_map(|(&id, assembly)| {
+            (now.saturating_sub(assembly.last_seen_ms) > 2000).then_some(id)
+        }) {
+            Self::remove(chunks, buffered, id);
+            reclaimed = reclaimed.saturating_add(1);
+        }
+        reclaimed
+    }
     pub(crate) fn make_room(
-        chunks: &mut BTreeMap<u32, SideChunkAssembly>,
+        chunks: &mut BTreeMap<u32, Self>,
+        buffered: &mut usize,
         transfer_id: u32,
         index: u16,
         total: u16,
         payload_len: usize,
         budget: usize,
-    ) -> TelemetryResult<()> {
+    ) -> TelemetryResult<usize> {
+        debug_assert_eq!(
+            *buffered,
+            chunks.values().map(Self::byte_cost).sum::<usize>()
+        );
         let cost = payload_len.saturating_add(64);
         if usize::from(total) > budget / 64 || cost > budget {
-            chunks.remove(&transfer_id);
+            Self::remove(chunks, buffered, transfer_id);
             return Err(TelemetryError::PacketTooLarge("side chunk receive budget"));
         }
         if chunks
             .get(&transfer_id)
             .is_some_and(|a| a.received.contains_key(&index))
         {
-            return Ok(());
+            return Ok(0);
         }
-        let mut buffered: usize = chunks
-            .values()
-            .flat_map(|a| a.received.values())
-            .map(|p| p.len().saturating_add(64))
-            .sum();
         while buffered.saturating_add(cost) > budget {
-            // Reclaim unrelated incomplete transfers before discarding the one
-            // receiving a new fragment. Completed schemas/routes are untouched.
-            let victim = chunks
-                .iter()
-                .filter(|(id, _)| **id != transfer_id)
-                .min_by_key(|(id, a)| (a.last_seen_ms, **id))
-                .map(|(id, _)| *id);
-            let Some(victim) = victim else {
-                chunks.remove(&transfer_id);
+            let Some((victim, _)) = Self::oldest(chunks, Some(transfer_id)) else {
+                Self::remove(chunks, buffered, transfer_id);
                 return Err(TelemetryError::PacketTooLarge("side chunk receive budget"));
             };
-            if let Some(removed) = chunks.remove(&victim) {
-                let freed: usize = removed
-                    .received
-                    .values()
-                    .map(|p| p.len().saturating_add(64))
-                    .sum();
-                buffered = buffered.saturating_sub(freed);
-            }
+            Self::remove(chunks, buffered, victim);
         }
-        Ok(())
+        Ok(cost)
     }
 
     pub(crate) fn assemble(self) -> TelemetryResult<Vec<u8>> {
@@ -749,5 +892,186 @@ impl SideChunkAssembly {
             out.extend_from_slice(&chunk);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod template_storage_tests {
+    use super::*;
+    #[test]
+    fn immutable_template_metadata_stays_small_in_both_packet_store_modes() {
+        assert!(size_of::<SideHeaderTemplate>() <= size_of::<Arc<[u8]>>() + 24);
+    }
+    #[test]
+    fn one_shared_buffer_preserves_both_ranges_and_clone_lifetime() {
+        for (prefix, between) in [
+            (&[][..], &[][..]),
+            (&[1, 2, 3][..], &[9, 8, 7, 6][..]),
+            (&[][..], &[42][..]),
+        ] {
+            let view = SideHeaderTemplateView {
+                hash: 77,
+                base_flags: 5,
+                prefix,
+                between,
+                reliable_flags: Some(1),
+                reliable_compact: true,
+            };
+            let owned = view.into_owned();
+            let clone = owned.clone();
+            assert!(Arc::ptr_eq(&owned.header, &clone.header));
+            assert_eq!(owned.header.len(), prefix.len() + between.len());
+            drop(owned);
+            assert_eq!(clone.prefix(), prefix);
+            assert_eq!(clone.between(), between);
+            assert_eq!(clone.hash, 77);
+            assert_eq!(clone.base_flags, 5);
+            assert_eq!(clone.reliable_flags, Some(1));
+            assert!(clone.reliable_compact);
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<SideChunkAssembly>() == 24);
+
+#[cfg(all(test, feature = "std"))]
+mod incremental_chunk_cache_tests {
+    use super::*;
+    #[test]
+    fn large_assemblies_keep_exact_cost_after_small_cache_saturates() {
+        let mut assembly = SideChunkAssembly {
+            total: 2,
+            ..Default::default()
+        };
+        let left = vec![3u8; 60000];
+        let right = vec![7u8; 20000];
+        assert_eq!(
+            assembly.insert_with(0, || crate::shared_bytes::convert(Arc::<[u8]>::from(left))),
+            60064
+        );
+        assert_eq!(
+            assembly.insert_with(1, || crate::shared_bytes::convert(Arc::<[u8]>::from(right))),
+            20064
+        );
+        assert_eq!(assembly.payload_bytes, u16::MAX);
+        assert_eq!(assembly.byte_cost(), 80128);
+        let out = assembly.assemble().unwrap();
+        assert_eq!(out.len(), 80000);
+        assert!(out[..60000].iter().all(|b| *b == 3));
+        assert!(out[60000..].iter().all(|b| *b == 7));
+    }
+    #[test]
+    fn duplicate_does_not_allocate_or_change_cached_cost() {
+        let mut assembly = SideChunkAssembly {
+            total: 2,
+            ..Default::default()
+        };
+        assembly.insert_with(0, || {
+            crate::shared_bytes::convert(Arc::<[u8]>::from([9u8; 112]))
+        });
+        assert_eq!(
+            assembly.insert_with(0, || panic!("duplicate called payload factory")),
+            0
+        );
+        assert_eq!(assembly.byte_cost(), 176);
+    }
+}
+
+#[cfg(test)]
+mod expiry_chunk_cache_tests {
+    use super::*;
+
+    fn fixture(entries: &[(u32, u64, usize)]) -> (BTreeMap<u32, SideChunkAssembly>, usize) {
+        let mut chunks = BTreeMap::new();
+        let mut buffered = 0usize;
+        for &(id, last_seen_ms, length) in entries {
+            let mut assembly = SideChunkAssembly {
+                total: 2,
+                last_seen_ms,
+                ..Default::default()
+            };
+            buffered += assembly.insert_with(0, || {
+                crate::shared_bytes::convert(Arc::<[u8]>::from(vec![id as u8; length]))
+            });
+            chunks.insert(id, assembly);
+        }
+        (chunks, buffered)
+    }
+
+    #[test]
+    fn chunk_expiry_keeps_exact_boundary_and_future_clock_entries() {
+        let (mut chunks, mut buffered) =
+            fixture(&[(1, 0, 3), (2, 2000, 4), (3, u64::MAX, 5), (4, 1, 1)]);
+        let original = buffered;
+        assert_eq!(
+            SideChunkAssembly::expire(&mut chunks, &mut buffered, 2000),
+            0
+        );
+        assert_eq!(buffered, original);
+        assert_eq!(
+            SideChunkAssembly::expire(&mut chunks, &mut buffered, 2001),
+            1
+        );
+        assert_eq!(buffered, original - 67);
+        assert!(!chunks.contains_key(&1));
+        assert_eq!(
+            SideChunkAssembly::expire(&mut chunks, &mut buffered, 2001),
+            0
+        );
+        assert_eq!(SideChunkAssembly::expire(&mut chunks, &mut buffered, 0), 0);
+        assert_eq!(
+            SideChunkAssembly::expire(&mut chunks, &mut buffered, 4001),
+            2
+        );
+        assert_eq!(chunks.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(buffered, 69);
+    }
+
+    #[test]
+    fn chunk_expiry_matches_retention_model_for_every_four_entry_subset() {
+        for expired_mask in 0u32..16 {
+            let entries = [0, 1, 7, u32::MAX]
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    (
+                        id,
+                        if expired_mask & (1 << index) != 0 {
+                            0
+                        } else {
+                            1001
+                        },
+                        1 + index * 112,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (mut chunks, mut buffered) = fixture(&entries);
+            let mut expected = chunks.clone();
+            expected.retain(|_, assembly| 3001u64.saturating_sub(assembly.last_seen_ms) <= 2000);
+            let expected_bytes = expected
+                .values()
+                .map(SideChunkAssembly::byte_cost)
+                .sum::<usize>();
+            assert_eq!(
+                SideChunkAssembly::expire(&mut chunks, &mut buffered, 3001),
+                expired_mask.count_ones()
+            );
+            assert_eq!(chunks, expected);
+            assert_eq!(buffered, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn chunk_expiry_releases_full_cost_after_small_payload_cache_saturates() {
+        let (mut chunks, mut buffered) = fixture(&[(1, 0, 80000), (2, 2001, 20)]);
+        assert_eq!(chunks[&1].payload_bytes, u16::MAX);
+        assert_eq!(buffered, 80064 + 84);
+        assert_eq!(
+            SideChunkAssembly::expire(&mut chunks, &mut buffered, 2001),
+            1
+        );
+        assert_eq!(buffered, 84);
+        assert_eq!(chunks.keys().copied().collect::<Vec<_>>(), vec![2]);
     }
 }

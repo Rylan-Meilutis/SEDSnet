@@ -149,12 +149,12 @@ def validate_pypi_credentials(username: str, token: str) -> None:
     except urllib.error.HTTPError as e:
         response_body = e.read().decode("utf-8", "replace").lower()
         if e.code in (401, 403) or "invalid or non-existent authentication" in response_body:
-            raise SystemExit("PyPI rejected the credentials; config was not written.") from e
+            raise SystemExit("PyPI rejected the credentials; config was not written.") from None
         # Valid credentials should get a non-auth upload/form error because this validation
         # deliberately does not include a distribution file.
         return
     except urllib.error.URLError as e:
-        raise SystemExit(f"Could not validate PyPI credentials: {e}") from e
+        raise SystemExit("Could not validate PyPI credentials: network request failed; config was not written.") from None
 
 
 def write_maturin_login_config(repo_root: Path) -> None:
@@ -638,6 +638,51 @@ def _append_flag(existing: str, flag: str) -> str:
     return existing + " " + flag
 
 
+def apply_embedded_path_remaps(target: str, env: dict[str, str]) -> None:
+    """Shorten embedded panic-source paths without changing generated logic.
+
+    Only augment explicit environment flags; otherwise Cargo configuration
+    may provide target flags that an encoded override would accidentally hide.
+    Encoded flags preserve source paths containing whitespace.
+    """
+    if "-none-" not in target or env.get("SEDSNET_EMBEDDED_PATH_REMAP_AUTO", "1").lower() in ("0", "false"):
+        return
+    if "CARGO_ENCODED_RUSTFLAGS" not in env and "RUSTFLAGS" not in env:
+        return
+    try:
+        sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], env=env, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        print("warning: could not query Rust sysroot; keeping original source paths.")
+        return
+    if not sysroot:
+        return
+    flags = (env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+             if "CARGO_ENCODED_RUSTFLAGS" in env else env["RUSTFLAGS"].split())
+    library = Path(sysroot) / "lib/rustlib/src/rust/library"
+    registry = Path(env.get("CARGO_HOME", str(Path.home() / ".cargo"))) / "registry/src"
+    roots = [(str(library), "rust"), (str(registry), "crates")]
+    # Distributed rust-src/rlibs use a virtual /rustc/<commit> source root.
+    # Generic std/alloc code may retain those locations when instantiated here.
+    try:
+        version = subprocess.check_output(["rustc", "--version", "--verbose"], env=env, text=True)
+        commit = next((line.partition(":")[2].strip() for line in version.splitlines()
+                       if line.startswith("commit-hash:")), "")
+        if len(commit) == 40 and all(char in "0123456789abcdef" for char in commit):
+            virtual_library = Path("/rustc") / commit / "library"
+            roots.append((str(virtual_library), "rust"))
+            roots.extend((str(virtual_library / module / "src"), module)
+                         for module in ("core", "alloc", "std"))
+    except (OSError, subprocess.CalledProcessError):
+        pass  # The physical sysroot mappings remain useful without metadata.
+    # Keep useful module/crate paths, omitting toolchain paths and registry
+    # hostname hashes repeated throughout embedded panic-location strings.
+    roots.extend((str(library / module / "src"), module) for module in ("core", "alloc", "std"))
+    roots.extend((str(directory), "crates") for directory in sorted(registry.glob("*")) if directory.is_dir())
+    additions = [f"--remap-path-prefix={source}={destination}" for source, destination in roots
+                 if not any(flag.startswith(f"--remap-path-prefix={source}=") for flag in flags)]
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(additions + flags)
+
+
 def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
     """
     For embedded cross builds with C deps (e.g. zstd-sys), apply size-oriented
@@ -645,6 +690,8 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
     """
     if not target:
         return
+
+    apply_embedded_path_remaps(target, env)
 
     if env.get("SEDSNET_EMBEDDED_CFLAGS_AUTO", "1") in ("0", "false", "False"):
         print("info: embedded CFLAGS auto-tuning disabled by SEDSNET_EMBEDDED_CFLAGS_AUTO.")

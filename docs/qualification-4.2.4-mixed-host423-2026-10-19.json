@@ -1,0 +1,204 @@
+{
+  "date": "2026-10-19",
+  "sedsnet_version": "4.2.4",
+  "phase": "mixed-version firmware 4.2.4 / GroundStation SDK 4.2.3 cohort passed; all-current hosted rerun running",
+  "capture": "Jupiter:receipt-diagnostics/bay-1792394403869738960",
+  "virtual_duration_ms": 600000,
+  "observations": 60,
+  "printed_network_assertions_passed": 203,
+  "latency": {
+    "acknowledgements": {
+      "VB": {
+        "count": 58,
+        "min_ms": 10,
+        "max_ms": 260
+      },
+      "AB": {
+        "count": 58,
+        "min_ms": 10,
+        "max_ms": 50
+      }
+    },
+    "managed_variable_rounds": {
+      "count": 9,
+      "min_ms": 80,
+      "max_ms": 180
+    },
+    "valve_power_stale_events": 0,
+    "timeouts": 0
+  },
+  "sd": {
+    "daq": {
+      "recorded_rows": 935159,
+      "expected": {
+        "accepted": 936757,
+        "processed": 936751,
+        "flushed": 935159,
+        "acquired": 936757,
+        "boots": 1
+      },
+      "accepted_not_yet_on_exported_card": 1598,
+      "file_count": 2,
+      "clock_frequencies_hz": [
+        1000
+      ]
+    },
+    "flight": {
+      "recorded_rows": 19389,
+      "expected": {
+        "accepted": 19684,
+        "processed": 19565,
+        "flushed": 19389
+      },
+      "accepted_not_yet_on_exported_card": 295,
+      "file_count": 2,
+      "clock_frequencies_hz": [
+        1000
+      ]
+    }
+  },
+  "gates": {
+    "package_version": "4.2.4",
+    "builds": {
+      "factories": 0,
+      "images": 0
+    },
+    "release424-chunk-expiry-strict-gate-1": {
+      "exit": 0,
+      "wall_seconds": 157.9212764989934
+    },
+    "release424-chunk-expiry-strict-gate-2": {
+      "exit": 0,
+      "wall_seconds": 158.2080636069877
+    },
+    "release424-chunk-expiry-strict-gate-3": {
+      "exit": 0,
+      "wall_seconds": 163.00014026404824
+    },
+    "release424-chunk-expiry-120s-restart-regression": {
+      "exit": 0,
+      "wall_seconds": 1076.157760676986
+    },
+    "release424-chunk-expiry-10min-soak": {
+      "exit": 0,
+      "wall_seconds": 5394.249975027982
+    },
+    "sd-daq": {
+      "exit": 0,
+      "summary": "/home/rylan/seds-prefreeze-20261018/release424-chunk-expiry-10min-daq-csv.json"
+    },
+    "sd-flight": {
+      "exit": 0,
+      "summary": "/home/rylan/seds-prefreeze-20261018/release424-chunk-expiry-10min-flight-csv.json"
+    },
+    "source_unchanged_after_qualification": true
+  },
+  "sdk_source_snapshot_sha256": {
+    "SEDSnet/src/admission_fairness.rs": "b34936f1a6f207268b334af681ed0fa3518f7ade44c17c6d17c6630399209850",
+    "SEDSnet/src/binding_options.rs": "470c6a389b5cd6c81ddf281a8118ef65ff1f7dc6c4d84a6891b0feabf2074cb6",
+    "SEDSnet/src/c_api.rs": "a75bb59c2752cb9cca32969f7bee2dd6677a536044d96868b9c85e8ba206a2a9",
+    "SEDSnet/src/config.rs": "213a1ab7c51fc1c847da71f9f5d87c59cda507741a1f7aecd5b60115f7a7f249",
+    "SEDSnet/src/crypto.rs": "9910173f4340d1c7f5deab45a54f5b1b735af15b2c2aa5d23fdd76f83b1cdb29",
+    "SEDSnet/src/diagnostics.rs": "1eb529c8842e0ad66720f03c13c89eb6b7529eca363668d728e02a06d5a90b93",
+    "SEDSnet/src/discovery.rs": "b34f2b797a65367cf99286aefe693c1bcfd6a62b379f151edc67e122cffdf48f",
+    "SEDSnet/src/lock.rs": "07247922c30562f813ff7b930b962d3f1934218087d03f14b71716206d6edcad",
+    "SEDSnet/src/macros.rs": "3b301dda1f1cc09f53ad69a9b28f609fccee19d50d2babbaf95855712ba4740e",
+    "SEDSnet/src/memory_admission.rs": "963740f5cb578ffd8eb8226f334f027f4fb514288469450976e6514a9b19b6fe",
+    "SEDSnet/src/packet.rs": "5feec90c2a421245e5f92e380eeab6877c9b847cc27ed3f060b3a1d4e1687bd3",
+    "SEDSnet/src/packet_store.rs": "2b5b677edc919f3a619e969ef4a70b888a20ae5032537bf247d8d4f547079f9a",
+    "SEDSnet/src/python_api.rs": "338f4da903a77fd0fa387161f5e45f742c72fd5a641d990a842b64ee379a9cc8",
+    "SEDSnet/src/queue.rs": "4ddfbf518291d31f1d9cb3b1ccf3efbc8395416c3a43c38b2e6d5293b6d0a65d",
+    "SEDSnet/src/schema_identity.rs": "9bb0b3c959827873e32e048811094ce6fe523392981249ec09e8e2ee1f5f4974",
+    "SEDSnet/src/shared_bytes.rs": "3e18de3f371e3b5b63345cbacfa40c76513b96d5eef5f8b0b9fe329eadeafedc",
+    "SEDSnet/src/small_payload.rs": "eaf827578acb3014d9b36b33f4cd4b45bba88648e5aea219ad07b0925c40e77d",
+    "SEDSnet/src/small_sort.rs": "3309b629774f643ada331b8d824e0447dcd8ee85d2cf32c0742de1bb7c27aff9",
+    "SEDSnet/src/timesync.rs": "4c5fcf84f12d13adce4af4e41c7da005dfaf92ece711fef5a37192005291ac19",
+    "SEDSnet/src/varint.rs": "9090ff399c26467f47508224afeaf5e2a78fec4e77d9ae98f791384b66a0455e",
+    "SEDSnet/src/wire_format.rs": "cf953d9cf1531366d90d798003ec83e5693271d4e98c69e548775f2069f749d7",
+    "SEDSnet/src/lib.rs": "8b3739a5235525d2db379b839b382559dbce0597102acbf5fec760b678c2bc14",
+    "SEDSnet/src/type_stats.rs": "950562a0b77bc2ceaf01d7e56c477dc4c064ff9a97c5f26f78ce986255e17a52",
+    "SEDSnet/src/router.rs": "03d11c90fcd1d37fa36c67376b74030913308ed8c76116cc241a47b066f608d3",
+    "SEDSnet/src/relay.rs": "62d5392a3ed7f4c6ecaba490cbd788f75265f0b482a65dd9c6d92c8dfc832b02",
+    "SEDSnet/src/side_transport.rs": "5b009e23ccef2e20e587f06228821613d250316024bde3b6f1ffd39356486cc9",
+    "SEDSnet/src/tests/ack_return_identity.rs": "375a1b2bc26869ac21b52bec3a6c5cb0850d7decfa51cf1912f6843fc418d09f",
+    "SEDSnet/src/tests/compression_memory_tests.rs": "9777e33bca239f919e2ef97839e54b27ccf126bb8f4258e2f8ce948954fc3c21",
+    "SEDSnet/src/tests/concurrency_tests.rs": "aa549f2a9c4dc7a49827fcd2bdd6dd8e82d1a48738ae725f3807857d4362902c",
+    "SEDSnet/src/tests/data_conversion_types.rs": "4f53ac0b6d9d8242971bffdd6fa1a883ce80a8151280e1ccf05875f65d9c0bdf",
+    "SEDSnet/src/tests/dedupe_tests.rs": "b8c8b5b18b5bc5077d659235fce1e60ecc849c6bb879ee2ba41abef598229ade",
+    "SEDSnet/src/tests/discovery_liveness.rs": "3832f9fc620222d03568a7778756c7688f956aef4d000963e4e0cab57a392849",
+    "SEDSnet/src/tests/error_display_tests.rs": "63f395a51b8d0eb5e4c9f28354635f0a33cdfe347e90bdbf611404087a2c9627",
+    "SEDSnet/src/tests/handler_failure_tests.rs": "1ac3867acd75f49464b691faf920c31945e195a5a8c952aed2857f6a73e1539a",
+    "SEDSnet/src/tests/mod.rs": "08e57bbd3fe6877dbd94e3d618746d1e42bafdf1bf624ea216168f7f342c87f0",
+    "SEDSnet/src/tests/p2p_address_tests.rs": "3d5582c8188e403317155e56dd4317527c534a9e7d3bc9f0eb28662239f2b9dd",
+    "SEDSnet/src/tests/relay_ack_recovery.rs": "0a3ee41d7141cb0903159e5d2b7fe5d71aa5bc952b35e56f51b1e77357b0ece9",
+    "SEDSnet/src/tests/relay_control_priority.rs": "d36e53ac42f2027a764d3044dfa1344c4f232b467799669afa742721e3a38783",
+    "SEDSnet/src/tests/relay_reliable_tests.rs": "c21b93d054b28d65d4f51ab4d55ae1ae3c0598c42d3675a17739cba9e2be8524",
+    "SEDSnet/src/tests/relay_restart_transport.rs": "0941b0b9f9857345706b180e541cb64ad14ad7ee8ec4b652b2d48b94de43e8b4",
+    "SEDSnet/src/tests/relay_tests.rs": "b4ae69d4aa3c592b63351bbd8dac1cc856ddbd7007e84ad2949c0e92ae1eb692",
+    "SEDSnet/src/tests/reliable_tests.rs": "48f9bf9cd63e8667d70e8f714abbdfe7f59e6f1d14e38830561c0f434d912061",
+    "SEDSnet/src/tests/tests2.rs": "2a20ce6989f4eebf4fc9295fc914129c073a7a0891561a5243067d2c4071e47c",
+    "SEDSnet/src/tests/tests_extra.rs": "bb6e9615ccbf39efb4bcede6d47f7955de2870d7086b7d6b9e532facdc85f7aa",
+    "SEDSnet/src/tests/tests_more.rs": "90af81bb6ab9a1eb57f638034c9b7fad5a1903ea0fb5b76a02272dec53c1edcb",
+    "SEDSnet/src/tests/timeout_tests.rs": "6eecc06ac8e25ef82cc55f02fe2a62d2837df565340b172955d3a007e428ee19",
+    "SEDSnet/src/tests/untemplated_transport.rs": "a3d3a322aaad59be6d13e0cd488970101d7e989c8c5840727da949256649ca04",
+    "SEDSnet/src/tests/side_template_index.rs": "030d110721444553dbc67313537f2e00872a662b9915ce19867db2762af24f61",
+    "SEDSnet/src/tests/shared_chunk_budget_relay.rs": "df59ec4f424a38a76ef6f8ae70cd72f02a1e170fe4735a38dd244d631ddad4fc",
+    "SEDSnet/src/tests/shared_chunk_budget_router.rs": "3c48c9bc5407f3e5ab0cd2c0136396fa482a3147f84434d762856b533a2a928b",
+    "SEDSnet/src/tests/router_tests/discovery_tests.rs": "5049dd7ec1b1a644a3a47684c743e0d7ba04d5455fba142052fe3a7807c8ed99",
+    "SEDSnet/src/tests/router_tests/mod.rs": "69348f7820ea17f8cad0408e2112033f7d9545c77b8fea9167e143e8278eddc5",
+    "SEDSnet/src/tests/router_tests/schema_sync_tests.rs": "806ec63cf3e80dfe0f5dbd4d972f3e4057e4885eb1c86c3fffef21c74d79f538",
+    "SEDSnet/src/tests/router_tests/timesync_tests.rs": "1651efb60dbd1280c93d8650b89198fbe8d6cfbc6780b924466428190768c70f",
+    "SEDSnet/sedsnet_macros/src/lib.rs": "5363ede6488d76620252212122fb2c4ad78ad82235a0036e7b54174817656db7",
+    "SEDSnet/C-Headers/sedsnet.h": "3d7a3e9044224aee630758c2954fe4b71e09a4976bef546163d08113305df44b",
+    "DAQ-Board/Core/Inc/sim_network_probe.h": "cd82acd25e253ddea9482f629b266d39ddb2c06282b2ff4ca305715b0f874ea6",
+    "SEDSnet/Cargo.toml": "10fc728a5869cbcaf583aaf451c333cf6455c593e3163e2f973984ddf514ca38",
+    "SEDSnet/Cargo.lock": "1baea7076ed154baa115e226d501d233327ed16ba92df80474c0a480f9f5550f",
+    "SEDSnet/build.rs": "1b5df53499363799a73ffee5d7796ae4271cb20bc6dd48e5e572fa9e5325a8dd",
+    "SEDSnet/build.py": "656856df06b098b58f59589dd3e051c91d918504fdac00a5398b022ee9742d08",
+    "SEDSnet/sedsnet_macros/Cargo.toml": "4952c52b8af3b894330f9db051e9cdf035b5426ad9c5890a6c447d3b8e96b8e2",
+    "RFBoard26/Core/Src/telemetry.c": "9bcb1d419bbf6c6862fa93d3e382784dcb90f99a899c40d935cc82ab7423e6dd",
+    "RFBoard26/Core/Src/telemetry_tlsf.c": "4019355e4eefd00c3f982493115e1ceab5b177f0b4b46b7729f455db8c137226",
+    "RFBoard26/sim/board.json": "791ce2fa4c68404f74e15727f64fcfb9501175cf7005cfb43988cdfc2a50895c",
+    "GroundStation26/backend/src/main.rs": "ea0feac7b893d6a7702616ae292fb69927ef32212c38f15f354f12ee778a4fad",
+    "GroundStation26/backend/src/telemetry_task/radio_io.rs": "4f3cab89d23504daf49bc49f4d53085e9f134e5e481a70b0285682528ed4846c"
+  },
+  "release_only_deltas": [
+    "Self-contained cfg(test) schema fixture",
+    "C harness Release/assertion and formatting fixes",
+    "Publishing-tool credential redaction and availability inspection",
+    "Simulator 0.4.14 package/image selectors; equivalent diagnostic alignment predicate"
+  ],
+  "limits": [
+    "Gateway/RF ingress admission refusals remain measurable; this is not a lossless best-effort network claim.",
+    "Accepted-but-buffered SD records are not counted as durable on-card data.",
+    "Physical 12 kHz ADC/card throughput, card flush stalls and power-loss durability require hardware testing."
+  ],
+  "firmware_sdk_version": "4.2.4",
+  "groundstation_sdk_version": "4.2.3",
+  "validation_gap": "Cargo ignored the 4.2.4 path patch because the hosted lockfile retained 4.2.3. Image build logs confirm the actual version. This record qualifies mixed-version behavior only.",
+  "corrected_local_backend": {
+    "sdk_selection": {
+      "name": "SEDSnet",
+      "version": "4.2.4",
+      "manifest_path": "/Users/rylan/Documents/GitKraken/SEDS/SEDSnet/Cargo.toml",
+      "source": null
+    },
+    "checks": [
+      {
+        "mode": "normal",
+        "exit": 0,
+        "wall_seconds": 22.034871874842793
+      },
+      {
+        "mode": "hitl",
+        "exit": 0,
+        "wall_seconds": 15.68165412498638
+      },
+      {
+        "mode": "testfire",
+        "exit": 0,
+        "wall_seconds": 15.943340042140335
+      }
+    ]
+  }
+}

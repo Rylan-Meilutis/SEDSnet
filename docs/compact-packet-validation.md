@@ -3,6 +3,37 @@
 The optional arena and indexed codec shipped in 4.1.0 as experimental features.
 The development results below are not a hardware qualification.
 
+## Current qualification: 4.2.4 (2026-10-19)
+
+The latest cohort uses the compact packet store and TLSF on all seven firmware
+nodes, with compression disabled. Three strict starts, the all-current
+120-second restart and 600-second ARM/Renode soak pass, along with both DAQ/FC
+CSV reconciliations. The hosted backend's resolved SDK
+version is checked explicitly, after an older lockfile was found to have ignored
+a candidate path patch. The earlier passing firmware4.2.4/host4.2.3 run is retained
+as mixed-version evidence rather than relabelled as all-current qualification.
+
+See [the current qualification record](qualification-4.2.4-2026-10-19.json) and
+[the earlier mixed-version record](qualification-4.2.4-mixed-host423-2026-10-19.json).
+Neither simulation nor native tests establish physical SD-card throughput,
+power-loss durability, lossless best-effort delivery or indefinite OOM immunity.
+The packet store remains opt-in; the indexed compression configuration requires
+its own MCU memory and throughput qualification.
+
+## Current native pressure checks (2026-10-19)
+
+The final 4.2.4 candidate repeats the explicit 600-second wall-clock codec/arena
+pressure soak: 14,558,397 rounds and 227,475 deliberate oversized
+request refusals. Pinned data remains intact, partial reads retain no full decode,
+and live arena bytes/handles return to zero after drain. Codec scratch remains
+fixed at 126,879 bytes on this native host. A separate 2,400-tick mixed-network
+churn test passes recovery after injected loss and route outages. These native
+checks do not qualify compression on a memory-constrained MCU.
+
+[Exact results and source hashes](native-pressure-soaks-2026-10-19.json).
+
+## Initial development validation (2026-10-05)
+
 On 2026-10-05 the default, compact arena, and compact compression Rust suites
 passed, along with minimal std, ARM embedded (plain and codec), and Python
 build checks. Regression coverage includes pinned addresses during compaction,
@@ -25,7 +56,7 @@ injected loss and route outages and checked post-recovery reliable delivery,
 network variables, discovery/schema, streams, and packet transport. This is a
 native network test, not 600 seconds of ARM instruction execution.
 
-The latest seven-board ARM/Renode qualification remains incomplete. The
+At that time, seven-board ARM/Renode qualification was incomplete. The
 simulator needed byte UART DMA support, request pacing, G4 DMA completion IRQs,
 allocator-specific probes, and build-selected Pico UART baud. The initial
 115200-baud baseline failed queue/ring limits; the corrected 1 Mbaud baseline

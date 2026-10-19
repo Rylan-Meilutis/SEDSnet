@@ -664,6 +664,10 @@ fn runtime_stats_snapshot_to_pydict(
             "side_transport_chunk_frames",
             side.side_transport_chunk_frames,
         )?;
+        side_dict.set_item(
+            "side_transport_chunk_reclaims",
+            side.side_transport_chunk_reclaims,
+        )?;
         side_dict.set_item("side_transport_raw_bytes", side.side_transport_raw_bytes)?;
         side_dict.set_item("side_transport_wire_bytes", side.side_transport_wire_bytes)?;
         side_dict.set_item(

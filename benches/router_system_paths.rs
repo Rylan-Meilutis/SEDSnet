@@ -1,53 +1,16 @@
+mod support;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use sedsnet::TelemetryResult;
-use sedsnet::config::{
-    DataEndpoint, DataType, data_type_definition_by_name, endpoint_definition_by_name,
-    register_data_type_with_description, register_endpoint_with_description,
-};
+use sedsnet::config::{DataEndpoint, DataType};
 use sedsnet::packet::Packet;
 use sedsnet::relay::Relay;
 use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
 use sedsnet::wire_format::peek_frame_info;
-use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn zero_clock() -> Box<dyn Clock + Send + Sync> {
     Box::new(|| 0u64)
-}
-
-fn ensure_common_bench_schema() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if endpoint_definition_by_name("RADIO").is_none() {
-            register_endpoint_with_description(
-                "RADIO",
-                "Radio or external link (telemetry uplink/downlink).",
-                false,
-            )
-            .unwrap();
-        }
-        if endpoint_definition_by_name("SD_CARD").is_none() {
-            register_endpoint_with_description(
-                "SD_CARD",
-                "On-board storage (e.g. SD card / flash).",
-                false,
-            )
-            .unwrap();
-        }
-        if data_type_definition_by_name("GPS_DATA").is_none() {
-            register_data_type_with_description(
-                "GPS_DATA",
-                "GPS data (typically 3x f32: latitude, longitude, altitude).",
-                MessageElement::Static(3, MessageDataType::Float32, MessageClass::Data),
-                &[DataEndpoint::named("RADIO"), DataEndpoint::named("SD_CARD")],
-                ReliableMode::Ordered,
-                80,
-            )
-            .unwrap();
-        }
-    });
 }
 
 fn endpoints() -> [DataEndpoint; 2] {
@@ -72,7 +35,7 @@ fn count_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> usize {
 }
 
 fn benchmark_router_system_paths(c: &mut Criterion) {
-    ensure_common_bench_schema();
+    support::initialize_schema();
     let mut group = c.benchmark_group("router_system_paths");
 
     let delivered = Arc::new(AtomicUsize::new(0));

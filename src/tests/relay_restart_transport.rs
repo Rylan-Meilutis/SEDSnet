@@ -340,11 +340,19 @@ fn queue_service_expires_incomplete_transfers_without_new_fragments() {
             SideChunkAssembly {
                 last_seen_ms: 0,
                 total: 2,
+                payload_bytes: u16::try_from(retained.len()).unwrap(),
                 received: [(0, crate::shared_bytes::convert(retained))]
                     .into_iter()
                     .collect(),
             },
         );
+    router
+        .state
+        .lock()
+        .side_transport
+        .get_mut(&side)
+        .unwrap()
+        .refresh_rx_chunk_bytes();
     now.store(2000, core::sync::atomic::Ordering::Relaxed);
     router.process_tx_queue_with_timeout(1).unwrap();
     assert!(witness.upgrade().is_some(), "live transfer expired early");

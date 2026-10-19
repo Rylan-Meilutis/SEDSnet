@@ -792,6 +792,19 @@ typedef struct SedsReliablePendingRow {
  * and writable; unused output rows and owner slots are zeroed. */
 int32_t seds_router_copy_reliable_pending(SedsRouter *r, size_t first, SedsReliablePendingRow *rows, size_t capacity);
 
+/** Allocation-free uint32 memory counters, version 1; saturate at UINT32_MAX.
+ * Index: 0 version; 1 shared budget; 2 logical shared bytes; 3 RX bytes;
+ * 4 TX bytes; 5 retained RX/TX/recent-ID ring storage (excludes ISR ring);
+ * 6 reliable RX bytes; 7 discovery bytes; 8 dynamic schema bytes;
+ * 9 managed cache bytes; 10 pending end-to-end payload bytes;
+ * 11 template count; 12 template header+payload bytes; 13 RX chunk bytes;
+ * 14 per-type statistic entries; 15 per-type statistic value bytes.
+ * These approximate component costs exclude allocator headers/B-tree nodes
+ * and can share underlying payloads. Do not sum them as total heap usage.
+ * Copies min(capacity,16) words; returns required count, or negative error.
+ * NULL words allowed only with zero capacity. Output aligned/writable. */
+int32_t seds_router_copy_memory_counters(SedsRouter *r, uint32_t *words, size_t capacity);
+
 /** @brief Return required buffer length for router memory-layout JSON. */
 int32_t seds_router_export_memory_layout_len(SedsRouter * r);
 

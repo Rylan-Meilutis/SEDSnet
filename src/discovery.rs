@@ -1,5 +1,6 @@
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -784,6 +785,67 @@ pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryRes
     Ok(out)
 }
 
+pub(crate) fn topology_payload_is_incremental(payload: &[u8]) -> bool {
+    payload.starts_with(&DISCOVERY_TOPOLOGY_DELTA_MARKER.to_le_bytes())
+}
+
+pub(crate) fn apply_shared_topology_update(
+    retained: &mut Arc<Vec<TopologyBoardNode>>,
+    update: DiscoveryTopologyUpdate,
+) -> bool {
+    if !update.incremental {
+        if retained.as_slice() == update.boards {
+            return false;
+        }
+        *retained = Arc::new(update.boards);
+        true
+    } else {
+        apply_topology_update(Arc::make_mut(retained), update)
+    }
+}
+
+// Transient clone working storage is separate from logical queue accounting.
+// Per-allocation slack covers ownership/alignment overhead; application probes
+// still enforce their own allocator fragmentation and safety reserves.
+#[derive(Default)]
+pub(crate) struct CloneScratch {
+    pub bytes: usize,
+    pub largest: usize,
+}
+impl CloneScratch {
+    pub fn buffer(&mut self, bytes: usize) {
+        if bytes != 0 {
+            let owned = bytes.saturating_add(32);
+            self.bytes = self.bytes.saturating_add(owned);
+            self.largest = self.largest.max(owned);
+        }
+    }
+    pub fn strings(&mut self, strings: &[String]) {
+        self.buffer(strings.len().saturating_mul(core::mem::size_of::<String>()));
+        for value in strings {
+            self.buffer(value.len());
+        }
+    }
+    pub fn graph(&mut self, boards: &[TopologyBoardNode], new_nodes: usize) {
+        let node_size = core::mem::size_of::<TopologyBoardNode>();
+        // COW clone then a geometrically grown node vector can coexist.
+        self.buffer(boards.len().saturating_mul(node_size));
+        self.buffer(
+            boards
+                .len()
+                .saturating_add(new_nodes)
+                .saturating_mul(node_size)
+                .saturating_mul(2),
+        );
+        for board in boards {
+            self.buffer(board.sender_id.len());
+            self.buffer(board.reachable_endpoints.len().saturating_mul(4));
+            self.strings(&board.reachable_timesync_sources);
+            self.strings(&board.connections);
+        }
+    }
+}
+
 type TopologyScratchPeer<'a> = (
     &'a str,
     &'a [DataEndpoint],
@@ -1180,6 +1242,75 @@ pub fn decode_discovery_topology(pkt: &Packet) -> TelemetryResult<Vec<TopologyBo
         return Err(TelemetryError::InvalidType);
     }
     Ok(decode_discovery_topology_update(pkt)?.boards)
+}
+
+/// Recognizes an exact, canonical no-op without allocating a decoded graph.
+/// Returns whether the matching update is a full baseline. Any changed,
+/// noncanonical, truncated, or otherwise unrecognized payload takes the normal
+/// validated decoding and transactional admission path instead.
+pub(crate) fn topology_payload_matches_retained(
+    payload: &[u8],
+    retained: &[TopologyBoardNode],
+) -> Option<bool> {
+    fn word(input: &mut &[u8]) -> Option<u32> {
+        let (head, tail) = input.split_at_checked(4)?;
+        *input = tail;
+        Some(u32::from_le_bytes(head.try_into().ok()?))
+    }
+    fn text<'a>(input: &mut &'a [u8]) -> Option<&'a str> {
+        let count = word(input)? as usize;
+        let (head, tail) = input.split_at_checked(count)?;
+        *input = tail;
+        core::str::from_utf8(head).ok()
+    }
+    let mut input = payload;
+    let first = word(&mut input)?;
+    let full = first != DISCOVERY_TOPOLOGY_DELTA_MARKER;
+    let count = if full { first } else { word(&mut input)? } as usize;
+    if (full && count != retained.len()) || count > input.len() / 16 {
+        return None;
+    }
+    let mut previous = None;
+    for _ in 0..count {
+        let name = text(&mut input)?;
+        // Duplicate or unordered nodes require normalization in the decoder.
+        if previous.is_some_and(|previous| previous >= name) {
+            return None;
+        }
+        previous = Some(name);
+        let board = retained.iter().find(|board| board.sender_id == name)?;
+        if word(&mut input)? as usize != board.reachable_endpoints.len() {
+            return None;
+        }
+        for endpoint in &board.reachable_endpoints {
+            if word(&mut input)? != endpoint.as_u32() {
+                return None;
+            }
+        }
+        for values in [&board.reachable_timesync_sources, &board.connections] {
+            if word(&mut input)? as usize != values.len() {
+                return None;
+            }
+            for value in values {
+                if text(&mut input)? != value {
+                    return None;
+                }
+            }
+        }
+    }
+    if !full {
+        let removed = word(&mut input)? as usize;
+        if removed > input.len() / 4 {
+            return None;
+        }
+        for _ in 0..removed {
+            let name = text(&mut input)?;
+            if retained.iter().any(|board| board.sender_id == name) {
+                return None;
+            }
+        }
+    }
+    input.is_empty().then_some(full)
 }
 
 /// Decodes either a legacy/full topology snapshot or an incremental delta.
@@ -2025,5 +2156,83 @@ mod bounded_decode_tests {
         types.extend_from_slice(&0u32.to_le_bytes());
         types.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_discovery_schema_payload(&types).is_err());
+    }
+    #[test]
+    fn borrowed_topology_comparison_requires_exact_unchanged_semantics() {
+        use super::{
+            TopologyBoardNode, apply_topology_update, build_discovery_topology,
+            build_discovery_topology_delta, decode_discovery_topology_update,
+            topology_payload_matches_retained,
+        };
+        use crate::packet::Packet;
+        let nodes = vec![
+            TopologyBoardNode {
+                sender_id: "AB".into(),
+                reachable_endpoints: vec![DataEndpoint(400)],
+                reachable_timesync_sources: vec!["UTC".into()],
+                connections: vec!["GS".into()],
+            },
+            TopologyBoardNode {
+                sender_id: "VB".into(),
+                reachable_endpoints: vec![DataEndpoint(401)],
+                reachable_timesync_sources: vec![],
+                connections: vec!["AB".into(), "GS".into()],
+            },
+        ];
+        let full = build_discovery_topology("GS", 0, &nodes).unwrap();
+        let delta =
+            build_discovery_topology_delta("GS", 0, &nodes[1..], &["ABSENT".into()]).unwrap();
+        assert_eq!(
+            topology_payload_matches_retained(full.payload(), &nodes),
+            Some(true)
+        );
+        assert_eq!(
+            topology_payload_matches_retained(delta.payload(), &nodes),
+            Some(false)
+        );
+        let removal = build_discovery_topology_delta("GS", 0, &[], &["VB".into()]).unwrap();
+        assert_eq!(
+            topology_payload_matches_retained(removal.payload(), &nodes),
+            None
+        );
+        assert_eq!(
+            topology_payload_matches_retained(full.payload(), &nodes[..1]),
+            None
+        );
+        // Every truncation and trailing garbage must leave the shortcut.
+        for packet in [&full, &delta] {
+            for end in 0..packet.payload().len() {
+                assert_eq!(
+                    topology_payload_matches_retained(&packet.payload()[..end], &nodes),
+                    None
+                );
+            }
+            let mut trailing = packet.payload().to_vec();
+            trailing.push(0);
+            assert_eq!(topology_payload_matches_retained(&trailing, &nodes), None);
+            // A shortcut acceptance must agree with the normal decoder and
+            // full/delta application, even for adversarial byte mutations.
+            for index in 0..packet.payload().len() {
+                for bit in 0..8 {
+                    let mut payload = packet.payload().to_vec();
+                    payload[index] ^= 1 << bit;
+                    if let Some(is_full) = topology_payload_matches_retained(&payload, &nodes) {
+                        let mutated = Packet::new(
+                            DataType::DiscoveryTopology,
+                            &[DataEndpoint::Discovery],
+                            "GS",
+                            0,
+                            payload.into(),
+                        )
+                        .unwrap();
+                        let update = decode_discovery_topology_update(&mutated).unwrap();
+                        assert_eq!(is_full, !update.incremental);
+                        let mut retained = nodes.clone();
+                        assert!(!apply_topology_update(&mut retained, update));
+                        assert_eq!(retained, nodes);
+                    }
+                }
+            }
+        }
     }
 }

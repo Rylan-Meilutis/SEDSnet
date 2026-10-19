@@ -88,11 +88,22 @@ fn decoded_schema_is_owned_until_it_fits_the_registry_budget() {
 fn schema_registry_counts_against_router_shared_queue_budget() {
     use crate::router::{Router, RouterConfig};
 
-    let router = Router::new(RouterConfig::default());
+    // Nextest runs this in a fresh process. Populate the runtime overlay
+    // explicitly instead of relying on registrations from an earlier test.
+    let before = schema_bytes_used();
+    let endpoint = register_endpoint_with_description(
+        "SCHEMA_SHARED_QUEUE_BUDGET_SELF_CONTAINED",
+        "runtime queue accounting fixture",
+        false,
+    )
+    .unwrap();
     let schema_bytes = schema_bytes_used();
-    assert!(schema_bytes > 0);
+    assert!(schema_bytes > before);
+    let router = Router::new(RouterConfig::default());
     assert!(router.debug_shared_queue_bytes_used() >= schema_bytes);
     assert!(router.debug_shared_queue_bytes_used() <= MAX_QUEUE_BUDGET);
+    drop(router);
+    assert!(remove_endpoint(endpoint).unwrap());
 }
 
 #[test]

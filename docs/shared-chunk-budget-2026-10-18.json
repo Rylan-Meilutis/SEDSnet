@@ -1,0 +1,142 @@
+{
+  "candidate": "SEDSnet 4.2.4 shared transport receive budget",
+  "status": "Software qualified: local/macOS/Linux gates, three strict starts, 120-second restart, 600-second mixed-restart soak and both SD reconciliations pass",
+  "capture": "Jupiter:receipt-diagnostics/bay-1792379104896398535",
+  "observed_failure": {
+    "type": "FLIGHT_BUZZER",
+    "packet_id": 2237713083956123803,
+    "registered_ms": 2730,
+    "completed_ms": 3270,
+    "actual_sdk_latency_ms": 540,
+    "retry_ms": [
+      2980,
+      3230
+    ],
+    "rf_incomplete_payload_bytes_first_sample": 10230,
+    "rf_live_peak_bytes": 61620,
+    "first_two_sample_admission_refusals": [
+      128,
+      172
+    ]
+  },
+  "cause": "Incomplete side-chunk assemblies had an independent receive budget on each link and were missing from shared queue byte accounting. Partial transfers and queued traffic could together retain more than the configured budget.",
+  "negative_controls": {
+    "two_links_retained_fragment_cost": 24288,
+    "configured_fragment_headroom": 16384,
+    "router_relay_accounting_and_active_progress_failures": 4,
+    "oversized_metadata_evicted_an_unrelated_transfer_failures": 2,
+    "fixture_compile_errors_in_reported_negative_controls": 0,
+    "wrong_retryable_pressure_classification_failures": 2,
+    "mid_transfer_refusal_discarded_prior_fragments_failures": 2
+  },
+  "fix": {
+    "same_queue_budget": true,
+    "same_application_allocator_capacity": true,
+    "learned_routes_not_evicted": true,
+    "known_bulk_reclaimed_by_dominant_sender": true,
+    "active_transfer_excluded_from_unrelated_reclamation": true,
+    "crc_and_shape_checks_retained": true,
+    "duplicates_do_not_allocate_or_grow_usage": true,
+    "diagnostic": "side_transport_chunk_reclaims",
+    "incremental_per_link_accounting": true,
+    "assembly_32bit_size_bytes": 24,
+    "temporary_pressure_is_retryable": true,
+    "retryable_receive_refusal_preserves_prior_fragments": true,
+    "expiry_reuses_existing_removal_without_allocating": true,
+    "expiry_timeout_ms": 2000,
+    "queue_and_allocator_capacities_unchanged": true
+  },
+  "checks": {
+    "full_default_passed": 602,
+    "full_default_ignored": 2,
+    "full_experimental_passed": 626,
+    "full_experimental_ignored": 3,
+    "focused_heap_and_arena_chunk_checks": 40,
+    "strict_clippy": "passed",
+    "python_tests": 41,
+    "gs_backend_modes": [
+      "normal",
+      "HITL",
+      "test-fire"
+    ],
+    "macos_factory_passes": 8,
+    "linux_factory_passes": 7,
+    "fc_macos_production_flash_bytes": 473624,
+    "fc_macos_sim_flash_bytes": 474112,
+    "fc_linux_sim_flash_bytes": 474200,
+    "fc_flash_capacity_bytes": 474624,
+    "expiry_size_saving_bytes": 784,
+    "daq_native_tests": 181,
+    "fc_native_tests_run": 170,
+    "fc_native_tests_skipped": 1,
+    "release_full_nextest_passed": 604,
+    "release_full_nextest_skipped": 0,
+    "release_tools_python_tests": 48,
+    "release_tools_python_skipped": 0,
+    "native_c_release_executables_passed": 5
+  },
+  "limits": [
+    "Build/test results refer to the integrated incremental-cache, fragment-continuation and expiry implementation.",
+    "Qualification is simulated; physical-card throughput and power-loss durability remain hardware follow-up."
+  ],
+  "updated": "2026-10-19",
+  "historical_checks": {
+    "focused_heap": 16,
+    "focused_active_arena": 16,
+    "full_default_passed": 591,
+    "full_default_ignored": 2,
+    "full_experimental_passed": 615,
+    "full_experimental_ignored": 3,
+    "strict_clippy": "passed",
+    "python_tests": 41,
+    "gs_backend_modes": [
+      "normal",
+      "HITL",
+      "test-fire"
+    ],
+    "initial_macos_factory_passes": 7,
+    "initial_fc_overflow_bytes": 4008,
+    "per_link_cache_probe_fc_overflow_bytes": 816,
+    "compact_helper_probe_fc_flash_bytes": 474512,
+    "compact_helper_probe_fc_spare_bytes": 112
+  },
+  "qualification": {
+    "prefix": "release424-hosted424",
+    "jupiter_workspace": "/home/rylan/seds-prefreeze-20261018",
+    "local_checks": 17,
+    "strict_starts": {
+      "passed": 3
+    },
+    "restart_120_virtual_seconds": "passed",
+    "soak_600_virtual_seconds": "passed",
+    "sd_reconciliation": "DAQ and FC passed",
+    "final_evidence": "docs/qualification-4.2.4-2026-10-19.json",
+    "hosted_sdk_selection_gap": "Previous path patch was unused; mixed-version evidence retained separately.",
+    "all_current_hosted_sdk": "passed with verified SDK4.2.4 image/source proof"
+  },
+  "release_only_source_deltas": {
+    "test_fixture": {
+      "file": "src/tests/router_tests/schema_sync_tests.rs",
+      "before": "806ec63cf3e80dfe0f5dbd4d972f3e4057e4885eb1c86c3fffef21c74d79f538",
+      "after": "d0f3b602163c192966dc1d2aaa2e30bc819257d009f25acb7540d39af77f965f",
+      "reason": "Isolated nextest fixture previously relied on runtime registrations from other tests",
+      "runtime_source_changed": false,
+      "module_gated_by_cfg_test": true
+    },
+    "build_helper": {
+      "frozen_build_py_sha256": "656856df06b098b58f59589dd3e051c91d918504fdac00a5398b022ee9742d08",
+      "release_build_py_sha256": "7b9d950aaf03f3829c5ebd80021964ccf4a97b8ee3e02d6c66a4a48928465b12",
+      "non_login_build_ast_identical": true,
+      "scope": "PyPI login error text/context only; firmware build/configure logic unchanged",
+      "runtime_test_fixture_delta": {
+        "file": "src/tests/router_tests/schema_sync_tests.rs",
+        "before": "806ec63cf3e80dfe0f5dbd4d972f3e4057e4885eb1c86c3fffef21c74d79f538",
+        "after": "d0f3b602163c192966dc1d2aaa2e30bc819257d009f25acb7540d39af77f965f",
+        "reason": "Isolated nextest fixture previously relied on runtime registrations from other tests",
+        "runtime_source_changed": false,
+        "module_gated_by_cfg_test": true
+      }
+    },
+    "c_harness": "Release assertion guards and test runner only; not linked into firmware"
+  }
+}

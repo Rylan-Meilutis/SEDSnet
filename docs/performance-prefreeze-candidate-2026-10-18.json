@@ -1,0 +1,482 @@
+{
+  "command": "cargo bench --locked --bench BENCH -- --warm-up-time 1 --measurement-time 2 --sample-size 30 --save-baseline prefreeze-final-20261018",
+  "estimates": [
+    {
+      "benchmark": "packet_paths/construct_gps_packet",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 118.17267949668482,
+            "upper_bound": 119.68290468723575
+          },
+          "point_estimate": 118.92610177731082,
+          "standard_error": 0.3827373970699866
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 117.05759903336997,
+            "upper_bound": 120.89029206137813
+          },
+          "point_estimate": 118.10672550650524,
+          "standard_error": 1.324920345122835
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.7643950903441775,
+            "upper_bound": 3.2205670716912387
+          },
+          "point_estimate": 2.6354868947433845,
+          "standard_error": 0.7246833465509365
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 119.54546988867119,
+            "upper_bound": 120.74131998809867
+          },
+          "point_estimate": 120.27467145173321,
+          "standard_error": 0.30755501082285885
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.8712539347539123,
+            "upper_bound": 2.244552436937917
+          },
+          "point_estimate": 2.1134371133117558,
+          "standard_error": 0.09720997685081274
+        }
+      }
+    },
+    {
+      "benchmark": "packet_paths/pack_gps_packet",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 144.7565869048772,
+            "upper_bound": 147.23157055214475
+          },
+          "point_estimate": 145.74651693157892,
+          "standard_error": 0.653600059810922
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 144.10799152193516,
+            "upper_bound": 146.13719822324697
+          },
+          "point_estimate": 145.91742675979927,
+          "standard_error": 0.5696171410611616
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.29745460362599196,
+            "upper_bound": 2.575089820635294
+          },
+          "point_estimate": 1.0718883251256595,
+          "standard_error": 0.6983978620374791
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 143.79195162768252,
+            "upper_bound": 144.866697823698
+          },
+          "point_estimate": 144.27943668435069,
+          "standard_error": 0.27318895986211805
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.210574053846167,
+            "upper_bound": 5.817484572125788
+          },
+          "point_estimate": 3.601320673277463,
+          "standard_error": 1.5252054724145605
+        }
+      }
+    },
+    {
+      "benchmark": "packet_paths/peek_gps_frame_info",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 99.69593506849716,
+            "upper_bound": 99.9310661584942
+          },
+          "point_estimate": 99.81149729555595,
+          "standard_error": 0.060086201334739305
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 99.72849211849118,
+            "upper_bound": 99.9336086460707
+          },
+          "point_estimate": 99.80835242950008,
+          "standard_error": 0.048851770868333276
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.1310971407641339,
+            "upper_bound": 0.3996843456233742
+          },
+          "point_estimate": 0.2864680875578677,
+          "standard_error": 0.06995490041842918
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 99.52823456297818,
+            "upper_bound": 99.82852344886258
+          },
+          "point_estimate": 99.67379157241825,
+          "standard_error": 0.07666880979038677
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.22295241633278867,
+            "upper_bound": 0.42918442053710504
+          },
+          "point_estimate": 0.33468785802390266,
+          "standard_error": 0.052938017441246495
+        }
+      }
+    },
+    {
+      "benchmark": "packet_paths/roundtrip_message_packet",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 130.57669531133666,
+            "upper_bound": 134.2359819147439
+          },
+          "point_estimate": 132.39988366618113,
+          "standard_error": 0.9354188304287235
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 127.38873895462035,
+            "upper_bound": 135.93030621584163
+          },
+          "point_estimate": 135.33552992861064,
+          "standard_error": 3.0824511266349943
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.1568300233940911,
+            "upper_bound": 11.053923957999135
+          },
+          "point_estimate": 4.660169999095101,
+          "standard_error": 2.8150847828847376
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 127.7742707060747,
+            "upper_bound": 130.79144255692188
+          },
+          "point_estimate": 128.9468806738239,
+          "standard_error": 0.7716690375217115
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4.389749615917568,
+            "upper_bound": 5.997703108597764
+          },
+          "point_estimate": 5.225060368031869,
+          "standard_error": 0.42006873951854273
+        }
+      }
+    },
+    {
+      "benchmark": "packet_paths/unpack_gps_packet",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 95.96399343817585,
+            "upper_bound": 96.54449444507863
+          },
+          "point_estimate": 96.2588509848277,
+          "standard_error": 0.1481919611447541
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 95.54352980396166,
+            "upper_bound": 96.83017777378734
+          },
+          "point_estimate": 96.61191836322416,
+          "standard_error": 0.3079457894551192
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.3413300600442009,
+            "upper_bound": 1.268977455088954
+          },
+          "point_estimate": 0.7798607546516633,
+          "standard_error": 0.2632192279561799
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 95.51431676988757,
+            "upper_bound": 96.19512973580918
+          },
+          "point_estimate": 95.82591881785734,
+          "standard_error": 0.17444196992559052
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.6875241502499504,
+            "upper_bound": 0.9150359219138559
+          },
+          "point_estimate": 0.828496864681809,
+          "standard_error": 0.05795491352411901
+        }
+      }
+    },
+    {
+      "benchmark": "route_selection_paths/relay_failover_forward",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2716.069081868841,
+            "upper_bound": 2730.2781373681296
+          },
+          "point_estimate": 2723.163324224167,
+          "standard_error": 3.617175414664243
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2704.7738825484494,
+            "upper_bound": 2736.921395991205
+          },
+          "point_estimate": 2733.531467044649,
+          "standard_error": 10.985862368935205
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4.420787609163992,
+            "upper_bound": 34.07335566722443
+          },
+          "point_estimate": 22.87373662438474,
+          "standard_error": 8.678852130605836
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2705.353359643203,
+            "upper_bound": 2715.7167896685987
+          },
+          "point_estimate": 2709.4679895555096,
+          "standard_error": 2.63475569892791
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 16.72269004954651,
+            "upper_bound": 23.012013384953708
+          },
+          "point_estimate": 20.06919161333656,
+          "standard_error": 1.622874443688603
+        }
+      }
+    },
+    {
+      "benchmark": "route_selection_paths/router_weighted_local_tx",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1368.3861865055298,
+            "upper_bound": 1379.9946943600048
+          },
+          "point_estimate": 1374.2940334467778,
+          "standard_error": 2.9857818281912607
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1356.6541633609127,
+            "upper_bound": 1389.078772583498
+          },
+          "point_estimate": 1387.922418678454,
+          "standard_error": 12.550152133595939
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.7253249778699784,
+            "upper_bound": 24.73917922637867
+          },
+          "point_estimate": 5.442035995242367,
+          "standard_error": 6.69700364602673
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1358.8190904739201,
+            "upper_bound": 1368.243333449619
+          },
+          "point_estimate": 1362.4219849891151,
+          "standard_error": 2.4253465175571725
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 14.943833349783604,
+            "upper_bound": 17.156518848931537
+          },
+          "point_estimate": 16.662776395391734,
+          "standard_error": 0.5642651824836774
+        }
+      }
+    },
+    {
+      "benchmark": "router_system_paths/relay_forward_between_sides",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7105.617895813663,
+            "upper_bound": 9488.667123146974
+          },
+          "point_estimate": 8294.903052581962,
+          "standard_error": 607.7218376319812
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6377.836231884058,
+            "upper_bound": 10147.704244306418
+          },
+          "point_estimate": 8271.202928743962,
+          "standard_error": 1025.301928812301
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2566.33144139503,
+            "upper_bound": 5450.545049447251
+          },
+          "point_estimate": 4216.282230982511,
+          "standard_error": 748.9072032172767
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10030.299716376976,
+            "upper_bound": 11894.760955002375
+          },
+          "point_estimate": 11121.84610243794,
+          "standard_error": 479.3384881718088
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2733.0781501726233,
+            "upper_bound": 3851.686077806379
+          },
+          "point_estimate": 3382.446150151962,
+          "standard_error": 285.33882362908963
+        }
+      }
+    },
+    {
+      "benchmark": "router_system_paths/router_to_router_roundtrip",
+      "estimates": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2014.5771764352758,
+            "upper_bound": 2020.1739791243626
+          },
+          "point_estimate": 2017.08111064203,
+          "standard_error": 1.4444926330663428
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2013.0517034400832,
+            "upper_bound": 2018.3580938222663
+          },
+          "point_estimate": 2015.1143914329855,
+          "standard_error": 1.2798983120768093
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2.4891875095178557,
+            "upper_bound": 6.41657954416023
+          },
+          "point_estimate": 4.673735584280179,
+          "standard_error": 0.9564014568734271
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2013.3812211644833,
+            "upper_bound": 2016.6054059195633
+          },
+          "point_estimate": 2014.7655155949706,
+          "standard_error": 0.8222842138750992
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3.335203390826261,
+            "upper_bound": 11.410086419691684
+          },
+          "point_estimate": 8.026151611634859,
+          "standard_error": 2.1330958498790626
+        }
+      }
+    }
+  ],
+  "interpretation": "Same idle Jupiter host/profile; Criterion confidence intervals retained. Router roundtrip is essentially unchanged; other paths vary in both directions. This does not establish MCU throughput or a systematic CPU speedup. The verified runtime benefit is lower sparse metadata allocation demand and allocation-free managed-cache updates. Network qualification remains in progress.",
+  "measured": "2026-10-18",
+  "platform": "Linux x86_64, AMD Ryzen 9 7900X",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+  "features": "default (std, compression, timesync, discovery, cryptography)",
+  "profile": "Cargo bench/release; fixture telemetry_config.test.json",
+  "sdk_base_commit": "a94de32ab34557ac3dc8fc71996f6f4d1eb53dca",
+  "source_sha256": {
+    "src/router.rs": "5de73cf016986b152ca0c357c014ca20b6a9606c1a57e35c3efce93b7a8e8fe6",
+    "src/relay.rs": "77b30e7a57afdf30877c9e9dc83c2aaeedffe1260f5eb3f66c4968490def7c5b",
+    "src/side_transport.rs": "270a8bb5963a8d6107b4c8d647d76b97a24b16b1280402edf5ccd6c8ac997ad6",
+    "src/config.rs": "213a1ab7c51fc1c847da71f9f5d87c59cda507741a1f7aecd5b60115f7a7f249",
+    "src/c_api.rs": "1d7e238039eba325466c09435873ad1af2dc619465a5c42bf44cef90385b7213",
+    "Cargo.toml": "a58b8a4ecfbf62eaced30748efe26c8a6f375c962a9797fd3fafbad5fc9cd1a5",
+    "Cargo.lock": "b2efdcd05a0d00d0bd3df59e885db7fc9acaf099d207c112f46442dc83abaa9e"
+  },
+  "comparison_mean_percent": {
+    "packet_paths/construct_gps_packet": -14.293419534372465,
+    "packet_paths/pack_gps_packet": -3.8585536835698098,
+    "packet_paths/peek_gps_frame_info": 5.9592446742190885,
+    "packet_paths/roundtrip_message_packet": -4.304612378048245,
+    "packet_paths/unpack_gps_packet": -15.146007230954561,
+    "route_selection_paths/relay_failover_forward": 4.862307036880353,
+    "route_selection_paths/router_weighted_local_tx": 4.703243231336995,
+    "router_system_paths/relay_forward_between_sides": -1.2068026225397932,
+    "router_system_paths/router_to_router_roundtrip": 0.017073890606922326
+  }
+}

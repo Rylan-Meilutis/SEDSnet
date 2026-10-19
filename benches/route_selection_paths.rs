@@ -1,3 +1,4 @@
+mod support;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use sedsnet::RouteSelectionMode;
 use sedsnet::TelemetryResult;
@@ -24,6 +25,7 @@ fn next_packet(counter: &AtomicU64) -> Packet {
 }
 
 fn benchmark_route_selection_paths(c: &mut Criterion) {
+    support::initialize_schema();
     let mut group = c.benchmark_group("route_selection_paths");
 
     let weighted_hits_a = Arc::new(AtomicUsize::new(0));

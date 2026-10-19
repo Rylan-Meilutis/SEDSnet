@@ -215,6 +215,20 @@ file(GLOB_RECURSE RS_SRC CONFIGURE_DEPENDS
     "${RUST_DIR}/c-wrapper/*.hpp"
 )
 
+# JSON catalogs and proc-macro sources affect generated identities and shapes
+# just as much as src/*.rs. Cargo's own rerun directives are insufficient if
+# Ninja never invokes Cargo after these files change.
+file(GLOB _RS_DEFAULT_SCHEMA CONFIGURE_DEPENDS "${RUST_DIR}/telemetry_config.json")
+file(GLOB_RECURSE _RS_MACRO_INPUTS CONFIGURE_DEPENDS "${RUST_DIR}/sedsnet_macros/src/*.rs")
+list(APPEND RS_SRC ${_RS_DEFAULT_SCHEMA} ${_RS_MACRO_INPUTS})
+if(NOT SEDSNET_SCHEMA_PATH STREQUAL "")
+    get_filename_component(_RS_SELECTED_SCHEMA "${SEDSNET_SCHEMA_PATH}" ABSOLUTE BASE_DIR "${RUST_DIR}")
+    if(NOT EXISTS "${_RS_SELECTED_SCHEMA}")
+        message(FATAL_ERROR "SEDSNET_SCHEMA_PATH does not exist: ${_RS_SELECTED_SCHEMA}")
+    endif()
+    list(APPEND RS_SRC "${_RS_SELECTED_SCHEMA}")
+endif()
+
 if (SEDSNET_FORCE_RELEASE)
     set(RS_BUILD_OUTPUTS "${RS_LIB_REL}")
 else ()

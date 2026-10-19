@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+## 4.2.4
+
+- Keep C integration assertions and setup active in Release builds; reject disabled checks, register all five CTest programs, and exercise Release through the existing Rust test gate.
+
+- Redact local release credentials from command displays, child output and
+  timeout/error reports. Add `publish_crates.py --credential-status` to inspect
+  availability without opening credential files or publishing.
+
+- Include incomplete transport transfers in the router/relay shared byte budget
+  across all links. Preserve active-transfer progress and learned routes; reclaim
+  dominant best-effort backlog before unrelated partial transfers. Validate chunk
+  metadata before reclamation and report incomplete-transfer reclamation counts
+  in Rust runtime statistics, C JSON and Python. Regressions cover heap and active
+  arena storage, duplicate/CRC handling, expiry and slow-report/control survival.
+- Preserve accepted RX fragments when temporary shared-budget pressure refuses
+  a later fragment. The existing retryable pressure result lets Router and Relay
+  resume without silently losing earlier payloads. Maintain per-link costs
+  incrementally without enlarging the 32-bit assembly layout; reuse ordinary
+  map removal for two-second expiry to reduce embedded code size.
+
+- Retain partially transmitted packets when allocation admission defers the next
+  side-transport fragment. Resume at the first unsent chunk on both Router and
+  Relay, and avoid allocating diagnostic strings for memory-pressure refusal.
+  Reassembly regressions reproduce the former loss and verify chunk identity,
+  ordering, CRCs and payload recovery with heap and active arena storage.
+
+- Reclaim ordinary queued telemetry for CRC-valid small frozen controls even
+  when a forwarding proxy neither owns the variable nor assigns it high schema
+  priority. Preserve existing control queues and malformed-frame rejection.
+- Keep single-side discovery plans on the stack. Apply learned-graph workspace
+  admission to full-schema replies too; release relay snapshot buffers before
+  constructing schema. Refused workspace preserves the learned routes.
+
+- Admit CRC-validated, empty, untargeted topology/schema recovery requests using the bounded control reserve through ingress and payload decoding. Keep their existing dynamic wire schema, full allocation estimate, legacy-probe behavior and independent reply-workspace admission. Nonempty, corrupt or misaddressed requests retain ordinary admission.
+
+- Share retained peer topology graphs during transactional route copies. Only a
+  changed peer detaches its graph; full snapshots take ownership of decoded
+  nodes without cloning the old catalog. Rejected growth preserves prior routes.
+- Account for map, container, string and vector-growth workspace when a known
+  peer sends a small topology update. Resolve compact aliases without allocating
+  a hostname before admission. Allocation-metered router/relay regressions catch
+  the previous 16.7 KiB working peak admitted with a 10.9 KiB estimate.
+
+- Admit small compact-frame reconstruction using its bounded byte-buffer workspace, then require canonical routing/decoder admission before enqueueing and again at dispatch. Routers and relays retain fair bulk reclamation, legacy-probe behavior and application safety reserves. Pressure regressions cover cold traffic, route expiry and changed local handling.
+
+- Consume CRC-validated, unsequenced topology retries directly from borrowed wire bytes when their canonical full/delta payload exactly matches retained state. Router and Relay allocate nothing for this case; unknown peers, changed graphs, bad CRCs, frozen targets and sequenced/piggyback receipts retain normal processing.
+- Permit bounded warmed forwarding of matching inline schema contracts. Preserve full admission for changed/unknown shapes, cold statistics/routes, local managed variables, compressed/encrypted frames and reliable/frozen traffic. Fragmented-pool regressions cover both routers and relays, with negative controls that fail when the optimization is disabled.
+
+- Compare exact canonical topology retries against retained nodes without decoding or cloning the graph. Router and standalone Relay renew liveness and full-baseline receipt in place; changed or malformed updates retain normal transactional admission.
+
+- Keep immutable side-header templates in one shared allocation instead of two general-purpose packet-store handles. Router and Relay retain identical wire bytes and dictionary capacity while reducing retained metadata, clone work and embedded flash.
+
+- Store one traffic direction inline in router/relay per-type statistics; allocate opposite-direction and error counters only when needed. Preserve full-width saturating counters, public snapshots and warmed transit detection.
+
+- Bound sparse managed-value cache leaf allocations; reuse each retained entry on updates without adding allocation churn.
+
+- Keep sparse router/relay side metadata behind pointer-sized B-tree entries, reducing retained leaf capacity and large startup allocations. Runtime-stat exports borrow counter trees instead of cloning them.
+
+- Recheck allocator headroom immediately before each lazy side-transport fragment; refused transfers resume at the first unsent chunk on routers and relays.
+- Add allocation-free fixed router memory counters for constrained-device profiling. Hosted memory queries no longer instantiate the schema registry as a side effect.
+
+- Shorten embedded Rust source-path strings when explicit environment compiler flags are supplied, preserving flags and paths with spaces. Disable with `SEDSNET_EMBEDDED_PATH_REMAP_AUTO=0`. FlightComputer factory builds recover flash without removing runtime features.
+
+- Rebuild the CMake static library after schema JSON or proc-macro source changes,
+  including an external schema override. A real Ninja regression covers clean,
+  cached, schema-created, schema-edited and macro-edited builds.
+
 - Upgrade PyO3 to 0.30.1 and require Python 3.9 or newer for Python bindings.
   Build stable-ABI wheels from Python 3.9 (`cp39-abi3`), retaining Python 3.9
   and 3.10 support while dropping Python 3.8. Embedded/Rust/C wire formats and APIs are unchanged.

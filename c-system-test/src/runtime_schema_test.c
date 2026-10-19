@@ -1,6 +1,6 @@
 #include "sedsnet.h"
 #include "sedsnet_c_wrapper.h"
-#include <assert.h>
+#include "test_assertions.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>

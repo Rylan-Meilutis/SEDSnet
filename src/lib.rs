@@ -189,6 +189,7 @@ mod small_payload;
 mod small_sort;
 #[cfg(feature = "timesync")]
 pub mod timesync;
+mod type_stats;
 mod varint;
 pub mod wire_format;
 // ============================================================================

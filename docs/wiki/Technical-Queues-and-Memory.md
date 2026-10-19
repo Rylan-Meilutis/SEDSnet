@@ -12,7 +12,10 @@ Key properties:
 
 - **Byte budget**: each item reports its `byte_cost` via the `ByteCost` trait.
 - **Hard element cap**: capacity never exceeds `max_elems`, derived from `size_of::<T>()`.
-- **Eviction policy**: evict from the front until a new item fits in the byte budget.
+- **FIFO eviction policy**: ordinary FIFO users evict from the front until a new
+  item fits in the byte budget. Router/Relay packet queues additionally apply
+  schema priority and dominant-sender admission before selecting a victim; the
+  shared-budget rules below describe those paths.
 - **Growth policy**: multiplicative growth using `QUEUE_GROW_STEP`. Set it to
   exactly `1.0` on fragmented embedded heaps to retain the startup capacity
   and evict from a full bounded queue without reallocating under live traffic.
@@ -26,6 +29,24 @@ Key properties:
   guarantee every later allocation succeeds.
 
 This keeps memory use bounded and avoids unbounded `VecDeque` growth in embedded builds.
+
+## Shared transport-reassembly budget
+
+Incomplete side transfers consume the same byte budget as RX/TX work across all
+links. Per-link limits cannot each spend the entire router budget independently.
+Under pressure, known best-effort backlog yields by dominant sender before an
+unrelated incomplete transfer is reclaimed. A transfer that fits the available budget keeps its current
+fragments; learned routes, committed schema and protected controls are retained.
+Duplicate chunks add no storage. Invalid metadata is checked before reclaiming
+other transfers, and inactive transfers expire after two seconds. Temporary global-budget
+pressure returns `Io("memory pressure")` while preserving the active assembly; a
+same-fragment retry must still complete the original packet. Per-link byte costs
+update incrementally on insertion and removal. Expiry shares the existing removal
+path, allocates no scratch, and preserves the timeout and reclaim accounting.
+
+`side_transport_chunk_reclaims` reports incomplete transfers reclaimed by pressure,
+expiry or the per-link cap. Successful reassembly is not a drop. The counter is
+available through Rust runtime statistics, C runtime JSON and Python side statistics.
 
 ## Optional admission work classes
 

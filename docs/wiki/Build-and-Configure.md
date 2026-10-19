@@ -48,6 +48,15 @@ Useful options:
   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 - `--target <triple>` sets the Rust target triple for embedded builds.
 
+## Local publication credentials
+
+Use `python3 publish_crates.py --credential-status` to check credential availability.
+It prints only configuration status and never validates or uploads a package.
+Use `python3 build.py maturin-login` to save a PyPI token locally through a hidden
+prompt. Do not print the ignored credential file. Cargo can use its saved local
+login. Publishing commands pass credentials through the child environment;
+command displays, child logs and failure/timeout reports redact tokens.
+
 ## Cargo features
 
 From
@@ -99,6 +108,18 @@ It covers four layers:
 The C system tests exercise the static C ABI, multi-endpoint routing, relay forwarding, discovery, and time-sync
 behavior through compiled executables in `c-system-test/`. The main multi-node C test now waits for every asserted
 endpoint count before shutdown so it does not fail early when one simulated board drains slightly slower than another.
+
+All five C executables retain assertions in Release mode, including setup calls.
+A compile-time guard rejects accidentally disabled checks. Run the standalone suite with:
+
+```sh
+cmake -S c-system-test -B build/c-system -DCMAKE_BUILD_TYPE=Release
+cmake --build build/c-system
+ctest --test-dir build/c-system --output-on-failure
+```
+
+The Rust test gate uses Release for these programs too. On macOS, pass a matching
+`MACOSX_DEPLOYMENT_TARGET` for C and Rust when selecting a deployment baseline.
 
 The Rust system tests under `tests/rust-system-test/` cover the higher-level multi-node behaviors that matter most for
 regressions:

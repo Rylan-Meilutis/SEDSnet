@@ -73,7 +73,8 @@ mod c_system_test {
         // Give every harness process an isolated directory instead.
         let build_dir =
             std::env::temp_dir().join(format!("sedsnet-c-system-test-{}", std::process::id()));
-        let macos_deployment_target = "26.0";
+        let macos_deployment_target =
+            std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "11.0".to_owned());
 
         if build_dir.exists() {
             fs::remove_dir_all(&build_dir).expect("Failed to remove stale C system-test build");
@@ -85,11 +86,12 @@ mod c_system_test {
         prebuild
             .arg("build.py")
             .arg("build")
+            .arg("--release")
             .arg("--features=timesync")
             .arg("--device-id=SYSTEM_TEST")
             .current_dir(&repo_root);
         if cfg!(target_os = "macos") {
-            prebuild.env("MACOSX_DEPLOYMENT_TARGET", macos_deployment_target);
+            prebuild.env("MACOSX_DEPLOYMENT_TARGET", &macos_deployment_target);
         }
         let status = prebuild
             .status()
@@ -102,10 +104,10 @@ mod c_system_test {
             .arg(".")
             .arg("-B")
             .arg(&build_dir)
-            .arg("-DCMAKE_BUILD_TYPE=Debug")
+            .arg("-DCMAKE_BUILD_TYPE=Release")
             .current_dir(&root);
         if cfg!(target_os = "macos") {
-            cmake_config.env("MACOSX_DEPLOYMENT_TARGET", macos_deployment_target);
+            cmake_config.env("MACOSX_DEPLOYMENT_TARGET", &macos_deployment_target);
         }
         let status = cmake_config.status().expect("Failed to config cmake build");
         assert!(status.success(), "CMake config failed");
@@ -117,7 +119,7 @@ mod c_system_test {
             .arg(&build_dir)
             .current_dir(&root);
         if cfg!(target_os = "macos") {
-            cmake_build.env("MACOSX_DEPLOYMENT_TARGET", macos_deployment_target);
+            cmake_build.env("MACOSX_DEPLOYMENT_TARGET", &macos_deployment_target);
         }
         let status = cmake_build.status().expect("Failed to invoke cmake build");
         assert!(status.success(), "CMake build failed");

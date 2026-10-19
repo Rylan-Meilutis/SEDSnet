@@ -908,6 +908,7 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
                  \"side_transport_compact_delta_frames\":{},\
                  \"side_transport_compact_omitted_timestamp_frames\":{},\
                  \"side_transport_chunk_frames\":{},\
+                 \"side_transport_chunk_reclaims\":{},\
                  \"side_transport_raw_bytes\":{},\
                  \"side_transport_wire_bytes\":{},\
                  \"side_transport_bytes_saved\":{},\
@@ -933,6 +934,7 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
                 side.side_transport_compact_delta_frames,
                 side.side_transport_compact_omitted_timestamp_frames,
                 side.side_transport_chunk_frames,
+                side.side_transport_chunk_reclaims,
                 side.side_transport_raw_bytes,
                 side.side_transport_wire_bytes,
                 side.side_transport_bytes_saved,
@@ -3728,6 +3730,30 @@ pub extern "C" fn seds_router_copy_reliable_pending(
         .min(i32::MAX as usize) as i32
 }
 
+/// Copy versioned fixed memory counters without allocation. Returns the
+/// required word count (16), even if capacity is smaller. NULL with zero
+/// capacity queries the count. Output must be aligned and writable.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_copy_memory_counters(
+    r: *mut SedsRouter,
+    words: *mut u32,
+    capacity: usize,
+) -> i32 {
+    if r.is_null()
+        || (capacity != 0
+            && (words.is_null() || !(words as usize).is_multiple_of(core::mem::align_of::<u32>())))
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    if capacity != 0 {
+        let counters = unsafe { &(*r).inner }.memory_counters();
+        unsafe {
+            core::ptr::copy_nonoverlapping(counters.as_ptr(), words, capacity.min(counters.len()))
+        };
+    }
+    16
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_memory_layout_len(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -5839,6 +5865,62 @@ mod tests {
     use std::ffi::CStr;
     use std::sync::Mutex;
 
+    #[test]
+    fn fixed_unsigned_bytes_preserve_all_bits_through_queue_and_wire() {
+        crate::tests::ensure_common_test_schema();
+        let endpoint =
+            crate::config::register_endpoint("C_ABI_UNSIGNED_BYTES_SINK", false).unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            "C_ABI_UNSIGNED_BYTES",
+            "",
+            crate::MessageElement::Static(
+                24,
+                crate::MessageDataType::UInt32,
+                crate::MessageClass::Data,
+            ),
+            &[endpoint],
+            crate::ReliableMode::None,
+            0,
+        )
+        .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let output = captured.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(
+                endpoint,
+                move |packet| {
+                    let frame = pack_packet(packet);
+                    *output.lock().unwrap() = unpack_packet(&frame)?.data_as_u32()?;
+                    Ok(())
+                },
+            )]),
+            Box::new(|| 0u64),
+        );
+        let mut handle = SedsRouter {
+            inner: Arc::new(router),
+        };
+        let mut words = [0u32; 24];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = (index as u32).wrapping_mul(0x9e3779b1) ^ 0xf00d1234;
+        }
+        words[0] = u32::MAX;
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert_eq!(
+            seds_router_log_bytes_ex(
+                &mut handle,
+                ty.as_u32(),
+                bytes.as_ptr(),
+                bytes.len(),
+                ptr::null(),
+                true
+            ),
+            0
+        );
+        bytes.fill(0); // The caller may immediately reuse its stack/output buffer.
+        handle.inner.process_all_queues().unwrap();
+        assert_eq!(*captured.lock().unwrap(), words);
+    }
+
     struct BackpressureProbe {
         busy: core::sync::atomic::AtomicBool,
         delivered: AtomicUsize,
@@ -6219,6 +6301,7 @@ mod tests {
                 .is_u64()
         );
         assert!(side.get("side_transport_chunk_frames").unwrap().is_u64());
+        assert!(side.get("side_transport_chunk_reclaims").unwrap().is_u64());
         assert!(side.get("side_transport_raw_bytes").unwrap().is_u64());
         assert!(side.get("side_transport_wire_bytes").unwrap().is_u64());
         assert!(side.get("side_transport_bytes_saved").unwrap().is_u64());
@@ -7417,6 +7500,36 @@ mod tests {
         );
 
         seds_relay_free(relay);
+    }
+
+    #[test]
+    fn c_abi_memory_counters_validate_buffers_and_keep_output_bounds() {
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
+        assert!(!router.is_null());
+        assert_eq!(
+            seds_router_copy_memory_counters(router, ptr::null_mut(), 0),
+            16
+        );
+        assert!(seds_router_copy_memory_counters(ptr::null_mut(), ptr::null_mut(), 0) < 0);
+        assert!(seds_router_copy_memory_counters(router, ptr::null_mut(), 1) < 0);
+        let mut words = [u32::MAX; 18];
+        assert_eq!(
+            seds_router_copy_memory_counters(router, words.as_mut_ptr(), 2),
+            16
+        );
+        assert_eq!(words[0], 1);
+        assert_ne!(words[1], u32::MAX);
+        assert!(words[2..].iter().all(|word| *word == u32::MAX));
+        assert_eq!(
+            seds_router_copy_memory_counters(router, words.as_mut_ptr(), 18),
+            16
+        );
+        assert_eq!(&words[16..], &[u32::MAX, u32::MAX]);
+        let misaligned = (words.as_mut_ptr() as *mut u8)
+            .wrapping_add(1)
+            .cast::<u32>();
+        assert!(seds_router_copy_memory_counters(router, misaligned, 1) < 0);
+        seds_router_free(router);
     }
 
     #[test]

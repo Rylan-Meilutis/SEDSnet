@@ -1,14 +1,15 @@
 use super::*;
 
 fn template(hash: u64) -> SideHeaderTemplate {
-    SideHeaderTemplate {
+    crate::side_transport::SideHeaderTemplateView {
         hash,
         base_flags: 0,
-        prefix: crate::shared_bytes::convert(Arc::<[u8]>::from([1u8, 2])),
-        between: crate::shared_bytes::convert(Arc::<[u8]>::from([])),
+        prefix: &[1u8, 2],
+        between: &[],
         reliable_flags: None,
         reliable_compact: false,
     }
+    .into_owned()
 }
 
 #[test]

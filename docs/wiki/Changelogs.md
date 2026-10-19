@@ -2,16 +2,41 @@
 
 ## Unreleased
 
-- Upgrade PyO3 to 0.30.1 and require Python 3.9 or newer for Python bindings.
-  Build stable-ABI wheels from Python 3.9 (`cp39-abi3`), retaining Python 3.9
-  and 3.10 support while dropping Python 3.8. Embedded/Rust/C wire formats and APIs are unchanged.
-
-- Use Cargo-style build commands and options: `build`, `check`, `test`,
-  `--release`, `--features`, `--target`, and named configuration flags.
-  Migrate CMake, C integration tests, release tooling, and usage documentation
-  together. Runtime APIs, wire format, and firmware build.py flags are unchanged.
-
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
+
+## Version 4.2.4 highlights
+
+- Keep C integration assertions and setup active in Release builds; reject disabled checks, register all five CTest programs, and exercise Release through the existing Rust test gate.
+
+- Redact publishing credentials from command displays, subprocess logs and errors; add a secret-free local credential-status command.
+
+- Include incomplete transport transfers in the router/relay shared byte budget
+  across all links. Preserve active-transfer progress and learned routes; reclaim
+  dominant best-effort backlog before unrelated partial transfers. Validate chunk
+  metadata before reclamation and report incomplete-transfer reclamation counts
+  in Rust runtime statistics, C JSON and Python. Regressions cover heap and active
+  arena storage, duplicate/CRC handling, expiry and slow-report/control survival.
+- Preserve accepted RX fragments when temporary shared-budget pressure refuses
+  a later fragment. The existing retryable pressure result lets Router and Relay
+  resume without silently losing earlier payloads. Maintain per-link costs
+  incrementally without enlarging the 32-bit assembly layout; reuse ordinary
+  map removal for two-second expiry to reduce embedded code size.
+
+- Resume partially transmitted packets after temporary allocator refusal, preserving
+  fragment progress on Router and Relay without formatting pressure diagnostics.
+
+- Preserve frozen-control admission through foreign proxies under pressure.
+- Avoid heap allocation for single-side discovery plans and include learned
+  graphs in full-schema working-memory admission for routers and relays.
+
+- Share retained discovery graphs and admit transactional workspace accurately.
+- Recover topology/schema requests using bounded control admission; keep full
+  reply checks and reject malformed or misaddressed requests normally.
+- Avoid copying unchanged topology retries, header templates and idle counters.
+- Bound compact reconstruction before canonical queue/dispatch admission.
+- Expose allocation-free memory counters and rebuild CMake outputs after schema
+  or proc-macro edits.
+- Use Cargo-style SDK commands and current PyO3 with Python 3.9+ ABI wheels.
 
 ## Version 4.2.3 highlights
 
@@ -125,7 +150,7 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 - Experimental opt-in packet/frame arena supports pin-aware compaction and fixed queue slabs.
 - Optional indexed Zstd storage reads individual field ranges with fixed contexts and bounded reusable scratch; compression is retained only when it saves space.
 - Existing default allocation, ThreadX scheduling, and wire format are unchanged. Application heap allocations remain outside the arena.
-- Native pressure and churn tests passed; full embedded network qualification remains incomplete. See [validation and limits](../compact-packet-validation.md).
+- Initial native pressure and churn tests passed. Current linked-firmware qualification and remaining hardware limits are tracked in [validation and limits](../compact-packet-validation.md).
 
 ## Version 4.0.38 highlights
 

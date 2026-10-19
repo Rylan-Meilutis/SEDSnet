@@ -1,0 +1,89 @@
+{
+  "date": "2026-10-19",
+  "version": "4.2.4",
+  "status": "passed",
+  "native_codec": {
+    "wall_seconds": 600,
+    "rounds": 14558397,
+    "fixed_codec_workspace_bytes": 126879,
+    "final_arena_stats": {
+      "capacity": 131072,
+      "live_bytes": 0,
+      "largest_gap": 131072,
+      "live_handles": 0,
+      "pinned_bytes": 0,
+      "moves": 0,
+      "rejected": 227475,
+      "reserved_bytes": 139264
+    },
+    "checks": [
+      "Pinned address/data remain stable",
+      "Range reads retain no full decoded copy",
+      "Compression never expands stored payload",
+      "Oversized requests are refused while retained work continues",
+      "Arena live bytes and handles return to zero after final drain"
+    ]
+  },
+  "native_churn": {
+    "ticks": 2400,
+    "tick_ms": 250,
+    "protocol_duration_ms": 600000,
+    "post_recovery_delivery": "passed",
+    "fault_injection_delivery_failures": 33,
+    "scope": "Deliberate packet-loss/route-outage injection; recovery checks pass, not a lossless-during-outage claim"
+  },
+  "commands": [
+    {
+      "name": "codec",
+      "exit": 0,
+      "wall_seconds": 656.2626315830275,
+      "command": [
+        "cargo",
+        "test",
+        "--release",
+        "--features",
+        "compact-packet-compression",
+        "--test",
+        "compact_packet_store",
+        "bounded_codec_pressure_soak",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "environment": {
+        "SEDSNET_CODEC_SOAK_SECONDS": "600"
+      }
+    },
+    {
+      "name": "churn",
+      "exit": 0,
+      "wall_seconds": 42.97083124984056,
+      "command": [
+        "cargo",
+        "test",
+        "--release",
+        "--features",
+        "compact-packet-compression",
+        "--test",
+        "reliable_drop_test",
+        "comprehensive_multinode_churn_soak_exercises_stack_features",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "environment": {
+        "SEDSNET_SOAK_TICKS": "2400"
+      }
+    }
+  ],
+  "source_sha256": {
+    "src/packet_store.rs": "2b5b677edc919f3a619e969ef4a70b888a20ae5032537bf247d8d4f547079f9a",
+    "src/router.rs": "03d11c90fcd1d37fa36c67376b74030913308ed8c76116cc241a47b066f608d3",
+    "src/relay.rs": "62d5392a3ed7f4c6ecaba490cbd788f75265f0b482a65dd9c6d92c8dfc832b02",
+    "tests/compact_packet_store.rs": "5873a77390eb8ad5c455a32b9606ff5c9c87334aee26f28831e5e93128ae83a1"
+  },
+  "limits": [
+    "Native codec/arena memory requirements are not MCU codec qualification.",
+    "Linked firmware cohort uses arena storage with compression disabled; hardware card throughput and power-loss durability remain separate."
+  ]
+}

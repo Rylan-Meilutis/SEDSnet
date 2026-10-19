@@ -1297,7 +1297,16 @@ pub(crate) fn unpack_packet_with_role(buf: &[u8], managed: bool) -> Result<Packe
         && !small_ack
         && buf.len() <= 128
         && flags & 0x11 == 0
-        && crate::memory_admission::protected_control_shape(
+        && (crate::memory_admission::protected_discovery_request_shape(
+            ty,
+            dsz == 0 && r.remaining() == 0,
+            eps.as_ref() == [DataEndpoint::Discovery],
+            contract
+                .target_senders
+                .as_ref()
+                .map_or(0, |owners| owners.len()),
+            contract.shape,
+        ) || crate::memory_admission::protected_control_shape(
             ty,
             nep,
             contract
@@ -1307,7 +1316,7 @@ pub(crate) fn unpack_packet_with_role(buf: &[u8], managed: bool) -> Result<Packe
             contract.shape,
             reliable_hdr.is_some(),
             managed,
-        )
+        ))
     {
         crate::memory_admission::check_small_protected_decode(buf.len())?;
     } else {
@@ -1409,6 +1418,7 @@ pub(crate) struct RoutingEnvelope<'a> {
     pub timestamp_ms: u64,
     pub wire_shape: Option<MessageElement>,
     pub is_reliable: bool,
+    payload_is_empty: bool,
     targets: &'a [u8],
     has_reliable_header: bool,
 }
@@ -1503,7 +1513,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
     let flags = r.read_bytes(1)?[0];
     let nep = r.read_bytes(1)?[0] as usize;
     let ty_v = read_uleb128(r)?;
-    let _data_size = read_uleb128(r)?;
+    let payload_is_empty = read_uleb128(r)? == 0;
     let timestamp_ms = read_uleb128(r)?;
     if flags & FLAG_PACKET_NONCE != 0 {
         let _ = read_uleb128(r)?;
@@ -1603,6 +1613,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
         timestamp_ms,
         wire_shape: shape,
         is_reliable,
+        payload_is_empty,
         targets,
         has_reliable_header,
     })
@@ -1642,6 +1653,7 @@ impl TelemetryFrameInfo {
 pub(crate) struct RoutingFrameInfo<'a> {
     pub envelope: RoutingEnvelope<'a>,
     pub reliable: Option<ReliableHeader>,
+    pub empty_payload: bool,
 }
 impl RoutingFrameInfo<'_> {
     pub fn ack_only(&self) -> bool {
@@ -1649,26 +1661,29 @@ impl RoutingFrameInfo<'_> {
             .is_some_and(|header| header.flags & RELIABLE_FLAG_ACK_ONLY != 0)
     }
 }
-/// Borrow a complete, uncompressed schema without allocating its envelope or payload.
-/// Other packet kinds retain the ordinary decode and reliable-delivery path.
-#[cfg(all(feature = "discovery", not(feature = "std")))]
-pub(crate) fn peek_plain_schema_payload(buf: &[u8]) -> TelemetryResult<Option<(u32, &[u8])>> {
+/// Borrow an uncompressed discovery payload without owning its envelope or bytes.
+/// Sequenced, piggyback-ACK, compressed, targeted and encrypted frames retain normal processing.
+#[cfg(feature = "discovery")]
+pub(crate) fn peek_plain_discovery_payload(
+    buf: &[u8],
+    expected: DataType,
+) -> TelemetryResult<Option<(u32, &[u8])>> {
     // Avoid a second CRC pass for ordinary telemetry. Its existing receive
     // and decode path remains responsible for complete frame validation.
     let mut prelude = ByteReader::new(buf);
     prelude.read_bytes(2)?;
-    if data_type_id_from_wire(read_uleb128(&mut prelude)?)? != DataType::DiscoverySchema.as_u32() {
+    if data_type_id_from_wire(read_uleb128(&mut prelude)?)? != expected.as_u32() {
         return Ok(None);
     }
     let data = verify_crc32(buf)?;
     let mut reader = ByteReader::new(data);
     let envelope = read_routing_envelope(&mut reader)?;
-    if envelope.ty != DataType::DiscoverySchema
+    if envelope.ty != expected
         || data[0] & (FLAG_COMPRESSED_PAYLOAD | 0x10) != 0
         || envelope.target_senders().len() != 0
         || envelope
             .wire_shape
-            .is_some_and(|shape| shape != crate::message_meta(DataType::DiscoverySchema).element)
+            .is_some_and(|shape| shape != crate::message_meta(expected).element)
     {
         return Ok(None);
     }
@@ -1687,9 +1702,9 @@ pub(crate) fn peek_plain_schema_payload(buf: &[u8]) -> TelemetryResult<Option<(u
     prelude.read_bytes(2)?;
     read_uleb128(&mut prelude)?;
     let size = usize::try_from(read_uleb128(&mut prelude)?)
-        .map_err(|_| TelemetryError::Unpack("schema payload too large"))?;
+        .map_err(|_| TelemetryError::Unpack("discovery payload too large"))?;
     if reader.remaining() != size {
-        return Err(TelemetryError::Unpack("schema payload length mismatch"));
+        return Err(TelemetryError::Unpack("discovery payload length mismatch"));
     }
     Ok(Some((envelope.source_address, reader.read_bytes(size)?)))
 }
@@ -1706,7 +1721,12 @@ pub(crate) fn peek_routing_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFram
     } else {
         None
     };
-    Ok(RoutingFrameInfo { envelope, reliable })
+    let empty_payload = envelope.payload_is_empty && reader.remaining() == 0;
+    Ok(RoutingFrameInfo {
+        envelope,
+        reliable,
+        empty_payload,
+    })
 }
 
 fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {

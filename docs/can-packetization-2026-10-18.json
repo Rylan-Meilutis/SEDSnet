@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-18",
+  "kind": "protocol-packetization measurement, not hardware throughput",
+  "test": "cargo test --locked --test lower_layer_packetization -- --nocapture",
+  "storage_modes": [
+    "heap",
+    "compact-packet-store"
+  ],
+  "logical_payload_bytes": 4096,
+  "legacy": {
+    "outbound_transport_cap": 128,
+    "physical_frames": 114,
+    "padded_can_bytes": 7296
+  },
+  "aligned": {
+    "outbound_transport_cap": 110,
+    "physical_frames": 92,
+    "padded_can_bytes": 5888
+  },
+  "reduction_fraction": 0.19298245614035087,
+  "compatibility": "Both sender caps delivered the complete payload exactly once to a receiver configured for110-byte outbound chunks. Driver tests retain receive support for all1..128-byte packets and the existing55-byte fragment stride. Logical messages remain chunked; queue budgets, RAM reserves and acquisition settings are unchanged.",
+  "source_sha256": {
+    "SEDSnet/tests/lower_layer_packetization.rs": "0f7e4dba1b726413b87f71f6eedad6ae8bede74bbf88e26d1519e359f418aaaf",
+    "SEDSnet/src/side_transport.rs": "28f09bb7c7d1df8f28ee279487ff9402b2f348a40df1c754258c571d2e2b411a",
+    "DAQ-Board/Core/Inc/can_tx_queue.h": "ea50bea77eb605290f705d8a8344bc67f4e88a23c0ac1c7382df685ea4271ba7",
+    "DAQ-Board/Core/Src/can_tx_queue.c": "0271e4017b26e00ac13652857e9ddff3282a55c96f2f7a80ec56b0176d9e945b"
+  },
+  "qualification": "All8native/macOS and7Linux factories passed;3aligned-CAN startup gates passed. The120s restart run failed named route/ACK recovery. A later compact-ingress candidate also exposed a gateway allocation panic. Shared topology storage is now under qualification; no final long-soak pass yet."
+}

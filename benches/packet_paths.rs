@@ -1,3 +1,4 @@
+mod support;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use sedsnet::config::{DataEndpoint, DataType};
 use sedsnet::packet::Packet;
@@ -33,6 +34,7 @@ fn message_packet() -> Packet {
 }
 
 fn benchmark_packet_paths(c: &mut Criterion) {
+    support::initialize_schema();
     let mut group = c.benchmark_group("packet_paths");
 
     group.bench_function("construct_gps_packet", |b| {

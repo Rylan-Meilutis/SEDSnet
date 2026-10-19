@@ -126,7 +126,16 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
         && bytes.len() <= 128
         && bytes.first().is_some_and(|flags| flags & 0x11 == 0)
         && frame.as_ref().is_some_and(|frame| {
-            protected_control_shape(
+            protected_discovery_request_shape(
+                frame.envelope.ty,
+                frame.empty_payload,
+                frame
+                    .envelope
+                    .endpoints()
+                    .eq([crate::DataEndpoint::Discovery]),
+                frame.envelope.target_senders().len(),
+                frame.envelope.wire_shape,
+            ) || protected_control_shape(
                 frame.envelope.ty,
                 bytes.get(1).copied().unwrap_or(u8::MAX) as usize,
                 frame.envelope.target_senders().len(),
@@ -141,6 +150,26 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
         return check_frame_kind(bytes.len(), false, WORK_SMALL_PROTECTED);
     }
     check_frame(bytes.len(), ack)
+}
+
+/// Empty, untargeted discovery requests are bounded recovery controls even
+/// though their established schema uses a dynamic byte element. The reply
+/// still requires independent admission for its full graph/schema workspace.
+pub(crate) fn protected_discovery_request_shape(
+    ty: crate::DataType,
+    empty: bool,
+    discovery_only: bool,
+    owners: usize,
+    shape: Option<crate::MessageElement>,
+) -> bool {
+    empty
+        && discovery_only
+        && owners == 0
+        && matches!(
+            ty,
+            crate::DataType::DiscoveryTopologyRequest | crate::DataType::DiscoverySchemaRequest
+        )
+        && shape.is_none_or(|value| value == crate::message_meta(ty).element)
 }
 
 /// Shared by ingress and the CRC-validated payload decoder. Keep the work
@@ -178,6 +207,24 @@ pub(crate) fn protected_control_shape(
 /// objects, when allocating a previously admitted small control payload.
 pub(crate) fn check_small_protected_decode(len: usize) -> TelemetryResult<()> {
     check_frame_kind(len, false, WORK_SMALL_PROTECTED)
+}
+
+/// A validated compact wrapper initially materializes only a byte vector and
+/// its shared owned frame. Extended-probe users recheck full decoder/routing
+/// work before queueing and again at dispatch in Router::rx_item / Relay::process_rx_queue_item.
+/// Retain the legacy full estimate when that second check is not installed.
+pub(crate) fn check_compact_reconstruction(len: usize, ack: bool) -> TelemetryResult<()> {
+    if supports_work_kinds() && !ack && len <= 192 {
+        // Two simultaneous byte buffers plus shared ownership, queue bookkeeping
+        // and alignment. No schema, graph or payload decoder is created here.
+        // This is ordinary work: the application's control reserve is unchanged.
+        check(
+            512usize.saturating_add(len.saturating_mul(2)),
+            len.saturating_add(32),
+        )
+    } else {
+        check_frame(len, ack)
+    }
 }
 
 pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {

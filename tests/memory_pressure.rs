@@ -9,6 +9,7 @@ use std::sync::{
 };
 struct CountingAllocator;
 std::thread_local! {
+    static MAX_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static ALLOCATION_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static REFUSE_CONTIGUOUS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static CONTIGUOUS_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -17,6 +18,11 @@ std::thread_local! {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = MAX_ALLOCATION.try_with(|largest| {
+            if let Some(n) = largest.get() {
+                largest.set(Some(n.max(layout.size())));
+            }
+        });
         let _ = ALLOCATION_COUNT.try_with(|count| {
             if let Some(n) = count.get() {
                 count.set(Some(n + 1));
@@ -860,6 +866,22 @@ fn known_peer_restart_does_not_require_a_full_discovery_snapshot_under_pressure(
     ));
 }
 
+// Build a real migration-safe wire frame without exposing private Packet
+// constructors. Protocol codes: static flag64, Float32=1, UInt8=2, Data=0.
+fn cached_inline_test_wire(packet: &Packet, shape: Option<(u8, u8)>) -> Vec<u8> {
+    let mut wire = sedsnet::wire_format::pack_packet(packet).to_vec();
+    if let Some((primitive, count)) = shape {
+        assert_eq!(wire[0] & 0x17, 0, "fixture expects plain best-effort input");
+        wire[0] |= 4;
+        let start = wire.len() - 4 - packet.payload().len();
+        wire.splice(start..start, [3, 2, 64 | primitive, count]);
+        let crc_offset = wire.len() - 4;
+        let crc = crc32fast::hash(&wire[..crc_offset]);
+        wire[crc_offset..].copy_from_slice(&crc.to_le_bytes());
+    }
+    wire
+}
+
 static CACHED_ACCEPTS: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn fragmented_cached_probe(additional: usize, largest: usize, work: u32) -> bool {
     let accepted = work == sedsnet::memory_admission::WORK_CACHED_TRANSIT
@@ -1022,11 +1044,13 @@ fn cached_bridge_forwards_in_small_fragments_without_admitting_cold_work() {
 #[test]
 fn standalone_relay_uses_cached_scratch_and_rechecks_expired_routes() {
     for endpoint_count in [1, 3] {
-        cached_relay_endpoint_count(endpoint_count);
+        for inline_contract in [false, true] {
+            cached_relay_endpoint_count(endpoint_count, inline_contract, false);
+        }
     }
 }
 
-fn cached_relay_endpoint_count(endpoint_count: usize) {
+fn cached_relay_endpoint_count(endpoint_count: usize, inline_contract: bool, wrapped: bool) {
     use sedsnet::discovery::{
         TopologyBoardNode, build_discovery_announce, build_discovery_topology,
     };
@@ -1034,24 +1058,17 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
     use std::sync::atomic::AtomicU64;
     let _lock = TEST_LOCK.lock().unwrap();
     let _reset = Reset;
-    let ep = register_endpoint_with_description(
-        &format!("RELAY_CACHED_SINK_{endpoint_count}"),
-        "",
-        false,
-    )
-    .unwrap();
-    let ep2 =
-        register_endpoint_with_description(&format!("RELAY_CACHED_SD_{endpoint_count}"), "", false)
+    let suffix = format!("{endpoint_count}_{inline_contract}_{wrapped}");
+    let ep = register_endpoint_with_description(&format!("RELAY_CACHED_SINK_{suffix}"), "", false)
+        .unwrap();
+    let ep2 = register_endpoint_with_description(&format!("RELAY_CACHED_SD_{suffix}"), "", false)
+        .unwrap();
+    let ep3 =
+        register_endpoint_with_description(&format!("RELAY_CACHED_HEARTBEAT_{suffix}"), "", false)
             .unwrap();
-    let ep3 = register_endpoint_with_description(
-        &format!("RELAY_CACHED_HEARTBEAT_{endpoint_count}"),
-        "",
-        false,
-    )
-    .unwrap();
     let endpoints = &([ep, ep2, ep3])[..endpoint_count];
     let ty = register_data_type_with_description(
-        &format!("RELAY_CACHED_DATA_{endpoint_count}"),
+        &format!("RELAY_CACHED_DATA_{suffix}"),
         "",
         MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
         endpoints,
@@ -1092,18 +1109,18 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
         )
         .unwrap();
     relay.drain_queues_with_timeout(0).unwrap();
-    let wire = |timestamp| {
-        sedsnet::wire_format::pack_packet(
-            &Packet::new(
-                ty,
-                endpoints,
-                "RELAY_SOURCE",
-                timestamp,
-                Arc::<[u8]>::from((timestamp as f32).to_le_bytes()),
-            )
-            .unwrap(),
+    let packet = |timestamp| {
+        Packet::new(
+            ty,
+            endpoints,
+            "RELAY_SOURCE",
+            timestamp,
+            Arc::<[u8]>::from((timestamp as f32).to_le_bytes()),
         )
+        .unwrap()
     };
+    let wire =
+        |timestamp| cached_inline_test_wire(&packet(timestamp), inline_contract.then_some((1, 1)));
     relay.rx_packed_from_side(ingress, &wire(0)).unwrap();
     relay.drain_queues_with_timeout(0).unwrap();
     relay
@@ -1117,7 +1134,7 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
     // Only cached bounded work is admitted below; it must forward canonical
     // bytes rather than allocate a replacement compression template.
     let churn_ty = register_data_type_with_description(
-        &format!("RELAY_CACHED_CHURN_{endpoint_count}"),
+        &format!("RELAY_CACHED_CHURN_{suffix}"),
         "",
         MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
         endpoints,
@@ -1130,15 +1147,40 @@ fn cached_relay_endpoint_count(endpoint_count: usize) {
         .rx_packed_from_side(ingress, &sedsnet::wire_format::pack_packet(&churn))
         .unwrap();
     relay.drain_queues_with_timeout(0).unwrap();
+    assert_eq!(wire(0)[0] & 4 != 0, inline_contract);
+    let mismatched = cached_inline_test_wire(&packet(90), Some((2, 4)));
+    let compact_frames = if wrapped {
+        let (full, _) = compact_status_frames(&packet(0));
+        relay.rx_packed_from_side(ingress, &full).unwrap();
+        relay.drain_queues_with_timeout(0).unwrap();
+        (1..=32)
+            .map(|ts| compact_status_frames(&packet(ts)).1)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let before = sent.load(Ordering::Relaxed);
-    sedsnet::memory_admission::set_probe_v2(Some(fragmented_cached_probe));
+    sedsnet::memory_admission::set_probe_v2(Some(if wrapped {
+        compact_cached_probe
+    } else {
+        fragmented_cached_probe
+    }));
     for timestamp in 1..=32 {
-        relay
-            .rx_packed_from_side(ingress, &wire(timestamp))
-            .unwrap();
+        let canonical;
+        let input = if wrapped {
+            compact_frames[timestamp as usize - 1].as_slice()
+        } else {
+            canonical = wire(timestamp);
+            canonical.as_slice()
+        };
+        relay.rx_packed_from_side(ingress, input).unwrap();
         relay.drain_queues_with_timeout(0).unwrap();
     }
     assert_eq!(sent.load(Ordering::Relaxed) - before, 32);
+    assert!(matches!(
+        relay.rx_packed_from_side(ingress, &mismatched),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
     let unknown = Packet::new(
         ty,
         endpoints,
@@ -1223,38 +1265,35 @@ fn repeated_topology_merge_reuses_retained_nodes_without_scratch_allocations() {
 #[test]
 fn cached_two_and_three_endpoint_bridges_forward_without_general_scratch() {
     for endpoint_count in [2, 3] {
-        cached_multi_endpoint_bridge(endpoint_count);
+        for inline_contract in [false, true] {
+            cached_multi_endpoint_bridge(endpoint_count, inline_contract);
+        }
     }
 }
 
-fn cached_multi_endpoint_bridge(endpoint_count: usize) {
+fn cached_multi_endpoint_bridge(endpoint_count: usize, inline_contract: bool) {
     use sedsnet::discovery::{
         TopologyBoardNode, build_discovery_announce, build_discovery_topology,
     };
     use sedsnet::router::{NetworkVariablePermissions, RouterSideOptions};
     let _lock = TEST_LOCK.lock().unwrap();
     let _reset = Reset;
+    let suffix = format!("{endpoint_count}_{inline_contract}");
     let ep = register_endpoint_with_description(
-        &format!("CACHED_MULTI_FRAGMENT_SINK_{endpoint_count}"),
+        &format!("CACHED_MULTI_FRAGMENT_SINK_{suffix}"),
         "",
         false,
     )
     .unwrap();
-    let ep2 = register_endpoint_with_description(
-        &format!("CACHED_MULTI_SD_CARD_{endpoint_count}"),
-        "",
-        false,
-    )
-    .unwrap();
-    let ep3 = register_endpoint_with_description(
-        &format!("CACHED_MULTI_HEARTBEAT_{endpoint_count}"),
-        "",
-        false,
-    )
-    .unwrap();
+    let ep2 =
+        register_endpoint_with_description(&format!("CACHED_MULTI_SD_CARD_{suffix}"), "", false)
+            .unwrap();
+    let ep3 =
+        register_endpoint_with_description(&format!("CACHED_MULTI_HEARTBEAT_{suffix}"), "", false)
+            .unwrap();
     let endpoints = &([ep, ep2, ep3])[..endpoint_count];
     let ty = register_data_type_with_description(
-        &format!("CACHED_MULTI_FRAGMENT_DATA_{endpoint_count}"),
+        &format!("CACHED_MULTI_FRAGMENT_DATA_{suffix}"),
         "",
         MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
         endpoints,
@@ -1263,7 +1302,7 @@ fn cached_multi_endpoint_bridge(endpoint_count: usize) {
     )
     .unwrap();
     let cold_ty = register_data_type_with_description(
-        &format!("COLD_MULTI_FRAGMENT_DATA_{endpoint_count}"),
+        &format!("COLD_MULTI_FRAGMENT_DATA_{suffix}"),
         "",
         MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
         endpoints,
@@ -1303,21 +1342,26 @@ fn cached_multi_endpoint_bridge(endpoint_count: usize) {
     router.drain_queues_with_timeout(0).unwrap();
     let packet =
         |timestamp| Packet::from_f32_slice(ty, &[timestamp as f32], endpoints, timestamp).unwrap();
-    let warm = sedsnet::wire_format::pack_packet(&packet(0));
+    let wire =
+        |timestamp| cached_inline_test_wire(&packet(timestamp), inline_contract.then_some((1, 1)));
+    let warm = wire(0);
     router.rx_packed_from_side(&warm, ingress).unwrap();
+    assert_eq!(wire(0)[0] & 4 != 0, inline_contract);
+    let mismatched = cached_inline_test_wire(&packet(90), Some((2, 4)));
     let before = sent.load(Ordering::Relaxed);
     CACHED_ACCEPTS.store(0, Ordering::Relaxed);
     sedsnet::memory_admission::set_probe_v2(Some(fragmented_cached_probe));
     for timestamp in 1..=32 {
         router
-            .rx_packed_queue_from_side(
-                &sedsnet::wire_format::pack_packet(&packet(timestamp)),
-                ingress,
-            )
+            .rx_packed_queue_from_side(&wire(timestamp), ingress)
             .unwrap();
         router.drain_queues_with_timeout(0).unwrap();
     }
     assert_eq!(sent.load(Ordering::Relaxed) - before, 32);
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&mismatched, ingress),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
     assert!(CACHED_ACCEPTS.load(Ordering::Relaxed) >= 64); // Handoff and dispatch both verify the cache.
     let cold = Packet::from_f32_slice(cold_ty, &[1.0], endpoints, 99).unwrap();
     assert!(matches!(
@@ -1343,7 +1387,7 @@ fn cached_multi_endpoint_bridge(endpoint_count: usize) {
     ));
     // A queue-time classification is not permission to decode later metadata.
     router
-        .rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&packet(100)), ingress)
+        .rx_packed_queue_from_side(&wire(100), ingress)
         .unwrap();
     router
         .enable_network_variable(
@@ -2145,4 +2189,530 @@ fn topology_encoding_does_not_clone_normalized_graph_strings() {
         let normalized = build_discovery_topology("GB", 1, &graph).unwrap();
         assert_eq!(normalized.payload(), canonical.payload());
     }
+}
+
+#[test]
+fn memory_counters_are_allocation_free_even_when_admission_refuses_work() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let router = Router::new(RouterConfig::new([]));
+    router.add_side_packed("memory-profile", |_| Ok(()));
+    let _reset = Reset;
+    ALLOW.store(false, Ordering::Relaxed);
+    sedsnet::memory_admission::set_probe(Some(probe));
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    let counters = router.memory_counters();
+    let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    assert_eq!(allocations, 0);
+    assert_eq!(counters[0], 1);
+    assert!(counters[1] > 0);
+    assert_eq!(counters[3], 0);
+    assert_eq!(counters[4], 0);
+    assert!(counters[5] > 0);
+    assert_eq!(counters[13], 0);
+}
+
+#[test]
+fn sparse_router_and_relay_side_metadata_avoids_large_btree_leaf_allocations() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    // Exclude registry and queue initialization from side-table measurement.
+    let _ = sedsnet::config::schema_fingerprint();
+    let router = Router::new(RouterConfig::new([]));
+    MAX_ALLOCATION.with(|n| n.set(Some(0)));
+    router.add_side_packed("can", |_| Ok(()));
+    router.add_side_packed("uart", |_| Ok(()));
+    let largest_router = MAX_ALLOCATION.with(|n| n.replace(None).unwrap());
+    assert!(
+        largest_router <= 1024,
+        "router side metadata requested {largest_router} bytes"
+    );
+    let relay = sedsnet::relay::Relay::new(Box::new(|| 0));
+    MAX_ALLOCATION.with(|n| n.set(Some(0)));
+    relay.add_side_packed("can", |_| Ok(()));
+    relay.add_side_packed("uart", |_| Ok(()));
+    let largest_relay = MAX_ALLOCATION.with(|n| n.replace(None).unwrap());
+    assert!(
+        largest_relay <= 1024,
+        "relay side metadata requested {largest_relay} bytes"
+    );
+}
+
+#[test]
+fn sparse_managed_cache_avoids_large_leaf_and_reuses_entry_on_updates() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let ep = register_endpoint_with_description("SPARSE_CACHE_EP", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "SPARSE_CACHE_VALUE",
+        "",
+        MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        16,
+    )
+    .unwrap();
+    let router = Router::new(RouterConfig::new([]));
+    router
+        .enable_network_variable(
+            ty,
+            sedsnet::router::NetworkVariablePermissions {
+                read: true,
+                write: true,
+            },
+        )
+        .unwrap();
+    let first = Packet::new(ty, &[ep], "GS", 1, vec![1].into()).unwrap();
+    let changed = Packet::new(ty, &[ep], "GS", 2, vec![2].into()).unwrap();
+    MAX_ALLOCATION.with(|n| n.set(Some(0)));
+    router.seed_managed_variable(first).unwrap();
+    let largest = MAX_ALLOCATION.with(|n| n.replace(None).unwrap());
+    assert!(
+        largest <= 512,
+        "sparse managed cache requested {largest} bytes"
+    );
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    router.seed_managed_variable(changed).unwrap();
+    let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    assert_eq!(
+        allocations, 0,
+        "a managed-value update must reuse its entry"
+    );
+    assert_eq!(router.cached_managed_variable(ty).unwrap().payload(), &[2]);
+}
+
+#[test]
+fn duplicate_topology_refresh_fits_small_headroom_on_router_and_relay() {
+    use sedsnet::discovery::{
+        TopologyBoardNode, build_discovery_topology, build_discovery_topology_delta,
+    };
+    use sedsnet::relay::Relay;
+    use std::sync::atomic::AtomicU64;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let boards: Vec<_> = (0..32)
+        .map(|n| TopologyBoardNode {
+            sender_id: format!("NOOP_PEER_{n:02}"),
+            reachable_endpoints: vec![sedsnet::config::DataEndpoint(800 + n)],
+            reachable_timesync_sources: vec!["UTC".into()],
+            connections: vec!["GS".into()],
+        })
+        .collect();
+    let full = build_discovery_topology("NOOP_PEER_00", 1, &boards).unwrap();
+    let delta =
+        build_discovery_topology_delta("NOOP_PEER_00", 2, &boards[3..5], &["ALREADY_GONE".into()])
+            .unwrap();
+    let mut changed = boards.clone();
+    changed[0]
+        .reachable_endpoints
+        .push(sedsnet::config::DataEndpoint(900));
+    let changed = build_discovery_topology("NOOP_PEER_00", 3, &changed).unwrap();
+    let clock = Arc::new(AtomicU64::new(1));
+    let tick = clock.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::default(),
+        Box::new(move || tick.load(Ordering::Relaxed)),
+    );
+    let side = router.add_side_packed("noop", |_| Ok(()));
+    let relay_tick = clock.clone();
+    let relay = Relay::new(Box::new(move || relay_tick.load(Ordering::Relaxed)));
+    let relay_side = relay.add_side_packed("noop", |_| Ok(()));
+    router.rx_from_side(&full, side).unwrap();
+    relay.rx_from_side(relay_side, full.clone()).unwrap();
+    relay.process_rx_queue().unwrap();
+    router.clear_queues();
+    relay.clear_queues();
+    // The full retained side is several KiB; ordinary guarded graph cloning
+    // cannot pass this admission limit. An exact retry must still renew life.
+    extern "C" fn tiny(additional: usize, largest: usize) -> bool {
+        additional <= 1024 && largest <= 128
+    }
+    sedsnet::memory_admission::set_probe(Some(tiny));
+    MAX_ALLOCATION.with(|n| n.set(Some(0)));
+    for time in 2..12 {
+        clock.store(time * 1000, Ordering::Relaxed);
+        router.rx_from_side(&full, side).unwrap();
+        router.rx_from_side(&delta, side).unwrap();
+        relay.rx_from_side(relay_side, full.clone()).unwrap();
+        relay.rx_from_side(relay_side, delta.clone()).unwrap();
+        relay.process_rx_queue().unwrap();
+    }
+    let largest = MAX_ALLOCATION.with(|n| n.replace(None).unwrap());
+    assert!(
+        largest <= full.payload().len() + 256,
+        "duplicate topology allocated a graph-sized block: {largest}"
+    );
+    assert!(matches!(
+        router.rx_from_side(&changed, side),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    relay.rx_from_side(relay_side, changed).unwrap();
+    assert!(matches!(
+        relay.process_rx_queue(),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    sedsnet::memory_admission::set_probe(None);
+    assert!(
+        router
+            .export_topology()
+            .routes
+            .iter()
+            .flat_map(|r| &r.announcers)
+            .any(|p| p.sender_id == "NOOP_PEER_00" && p.age_ms == 0)
+    );
+    assert!(
+        relay
+            .export_topology()
+            .routes
+            .iter()
+            .flat_map(|r| &r.announcers)
+            .any(|p| p.sender_id == "NOOP_PEER_00" && p.age_ms == 0)
+    );
+}
+
+#[test]
+fn unchanged_unsequenced_topology_wire_needs_no_allocations_or_queue_headroom() {
+    use sedsnet::discovery::{
+        TopologyBoardNode, build_discovery_topology, build_discovery_topology_delta,
+    };
+    use sedsnet::relay::Relay;
+    use sedsnet::wire_format::{ReliableHeader, pack_packet, pack_packet_with_reliable};
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let nodes = vec![TopologyBoardNode {
+        sender_id: "PX".into(),
+        reachable_endpoints: vec![sedsnet::config::DataEndpoint(1200)],
+        reachable_timesync_sources: vec![],
+        connections: vec![],
+    }];
+    let full = build_discovery_topology("PX", 1, &nodes).unwrap();
+    let wire = pack_packet(&full);
+    let empty_delta = pack_packet(&build_discovery_topology_delta("PX", 2, &[], &[]).unwrap());
+    assert_eq!(wire[0] & 1, 0, "fixture must exercise uncompressed wire");
+    assert_eq!(empty_delta[0] & 1, 0);
+    let mut changed_nodes = nodes.clone();
+    changed_nodes[0]
+        .reachable_endpoints
+        .push(sedsnet::config::DataEndpoint(1201));
+    let changed = pack_packet(&build_discovery_topology("PX", 3, &changed_nodes).unwrap());
+    let sequenced = pack_packet_with_reliable(
+        &full,
+        ReliableHeader {
+            flags: 0,
+            seq: 7,
+            ack: 0,
+        },
+    );
+    let piggyback = pack_packet_with_reliable(
+        &full,
+        ReliableHeader {
+            flags: sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED,
+            seq: 0,
+            ack: 9,
+        },
+    );
+    let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+    let side = router.add_side_packed("can", |_| Ok(()));
+    let relay = Relay::new(Box::new(|| 0));
+    let relay_side = relay.add_side_packed("can", |_| Ok(()));
+    router.rx_from_side(&full, side).unwrap();
+    relay.rx_from_side(relay_side, full.clone()).unwrap();
+    relay.process_rx_queue().unwrap();
+    router.clear_queues();
+    relay.clear_queues();
+    ALLOW.store(false, Ordering::Relaxed);
+    sedsnet::memory_admission::set_probe(Some(probe));
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    for _ in 0..20 {
+        router.rx_packed_queue_from_side(&wire, side).unwrap();
+        router
+            .rx_packed_queue_from_side(&empty_delta, side)
+            .unwrap();
+        relay.rx_packed_from_side(relay_side, &wire).unwrap();
+        relay.rx_packed_from_side(relay_side, &empty_delta).unwrap();
+    }
+    let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    assert_eq!(
+        allocations, 0,
+        "known unsequenced retries should borrow retained state"
+    );
+    for frame in [&changed, &sequenced, &piggyback] {
+        assert!(matches!(
+            router.rx_packed_queue_from_side(frame, side),
+            Err(TelemetryError::Io("memory pressure"))
+        ));
+        assert!(matches!(
+            relay.rx_packed_from_side(relay_side, frame),
+            Err(TelemetryError::Io("memory pressure"))
+        ));
+    }
+    let mut corrupt = wire.to_vec();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    assert!(router.rx_packed_queue_from_side(&corrupt, side).is_err());
+    assert!(relay.rx_packed_from_side(relay_side, &corrupt).is_err());
+    let unknown = pack_packet(&build_discovery_topology("UNKNOWN", 4, &nodes).unwrap());
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&unknown, side),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    assert!(matches!(
+        relay.rx_packed_from_side(relay_side, &unknown),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+}
+
+// A compact wrapper first allocates only bounded reconstruction buffers. Full
+// routing/decoder admission must still run when the owned frame is dispatched.
+extern "C" fn compact_cached_probe(additional: usize, largest: usize, work: u32) -> bool {
+    (work == sedsnet::memory_admission::WORK_GENERAL
+        && additional > 512
+        && additional <= 1024
+        && largest <= 256)
+        || fragmented_cached_probe(additional, largest, work)
+}
+
+#[test]
+fn compact_cached_bridge_admits_only_reconstruction_before_cached_dispatch() {
+    use sedsnet::discovery::{
+        TopologyBoardNode, build_discovery_announce, build_discovery_topology,
+    };
+    use sedsnet::router::{NetworkVariablePermissions, RouterSideOptions};
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("COMPACT_CACHED_FRAGMENT_SINK", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "COMPACT_CACHED_FRAGMENT_DATA",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let cold_ty = register_data_type_with_description(
+        "COMPACT_COLD_FRAGMENT_DATA",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+    let mut opts = RouterSideOptions::default().with_small_packet_transport(64);
+    opts.max_side_transport_templates = 1;
+    let ingress = router.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
+    let output = sent.clone();
+    let egress = router.add_side_packed_with_options(
+        "uart",
+        move |_| {
+            output.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+        opts,
+    );
+    router
+        .rx_from_side(
+            &build_discovery_topology(
+                "GS",
+                0,
+                &[TopologyBoardNode {
+                    sender_id: "GS".into(),
+                    reachable_endpoints: vec![ep],
+                    reachable_timesync_sources: vec![],
+                    connections: vec![],
+                }],
+            )
+            .unwrap(),
+            egress,
+        )
+        .unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    let packet = |timestamp| {
+        Packet::new(
+            ty,
+            &[ep],
+            "CACHED_SOURCE",
+            timestamp,
+            Arc::<[u8]>::from((timestamp as f32).to_le_bytes()),
+        )
+        .unwrap()
+    };
+    let warm = sedsnet::wire_format::pack_packet(&packet(0));
+    router.rx_packed_from_side(&warm, ingress).unwrap();
+    let announce = build_discovery_announce(packet(0).sender(), 0, &[]).unwrap();
+    router.rx_from_side(&announce, ingress).unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    // A different warm type evicts the one-entry optional TX dictionary.
+    // Only cached bounded work is admitted below; it must forward canonical
+    // bytes rather than allocate a replacement compression template.
+    let churn_ty = register_data_type_with_description(
+        "COMPACT_CACHED_FRAGMENT_CHURN",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let churn = Packet::from_f32_slice(churn_ty, &[0.0], &[ep], 0).unwrap();
+    router
+        .rx_packed_from_side(&sedsnet::wire_format::pack_packet(&churn), ingress)
+        .unwrap();
+    let (full, _) = compact_status_frames(&packet(0));
+    router.rx_packed_from_side(&full, ingress).unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    let compact_frames = (1..=32)
+        .map(|ts| compact_status_frames(&packet(ts)).1)
+        .collect::<Vec<_>>();
+    let before = sent.load(Ordering::Relaxed);
+    CACHED_ACCEPTS.store(0, Ordering::Relaxed);
+    sedsnet::memory_admission::set_probe_v2(Some(compact_cached_probe));
+    for compact in &compact_frames {
+        router.rx_packed_queue_from_side(compact, ingress).unwrap();
+        router.drain_queues_with_timeout(0).unwrap();
+    }
+    assert_eq!(sent.load(Ordering::Relaxed) - before, 32);
+    assert!(CACHED_ACCEPTS.load(Ordering::Relaxed) >= 64); // Queueing and dispatch verify the cache.
+    let cold = Packet::from_f32_slice(cold_ty, &[1.0], &[ep], 99).unwrap();
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&cold), ingress),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    let discovery = build_discovery_announce("UNKNOWN_PEER", 99, &[]).unwrap();
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&discovery), ingress),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    let unknown = Packet::new(
+        ty,
+        &[ep],
+        "UNDISCOVERED_SOURCE",
+        99,
+        Arc::<[u8]>::from(0f32.to_le_bytes()),
+    )
+    .unwrap();
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&unknown), ingress),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    // A queue-time classification is not permission to decode later metadata.
+    router
+        .rx_packed_queue_from_side(&sedsnet::wire_format::pack_packet(&packet(100)), ingress)
+        .unwrap();
+    router
+        .enable_network_variable(
+            ty,
+            NetworkVariablePermissions {
+                read: true,
+                write: true,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        router.drain_queues_with_timeout(0),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    assert_eq!(sent.load(Ordering::Relaxed) - before, 32);
+    // The legacy setter disables the extended probe; no hint changes old callers.
+    sedsnet::memory_admission::set_probe(None);
+    router.drain_queues_with_timeout(0).unwrap();
+}
+
+#[test]
+fn compact_cached_relay_admits_only_reconstruction_before_cached_dispatch() {
+    for endpoints in [1, 3] {
+        cached_relay_endpoint_count(endpoints, false, true);
+    }
+}
+
+// A captured gateway OOM occurred while constructing a full discovery reply.
+// The old schema branch checked a fixed 8 KiB and skipped the learned graph.
+static FIRST_SNAPSHOT_SCRATCH: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn reject_snapshot_scratch(additional: usize, _largest: usize) -> bool {
+    let _ =
+        FIRST_SNAPSHOT_SCRATCH.compare_exchange(0, additional, Ordering::SeqCst, Ordering::SeqCst);
+    false
+}
+fn large_snapshot_graph() -> Vec<sedsnet::discovery::TopologyBoardNode> {
+    (0..16)
+        .map(|i| sedsnet::discovery::TopologyBoardNode {
+            sender_id: format!("NODE_{i:02}_{}", "long_name".repeat(12)),
+            reachable_endpoints: vec![],
+            reachable_timesync_sources: vec![],
+            connections: vec!["GB".into()],
+        })
+        .collect()
+}
+#[test]
+fn router_full_schema_snapshot_admits_learned_graph_before_allocating() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let router = Router::new_with_clock(RouterConfig::default().with_sender("GB"), Box::new(|| 0));
+    router.add_side_packed("radio", |_| Ok(()));
+    let ingress = router.add_side_packed("can", |_| Ok(()));
+    router
+        .rx_from_side(
+            &sedsnet::discovery::build_discovery_topology("PEER", 0, &large_snapshot_graph())
+                .unwrap(),
+            ingress,
+        )
+        .unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    let retained_routes = router.export_topology().routes;
+    assert!(!retained_routes.is_empty());
+    FIRST_SNAPSHOT_SCRATCH.store(0, Ordering::SeqCst);
+    sedsnet::memory_admission::set_probe(Some(reject_snapshot_scratch));
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    assert!(matches!(
+        router.announce_discovery(),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    assert_eq!(allocations, 0, "refused snapshot allocated working storage");
+    let scratch = FIRST_SNAPSHOT_SCRATCH.load(Ordering::SeqCst);
+    assert!(
+        scratch > 8192,
+        "full schema bypassed retained graph: {scratch}"
+    );
+    sedsnet::memory_admission::set_probe(None);
+    assert_eq!(router.export_topology().routes, retained_routes);
+    router.announce_discovery().unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+}
+#[test]
+fn relay_full_schema_snapshot_admits_learned_graph_before_allocating() {
+    use sedsnet::relay::{Relay, RelayConfig};
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let relay = Relay::new_with_config(RelayConfig::default().with_sender("GB"), Box::new(|| 0));
+    relay.add_side_packed("radio", |_| Ok(()));
+    let ingress = relay.add_side_packed("can", |_| Ok(()));
+    relay
+        .rx_from_side(
+            ingress,
+            sedsnet::discovery::build_discovery_topology("PEER", 0, &large_snapshot_graph())
+                .unwrap(),
+        )
+        .unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
+    let retained_routes = relay.export_topology().routes;
+    assert!(!retained_routes.is_empty());
+    FIRST_SNAPSHOT_SCRATCH.store(0, Ordering::SeqCst);
+    sedsnet::memory_admission::set_probe(Some(reject_snapshot_scratch));
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    assert!(matches!(
+        relay.announce_discovery(),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+    let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    assert_eq!(allocations, 0, "refused snapshot allocated working storage");
+    let scratch = FIRST_SNAPSHOT_SCRATCH.load(Ordering::SeqCst);
+    assert!(
+        scratch > 8192,
+        "full schema bypassed retained graph: {scratch}"
+    );
+    sedsnet::memory_admission::set_probe(None);
+    assert_eq!(relay.export_topology().routes, retained_routes);
+    relay.announce_discovery().unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
 }

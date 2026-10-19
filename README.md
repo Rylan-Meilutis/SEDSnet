@@ -101,11 +101,17 @@ telemetry senders to their board identity without requiring repeated hostnames i
 Queue memory is bounded per router/relay instance. Packaged values such as `MAX_QUEUE_BUDGET`
 provide defaults, and Rust, C, and Python constructors can override the active budget at runtime.
 Router and relay internals share that budget dynamically across RX work, TX work, reliable
-replay/out-of-order buffers, recent packet ID tracking, and learned discovery topology state. The
+replay/out-of-order buffers, incomplete transport transfers across all links, recent packet ID
+tracking, and learned discovery topology state. The
 recent packet ID cache preallocates its final storage because it is expected to fill during normal
 operation, so its reserved bytes come out of the shared budget immediately. If one active queue area
-is idle, another can use more of the remaining budget; if several areas fill at once, older queued
-state is evicted so total queue-owned memory stays bounded.
+is idle, another can use more of the remaining budget. Under pressure, reclaimable queued
+packets yield before admitting new work. Learned routes remain intact. Unrelated incomplete transfers may be reclaimed
+so bounded active work can finish; transfers that cannot fit are refused. Temporary receive pressure returns the retryable
+`Io("memory pressure")` error and preserves already accepted fragments, so the sender
+can resume at the refused fragment after protected queues drain. Per-link retained-byte
+counters update incrementally; expiry reuses ordinary map removal without extra
+allocations or a second retention iterator.
 
 Experimental, opt-in [compact packet storage](docs/compact-packet-store.md) gives queued
 payloads and raw frames a private handle-managed arena. Unpinned small buffers
@@ -189,6 +195,22 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 ---
 
 ## Recent changelog milestones
+
+### Version 4.2.4 highlights
+
+- Count partial transport transfers against the shared RX/TX budget across all
+  links, reclaim dominant best-effort backlog first, and expose reclamation counts.
+- Share unchanged discovery graphs and account for transactional working memory;
+  retain prior routes when a growth request cannot fit.
+- Preserve bounded topology/schema recovery requests under pressure without
+  changing their wire schema or skipping reply admission.
+- Avoid allocations for identical canonical topology retries; keep full checks
+  for changed, malformed, sequenced and targeted frames.
+- Reduce retained header/statistics metadata and bound compact reconstruction,
+  with canonical admission before enqueueing and dispatch.
+- Add allocation-free memory counters and schema-aware CMake rebuild checks.
+- Align SDK build commands with Cargo and support current PyO3 with Python 3.9+
+  stable-ABI wheels.
 
 ### Version 4.2.3 highlights
 
@@ -294,7 +316,7 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 - Experimental opt-in packet/frame arena supports pin-aware compaction and fixed queue slabs.
 - Optional indexed Zstd storage reads individual field ranges with fixed contexts and bounded reusable scratch; compression is retained only when it saves space.
 - Existing default allocation, ThreadX scheduling, and wire format are unchanged. Application heap allocations remain outside the arena.
-- Native pressure and churn tests passed; full embedded network qualification remains incomplete. See [validation and limits](docs/compact-packet-validation.md).
+- Initial native pressure and churn tests passed. Current linked-firmware qualification and remaining hardware limits are tracked in [validation and limits](docs/compact-packet-validation.md).
 
 ### Version 4.0.38 highlights
 

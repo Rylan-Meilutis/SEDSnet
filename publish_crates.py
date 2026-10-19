@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import platform
 import re
@@ -57,15 +58,55 @@ PUBLISH_ALREADY_EXISTS = "already_exists"
 PUBLISH_FAILED = "failed"
 
 
+def redact_output(text: str, env: dict[str, str] | None = None) -> str:
+    """Sanitize logs even when a publishing subprocess echoes its credentials."""
+    values = dict(os.environ)
+    if env is not None:
+        values.update(env)
+    secrets = {
+        value for key, value in values.items()
+        if value and (key.endswith(("_TOKEN", "_PASSWORD")) or key == "CARGO_REGISTRY_TOKEN")
+    }
+    for secret in sorted(secrets, key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    # Cover registry token formats, including a locally saved Cargo login that
+    # never passed through this process's environment.
+    text = re.sub(r"\b(?:pypi-|cio)[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*(?:basic|bearer)\s+)\S+", r"\1[REDACTED]", text)
+    return text
+
+
+def safe_command(cmd: list[str], env: dict[str, str] | None = None) -> list[str]:
+    safe = []
+    hide_next = False
+    for arg in cmd:
+        if hide_next:
+            safe.append("[REDACTED]")
+            hide_next = False
+            continue
+        hide_next = arg in ("--token", "--password", "-p")
+        arg = re.sub(r"^(--(?:token|password)=).*", r"\1[REDACTED]", arg)
+        safe.append(redact_output(arg, env))
+    return safe
+
+
 def run(
     cmd: list[str],
     *,
     env: dict[str, str] | None = None,
     display_cmd: list[str] | None = None,
 ) -> None:
-    shown = display_cmd if display_cmd is not None else cmd
+    shown = safe_command(display_cmd if display_cmd is not None else cmd, env)
     print(f"\n$ {' '.join(shown)}", flush=True)
-    subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
+    # Stream sanitized output rather than handing the child our log handles.
+    with subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+        assert child.stdout is not None
+        for line in child.stdout:
+            print(redact_output(line, env), end="", flush=True)
+        code = child.wait()
+    if code:
+        raise subprocess.CalledProcessError(code, safe_command(cmd, env))
 
 
 def cargo_env() -> dict[str, str]:
@@ -88,28 +129,29 @@ def run_optional(
     timeout_s: int | None = None,
     display_cmd: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    shown = display_cmd if display_cmd is not None else cmd
+    shown = safe_command(display_cmd if display_cmd is not None else cmd, env)
     print(f"\n$ {' '.join(shown)}", flush=True)
     try:
-        return subprocess.run(
-            cmd,
-            cwd=REPO_ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout_s,
+        result = subprocess.run(
+            cmd, cwd=REPO_ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_s,
         )
+        return subprocess.CompletedProcess(safe_command(cmd, env), result.returncode,
+                                           redact_output(result.stdout or "", env))
     except subprocess.TimeoutExpired as e:
         output = e.output or ""
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
+        output = redact_output(output, env)
         output += f"\nerror: command timed out after {timeout_s}s\n"
-        return subprocess.CompletedProcess(cmd, 124, output)
+        return subprocess.CompletedProcess(safe_command(cmd, env), 124, output)
 
 
 def capture(cmd: list[str], *, env: dict[str, str] | None = None) -> str:
-    return subprocess.check_output(cmd, cwd=REPO_ROOT, env=env, text=True).strip()
+    result = run_optional(cmd, env=env)
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout)
+    return result.stdout.strip()
 
 
 def manifest_package(manifest: Path) -> tuple[str, str]:
@@ -234,7 +276,7 @@ def cargo_publish(
         return PUBLISH_DRY_RUN_OK
 
     result = run_optional(cmd, env=env, timeout_s=timeout_s)
-    print(result.stdout, end="")
+    print(redact_output(result.stdout, env), end="")
     if result.returncode == 0:
         return PUBLISH_PUBLISHED
     if is_already_published_output(result.stdout):
@@ -247,7 +289,7 @@ def cargo_publish(
             file=sys.stderr,
         )
         return PUBLISH_FAILED
-    raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+    raise subprocess.CalledProcessError(result.returncode, safe_command(cmd, env), output=redact_output(result.stdout, env))
 
 
 def maturin_build() -> None:
@@ -514,13 +556,13 @@ def twine_upload(
         env["TWINE_PASSWORD"] = token
     cmd.extend(str(path) for path in artifacts)
     result = run_optional(cmd, env=env)
-    print(result.stdout, end="")
+    print(redact_output(result.stdout, env), end="")
     if result.returncode == 0:
         return
     if skip_existing and is_already_published_output(result.stdout):
         print("\nPyPI artifacts already exist; continuing.")
         return
-    raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+    raise subprocess.CalledProcessError(result.returncode, safe_command(cmd, env), output=redact_output(result.stdout, env))
 
 
 def build_local_pypi_artifacts(out_dir: str) -> list[Path]:
@@ -758,11 +800,30 @@ def parse_args() -> argparse.Namespace:
         default=15,
         help="Seconds between crates.io index checks.",
     )
+    parser.add_argument(
+        "--credential-status", action="store_true",
+        help="Report local credential availability without displaying secrets, building or publishing.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.credential_status:
+        try:
+            _, pypi_token = load_pypi_credentials(args.pypi_token_env)
+            pypi_status = "configured" if pypi_token else "missing"
+        except (OSError, ValueError):
+            pypi_status = "configuration unreadable"
+        cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
+        print(json.dumps({
+            "pypi": pypi_status,
+            "crates_environment": bool(os.environ.get(args.token_env)),
+            "cargo_saved_credentials_file": any((cargo_home / name).is_file()
+                                                 for name in ("credentials.toml", "credentials")),
+            "credentials_validated": False,
+        }, indent=2))
+        return 0
     macro_name, macro_version = manifest_package(MACROS_MANIFEST)
     main_name, main_version = manifest_package(MAIN_MANIFEST)
     py_name, py_version = pyproject_package(PYPROJECT)

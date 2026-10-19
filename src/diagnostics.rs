@@ -60,6 +60,8 @@ pub struct RuntimeSideStats {
     pub side_transport_compact_delta_frames: u64,
     pub side_transport_compact_omitted_timestamp_frames: u64,
     pub side_transport_chunk_frames: u64,
+    /// Incomplete transfers reclaimed under pressure, expiry or the per-link cap.
+    pub side_transport_chunk_reclaims: u64,
     pub side_transport_raw_bytes: u64,
     pub side_transport_wire_bytes: u64,
     pub side_transport_bytes_saved: u64,

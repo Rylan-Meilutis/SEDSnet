@@ -1,6 +1,6 @@
 // main.c
 
-#include <assert.h>
+#include "test_assertions.h"
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
