@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Retain successful local reliable delivery in the existing bounded return-route
+  cache. Best-effort sensor traffic can no longer evict the only duplicate
+  record before a lost final receipt is retried, re-executing the application
+  handler. Regressions exercise packed/decoded and queued/immediate ingress.
+- Borrow immutable embedded type definitions during metadata lookup instead of
+  copying complete definitions in the routing hot path. Owned APIs still return
+  owned definitions; runtime schema learning remains supported.
+
 ## 4.2.4
 
 - Keep C integration assertions and setup active in Release builds; reject disabled checks, register all five CTest programs, and exercise Release through the existing Rust test gate.

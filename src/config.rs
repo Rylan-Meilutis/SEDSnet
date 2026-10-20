@@ -627,7 +627,7 @@ impl DataType {
                         .find(|def| {
                             def.name == name
                                 && type_visible_at(
-                                    **def,
+                                    def,
                                     EMBEDDED_TYPE_HEAD.load(Ordering::Acquire),
                                 )
                         })
@@ -2762,16 +2762,16 @@ fn embedded_overlay_endpoint(id: DataEndpoint) -> Option<EndpointDefinition> {
 }
 
 #[cfg(not(feature = "std"))]
-fn embedded_overlay_type(id: DataType) -> Option<DataTypeDefinition> {
+fn embedded_overlay_type(id: DataType) -> Option<&'static DataTypeDefinition> {
     let mut node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
     while !node.is_null() {
         // SAFETY: published nodes and their referenced fields are immutable
         // and intentionally live until reboot.
         let current = unsafe { &*node };
         if current.def.id == id
-            && type_visible_at(current.def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
+            && type_visible_at(&current.def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
         {
-            return Some(current.def);
+            return Some(&current.def);
         }
         node = current.next;
     }
@@ -2799,7 +2799,7 @@ fn embedded_overlay_type_by_name(name: &str) -> Option<DataTypeDefinition> {
     while !node.is_null() {
         let current = unsafe { &*node };
         if current.def.name == name
-            && type_visible_at(current.def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
+            && type_visible_at(&current.def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
         {
             return Some(current.def);
         }
@@ -2830,11 +2830,11 @@ fn endpoint_visible_at(def: EndpointDefinition, mut head: *mut EmbeddedEndpointN
     true
 }
 #[cfg(not(feature = "std"))]
-fn type_visible_at(def: DataTypeDefinition, mut head: *mut EmbeddedTypeNode) -> bool {
+fn type_visible_at(def: &DataTypeDefinition, mut head: *mut EmbeddedTypeNode) -> bool {
     while !head.is_null() {
         let current = unsafe { &*head };
         if current.def.id == def.id || current.def.name == def.name {
-            return current.def == def;
+            return &current.def == def;
         }
         head = current.next;
     }
@@ -2885,14 +2885,14 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
     }
     let mut types = Vec::new();
     for def in embedded_static_data_types() {
-        if type_visible_at(def, type_head) {
+        if type_visible_at(&def, type_head) {
             types.push(own_embedded_type(def));
         }
     }
     let mut node = type_head;
     while !node.is_null() {
         let current = unsafe { &*node };
-        if type_visible_at(current.def, type_head) {
+        if type_visible_at(&current.def, type_head) {
             types.push(own_embedded_type(current.def));
         }
         node = current.next;
@@ -2987,14 +2987,14 @@ pub(crate) fn encode_embedded_schema_payload() -> TelemetryResult<Arc<[u8]>> {
             .iter()
             .chain(EMBEDDED_SCHEMA_TYPES.iter())
         {
-            if type_visible_at(*def, type_head) {
+            if type_visible_at(def, type_head) {
                 visit(*def);
             }
         }
         let mut node = type_head;
         while !node.is_null() {
             let current = unsafe { &*node };
-            if type_visible_at(current.def, type_head) {
+            if type_visible_at(&current.def, type_head) {
                 visit(current.def);
             }
             node = current.next;
@@ -3076,16 +3076,15 @@ fn embedded_type_allocation_cost(def: &OwnedDataTypeDefinition) -> usize {
 // A schema subset or reordered file cannot change another definition's ID.
 #[cfg(not(feature = "std"))]
 #[inline(never)]
-fn compiled_type_definition(id: DataType) -> Option<DataTypeDefinition> {
+fn compiled_type_definition(id: DataType) -> Option<&'static DataTypeDefinition> {
     EMBEDDED_BUILTIN_TYPES
         .iter()
         .find(|def| def.id == id)
-        .copied()
         .or_else(|| {
             EMBEDDED_SCHEMA_TYPES
                 .binary_search_by_key(&id.0, |def| def.id.0)
                 .ok()
-                .map(|index| EMBEDDED_SCHEMA_TYPES[index])
+                .map(|index| &EMBEDDED_SCHEMA_TYPES[index])
         })
         .filter(|def| type_visible_at(*def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
 }
@@ -3304,7 +3303,7 @@ pub fn endpoint_definition(ep: DataEndpoint) -> Option<OwnedEndpointDefinition> 
 pub fn data_type_definition(ty: DataType) -> Option<OwnedDataTypeDefinition> {
     embedded_overlay_type(ty)
         .or_else(|| compiled_type_definition(ty))
-        .map(own_embedded_type)
+        .map(|def| own_embedded_type(*def))
 }
 
 #[cfg(not(feature = "std"))]

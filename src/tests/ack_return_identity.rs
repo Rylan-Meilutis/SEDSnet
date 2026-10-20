@@ -750,3 +750,90 @@ fn queued_radio_receipt_survives_echo(churn: bool) {
         "explicitly disabling the original path permits alternate ingress recovery"
     );
 }
+
+#[test]
+fn final_command_retry_is_not_redelivered_after_telemetry_churn() {
+    crate::tests::ensure_common_test_schema();
+    let endpoint = DataEndpoint::named("RADIO");
+    let register = |name, reliability| {
+        crate::config::register_data_type_with_description(
+            name,
+            "",
+            crate::MessageElement::Static(
+                1,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[endpoint],
+            reliability,
+            16,
+        )
+        .unwrap()
+    };
+    let command = register(
+        "FINAL_COMMAND_CHURN_REGRESSION",
+        crate::ReliableMode::Ordered,
+    );
+    let telemetry = register(
+        "FINAL_TELEMETRY_CHURN_REGRESSION",
+        crate::ReliableMode::None,
+    );
+    for (packed, queued) in [(false, false), (false, true), (true, false), (true, true)] {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = executions.clone();
+        let config = RouterConfig::new([EndpointHandler::new_packet_handler(
+            endpoint,
+            move |packet| {
+                if packet.data_type() == command {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )])
+        .with_sender("FC")
+        .with_reliable_enabled(true)
+        .with_memory_config(crate::config::RuntimeMemoryConfig::new(32768, 16, 512, 1.0).unwrap())
+        .unwrap();
+        let router = Router::new_with_clock(config, Box::new(|| 1000u64));
+        let side = router.add_side_packed_with_options(
+            "CAN",
+            |_| Ok(()),
+            RouterSideOptions {
+                reliable_enabled: false,
+                ..RouterSideOptions::default()
+            },
+        );
+        let first = Packet::new(command, &[endpoint], "GS", 1, Arc::<[u8]>::from([10u8])).unwrap();
+        let receive = |packet: &Packet| match (packed, queued) {
+            (true, true) => {
+                router.rx_packed_queue_from_side(&wire_format::pack_packet(packet), side)
+            }
+            (true, false) => router.rx_packed_from_side(&wire_format::pack_packet(packet), side),
+            (false, true) => router.rx_queue_from_side(packet.clone(), side),
+            (false, false) => router.rx_from_side(packet, side),
+        };
+        receive(&first).unwrap();
+        router.process_all_queues().unwrap();
+        for timestamp in 2..66 {
+            receive(
+                &Packet::new(
+                    telemetry,
+                    &[endpoint],
+                    "RF",
+                    timestamp,
+                    Arc::<[u8]>::from([0u8]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            router.process_all_queues().unwrap();
+        }
+        receive(&first).unwrap();
+        router.process_all_queues().unwrap();
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a lost receipt and ordinary telemetry must not execute one command twice (packed={packed}, queued={queued})"
+        );
+    }
+}

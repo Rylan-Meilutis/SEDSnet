@@ -1,0 +1,34 @@
+{
+  "date": "2026-10-20",
+  "status": "candidate qualified; physical radio latency unresolved",
+  "changes": [
+    "retain local reliable delivery in existing bounded return-route cache",
+    "borrow immutable embedded type definitions on routing metadata lookup"
+  ],
+  "regression": {
+    "before": "same command executed twice after 64 best-effort packets evicted ordinary RX history",
+    "after": "one execution through decoded/packed and immediate/queued ingress"
+  },
+  "tests": {
+    "default_library": 493,
+    "compact_fair_admission_library": 499
+  },
+  "fc": {
+    "allocator": "tlsf",
+    "packet_store": "compact",
+    "watchdog": true,
+    "flash_used": 473512,
+    "flash_capacity": 474624,
+    "ram_used": 181504,
+    "dma_used": 65568,
+    "factory_sha256": "5690c1e5be9276fe9c896ca347d6ff6d15cc938b7b64115f2d44cafa848f864e",
+    "programmer_verification": true,
+    "post_restart_gpio_b_odr": 0,
+    "post_restart_deployment_pulse_completions": 0
+  },
+  "limits": [
+    "delivery history follows existing reliable return-route capacity and lifetime; it is not an unbounded or power-loss-persistent journal",
+    "no physical deployment command was used for qualification",
+    "physical radio packet-integrity errors and reported five-second latency remain under investigation"
+  ]
+}

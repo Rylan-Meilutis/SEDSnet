@@ -737,6 +737,9 @@ struct ReliableRxState {
 #[derive(Debug, Clone)]
 struct ReliableReturnRouteState {
     side: RouterSideId,
+    // A final receipt can be lost after the application has acted. Ordinary
+    // RX traffic must not evict this delivery record before its return route.
+    locally_delivered: bool,
     last_replay_ms: u64,
     // A legacy contract names this router, not its downstream owner.
     // Translate the child receipt back to the router identity and original
@@ -4281,7 +4284,9 @@ impl Router {
         // delay on every retry, or sustained cache churn suppresses it forever.
         let now = self.clock.now_ms();
         let retry_ms = runtime_reliable_retransmit_ms();
-        let duplicate = st.recent_rx.contains(&packet_id);
+        let duplicate = st.recent_rx.contains(&packet_id)
+            || st.reliable_return_routes.get(&packet_id)
+                .is_some_and(|route| route.locally_delivered);
         let last_replay_ms = if duplicate {
             now.saturating_sub(retry_ms)
         } else {
@@ -4313,6 +4318,7 @@ impl Router {
             })
             .or_insert(ReliableReturnRouteState {
                 side,
+                locally_delivered: false,
                 last_replay_ms,
                 upstream_contract: None,
             });
@@ -5055,7 +5061,14 @@ impl Router {
             return Ok(());
         }
         let original_sender_hash = {
-            let st = self.state.lock();
+            let mut st = self.state.lock();
+            // This helper is reached after local delivery succeeds, before
+            // attempting its final receipt. Keep that fact in the existing
+            // bounded reliable return-route cache: best-effort telemetry can
+            // churn recent_rx thousands of times while this receipt retries.
+            if let Some(route) = st.reliable_return_routes.get_mut(&packet_id) {
+                route.locally_delivered = true;
+            }
             Self::sender_hash(&Self::canonical_sender_locked(&st, original_sender))
         };
         self.queue_end_to_end_reliable_ack_for_sender_hash(
@@ -12235,7 +12248,10 @@ impl Router {
     fn is_duplicate_pkt(&self, item: &RouterItem) -> TelemetryResult<bool> {
         let id = Self::get_hash(item);
         let mut st = self.state.lock();
-        if st.recent_rx.contains(&id) {
+        if st.recent_rx.contains(&id)
+            || st.reliable_return_routes.get(&id)
+                .is_some_and(|route| route.locally_delivered)
+        {
             Ok(true)
         } else {
             st.push_recent_rx(id)?;
@@ -13044,6 +13060,7 @@ impl Router {
                             upstream_id,
                             ReliableReturnRouteState {
                                 side: alias.side,
+                                locally_delivered: false,
                                 last_replay_ms: alias.last_replay_ms,
                                 upstream_contract: None,
                             },
