@@ -18,15 +18,14 @@ use crate::{
     DataType, MessageElement, RouteSelectionMode, TelemetryError, TelemetryErrorCode,
     TelemetryResult,
     config::{
-        DataEndpoint, RuntimeMemoryConfig, RuntimeTuningConfig, data_type_definition,
-        data_type_definition_by_name, data_type_exists, e2e_encryption_policy_code,
-        e2e_encryption_policy_from_code, endpoint_definition, endpoint_definition_by_name,
-        endpoint_exists, get_endpoint_meta, known_endpoints, message_class_code,
-        message_class_from_code, message_data_type_code, message_data_type_from_code,
-        register_data_type_id_with_description_and_e2e_encryption, register_endpoint_id,
-        register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
-        reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
-        remove_endpoint_by_name, runtime_device_identifier, runtime_tuning_config,
+        DataEndpoint, RuntimeMemoryConfig, RuntimeTuningConfig, data_type_exists,
+        e2e_encryption_policy_code, e2e_encryption_policy_from_code, endpoint_definition,
+        endpoint_definition_by_name, endpoint_exists, get_endpoint_meta, known_endpoints,
+        message_class_code, message_class_from_code, message_data_type_code,
+        message_data_type_from_code, register_data_type_id_with_description_and_e2e_encryption,
+        register_endpoint_id, register_endpoint_id_with_description, register_schema_json_bytes,
+        reliable_code, reliable_from_code, remove_data_type, remove_data_type_by_name,
+        remove_endpoint, remove_endpoint_by_name, runtime_device_identifier, runtime_tuning_config,
         set_data_type_e2e_encryption_policy, set_runtime_device_identifier,
         set_runtime_tuning_config,
     },
@@ -3289,7 +3288,7 @@ pub extern "C" fn seds_dtype_get_info(
     if out.is_null() {
         return status_from_err(TelemetryError::BadArg);
     }
-    let Some(def) = data_type_definition(DataType(ty)) else {
+    let Some(meta) = crate::config::try_get_message_meta(DataType(ty)) else {
         unsafe {
             *out = SedsDataTypeInfo {
                 exists: false,
@@ -3313,36 +3312,35 @@ pub extern "C" fn seds_dtype_get_info(
         return status_from_result_code(SedsResult::SedsOk);
     };
     if !endpoints_out.is_null() {
-        if def.endpoints.len() > endpoints_cap {
+        if meta.endpoints.len() > endpoints_cap {
             return status_from_err(TelemetryError::BadArg);
         }
-        for (idx, ep) in def.endpoints.iter().enumerate() {
+        for (idx, ep) in meta.endpoints.iter().enumerate() {
             unsafe {
                 *endpoints_out.add(idx) = ep.as_u32();
             }
         }
     }
-    let (is_static, count, data_type, class) = match def.element {
+    let (is_static, count, data_type, class) = match meta.element {
         MessageElement::Static(count, data_type, class) => (true, count, data_type, class),
         MessageElement::Dynamic(data_type, class) => (false, 0, data_type, class),
     };
-    let meta = message_meta(def.id);
     let name = meta.name_ref();
     let description = meta.description_ref();
     unsafe {
         *out = SedsDataTypeInfo {
             exists: true,
-            id: def.id.as_u32(),
+            id: ty,
             is_static,
             element_count: count,
             message_data_type: message_data_type_code(data_type),
             message_class: message_class_code(class),
-            reliable: reliable_code(def.reliable),
-            priority: def.priority,
-            e2e_encryption: e2e_encryption_policy_code(def.e2e_encryption),
-            fixed_size: fixed_payload_size_if_static(def.id).unwrap_or(0),
+            reliable: reliable_code(meta.reliable),
+            priority: meta.priority,
+            e2e_encryption: e2e_encryption_policy_code(meta.e2e_encryption),
+            fixed_size: fixed_payload_size_if_static(DataType(ty)).unwrap_or(0),
             endpoints: endpoints_out,
-            num_endpoints: def.endpoints.len(),
+            num_endpoints: meta.endpoints.len(),
             name: name.as_ptr() as *const c_char,
             name_len: name.len(),
             description: description.as_ptr() as *const c_char,
@@ -3367,7 +3365,7 @@ pub extern "C" fn seds_dtype_get_info_by_name(
     let Ok(name) = from_utf8(bytes) else {
         return status_from_err(TelemetryError::Unpack("data type name"));
     };
-    let Some(def) = data_type_definition_by_name(name) else {
+    let Some(ty) = DataType::try_named(name) else {
         unsafe {
             *out = SedsDataTypeInfo {
                 exists: false,
@@ -3390,44 +3388,7 @@ pub extern "C" fn seds_dtype_get_info_by_name(
         }
         return status_from_result_code(SedsResult::SedsOk);
     };
-    if !endpoints_out.is_null() {
-        if def.endpoints.len() > endpoints_cap {
-            return status_from_err(TelemetryError::BadArg);
-        }
-        for (idx, ep) in def.endpoints.iter().enumerate() {
-            unsafe {
-                *endpoints_out.add(idx) = ep.as_u32();
-            }
-        }
-    }
-    let (is_static, count, data_type, class) = match def.element {
-        MessageElement::Static(count, data_type, class) => (true, count, data_type, class),
-        MessageElement::Dynamic(data_type, class) => (false, 0, data_type, class),
-    };
-    let meta = message_meta(def.id);
-    let name = meta.name_ref();
-    let description = meta.description_ref();
-    unsafe {
-        *out = SedsDataTypeInfo {
-            exists: true,
-            id: def.id.as_u32(),
-            is_static,
-            element_count: count,
-            message_data_type: message_data_type_code(data_type),
-            message_class: message_class_code(class),
-            reliable: reliable_code(def.reliable),
-            priority: def.priority,
-            e2e_encryption: e2e_encryption_policy_code(def.e2e_encryption),
-            fixed_size: fixed_payload_size_if_static(def.id).unwrap_or(0),
-            endpoints: endpoints_out,
-            num_endpoints: def.endpoints.len(),
-            name: name.as_ptr() as *const c_char,
-            name_len: name.len(),
-            description: description.as_ptr() as *const c_char,
-            description_len: description.len(),
-        };
-    }
-    status_from_result_code(SedsResult::SedsOk)
+    seds_dtype_get_info(ty.as_u32(), endpoints_out, endpoints_cap, out)
 }
 
 #[unsafe(no_mangle)]

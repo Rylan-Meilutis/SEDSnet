@@ -635,19 +635,19 @@ pub fn message_meta(ty: DataType) -> MessageMeta {
 /// Return whether the given [`DataType`] is configured for reliable delivery.
 #[inline]
 pub fn is_reliable_type(ty: DataType) -> bool {
-    !matches!(get_message_meta(ty).reliable, ReliableMode::None)
+    !matches!(reliable_mode(ty), ReliableMode::None)
 }
 
 /// Return the reliable delivery mode for the given [`DataType`].
 #[inline]
 pub fn reliable_mode(ty: DataType) -> ReliableMode {
-    get_message_meta(ty).reliable
+    config::message_delivery_meta(ty).0
 }
 
 /// Return the queue priority for the given [`DataType`].
 #[inline]
 pub fn message_priority(ty: DataType) -> u8 {
-    get_message_meta(ty).priority
+    config::message_delivery_meta(ty).1
 }
 
 /// Priority used by the router/relay schedulers.

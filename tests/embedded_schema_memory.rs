@@ -313,3 +313,67 @@ fn embedded_named_id_lookup_uses_retained_schema_storage() {
         "embedded ID lookup copied static schema definitions"
     );
 }
+
+#[test]
+fn embedded_scheduling_metadata_follows_replaced_runtime_definitions() {
+    use sedsnet::config::{
+        DataEndpoint, DataType, OwnedDataTypeDefinition, OwnedRuntimeSchemaSnapshot,
+        merge_owned_schema_snapshot_with_budget,
+    };
+    let ty = DataType::identity("LIVE_EMBEDDED_DELIVERY_META");
+    assert_eq!(sedsnet::message_priority(ty), 0);
+    assert_eq!(sedsnet::reliable_mode(ty), sedsnet::ReliableMode::None);
+    merge_owned_schema_snapshot_with_budget(
+        OwnedRuntimeSchemaSnapshot {
+            endpoints: vec![],
+            types: vec![OwnedDataTypeDefinition {
+                id: ty,
+                name: "LIVE_EMBEDDED_DELIVERY_META".into(),
+                description: String::new(),
+                element: sedsnet::MessageElement::Static(
+                    1,
+                    sedsnet::MessageDataType::UInt8,
+                    sedsnet::MessageClass::Data,
+                ),
+                endpoints: vec![DataEndpoint::Discovery],
+                reliable: sedsnet::ReliableMode::Unordered,
+                priority: 123,
+                e2e_encryption: sedsnet::E2eEncryptionPolicy::PreferOff,
+            }],
+        },
+        usize::MAX,
+    )
+    .unwrap();
+    assert_eq!(sedsnet::message_priority(ty), 123);
+    assert_eq!(sedsnet::reliable_mode(ty), sedsnet::ReliableMode::Unordered);
+
+    for (mode, priority) in [
+        (sedsnet::ReliableMode::Unordered, 231),
+        (sedsnet::ReliableMode::Ordered, 241),
+        (sedsnet::ReliableMode::None, 0),
+    ] {
+        let mut definition = sedsnet::config::data_type_definition(ty).unwrap();
+        definition.reliable = mode;
+        definition.priority = priority;
+        sedsnet::config::merge_owned_schema_snapshot_with_budget(
+            sedsnet::config::OwnedRuntimeSchemaSnapshot {
+                endpoints: vec![],
+                types: vec![definition],
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        // Conflicting wire contracts use the deterministic merge winner.
+        // The fast accessors must reflect that current winner, never a cache.
+        let current = sedsnet::config::data_type_definition(ty).unwrap();
+        assert_eq!(sedsnet::reliable_mode(ty), current.reliable);
+        assert_eq!(
+            sedsnet::is_reliable_type(ty),
+            current.reliable != sedsnet::ReliableMode::None
+        );
+        assert_eq!(sedsnet::message_priority(ty), current.priority);
+        if mode == sedsnet::ReliableMode::Unordered && priority == 231 {
+            assert_eq!(current.priority, 231);
+        }
+    }
+}

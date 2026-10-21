@@ -1020,6 +1020,7 @@ def main(argv: list[str]) -> None:
                 "--test",
                 "embedded_memory_behavior_test",
                 "--test", "embedded_schema_memory",
+                "--test", "embedded_cached_transit",
             ],
             env=embedded_test_env,
             repo_root=repo_root,

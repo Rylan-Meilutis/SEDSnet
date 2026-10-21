@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+## 4.2.5
+
+Release candidate; not yet published. Firmware qualification remains in progress.
+
+- Reuse an ingress-local validated routing view for liveness and admission, and
+  a dispatch-local view for admission and routing. No validation cache survives
+  queueing. Embedded reserved control types use checked direct indexing instead
+  of a control-list scan on every application metadata lookup.
+- Read priority and reliable mode without cloning/copying the complete metadata
+  object. Unknown hosted types no longer allocate fallback strings for these
+  queries. Runtime-schema tests compare fast accessors with the merged current
+  definition, including deterministic conflict winners. The old implementation
+  performs 576 allocations in the new 64-query negative control; the repair
+  performs zero. Both packet stores pass the 49 pressure tests.
+
+- Keep transient reassembly fragments in shared slices instead of pinned arena
+  containers, reducing per-fragment tree metadata without copying payloads.
+  Existing small assemblies use a separately measured insertion estimate;
+  new transfers, larger trees, assembly and decoding retain independent guards.
+  Router and relay pressure tests cover out-of-order node splits, duplicate
+  retries, retained-tree bounds and new-transfer refusal in both stores. The
+  application's free-memory safety reserve remains unchanged.
+
+- Share the ready-TX selector between transmit-only and combined queue service,
+  preserving deferred retries and protected-control selection while reducing
+  duplicated code on flash-constrained FC builds. Keep RX fairness's cold scan
+  free of a second generic iterator instantiation.
+
+- Bound receive-side best-effort priority bursts on routers and relays. A
+  continuously active higher-priority data source no longer strands a retained
+  low-rate report. Protected command/ACK/discovery traffic remains first, and
+  equal-priority reports retain FIFO order. The ordinary dequeue path checks
+  only the queue ends; it scans only for a fairness turn. Regression tests fail
+  on strict RX ordering and pass for heap and compact stores after the repair.
+
+- Keep the one-byte ULEB128 success path inline on 32-bit targets, with the
+  bounded full-width decoder retained for multi-byte values and malformed input.
+  Avoid constructing an optional side-header dictionary hash for bounded frames
+  from an already discovered peer when canonical transit is sufficient. These
+  CPU candidates retain all CRC, schema, cold-source, route and admission checks;
+  sustained firmware qualification is still pending.
+
+- Allow bounded canonical forwarding after optional header-cache eviction in
+  ordinary embedded builds, matching hosted behavior without requiring the
+  fair-admission feature. A real no_std regression covers routers and relays,
+  cold/unknown sources, CRC failures and route expiry, with both heap and active
+  compact arena storage. The normal build-script test gate runs it too.
+- Share atomic schema-delta merging between packed and decoded embedded ingress,
+  and reuse the fixed link-capability decoder. This removes redundant code and
+  transient catalog copies while preserving runtime schema learning and flash
+  limits on constrained FC builds.
+
+- Refresh unchanged, CRC-validated address summaries using borrowed fields,
+  without payload/route clones. Routers consume unchanged summaries without
+  allocation admission; transparent relays preserve normal owned forwarding for
+  global address-collision arbitration. Changed owners, routes and contested
+  restarts retain the transactional path. Malformed/truncated summaries stay
+  rejected; regressions cover both packet stores and repeated relay forwarding.
+- Avoid redundant registry lookup for bounded scheduling hints and share the
+  type/priority envelope during router transmission. Full wire validation remains
+  mandatory before dispatch; hints do not authorize traffic.
+
+- Reclaim best-effort backlog before fragment admission, preserve validated
+  duplicate chunks without allocation, and expire incomplete transfers from
+  their last new fragment rather than allowing retries to pin them forever.
+- Assemble fragmented frames with bounded progressive growth when a second full
+  working copy would violate allocator headroom. Keep normal decode admission.
+- Reuse borrowed routing headers within receive/dispatch and avoid owned type
+  definition clones in C metadata queries. Permit compressed payloads to remain
+  opaque on fully warmed cached transit paths; preserve normal decoding elsewhere.
+- Merge changed embedded schema definitions directly from validated snapshots,
+  retaining runtime schema learning without copying the complete known catalog.
+  Router and standalone Relay use the same bounded decoder and merge limits.
+  These changes remain unreleased pending the stricter field-fidelity soak.
+
 - Retain successful local reliable delivery in the existing bounded return-route
   cache. Best-effort sensor traffic can no longer evict the only duplicate
   record before a lost final receipt is retried, re-executing the application

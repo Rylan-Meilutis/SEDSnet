@@ -256,6 +256,41 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.pop_front_fair_if(priority_burst, max_priority_burst, priority_of, |_| true)
     }
 
+    /// Bounded fairness for a ready RX queue sorted by descending priority.
+    /// Protected control never yields. The usual path checks only its ends;
+    /// scan for the first low-priority item only once per bounded bulk burst.
+    pub(crate) fn pop_front_bulk_fair<F>(
+        &mut self,
+        priority_burst: &mut u8,
+        max_priority_burst: u8,
+        priority_of: F,
+    ) -> Option<T>
+    where
+        F: Fn(&T) -> u8,
+    {
+        let Some(front) = self.q.front().map(&priority_of) else {
+            *priority_burst = 0;
+            return None;
+        };
+        let lowest = self.q.back().map(&priority_of).unwrap_or(front);
+        if front >= 200 || front == lowest {
+            *priority_burst = 0;
+            return self.pop_front();
+        }
+        if *priority_burst < max_priority_burst {
+            *priority_burst += 1;
+            return self.pop_front();
+        }
+        *priority_burst = 0;
+        // Explicit indexing avoids a second generic iterator traversal on
+        // small MCUs. The first match retains FIFO within the lowest priority.
+        let mut index = 0;
+        while self.q.get(index).is_some_and(|item| priority_of(item) != lowest) {
+            index += 1;
+        }
+        self.remove_pos(index)
+    }
+
     /// Preserve priority fairness while leaving deferred work in owned storage.
     pub(crate) fn pop_front_fair_if<F, G>(
         &mut self,

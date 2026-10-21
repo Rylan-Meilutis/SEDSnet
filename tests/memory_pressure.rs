@@ -9,6 +9,8 @@ use std::sync::{
 };
 struct CountingAllocator;
 std::thread_local! {
+    static LIVE_ALLOCATION_DELTA: std::cell::Cell<Option<isize>> = const { std::cell::Cell::new(None) };
+    static PEAK_ALLOCATION_DELTA: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     static MAX_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static ALLOCATION_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static REFUSE_CONTIGUOUS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -18,6 +20,13 @@ std::thread_local! {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = LIVE_ALLOCATION_DELTA.try_with(|n| {
+            if let Some(old) = n.get() {
+                let current = old + layout.size() as isize;
+                n.set(Some(current));
+                let _ = PEAK_ALLOCATION_DELTA.try_with(|p| p.set(p.get().max(current)));
+            }
+        });
         let _ = MAX_ALLOCATION.try_with(|largest| {
             if let Some(n) = largest.get() {
                 largest.set(Some(n.max(layout.size())));
@@ -40,6 +49,11 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        let _ = LIVE_ALLOCATION_DELTA.try_with(|n| {
+            if let Some(old) = n.get() {
+                n.set(Some(old - layout.size() as isize));
+            }
+        });
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
 }
@@ -2715,4 +2729,849 @@ fn relay_full_schema_snapshot_admits_learned_graph_before_allocating() {
     assert_eq!(relay.export_topology().routes, retained_routes);
     relay.announce_discovery().unwrap();
     relay.drain_queues_with_timeout(0).unwrap();
+}
+
+#[cfg(feature = "compression")]
+#[test]
+fn compressed_opaque_transit_uses_bounded_admission_on_router_and_relay() {
+    use sedsnet::discovery::{
+        TopologyBoardNode, build_discovery_announce, build_discovery_topology,
+    };
+    use sedsnet::relay::{Relay, RelaySideOptions};
+    use sedsnet::router::{NetworkVariablePermissions, RouterSideOptions};
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("COMPRESSED_TRANSIT_SINK", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "COMPRESSED_TRANSIT_DATA",
+        "",
+        MessageElement::Static(256, MessageDataType::UInt8, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let packet = |ts| {
+        Packet::new(
+            ty,
+            &[ep],
+            "COMPRESSED_TRANSIT_SOURCE",
+            ts,
+            Arc::<[u8]>::from([0u8; 256]),
+        )
+        .unwrap()
+    };
+    let raw = |ts| sedsnet::wire_format::pack_packet(&packet(ts));
+    assert_ne!(
+        raw(0)[0] & 1,
+        0,
+        "fixture must exercise actual zstd compression"
+    );
+    assert!(raw(0).len() <= 64);
+    let topology = build_discovery_topology(
+        "GS",
+        0,
+        &[TopologyBoardNode {
+            sender_id: "GS".into(),
+            reachable_endpoints: vec![ep],
+            reachable_timesync_sources: vec![],
+            connections: vec![],
+        }],
+    )
+    .unwrap();
+    let announce = build_discovery_announce("COMPRESSED_TRANSIT_SOURCE", 0, &[]).unwrap();
+    let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+    let opts = RouterSideOptions::default();
+    let ri = router.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
+    let router_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = router_out.clone();
+    let ro = router.add_side_packed_with_options(
+        "uart",
+        move |b| {
+            out.lock().unwrap().push(b.to_vec());
+            Ok(())
+        },
+        opts,
+    );
+    router.rx_from_side(&topology, ro).unwrap();
+    router.rx_from_side(&announce, ri).unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    router.rx_packed_from_side(&raw(0), ri).unwrap();
+    router_out.lock().unwrap().clear();
+
+    let relay = Relay::new(Box::new(|| 0));
+    let opts = RelaySideOptions::default();
+    let li = relay.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
+    let relay_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = relay_out.clone();
+    let lo = relay.add_side_packed_with_options(
+        "uart",
+        move |b| {
+            out.lock().unwrap().push(b.to_vec());
+            Ok(())
+        },
+        opts,
+    );
+    relay.rx_from_side(lo, topology).unwrap();
+    relay.rx_from_side(li, announce).unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
+    relay.rx_packed_from_side(li, &raw(0)).unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
+    relay_out.lock().unwrap().clear();
+    CACHED_ACCEPTS.store(0, Ordering::Relaxed);
+    sedsnet::memory_admission::set_probe_v2(Some(fragmented_cached_probe));
+    for ts in 1..=32 {
+        let bytes = raw(ts);
+        router.rx_packed_queue_from_side(&bytes, ri).unwrap();
+        router.drain_queues_with_timeout(0).unwrap();
+        relay.rx_packed_from_side(li, &bytes).unwrap();
+        relay.drain_queues_with_timeout(0).unwrap();
+        for output in [&router_out, &relay_out] {
+            let wire = output.lock().unwrap().pop().unwrap();
+            // Small-packet transport may add the ordinary full wrapper even
+            // with dictionaries disabled; the canonical payload must be exact.
+            if wire.starts_with(b"SDT\x01") {
+                let n = wire.len();
+                assert_eq!(crc32fast::hash(&wire[..n - 4]).to_le_bytes(), wire[n - 4..]);
+                assert_eq!(&wire[4..n - 4], bytes.as_ref());
+            } else {
+                assert_eq!(wire, bytes.as_ref());
+            }
+        }
+    }
+    assert!(CACHED_ACCEPTS.load(Ordering::Relaxed) >= 128);
+    // Corruption still fails CRC validation; compression is never permission
+    // to treat bytes as locally decoded or skip current role checks.
+    let mut corrupt = raw(40).to_vec();
+    let n = corrupt.len();
+    corrupt[n - 1] ^= 1;
+    assert!(router.rx_packed_queue_from_side(&corrupt, ri).is_err());
+    assert!(relay.rx_packed_from_side(li, &corrupt).is_err());
+    router
+        .enable_network_variable(
+            ty,
+            NetworkVariablePermissions {
+                read: true,
+                write: true,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        router.rx_packed_queue_from_side(&raw(41), ri),
+        Err(TelemetryError::Io("memory pressure"))
+    ));
+}
+
+static CHUNK_ADMISSION_CALLS: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn retry_chunk_after_reclaim(_: usize, _: usize, _: u32) -> bool {
+    CHUNK_ADMISSION_CALLS.fetch_add(1, Ordering::Relaxed) > 0 && ALLOW.load(Ordering::Relaxed)
+}
+
+#[test]
+fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation() {
+    use sedsnet::relay::Relay;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("CHUNK_PRESSURE_SINK", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "CHUNK_PRESSURE_DATA",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let packet = Packet::from_f32_slice(ty, &[1.0], &[ep], 0).unwrap();
+    let control_ty = register_data_type_with_description(
+        "CHUNK_PROTECTED_CONTROL",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        230,
+    )
+    .unwrap();
+    let control = Packet::from_f32_slice(control_ty, &[1.0], &[ep], 0).unwrap();
+    // Same framing and 40-fragment transfer size as the captured gateway rejects.
+    let mut fragment = b"SDT\x03".to_vec();
+    fragment.extend_from_slice(&1234u32.to_le_bytes());
+    fragment.extend_from_slice(&38u16.to_le_bytes());
+    fragment.extend_from_slice(&40u16.to_le_bytes());
+    fragment.extend_from_slice(&[7u8; 94]);
+    fragment.extend_from_slice(&crc32fast::hash(&fragment).to_le_bytes());
+    for use_relay in [false, true] {
+        sedsnet::memory_admission::set_probe(None);
+        ALLOW.store(true, Ordering::Relaxed);
+        let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+        let ri = router.add_side_packed("can", |_| Ok(()));
+        let relay = Relay::new(Box::new(|| 0));
+        let li = relay.add_side_packed("can", |_| Ok(()));
+        if use_relay {
+            relay.rx_from_side(li, packet.clone()).unwrap();
+        } else {
+            router.rx_queue_from_side(packet.clone(), ri).unwrap();
+        }
+        CHUNK_ADMISSION_CALLS.store(0, Ordering::Relaxed);
+        sedsnet::memory_admission::set_probe_v2(Some(retry_chunk_after_reclaim));
+        if use_relay {
+            relay.rx_packed_from_side(li, &fragment).unwrap();
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri).unwrap();
+        }
+        assert_eq!(
+            CHUNK_ADMISSION_CALLS.load(Ordering::Relaxed),
+            2,
+            "one failed preflight, one queued bulk eviction, then one retry"
+        );
+        // Retrying an already retained fragment allocates nothing and must not
+        // be rejected (or evict another packet) merely because headroom fell.
+        ALLOW.store(false, Ordering::Relaxed);
+        CHUNK_ADMISSION_CALLS.store(0, Ordering::Relaxed);
+        MAX_ALLOCATION.with(|n| n.set(Some(0)));
+        let duplicate = if use_relay {
+            relay.rx_packed_from_side(li, &fragment)
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri)
+        };
+        let allocation = MAX_ALLOCATION.with(|n| n.replace(None));
+        duplicate.unwrap();
+        assert_eq!(allocation, Some(0));
+        assert_eq!(CHUNK_ADMISSION_CALLS.load(Ordering::Relaxed), 0);
+        sedsnet::memory_admission::set_probe(None);
+        if use_relay {
+            relay.rx_from_side(li, control.clone()).unwrap();
+        } else {
+            router.rx_queue_from_side(control.clone(), ri).unwrap();
+        }
+        sedsnet::memory_admission::set_probe_v2(Some(retry_chunk_after_reclaim));
+        // No reclaimable work: a different fragment is still refused. The
+        // accepted assembly is preserved for retry; no relaxed allocation guard.
+        fragment[8..10].copy_from_slice(&39u16.to_le_bytes());
+        let n = fragment.len();
+        let crc = crc32fast::hash(&fragment[..n - 4]);
+        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let rejected = if use_relay {
+            relay.rx_packed_from_side(li, &fragment)
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri)
+        };
+        assert!(matches!(
+            rejected,
+            Err(TelemetryError::Io("memory pressure"))
+        ));
+        assert_eq!(
+            CHUNK_ADMISSION_CALLS.load(Ordering::Relaxed),
+            1,
+            "protected controls must not be evicted to retry the allocation"
+        );
+        fragment[8..10].copy_from_slice(&38u16.to_le_bytes());
+        let crc = crc32fast::hash(&fragment[..n - 4]);
+        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+    }
+}
+
+#[test]
+fn warmed_relay_transit_dispatch_has_a_bounded_allocation_budget() {
+    use sedsnet::discovery::{TopologyBoardNode, build_discovery_topology};
+    use sedsnet::relay::Relay;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("RELAY_DISPATCH_BUDGET_SINK", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "RELAY_DISPATCH_BUDGET_DATA",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let relay = Relay::new(Box::new(|| 0));
+    let ingress = relay.add_side_packed("can", |_| Ok(()));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counter = sent.clone();
+    let egress = relay.add_side_packed("ethernet", move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    relay
+        .rx_from_side(
+            egress,
+            build_discovery_topology(
+                "GS",
+                0,
+                &[TopologyBoardNode {
+                    sender_id: "GS".into(),
+                    reachable_endpoints: vec![ep],
+                    reachable_timesync_sources: vec![],
+                    connections: vec![],
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    relay.drain_queues_with_timeout(0).unwrap();
+    let mut total = 0;
+    for ts in 0..=32 {
+        let pkt = Packet::from_f32_slice(ty, &[ts as f32], &[ep], ts).unwrap();
+        relay
+            .rx_packed_from_side(ingress, &sedsnet::wire_format::pack_packet(&pkt))
+            .unwrap();
+        if ts != 0 {
+            ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+        }
+        let result = relay.drain_queues_with_timeout(0);
+        if ts != 0 {
+            total += ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+        }
+        result.unwrap();
+    }
+    assert!(sent.load(Ordering::Relaxed) >= 33);
+    assert!(
+        total <= 64,
+        "warmed opaque dispatch allocated {total} objects for 32 packets; owned header arrays must not be recreated"
+    );
+}
+
+extern "C" fn assembly_headroom_probe(additional: usize, _: usize) -> bool {
+    let delta = LIVE_ALLOCATION_DELTA.with(|n| n.get().unwrap_or(0));
+    let available = 6600isize - delta;
+    available >= 0 && additional.saturating_add(4096) <= available as usize
+}
+
+#[test]
+fn fragmented_known_topology_recovers_without_two_full_working_copies() {
+    use sedsnet::discovery::{TopologyBoardNode, build_discovery_topology};
+    use sedsnet::relay::Relay;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("ASSEMBLY_HEADROOM_SINK", "", false).unwrap();
+    let boards = (0..32)
+        .map(|i| TopologyBoardNode {
+            sender_id: if i == 0 {
+                "ASSEMBLY_SOURCE".into()
+            } else {
+                format!("NODE_{i:02}_{}", "X".repeat(88))
+            },
+            reachable_endpoints: vec![ep],
+            reachable_timesync_sources: vec![],
+            connections: vec![],
+        })
+        .collect::<Vec<_>>();
+    let topology = build_discovery_topology("ASSEMBLY_SOURCE", 0, &boards).unwrap();
+    let tuning = sedsnet::config::runtime_tuning_config();
+    let mut plain = tuning;
+    plain.payload_compress_threshold = usize::MAX;
+    sedsnet::config::set_runtime_tuning_config(plain).unwrap();
+    let wire = sedsnet::wire_format::pack_packet(&topology);
+    sedsnet::config::set_runtime_tuning_config(tuning).unwrap();
+    assert_eq!(wire[0] & 1, 0);
+    assert!((3000..5000).contains(&wire.len()), "{}", wire.len());
+    let chunks = wire
+        .chunks(94)
+        .enumerate()
+        .map(|(index, bytes)| {
+            let mut out = b"SDT\x03".to_vec();
+            out.extend_from_slice(&8765u32.to_le_bytes());
+            out.extend_from_slice(&(index as u16).to_le_bytes());
+            out.extend_from_slice(&(wire.len().div_ceil(94) as u16).to_le_bytes());
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(&crc32fast::hash(&out).to_le_bytes());
+            out
+        })
+        .collect::<Vec<_>>();
+    for use_relay in [false, true] {
+        sedsnet::memory_admission::set_probe(None);
+        // This budget isolates working-headroom from retained graph accounting.
+        // The allocator model below, not this queue ceiling, permits only 6600
+        // free bytes above the already retained fragment/graph baseline.
+        let memory = sedsnet::config::RuntimeMemoryConfig::new(65536, 16, 1024, 1.25).unwrap();
+        let router = Router::new_with_clock(
+            RouterConfig::default().with_memory_config(memory).unwrap(),
+            Box::new(|| 0),
+        );
+        let ri = router.add_side_packed("can", |_| Ok(()));
+        let relay = Relay::new_with_config(
+            sedsnet::relay::RelayConfig::default()
+                .with_memory_config(memory)
+                .unwrap(),
+            Box::new(|| 0),
+        );
+        let li = relay.add_side_packed("can", |_| Ok(()));
+        if use_relay {
+            relay.rx_from_side(li, topology.clone()).unwrap();
+            relay.drain_queues_with_timeout(0).unwrap();
+        } else {
+            router.rx_from_side(&topology, ri).unwrap();
+            router.drain_queues_with_timeout(0).unwrap();
+        }
+        for part in &chunks[..chunks.len() - 1] {
+            if use_relay {
+                relay.rx_packed_from_side(li, part).unwrap();
+            } else {
+                router.rx_packed_queue_from_side(part, ri).unwrap();
+            }
+        }
+        LIVE_ALLOCATION_DELTA.with(|n| n.set(Some(0)));
+        PEAK_ALLOCATION_DELTA.with(|n| n.set(0));
+        sedsnet::memory_admission::set_probe(Some(assembly_headroom_probe));
+        let result = if use_relay {
+            relay.rx_packed_from_side(li, chunks.last().unwrap())
+        } else {
+            router.rx_packed_queue_from_side(chunks.last().unwrap(), ri)
+        };
+        LIVE_ALLOCATION_DELTA.with(|n| n.set(None));
+        let peak = PEAK_ALLOCATION_DELTA.with(|n| n.get());
+        sedsnet::memory_admission::set_probe(None);
+        assert!(
+            result.is_ok(),
+            "relay={use_relay}, peak={peak}, error={result:?}"
+        );
+        assert!(
+            peak <= 6600 - 4096,
+            "assembly consumed protected reserve: {peak}"
+        );
+    }
+}
+
+#[test]
+fn c_metadata_queries_do_not_clone_owned_type_definitions() {
+    unsafe extern "C" {
+        fn seds_dtype_get_info(
+            ty: u32,
+            eps: *mut u32,
+            cap: usize,
+            out: *mut core::ffi::c_void,
+        ) -> i32;
+        fn seds_dtype_get_info_by_name(
+            name: *const core::ffi::c_char,
+            len: usize,
+            eps: *mut u32,
+            cap: usize,
+            out: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let ep = register_endpoint_with_description("C_METADATA_BUDGET_SINK", "", false).unwrap();
+    let name = "C_METADATA_BUDGET_DATA";
+    let ty = register_data_type_with_description(
+        name,
+        "C metadata must borrow retained definitions",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let mut storage = [0usize; 32];
+    let mut endpoints = [0u32; 3];
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    for _ in 0..32 {
+        assert_eq!(
+            unsafe {
+                seds_dtype_get_info(
+                    ty.as_u32(),
+                    endpoints.as_mut_ptr(),
+                    3,
+                    storage.as_mut_ptr().cast(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                seds_dtype_get_info_by_name(
+                    name.as_ptr().cast(),
+                    name.len(),
+                    endpoints.as_mut_ptr(),
+                    3,
+                    storage.as_mut_ptr().cast(),
+                )
+            },
+            0
+        );
+    }
+    let count = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    assert_eq!(endpoints[0], ep.as_u32());
+    assert_eq!(
+        count, 0,
+        "C type queries allocated owned schema names/description/endpoints"
+    );
+}
+
+#[test]
+fn duplicate_fragment_retries_cannot_keep_stalled_transfers_alive() {
+    use sedsnet::relay::Relay;
+    use std::sync::atomic::AtomicU64;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let mut fragment = b"SDT\x03".to_vec();
+    fragment.extend_from_slice(&4321u32.to_le_bytes());
+    fragment.extend_from_slice(&0u16.to_le_bytes());
+    fragment.extend_from_slice(&2u16.to_le_bytes());
+    fragment.extend_from_slice(&[5u8; 94]);
+    fragment.extend_from_slice(&crc32fast::hash(&fragment).to_le_bytes());
+    for use_relay in [false, true] {
+        sedsnet::memory_admission::set_probe(None);
+        ALLOW.store(true, Ordering::Relaxed);
+        let clock = Arc::new(AtomicU64::new(0));
+        let tick = clock.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::default(),
+            Box::new(move || tick.load(Ordering::Relaxed)),
+        );
+        let ri = router.add_side_packed("can", |_| Ok(()));
+        let tick = clock.clone();
+        let relay = Relay::new(Box::new(move || tick.load(Ordering::Relaxed)));
+        let li = relay.add_side_packed("can", |_| Ok(()));
+        if use_relay {
+            relay.rx_packed_from_side(li, &fragment).unwrap();
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri).unwrap();
+        }
+        ALLOW.store(false, Ordering::Relaxed);
+        sedsnet::memory_admission::set_probe(Some(probe));
+        for now in [1000, 2000] {
+            clock.store(now, Ordering::Relaxed);
+            if use_relay {
+                relay.rx_packed_from_side(li, &fragment).unwrap();
+            } else {
+                router.rx_packed_queue_from_side(&fragment, ri).unwrap();
+            }
+        }
+        clock.store(2100, Ordering::Relaxed);
+        let result = if use_relay {
+            relay.rx_packed_from_side(li, &fragment)
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri)
+        };
+        assert!(
+            matches!(result, Err(TelemetryError::Io("memory pressure"))),
+            "relay={use_relay}: a stale assembly must expire; a retry then requires fresh admission"
+        );
+        if !use_relay {
+            assert_eq!(router.memory_counters()[13], 0);
+        }
+    }
+}
+
+#[test]
+fn unchanged_address_liveness_inspection_does_not_allocate_under_pressure() {
+    use sedsnet::discovery::{
+        ADDRESS_MODE_STATIC, ADDRESS_STATE_APPROVED, AddressAdvertisement, LinkCapabilities,
+        build_discovery_address,
+    };
+    use sedsnet::relay::Relay;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let old = sedsnet::config::runtime_tuning_config();
+    struct Restore(sedsnet::config::RuntimeTuningConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            sedsnet::config::set_runtime_tuning_config(self.0).unwrap();
+        }
+    }
+    let _restore = Restore(old);
+    let mut tuning = old;
+    tuning.payload_compress_threshold = usize::MAX;
+    sedsnet::config::set_runtime_tuning_config(tuning).unwrap();
+    let ep = register_endpoint_with_description("BORROWED_ADDRESS_EP", "", false).unwrap();
+    let ad = AddressAdvertisement {
+        hostname: "ADDRESS_PEER".into(),
+        address: 42,
+        requested_address: 42,
+        mode: ADDRESS_MODE_STATIC,
+        state: ADDRESS_STATE_APPROVED,
+        birth_ms: 0,
+        owner_hash: 77,
+        reachable_endpoints: vec![ep],
+        reachable_network_variables: vec![],
+        reachable_timesync_sources: vec!["peer-clock".into()],
+        link_capabilities: LinkCapabilities {
+            version: 1,
+            flags: 0,
+            profile: 0,
+            max_frame_bytes: 64,
+            compact_header_target_bytes: 40,
+            max_side_transport_templates: 8,
+        },
+    };
+    for use_relay in [false, true] {
+        sedsnet::memory_admission::set_probe(None);
+        let router = Router::new(RouterConfig::default());
+        let ri = router.add_side_packed("peer", |_| Ok(()));
+        let relay = Relay::new(Box::new(|| 0));
+        let li = relay.add_side_packed("peer", |_| Ok(()));
+        let pkt = build_discovery_address("ADDRESS_PEER", 1, &ad).unwrap();
+        if use_relay {
+            relay.rx_from_side(li, pkt.clone()).unwrap();
+            relay.process_rx_queue().unwrap();
+            relay.clear_queues();
+        } else {
+            router.rx_from_side(&pkt, ri).unwrap();
+            router.clear_queues();
+        }
+        let wire = sedsnet::wire_format::pack_packet(&pkt);
+        assert_eq!(wire[0] & 1, 0);
+        ALLOW.store(false, Ordering::Relaxed);
+        sedsnet::memory_admission::set_probe(Some(probe));
+        ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+        for _ in 0..32 {
+            if use_relay {
+                assert!(matches!(
+                    relay.rx_packed_from_side(li, &wire),
+                    Err(TelemetryError::Io("memory pressure"))
+                ));
+            } else {
+                router.rx_packed_queue_from_side(&wire, ri).unwrap();
+            }
+        }
+        let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+        assert_eq!(
+            allocations, 0,
+            "relay={use_relay}: repeated address summaries must stay borrowed"
+        );
+        let mut bad = wire.to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        let invalid = if use_relay {
+            relay.rx_packed_from_side(li, &bad)
+        } else {
+            router.rx_packed_queue_from_side(&bad, ri)
+        };
+        assert!(invalid.is_err());
+        sedsnet::memory_admission::set_probe(None);
+        let mut changed = ad.clone();
+        changed.reachable_endpoints.push(
+            register_endpoint_with_description(
+                if use_relay {
+                    "ADDRESS_CHANGED_RELAY"
+                } else {
+                    "ADDRESS_CHANGED_ROUTER"
+                },
+                "",
+                false,
+            )
+            .unwrap(),
+        );
+        let changed = sedsnet::wire_format::pack_packet(
+            &build_discovery_address("ADDRESS_PEER", 2, &changed).unwrap(),
+        );
+        sedsnet::memory_admission::set_probe(Some(probe));
+        let result = if use_relay {
+            relay.rx_packed_from_side(li, &changed)
+        } else {
+            router.rx_packed_queue_from_side(&changed, ri)
+        };
+        assert!(
+            matches!(result, Err(TelemetryError::Io("memory pressure"))),
+            "changed routing must retain normal admission"
+        );
+    }
+}
+
+#[test]
+fn transparent_relay_forwards_repeated_addresses_for_global_collision_arbitration() {
+    use sedsnet::discovery::{
+        ADDRESS_MODE_STATIC, ADDRESS_STATE_APPROVED, AddressAdvertisement, LinkCapabilities,
+        build_discovery_address,
+    };
+    use sedsnet::relay::Relay;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let tuning = sedsnet::config::runtime_tuning_config();
+    let mut plain = tuning;
+    plain.payload_compress_threshold = usize::MAX;
+    sedsnet::config::set_runtime_tuning_config(plain).unwrap();
+    let ad = AddressAdvertisement {
+        hostname: "TRANSPARENT_ADDRESS".into(),
+        address: 42,
+        requested_address: 42,
+        mode: ADDRESS_MODE_STATIC,
+        state: ADDRESS_STATE_APPROVED,
+        birth_ms: 1,
+        owner_hash: 77,
+        reachable_endpoints: vec![],
+        reachable_network_variables: vec![],
+        reachable_timesync_sources: vec![],
+        link_capabilities: LinkCapabilities {
+            version: 1,
+            flags: 0,
+            profile: 0,
+            max_frame_bytes: 0,
+            compact_header_target_bytes: 0,
+            max_side_transport_templates: 0,
+        },
+    };
+    let relay = Relay::new(Box::new(|| 0));
+    let src = relay.add_side_packed("in", |_| Ok(()));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let count = seen.clone();
+    relay.add_side_packed("out", move |wire| {
+        if sedsnet::wire_format::peek_frame_info(wire)?.envelope.ty
+            == sedsnet::config::DataType::DiscoveryAddress
+        {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    for timestamp in [1, 2] {
+        let wire = sedsnet::wire_format::pack_packet(
+            &build_discovery_address("TRANSPARENT_ADDRESS", timestamp, &ad).unwrap(),
+        );
+        relay.rx_packed_from_side(src, &wire).unwrap();
+        relay.process_all_queues().unwrap();
+    }
+    sedsnet::config::set_runtime_tuning_config(tuning).unwrap();
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        2,
+        "unchanged addresses must cross transparent relays too"
+    );
+}
+
+static FRAGMENT_WORK: AtomicUsize = AtomicUsize::new(0);
+static FRAGMENT_LARGEST: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn bounded_fragment_probe(additional: usize, largest: usize, _: u32) -> bool {
+    FRAGMENT_WORK.store(additional, Ordering::Relaxed);
+    FRAGMENT_LARGEST.store(largest, Ordering::Relaxed);
+    additional <= 1600 && largest <= 1024
+}
+
+#[test]
+fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
+    use sedsnet::relay::Relay;
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    for use_relay in [false, true] {
+        sedsnet::memory_admission::set_probe(None);
+        let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
+        let ri = router.add_side_packed("can", |_| Ok(()));
+        let relay = Relay::new(Box::new(|| 0));
+        let li = relay.add_side_packed("can", |_| Ok(()));
+        let mut fragment = b"SDT\x03".to_vec();
+        fragment.extend_from_slice(&12345u32.to_le_bytes());
+        fragment.extend_from_slice(&0u16.to_le_bytes());
+        fragment.extend_from_slice(&65u16.to_le_bytes());
+        fragment.extend_from_slice(&[7u8; 94]);
+        fragment.extend_from_slice(&[0u8; 4]);
+        for index in 0..64u16 {
+            // Alternating ends exercises out-of-order B-tree node splits.
+            let index = if index % 2 == 0 {
+                index / 2
+            } else {
+                63 - index / 2
+            };
+            fragment[8..10].copy_from_slice(&index.to_le_bytes());
+            let n = fragment.len();
+            let crc = crc32fast::hash(&fragment[..n - 4]);
+            fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+            LIVE_ALLOCATION_DELTA.with(|v| v.set(Some(0)));
+            PEAK_ALLOCATION_DELTA.with(|v| v.set(0));
+            MAX_ALLOCATION.with(|v| v.set(Some(0)));
+            let result = if use_relay {
+                relay.rx_packed_from_side(li, &fragment)
+            } else {
+                router.rx_packed_queue_from_side(&fragment, ri)
+            };
+            let peak = PEAK_ALLOCATION_DELTA.with(|v| v.get());
+            LIVE_ALLOCATION_DELTA.with(|v| v.set(None));
+            let largest = MAX_ALLOCATION.with(|v| v.replace(None).unwrap());
+            result.unwrap();
+            if index == 0 {
+                sedsnet::memory_admission::set_probe_v2(Some(bounded_fragment_probe));
+            } else {
+                assert!(
+                    peak <= FRAGMENT_WORK.load(Ordering::Relaxed) as isize,
+                    "relay={use_relay} index={index} peak={peak} largest={largest} shared={}",
+                    core::mem::size_of::<sedsnet::SharedBytes>()
+                );
+                assert!(
+                    largest <= FRAGMENT_LARGEST.load(Ordering::Relaxed),
+                    "relay={use_relay} index={index} largest={largest}"
+                );
+            }
+        }
+        // Exceeding the bounded tree requires the original full guard too.
+        fragment[8..10].copy_from_slice(&64u16.to_le_bytes());
+        let n = fragment.len();
+        let crc = crc32fast::hash(&fragment[..n - 4]);
+        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let result = if use_relay {
+            relay.rx_packed_from_side(li, &fragment)
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri)
+        };
+        assert!(matches!(result, Err(TelemetryError::Io("memory pressure"))));
+        // A new transfer still needs the full initial allocation guard.
+        fragment[4..8].copy_from_slice(&54321u32.to_le_bytes());
+        let n = fragment.len();
+        let crc = crc32fast::hash(&fragment[..n - 4]);
+        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let result = if use_relay {
+            relay.rx_packed_from_side(li, &fragment)
+        } else {
+            router.rx_packed_queue_from_side(&fragment, ri)
+        };
+        assert!(matches!(result, Err(TelemetryError::Io("memory pressure"))));
+    }
+}
+
+#[test]
+fn scheduling_metadata_queries_do_not_allocate_for_known_or_unknown_types() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let ep = register_endpoint_with_description("DELIVERY_META_SINK", "", false).unwrap();
+    let ty = register_data_type_with_description(
+        "DELIVERY_META_DATA",
+        "",
+        MessageElement::Static(1, MessageDataType::Float32, MessageClass::Data),
+        &[ep],
+        ReliableMode::Unordered,
+        123,
+    )
+    .unwrap();
+    let unknown = sedsnet::config::DataType(u32::MAX);
+    assert!(!sedsnet::config::data_type_exists(unknown));
+    ALLOCATION_COUNT.with(|v| v.set(Some(0)));
+    for _ in 0..64 {
+        assert!(sedsnet::is_reliable_type(ty));
+        assert_eq!(sedsnet::reliable_mode(ty), ReliableMode::Unordered);
+        assert_eq!(sedsnet::message_priority(ty), 123);
+        assert!(!sedsnet::is_reliable_type(unknown));
+        assert_eq!(sedsnet::reliable_mode(unknown), ReliableMode::None);
+        assert_eq!(sedsnet::message_priority(unknown), 0);
+    }
+    let allocations = ALLOCATION_COUNT.with(|v| v.replace(None).unwrap());
+    assert_eq!(allocations, 0);
+    for (mode, priority) in [
+        (sedsnet::ReliableMode::Unordered, 231),
+        (sedsnet::ReliableMode::Ordered, 241),
+        (sedsnet::ReliableMode::None, 0),
+    ] {
+        let mut definition = sedsnet::config::data_type_definition(ty).unwrap();
+        definition.reliable = mode;
+        definition.priority = priority;
+        sedsnet::config::merge_owned_schema_snapshot_with_budget(
+            sedsnet::config::OwnedRuntimeSchemaSnapshot {
+                endpoints: vec![],
+                types: vec![definition],
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        // Conflicting wire contracts use the deterministic merge winner.
+        // The fast accessors must reflect that current winner, never a cache.
+        let current = sedsnet::config::data_type_definition(ty).unwrap();
+        assert_eq!(sedsnet::reliable_mode(ty), current.reliable);
+        assert_eq!(
+            sedsnet::is_reliable_type(ty),
+            current.reliable != sedsnet::ReliableMode::None
+        );
+        assert_eq!(sedsnet::message_priority(ty), current.priority);
+        if mode == sedsnet::ReliableMode::Unordered && priority == 231 {
+            assert_eq!(current.priority, 231);
+        }
+    }
 }

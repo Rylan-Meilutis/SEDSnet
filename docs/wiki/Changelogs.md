@@ -4,6 +4,21 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.2.5 highlights
+
+Release candidate; linked firmware qualification is in progress.
+
+- Reduce repeated receive parsing, copies and metadata-query allocations;
+  accelerate short ULEB128 decoding on32-bit targets.
+- Admit warm embedded forwarding after optional codec-cache eviction and retain
+  canonical frames under pressure. Preserve CRC, cold-peer and route checks.
+- Bound bulk receive-priority bursts on routers and relays while keeping protected
+  control first and same-priority FIFO ordering.
+- Merge only changed schema definitions, borrow unchanged address summaries, and
+  reclaim bounded partial transfers without discarding learned routes.
+- Share queue scheduling code to fit constrained FC images; exercise the observed
+  pressure, stale-report and codec-cache failures in regression tests.
+
 ## Version 4.2.4 highlights
 
 - Keep C integration assertions and setup active in Release builds; reject disabled checks, register all five CTest programs, and exercise Release through the existing Rust test gate.

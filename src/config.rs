@@ -626,10 +626,7 @@ impl DataType {
                         .chain(EMBEDDED_SCHEMA_TYPES.iter())
                         .find(|def| {
                             def.name == name
-                                && type_visible_at(
-                                    def,
-                                    EMBEDDED_TYPE_HEAD.load(Ordering::Acquire),
-                                )
+                                && type_visible_at(def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire))
                         })
                         .copied()
                 })
@@ -1798,6 +1795,32 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
             description: Arc::from(""),
             link_local_only: false,
         })
+}
+
+/// Scheduling only needs two small fields. Do not clone hosted metadata or
+/// copy the entire embedded definition for every queue/reliability decision.
+/// Look up current runtime definitions on every call; no stale schema cache.
+pub(crate) fn message_delivery_meta(data_type: DataType) -> (ReliableMode, u8) {
+    #[cfg(feature = "std")]
+    {
+        #[cfg(test)]
+        seed_test_schema();
+        registry()
+            .lock()
+            .expect("schema registry poisoned")
+            .types
+            .iter()
+            .find(|(id, _)| *id == data_type)
+            .map(|(_, meta)| (meta.reliable, meta.priority))
+            .unwrap_or((ReliableMode::None, 0))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        embedded_overlay_type(data_type)
+            .or_else(|| compiled_type_definition(data_type))
+            .map(|def| (def.reliable, def.priority))
+            .unwrap_or((ReliableMode::None, 0))
+    }
 }
 
 #[cfg(feature = "std")]
@@ -3072,21 +3095,31 @@ fn embedded_type_allocation_cost(def: &OwnedDataTypeDefinition) -> usize {
         )
 }
 
+// Reserved definitions are dense by protocol identity. Keep this invariant
+// checked at compile time so normal application IDs never scan the control list.
+#[cfg(not(feature = "std"))]
+const _: () = {
+    let mut i = 0;
+    while i < EMBEDDED_BUILTIN_TYPES.len() {
+        assert!(EMBEDDED_BUILTIN_TYPES[i].id.0 == i as u32);
+        i += 1;
+    }
+};
+
 // Runtime and generated schemas use the same name-based wire identities.
 // A schema subset or reordered file cannot change another definition's ID.
 #[cfg(not(feature = "std"))]
 #[inline(never)]
 fn compiled_type_definition(id: DataType) -> Option<&'static DataTypeDefinition> {
     EMBEDDED_BUILTIN_TYPES
-        .iter()
-        .find(|def| def.id == id)
+        .get(id.0 as usize)
         .or_else(|| {
             EMBEDDED_SCHEMA_TYPES
                 .binary_search_by_key(&id.0, |def| def.id.0)
                 .ok()
                 .map(|index| &EMBEDDED_SCHEMA_TYPES[index])
         })
-        .filter(|def| type_visible_at(*def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
+        .filter(|def| type_visible_at(def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
 }
 #[cfg(not(feature = "std"))]
 #[inline(never)]

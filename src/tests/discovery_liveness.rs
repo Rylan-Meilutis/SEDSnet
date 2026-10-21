@@ -154,7 +154,7 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
         // Drain newly queued advertisements without running timeout/retry
         // maintenance: keep the original pending ACK outstanding throughout.
         loop {
-            let queued = Router::pop_transmit_queue_locked(&mut rf.state.lock(), rf.clock.now_ms());
+            let queued = Router::pop_transmit_queue_locked(&mut rf.state.lock(), rf.clock.now_ms(), false);
             let Some(queued) = queued else {
                 break;
             };

@@ -227,6 +227,23 @@ pub(crate) fn check_compact_reconstruction(len: usize, ack: bool) -> TelemetryRe
     }
 }
 
+/// Retaining a validated fragment allocates bytes and at most two B-tree
+/// nodes, not a decoder. Below 64 retained entries the fragment tree cannot
+/// have a full internal root (that requires at least 71 entries). Include
+/// both node splits, shared ownership and allocator slack. New assemblies,
+/// larger trees and legacy probes retain the general receive estimate.
+/// Assembly and canonical decode each perform their own later admission.
+pub(crate) fn check_retained_fragment(
+    bytes: &[u8],
+    retained: Option<usize>,
+) -> TelemetryResult<()> {
+    if supports_work_kinds() && bytes.len() <= 192 && retained.is_some_and(|count| count < 64) {
+        check(1280usize.saturating_add(bytes.len()), 1024)
+    } else {
+        check_receive(bytes)
+    }
+}
+
 pub(crate) fn check_frame(len: usize, ack: bool) -> TelemetryResult<()> {
     check_frame_kind(len, ack, WORK_GENERAL)
 }

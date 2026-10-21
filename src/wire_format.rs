@@ -1626,7 +1626,10 @@ pub(crate) fn scheduling_type(buf: &[u8]) -> Option<DataType> {
     let mut reader = ByteReader::new(buf.get(..buf.len().min(12))?);
     reader.read_bytes(2).ok()?;
     let id = data_type_id_from_wire(read_uleb128(&mut reader).ok()?).ok()?;
-    DataType::try_from_u32(id)
+    // Scheduling reads identity, not registry membership. Dynamic/frozen wire
+    // contracts may precede their schema, and authoritative parsing follows.
+    // Avoid a redundant schema lookup for every retained queue item.
+    Some(DataType(id))
 }
 
 pub(crate) fn peek_routing_envelope(buf: &[u8]) -> TelemetryResult<RoutingEnvelope<'_>> {
@@ -2274,6 +2277,10 @@ mod endpoint_decode_tests {
         assert_eq!(scheduling_type(&[0, 0, 0x80]), None);
         assert_eq!(scheduling_type(&[0xff; 1024]), None);
         assert_eq!(scheduling_type(&[]), None);
+        let unknown_prefix = [0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(scheduling_type(&unknown_prefix), Some(DataType(u32::MAX)));
+        assert!(peek_routing_envelope(&unknown_prefix).is_err());
+        assert!(unpack_packet(&unknown_prefix).is_err());
     }
 
     #[test]

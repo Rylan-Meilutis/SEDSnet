@@ -3,7 +3,8 @@ use crate::{TelemetryError, TelemetryResult};
 
 // Cortex-M does not have a variable 64-bit shift instruction. Keep the two
 // halves separate until the final constant-width join.
-#[inline]
+#[cfg_attr(target_pointer_width = "32", inline(always))]
+#[cfg_attr(not(target_pointer_width = "32"), inline)]
 pub(crate) fn read_u64(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
     #[cfg(target_pointer_width = "32")]
     {
@@ -32,8 +33,23 @@ pub(crate) fn read_u64(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
 }
 
 #[cfg(any(test, target_pointer_width = "32"))]
-#[inline(never)]
+#[inline(always)]
 fn read_u64_32(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
+    // Sizes, endpoint IDs and short timestamp fields commonly fit one byte.
+    // Keep their success path in the caller: a non-inlined Result<u64> on ARM
+    // otherwise copies the large error union even for this trivial success.
+    if let Some(&byte) = buf.get(*off)
+        && byte < 0x80
+    {
+        *off += 1;
+        return Ok(u64::from(byte));
+    }
+    read_u64_32_slow(buf, off)
+}
+
+#[cfg(any(test, target_pointer_width = "32"))]
+#[inline(never)]
+fn read_u64_32_slow(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
     let (mut low, mut high) = (0u32, 0u32);
     for index in 0..10u32 {
         let Some(&byte) = buf.get(*off) else {

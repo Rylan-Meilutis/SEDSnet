@@ -496,7 +496,10 @@ pub fn decode_discovery_link_capabilities(pkt: &Packet) -> TelemetryResult<LinkC
     if pkt.data_type() != DataType::DiscoveryLinkCapabilities {
         return Err(TelemetryError::InvalidType);
     }
-    let payload = pkt.payload();
+    decode_link_capabilities_payload(pkt.payload())
+}
+
+fn decode_link_capabilities_payload(payload: &[u8]) -> TelemetryResult<LinkCapabilities> {
     if payload.len() != 18 {
         return Err(TelemetryError::Unpack("discovery link capabilities width"));
     }
@@ -578,11 +581,67 @@ pub fn build_discovery_address(
     )
 }
 
-pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertisement> {
-    if pkt.data_type() != DataType::DiscoveryAddress {
-        return Err(TelemetryError::InvalidType);
+/// Borrowed, fully validated address summary. No persistent cache is added.
+pub(crate) struct AddressView<'a> {
+    pub hostname: &'a str,
+    pub address: u32,
+    pub requested_address: u32,
+    pub mode: u8,
+    pub state: u8,
+    pub birth_ms: u64,
+    pub owner_hash: u64,
+    reachable_endpoints: &'a [u8],
+    reachable_network_variables: &'a [u8],
+    reachable_timesync_sources: &'a [u8],
+    pub link_capabilities: LinkCapabilities,
+}
+impl AddressView<'_> {
+    pub fn endpoints(&self) -> impl Iterator<Item = DataEndpoint> + '_ {
+        self.reachable_endpoints
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| DataEndpoint(u32::from_le_bytes(*b)))
+            .filter(|ep| !is_discovery_endpoint(*ep))
     }
-    let payload = pkt.payload();
+    pub fn variables(&self) -> impl Iterator<Item = DataType> + '_ {
+        self.reachable_network_variables
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| DataType(u32::from_le_bytes(*b)))
+            .filter(|ty| !is_discovery_type(*ty))
+    }
+    pub fn sources(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut cursor = 0usize;
+        core::iter::from_fn(move || {
+            if cursor == self.reachable_timesync_sources.len() {
+                return None;
+            }
+            borrowed_schema_string(
+                self.reachable_timesync_sources,
+                &mut cursor,
+                "discovery address source",
+            )
+            .ok()
+        })
+        .filter(|s| !s.is_empty())
+    }
+}
+fn borrowed_u32s<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+    label: &'static str,
+) -> TelemetryResult<&'a [u8]> {
+    if count > payload.len().saturating_sub(*cursor) / 4 {
+        return Err(TelemetryError::Unpack(label));
+    }
+    let start = *cursor;
+    *cursor += count * 4;
+    Ok(&payload[start..*cursor])
+}
+pub(crate) fn decode_address_view(payload: &[u8]) -> TelemetryResult<AddressView<'_>> {
     let mut cursor = 0usize;
     let version = read_u8(payload, &mut cursor, "discovery address version")?;
     if version != 1 && version != 2 {
@@ -610,86 +669,46 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
             .expect("8-byte owner"),
     );
     cursor += 8;
-    let hostname = decode_string(payload, &mut cursor, "discovery address hostname")?;
+    let hostname = borrowed_schema_string(payload, &mut cursor, "discovery address hostname")?;
     let endpoint_count =
         read_u32(payload, &mut cursor, "discovery address endpoint count")? as usize;
-    let mut reachable_endpoints = bounded_wire_vec(
+    let reachable_endpoints = borrowed_u32s(
         payload,
-        cursor,
+        &mut cursor,
         endpoint_count,
-        4,
         "discovery address endpoint count",
     )?;
-    for _ in 0..endpoint_count {
-        let raw = read_u32(payload, &mut cursor, "discovery address endpoint")?;
-        let ep = DataEndpoint(raw);
-        if !is_discovery_endpoint(ep) {
-            reachable_endpoints.push(ep);
-        }
-    }
-    crate::small_sort::sort(&mut reachable_endpoints);
-    reachable_endpoints.dedup();
-    let mut reachable_network_variables = Vec::new();
-    if version >= 2 {
+    let reachable_network_variables = if version >= 2 {
         let count = read_u32(
             payload,
             &mut cursor,
             "discovery address network variable count",
         )? as usize;
-        reachable_network_variables = bounded_wire_vec(
+        borrowed_u32s(
             payload,
-            cursor,
+            &mut cursor,
             count,
-            4,
             "discovery address network variable count",
-        )?;
-        for _ in 0..count {
-            let raw = read_u32(payload, &mut cursor, "discovery address network variable")?;
-            /* A relay may hear the address advertisement before the matching
-             * runtime-schema fragment. Preserve the stable wire id so the
-             * route is usable immediately and the later schema merge can add
-             * its name/shape without requiring a blank-slate rediscovery. */
-            let ty = DataType(raw);
-            if !is_discovery_type(ty) {
-                reachable_network_variables.push(ty);
-            }
-        }
-        crate::small_sort::sort(&mut reachable_network_variables);
-        reachable_network_variables.dedup();
+        )?
+    } else {
+        &[]
+    };
+    let count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
+    if count > payload.len().saturating_sub(cursor) / 4 {
+        return Err(TelemetryError::Unpack("discovery address source count"));
     }
-    let source_count = read_u32(payload, &mut cursor, "discovery address source count")? as usize;
-    let mut reachable_timesync_sources = bounded_wire_vec(
-        payload,
-        cursor,
-        source_count,
-        4,
-        "discovery address source count",
-    )?;
-    for _ in 0..source_count {
-        let source = decode_string(payload, &mut cursor, "discovery address source")?;
-        if !source.is_empty() {
-            reachable_timesync_sources.push(source);
-        }
+    let source_start = cursor;
+    for _ in 0..count {
+        borrowed_schema_string(payload, &mut cursor, "discovery address source")?;
     }
-    sort_dedup_strings(&mut reachable_timesync_sources);
-    let version = read_u8(payload, &mut cursor, "discovery address link version")?;
-    let flags = read_u32(payload, &mut cursor, "discovery address link flags")?;
-    let profile = read_u8(payload, &mut cursor, "discovery address link profile")?;
-    let max_frame_bytes = read_u32(payload, &mut cursor, "discovery address link max frame")?;
-    let compact_header_target_bytes = read_u32(
-        payload,
-        &mut cursor,
-        "discovery address link compact target",
-    )?;
-    let max_side_transport_templates =
-        read_u32(payload, &mut cursor, "discovery address link templates")?;
-    if cursor != payload.len() {
-        return Err(TelemetryError::Unpack("discovery address trailing bytes"));
-    }
+    let reachable_timesync_sources = &payload[source_start..cursor];
+    // Both wire messages carry the same fixed18-byte link contract. Share
+    // its decoder instead of keeping a second field parser and error table.
+    let link_capabilities = decode_link_capabilities_payload(&payload[cursor..])?;
     if hostname.is_empty() || address == 0 {
         return Err(TelemetryError::Unpack("bad discovery address"));
     }
-    Ok(AddressAdvertisement {
+    Ok(AddressView {
         hostname,
         address,
         requested_address,
@@ -700,14 +719,56 @@ pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertis
         reachable_endpoints,
         reachable_network_variables,
         reachable_timesync_sources,
-        link_capabilities: LinkCapabilities {
-            version,
-            flags,
-            profile,
-            max_frame_bytes,
-            compact_header_target_bytes,
-            max_side_transport_templates,
-        },
+        link_capabilities,
+    })
+}
+
+pub fn decode_discovery_address(pkt: &Packet) -> TelemetryResult<AddressAdvertisement> {
+    if pkt.data_type() != DataType::DiscoveryAddress {
+        return Err(TelemetryError::InvalidType);
+    }
+    let ad = decode_address_view(pkt.payload())?;
+    let mut reachable_endpoints = bounded_wire_vec(
+        ad.reachable_endpoints,
+        0,
+        ad.reachable_endpoints.len() / 4,
+        4,
+        "discovery address endpoint count",
+    )?;
+    reachable_endpoints.extend(ad.endpoints());
+    crate::small_sort::sort(&mut reachable_endpoints);
+    reachable_endpoints.dedup();
+    let mut reachable_network_variables = bounded_wire_vec(
+        ad.reachable_network_variables,
+        0,
+        ad.reachable_network_variables.len() / 4,
+        4,
+        "discovery address network variable count",
+    )?;
+    reachable_network_variables.extend(ad.variables());
+    crate::small_sort::sort(&mut reachable_network_variables);
+    reachable_network_variables.dedup();
+    let mut reachable_timesync_sources = bounded_wire_vec(
+        ad.reachable_timesync_sources,
+        0,
+        ad.sources().count(),
+        4,
+        "discovery address source count",
+    )?;
+    reachable_timesync_sources.extend(ad.sources().map(ToString::to_string));
+    sort_dedup_strings(&mut reachable_timesync_sources);
+    Ok(AddressAdvertisement {
+        hostname: ad.hostname.into(),
+        address: ad.address,
+        requested_address: ad.requested_address,
+        mode: ad.mode,
+        state: ad.state,
+        birth_ms: ad.birth_ms,
+        owner_hash: ad.owner_hash,
+        reachable_endpoints,
+        reachable_network_variables,
+        reachable_timesync_sources,
+        link_capabilities: ad.link_capabilities,
     })
 }
 
@@ -1539,7 +1600,6 @@ fn skip_string(payload: &[u8], cursor: &mut usize, label: &'static str) -> Telem
     Ok(())
 }
 
-#[cfg(any(not(feature = "std"), test))]
 fn borrowed_schema_string<'a>(
     payload: &'a [u8],
     cursor: &mut usize,
@@ -1561,10 +1621,17 @@ fn borrowed_schema_string<'a>(
 /// snapshots equivalent to compiled/previously learned definitions do not create a
 /// large transient heap burst merely to discard every decoded definition.
 #[cfg(any(not(feature = "std"), test))]
-pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> TelemetryResult<bool> {
+fn scan_schema_changes(
+    payload: &[u8],
+    retain: bool,
+) -> TelemetryResult<(bool, OwnedRuntimeSchemaSnapshot)> {
+    let mut changed = OwnedRuntimeSchemaSnapshot {
+        endpoints: Vec::new(),
+        types: Vec::new(),
+    };
     let mut cursor = 0usize;
     if read_u32(payload, &mut cursor, "discovery schema version")? != 3 {
-        return Ok(false);
+        return Err(TelemetryError::Unpack("discovery schema version"));
     }
 
     let endpoint_count =
@@ -1584,7 +1651,7 @@ pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> Telemet
         let link_local_only =
             read_u8(payload, &mut cursor, "discovery schema endpoint flags")? != 0;
         let name = borrowed_schema_string(payload, &mut cursor, "discovery schema endpoint name")?;
-        all_known &= known
+        let equivalent = known
             && AsRef::<str>::as_ref(&meta.name) == name
             && (!link_local_only || meta.link_local_only);
         skip_string(
@@ -1592,6 +1659,26 @@ pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> Telemet
             &mut cursor,
             "discovery schema endpoint description",
         )?;
+        all_known &= equivalent;
+        if retain && !equivalent {
+            let bytes = name
+                .len()
+                .saturating_add(core::mem::size_of::<OwnedEndpointDefinition>());
+            crate::memory_admission::check(
+                bytes.saturating_mul(3).saturating_add(1024),
+                bytes.saturating_add(128),
+            )?;
+            changed
+                .endpoints
+                .try_reserve_exact(1)
+                .map_err(|_| TelemetryError::Io("memory pressure"))?;
+            changed.endpoints.push(OwnedEndpointDefinition {
+                id,
+                name: name.into(),
+                description: String::new(),
+                link_local_only,
+            });
+        }
     }
 
     let type_count = read_u32(payload, &mut cursor, "discovery schema type count")? as usize;
@@ -1639,28 +1726,78 @@ pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> Telemet
         } else {
             MessageElement::Dynamic(data_type, class)
         };
-        all_known &= meta.as_ref().is_some_and(|meta| {
+        let mut equivalent = meta.as_ref().is_some_and(|meta| {
             AsRef::<str>::as_ref(&meta.name) == name
                 && meta.element == element
                 && meta.reliable == reliable
                 && meta.priority >= priority
                 && meta.e2e_encryption == encryption
         });
+        let endpoints_start = cursor;
         for _ in 0..endpoint_count {
             let ep = DataEndpoint(read_u32(
                 payload,
                 &mut cursor,
                 "discovery schema type endpoint",
             )?);
-            all_known &= meta
+            equivalent &= meta
                 .as_ref()
                 .is_some_and(|meta| meta.endpoints.contains(&ep));
+        }
+        all_known &= equivalent;
+        if retain && !equivalent {
+            let bytes = name
+                .len()
+                .saturating_add(endpoint_count.saturating_mul(4))
+                .saturating_add(core::mem::size_of::<OwnedDataTypeDefinition>());
+            // Decode only this changed definition; known entries stay borrowed.
+            // Include merge scratch, rather than charging the entire snapshot.
+            crate::memory_admission::check(
+                bytes.saturating_mul(3).saturating_add(1024),
+                bytes.saturating_add(128),
+            )?;
+            changed
+                .types
+                .try_reserve_exact(1)
+                .map_err(|_| TelemetryError::Io("memory pressure"))?;
+            let mut endpoints = bounded_wire_vec(
+                payload,
+                endpoints_start,
+                endpoint_count,
+                4,
+                "discovery schema type endpoint count",
+            )?;
+            for bytes in payload[endpoints_start..cursor].as_chunks::<4>().0 {
+                endpoints.push(DataEndpoint(u32::from_le_bytes(*bytes)));
+            }
+            changed.types.push(OwnedDataTypeDefinition {
+                id,
+                name: name.into(),
+                description: String::new(),
+                element,
+                endpoints,
+                reliable,
+                priority,
+                e2e_encryption: encryption,
+            });
         }
     }
     if cursor != payload.len() {
         return Err(TelemetryError::Unpack("discovery schema trailing bytes"));
     }
-    Ok(all_known)
+    Ok((all_known, changed))
+}
+
+#[cfg(test)]
+pub(crate) fn discovery_schema_payload_is_fully_known(payload: &[u8]) -> TelemetryResult<bool> {
+    scan_schema_changes(payload, false).map(|(known, _)| known)
+}
+
+/// Only materialize routing definitions that differ from the current registry.
+/// The full payload is validated before the caller atomically merges the delta.
+#[cfg(any(not(feature = "std"), test))]
+pub(crate) fn decode_schema_changes(payload: &[u8]) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
+    scan_schema_changes(payload, true).map(|(_, changed)| changed)
 }
 
 /// Builds a discovery packet containing the complete runtime schema snapshot.
@@ -2053,6 +2190,110 @@ mod bounded_decode_tests {
         discovery_schema_payload_is_fully_known,
     };
     use crate::{DataEndpoint, DataType};
+
+    #[test]
+    fn schema_delta_owns_only_changed_definitions_and_validates_the_whole_payload() {
+        let original = crate::config::export_schema();
+        let mut updated = original.clone();
+        let id = updated.types[0].id;
+        updated.types[0].priority = 255;
+        updated.types[0].endpoints.push(DataEndpoint(u32::MAX - 11));
+        let packet = super::build_discovery_schema_from_owned_snapshot("rf", 1, updated).unwrap();
+        let delta = super::decode_schema_changes(packet.payload()).unwrap();
+        assert!(delta.endpoints.is_empty());
+        assert_eq!(delta.types.len(), 1);
+        assert_eq!(delta.types[0].id, id);
+        assert_eq!(delta.types[0].priority, 255);
+        assert!(
+            delta.types[0]
+                .endpoints
+                .contains(&DataEndpoint(u32::MAX - 11))
+        );
+        let mut malformed = packet.payload().to_vec();
+        malformed.push(0);
+        assert!(super::decode_schema_changes(&malformed).is_err());
+        let unchanged =
+            super::build_discovery_schema_from_owned_snapshot("rf", 1, original).unwrap();
+        let delta = super::decode_schema_changes(unchanged.payload()).unwrap();
+        assert!(delta.types.is_empty() && delta.endpoints.is_empty());
+    }
+
+    #[test]
+    fn schema_delta_retains_unknown_endpoints_and_runtime_types() {
+        let mut updated = crate::config::export_schema();
+        let mut endpoint = updated.endpoints[0].clone();
+        endpoint.id = DataEndpoint(u32::MAX - 13);
+        endpoint.name = "runtime_delta_endpoint".into();
+        updated.endpoints.push(endpoint.clone());
+        let mut ty = updated.types[0].clone();
+        ty.id = DataType(u32::MAX - 13);
+        ty.name = "runtime_delta_type".into();
+        ty.endpoints = vec![endpoint.id];
+        updated.types.push(ty.clone());
+        let packet = super::build_discovery_schema_from_owned_snapshot("rf", 1, updated).unwrap();
+        let delta = super::decode_schema_changes(packet.payload()).unwrap();
+        assert_eq!(delta.types.len(), 1);
+        assert_eq!(delta.endpoints.len(), 1);
+        assert_eq!(delta.types[0].id, ty.id);
+        assert_eq!(delta.types[0].endpoints, ty.endpoints);
+        assert_eq!(delta.endpoints[0].id, endpoint.id);
+    }
+
+    #[test]
+    fn borrowed_address_requires_complete_counts_strings_and_link_contract() {
+        let advertisement = AddressAdvertisement {
+            hostname: "borrowed-peer".into(),
+            address: 42,
+            requested_address: 42,
+            mode: ADDRESS_MODE_STATIC,
+            state: ADDRESS_STATE_APPROVED,
+            birth_ms: 123,
+            owner_hash: 456,
+            reachable_endpoints: vec![DataEndpoint(4001)],
+            reachable_network_variables: vec![DataType(4002)],
+            reachable_timesync_sources: vec!["peer-clock".into()],
+            link_capabilities: LinkCapabilities {
+                version: 1,
+                flags: 3,
+                profile: 2,
+                max_frame_bytes: 64,
+                compact_header_target_bytes: 40,
+                max_side_transport_templates: 8,
+            },
+        };
+        let pkt = build_discovery_address("borrowed-peer", 1, &advertisement).unwrap();
+        let view = super::decode_address_view(pkt.payload()).unwrap();
+        assert_eq!(view.hostname, advertisement.hostname);
+        assert_eq!(view.birth_ms, 123);
+        assert_eq!(view.owner_hash, 456);
+        assert_eq!(view.link_capabilities, advertisement.link_capabilities);
+        assert_eq!(
+            view.endpoints().collect::<Vec<_>>(),
+            advertisement.reachable_endpoints
+        );
+        assert_eq!(
+            view.variables().collect::<Vec<_>>(),
+            advertisement.reachable_network_variables
+        );
+        assert_eq!(view.sources().collect::<Vec<_>>(), vec!["peer-clock"]);
+        assert_eq!(decode_discovery_address(&pkt).unwrap(), advertisement);
+        for end in 0..pkt.payload().len() {
+            assert!(
+                super::decode_address_view(&pkt.payload()[..end]).is_err(),
+                "truncation {end}"
+            );
+        }
+        let mut trailing = pkt.payload().to_vec();
+        trailing.push(0);
+        assert!(super::decode_address_view(&trailing).is_err());
+        let mut bad_count = pkt.payload().to_vec();
+        let offset = 27 + 4 + advertisement.hostname.len();
+        bad_count[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(super::decode_address_view(&bad_count).is_err());
+        let mut invalid_utf8 = pkt.payload().to_vec();
+        invalid_utf8[31] = 255;
+        assert!(super::decode_address_view(&invalid_utf8).is_err());
+    }
 
     #[test]
     fn equivalent_schema_definitions_are_detected_without_owned_decode() {

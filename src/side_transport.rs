@@ -764,7 +764,10 @@ mod streamed_chunk_tests {
 pub(crate) struct SideChunkAssembly {
     pub(crate) last_seen_ms: u64,
     pub(crate) total: u16,
-    pub(crate) received: BTreeMap<u16, crate::SharedBytes>,
+    // Fragments remain pinned until assembly. An arena-aware payload enum here
+    // cannot compact those bytes and multiplies every B-tree node's size.
+    // Keep the transient shared slice; completed frames still use the store.
+    pub(crate) received: BTreeMap<u16, Arc<[u8]>>,
     pub(crate) payload_bytes: u16,
 }
 
@@ -791,11 +794,7 @@ impl SideChunkAssembly {
         };
         payload.saturating_add(self.received.len().saturating_mul(64))
     }
-    pub(crate) fn insert_with(
-        &mut self,
-        index: u16,
-        make: impl FnOnce() -> crate::SharedBytes,
-    ) -> usize {
+    pub(crate) fn insert_with(&mut self, index: u16, make: impl FnOnce() -> Arc<[u8]>) -> usize {
         if let alloc::collections::btree_map::Entry::Vacant(slot) = self.received.entry(index) {
             let bytes = make();
             let cost = bytes.len().saturating_add(64);
@@ -810,7 +809,7 @@ impl SideChunkAssembly {
     }
     #[cfg(test)]
     pub(crate) fn insert(&mut self, index: u16, bytes: crate::SharedBytes) {
-        self.insert_with(index, || bytes);
+        self.insert_with(index, || crate::shared_bytes::convert(bytes));
     }
     #[inline(never)]
     pub(crate) fn remove(
@@ -877,17 +876,40 @@ impl SideChunkAssembly {
             n.checked_add(chunk.len())
                 .ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
         })?;
-        // Repeated extend growth can double a ~3.6 KiB discovery packet to
-        // 7 KiB while retaining the old buffer and every received fragment.
-        // Reserve once, report exhaustion instead of panicking, and consume
-        // fragments as we copy. Decoding accepts the Vec directly: no extra Arc.
-        crate::memory_admission::check(len.saturating_add(512), len.saturating_add(32))?;
+        // Prefer one allocation when the full scratch fits. Under pressure,
+        // retaining all fragments while reserving a second full frame can
+        // prevent a bounded schema from ever completing. Grow in at most eight
+        // exact steps instead, releasing consumed fragment storage as we copy.
+        // Each allocation still passes the original headroom/contiguous guard;
+        // no extra reserve or decoder permission is granted by this fallback.
+        let eager =
+            match crate::memory_admission::check(len.saturating_add(512), len.saturating_add(32)) {
+                Ok(()) => true,
+                Err(TelemetryError::Io("memory pressure")) => false,
+                Err(error) => return Err(error),
+            };
+        let step = len.div_ceil(8).max(128);
         let mut out = Vec::new();
-        out.try_reserve_exact(len)
-            .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
+        if eager {
+            out.try_reserve_exact(len)
+                .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
+        }
         for (expected, (index, chunk)) in self.received.into_iter().enumerate() {
             if usize::from(index) != expected {
                 return Err(TelemetryError::Unpack("side chunk gap"));
+            }
+            let end = out.len().saturating_add(chunk.len());
+            if end > out.capacity() {
+                let target = end.div_ceil(step).saturating_mul(step).min(len);
+                crate::memory_admission::check(
+                    // Only an exact Vec buffer is allocated here: fragment
+                    // metadata is being consumed, not rebuilt. Include bounded
+                    // allocator/header slack without charging decoder scratch.
+                    target.saturating_add(128).max(1024),
+                    target.saturating_add(32),
+                )?;
+                out.try_reserve_exact(target - out.len())
+                    .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
             }
             out.extend_from_slice(&chunk);
         }
