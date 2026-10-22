@@ -3086,7 +3086,7 @@ fn compiled_type_definition(id: DataType) -> Option<&'static DataTypeDefinition>
                 .ok()
                 .map(|index| &EMBEDDED_SCHEMA_TYPES[index])
         })
-        .filter(|def| type_visible_at(*def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
+        .filter(|def| type_visible_at(def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
 }
 #[cfg(not(feature = "std"))]
 #[inline(never)]
