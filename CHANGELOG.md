@@ -11,6 +11,9 @@ Development source; package publication and long-duration simulator qualificatio
   template and reliable replay maps on B-trees; desktop production is unchanged.
 - Preserve ordered iteration, borrowed lookup and entry semantics, and release
   empty index allocations. Add randomized equivalence and ownership regressions.
+- Send discovery/bootstrap control packets without optional compression so
+  codec-free peers can still merge runtime schemas. Match encoded-size accounting
+  to this policy; ordinary payload compression is unchanged.
 - Validate the current full-feature FC Release/TLSF/compact factory image at
   449,820 of 474,624 application FLASH bytes (94.774%).
 

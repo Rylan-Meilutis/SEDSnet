@@ -929,6 +929,16 @@ pub fn pack_reliable_ack(sender: &str, ty: DataType, timestamp_ms: u64, ack: u32
     Arc::<[u8]>::from(out)
 }
 
+// Discovery must bootstrap across peers before optional codec support is known.
+// A host with compression enabled must still seed an empty no-compression MCU.
+fn payload_for_wire(pkt: &Packet) -> (bool, alloc::borrow::Cow<'_, [u8]>) {
+    #[cfg(feature = "discovery")]
+    if crate::discovery::is_discovery_type(pkt.data_type()) {
+        return (false, alloc::borrow::Cow::Borrowed(pkt.payload()));
+    }
+    payload_compression::compress_if_beneficial(pkt.payload())
+}
+
 fn pack_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]> {
     pack_packet_inner_with_contract(
         pkt,
@@ -1068,8 +1078,7 @@ fn with_packet_frame_parts<T>(
     let source_address = source_address_for_sender(pkt.sender());
 
     // Decide whether to compress the payload.
-    let payload = pkt.payload();
-    let (payload_compressed, payload_wire) = payload_compression::compress_if_beneficial(payload);
+    let (payload_compressed, payload_wire) = payload_for_wire(pkt);
 
     // Size the variable-length prefix exactly. A 16-byte estimate can be
     // too small for real timestamps/nonces, doubling a multi-KiB schema
@@ -2049,7 +2058,7 @@ pub fn packet_wire_size(pkt: &Packet) -> usize {
     } else {
         0
     };
-    let (_, payload_wire) = payload_compression::compress_if_beneficial(pkt.payload());
+    let (_, payload_wire) = payload_for_wire(pkt);
     let reliable_len = if is_reliable_type(pkt.data_type()) {
         let header = ReliableHeader {
             flags: RELIABLE_FLAG_UNSEQUENCED,
@@ -2499,5 +2508,45 @@ mod endpoint_decode_tests {
             bitmap[id as usize / 8] = 1 << (id % 8);
             assert!(expand_endpoint_bitmap(&bitmap).is_err());
         }
+    }
+}
+
+#[cfg(all(test, feature = "discovery", feature = "compression"))]
+mod bootstrap_compression_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_payloads_remain_decodable_without_optional_compression() {
+        let payload: Arc<[u8]> = Arc::from(alloc::vec![b'A'; 4096]);
+        assert!(payload_compression::compress_if_beneficial(&payload).0);
+        for ty in [
+            DataType::DiscoverySchema,
+            DataType::DiscoveryTopology,
+            DataType::ManagedVariableValue,
+        ] {
+            let packet =
+                Packet::new(ty, &[DataEndpoint::Discovery], "HOST", 123, payload.clone()).unwrap();
+            let wire = pack_packet(&packet);
+            assert_eq!(wire[0] & FLAG_COMPRESSED_PAYLOAD, 0, "{ty:?}");
+            assert_eq!(packet_wire_size(&packet), wire.len());
+            assert_eq!(unpack_packet(&wire).unwrap().payload(), payload.as_ref());
+        }
+    }
+
+    #[test]
+    fn ordinary_data_keeps_optional_payload_compression() {
+        let payload: Arc<[u8]> = Arc::from(alloc::vec![b'A'; 4096]);
+        let packet = Packet::new(
+            DataType::TelemetryError,
+            &[DataEndpoint::TelemetryError],
+            "HOST",
+            123,
+            payload.clone(),
+        )
+        .unwrap();
+        let wire = pack_packet(&packet);
+        assert_ne!(wire[0] & FLAG_COMPRESSED_PAYLOAD, 0);
+        assert_eq!(packet_wire_size(&packet), wire.len());
+        assert_eq!(unpack_packet(&wire).unwrap().payload(), payload.as_ref());
     }
 }

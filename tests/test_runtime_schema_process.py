@@ -37,6 +37,10 @@ class RuntimeSchemaProcessTests(unittest.TestCase):
             embedded_environment = environment.copy()
             embedded_environment["SEDSNET_EMBEDDED_SCHEMA_PATH"] = str(Path(scratch) / "no-schema.json")
             embedded = build(["--no-default-features", "--features", "embedded"], embedded_environment)
+            # Production MCU recipes omit optional compression/crypto. Exercise
+            # that wire capability independently from the bundled feature group.
+            minimal = build(["--no-default-features", "--features",
+                "discovery,timesync,serde,serde_json"], embedded_environment)
             selected_seed = Path(scratch) / "selected-seed.json"
             selected_seed.write_text(json.dumps({
                 "endpoints": [{"rust": "SelectedSeed", "name": "BUNDLED_PROCESS_SEED"}],
@@ -45,10 +49,13 @@ class RuntimeSchemaProcessTests(unittest.TestCase):
             combined_environment["SEDSNET_EMBEDDED_SCHEMA_PATH"] = str(selected_seed)
             combined = build(["--features", "embedded"], combined_environment)
             for producer_a, producer_b in [(hosted, embedded), (embedded, hosted),
-                                           (combined, embedded), (embedded, combined)]:
+                                           (combined, embedded), (embedded, combined),
+                                           (hosted, minimal), (minimal, hosted),
+                                           (combined, minimal), (minimal, combined)]:
                 with tempfile.TemporaryDirectory() as directory:
                     for executable, role in [(producer_a, "a"), (producer_b, "b"),
-                        (hosted, "receive"), (embedded, "receive"), (combined, "receive")]:
+                        (hosted, "receive"), (embedded, "receive"), (combined, "receive"),
+                        (minimal, "receive")]:
                         child_environment = environment.copy()
                         child_environment.update(SEDSNET_PROCESS_SCHEMA_DIR=directory,
                             SEDSNET_PROCESS_SCHEMA_ROLE=role)
