@@ -210,10 +210,18 @@ use crate::{
     reliable_mode, wire_format,
 };
 use alloc::string::{String, ToString};
+
+#[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
+use crate::small_map::SmallMap as RouterMap;
+#[cfg(not(any(test, all(feature = "embedded", not(feature = "std")))))]
+use alloc::collections::BTreeMap as RouterMap;
+
+use alloc::collections::BTreeMap;
+
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeSet, VecDeque},
     format,
     sync::Arc,
     vec,
@@ -424,13 +432,13 @@ struct SideTransportState {
     #[cfg(feature = "std")]
     tx_callback_gate: Arc<ReentryGate>,
     tx_chunk_progress: Option<Box<crate::side_transport::SideTxProgress>>,
-    tx_template_ids: BTreeMap<u64, u32>,
+    tx_template_ids: RouterMap<u64, u32>,
     tx_templates: BTreeMap<u64, SideHeaderTemplate>,
-    tx_last_timestamps: BTreeMap<u32, u64>,
-    tx_compact_uses: BTreeMap<u32, u8>,
-    rx_templates: BTreeMap<u64, u32>,
+    tx_last_timestamps: RouterMap<u32, u64>,
+    tx_compact_uses: RouterMap<u32, u8>,
+    rx_templates: RouterMap<u64, u32>,
     rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
-    rx_last_timestamps: BTreeMap<u32, u64>,
+    rx_last_timestamps: RouterMap<u32, u64>,
     rx_chunks: BTreeMap<u32, SideChunkAssembly>,
     rx_chunk_reclaims: u32,
     rx_chunk_bytes: usize,
@@ -780,7 +788,7 @@ struct EndToEndReliableSent {
 #[derive(Debug, Clone)]
 struct ReliableRxState {
     expected_seq: u32,
-    buffered: BTreeMap<u32, crate::SharedBytes>,
+    buffered: RouterMap<u32, crate::SharedBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -2091,17 +2099,17 @@ fn fallback_stdout(_msg: &str) {
 struct RouterInner {
     memory: RuntimeMemoryConfig,
     sides: Vec<Option<RouterSide>>,
-    route_overrides: BTreeMap<(Option<RouterSideId>, RouterSideId), bool>,
-    typed_route_overrides: BTreeMap<(Option<RouterSideId>, u32, RouterSideId), bool>,
-    route_weights: BTreeMap<(Option<RouterSideId>, RouterSideId), u32>,
-    route_priorities: BTreeMap<(Option<RouterSideId>, RouterSideId), u32>,
-    source_route_modes: BTreeMap<Option<RouterSideId>, RouteSelectionMode>,
-    route_selection_cursors: BTreeMap<Option<RouterSideId>, u64>,
-    adaptive_route_stats: BTreeMap<RouterSideId, AdaptiveRouteStats>,
-    // Sparse side tables must not reserve eleven full metadata values in
-    // every B-tree leaf. Own each side once; keep the index pointer-sized.
-    side_runtime_stats: BTreeMap<RouterSideId, Box<SideRuntimeStatsInner>>,
-    side_transport: BTreeMap<RouterSideId, Box<SideTransportState>>,
+    route_overrides: RouterMap<(Option<RouterSideId>, RouterSideId), bool>,
+    typed_route_overrides: RouterMap<(Option<RouterSideId>, u32, RouterSideId), bool>,
+    route_weights: RouterMap<(Option<RouterSideId>, RouterSideId), u32>,
+    route_priorities: RouterMap<(Option<RouterSideId>, RouterSideId), u32>,
+    source_route_modes: RouterMap<Option<RouterSideId>, RouteSelectionMode>,
+    route_selection_cursors: RouterMap<Option<RouterSideId>, u64>,
+    adaptive_route_stats: RouterMap<RouterSideId, AdaptiveRouteStats>,
+    // Own each large side value once and keep sparse index entries pointer-sized.
+    // Embedded side indexes use compact sorted vectors; desktop indexes use B-trees.
+    side_runtime_stats: RouterMap<RouterSideId, Box<SideRuntimeStatsInner>>,
+    side_transport: RouterMap<RouterSideId, Box<SideTransportState>>,
     managed_variable_types: BTreeSet<u32>,
     managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
     managed_variable_latest: BTreeMap<u32, Box<ManagedVariableCacheEntry>>,
@@ -2127,15 +2135,15 @@ struct RouterInner {
     total_handler_failures: u64,
     total_handler_retries: u64,
     #[cfg(feature = "discovery")]
-    discovery_routes: BTreeMap<RouterSideId, DiscoverySideState>,
+    discovery_routes: RouterMap<RouterSideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
     #[cfg(feature = "discovery")]
-    discovery_side_throttle: BTreeMap<RouterSideId, DiscoverySideThrottleState>,
+    discovery_side_throttle: RouterMap<RouterSideId, DiscoverySideThrottleState>,
     #[cfg(feature = "discovery")]
     preferred_discovery_master: Option<Arc<str>>,
     #[cfg(all(feature = "discovery", feature = "timesync"))]
-    timesync_side_throttle: BTreeMap<RouterSideId, TimeSyncSideThrottleState>,
+    timesync_side_throttle: RouterMap<RouterSideId, TimeSyncSideThrottleState>,
 }
 
 #[derive(Debug, Clone)]
@@ -2950,7 +2958,7 @@ impl RouterInner {
             .entry(key)
             .or_insert_with(|| ReliableRxState {
                 expected_seq: 1,
-                buffered: BTreeMap::new(),
+                buffered: Default::default(),
             });
         if rx_state.buffered.len() >= runtime_reliable_max_pending() {
             let _ = rx_state.buffered.pop_first();
@@ -3110,7 +3118,7 @@ impl TimeSyncRuntime {
                 cfg.map(|c| c.max_slew_ppm)
                     .unwrap_or(TimeSyncConfig::default().max_slew_ppm),
             ),
-            remote_sources: BTreeMap::new(),
+            remote_sources: Default::default(),
             next_seq: 1,
             next_announce_mono_ms: 0,
             next_request_mono_ms: 0,
@@ -8410,7 +8418,7 @@ impl Router {
             .or_insert_with(|| ReliableTxState {
                 next_seq: 1,
                 sent_order: VecDeque::new(),
-                sent: BTreeMap::new(),
+                sent: Default::default(),
             })
     }
 
@@ -8425,7 +8433,7 @@ impl Router {
             .entry(key)
             .or_insert_with(|| ReliableRxState {
                 expected_seq: 1,
-                buffered: BTreeMap::new(),
+                buffered: Default::default(),
             })
     }
 
@@ -11059,25 +11067,25 @@ impl Router {
             state: RouterMutex::new(RouterInner {
                 memory,
                 sides: Vec::new(),
-                route_overrides: BTreeMap::new(),
-                typed_route_overrides: BTreeMap::new(),
-                route_weights: BTreeMap::new(),
-                route_priorities: BTreeMap::new(),
-                source_route_modes: BTreeMap::new(),
-                route_selection_cursors: BTreeMap::new(),
-                adaptive_route_stats: BTreeMap::new(),
-                side_runtime_stats: BTreeMap::new(),
-                side_transport: BTreeMap::new(),
+                route_overrides: Default::default(),
+                typed_route_overrides: Default::default(),
+                route_weights: Default::default(),
+                route_priorities: Default::default(),
+                source_route_modes: Default::default(),
+                route_selection_cursors: Default::default(),
+                adaptive_route_stats: Default::default(),
+                side_runtime_stats: Default::default(),
+                side_transport: Default::default(),
                 managed_variable_types: BTreeSet::new(),
-                managed_variable_permissions: BTreeMap::new(),
-                managed_variable_latest: BTreeMap::new(),
-                network_variable_update_handlers: BTreeMap::new(),
+                managed_variable_permissions: Default::default(),
+                managed_variable_latest: Default::default(),
+                network_variable_update_handlers: Default::default(),
                 local_address,
                 address_book,
                 address_by_value,
-                p2p_port_handlers: BTreeMap::new(),
-                p2p_stream_handlers: BTreeMap::new(),
-                p2p_stream_sessions: BTreeMap::new(),
+                p2p_port_handlers: Default::default(),
+                p2p_stream_handlers: Default::default(),
+                p2p_stream_sessions: Default::default(),
                 next_p2p_stream_id: 1,
                 received_queue: BoundedDeque::new(
                     memory.max_queue_budget,
@@ -11096,24 +11104,24 @@ impl Router {
                     memory.recent_rx_queue_bytes(),
                     memory.queue_grow_step,
                 ),
-                reliable_tx: BTreeMap::new(),
-                reliable_rx: BTreeMap::new(),
-                reliable_return_routes: BTreeMap::new(),
+                reliable_tx: Default::default(),
+                reliable_rx: Default::default(),
+                reliable_return_routes: Default::default(),
                 reliable_return_route_order: VecDeque::new(),
-                end_to_end_reliable_tx: BTreeMap::new(),
+                end_to_end_reliable_tx: Default::default(),
                 end_to_end_reliable_tx_order: VecDeque::new(),
                 total_handler_failures: 0,
                 total_handler_retries: 0,
                 #[cfg(feature = "discovery")]
-                discovery_routes: BTreeMap::new(),
+                discovery_routes: Default::default(),
                 #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
                 #[cfg(feature = "discovery")]
-                discovery_side_throttle: BTreeMap::new(),
+                discovery_side_throttle: Default::default(),
                 #[cfg(feature = "discovery")]
                 preferred_discovery_master,
                 #[cfg(all(feature = "discovery", feature = "timesync"))]
-                timesync_side_throttle: BTreeMap::new(),
+                timesync_side_throttle: Default::default(),
             }),
             isr_rx_queue: IsrRxQueue::new(
                 memory.max_queue_budget,
@@ -14867,7 +14875,7 @@ impl Router {
                             pending
                         };
                         if !pending.is_empty() {
-                            // BTreeMap keys already form a sorted, unique frozen cohort.
+                            // RouterMap keys already form a sorted, unique frozen cohort.
                             let targets: Vec<u64> = pending.keys().copied().collect();
                             data = self.attach_wire_contract_to_item(data, &targets)?;
                             match self.register_end_to_end_reliable_tx(&data, Some(pending)) {

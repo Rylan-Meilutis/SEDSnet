@@ -186,6 +186,8 @@ pub mod relay;
 pub mod router;
 mod side_transport;
 mod small_payload;
+#[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
+mod small_map;
 mod small_sort;
 #[cfg(feature = "timesync")]
 pub mod timesync;

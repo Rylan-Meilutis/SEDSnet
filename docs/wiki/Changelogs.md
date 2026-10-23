@@ -4,6 +4,18 @@
 
 Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/blob/main/CHANGELOG.md).
 
+## Version 4.2.6 highlights
+
+Development source; package publication and long-duration simulator qualification are pending.
+
+- Reduce embedded router FLASH use with sorted-vector indexes for small side and
+  scalar transport tables. Keep dynamic schema, address, timesync-source, large
+  template and reliable replay maps on B-trees; desktop production is unchanged.
+- Preserve ordered iteration, borrowed lookup and entry semantics, and release
+  empty index allocations. Add randomized equivalence and ownership regressions.
+- Validate the current full-feature FC Release/TLSF/compact factory image at
+  449,820 of 474,624 application FLASH bytes (94.774%).
+
 ## Version 4.2.5 highlights
 
 Source qualification passed on 2026-10-23; publication is pending.
