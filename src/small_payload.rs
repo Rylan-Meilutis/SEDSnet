@@ -162,10 +162,7 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         }
     }
 
-    #[cfg(all(
-        feature = "compact-packet-store",
-        any(feature = "std", feature = "fair-admission")
-    ))]
+    #[cfg(feature = "compact-packet-store")]
     pub(crate) fn with_slice<R>(&self, read: impl FnOnce(&[u8]) -> R) -> crate::TelemetryResult<R> {
         match self {
             Self::Inline { len, buf } => Ok(read(buf.as_slice(*len))),

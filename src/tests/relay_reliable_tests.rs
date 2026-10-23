@@ -1,4 +1,5 @@
 use crate::config::{DataEndpoint, DataType, RELIABLE_RETRANSMIT_MS};
+#[cfg(feature = "discovery")]
 use crate::discovery::build_discovery_announce;
 use crate::relay::{Relay, RelaySideOptions};
 use crate::router::Clock;
@@ -12,6 +13,7 @@ fn zero_clock() -> Box<dyn Clock + Send + Sync> {
     Box::new(|| 0u64)
 }
 
+#[cfg(feature = "discovery")]
 fn advertise_side(relay: &Relay, side: usize) {
     let pkt = build_discovery_announce("DST_SIDE", 0, &[DataEndpoint::named("SD_CARD")]).unwrap();
     relay.rx_from_side(side, pkt).unwrap();
@@ -35,7 +37,7 @@ fn relay_reliable_seq_advances_with_ack() {
     let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let sent_c = sent.clone();
     let relay_c = relay.clone();
-    let dst = relay.add_side_packed_with_options(
+    let _dst = relay.add_side_packed_with_options(
         "DST",
         move |bytes: &[u8]| -> TelemetryResult<()> {
             sent_c.lock().unwrap().push(bytes.to_vec());
@@ -54,7 +56,8 @@ fn relay_reliable_seq_advances_with_ack() {
             ..RelaySideOptions::default()
         },
     );
-    advertise_side(&relay, dst);
+    #[cfg(feature = "discovery")]
+    advertise_side(&relay, _dst);
     relay.process_all_queues_with_timeout(0).unwrap();
 
     let pkt1 = Packet::from_f32_slice(
@@ -270,7 +273,7 @@ fn relay_reliable_reorders_out_of_order_frames() {
     let delivered: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let delivered_c = delivered.clone();
     let relay_for_ack = relay.clone();
-    let dst = relay.add_side_packed_with_options(
+    let _dst = relay.add_side_packed_with_options(
         "DST",
         move |bytes: &[u8]| -> TelemetryResult<()> {
             let frame = wire_format::peek_frame_info(bytes)?;
@@ -291,7 +294,8 @@ fn relay_reliable_reorders_out_of_order_frames() {
             ..RelaySideOptions::default()
         },
     );
-    advertise_side(&relay, dst);
+    #[cfg(feature = "discovery")]
+    advertise_side(&relay, _dst);
     relay.process_all_queues_with_timeout(0).unwrap();
 
     let pkt1 = Packet::from_f32_slice(

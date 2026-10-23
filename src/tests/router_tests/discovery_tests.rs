@@ -4793,7 +4793,7 @@ fn timesync_announces_throttle_only_the_measured_slow_side() {
     );
     assert_eq!(
         count_packets_of_type(&seen_slow.lock().unwrap(), DataType::TimeSyncAnnounce),
-        0
+        1
     );
 
     seen_fast.lock().unwrap().clear();
@@ -4808,6 +4808,24 @@ fn timesync_announces_throttle_only_the_measured_slow_side() {
     assert_eq!(
         count_packets_of_type(&seen_slow.lock().unwrap(), DataType::TimeSyncAnnounce),
         0
+    );
+    // A route check must not consume the same slow-link allowance twice.
+    // Once allowed, subsequent announcements remain throttled for the full
+    // configured interval, then one actual announcement is allowed again.
+    seen_fast.lock().unwrap().clear();
+    seen_slow.lock().unwrap().clear();
+    let ready = 6000 + crate::discovery::TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS;
+    now_ms.store(ready, Ordering::SeqCst);
+    router.note_side_link_probe_sample(slow, 250, 5000).unwrap();
+    assert!(router.poll_timesync().unwrap());
+    router.process_tx_queue().unwrap();
+    assert_eq!(
+        count_packets_of_type(&seen_fast.lock().unwrap(), DataType::TimeSyncAnnounce),
+        1
+    );
+    assert_eq!(
+        count_packets_of_type(&seen_slow.lock().unwrap(), DataType::TimeSyncAnnounce),
+        1
     );
 }
 
@@ -5151,7 +5169,10 @@ fn router_runtime_stats_track_ingress_local_handler_failures_and_relayed_rx() {
         1,
     )
     .unwrap();
-    router.rx_from_side(&pkt, side).unwrap();
+    assert!(matches!(
+        router.rx_from_side(&pkt, side),
+        Err(TelemetryError::HandlerError("local handler failed"))
+    ));
 
     let stats = router.export_runtime_stats();
     let ingress = side_stats(&stats, side);
@@ -5162,10 +5183,10 @@ fn router_runtime_stats_track_ingress_local_handler_failures_and_relayed_rx() {
     assert_eq!(ingress.rx_packets, 1);
     assert!(ingress.rx_bytes > 0);
     assert_eq!(ingress.relayed_rx_packets, 1);
-    assert_eq!(ingress.local_delivery_packets, 1);
+    assert_eq!(ingress.local_delivery_packets, 0);
     assert_eq!(ingress.local_handler_failures, 1);
     assert_eq!(ingress.total_handler_retries, MAX_HANDLER_RETRIES as u64);
-    assert_eq!(gps.rx_packets, 2);
+    assert_eq!(gps.rx_packets, 1);
     assert_eq!(gps.relayed_rx_packets, 1);
     assert_eq!(gps.handler_failures, 1);
 }
@@ -7217,16 +7238,18 @@ fn router_runtime_memory_budget_caps_queued_state() {
     );
     router.add_side_packed("budget-link", |_bytes| Ok(()));
 
+    // Saturate with best-effort reports: accepted reliable originals are
+    // protected and exert backpressure instead of silently losing ownership.
     for idx in 0..300u64 {
         router
             .log_queue_ts(
-                DataType::named("GPS_DATA"),
+                DataType::named("BAROMETER_DATA"),
                 idx,
                 &[idx as f32, 2.0_f32, 3.0_f32],
             )
             .unwrap();
         let pkt = Packet::from_f32_slice(
-            DataType::named("GPS_DATA"),
+            DataType::named("BAROMETER_DATA"),
             &[9.0_f32, 8.0_f32, idx as f32],
             &[DataEndpoint::named("SD_CARD")],
             idx + 10_000,
@@ -8187,8 +8210,10 @@ fn bounded_discovery_drain_yields_before_routing_remaining_announcements() {
         .unwrap();
     router.drain_queues_with_timeout(1).unwrap();
     assert_eq!(router.export_topology().routes[0].announcers.len(), 1);
-    assert_eq!(sent.load(Ordering::Relaxed), 0);
-    // Unbounded drains retain the discovery-before-data ordering and finish.
+    // One fair RX/TX pair is atomic: exhausting RX's budget must yield the
+    // remaining discovery work, while still draining a ready telemetry item.
+    assert_eq!(sent.load(Ordering::Relaxed), 1);
+    // The remaining announcements finish without duplicating the data.
     router.drain_queues_with_timeout(0).unwrap();
     assert_eq!(router.export_topology().routes[0].announcers.len(), 3);
     assert_eq!(sent.load(Ordering::Relaxed), 1);
@@ -8284,5 +8309,158 @@ fn busy_transport_yields_without_spinning_or_blocking_healthy_side() {
         healthy.load(Ordering::Relaxed),
         1,
         "successful sides must not be replayed"
+    );
+}
+
+#[test]
+fn one_best_effort_publication_advances_weighted_route_cursor_once() {
+    ensure_topology_test_schema();
+    let ty = register_data_type_with_description(
+        "SINGLE_TX_ROUTE_PLAN",
+        "",
+        MessageElement::Static(4, MessageDataType::Float32, MessageClass::Data),
+        &[DataEndpoint::named("RADIO")],
+        ReliableMode::None,
+        16,
+    )
+    .unwrap();
+    for queued in [false, true] {
+        let counts = Arc::new(Mutex::new([0usize; 4]));
+        let router = Router::new_with_clock(RouterConfig::default(), zero_clock());
+        let ep = DataEndpoint::named("RADIO");
+        for index in 0..4 {
+            let hits = counts.clone();
+            let side = router.add_side_packet(format!("PATH{index}"), move |packet: &Packet| {
+                if packet.data_type() == ty {
+                    hits.lock().unwrap()[index] += 1;
+                }
+                Ok(())
+            });
+            let announce = build_discovery_announce(&format!("SINK{index}"), 0, &[ep]).unwrap();
+            router.rx_from_side(&announce, side).unwrap();
+            router.set_route_weight(None, side, 1).unwrap();
+        }
+        router.drain_queues_with_timeout(0).unwrap();
+        router
+            .set_source_route_mode(None, RouteSelectionMode::Weighted)
+            .unwrap();
+        for sequence in 0..4 {
+            let packet = Packet::from_f32_slice(ty, &[0.0; 4], &[ep], sequence).unwrap();
+            if queued {
+                router.tx_queue(packet).unwrap();
+            } else {
+                router.tx(packet).unwrap();
+            }
+        }
+        router.drain_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            *counts.lock().unwrap(),
+            [1, 1, 1, 1],
+            "one publication must not select and advance twice (queued={queued})"
+        );
+    }
+}
+
+#[cfg(feature = "timesync")]
+#[test]
+fn forwarding_one_clock_announcement_consumes_one_slow_link_allowance() {
+    ensure_topology_test_schema();
+    for (packed, queued) in [(false, false), (true, false), (false, true), (true, true)] {
+        let now = Arc::new(AtomicU64::new(5000));
+        let clock = now.clone();
+        let received = Arc::new(Mutex::new(0usize));
+        let hits = received.clone();
+        let bridge = Router::new_with_clock(
+            RouterConfig::default(),
+            Box::new(move || clock.load(Ordering::SeqCst)),
+        );
+        let incoming = bridge.add_side_packet("ETHERNET", |_| Ok(()));
+        let outgoing = bridge.add_side_packet("RADIO", move |packet: &Packet| {
+            if packet.data_type() == DataType::TimeSyncAnnounce {
+                *hits.lock().unwrap() += 1;
+            }
+            Ok(())
+        });
+        bridge
+            .note_side_link_probe_sample(outgoing, 250, 5000)
+            .unwrap();
+        for (stamp, expected) in [(5000, 1usize), (6000, 1), (35000, 2)] {
+            now.store(stamp, Ordering::SeqCst);
+            bridge
+                .note_side_link_probe_sample(outgoing, 250, 5000)
+                .unwrap();
+            let packet = Packet::new(
+                DataType::TimeSyncAnnounce,
+                &[DataEndpoint::TimeSync],
+                "GS",
+                stamp,
+                crate::router::encode_slice_le(&[1u64, 1792640000000 + stamp]),
+            )
+            .unwrap();
+            match (packed, queued) {
+                (false, false) => bridge.rx_from_side(&packet, incoming),
+                (true, false) => {
+                    bridge.rx_packed_from_side(&wire_format::pack_packet(&packet), incoming)
+                }
+                (false, true) => bridge.rx_queue_from_side(packet, incoming),
+                (true, true) => {
+                    bridge.rx_packed_queue_from_side(&wire_format::pack_packet(&packet), incoming)
+                }
+            }
+            .unwrap();
+            bridge.drain_queues_with_timeout(0).unwrap();
+            assert_eq!(
+                *received.lock().unwrap(),
+                expected,
+                "the reachability check must not consume a transmission allowance"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "timesync")]
+#[test]
+fn failed_clock_handoff_does_not_spend_its_slow_link_allowance() {
+    ensure_topology_test_schema();
+    let now = Arc::new(AtomicU64::new(5000));
+    let clock = now.clone();
+    let busy = Arc::new(AtomicBool::new(true));
+    let blocked = busy.clone();
+    let received = Arc::new(AtomicUsize::new(0));
+    let hits = received.clone();
+    let bridge = Router::new_with_clock(
+        RouterConfig::default(),
+        Box::new(move || clock.load(Ordering::SeqCst)),
+    );
+    let incoming = bridge.add_side_packet("ETHERNET", |_| Ok(()));
+    let outgoing = bridge.add_side_packet("RADIO", move |packet: &Packet| {
+        if packet.data_type() == DataType::TimeSyncAnnounce {
+            if blocked.load(Ordering::SeqCst) {
+                return Err(TelemetryError::Io("side tx busy"));
+            }
+            hits.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    bridge
+        .note_side_link_probe_sample(outgoing, 250, 5000)
+        .unwrap();
+    let packet = Packet::new(
+        DataType::TimeSyncAnnounce,
+        &[DataEndpoint::TimeSync],
+        "GS",
+        5000,
+        crate::router::encode_slice_le(&[1u64, 1792640005000]),
+    )
+    .unwrap();
+    bridge.rx_from_side(&packet, incoming).unwrap();
+    assert_eq!(received.load(Ordering::SeqCst), 0);
+    busy.store(false, Ordering::SeqCst);
+    now.store(5010, Ordering::SeqCst);
+    bridge.drain_queues_with_timeout(0).unwrap();
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        1,
+        "failed handoff must not block its retry for30seconds"
     );
 }

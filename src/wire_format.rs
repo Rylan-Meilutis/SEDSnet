@@ -395,8 +395,19 @@ fn split_crc32(buf: &[u8]) -> Result<(&[u8], u32), TelemetryError> {
     Ok((&buf[..data_len], crc))
 }
 
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+std::thread_local! {
+    static CRC_VERIFICATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+pub(crate) fn crc_verification_count() -> usize {
+    CRC_VERIFICATIONS.with(core::cell::Cell::get)
+}
+
 #[inline]
 fn verify_crc32(buf: &[u8]) -> Result<&[u8], TelemetryError> {
+    #[cfg(all(test, feature = "std", feature = "discovery"))]
+    CRC_VERIFICATIONS.with(|count| count.set(count.get().wrapping_add(1)));
     let (data, expected) = split_crc32(buf)?;
     let actual = crc32_bytes(data);
     if actual != expected {
@@ -1650,6 +1661,59 @@ impl TelemetryFrameInfo {
         self.reliable
             .map(|h| (h.flags & RELIABLE_FLAG_ACK_ONLY) != 0)
             .unwrap_or(false)
+    }
+}
+
+/// Borrow frozen target hashes from a Packet or its little-endian wire header.
+/// Membership never allocates an owner array or changes the frozen cohort.
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy)]
+pub(crate) enum TargetSenderSet<'a> {
+    Hashes(&'a [u64]),
+    Encoded(&'a [u8]),
+}
+#[cfg(feature = "discovery")]
+impl<'a> TargetSenderSet<'a> {
+    pub(crate) fn skip(self, count: usize) -> Self {
+        match self {
+            Self::Hashes(v) => Self::Hashes(v.get(count..).unwrap_or(&[])),
+            Self::Encoded(v) => Self::Encoded(v.get(count.saturating_mul(8)..).unwrap_or(&[])),
+        }
+    }
+    pub(crate) fn iter(self) -> impl Iterator<Item = u64> + 'a {
+        let (hashes, encoded) = match self {
+            Self::Hashes(v) => (v, &[][..]),
+            Self::Encoded(v) => (&[][..], v),
+        };
+        hashes.iter().copied().chain(
+            encoded
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| u64::from_le_bytes(*v)),
+        )
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Hashes(v) => v.is_empty(),
+            Self::Encoded(v) => v.is_empty(),
+        }
+    }
+    pub(crate) fn contains(&self, target: u64) -> bool {
+        match self {
+            Self::Hashes(v) => v.contains(&target),
+            Self::Encoded(v) => v
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .any(|bytes| u64::from_le_bytes(*bytes) == target),
+        }
+    }
+}
+#[cfg(feature = "discovery")]
+impl<'a> RoutingEnvelope<'a> {
+    pub(crate) fn target_sender_set(&self) -> TargetSenderSet<'a> {
+        TargetSenderSet::Encoded(self.targets)
     }
 }
 

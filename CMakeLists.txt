@@ -54,6 +54,7 @@ option(SEDSNET_ENABLE_C_WRAPPER
 option(SEDSNET_ENABLE_CPP_WRAPPER
     "Expose the optional header-only C++ convenience target sedsnet::cpp_wrapper"
     OFF)
+option(SEDSNET_INGRESS_TARGET_FILTER "Avoid owning overheard frames addressed only behind ingress" OFF)
 option(SEDSNET_FAIR_ADMISSION "Reclaim competing bulk traffic on embedded memory refusal" OFF)
 option(SEDSNET_COMPACT_PACKET_STORE "Enable private compactable packet arena" OFF)
 option(SEDSNET_COMPACT_PACKET_COMPRESSION "Enable indexed Zstd arena buffers" OFF)
@@ -99,12 +100,26 @@ else ()
     set(SEDSNET_ACTIVE_PROFILE "$<IF:$<CONFIG:Debug>,debug,${RELEASE_PROFILE_DIR}>")
 endif ()
 
+# Cargo owns target-dir resolution, including .cargo/config.toml and relative
+# CARGO_TARGET_DIR values. Resolve under the same crate working directory.
+set(_RS_METADATA_ENV ${CMAKE_COMMAND} -E env)
+if (DEFINED SEDSNET_ENV_CARGO_TARGET_DIR AND NOT SEDSNET_ENV_CARGO_TARGET_DIR STREQUAL "")
+    list(APPEND _RS_METADATA_ENV "CARGO_TARGET_DIR=${SEDSNET_ENV_CARGO_TARGET_DIR}")
+endif ()
+execute_process(
+    COMMAND ${_RS_METADATA_ENV} "${PYTHON_EXECUTABLE}" "${RUST_DIR}/cargo_paths.py" "${RUST_DIR}"
+    WORKING_DIRECTORY "${RUST_DIR}"
+    OUTPUT_VARIABLE RS_TARGET_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+)
+
 if (RUST_TRIPLE STREQUAL "")
-    set(RS_STATIC_LIB_DBG "${RUST_DIR}/target/debug/libsedsnet.a")
-    set(RS_STATIC_LIB_REL "${RUST_DIR}/target/release/libsedsnet.a")
+    set(RS_STATIC_LIB_DBG "${RS_TARGET_DIR}/debug/libsedsnet.a")
+    set(RS_STATIC_LIB_REL "${RS_TARGET_DIR}/release/libsedsnet.a")
 else ()
-    set(RS_STATIC_LIB_DBG "${RUST_DIR}/target/${RUST_TRIPLE}/debug/libsedsnet.a")
-    set(RS_STATIC_LIB_REL "${RUST_DIR}/target/${RUST_TRIPLE}/${RELEASE_PROFILE_DIR}/libsedsnet.a")
+    set(RS_STATIC_LIB_DBG "${RS_TARGET_DIR}/${RUST_TRIPLE}/debug/libsedsnet.a")
+    set(RS_STATIC_LIB_REL "${RS_TARGET_DIR}/${RUST_TRIPLE}/${RELEASE_PROFILE_DIR}/libsedsnet.a")
 endif ()
 
 set(RS_LIB_DBG "${RS_STATIC_LIB_DBG}")
@@ -172,6 +187,9 @@ if (SEDSNET_COMPACT_PACKET_COMPRESSION)
 elseif (SEDSNET_COMPACT_PACKET_STORE)
     list(APPEND RS_ARGS_BOOTSTRAP "--features" "compact-packet-store")
 endif ()
+if (SEDSNET_INGRESS_TARGET_FILTER)
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "ingress-target-filter")
+endif ()
 if (SEDSNET_FAIR_ADMISSION)
     list(APPEND RS_ARGS_BOOTSTRAP "--features" "fair-admission")
 endif ()
@@ -206,6 +224,7 @@ endif ()
 file(GLOB_RECURSE RS_SRC CONFIGURE_DEPENDS
     "${RUST_DIR}/src/*.rs"
     "${RUST_DIR}/build.py"
+    "${RUST_DIR}/cargo_paths.py"
     "${RUST_DIR}/build.rs"
     "${RUST_DIR}/Cargo.toml"
     "${RUST_DIR}/Cargo.lock"

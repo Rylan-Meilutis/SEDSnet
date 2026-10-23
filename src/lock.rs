@@ -28,6 +28,7 @@ pub struct ReentryGate {
     busy: AtomicBool,
 }
 
+#[cfg(not(feature = "std"))]
 pub struct ReentryGuard<'a> {
     busy: &'a AtomicBool,
 }
@@ -41,6 +42,7 @@ impl ReentryGate {
     }
 
     #[inline]
+    #[cfg(not(feature = "std"))]
     pub fn try_enter(&self) -> Option<ReentryGuard<'_>> {
         self.busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -54,6 +56,48 @@ impl ReentryGate {
     }
 }
 
+// Host transports may execute concurrently on independent interfaces. Each
+// side keeps its own callback gate; the activity count still defers recursive
+// receive/API dispatch while any callback is on a stack. No per-packet allocation.
+#[cfg(feature = "std")]
+impl Default for ReentryGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[cfg(feature = "std")]
+#[derive(Default)]
+pub(crate) struct SideTxActivity(core::sync::atomic::AtomicUsize);
+#[cfg(feature = "std")]
+pub(crate) struct ActiveSideTxGuard<'a> {
+    gate: alloc::sync::Arc<ReentryGate>,
+    activity: &'a core::sync::atomic::AtomicUsize,
+}
+#[cfg(feature = "std")]
+impl SideTxActivity {
+    pub fn try_enter(&self, gate: alloc::sync::Arc<ReentryGate>) -> Option<ActiveSideTxGuard<'_>> {
+        gate.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        self.0.fetch_add(1, Ordering::AcqRel);
+        Some(ActiveSideTxGuard {
+            gate,
+            activity: &self.0,
+        })
+    }
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+}
+#[cfg(feature = "std")]
+impl Drop for ActiveSideTxGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.busy.store(false, Ordering::Release);
+        self.activity.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(not(feature = "std"))]
 impl Drop for ReentryGuard<'_> {
     #[inline]
     fn drop(&mut self) {

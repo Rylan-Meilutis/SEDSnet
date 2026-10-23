@@ -5,6 +5,23 @@ spec = importlib.util.spec_from_file_location("sedsnet_build", Path(__file__).pa
 build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 class BuildCliTests(unittest.TestCase):
+    def test_wheel_install_uses_selected_target_features_and_cargo_output(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / 'external artifacts'
+            wheels = output / 'wheels'
+            wheels.mkdir(parents=True)
+            wheel = wheels / 'sedsnet-4.2.5-test.whl'
+            wheel.write_bytes(b'fixture')
+            env = {'CARGO_TARGET_DIR': str(output)}
+            with patch.object(build, 'run_cmd') as run, patch.object(build, 'cargo_target_directory', return_value=output) as resolve:
+                build.install_wheel_file(['--release'], env=env, repo_root=root, target='aarch64-apple-darwin', feature_parts=['timesync'])
+            self.assertEqual(run.call_args_list[0].args[0], ['maturin', 'build', '--release', '--target', 'aarch64-apple-darwin', '--features', 'timesync'])
+            self.assertEqual(run.call_args_list[1].args[0], ['uv', 'pip', 'install', str(wheel)])
+            resolve.assert_called_once_with(root, env=env)
+
     def test_cargo_style_embedded_command(self):
         args = build.parse_args(["build", "--release", "--target", "thumbv7em-none-eabihf", "--features", "embedded,compact-packet-store", "--device-id", "RF", "--max-queue-budget", "8192", "--env", "RUSTFLAGS=-C target-cpu=cortex-m4"])
         self.assertTrue(args.release)
@@ -27,6 +44,26 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("build --release --device-id=CLI_TEST --max-queue-budget=8192", result.stdout)
             self.assertIn("--env QUEUE_GROW_STEP=1.25", result.stdout)
+
+    def test_ingress_filter_cmake_feature_uses_supported_build_cli(self):
+        import subprocess, tempfile
+        args=build.parse_args(["build", "--features", "embedded,ingress-target-filter"])
+        self.assertEqual(args.features, ["embedded", "ingress-target-filter"])
+        with tempfile.TemporaryDirectory() as directory:
+            result=subprocess.run(["cmake", "-S", str(Path(__file__).parents[1]), "-B", directory,
+                "-DSEDSNET_INGRESS_TARGET_FILTER=ON"],text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertIn("--features ingress-target-filter", result.stdout)
+
+    def test_requested_embedded_features_reach_the_actual_cargo_command(self):
+        from unittest.mock import patch
+        with patch.object(build, "ensure_rust_target_installed"), patch.object(build, "has_embedded_c_toolchain", return_value=True), patch.object(build, "collect_artifact_sizes", return_value={}), patch.object(build, "print_artifact_sizes"), patch.object(build, "run_cmd") as run:
+            build.main(["build", "--release", "--target", "thumbv7em-none-eabihf", "--features", "embedded,ingress-target-filter,compact-packet-store,fair-admission"])
+        command=run.call_args.args[0]
+        features=command[command.index("--features")+1].split(",")
+        self.assertEqual(set(features), {"embedded", "ingress-target-filter", "compact-packet-store", "fair-admission"})
+        self.assertIn("--profile",command)
+        self.assertIn("release-embedded",command)
 
     def test_default_build(self):
         self.assertEqual(build.parse_args([]).command, "build")

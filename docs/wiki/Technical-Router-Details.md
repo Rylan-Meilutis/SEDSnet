@@ -209,6 +209,9 @@ confirmation path works like this:
 - those end-to-end acknowledgements are routed only toward the learned return side for that packet
   id
 - unrelated sides do not receive the end-to-end acknowledgement
+- a publisher known on the ingress segment, or excluded by current route policy,
+  does not use the unknown-publisher sole-link fallback; genuinely unknown legacy
+  publishers retain that fallback when exactly one eligible side exists
 - if one acknowledgement is lost, the source retransmits only toward the destinations that are
   still outstanding instead of replaying to holders that already confirmed delivery
 - if discovery later ages out one of those holders, the source removes that holder from the

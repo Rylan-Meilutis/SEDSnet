@@ -8,7 +8,9 @@ use crate::{
     DataType, TelemetryResult, packet::Packet, router::Clock, router::Router, router::RouterConfig,
 };
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "discovery")]
+use std::sync::Mutex;
 // ---------------- Mock clock ----------------
 
 /// A deterministic clock that steps forward by `step` ms on each `now_ms()`

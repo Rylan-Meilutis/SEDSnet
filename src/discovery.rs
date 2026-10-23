@@ -1822,53 +1822,65 @@ pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResul
 /// 3. Lowest total hop distance across all reachable boards.
 /// 4. Lexicographically smallest sender ID.
 pub fn elect_discovery_master(local_sender: &str, boards: &[TopologyBoardNode]) -> String {
-    let mut nodes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut nodes: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for board in boards {
-        nodes.entry(board.sender_id.clone()).or_default();
+        nodes.entry(board.sender_id.as_str()).or_default();
         for peer in board.connections.iter() {
             nodes
-                .entry(peer.clone())
+                .entry(peer.as_str())
                 .or_default()
-                .push(board.sender_id.clone());
+                .push(board.sender_id.as_str());
             nodes
-                .entry(board.sender_id.clone())
+                .entry(board.sender_id.as_str())
                 .or_default()
-                .push(peer.clone());
+                .push(peer.as_str());
         }
     }
-    nodes.entry(local_sender.to_string()).or_default();
+    nodes.entry(local_sender).or_default();
     for peers in nodes.values_mut() {
         peers.sort_unstable();
         peers.dedup();
     }
 
-    let mut best_sender = local_sender.to_string();
+    let mut best_sender = local_sender;
     let mut best_unreachable = usize::MAX;
     let mut best_max_hops = usize::MAX;
     let mut best_total_hops = usize::MAX;
 
-    for sender in nodes.keys() {
-        let mut frontier = vec![sender.clone()];
-        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        seen.insert(sender.clone(), 0);
+    // Reuse compact index workspaces across candidate roots. The names remain
+    // borrowed and lexicographically ordered; BFS no longer allocates a second
+    // map and growing frontier for every candidate in the same graph.
+    let names: Vec<&str> = nodes.keys().copied().collect();
+    let mut distances = vec![usize::MAX; names.len()];
+    let mut frontier = Vec::with_capacity(names.len());
+    for (source_index, &sender) in names.iter().enumerate() {
+        distances.fill(usize::MAX);
+        frontier.clear();
+        frontier.push(source_index);
+        distances[source_index] = 0;
         let mut idx = 0;
         while idx < frontier.len() {
-            let cur = frontier[idx].clone();
+            let current = frontier[idx];
             idx += 1;
-            let cur_dist = seen[&cur];
-            if let Some(peers) = nodes.get(&cur) {
-                for peer in peers {
-                    if !seen.contains_key(peer) {
-                        seen.insert(peer.clone(), cur_dist + 1);
-                        frontier.push(peer.clone());
+            let current_distance = distances[current];
+            if let Some(peers) = nodes.get(names[current]) {
+                for &peer in peers {
+                    // Map construction above indexes every edge endpoint.
+                    let Ok(peer_index) = names.binary_search(&peer) else {
+                        continue;
+                    };
+                    if distances[peer_index] == usize::MAX {
+                        distances[peer_index] = current_distance + 1;
+                        frontier.push(peer_index);
                     }
                 }
             }
         }
 
-        let unreachable = nodes.len().saturating_sub(seen.len());
-        let max_hops = seen.values().copied().max().unwrap_or(0);
-        let total_hops = seen.values().copied().sum();
+        let reachable = distances.iter().copied().filter(|&n| n != usize::MAX);
+        let unreachable = names.len().saturating_sub(frontier.len());
+        let max_hops = reachable.clone().max().unwrap_or(0);
+        let total_hops = reachable.sum();
         let better = unreachable < best_unreachable
             || (unreachable == best_unreachable && max_hops < best_max_hops)
             || (unreachable == best_unreachable
@@ -1877,16 +1889,16 @@ pub fn elect_discovery_master(local_sender: &str, boards: &[TopologyBoardNode]) 
             || (unreachable == best_unreachable
                 && max_hops == best_max_hops
                 && total_hops == best_total_hops
-                && sender < &best_sender);
+                && sender < best_sender);
         if better {
-            best_sender = sender.clone();
+            best_sender = sender;
             best_unreachable = unreachable;
             best_max_hops = max_hops;
             best_total_hops = total_hops;
         }
     }
 
-    best_sender
+    best_sender.to_string()
 }
 
 /// Builds a discovery schema packet from an explicit snapshot.

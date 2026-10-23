@@ -1,6 +1,7 @@
 //! Tests specifically for RX/relay deduplication behavior.
 
 use crate::config::{DataEndpoint, DataType};
+#[cfg(feature = "discovery")]
 use crate::discovery::build_discovery_announce;
 use crate::relay::Relay;
 use crate::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
@@ -50,6 +51,7 @@ fn wire_for_value(v: u64) -> Arc<[u8]> {
     wire_format::pack_packet(&pkt)
 }
 
+#[cfg(feature = "discovery")]
 fn advertise_side(relay: &Relay, side: usize, sender: &str) {
     crate::tests::ensure_common_test_schema();
     let pkt = build_discovery_announce(sender, 0, &[DataEndpoint::named("SD_CARD")]).unwrap();
@@ -930,6 +932,7 @@ fn bounded_side_template_dictionaries_remain_synchronized() {
     );
 }
 
+#[cfg(feature = "discovery")]
 #[test]
 fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
     crate::tests::ensure_common_test_schema();
@@ -1157,6 +1160,7 @@ fn compact_side_recovers_when_initial_full_template_is_lost() {
 #[cfg(feature = "discovery")]
 #[test]
 fn topology_change_resynchronizes_a_missing_compact_template_immediately() {
+    #[cfg(feature = "discovery")]
     use crate::discovery::build_discovery_announce;
 
     crate::tests::ensure_common_test_schema();
@@ -1447,13 +1451,15 @@ fn relay_deduplicates_identical_frames_per_side() {
     };
 
     let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
-    let side_b = relay.add_side_packed("B", tx_b);
-    let side_c = relay.add_side_packed("C", tx_c);
+    let _side_b = relay.add_side_packed("B", tx_b);
+    let _side_c = relay.add_side_packed("C", tx_c);
     relay
         .set_source_route_mode(Some(id_src), crate::RouteSelectionMode::Fanout)
         .unwrap();
-    advertise_side(&relay, side_b, "SIDE_B");
-    advertise_side(&relay, side_c, "SIDE_C");
+    #[cfg(feature = "discovery")]
+    advertise_side(&relay, _side_b, "SIDE_B");
+    #[cfg(feature = "discovery")]
+    advertise_side(&relay, _side_c, "SIDE_C");
     relay.process_all_queues_with_timeout(0).unwrap();
 
     let frame = wire_for_value(1);
@@ -1492,14 +1498,15 @@ fn relay_dedup_persists_across_time_advance() {
     let txc = tx_count.clone();
 
     let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
-    let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
+    let _dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
         assert!(!bytes.is_empty());
         if packed_frame_type(bytes) == Some(best_effort_type()) {
             txc.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     });
-    advertise_side(&relay, dst, "DST_SIDE");
+    #[cfg(feature = "discovery")]
+    advertise_side(&relay, _dst, "DST_SIDE");
     relay.process_all_queues_with_timeout(0).unwrap();
 
     let frame = wire_for_value(1);
@@ -1536,14 +1543,15 @@ fn relay_does_not_dedupe_different_frames_from_same_side() {
     let txc = tx_count.clone();
 
     let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
-    let dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
+    let _dst = relay.add_side_packed("DST", move |bytes: &[u8]| -> TelemetryResult<()> {
         assert!(!bytes.is_empty());
         if packed_frame_type(bytes) == Some(best_effort_type()) {
             txc.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     });
-    advertise_side(&relay, dst, "DST_SIDE");
+    #[cfg(feature = "discovery")]
+    advertise_side(&relay, _dst, "DST_SIDE");
     relay.process_all_queues_with_timeout(0).unwrap();
 
     let frame_a = wire_for_value(1);

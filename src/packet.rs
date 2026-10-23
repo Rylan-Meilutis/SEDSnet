@@ -302,7 +302,7 @@ impl Packet {
             return Err(TelemetryError::EmptyEndpoints);
         }
 
-        let element = wire_shape.unwrap_or(message_meta(ty).element);
+        let element = wire_shape.unwrap_or_else(|| message_meta(ty).element);
         Self::validate_payload_against_element(element, &payload)?;
 
         Ok(Self {
@@ -334,7 +334,7 @@ impl Packet {
         if endpoints.is_empty() {
             return Err(TelemetryError::EmptyEndpoints);
         }
-        let element = wire_shape.unwrap_or(message_meta(ty).element);
+        let element = wire_shape.unwrap_or_else(|| message_meta(ty).element);
         Self::validate_payload_against_element(element, &payload)?;
         Ok(Self {
             ty,
@@ -390,6 +390,27 @@ impl Packet {
         )
     }
 
+    /// Build a local publication while retaining owned sender/schema metadata
+    /// and an already-inline payload. Wire identity and validation are identical.
+    pub(crate) fn new_local(
+        ty: DataType,
+        endpoints: Arc<[DataEndpoint]>,
+        sender: Arc<str>,
+        timestamp: u64,
+        payload: StandardSmallPayload,
+    ) -> TelemetryResult<Self> {
+        Self::new_with_owned_wire_contract(
+            ty,
+            endpoints,
+            sender,
+            timestamp,
+            next_packet_nonce(),
+            payload,
+            None,
+            None,
+        )
+    }
+
     /// Create a packet with an explicit nonce value.
     ///
     /// This is mainly useful when callers need stable byte-for-byte wire output
@@ -424,7 +445,8 @@ impl Packet {
     /// still be interpreted after runtime schema churn.
     #[inline]
     fn effective_element(&self) -> MessageElement {
-        self.wire_shape.unwrap_or(message_meta(self.ty).element)
+        self.wire_shape
+            .unwrap_or_else(|| message_meta(self.ty).element)
     }
 
     /// Return the effective primitive payload kind for this packet.

@@ -2921,8 +2921,8 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
         }
         assert_eq!(
             CHUNK_ADMISSION_CALLS.load(Ordering::Relaxed),
-            2,
-            "one failed preflight, one queued bulk eviction, then one retry"
+            3,
+            "one failed preflight, one bulk eviction, successful retry and descriptor admission"
         );
         // Retrying an already retained fragment allocates nothing and must not
         // be rejected (or evict another packet) merely because headroom fell.
@@ -3574,4 +3574,53 @@ fn scheduling_metadata_queries_do_not_allocate_for_known_or_unknown_types() {
             assert_eq!(current.priority, 231);
         }
     }
+}
+
+#[test]
+fn full_topology_response_has_bounded_snapshot_allocation_peak() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let router = Router::new_with_clock(
+        RouterConfig::default()
+            .with_sender("GB")
+            .with_preferred_discovery_master("GS"),
+        Box::new(|| 0),
+    );
+    let ingress = router.add_side_packed("can", |_| Ok(()));
+    let packets = Arc::new(AtomicUsize::new(0));
+    let count = packets.clone();
+    let requester = router.add_side_packet("uart", move |packet| {
+        if packet.data_type() == sedsnet::config::DataType::DiscoveryTopology {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    router
+        .rx_from_side(
+            &sedsnet::discovery::build_discovery_topology("PEER", 0, &large_snapshot_graph())
+                .unwrap(),
+            ingress,
+        )
+        .unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    let request = sedsnet::discovery::build_discovery_topology_request("GS", 0).unwrap();
+    let before = packets.load(Ordering::Relaxed);
+    LIVE_ALLOCATION_DELTA.with(|n| n.set(Some(0)));
+    PEAK_ALLOCATION_DELTA.with(|n| n.set(0));
+    ALLOCATION_COUNT.with(|n| n.set(Some(0)));
+    router.rx_from_side(&request, requester).unwrap();
+    router.drain_queues_with_timeout(0).unwrap();
+    let allocations = ALLOCATION_COUNT.with(|n| n.replace(None).unwrap());
+    let peak = PEAK_ALLOCATION_DELTA.with(|n| n.get());
+    LIVE_ALLOCATION_DELTA.with(|n| n.set(None));
+    assert!(packets.load(Ordering::Relaxed) > before);
+    println!("full topology response: allocations={allocations} peak_bytes={peak}");
+    assert!(
+        allocations <= 500,
+        "discovery election cloned graph names: {allocations} allocations"
+    );
+    assert!(
+        peak <= 17500,
+        "discovery response retained excess graph scratch: {peak} bytes"
+    );
 }

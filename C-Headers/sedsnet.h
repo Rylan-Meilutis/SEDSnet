@@ -804,6 +804,11 @@ int32_t seds_router_copy_reliable_pending(SedsRouter *r, size_t first, SedsRelia
  * Copies min(capacity,16) words; returns required count, or negative error.
  * NULL words allowed only with zero capacity. Output aligned/writable. */
 int32_t seds_router_copy_memory_counters(SedsRouter *r, uint32_t *words, size_t capacity);
+/* Return1 if work remains,0 if idle, negative status for an invalid router.
+ * Workers must bound consecutive active passes to preserve scheduler fairness. */
+int32_t seds_router_has_queued_work(SedsRouter *r);
+/* Allocation-free versioned queue accounting; required word count is16. */
+int32_t seds_router_copy_queue_counters(SedsRouter *r, uint32_t *words, size_t capacity);
 
 /** @brief Return required buffer length for router memory-layout JSON. */
 int32_t seds_router_export_memory_layout_len(SedsRouter * r);

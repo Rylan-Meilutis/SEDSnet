@@ -14,7 +14,6 @@ pub(crate) fn convert<T: Into<U>, U>(bytes: T) -> U {
 }
 
 /// Queue inspection must not retain a full-slice pin after classification.
-#[cfg(any(feature = "std", feature = "fair-admission"))]
 pub(crate) fn with_slice<R>(
     bytes: &SharedBytes,
     read: impl FnOnce(&[u8]) -> R,

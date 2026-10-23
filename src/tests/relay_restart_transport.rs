@@ -340,10 +340,8 @@ fn queue_service_expires_incomplete_transfers_without_new_fragments() {
             SideChunkAssembly {
                 last_seen_ms: 0,
                 total: 2,
-                payload_bytes: u16::try_from(retained.len()).unwrap(),
-                received: [(0, crate::shared_bytes::convert(retained))]
-                    .into_iter()
-                    .collect(),
+                received_count: 1,
+                received: vec![Some(crate::shared_bytes::convert(retained)), None],
             },
         );
     router

@@ -50,8 +50,7 @@ fn partials(node: &Router) -> usize {
         let actual = state
             .rx_chunks
             .values()
-            .flat_map(|a| a.received.values())
-            .map(|p| p.len() + 64)
+            .map(SideChunkAssembly::byte_cost)
             .sum::<usize>();
         assert_eq!(
             state.rx_chunk_bytes, actual,
@@ -61,8 +60,7 @@ fn partials(node: &Router) -> usize {
     st.side_transport
         .values()
         .flat_map(|s| s.rx_chunks.values())
-        .flat_map(|a| a.received.values())
-        .map(|p| p.len() + 64)
+        .map(SideChunkAssembly::byte_cost)
         .sum()
 }
 fn populate(node: &Router, a: usize, b: usize) {
@@ -359,7 +357,7 @@ fn shared_chunk_budget_same_transfer_id_is_scoped_to_each_link() {
         .unwrap();
     let st = node.state.lock();
     assert!(!st.side_transport[&a].rx_chunks.contains_key(&7));
-    assert_eq!(st.side_transport[&b].rx_chunks[&7].received.len(), 2);
+    assert_eq!(st.side_transport[&b].rx_chunks[&7].received_len(), 2);
     assert!(st.shared_queue_bytes_used() <= st.memory.max_queue_budget);
 }
 
@@ -404,7 +402,10 @@ fn shared_chunk_budget_busy_is_retryable_memory_pressure() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(partials(&node), 176);
+    assert_eq!(
+        partials(&node),
+        160 + 3 * core::mem::size_of::<Option<Arc<[u8]>>>()
+    );
 }
 
 #[test]

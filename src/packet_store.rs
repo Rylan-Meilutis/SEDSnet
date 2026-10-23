@@ -443,10 +443,7 @@ impl ParkedPayload {
     }
     /// Internal inspection pins only for this call, preserving movability of
     /// queued frames that have no ordinary full-slice consumer.
-    #[cfg(all(
-        feature = "compact-packet-store",
-        any(feature = "std", feature = "fair-admission")
-    ))]
+    #[cfg(feature = "compact-packet-store")]
     pub(crate) fn with_slice<R>(&self, read: impl FnOnce(&[u8]) -> R) -> TelemetryResult<R> {
         let view = self.handle.pin()?;
         Ok(read(&view))

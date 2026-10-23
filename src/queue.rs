@@ -53,6 +53,8 @@ pub struct BoundedDeque<T> {
     grow_num: usize,
     grow_den: usize,
     fixed_capacity: bool,
+    // Rotate bounded service opportunities through waiting lower bands.
+    fair_priority_cursor: u8,
 }
 
 #[cfg(feature = "compact-packet-store")]
@@ -68,6 +70,7 @@ impl<T: Clone> Clone for BoundedDeque<T> {
             grow_num: self.grow_num,
             grow_den: self.grow_den,
             fixed_capacity: self.fixed_capacity,
+            fair_priority_cursor: self.fair_priority_cursor,
         }
     }
 }
@@ -167,6 +170,7 @@ impl<T: ByteCost> BoundedDeque<T> {
             grow_num,
             grow_den,
             fixed_capacity: grow_mult == 1.0 || cfg!(feature = "compact-packet-store"),
+            fair_priority_cursor: u8::MAX,
         }
     }
 
@@ -204,6 +208,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     pub fn clear(&mut self) {
         self.q.clear();
         self.cur_bytes = 0;
+        self.fair_priority_cursor = u8::MAX;
     }
 
     /// Current used bytes (according to `ByteCost`).
@@ -285,7 +290,11 @@ impl<T: ByteCost> BoundedDeque<T> {
         // Explicit indexing avoids a second generic iterator traversal on
         // small MCUs. The first match retains FIFO within the lowest priority.
         let mut index = 0;
-        while self.q.get(index).is_some_and(|item| priority_of(item) != lowest) {
+        while self
+            .q
+            .get(index)
+            .is_some_and(|item| priority_of(item) != lowest)
+        {
             index += 1;
         }
         self.remove_pos(index)
@@ -307,20 +316,32 @@ impl<T: ByteCost> BoundedDeque<T> {
             let mut ready = self.q.iter().enumerate().filter(|(_, item)| eligible(item));
             let (front, first) = ready.next()?;
             let front_priority = priority_of(first);
-            let mut lowest = front;
-            let mut lowest_priority = front_priority;
+            let mut lower = front;
+            let mut lower_priority = front_priority;
+            let mut best_distance = u8::MAX;
             for (index, item) in ready {
                 let priority = priority_of(item);
-                if priority < lowest_priority {
-                    lowest = index;
-                    lowest_priority = priority;
+                if priority >= front_priority {
+                    continue;
+                }
+                // Descend from the previous service band, then wrap. Equal
+                // distances retain the first eligible item (FIFO in a band).
+                let distance = self
+                    .fair_priority_cursor
+                    .wrapping_sub(priority)
+                    .wrapping_sub(1);
+                if lower == front || distance < best_distance {
+                    lower = index;
+                    lower_priority = priority;
+                    best_distance = distance;
                 }
             }
-            if front_priority > lowest_priority && *priority_burst >= max_priority_burst {
+            if lower != front && *priority_burst >= max_priority_burst {
                 *priority_burst = 0;
-                lowest
+                self.fair_priority_cursor = lower_priority;
+                lower
             } else {
-                if front_priority > lowest_priority {
+                if lower != front {
                     *priority_burst = priority_burst.saturating_add(1);
                 } else {
                     *priority_burst = 0;
@@ -375,9 +396,17 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     /// Retain only the elements specified by the predicate, updating byte count.
-    pub fn retain<F>(&mut self, mut keep: F)
+    pub fn retain<F>(&mut self, keep: F)
     where
         F: FnMut(&T) -> bool,
+    {
+        self.retain_observed(keep, core::mem::drop)
+    }
+
+    pub(crate) fn retain_observed<F, E>(&mut self, mut keep: F, mut evicted: E)
+    where
+        F: FnMut(&T) -> bool,
+        E: FnMut(T),
     {
         let mut idx = 0;
         while idx < self.q.len() {
@@ -385,7 +414,9 @@ impl<T: ByteCost> BoundedDeque<T> {
             if keep_item {
                 idx += 1;
             } else {
-                let _ = self.remove_pos(idx);
+                if let Some(old) = self.remove_pos(idx) {
+                    evicted(old);
+                }
             }
         }
     }
@@ -482,11 +513,27 @@ impl<T: ByteCost> BoundedDeque<T> {
     ///
     /// `priority_of` must return a larger value for higher-priority items.
     /// Items with equal priority preserve FIFO order.
-    #[allow(unused_mut)]
-    pub fn push_back_prioritized<F>(&mut self, mut v: T, mut priority_of: F) -> TelemetryResult<()>
+    pub fn push_back_prioritized<F>(&mut self, v: T, priority_of: F) -> TelemetryResult<()>
     where
         F: FnMut(&T) -> u8,
     {
+        self.push_back_prioritized_observed(v, priority_of, core::mem::drop)
+    }
+
+    /// Observe removed entries so queue owners can release replay reservations.
+    /// Refusing the incoming entry never reports it as an earlier eviction.
+    pub(crate) fn push_back_prioritized_observed<F, E>(
+        &mut self,
+        v: T,
+        mut priority_of: F,
+        mut evicted: E,
+    ) -> TelemetryResult<()>
+    where
+        F: FnMut(&T) -> u8,
+        E: FnMut(T),
+    {
+        #[cfg(feature = "compact-packet-store")]
+        let mut v = v;
         #[cfg(feature = "compact-packet-store")]
         v.park_for_queue()?;
         if self.q.capacity() == 0 {
@@ -500,76 +547,86 @@ impl<T: ByteCost> BoundedDeque<T> {
         }
 
         let new_priority = priority_of(&v);
-        while !self.q.is_empty() && self.cur_bytes + cost > self.max_bytes {
+        // All admission limits share one eviction point. Besides avoiding
+        // repeated priority checks, this guarantees every removed entry has
+        // its reservation released exactly once.
+        loop {
+            let limit = self.cur_bytes.saturating_add(cost) > self.max_bytes
+                || self.q.len() >= self.max_elems
+                || (self.fixed_capacity && self.q.len() >= self.q.capacity());
+            if !limit && self.ensure_room_for_one() {
+                break;
+            }
             let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
             if tail_priority > new_priority
                 || (new_priority == 254 && tail_priority == new_priority)
             {
                 return Err(TelemetryError::Io("priority queue saturated"));
             }
-            let _ = self.pop_back();
+            let old = self
+                .pop_back()
+                .ok_or(TelemetryError::Io("queue unavailable"))?;
+            evicted(old);
         }
 
-        if self.q.len() >= self.max_elems {
-            let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
-            if tail_priority > new_priority
-                || (new_priority == 254 && tail_priority == new_priority)
-            {
-                return Err(TelemetryError::Io("priority queue saturated"));
-            }
-            let _ = self.pop_back();
-        }
+        self.insert_prioritized_prepared(v, cost, new_priority, priority_of);
+        Ok(())
+    }
 
-        if self.fixed_capacity && self.q.len() >= self.q.capacity() {
-            let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
-            if tail_priority > new_priority
-                || (new_priority == 254 && tail_priority == new_priority)
-            {
-                return Err(TelemetryError::Io("priority queue saturated"));
-            }
-            let _ = self.pop_back();
-        }
-
-        if !self.ensure_room_for_one() {
-            // Preserve protected ACK ordering and higher-priority ownership
-            // when growing the backing ring is refused. Otherwise discard the
-            // lowest-priority item and admit into the already allocated slot.
-            let tail_priority = self.q.back().map(&mut priority_of).unwrap_or(0);
-            if tail_priority > new_priority
-                || (new_priority == 254 && tail_priority == new_priority)
-            {
-                return Err(TelemetryError::Io("priority queue saturated"));
-            }
-            let _ = self.pop_back();
-        }
-
-        let insert_at = self
+    // Call only after parking and all capacity/byte/element limits succeeded.
+    // A selected victim must not be followed by a second admission pass that
+    // can park again or choose a different entry to evict.
+    fn insert_prioritized_prepared<F>(
+        &mut self,
+        v: T,
+        cost: usize,
+        new_priority: u8,
+        mut priority_of: F,
+    ) where
+        F: FnMut(&T) -> u8,
+    {
+        // Priority insertion maintains descending order. Most sensor traffic
+        // appends to its existing priority band; do not scan the whole backlog
+        // just to discover that its insertion point is the tail.
+        if self
             .q
-            .iter()
-            .position(|existing| priority_of(existing) < new_priority);
-        if let Some(idx) = insert_at {
-            self.q.insert(idx, v);
-        } else {
+            .back()
+            .is_none_or(|tail| priority_of(tail) >= new_priority)
+        {
             self.q.push_back(v);
+        } else if self
+            .q
+            .front()
+            .is_some_and(|head| priority_of(head) < new_priority)
+        {
+            self.q.push_front(v);
+        } else {
+            // Keep equal-priority FIFO order while locating a band boundary
+            // in logarithmic work, including a wrapped backing ring.
+            let index = self
+                .q
+                .partition_point(|existing| priority_of(existing) >= new_priority);
+            self.q.insert(index, v);
         }
         self.cur_bytes = self.cur_bytes.saturating_add(cost);
-        Ok(())
     }
     /// Apply a bounded cold-path selector before normal priority insertion.
     /// Preparing all limits first prevents the insertion fallback from evicting
     /// a different peer. Builds without fairness keep the original insertion.
-    #[cfg(any(feature = "std", feature = "fair-admission", test))]
-    #[allow(unused_mut)]
-    pub(crate) fn push_back_prioritized_select<F, V>(
+    pub(crate) fn push_back_prioritized_select<F, V, E>(
         &mut self,
-        mut v: T,
+        v: T,
         mut priority_of: F,
         mut victim: V,
+        mut evicted: E,
     ) -> TelemetryResult<()>
     where
         F: FnMut(&T) -> u8,
         V: FnMut(&Self, &T) -> Option<usize>,
+        E: FnMut(T),
     {
+        #[cfg(feature = "compact-packet-store")]
+        let mut v = v;
         #[cfg(feature = "compact-packet-store")]
         v.park_for_queue()?;
         if self.q.capacity() == 0 {
@@ -599,9 +656,12 @@ impl<T: ByteCost> BoundedDeque<T> {
             {
                 return Err(TelemetryError::Io("priority queue saturated"));
             }
-            let _ = self.remove_pos(index);
+            if let Some(old) = self.remove_pos(index) {
+                evicted(old);
+            }
         }
-        self.push_back_prioritized(v, priority_of)
+        self.insert_prioritized_prepared(v, cost, new_priority, priority_of);
+        Ok(())
     }
 }
 
@@ -620,6 +680,155 @@ mod tests {
         fn byte_cost(&self) -> usize {
             self.cost
         }
+    }
+
+    #[cfg(feature = "compact-packet-store")]
+    #[test]
+    fn selected_admission_parks_a_compact_payload_only_once() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        impl ByteCost for Counted {
+            fn byte_cost(&self) -> usize {
+                8
+            }
+            fn park_for_queue(&mut self) -> TelemetryResult<()> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut queue = BoundedDeque::new(128, 16, 1.25);
+        queue
+            .push_back_prioritized_select(
+                Counted(count.clone()),
+                |_| 1,
+                |_, _| None,
+                core::mem::drop,
+            )
+            .unwrap();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "prepared insertion must not park or admit an accepted payload a second time"
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.bytes_used(), 8);
+    }
+
+    #[test]
+    fn equal_priority_append_classifies_constant_work_under_backlog() {
+        let mut queue = BoundedDeque::new(16384, 16384, 1.25);
+        for id in 0..=255 {
+            queue
+                .push_back(Item {
+                    id,
+                    cost: 1,
+                    priority: 16,
+                })
+                .unwrap();
+        }
+        let mut classifications = 0;
+        queue
+            .push_back_prioritized(
+                Item {
+                    id: 0,
+                    cost: 1,
+                    priority: 16,
+                },
+                |item| {
+                    classifications += 1;
+                    item.priority
+                },
+            )
+            .unwrap();
+        assert!(
+            classifications <= 3,
+            "equal-priority append scanned a 256-entry backlog: {classifications} classifications"
+        );
+        assert_eq!(queue.len(), 257);
+        for id in 0..=255 {
+            assert_eq!(queue.pop_front().unwrap().id, id);
+        }
+        assert_eq!(queue.pop_front().unwrap().id, 0);
+    }
+
+    #[test]
+    fn middle_priority_insertion_avoids_a_linear_backlog_scan() {
+        let mut queue = BoundedDeque::new(16384, 16384, 1.25);
+        for id in 0..=255 {
+            queue
+                .push_back(Item {
+                    id,
+                    cost: 1,
+                    priority: 16,
+                })
+                .unwrap();
+        }
+        queue
+            .push_back(Item {
+                id: 0,
+                cost: 1,
+                priority: 0,
+            })
+            .unwrap();
+        let mut classifications = 0;
+        queue
+            .push_back_prioritized(
+                Item {
+                    id: 99,
+                    cost: 2,
+                    priority: 16,
+                },
+                |item| {
+                    classifications += 1;
+                    item.priority
+                },
+            )
+            .unwrap();
+        assert!(
+            classifications <= 16,
+            "one low-priority peer restored a linear scan: {classifications} classifications"
+        );
+        for id in 0..=255 {
+            let item = queue.pop_front().unwrap();
+            assert_eq!((item.id, item.cost, item.priority), (id, 1, 16));
+        }
+        let new_item = queue.pop_front().unwrap();
+        assert_eq!((new_item.id, new_item.cost, new_item.priority), (99, 2, 16));
+        assert_eq!(queue.pop_front().unwrap().priority, 0);
+    }
+
+    #[test]
+    fn priority_band_boundaries_preserve_fifo_after_ring_wrap() {
+        let mut queue = BoundedDeque::new(4096, 32 * core::mem::size_of::<Item>(), 1.0);
+        let mut expected = alloc::vec::Vec::new();
+        let mut wrapped = false;
+        for step in 0..1024usize {
+            if queue.len() >= 24 {
+                assert_eq!(queue.pop_front().unwrap(), expected.remove(0));
+            } else {
+                let item = Item {
+                    id: step as u8,
+                    cost: 1,
+                    priority: (step * 37 % 7) as u8,
+                };
+                queue
+                    .push_back_prioritized(item.clone(), |v| v.priority)
+                    .unwrap();
+                expected.push(item);
+                expected.sort_by_key(|v| core::cmp::Reverse(v.priority));
+            }
+            wrapped |= !queue.q.as_slices().1.is_empty();
+            assert_eq!(
+                queue.iter().cloned().collect::<alloc::vec::Vec<_>>(),
+                expected
+            );
+        }
+        assert!(
+            wrapped,
+            "the regression must exercise the split backing ring"
+        );
     }
 
     #[test]
@@ -692,6 +901,128 @@ mod tests {
         assert_eq!(q.pop_lowest_priority().map(|item| item.id), Some(1));
         assert_eq!(q.pop_front().map(|item| item.id), Some(2));
         assert_eq!(q.pop_front().map(|item| item.id), Some(3));
+    }
+
+    #[test]
+    fn every_lower_priority_band_gets_a_turn_before_rotation_wraps() {
+        let mut q = BoundedDeque::new(8192, 8192, 1.0);
+        for priority in 0..255 {
+            q.push_back_prioritized(
+                Item {
+                    id: priority,
+                    cost: 1,
+                    priority,
+                },
+                |i| i.priority,
+            )
+            .unwrap();
+        }
+        let mut burst = 0;
+        let mut seen = alloc::vec::Vec::new();
+        for _ in 0..9 * 256 {
+            q.push_back_prioritized(
+                Item {
+                    id: 255,
+                    cost: 1,
+                    priority: 255,
+                },
+                |i| i.priority,
+            )
+            .unwrap();
+            let item = q.pop_front_fair(&mut burst, 8, |i| i.priority).unwrap();
+            if item.priority != 255 {
+                seen.push(item.priority);
+                q.push_back_prioritized(item, |i| i.priority).unwrap();
+            }
+        }
+        let mut expected: alloc::vec::Vec<u8> = (0..255).rev().collect();
+        expected.push(254);
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn band_rotation_preserves_fifo_and_skips_deferred_items() {
+        let mut q = BoundedDeque::new(4096, 4096, 1.0);
+        for (id, priority) in [(1, 254), (2, 254), (3, 16)] {
+            q.push_back_prioritized(
+                Item {
+                    id,
+                    cost: 1,
+                    priority,
+                },
+                |i| i.priority,
+            )
+            .unwrap();
+        }
+        let mut burst = 8;
+        let first = q
+            .pop_front_fair_if(&mut burst, 8, |i| i.priority, |i| i.id != 1 && i.id != 2)
+            .unwrap();
+        assert_eq!(first.id, 3);
+        let mut seen = alloc::vec::Vec::new();
+        for _ in 0..27 {
+            q.push_back_prioritized(
+                Item {
+                    id: 255,
+                    cost: 1,
+                    priority: 255,
+                },
+                |i| i.priority,
+            )
+            .unwrap();
+            let item = q
+                .pop_front_fair_if(&mut burst, 8, |i| i.priority, |_| true)
+                .unwrap();
+            if item.id != 255 {
+                seen.push(item.id);
+            }
+        }
+        assert_eq!(seen, alloc::vec![1, 2]);
+        // The cursor occupies existing tail padding on the supported layouts.
+        assert_eq!(
+            core::mem::size_of::<BoundedDeque<Item>>(),
+            10 * core::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn sustained_receipts_and_bulk_cannot_starve_managed_updates_between_them() {
+        let mut q = BoundedDeque::new(4096, 4096, 1.0);
+        for priority in [16, 254] {
+            q.push_back_prioritized(
+                Item {
+                    id: priority,
+                    cost: 1,
+                    priority,
+                },
+                |i| i.priority,
+            )
+            .unwrap();
+        }
+        let mut burst = 0;
+        let mut seen = alloc::vec::Vec::new();
+        for _ in 0..18 {
+            // A live receipt stream keeps the highest band continuously ready.
+            q.push_back_prioritized(
+                Item {
+                    id: 255,
+                    cost: 1,
+                    priority: 255,
+                },
+                |i| i.priority,
+            )
+            .unwrap();
+            let item = q.pop_front_fair(&mut burst, 8, |i| i.priority).unwrap();
+            if item.priority != 255 {
+                seen.push(item.priority);
+                q.push_back_prioritized(item, |i| i.priority).unwrap();
+            }
+        }
+        assert_eq!(
+            seen,
+            alloc::vec![254, 16],
+            "every waiting band needs a bounded service turn"
+        );
     }
 
     #[test]
@@ -1164,7 +1495,8 @@ mod fair_selector_tests {
                             priority: 0
                         },
                         |item| item.priority,
-                        |_, _| selected
+                        |_, _| selected,
+                        core::mem::drop,
                     )
                     .is_err()
             );

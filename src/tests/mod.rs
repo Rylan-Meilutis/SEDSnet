@@ -133,6 +133,7 @@ pub(crate) fn count_packed_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> u
         .count()
 }
 
+#[cfg(feature = "discovery")]
 pub(crate) fn count_packets_of_type(pkts: &[Packet], ty: DataType) -> usize {
     pkts.iter().filter(|pkt| pkt.data_type() == ty).count()
 }
@@ -469,3 +470,6 @@ fn scheduler_reserves_discovery_and_shared_state_priority_bands() {
     assert!(discovery > managed);
     assert!(managed > user);
 }
+
+#[cfg(feature = "discovery")]
+mod borrowed_election;

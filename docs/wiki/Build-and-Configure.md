@@ -380,3 +380,18 @@ admission estimate; it does not grow pools, lower safety reserves or evict route
 schema, reliable replay or protected controls. Arbitration scans queues only on
 refusal and keeps no resident per-peer catalog. More than 32 queued bulk origins
 falls back to refusal rather than guessing an eviction victim.
+
+
+### Cargo artifact directories
+
+The Python builder and CMake integration resolve Cargo's effective target
+directory through `cargo metadata`. Both respect `.cargo/config.toml` and
+`CARGO_TARGET_DIR`; CMake's explicit `SEDSNET_ENV_CARGO_TARGET_DIR` overrides the
+inherited environment. Library and wheel lookup use the same resolved directory.
+The CMake source package includes `cargo_paths.py`; keep it with `build.py`.
+
+`ingress-target-filter` is enabled by hosted builds. Embedded builds can opt in
+with `--features embedded,ingress-target-filter` when receiving targeted traffic
+that belongs entirely to their ingress segment. Validation, current discovery
+and route policy must prove the packet irrelevant before filtering; cold/unknown
+routes, managed variables and internal control traffic take the ordinary path.

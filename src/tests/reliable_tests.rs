@@ -217,7 +217,10 @@ fn direct_tx_handler_failure_emits_error_without_queue_drain() {
     )
     .unwrap();
 
-    router.rx(&pkt).unwrap();
+    assert!(matches!(
+        router.rx(&pkt),
+        Err(crate::TelemetryError::HandlerError("local handler failed"))
+    ));
 
     let seen = seen.lock().unwrap().clone();
     assert!(

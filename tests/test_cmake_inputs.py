@@ -1,5 +1,6 @@
 """Exercise actual Ninja dependency edges without downloading or rebuilding Rust."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ class CMakeInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="seds inputs ") as temp:
             root=Path(temp); source=root/"crate"; output=root/"cmake build"; source.mkdir()
             (source/"CMakeLists.txt").write_text(CMAKE_TEMPLATE.read_text())
+            shutil.copy2(CMAKE_TEMPLATE.parent/"cargo_paths.py", source/"cargo_paths.py")
             for directory in ["C-Headers", "src", "sedsnet_macros/src"]: (source/directory).mkdir(parents=True)
             (source/"C-Headers/sedsnet.h").write_text("// test header\n")
             (source/"Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
@@ -19,7 +21,7 @@ class CMakeInputTests(unittest.TestCase):
             macro=source/"sedsnet_macros/src/lib.rs"; macro.write_text("// macro v1\n")
             (source/"build.py").write_text("from pathlib import Path\np=Path('target/release/libsedsnet.a');p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'!<arch>\\n')\nc=Path('invocations');c.write_text(c.read_text()+'x' if c.exists() else 'x')\n")
             def run(args):
-                result=subprocess.run(args,text=True,capture_output=True)
+                result=subprocess.run(args,text=True,capture_output=True,env={**os.environ,"CARGO_TARGET_DIR":str(source/"target")})
                 self.assertEqual(result.returncode,0,result.stdout+result.stderr)
             def build(): run(["cmake","--build",str(output),"--target","sedsnet_build"])
             def count(): return len((source/"invocations").read_text())

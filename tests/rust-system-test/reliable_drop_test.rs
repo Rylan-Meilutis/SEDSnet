@@ -946,6 +946,367 @@ mod reliable_drop_tests {
     }
 
     #[test]
+    fn unordered_pressure_batches_recover_lost_data_and_receipt_without_duplicates() {
+        ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = register_data_type_with_description(
+            "UNORDERED_PRESSURE_SD_REGRESSION",
+            "44-byte source-timed pressure batches",
+            MessageElement::Static(44, MessageDataType::UInt8, MessageClass::Data),
+            &[ep],
+            ReliableMode::Unordered,
+            200,
+        )
+        .unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let dest = Router::new_with_clock(
+            RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, move |pkt| {
+                if pkt.data_type() == ty {
+                    assert_eq!(pkt.payload().len(), 44);
+                    assert!(pkt.payload().iter().all(|byte| *byte == pkt.payload()[0]));
+                    sink.lock().unwrap().push(pkt.payload()[0]);
+                }
+                Ok(())
+            })])
+            .with_sender("DEST"),
+            shared_clock(now.clone()),
+        );
+        let source = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("SOURCE"),
+            shared_clock(now.clone()),
+        );
+        let gateway = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GATEWAY"),
+            shared_clock(now.clone()),
+        );
+        let up = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let down = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let back = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let ack = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let opts = RouterSideOptions {
+            reliable_enabled: false,
+            link_local_enabled: false,
+            ..Default::default()
+        };
+        let q = up.clone();
+        let ss = source.add_side_packed_with_options(
+            "can",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts.clone(),
+        );
+        let q = back.clone();
+        let gs = gateway.add_side_packed_with_options(
+            "can",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts.clone(),
+        );
+        let q = down.clone();
+        let gd = gateway.add_side_packed_with_options(
+            "uart",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts.clone(),
+        );
+        let q = ack.clone();
+        let ds = dest.add_side_packed_with_options(
+            "uart",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts,
+        );
+        let announce = build_discovery_announce("DEST", 0, &[ep]).unwrap();
+        source.rx_from_side(&announce, ss).unwrap();
+        gateway.rx_from_side(&announce, gd).unwrap();
+        for q in [&up, &down, &back, &ack] {
+            drain_queue(q);
+        }
+        for (index, value) in [1u8, 2, 3].into_iter().enumerate() {
+            source
+                .tx(Packet::new(
+                    ty,
+                    &[ep],
+                    "SOURCE",
+                    index as u64 + 1,
+                    Arc::<[u8]>::from([value; 44]),
+                )
+                .unwrap())
+                .unwrap();
+        }
+        let initial = drain_queue(&up);
+        for b in initial {
+            gateway.rx_packed_from_side(&b, gs).unwrap();
+        }
+        let mut dropped_ack = false;
+        let mut dropped_data = false;
+        let mut wire_transitions = Vec::new();
+        for _ in 0..40 {
+            source.process_all_queues().unwrap();
+            gateway.process_all_queues().unwrap();
+            dest.process_all_queues().unwrap();
+            for b in drain_queue(&up) {
+                gateway.rx_packed_from_side(&b, gs).unwrap();
+            }
+            for b in drain_queue(&down) {
+                if wire_format::peek_envelope(&b).unwrap().ty == ty {
+                    let value = wire_format::unpack_packet(&b).unwrap().payload()[0];
+                    wire_transitions.push(value);
+                    if value == 1 && !dropped_data {
+                        dropped_data = true;
+                        continue;
+                    }
+                }
+                dest.rx_packed_from_side(&b, ds).unwrap();
+            }
+            for b in drain_queue(&ack) {
+                if wire_format::peek_envelope(&b).unwrap().ty == DataType::ReliableAck
+                    && !dropped_ack
+                {
+                    dropped_ack = true;
+                    continue;
+                }
+                gateway.rx_packed_from_side(&b, gd).unwrap();
+            }
+            for b in drain_queue(&back) {
+                source.rx_packed_from_side(&b, ss).unwrap();
+            }
+            now.fetch_add(RELIABLE_RETRANSMIT_MS, Ordering::SeqCst);
+            if received.lock().unwrap().len() == 3
+                && source
+                    .export_runtime_stats()
+                    .reliable
+                    .end_to_end_pending_count
+                    == 0
+            {
+                break;
+            }
+        }
+        assert!(dropped_data && dropped_ack);
+        let mut values = received.lock().unwrap().clone();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            vec![1, 2, 3],
+            "each accepted batch must reach the SD handler exactly once"
+        );
+        assert!(wire_transitions.iter().filter(|value| **value == 1).count() >= 2);
+        assert_eq!(
+            source
+                .export_runtime_stats()
+                .reliable
+                .end_to_end_pending_count,
+            0
+        );
+    }
+
+    #[test]
+    fn pressure_sd_busy_handler_withholds_receipt_until_atomic_handoff_succeeds() {
+        for decoded in [false, true] {
+            for packed_handler in [false, true] {
+                pressure_sd_busy_case(decoded, packed_handler);
+            }
+        }
+    }
+
+    fn pressure_sd_busy_case(decoded: bool, packed_handler: bool) {
+        ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = register_data_type_with_description(
+            "PRESSURE_SD_BUSY_HANDOFF_REGRESSION",
+            "44-byte source-timed pressure batches",
+            MessageElement::Static(44, MessageDataType::UInt8, MessageClass::Data),
+            &[ep],
+            ReliableMode::Unordered,
+            200,
+        )
+        .unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = handler_calls.clone();
+        let handle_packet = move |pkt: &Packet| {
+            if pkt.data_type() == ty {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                    return Err(sedsnet::TelemetryError::Io("SD batch queue full"));
+                }
+                assert_eq!(pkt.payload().len(), 44);
+                assert!(pkt.payload().iter().all(|byte| *byte == pkt.payload()[0]));
+                sink.lock().unwrap().push(pkt.payload()[0]);
+            }
+            Ok(())
+        };
+        let handler = if packed_handler {
+            EndpointHandler::new_packed_handler(ep, move |bytes| {
+                handle_packet(&wire_format::unpack_packet(bytes)?)
+            })
+        } else {
+            EndpointHandler::new_packet_handler(ep, handle_packet)
+        };
+        let dest = Router::new_with_clock(
+            RouterConfig::new(vec![handler]).with_sender("DEST"),
+            shared_clock(now.clone()),
+        );
+        let source = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("SOURCE"),
+            shared_clock(now.clone()),
+        );
+        let gateway = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GATEWAY"),
+            shared_clock(now.clone()),
+        );
+        let up = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let down = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let back = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let ack = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let opts = RouterSideOptions {
+            reliable_enabled: false,
+            link_local_enabled: false,
+            ..Default::default()
+        };
+        let q = up.clone();
+        let ss = source.add_side_packed_with_options(
+            "can",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts.clone(),
+        );
+        let q = back.clone();
+        let gs = gateway.add_side_packed_with_options(
+            "can",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts.clone(),
+        );
+        let q = down.clone();
+        let gd = gateway.add_side_packed_with_options(
+            "uart",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts.clone(),
+        );
+        let q = ack.clone();
+        let ds = dest.add_side_packed_with_options(
+            "uart",
+            move |b| {
+                q.lock().unwrap().push_back(b.to_vec());
+                Ok(())
+            },
+            opts,
+        );
+        let announce = build_discovery_announce("DEST", 0, &[ep]).unwrap();
+        source.rx_from_side(&announce, ss).unwrap();
+        gateway.rx_from_side(&announce, gd).unwrap();
+        for q in [&up, &down, &back, &ack] {
+            drain_queue(q);
+        }
+        for (index, value) in [1u8, 2, 3].into_iter().enumerate() {
+            source
+                .tx(Packet::new(
+                    ty,
+                    &[ep],
+                    "SOURCE",
+                    index as u64 + 1,
+                    Arc::<[u8]>::from([value; 44]),
+                )
+                .unwrap())
+                .unwrap();
+        }
+        let initial = drain_queue(&up);
+        for b in initial {
+            gateway.rx_packed_from_side(&b, gs).unwrap();
+        }
+        let mut dropped_ack = false;
+        let mut dropped_data = false;
+        let mut wire_transitions = Vec::new();
+        for _ in 0..40 {
+            source.process_all_queues().unwrap();
+            gateway.process_all_queues().unwrap();
+            dest.process_all_queues().unwrap();
+            for b in drain_queue(&up) {
+                gateway.rx_packed_from_side(&b, gs).unwrap();
+            }
+            for b in drain_queue(&down) {
+                if wire_format::peek_envelope(&b).unwrap().ty == ty {
+                    let value = wire_format::unpack_packet(&b).unwrap().payload()[0];
+                    wire_transitions.push(value);
+                    if value == 1 && !dropped_data {
+                        dropped_data = true;
+                        continue;
+                    }
+                }
+                let outcome = if decoded {
+                    dest.rx_from_side(&wire_format::unpack_packet(&b).unwrap(), ds)
+                } else {
+                    dest.rx_packed_from_side(&b, ds)
+                };
+                if let Err(error) = outcome {
+                    assert!(matches!(
+                        error,
+                        sedsnet::TelemetryError::HandlerError("local handler failed")
+                    ));
+                }
+            }
+            for b in drain_queue(&ack) {
+                if wire_format::peek_envelope(&b).unwrap().ty == DataType::ReliableAck
+                    && !dropped_ack
+                {
+                    dropped_ack = true;
+                    continue;
+                }
+                gateway.rx_packed_from_side(&b, gd).unwrap();
+            }
+            for b in drain_queue(&back) {
+                source.rx_packed_from_side(&b, ss).unwrap();
+            }
+            now.fetch_add(RELIABLE_RETRANSMIT_MS, Ordering::SeqCst);
+            if received.lock().unwrap().len() == 3
+                && source
+                    .export_runtime_stats()
+                    .reliable
+                    .end_to_end_pending_count
+                    == 0
+            {
+                break;
+            }
+        }
+        assert!(dropped_data && dropped_ack);
+        assert!(handler_calls.load(Ordering::SeqCst) > 3);
+        let mut values = received.lock().unwrap().clone();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            vec![1, 2, 3],
+            "each accepted batch must reach the SD handler exactly once"
+        );
+        assert!(wire_transitions.iter().filter(|value| **value == 1).count() >= 2);
+        assert_eq!(
+            source
+                .export_runtime_stats()
+                .reliable
+                .end_to_end_pending_count,
+            0
+        );
+    }
+
+    #[test]
     fn end_to_end_reliable_ack_routes_back_without_flooding() {
         ensure_common_test_schema();
         let now = Arc::new(AtomicU64::new(0));

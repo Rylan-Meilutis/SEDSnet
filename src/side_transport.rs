@@ -764,14 +764,16 @@ mod streamed_chunk_tests {
 pub(crate) struct SideChunkAssembly {
     pub(crate) last_seen_ms: u64,
     pub(crate) total: u16,
-    // Fragments remain pinned until assembly. An arena-aware payload enum here
-    // cannot compact those bytes and multiplies every B-tree node's size.
-    // Keep the transient shared slice; completed frames still use the store.
-    pub(crate) received: BTreeMap<u16, Arc<[u8]>>,
-    pub(crate) payload_bytes: u16,
+    // One bounded descriptor allocation replaces repeated B-tree node growth.
+    // Payloads remain shared slices; completed frames still use the store.
+    pub(crate) received: Vec<Option<Arc<[u8]>>>,
+    pub(crate) received_count: u16,
 }
 
 impl SideChunkAssembly {
+    // Arc/allocator bookkeeping and padding, excluding the separately charged
+    // descriptor vector. The former 64-byte estimate included B-tree entries.
+    const FRAGMENT_OVERHEAD: usize = 48;
     #[inline(never)]
     pub(crate) fn oldest(chunks: &BTreeMap<u32, Self>, keep: Option<u32>) -> Option<(u32, u64)> {
         let mut victim = None;
@@ -785,31 +787,76 @@ impl SideChunkAssembly {
         }
         victim.map(|id| (id, time))
     }
-    /// Retained cost, inspected only when removing an assembly or seeding tests.
-    pub(crate) fn byte_cost(&self) -> usize {
-        let payload = if self.payload_bytes == u16::MAX {
-            self.received.values().map(|p| p.len()).sum::<usize>()
-        } else {
-            usize::from(self.payload_bytes)
-        };
-        payload.saturating_add(self.received.len().saturating_mul(64))
+    fn descriptor_bytes(total: u16) -> usize {
+        usize::from(total).saturating_mul(core::mem::size_of::<Option<Arc<[u8]>>>())
     }
-    pub(crate) fn insert_with(&mut self, index: u16, make: impl FnOnce() -> Arc<[u8]>) -> usize {
-        if let alloc::collections::btree_map::Entry::Vacant(slot) = self.received.entry(index) {
-            let bytes = make();
-            let cost = bytes.len().saturating_add(64);
-            self.payload_bytes = self
-                .payload_bytes
-                .saturating_add(u16::try_from(bytes.len()).unwrap_or(u16::MAX));
-            slot.insert(bytes);
-            cost
-        } else {
-            0
+    pub(crate) fn received_len(&self) -> usize {
+        usize::from(self.received_count)
+    }
+    pub(crate) fn contains_index(&self, index: u16) -> bool {
+        self.received
+            .get(usize::from(index))
+            .is_some_and(Option::is_some)
+    }
+    /// Include allocated descriptors even before the last fragment arrives.
+    pub(crate) fn byte_cost(&self) -> usize {
+        self.received
+            .iter()
+            .flatten()
+            .map(|p| p.len())
+            .sum::<usize>()
+            .saturating_add(self.received_len().saturating_mul(Self::FRAGMENT_OVERHEAD))
+            .saturating_add(
+                self.received
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<Option<Arc<[u8]>>>()),
+            )
+    }
+    pub(crate) fn insert_with(
+        &mut self,
+        index: u16,
+        now_ms: u64,
+        make: impl FnOnce() -> Arc<[u8]>,
+    ) -> TelemetryResult<usize> {
+        if index >= self.total {
+            return Err(TelemetryError::Unpack("invalid side chunk index"));
         }
+        if !self.received.is_empty() && self.received.len() != usize::from(self.total) {
+            return Err(TelemetryError::Unpack("side chunk total changed"));
+        }
+        if self.contains_index(index) {
+            return Ok(0);
+        }
+        let mut descriptor_cost = 0;
+        if self.received.is_empty() {
+            descriptor_cost = Self::descriptor_bytes(self.total);
+            crate::memory_admission::check(
+                descriptor_cost.saturating_add(128),
+                descriptor_cost.saturating_add(32),
+            )?;
+            self.received
+                .try_reserve_exact(usize::from(self.total))
+                .map_err(|_| TelemetryError::Unpack("side chunk descriptors allocation failed"))?;
+            self.received.resize_with(usize::from(self.total), || None);
+        }
+        let bytes = make();
+        let cost = bytes
+            .len()
+            .saturating_add(Self::FRAGMENT_OVERHEAD)
+            .saturating_add(descriptor_cost);
+        self.received[usize::from(index)] = Some(bytes);
+        self.received_count += 1;
+        // Only newly retained data extends assembly lifetime. Refused or replayed
+        // fragments must not keep incomplete transfers alive indefinitely.
+        self.last_seen_ms = now_ms;
+        Ok(cost)
     }
     #[cfg(test)]
     pub(crate) fn insert(&mut self, index: u16, bytes: crate::SharedBytes) {
-        self.insert_with(index, || crate::shared_bytes::convert(bytes));
+        self.insert_with(index, self.last_seen_ms, || {
+            crate::shared_bytes::convert(bytes)
+        })
+        .unwrap();
     }
     #[inline(never)]
     pub(crate) fn remove(
@@ -847,14 +894,24 @@ impl SideChunkAssembly {
             *buffered,
             chunks.values().map(Self::byte_cost).sum::<usize>()
         );
-        let cost = payload_len.saturating_add(64);
+        let descriptor_cost = if chunks
+            .get(&transfer_id)
+            .is_none_or(|a| a.received.is_empty())
+        {
+            Self::descriptor_bytes(total)
+        } else {
+            0
+        };
+        let cost = payload_len
+            .saturating_add(Self::FRAGMENT_OVERHEAD)
+            .saturating_add(descriptor_cost);
         if usize::from(total) > budget / 64 || cost > budget {
             Self::remove(chunks, buffered, transfer_id);
             return Err(TelemetryError::PacketTooLarge("side chunk receive budget"));
         }
         if chunks
             .get(&transfer_id)
-            .is_some_and(|a| a.received.contains_key(&index))
+            .is_some_and(|a| a.contains_index(index))
         {
             return Ok(0);
         }
@@ -869,13 +926,17 @@ impl SideChunkAssembly {
     }
 
     pub(crate) fn assemble(self) -> TelemetryResult<Vec<u8>> {
-        if self.received.len() != usize::from(self.total) {
+        if self.received_len() != usize::from(self.total) {
             return Err(TelemetryError::Unpack("side chunk gap"));
         }
-        let len = self.received.values().try_fold(0usize, |n, chunk| {
-            n.checked_add(chunk.len())
-                .ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
-        })?;
+        let len = self
+            .received
+            .iter()
+            .flatten()
+            .try_fold(0usize, |n, chunk| {
+                n.checked_add(chunk.len())
+                    .ok_or(TelemetryError::PacketTooLarge("side chunk size overflow"))
+            })?;
         // Prefer one allocation when the full scratch fits. Under pressure,
         // retaining all fragments while reserving a second full frame can
         // prevent a bounded schema from ever completing. Grow in at most eight
@@ -894,24 +955,59 @@ impl SideChunkAssembly {
             out.try_reserve_exact(len)
                 .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
         }
-        for (expected, (index, chunk)) in self.received.into_iter().enumerate() {
-            if usize::from(index) != expected {
-                return Err(TelemetryError::Unpack("side chunk gap"));
-            }
-            let end = out.len().saturating_add(chunk.len());
+        // A fixed tail lets the descriptor allocation go before the final
+        // buffer growth. Otherwise keeping Vec's full descriptor capacity
+        // alive regresses fragmented assembly's existing headroom bound.
+        // This is 128 bytes of metadata on 32-bit targets, independent of total.
+        let mut fragments = self.received.into_iter();
+        let tail_count = fragments.len().min(16);
+        let mut tail: [Option<Arc<[u8]>>; 16] = core::array::from_fn(|_| None);
+        for slot in tail[..tail_count].iter_mut().rev() {
+            *slot = fragments.next_back().flatten();
+        }
+        // Chain drops its exhausted first iterator before requesting the tail.
+        let mut fragments = fragments
+            .chain(tail.into_iter().take(tail_count))
+            .peekable();
+        let mut scratch = [0u8; 256];
+        let mut append = |bytes: &[u8]| -> TelemetryResult<()> {
+            let end = out.len().saturating_add(bytes.len());
             if end > out.capacity() {
                 let target = end.div_ceil(step).saturating_mul(step).min(len);
                 crate::memory_admission::check(
-                    // Only an exact Vec buffer is allocated here: fragment
-                    // metadata is being consumed, not rebuilt. Include bounded
-                    // allocator/header slack without charging decoder scratch.
                     target.saturating_add(128).max(1024),
                     target.saturating_add(32),
                 )?;
                 out.try_reserve_exact(target - out.len())
                     .map_err(|_| TelemetryError::Unpack("side chunk assembly allocation failed"))?;
             }
-            out.extend_from_slice(&chunk);
+            out.extend_from_slice(bytes);
+            Ok(())
+        };
+        while let Some(chunk) = fragments.next() {
+            let chunk = chunk.ok_or(TelemetryError::Unpack("side chunk gap"))?;
+            if chunk.len() <= scratch.len() {
+                let mut used = chunk.len();
+                scratch[..used].copy_from_slice(&chunk);
+                drop(chunk);
+                // Release up to two small payload allocations before growing
+                // the output, rather than holding them beside both Vec buffers.
+                if fragments.peek().is_some_and(|next| {
+                    next.as_ref()
+                        .is_some_and(|p| p.len() <= scratch.len() - used)
+                }) {
+                    let next = fragments
+                        .next()
+                        .flatten()
+                        .ok_or(TelemetryError::Unpack("side chunk gap"))?;
+                    scratch[used..used + next.len()].copy_from_slice(&next);
+                    used += next.len();
+                    drop(next);
+                }
+                append(&scratch[..used])?;
+            } else {
+                append(&chunk)?;
+            }
         }
         Ok(out)
     }
@@ -969,15 +1065,26 @@ mod incremental_chunk_cache_tests {
         let left = vec![3u8; 60000];
         let right = vec![7u8; 20000];
         assert_eq!(
-            assembly.insert_with(0, || crate::shared_bytes::convert(Arc::<[u8]>::from(left))),
-            60064
+            assembly
+                .insert_with(0, 0, || crate::shared_bytes::convert(Arc::<[u8]>::from(
+                    left
+                )))
+                .unwrap(),
+            60048 + SideChunkAssembly::descriptor_bytes(2)
         );
         assert_eq!(
-            assembly.insert_with(1, || crate::shared_bytes::convert(Arc::<[u8]>::from(right))),
-            20064
+            assembly
+                .insert_with(1, 0, || crate::shared_bytes::convert(Arc::<[u8]>::from(
+                    right
+                )))
+                .unwrap(),
+            20048
         );
-        assert_eq!(assembly.payload_bytes, u16::MAX);
-        assert_eq!(assembly.byte_cost(), 80128);
+        assert_eq!(assembly.received_len(), 2);
+        assert_eq!(
+            assembly.byte_cost(),
+            80096 + SideChunkAssembly::descriptor_bytes(2)
+        );
         let out = assembly.assemble().unwrap();
         assert_eq!(out.len(), 80000);
         assert!(out[..60000].iter().all(|b| *b == 3));
@@ -989,14 +1096,21 @@ mod incremental_chunk_cache_tests {
             total: 2,
             ..Default::default()
         };
-        assembly.insert_with(0, || {
-            crate::shared_bytes::convert(Arc::<[u8]>::from([9u8; 112]))
-        });
+        assembly
+            .insert_with(0, 0, || {
+                crate::shared_bytes::convert(Arc::<[u8]>::from([9u8; 112]))
+            })
+            .unwrap();
         assert_eq!(
-            assembly.insert_with(0, || panic!("duplicate called payload factory")),
+            assembly
+                .insert_with(0, 0, || panic!("duplicate called payload factory"))
+                .unwrap(),
             0
         );
-        assert_eq!(assembly.byte_cost(), 176);
+        assert_eq!(
+            assembly.byte_cost(),
+            160 + SideChunkAssembly::descriptor_bytes(2)
+        );
     }
 }
 
@@ -1013,9 +1127,11 @@ mod expiry_chunk_cache_tests {
                 last_seen_ms,
                 ..Default::default()
             };
-            buffered += assembly.insert_with(0, || {
-                crate::shared_bytes::convert(Arc::<[u8]>::from(vec![id as u8; length]))
-            });
+            buffered += assembly
+                .insert_with(0, last_seen_ms, || {
+                    crate::shared_bytes::convert(Arc::<[u8]>::from(vec![id as u8; length]))
+                })
+                .unwrap();
             chunks.insert(id, assembly);
         }
         (chunks, buffered)
@@ -1035,7 +1151,10 @@ mod expiry_chunk_cache_tests {
             SideChunkAssembly::expire(&mut chunks, &mut buffered, 2001),
             1
         );
-        assert_eq!(buffered, original - 67);
+        assert_eq!(
+            buffered,
+            original - 51 - SideChunkAssembly::descriptor_bytes(2)
+        );
         assert!(!chunks.contains_key(&1));
         assert_eq!(
             SideChunkAssembly::expire(&mut chunks, &mut buffered, 2001),
@@ -1047,7 +1166,7 @@ mod expiry_chunk_cache_tests {
             2
         );
         assert_eq!(chunks.keys().copied().collect::<Vec<_>>(), vec![3]);
-        assert_eq!(buffered, 69);
+        assert_eq!(buffered, 53 + SideChunkAssembly::descriptor_bytes(2));
     }
 
     #[test]
@@ -1087,13 +1206,113 @@ mod expiry_chunk_cache_tests {
     #[test]
     fn chunk_expiry_releases_full_cost_after_small_payload_cache_saturates() {
         let (mut chunks, mut buffered) = fixture(&[(1, 0, 80000), (2, 2001, 20)]);
-        assert_eq!(chunks[&1].payload_bytes, u16::MAX);
-        assert_eq!(buffered, 80064 + 84);
+        assert_eq!(chunks[&1].received_len(), 1);
+        assert_eq!(
+            buffered,
+            80048 + 68 + 2 * SideChunkAssembly::descriptor_bytes(2)
+        );
         assert_eq!(
             SideChunkAssembly::expire(&mut chunks, &mut buffered, 2001),
             1
         );
-        assert_eq!(buffered, 84);
+        assert_eq!(buffered, 68 + SideChunkAssembly::descriptor_bytes(2));
         assert_eq!(chunks.keys().copied().collect::<Vec<_>>(), vec![2]);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod chunk_slot_tests {
+    use super::*;
+    #[test]
+    fn forty_reordered_fragments_reuse_one_bounded_descriptor_buffer() {
+        let mut assembly = SideChunkAssembly {
+            last_seen_ms: 42,
+            total: 40,
+            ..Default::default()
+        };
+        let mut cost = 0;
+        for index in (0u16..40).rev() {
+            cost += assembly
+                .insert_with(index, 0, || Arc::<[u8]>::from([index as u8; 84]))
+                .unwrap();
+            assert_eq!(assembly.received.capacity(), 40);
+            assert_eq!(assembly.byte_cost(), cost);
+            assert_eq!(
+                assembly
+                    .insert_with(index, 0, || panic!("duplicate allocated"))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(assembly.received_len(), 40);
+        let bytes = assembly.assemble().unwrap();
+        assert_eq!(bytes.len(), 40 * 84);
+        for (index, chunk) in bytes.as_chunks::<84>().0.iter().enumerate() {
+            assert!(chunk.iter().all(|b| usize::from(*b) == index));
+        }
+    }
+    #[test]
+    fn only_newly_accepted_fragments_extend_assembly_lifetime() {
+        let mut assembly = SideChunkAssembly {
+            total: 2,
+            last_seen_ms: 10,
+            ..Default::default()
+        };
+        assembly
+            .insert_with(0, 100, || Arc::<[u8]>::from([1]))
+            .unwrap();
+        assert_eq!(assembly.last_seen_ms, 100);
+        assert_eq!(
+            assembly
+                .insert_with(0, 1800, || panic!("duplicate allocated"))
+                .unwrap(),
+            0
+        );
+        assert!(
+            assembly
+                .insert_with(2, 1900, || panic!("invalid allocated"))
+                .is_err()
+        );
+        assert_eq!(assembly.last_seen_ms, 100);
+        let mut chunks = BTreeMap::from([(1, assembly)]);
+        let mut buffered = chunks[&1].byte_cost();
+        // A repeated fragment cannot extend the original two-second expiry.
+        SideChunkAssembly::expire(&mut chunks, &mut buffered, 2101);
+        assert!(chunks.is_empty());
+        assert_eq!(buffered, 0);
+    }
+    #[test]
+    fn descriptor_admission_precedes_payload_allocation_and_invalid_indices_are_rejected() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::memory_admission::set_probe(None);
+            }
+        }
+        let mut assembly = SideChunkAssembly {
+            last_seen_ms: 42,
+            total: 40,
+            ..Default::default()
+        };
+        let _reset = Reset;
+        extern "C" fn deny(_: usize, _: usize) -> bool {
+            false
+        }
+        crate::memory_admission::set_probe(Some(deny));
+        assert!(
+            assembly
+                .insert_with(0, 1000, || panic!(
+                    "unadmitted descriptors allocated payload"
+                ))
+                .is_err()
+        );
+        assert!(assembly.received.is_empty());
+        assert_eq!(assembly.received_len(), 0);
+        assert_eq!(assembly.last_seen_ms, 42);
+        assert!(
+            assembly
+                .insert_with(40, 0, || panic!("invalid index allocated payload"))
+                .is_err()
+        );
     }
 }

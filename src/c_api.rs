@@ -12,6 +12,10 @@
 //! an ingress side for relay-style behavior.
 
 use crate::binding_options::{relay_side_options_for_profile, router_side_options_for_profile};
+#[cfg(feature = "discovery")]
+use crate::config::known_endpoints;
+#[cfg(target_endian = "big")]
+use crate::do_vec_log_typed;
 #[cfg(feature = "timesync")]
 use crate::timesync::{NetworkTimeReading, PartialNetworkTime, TimeSyncConfig};
 use crate::{
@@ -20,16 +24,16 @@ use crate::{
     config::{
         DataEndpoint, RuntimeMemoryConfig, RuntimeTuningConfig, data_type_exists,
         e2e_encryption_policy_code, e2e_encryption_policy_from_code, endpoint_definition,
-        endpoint_definition_by_name, endpoint_exists, get_endpoint_meta, known_endpoints,
-        message_class_code, message_class_from_code, message_data_type_code,
-        message_data_type_from_code, register_data_type_id_with_description_and_e2e_encryption,
-        register_endpoint_id, register_endpoint_id_with_description, register_schema_json_bytes,
-        reliable_code, reliable_from_code, remove_data_type, remove_data_type_by_name,
-        remove_endpoint, remove_endpoint_by_name, runtime_device_identifier, runtime_tuning_config,
+        endpoint_definition_by_name, endpoint_exists, get_endpoint_meta, message_class_code,
+        message_class_from_code, message_data_type_code, message_data_type_from_code,
+        register_data_type_id_with_description_and_e2e_encryption, register_endpoint_id,
+        register_endpoint_id_with_description, register_schema_json_bytes, reliable_code,
+        reliable_from_code, remove_data_type, remove_data_type_by_name, remove_endpoint,
+        remove_endpoint_by_name, runtime_device_identifier, runtime_tuning_config,
         set_data_type_e2e_encryption_policy, set_runtime_device_identifier,
         set_runtime_tuning_config,
     },
-    do_vec_log_typed, get_needed_message_size, message_meta,
+    get_needed_message_size, message_meta,
     packet::Packet,
     router::{
         AddressAssignmentMode, Clock, LeBytes, RouterE2eEncryptionMode, RouterSideOptions,
@@ -38,8 +42,11 @@ use crate::{
     router::{EndpointHandler, Router, RouterConfig},
     wire_format::{pack_packet, packet_wire_size, peek_envelope, unpack_packet},
 };
+#[cfg(target_endian = "big")]
 use crate::{MessageDataType::NoData, get_data_type};
-use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+#[cfg(feature = "discovery")]
+use alloc::{collections::BTreeMap, format};
 use core::{ffi::c_char, ffi::c_void, mem::size_of, ptr, slice, str::from_utf8};
 
 #[cfg(feature = "cryptography")]
@@ -3715,6 +3722,37 @@ pub extern "C" fn seds_router_copy_memory_counters(
     16
 }
 
+/// Return1 for queued work,0 if idle, or a negative status for an invalid router.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_has_queued_work(r: *mut SedsRouter) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    i32::from(unsafe { &(*r).inner }.has_queued_work())
+}
+
+/// Copy allocation-free queue accounting. Returns required word count (16).
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_copy_queue_counters(
+    r: *mut SedsRouter,
+    words: *mut u32,
+    capacity: usize,
+) -> i32 {
+    if r.is_null()
+        || (capacity != 0
+            && (words.is_null() || !(words as usize).is_multiple_of(core::mem::align_of::<u32>())))
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    if capacity != 0 {
+        let counters = unsafe { &(*r).inner }.queue_counters();
+        unsafe {
+            core::ptr::copy_nonoverlapping(counters.as_ptr(), words, capacity.min(counters.len()))
+        };
+    }
+    16
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_memory_layout_len(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -4471,6 +4509,7 @@ fn call_log_or_queue<T: LeBytes>(
     }
 }
 
+#[cfg(target_endian = "big")]
 fn finish_with<T: LeBytes + Copy>(
     r: *mut SedsRouter,
     ty: DataType,
@@ -4539,7 +4578,14 @@ pub extern "C" fn seds_router_log_bytes_ex(
         Err(_) => return status_from_err(TelemetryError::InvalidType),
     };
 
-    let src = unsafe { slice::from_raw_parts(data, len) };
+    if len > isize::MAX as usize {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let src = if len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(data, len) }
+    };
     let ts = opt_ts(timestamp_ms_opt);
 
     if let Some(required) = fixed_payload_size_if_static(ty) {
@@ -4640,73 +4686,125 @@ pub extern "C" fn seds_router_log_typed_ex(
         Ok(t) => t,
         Err(_) => return status_from_err(TelemetryError::InvalidType),
     };
+    #[cfg(target_endian = "big")]
     let ts = opt_ts(timestamp_ms_opt);
 
-    if let Some(required_bytes) = fixed_payload_size_if_static(ty) {
-        if required_bytes % elem_size != 0 {
+    if !matches!(
+        (elem_kind, elem_size),
+        (SEDS_EK_UNSIGNED | SEDS_EK_SIGNED, 1 | 2 | 4 | 8 | 16) | (SEDS_EK_FLOAT, 4 | 8)
+    ) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    #[cfg(target_endian = "little")]
+    {
+        // Native numeric memory is already the canonical little-endian byte
+        // representation. The bytes logger retains its static padding/truncation
+        // and schema validation without decoding into a Vec and encoding again.
+        let Some(bytes) = count
+            .checked_mul(elem_size)
+            .filter(|n| *n <= isize::MAX as usize)
+        else {
+            return status_from_err(TelemetryError::BadArg);
+        };
+        if let Some(required) = fixed_payload_size_if_static(ty)
+            && !required.is_multiple_of(elem_size)
+        {
             return status_from_err(TelemetryError::BadArg);
         }
+        if count == 0 && fixed_payload_size_if_static(ty).is_none() {
+            return status_from_err(TelemetryError::Io("vectorize_data failed"));
+        }
+        seds_router_log_bytes_ex(r, ty_u32, data.cast(), bytes, timestamp_ms_opt, queue)
+    }
+    #[cfg(target_endian = "big")]
+    {
+        if let Some(required_bytes) = fixed_payload_size_if_static(ty) {
+            if required_bytes % elem_size != 0 {
+                return status_from_err(TelemetryError::BadArg);
+            }
 
-        let src_bytes_len = count.saturating_mul(elem_size);
-        let src = unsafe { slice::from_raw_parts(data as *const u8, src_bytes_len) };
+            let Some(src_bytes_len) = count
+                .checked_mul(elem_size)
+                .filter(|n| *n <= isize::MAX as usize)
+            else {
+                return status_from_err(TelemetryError::BadArg);
+            };
+            let src = if src_bytes_len == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(data as *const u8, src_bytes_len) }
+            };
 
-        let mut padded = vec![0u8; required_bytes];
-        let ncopy = core::cmp::min(src.len(), required_bytes);
-        if ncopy > 0 {
-            padded[..ncopy].copy_from_slice(&src[..ncopy]);
+            let mut padded = vec![0u8; required_bytes];
+            let ncopy = core::cmp::min(src.len(), required_bytes);
+            if ncopy > 0 {
+                padded[..ncopy].copy_from_slice(&src[..ncopy]);
+            }
+
+            let required_elems = required_bytes / elem_size;
+
+            return match (elem_kind, elem_size) {
+                (SEDS_EK_UNSIGNED, 1) => {
+                    finish_with::<u8>(r, ty, ts, queue, &padded, required_elems, 1)
+                }
+                (SEDS_EK_UNSIGNED, 2) => {
+                    finish_with::<u16>(r, ty, ts, queue, &padded, required_elems, 2)
+                }
+                (SEDS_EK_UNSIGNED, 4) => {
+                    finish_with::<u32>(r, ty, ts, queue, &padded, required_elems, 4)
+                }
+                (SEDS_EK_UNSIGNED, 8) => {
+                    finish_with::<u64>(r, ty, ts, queue, &padded, required_elems, 8)
+                }
+                (SEDS_EK_UNSIGNED, 16) => {
+                    finish_with::<u128>(r, ty, ts, queue, &padded, required_elems, 16)
+                }
+
+                (SEDS_EK_SIGNED, 1) => {
+                    finish_with::<i8>(r, ty, ts, queue, &padded, required_elems, 1)
+                }
+                (SEDS_EK_SIGNED, 2) => {
+                    finish_with::<i16>(r, ty, ts, queue, &padded, required_elems, 2)
+                }
+                (SEDS_EK_SIGNED, 4) => {
+                    finish_with::<i32>(r, ty, ts, queue, &padded, required_elems, 4)
+                }
+                (SEDS_EK_SIGNED, 8) => {
+                    finish_with::<i64>(r, ty, ts, queue, &padded, required_elems, 8)
+                }
+                (SEDS_EK_SIGNED, 16) => {
+                    finish_with::<i128>(r, ty, ts, queue, &padded, required_elems, 16)
+                }
+
+                (SEDS_EK_FLOAT, 4) => {
+                    finish_with::<f32>(r, ty, ts, queue, &padded, required_elems, 4)
+                }
+                (SEDS_EK_FLOAT, 8) => {
+                    finish_with::<f64>(r, ty, ts, queue, &padded, required_elems, 8)
+                }
+
+                _ => status_from_err(TelemetryError::BadArg),
+            };
         }
 
-        let required_elems = required_bytes / elem_size;
+        match (elem_kind, elem_size) {
+            (SEDS_EK_UNSIGNED, 1) => do_vec_log_typed!(r, ty, ts, queue, data, count, u8),
+            (SEDS_EK_UNSIGNED, 2) => do_vec_log_typed!(r, ty, ts, queue, data, count, u16),
+            (SEDS_EK_UNSIGNED, 4) => do_vec_log_typed!(r, ty, ts, queue, data, count, u32),
+            (SEDS_EK_UNSIGNED, 8) => do_vec_log_typed!(r, ty, ts, queue, data, count, u64),
+            (SEDS_EK_UNSIGNED, 16) => do_vec_log_typed!(r, ty, ts, queue, data, count, u128),
 
-        return match (elem_kind, elem_size) {
-            (SEDS_EK_UNSIGNED, 1) => {
-                finish_with::<u8>(r, ty, ts, queue, &padded, required_elems, 1)
-            }
-            (SEDS_EK_UNSIGNED, 2) => {
-                finish_with::<u16>(r, ty, ts, queue, &padded, required_elems, 2)
-            }
-            (SEDS_EK_UNSIGNED, 4) => {
-                finish_with::<u32>(r, ty, ts, queue, &padded, required_elems, 4)
-            }
-            (SEDS_EK_UNSIGNED, 8) => {
-                finish_with::<u64>(r, ty, ts, queue, &padded, required_elems, 8)
-            }
-            (SEDS_EK_UNSIGNED, 16) => {
-                finish_with::<u128>(r, ty, ts, queue, &padded, required_elems, 16)
-            }
+            (SEDS_EK_SIGNED, 1) => do_vec_log_typed!(r, ty, ts, queue, data, count, i8),
+            (SEDS_EK_SIGNED, 2) => do_vec_log_typed!(r, ty, ts, queue, data, count, i16),
+            (SEDS_EK_SIGNED, 4) => do_vec_log_typed!(r, ty, ts, queue, data, count, i32),
+            (SEDS_EK_SIGNED, 8) => do_vec_log_typed!(r, ty, ts, queue, data, count, i64),
+            (SEDS_EK_SIGNED, 16) => do_vec_log_typed!(r, ty, ts, queue, data, count, i128),
 
-            (SEDS_EK_SIGNED, 1) => finish_with::<i8>(r, ty, ts, queue, &padded, required_elems, 1),
-            (SEDS_EK_SIGNED, 2) => finish_with::<i16>(r, ty, ts, queue, &padded, required_elems, 2),
-            (SEDS_EK_SIGNED, 4) => finish_with::<i32>(r, ty, ts, queue, &padded, required_elems, 4),
-            (SEDS_EK_SIGNED, 8) => finish_with::<i64>(r, ty, ts, queue, &padded, required_elems, 8),
-            (SEDS_EK_SIGNED, 16) => {
-                finish_with::<i128>(r, ty, ts, queue, &padded, required_elems, 16)
-            }
-
-            (SEDS_EK_FLOAT, 4) => finish_with::<f32>(r, ty, ts, queue, &padded, required_elems, 4),
-            (SEDS_EK_FLOAT, 8) => finish_with::<f64>(r, ty, ts, queue, &padded, required_elems, 8),
+            (SEDS_EK_FLOAT, 4) => do_vec_log_typed!(r, ty, ts, queue, data, count, f32),
+            (SEDS_EK_FLOAT, 8) => do_vec_log_typed!(r, ty, ts, queue, data, count, f64),
 
             _ => status_from_err(TelemetryError::BadArg),
-        };
-    }
-
-    match (elem_kind, elem_size) {
-        (SEDS_EK_UNSIGNED, 1) => do_vec_log_typed!(r, ty, ts, queue, data, count, u8),
-        (SEDS_EK_UNSIGNED, 2) => do_vec_log_typed!(r, ty, ts, queue, data, count, u16),
-        (SEDS_EK_UNSIGNED, 4) => do_vec_log_typed!(r, ty, ts, queue, data, count, u32),
-        (SEDS_EK_UNSIGNED, 8) => do_vec_log_typed!(r, ty, ts, queue, data, count, u64),
-        (SEDS_EK_UNSIGNED, 16) => do_vec_log_typed!(r, ty, ts, queue, data, count, u128),
-
-        (SEDS_EK_SIGNED, 1) => do_vec_log_typed!(r, ty, ts, queue, data, count, i8),
-        (SEDS_EK_SIGNED, 2) => do_vec_log_typed!(r, ty, ts, queue, data, count, i16),
-        (SEDS_EK_SIGNED, 4) => do_vec_log_typed!(r, ty, ts, queue, data, count, i32),
-        (SEDS_EK_SIGNED, 8) => do_vec_log_typed!(r, ty, ts, queue, data, count, i64),
-        (SEDS_EK_SIGNED, 16) => do_vec_log_typed!(r, ty, ts, queue, data, count, i128),
-
-        (SEDS_EK_FLOAT, 4) => do_vec_log_typed!(r, ty, ts, queue, data, count, f32),
-        (SEDS_EK_FLOAT, 8) => do_vec_log_typed!(r, ty, ts, queue, data, count, f64),
-
-        _ => status_from_err(TelemetryError::BadArg),
+        }
     }
 }
 
@@ -7490,6 +7588,199 @@ mod tests {
             .wrapping_add(1)
             .cast::<u32>();
         assert!(seds_router_copy_memory_counters(router, misaligned, 1) < 0);
+        seds_router_free(router);
+    }
+
+    #[test]
+    fn typed_native_logging_keeps_bytes_padding_unaligned_inputs_and_queue_ownership() {
+        use std::sync::Mutex;
+        let endpoint =
+            crate::config::register_endpoint_with_description("TYPED_NATIVE_SINK", "", false)
+                .unwrap();
+        let register = |name, count, kind| {
+            crate::config::register_data_type_with_description(
+                name,
+                "",
+                MessageElement::Static(count, kind, crate::MessageClass::Data),
+                &[endpoint],
+                crate::ReliableMode::None,
+                16,
+            )
+            .unwrap()
+        };
+        let ty = register("TYPED_NATIVE_16", 16, crate::MessageDataType::UInt8);
+        let odd = register("TYPED_NATIVE_ODD", 3, crate::MessageDataType::UInt8);
+        let empty = register("TYPED_NATIVE_EMPTY", 0, crate::MessageDataType::NoData);
+        let dynamic = crate::config::register_data_type_with_description(
+            "TYPED_NATIVE_DYNAMIC",
+            "",
+            MessageElement::Dynamic(crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[endpoint],
+            crate::ReliableMode::None,
+            16,
+        )
+        .unwrap();
+        for queued in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new([EndpointHandler::new_packet_handler(
+                    endpoint,
+                    move |packet| {
+                        sink.lock()
+                            .unwrap()
+                            .push((packet.data_type(), packet.payload().to_vec()));
+                        Ok(())
+                    },
+                )]),
+                Box::new(|| 0u64),
+            );
+            let mut handle = SedsRouter {
+                inner: Arc::new(router),
+            };
+            let mut stamp = 0u64;
+            for (kind, width) in [
+                (0, 1),
+                (0, 2),
+                (0, 4),
+                (0, 8),
+                (0, 16),
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (1, 8),
+                (1, 16),
+                (2, 4),
+                (2, 8),
+            ] {
+                let mut input = vec![0x55u8];
+                input.extend(0u8..24);
+                stamp += 1;
+                assert_eq!(
+                    seds_router_log_typed_ex(
+                        &mut handle,
+                        ty.as_u32(),
+                        input[1..].as_ptr().cast(),
+                        16 / width,
+                        width,
+                        kind,
+                        &stamp,
+                        queued
+                    ),
+                    0
+                );
+                input.fill(0xff);
+                handle.inner.drain_queues_with_timeout(0).unwrap();
+                assert_eq!(
+                    seen.lock().unwrap().last().unwrap().1,
+                    (0u8..16).collect::<Vec<_>>()
+                );
+            }
+            for count in [0usize, 8, 24] {
+                let input = (0u8..24).collect::<Vec<_>>();
+                stamp += 1;
+                let pointer = if count == 0 {
+                    ptr::null()
+                } else {
+                    input.as_ptr().cast()
+                };
+                assert_eq!(
+                    seds_router_log_typed_ex(
+                        &mut handle,
+                        ty.as_u32(),
+                        pointer,
+                        count,
+                        1,
+                        0,
+                        &stamp,
+                        queued
+                    ),
+                    0
+                );
+                handle.inner.drain_queues_with_timeout(0).unwrap();
+                let mut expected = vec![0; 16];
+                let copied = count.min(16);
+                expected[..copied].copy_from_slice(&input[..copied]);
+                assert_eq!(seen.lock().unwrap().last().unwrap().1, expected);
+            }
+            stamp += 1;
+            assert_eq!(
+                seds_router_log_typed_ex(
+                    &mut handle,
+                    empty.as_u32(),
+                    ptr::null(),
+                    0,
+                    4,
+                    2,
+                    &stamp,
+                    queued
+                ),
+                0
+            );
+            handle.inner.drain_queues_with_timeout(0).unwrap();
+            assert_eq!(seen.lock().unwrap().last().unwrap(), &(empty, vec![]));
+            assert!(
+                seds_router_log_typed_ex(
+                    &mut handle,
+                    dynamic.as_u32(),
+                    ptr::null(),
+                    0,
+                    1,
+                    0,
+                    &stamp,
+                    queued
+                ) < 0
+            );
+            let input = [0u8; 32];
+            for (message, count, width, kind) in [
+                (odd, 1, 4, 0),
+                (ty, usize::MAX, 16, 0),
+                (ty, 4, 4, 3),
+                (ty, 16, 1, 2),
+            ] {
+                assert!(
+                    seds_router_log_typed_ex(
+                        &mut handle,
+                        message.as_u32(),
+                        input.as_ptr().cast(),
+                        count,
+                        width,
+                        kind,
+                        &stamp,
+                        queued
+                    ) < 0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn c_abi_queue_counters_validate_buffers_and_keep_output_bounds() {
+        let router = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
+        assert!(!router.is_null());
+        assert_eq!(
+            seds_router_copy_queue_counters(router, ptr::null_mut(), 0),
+            16
+        );
+        assert!(seds_router_copy_queue_counters(ptr::null_mut(), ptr::null_mut(), 0) < 0);
+        assert!(seds_router_copy_queue_counters(router, ptr::null_mut(), 1) < 0);
+        let mut words = [u32::MAX; 18];
+        assert_eq!(
+            seds_router_copy_queue_counters(router, words.as_mut_ptr(), 2),
+            16
+        );
+        assert_eq!(words[0], 1);
+        assert_ne!(words[1], u32::MAX);
+        assert!(words[2..].iter().all(|word| *word == u32::MAX));
+        assert_eq!(
+            seds_router_copy_queue_counters(router, words.as_mut_ptr(), 18),
+            16
+        );
+        assert_eq!(&words[16..], &[u32::MAX, u32::MAX]);
+        let misaligned = (words.as_mut_ptr() as *mut u8)
+            .wrapping_add(1)
+            .cast::<u32>();
+        assert!(seds_router_copy_queue_counters(router, misaligned, 1) < 0);
         seds_router_free(router);
     }
 

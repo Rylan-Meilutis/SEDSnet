@@ -4,7 +4,25 @@
 
 ## 4.2.5
 
-Release candidate; not yet published. Firmware qualification remains in progress.
+Source qualification passed on 2026-10-23; publication is pending. See [qualification results](docs/qualification/4.2.5.md).
+
+- Keep final delivery receipts on the publisher's return path. A publisher known
+  on the ingress segment or excluded by route policy no longer triggers the
+  unknown-publisher sole-link fallback in Router or Relay. This prevents local
+  CAN receipts from flooding unrelated Ethernet/radio segments.
+- Preserve reliable-window backpressure and replay ownership across queue churn,
+  and allow independent hosted side callbacks to progress without serializing
+  unrelated links. Keep one fair transmit opportunity when RX exhausts its
+  cooperative deadline; protected controls retain priority.
+- Elect transmit work using borrowed metadata and avoid payload/shape copies in
+  warmed forwarding. Hosted ingress can discard validated targeted traffic that
+  belongs entirely to the ingress segment; embedded builds opt in with
+  `ingress-target-filter`. Cold, managed, explicitly routed and internal control
+  traffic retains ordinary processing.
+- Add allocation-free C queue counters and a queued-work query for bounded
+  firmware workers. Resolve CMake/build/wheel artifacts using Cargo's actual
+  target directory, including configuration, environment and cache overrides.
+
 
 - Reuse an ingress-local validated routing view for liveness and admission, and
   a dispatch-local view for admission and routing. No validation cache survives

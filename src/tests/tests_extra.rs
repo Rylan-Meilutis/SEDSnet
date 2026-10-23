@@ -557,6 +557,7 @@ fn from_none_slice_builds_valid_packet() {
     assert_eq!(pkt.timestamp(), 12345);
 }
 
+#[cfg(feature = "discovery")]
 #[test]
 fn heartbeat_reaches_each_independently_discovered_network_side() {
     crate::tests::ensure_common_test_schema();

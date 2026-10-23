@@ -154,7 +154,8 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
         // Drain newly queued advertisements without running timeout/retry
         // maintenance: keep the original pending ACK outstanding throughout.
         loop {
-            let queued = Router::pop_transmit_queue_locked(&mut rf.state.lock(), rf.clock.now_ms(), false);
+            let queued =
+                Router::pop_transmit_queue_locked(&mut rf.state.lock(), rf.clock.now_ms(), false);
             let Some(queued) = queued else {
                 break;
             };
@@ -251,10 +252,8 @@ fn queue_service_expires_incomplete_transfers_without_new_fragments() {
             SideChunkAssembly {
                 last_seen_ms: 0,
                 total: 2,
-                payload_bytes: u16::try_from(retained.len()).unwrap(),
-                received: [(0, crate::shared_bytes::convert(retained))]
-                    .into_iter()
-                    .collect(),
+                received_count: 1,
+                received: vec![Some(crate::shared_bytes::convert(retained)), None],
             },
         );
     router
@@ -315,6 +314,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     let mut st = router.state.lock();
     st.discovery_routes.insert(side, route.clone());
     st.push_transmit(TxQueued {
+        disposable: true,
         item: RouterTxItem::ToSide {
             src: None,
             dst: side,
@@ -326,6 +326,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     })
     .unwrap();
     st.push_transmit(TxQueued {
+        disposable: true,
         item: RouterTxItem::ToSide {
             src: None,
             dst: side,
@@ -736,6 +737,7 @@ fn schema_reclaims_queued_data_before_refusing_update() {
     {
         let mut st = node.state.lock();
         st.push_transmit(TxQueued {
+            disposable: true,
             item: RouterTxItem::ToSide {
                 src: None,
                 dst: side,
@@ -838,6 +840,7 @@ fn discovery_snapshot_reclaims_telemetry_but_preserves_commands_and_acks() {
         node.state
             .lock()
             .push_transmit(TxQueued {
+                disposable: true,
                 item: RouterTxItem::ToSide {
                     src: None,
                     dst: side,

@@ -568,6 +568,17 @@ pub struct MessageMeta {
 }
 
 impl MessageMeta {
+    pub(crate) fn endpoints_owned(&self) -> Arc<[DataEndpoint]> {
+        #[cfg(feature = "std")]
+        {
+            self.endpoints.clone()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Arc::from(self.endpoints)
+        }
+    }
+
     #[cfg(feature = "std")]
     pub(crate) fn name_ref(&self) -> &str {
         self.name.as_ref()
@@ -771,7 +782,8 @@ impl MessageElement {
 /// - Total static payload size in bytes.
 #[inline]
 pub fn get_needed_message_size(ty: DataType) -> usize {
-    data_type_size(get_data_type(ty)) * get_message_meta(ty).element
+    let element = get_message_meta(ty).element;
+    data_type_size(element.data_type()) * element
 }
 
 /// Return the logical "info" type (Info/Error) for a given `DataType`.

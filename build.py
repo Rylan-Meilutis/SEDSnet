@@ -16,12 +16,13 @@ import ssl
 from base64 import b64encode
 from getpass import getpass
 from pathlib import Path
+from cargo_paths import cargo_target_directory
 
 RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "compact-packet-store", "compact-packet-compression")
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression")
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and validate SEDSnet with Cargo-style commands and flags.")
@@ -204,8 +205,8 @@ def shared_lib_name() -> str:
     return "libsedsnet.so"
 
 
-def print_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> None:
-    out_dir = repo_root / "target" / target / profile if target else repo_root / "target" / profile
+def print_artifact_sizes(repo_root: Path, *, target: str, profile: str, env: dict[str, str] | None = None) -> None:
+    out_dir = cargo_target_directory(repo_root, env=env) / target / profile if target else cargo_target_directory(repo_root, env=env) / profile
     staticlib = out_dir / "libsedsnet.a"
     sharedlib = out_dir / shared_lib_name()
     rlib = out_dir / "libsedsnet.rlib"
@@ -220,8 +221,8 @@ def print_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> None:
         print(f"info: no direct crate artifacts found in {out_dir}")
 
 
-def collect_artifact_sizes(repo_root: Path, *, target: str, profile: str) -> dict[str, int]:
-    out_dir = repo_root / "target" / target / profile if target else repo_root / "target" / profile
+def collect_artifact_sizes(repo_root: Path, *, target: str, profile: str, env: dict[str, str] | None = None) -> dict[str, int]:
+    out_dir = cargo_target_directory(repo_root, env=env) / target / profile if target else cargo_target_directory(repo_root, env=env) / profile
     staticlib = out_dir / "libsedsnet.a"
     sharedlib = out_dir / shared_lib_name()
     rlib = out_dir / "libsedsnet.rlib"
@@ -271,6 +272,7 @@ def output_hint_for_cmd(
         target: str = "",
         release_build: bool = False,
         embedded_profile: bool = False,
+        env: dict[str, str] | None = None,
 ) -> str | None:
     """
     Best-effort output location hint for common commands.
@@ -280,10 +282,10 @@ def output_hint_for_cmd(
 
     if cmd[:2] == ["cargo", "test"] or cmd[:3] == ["cargo", "nextest", "run"]:
         # cargo test builds test artifacts (and deps) under target/...
-        return f"Build artifacts: {repo_root / 'target'}"
+        return f"Build artifacts: {cargo_target_directory(repo_root, env=env)}"
 
     if cmd[:2] == ["cargo", "bench"]:
-        return f"Bench artifacts/results: {repo_root / 'target' / 'criterion'}"
+        return f"Bench artifacts/results: {cargo_target_directory(repo_root, env=env) / 'criterion'}"
 
     if cmd[:2] == ["cargo", "build"]:
         # Determine target dir
@@ -306,8 +308,8 @@ def output_hint_for_cmd(
         if prof:
             # Custom profile output is still under target/<target?>/<profile> (cargo profile name)
             if tgt:
-                return f"Output: {repo_root / 'target' / tgt / prof}"
-            return f"Output: {repo_root / 'target' / prof}"
+                return f"Output: {cargo_target_directory(repo_root, env=env) / tgt / prof}"
+            return f"Output: {cargo_target_directory(repo_root, env=env) / prof}"
 
         # Standard debug/release
         std = "release" if release_build else "debug"
@@ -316,12 +318,12 @@ def output_hint_for_cmd(
             # but if embedded_profile is True we already handled prof above.
             pass
         if tgt:
-            return f"Output: {repo_root / 'target' / tgt / std}"
-        return f"Output: {repo_root / 'target' / std}"
+            return f"Output: {cargo_target_directory(repo_root, env=env) / tgt / std}"
+        return f"Output: {cargo_target_directory(repo_root, env=env) / std}"
 
     if cmd and cmd[0] == "maturin" and len(cmd) >= 2:
         if cmd[1] == "build":
-            return f"Wheels: {repo_root / 'target' / 'wheels'}"
+            return f"Wheels: {cargo_target_directory(repo_root, env=env) / 'wheels'}"
         if cmd[1] == "develop":
             return "Installs into the active Python environment (editable/dev install)."
 
@@ -435,6 +437,7 @@ def run_cmd(
         target=target,
         release_build=release_build,
         embedded_profile=embedded_profile,
+        env=env,
     )
     if hint:
         print(f"info: {hint}")
@@ -727,7 +730,7 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
     )
 
 
-def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root: Path) -> None:
+def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root: Path, target: str = "", feature_parts: list[str] | None = None) -> None:
     run_cmd(
         ["maturin", "build", *build_mode, *(["--target", target] if target else []), *(["--features", ",".join(feature_parts)] if feature_parts else [])],
         env=env,
@@ -735,7 +738,7 @@ def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root:
         title="maturin build (wheel)",
     )
 
-    wheels_dir = repo_root / "target" / "wheels"
+    wheels_dir = cargo_target_directory(repo_root, env=env) / "wheels"
     wheels = sorted(wheels_dir.glob("sedsnet-*.whl"))
     if not wheels:
         raise SystemExit(f"No wheels found in {wheels_dir}")
@@ -904,7 +907,7 @@ def main(argv: list[str]) -> None:
     build_python = "python" in args.features
     build_timesync = "timesync" in args.features
     build_cryptography = "cryptography" in args.features
-    compact_features = [f for f in args.features if f in ("compact-packet-store", "compact-packet-compression", "fair-admission")]
+    extra_features = [f for f in args.features if f not in ("embedded", "python", "timesync", "cryptography")]
     build_wheel = args.command == "maturin-build"
     develop_wheel = args.command == "maturin-develop"
     release_build = args.release
@@ -939,7 +942,7 @@ def main(argv: list[str]) -> None:
     # ---- CHECK MODE: lint default + python + embedded variants ----
     if checks:
         _banner("CHECK MODE")
-        feature_parts = list(compact_features)
+        feature_parts = list(extra_features)
         if build_timesync:
             feature_parts.append("timesync")
         if build_cryptography:
@@ -958,7 +961,7 @@ def main(argv: list[str]) -> None:
     # ---- TEST MODE: also validate embedded + python builds ----
     if tests:
         _banner("TEST MODE")
-        feature_parts = ["timesync", *compact_features]
+        feature_parts = ["timesync", *extra_features]
         if build_cryptography:
             feature_parts.append("cryptography")
         feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
@@ -1057,11 +1060,12 @@ def main(argv: list[str]) -> None:
             title=f"{next_step}/{total_steps} cargo build (python feature)",
             release_build=release_build,
         )
-        _success(f"Python-feature build finished. Output is under: {repo_root / 'target'}")
+        _success(f"Python-feature build finished. Output is under: {cargo_target_directory(repo_root, env=env)}")
         print_artifact_sizes(
             repo_root,
             target=target,
             profile="release" if release_build else "debug",
+            env=env,
         )
         next_step += 1
 
@@ -1099,6 +1103,7 @@ def main(argv: list[str]) -> None:
                 repo_root,
                 target=embedded_target,
                 profile=embedded_profile_name,
+                env=env,
             )
 
             run_cmd(
@@ -1120,8 +1125,8 @@ def main(argv: list[str]) -> None:
                 embedded_profile=uses_custom_profile,
             )
 
-            print(f"info: Embedded output: {repo_root / 'target' / embedded_target / embedded_profile_name}")
-            print_artifact_sizes(repo_root, target=embedded_target, profile=embedded_profile_name)
+            print(f"info: Embedded output: {cargo_target_directory(repo_root, env=env) / embedded_target / embedded_profile_name}")
+            print_artifact_sizes(repo_root, target=embedded_target, profile=embedded_profile_name, env=env)
         else:
             expected = ", ".join(preferred_cross_compilers(embedded_target)) or "CC_<target>/TARGET_CC"
             print(
@@ -1138,7 +1143,7 @@ def main(argv: list[str]) -> None:
 
     build_args: list[str] = []
     embedded_profile = False
-    feature_parts = list(compact_features)
+    feature_parts = list(extra_features)
     if build_timesync:
         feature_parts.append("timesync")
     if build_cryptography:
@@ -1177,7 +1182,7 @@ def main(argv: list[str]) -> None:
         else:
             profile_name = "release" if release_build else "debug"
 
-        before_sizes = collect_artifact_sizes(repo_root, target=target, profile=profile_name)
+        before_sizes = collect_artifact_sizes(repo_root, target=target, profile=profile_name, env=env)
 
         run_cmd(
             cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=False),
@@ -1188,8 +1193,8 @@ def main(argv: list[str]) -> None:
             release_build=release_build,
             embedded_profile=embedded_profile,
         )
-        print(f"info: Output: {repo_root / 'target' / target / profile_name}")
-        print_artifact_sizes(repo_root, target=target, profile=profile_name)
+        print(f"info: Output: {cargo_target_directory(repo_root, env=env) / target / profile_name}")
+        print_artifact_sizes(repo_root, target=target, profile=profile_name, env=env)
         return
 
     if build_python:
@@ -1201,11 +1206,12 @@ def main(argv: list[str]) -> None:
             title="cargo build (python feature)",
             release_build=release_build,
         )
-        _success(f"Build finished. Output is under: {repo_root / 'target'}")
+        _success(f"Build finished. Output is under: {cargo_target_directory(repo_root, env=env)}")
         print_artifact_sizes(
             repo_root,
             target=target,
             profile="release" if release_build else "debug",
+            env=env,
         )
         return
 
@@ -1216,7 +1222,7 @@ def main(argv: list[str]) -> None:
             repo_root=repo_root,
             title="maturin build (wheel)",
         )
-        _success(f"Wheel build finished. Wheels are in: {repo_root / 'target' / 'wheels'}")
+        _success(f"Wheel build finished. Wheels are in: {cargo_target_directory(repo_root, env=env) / 'wheels'}")
         return
 
     if develop_wheel:
@@ -1230,7 +1236,7 @@ def main(argv: list[str]) -> None:
         return
 
     if install_wheel:
-        install_wheel_file(build_mode, env=env, repo_root=repo_root)
+        install_wheel_file(build_mode, env=env, repo_root=repo_root, target=target, feature_parts=feature_parts)
         return
 
     # default: plain cargo build
@@ -1249,12 +1255,12 @@ def main(argv: list[str]) -> None:
     )
     if target:
         prof = "release" if release_build else "debug"
-        _success(f"Build finished. Output: {repo_root / 'target' / target / prof}")
-        print_artifact_sizes(repo_root, target=target, profile=prof)
+        _success(f"Build finished. Output: {cargo_target_directory(repo_root, env=env) / target / prof}")
+        print_artifact_sizes(repo_root, target=target, profile=prof, env=env)
     else:
         prof = "release" if release_build else "debug"
-        _success(f"Build finished. Output: {repo_root / 'target' / prof}")
-        print_artifact_sizes(repo_root, target="", profile=prof)
+        _success(f"Build finished. Output: {cargo_target_directory(repo_root, env=env) / prof}")
+        print_artifact_sizes(repo_root, target="", profile=prof, env=env)
 
 
 if __name__ == "__main__":
