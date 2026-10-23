@@ -5,7 +5,6 @@ import os
 import argparse
 import re
 import shlex
-import stat
 import subprocess
 import sys
 import time
@@ -17,6 +16,7 @@ from base64 import b64encode
 from getpass import getpass
 from pathlib import Path
 from cargo_paths import cargo_target_directory
+import release_credentials
 
 RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
@@ -109,16 +109,6 @@ def _fmt_bytes(n: int) -> str:
     return f"{x:.2f} {units[u]}"
 
 
-def _toml_string(value: str) -> str:
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-    )
-    return f'"{escaped}"'
-
-
 def validate_pypi_credentials(username: str, token: str) -> None:
     auth = b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
     body = urllib.parse.urlencode(
@@ -160,17 +150,15 @@ def validate_pypi_credentials(username: str, token: str) -> None:
 
 def write_maturin_login_config(repo_root: Path) -> None:
     config_path = repo_root / RELEASE_CONFIG_FILE
-    print(f"Writing PyPI credentials to ignored config: {config_path}")
+    print("Saving the PyPI token in the OS credential store; repo config contains no secret.")
     print("Use a PyPI API token. Username defaults to __token__.")
 
     username = os.environ.get("MATURIN_PYPI_USERNAME", "").strip()
     token = os.environ.get("MATURIN_PYPI_TOKEN", "").strip()
 
-    if not username and sys.stdin.isatty():
-        entered = input("PyPI username [__token__]: ").strip()
-        username = entered or "__token__"
-    elif not username:
-        username = "__token__"
+    username = username or "__token__"
+    if username != "__token__":
+        raise SystemExit("PyPI API tokens require username __token__; unset MATURIN_PYPI_USERNAME.")
 
     if not token and sys.stdin.isatty():
         token = getpass("PyPI API token: ").strip()
@@ -183,18 +171,11 @@ def write_maturin_login_config(repo_root: Path) -> None:
     print("Validating PyPI credentials before saving...")
     validate_pypi_credentials(username, token)
 
-    body = "\n".join(
-        [
-            "# Local release credentials. This file is ignored by git.",
-            "[pypi]",
-            f"username = {_toml_string(username)}",
-            f"token = {_toml_string(token)}",
-            "",
-        ]
-    )
-    config_path.write_text(body, encoding="utf-8")
-    config_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    _success(f"Saved PyPI credentials to {config_path}")
+    try:
+        release_credentials.save_pypi_credentials(config_path, username, token)
+    except release_credentials.CredentialStoreError as error:
+        raise SystemExit(str(error)) from None
+    _success("Saved PyPI token in OS credential store; repository reference contains no secret.")
 
 
 def shared_lib_name() -> str:

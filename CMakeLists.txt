@@ -225,6 +225,7 @@ file(GLOB_RECURSE RS_SRC CONFIGURE_DEPENDS
     "${RUST_DIR}/src/*.rs"
     "${RUST_DIR}/build.py"
     "${RUST_DIR}/cargo_paths.py"
+    "${RUST_DIR}/release_credentials.py"
     "${RUST_DIR}/build.rs"
     "${RUST_DIR}/Cargo.toml"
     "${RUST_DIR}/Cargo.lock"

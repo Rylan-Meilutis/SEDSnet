@@ -27,6 +27,7 @@ MACROS_MANIFEST = REPO_ROOT / "sedsnet_macros" / "Cargo.toml"
 MAIN_MANIFEST = REPO_ROOT / "Cargo.toml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 RELEASE_CONFIG = REPO_ROOT / ".sedsnet-release.toml"
+import release_credentials
 
 DEFAULT_LINUX_DOCKER_TARGETS = [
     "x86_64-unknown-linux-gnu",
@@ -180,19 +181,14 @@ def load_pypi_credentials(token_env: str) -> tuple[str | None, str | None]:
     username = os.environ.get("MATURIN_PYPI_USERNAME") or "__token__"
     if token:
         return username, token
-    if not RELEASE_CONFIG.exists():
-        return None, None
-    data = tomllib.loads(RELEASE_CONFIG.read_text(encoding="utf-8"))
-    pypi = data.get("pypi", {})
-    username = str(pypi.get("username", "__token__"))
-    token_value = pypi.get("token")
-    if not token_value:
-        return None, None
-    return username, str(token_value)
+    return release_credentials.load_pypi_credentials(RELEASE_CONFIG)
 
 
 def ensure_pypi_credentials(token_env: str) -> tuple[str | None, str | None]:
-    username, token = load_pypi_credentials(token_env)
+    try:
+        username, token = load_pypi_credentials(token_env)
+    except release_credentials.CredentialStoreError as error:
+        raise SystemExit(str(error)) from None
     if token:
         return username, token
     if not sys.stdin.isatty():
@@ -813,8 +809,8 @@ def main() -> int:
         try:
             _, pypi_token = load_pypi_credentials(args.pypi_token_env)
             pypi_status = "configured" if pypi_token else "missing"
-        except (OSError, ValueError):
-            pypi_status = "configuration unreadable"
+        except (OSError, ValueError, release_credentials.CredentialStoreError):
+            pypi_status = "credential store/configuration unavailable"
         cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
         print(json.dumps({
             "pypi": pypi_status,

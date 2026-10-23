@@ -81,7 +81,7 @@ For PyPI uploads, set `MATURIN_PYPI_TOKEN` or use the ignored local release conf
 for builds and Twine for uploads if they are not already available:
 
 ```sh
-python3 -m pip install maturin twine
+python3 -m pip install maturin twine keyring
 ```
 
 For local PyPI publishing without exporting the token every shell session, run:
@@ -90,9 +90,22 @@ For local PyPI publishing without exporting the token every shell session, run:
 python3 build.py maturin-login
 ```
 
-That command validates the PyPI token before saving it to `.sedsnet-release.toml`. The file is
-ignored by git and read automatically by `publish_crates.py --publish-pypi`. If no environment token
-or saved config exists, `publish_crates.py --publish-pypi` starts the login flow before upload.
+That command validates the PyPI token and saves it in the OS credential store
+(macOS Keychain, Windows Credential Locker, Secret Service or KWallet).
+`.sedsnet-release.toml` contains only a fixed, non-secret reference. No token is
+written there or passed on a command line. Plaintext/null/fallback backends are
+refused; CI can still supply its token through the environment.
+
+Existing plaintext config is migrated automatically: the secure-store write is
+read back and verified before an atomic replacement removes the token from the
+repo config. Migration failure stops publication; it does not use plaintext as
+a fallback or create a backup of the secret. Unlock/configure the OS credential
+store if necessary. The helper suppresses backend/parser exception details that
+could echo credentials. Never run `keyring get` in a captured terminal/log.
+
+`publish_crates.py --publish-pypi` reads the secure reference automatically. If no
+environment token or saved credential exists, it starts the interactive login
+flow before upload.
 When `--wheel-out` already contains wheels or source distributions, `--publish-pypi` recursively
 uploads every artifact found there instead of building only the local platform. Uploads fail if any
 file already exists so a partial or duplicated release is visible; pass `--pypi-skip-existing`
