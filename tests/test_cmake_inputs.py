@@ -1,6 +1,7 @@
 """Exercise actual Ninja dependency edges without downloading or rebuilding Rust."""
 from pathlib import Path
 import os
+import json
 import shutil
 import subprocess
 import tempfile
@@ -41,3 +42,44 @@ class CMakeInputTests(unittest.TestCase):
             run(configure+["-DSEDSNET_SCHEMA_PATH="+str(selected)]); build(); before=count()
             selected.write_text('{"types": []}')
             build(); self.assertEqual(count(),before+1,"external schema override must invalidate library")
+
+    @unittest.skipUnless(shutil.which("cc") and (shutil.which("c++") or shutil.which("g++")), "C/C++ compiler required")
+    def test_noexecstack_is_assembler_only_while_link_protection_is_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="seds noexecstack ") as temp:
+            root = Path(temp)
+            sdk = root / "sdk"
+            sdk.mkdir()
+            (sdk / "CMakeLists.txt").write_text(CMAKE_TEMPLATE.read_text())
+            shutil.copyfile(CMAKE_TEMPLATE.parent / "cargo_paths.py", sdk / "cargo_paths.py")
+            (sdk / "C-Headers").mkdir()
+            (sdk / "C-Headers/sedsnet.h").write_text("// fixture header\n")
+            (sdk / "src").mkdir()
+            (sdk / "src/lib.rs").write_text("// no Rust build in this fixture\n")
+            (sdk / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+            (sdk / "build.py").write_text("raise RuntimeError('Rust must not run during generation')\n")
+            for filename in ["probe.c", "probe.cpp", "probe.S"]:
+                (root / filename).write_text("// compile-command fixture\n")
+            (root / "CMakeLists.txt").write_text("""cmake_minimum_required(VERSION 3.22)
+project(consumer LANGUAGES C CXX ASM)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(SEDSNET_EMBEDDED_BUILD ON CACHE BOOL "" FORCE)
+add_subdirectory(sdk)
+foreach(kind IN ITEMS c cpp S)
+  add_library(probe_${kind} OBJECT probe.${kind})
+  target_link_libraries(probe_${kind} PRIVATE sedsnet)
+endforeach()
+target_compile_options(probe_c PRIVATE -flto)
+target_compile_options(probe_cpp PRIVATE -flto)
+get_target_property(protection sedsnet INTERFACE_LINK_OPTIONS)
+file(WRITE "${CMAKE_BINARY_DIR}/link-protection.txt" "${protection}")
+""")
+            build = root / "build"
+            result = subprocess.run(["cmake", "-S", str(root), "-B", str(build), "-G", "Ninja"], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commands = json.loads((build / "compile_commands.json").read_text())
+            by_kind = {Path(command["file"]).suffix: command["command"] for command in commands}
+            for kind in [".c", ".cpp"]:
+                self.assertIn("-flto", by_kind[kind])
+                self.assertNotIn("-Wa,--noexecstack", by_kind[kind])
+            self.assertIn("-Wa,--noexecstack", by_kind[".S"])
+            self.assertIn("-Wl,-z,noexecstack", (build / "link-protection.txt").read_text())

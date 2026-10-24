@@ -301,7 +301,8 @@ if (CMAKE_C_COMPILER_LOADED)
 endif ()
 
 if (SEDSNET_EMBEDDED_BUILD)
-    target_compile_options(sedsnet INTERFACE -Wa,--noexecstack)
+    # Assembler flags in C/C++ LTO metadata trigger lto-wrapper warnings.
+    target_compile_options(sedsnet INTERFACE "$<$<COMPILE_LANGUAGE:ASM>:-Wa,--noexecstack>")
     target_link_options(sedsnet INTERFACE -Wl,-z,noexecstack)
 endif ()
 
