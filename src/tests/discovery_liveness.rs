@@ -159,7 +159,7 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
             let Some(queued) = queued else {
                 break;
             };
-            rf.tx_item_impl(queued.item, queued.ignore_local, true)
+            rf.dispatch_queued_item(queued)
                 .unwrap();
         }
         let frames = emitted.lock().unwrap();
@@ -322,6 +322,9 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         },
         ignore_local: true,
         priority: 1,
+        delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+        deferred_since_ms: 0,
         retry_after_ms: 0,
     })
     .unwrap();
@@ -334,6 +337,9 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         },
         ignore_local: true,
         priority: 255,
+        delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+        deferred_since_ms: 0,
         retry_after_ms: 0,
     })
     .unwrap();
@@ -748,6 +754,9 @@ fn schema_reclaims_queued_data_before_refusing_update() {
             },
             ignore_local: true,
             priority: 254,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
             retry_after_ms: 0,
         })
         .unwrap();
@@ -850,6 +859,9 @@ fn discovery_snapshot_reclaims_telemetry_but_preserves_commands_and_acks() {
                 },
                 ignore_local: true,
                 priority,
+                delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+                deferred_since_ms: 0,
                 retry_after_ms: 0,
             })
             .unwrap();

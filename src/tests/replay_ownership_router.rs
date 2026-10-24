@@ -124,6 +124,9 @@ fn ring_slot_eviction_releases_end_to_end_replay_marker() {
             },
             ignore_local: true,
             priority: 255,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
             retry_after_ms: 0,
         })
         .unwrap();

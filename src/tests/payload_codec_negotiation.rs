@@ -272,6 +272,9 @@ fn required_downgrade_reserves_expanded_queue_credit_before_handler_dispatch() {
             item: RouterTxItem::Broadcast(RouterItem::Packet(competing.clone())),
             ignore_local: true,
             priority: 10,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
             retry_after_ms: 0,
         });
         assert!(
