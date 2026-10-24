@@ -1017,7 +1017,8 @@ def main(argv: list[str]) -> None:
         run_cmd(
             ["cargo", "test", *build_mode, "--no-default-features",
              "--features", "std,discovery,timesync",
-             "--test", "packet_packing_memory", "--test", "packet_routing_memory"],
+             "--test", "packet_packing_memory", "--test", "packet_routing_memory",
+             "--test", "accepted_queue_delivery"],
             env=env, repo_root=repo_root,
             title=f"{next_step}/{total_steps} cargo test (uncompressed forwarding memory)",
             release_build=release_build,

@@ -587,8 +587,13 @@ fn process_all_queues_timeout_zero_handles_large_queues() {
             Ok(())
         });
 
+    // This tests a complete zero-timeout drain, not eviction. Reserve room
+    // for all samples, the process-wide schema and recent-ID cache growth;
+    // bounded-pressure admission has separate tests.
+    let budget = crate::config::schema_bytes_used().saturating_add(256 * 1024);
+    let memory = crate::config::RuntimeMemoryConfig::new(budget, 16, 512, 1.5).unwrap();
     let router = Router::new_with_clock(
-        RouterConfig::new(vec![handler]),
+        RouterConfig::new(vec![handler]).with_memory_config(memory).unwrap(),
         Box::new(|| UnixClock.now_ms()),
     );
     router.add_side_packed("tx", tx);
@@ -611,10 +616,11 @@ fn process_all_queues_timeout_zero_handles_large_queues() {
         router.rx_queue(pkt).unwrap();
     }
 
-    let (queued_rx, _queued_tx, _queued_recent) = router.debug_queue_lengths();
-    assert!(queued_rx <= N, "RX queue should be bounded");
+    let (queued_rx, queued_tx, _queued_recent) = router.debug_queue_lengths();
+    assert_eq!(queued_rx, N, "all RX samples must be admitted for this drain test");
+    assert!(queued_tx >= N, "all application TX samples must be admitted");
     assert!(
-        router.debug_shared_queue_bytes_used() <= crate::config::MAX_QUEUE_BUDGET,
+        router.debug_shared_queue_bytes_used() <= budget,
         "shared queue budget should cap retained queued bytes"
     );
 

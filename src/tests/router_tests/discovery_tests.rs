@@ -7229,7 +7229,10 @@ fn router_runtime_memory_budget_caps_queued_state() {
     let ep = DataEndpoint::named("RADIO");
     // Leave room for the initial discovery snapshot, then verify that
     // sustained user traffic remains within the shared pool.
-    let memory = crate::config::RuntimeMemoryConfig::new(16_384, 8, 512, 1.5).unwrap();
+    // Registered schemas are process-wide and grow during this suite. Keep
+    // the same 16 KiB traffic allowance in addition to that fixed metadata.
+    let budget = crate::config::schema_bytes_used().saturating_add(16_384);
+    let memory = crate::config::RuntimeMemoryConfig::new(budget, 8, 512, 1.5).unwrap();
     let router = Router::new_with_clock(
         RouterConfig::new(vec![EndpointHandler::new_packet_handler(ep, |_pkt| Ok(()))])
             .with_memory_config(memory)
@@ -7262,12 +7265,12 @@ fn router_runtime_memory_budget_caps_queued_state() {
         serde_json::from_str(&router.export_memory_layout_json()).unwrap();
     let used = json["shared_queue_bytes_used"].as_u64().unwrap();
     let allocated = json["shared_queue_bytes_allocated"].as_u64().unwrap();
-    assert_eq!(allocated, 16_384);
+    assert_eq!(allocated, budget as u64);
     assert!(
         used <= allocated,
         "router queued state exceeded runtime memory budget: used={used} allocated={allocated}"
     );
-    assert!(router.debug_shared_queue_bytes_used() <= 16_384);
+    assert!(router.debug_shared_queue_bytes_used() <= budget);
     assert!(
         json["rx_queue_len"].as_u64().unwrap() + json["tx_queue_len"].as_u64().unwrap() < 600,
         "low budget should evict older queued work instead of growing without bound"

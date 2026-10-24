@@ -302,34 +302,68 @@ impl<T: ByteCost> BoundedDeque<T> {
 
     /// Preserve priority fairness while leaving deferred work in owned storage.
     pub(crate) fn pop_front_fair_if<F, G>(
+        &mut self, priority_burst: &mut u8, max_priority_burst: u8,
+        priority_of: F, mut eligible: G,
+    ) -> Option<T>
+    where F: FnMut(&T) -> u8, G: FnMut(&T) -> bool,
+    {
+        self.pop_front_fair_with_context(priority_burst, max_priority_burst,
+            priority_of, |_, item| eligible(item))
+    }
+
+    pub(crate) fn update_metadata<F>(&mut self, index: usize, update: F)
+    where F: FnOnce(&mut T),
+    {
+        if let Some(item) = self.q.get_mut(index) {
+            #[cfg(debug_assertions)]
+            let before = item.byte_cost();
+            update(item);
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(before, item.byte_cost());
+        }
+    }
+
+    pub(crate) fn pop_front_fair_with_context<F, G>(
         &mut self,
         priority_burst: &mut u8,
         max_priority_burst: u8,
-        mut priority_of: F,
-        mut eligible: G,
+        priority_of: F,
+        eligible: G,
     ) -> Option<T>
     where
         F: FnMut(&T) -> u8,
-        G: FnMut(&T) -> bool,
+        G: FnMut(&VecDeque<T>, &T) -> bool,
+    {
+        let selected = self.select_front_fair_with_context(priority_burst,
+            max_priority_burst, priority_of, eligible)?;
+        self.remove_pos(selected)
+    }
+
+    /// Select a service slot without copying/removing its owned payload.
+    /// Fairness cursor/burst updates match a normal pop; caller decides ownership.
+    pub(crate) fn select_front_fair_with_context<F, G>(
+        &mut self, priority_burst: &mut u8, max_priority_burst: u8,
+        mut priority_of: F, mut eligible: G,
+    ) -> Option<usize>
+    where F: FnMut(&T) -> u8, G: FnMut(&VecDeque<T>, &T) -> bool,
     {
         let selected = {
-            let mut ready = self.q.iter().enumerate().filter(|(_, item)| eligible(item));
-            let (front, first) = ready.next()?;
-            let front_priority = priority_of(first);
+            let mut first_ready = None;
+            for (index, item) in self.q.iter().enumerate() {
+                if eligible(&self.q, item) {
+                    first_ready = Some((index, priority_of(item)));
+                    break;
+                }
+            }
+            let (front, front_priority) = first_ready?;
             let mut lower = front;
             let mut lower_priority = front_priority;
             let mut best_distance = u8::MAX;
-            for (index, item) in ready {
+            for (index, item) in self.q.iter().enumerate().skip(front + 1) {
+                if !eligible(&self.q, item) { continue; }
                 let priority = priority_of(item);
-                if priority >= front_priority {
-                    continue;
-                }
-                // Descend from the previous service band, then wrap. Equal
-                // distances retain the first eligible item (FIFO in a band).
-                let distance = self
-                    .fair_priority_cursor
-                    .wrapping_sub(priority)
-                    .wrapping_sub(1);
+                if priority >= front_priority { continue; }
+                let distance = self.fair_priority_cursor.wrapping_sub(priority).wrapping_sub(1);
                 if lower == front || distance < best_distance {
                     lower = index;
                     lower_priority = priority;
@@ -349,7 +383,25 @@ impl<T: ByteCost> BoundedDeque<T> {
                 front
             }
         };
-        self.remove_pos(selected)
+        Some(selected)
+    }
+
+    #[inline]
+    pub(crate) fn update_admitted<F>(&mut self, index: usize, new_cost: usize, update: F) -> TelemetryResult<()>
+    where F: FnOnce(&mut T),
+    {
+        let old_cost = self.q.get(index).ok_or(TelemetryError::BadArg)?.byte_cost();
+        let used = self.cur_bytes.saturating_sub(old_cost).saturating_add(new_cost);
+        if used > self.max_bytes { return Err(TelemetryError::Io("queue full")); }
+        let item = self.q.get_mut(index).expect("admitted queue entry");
+        update(item);
+        debug_assert_eq!(item.byte_cost(), new_cost);
+        self.cur_bytes = used;
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&T> {
+        self.q.get(index)
     }
 
     /// Pop from back, updating byte count.

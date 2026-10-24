@@ -8,6 +8,10 @@
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
 
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/accepted_route_ownership.rs"]
+mod accepted_route_ownership;
+
 #[cfg(all(test, feature = "std"))]
 #[path = "tests/independent_side_tx_router.rs"]
 mod independent_side_tx;
@@ -718,6 +722,19 @@ impl RouterTxItem {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueuedDelivery {
+    Untracked,
+    OrderedTail,
+    Ordered,
+    DeferredOrdered,
+    DeferredUnordered,
+    Unordered,
+    ClaimedOrdered,
+    ClaimedUnordered,
+}
+
 /// Transmit queue item with flags.
 /// Holds a RouterTxItem and a flag to ignore local dispatch.
 /// Used internally by the Router transmit queue.
@@ -728,7 +745,27 @@ struct TxQueued {
     item: RouterTxItem,
     ignore_local: bool,
     priority: u8,
+    delivery_state: QueuedDelivery,
+    accepted_type: u32,
+    deferred_since_ms: u64,
     retry_after_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TxClaim {
+    token: u32,
+    ordered: bool,
+}
+#[derive(Default)]
+struct DispatchContext {
+    claim: Option<TxClaim>,
+    since: Option<u64>,
+    terminal: bool,
+    owner_transferred: bool,
+}
+struct TxWork {
+    queued: TxQueued,
+    claim: Option<TxClaim>,
 }
 
 /// Do not allow a continuously replenished stream of control traffic to keep
@@ -739,7 +776,7 @@ const MAX_PRIORITY_BURST: u8 = 8;
 
 /// ByteCost implementation for TxQueued.
 // The cached bit must fit the old metadata padding on host and MCU targets.
-const _: () = assert!(size_of::<TxQueued>() == size_of::<(RouterTxItem, bool, u8, u64)>());
+const _: () = assert!(size_of::<TxQueued>() == size_of::<(RouterTxItem, bool, u8, u64)>() + 8);
 
 impl ByteCost for TxQueued {
     #[cfg(feature = "compact-packet-store")]
@@ -749,7 +786,7 @@ impl ByteCost for TxQueued {
     /// Byte cost is the cost of the inner item plus one bool.
     #[inline]
     fn byte_cost(&self) -> usize {
-        self.item.byte_cost() + size_of::<bool>() + size_of::<u8>() + size_of::<u64>()
+        self.item.byte_cost() + size_of::<bool>() + size_of::<u8>() + 2 * size_of::<u64>()
     }
 }
 
@@ -2137,6 +2174,8 @@ struct RouterInner {
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     tx_priority_burst: u8,
+    has_ordered_retry: bool,
+    ordered_claim_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
     reliable_tx: BTreeMap<(RouterSideId, u32), ReliableTxState>,
@@ -2300,6 +2339,35 @@ impl RouterInner {
             if let Some(key) = evicted.item.replay_marker_key() {
                 Self::set_replay_queued(hop, end, key, false);
             }
+        });
+    }
+
+    #[inline(never)]
+    fn claim_index(&self, token: u32) -> Option<usize> {
+        self.transmit_queue.iter().position(|item| {
+            matches!(
+                item.delivery_state,
+                QueuedDelivery::ClaimedOrdered | QueuedDelivery::ClaimedUnordered
+            ) && item.deferred_since_ms == u64::from(token)
+        })
+    }
+
+    #[inline(never)]
+    fn refresh_retry_hint(&mut self) {
+        self.has_ordered_retry = self.transmit_queue.iter().any(|item| {
+            matches!(
+                item.delivery_state,
+                QueuedDelivery::ClaimedOrdered
+                    | QueuedDelivery::ClaimedUnordered
+                    | QueuedDelivery::DeferredOrdered
+            )
+        });
+    }
+
+    fn cancel_accepted_type(&mut self, ty: u32) {
+        self.retain_transmit(|item| {
+            !matches!(&item.item,
+            RouterTxItem::Broadcast(_) if item.accepted_type == ty)
         });
     }
 
@@ -2909,6 +2977,31 @@ impl RouterInner {
         }
     }
 
+    fn reliable_original_type(item: &TxQueued) -> Option<DataType> {
+        let RouterTxItem::Broadcast(data) = &item.item else {
+            return None;
+        };
+        let _ = data;
+        let ty = DataType(item.accepted_type);
+        (item.delivery_state != QueuedDelivery::Untracked).then_some(ty)
+    }
+
+    fn ordered_original_type(item: &TxQueued) -> Option<DataType> {
+        let RouterTxItem::Broadcast(data) = &item.item else {
+            return None;
+        };
+        let _ = data;
+        let ty = DataType(item.accepted_type);
+        matches!(
+            item.delivery_state,
+            QueuedDelivery::Ordered
+                | QueuedDelivery::OrderedTail
+                | QueuedDelivery::DeferredOrdered
+                | QueuedDelivery::ClaimedOrdered
+        )
+        .then_some(ty)
+    }
+
     fn pop_received_fair(&mut self) -> Option<RouterRxItem> {
         self.received_queue.pop_front_bulk_fair(
             &mut self.rx_priority_burst,
@@ -2958,7 +3051,46 @@ impl RouterInner {
             }
             _ => {}
         }
-        item.disposable = Self::classify_transmit_disposable(&item);
+        if let RouterTxItem::Broadcast(data) = &item.item {
+            item.accepted_type = match data {
+                RouterItem::Packet(packet) => packet.data_type().as_u32(),
+                RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
+                    wire_format::scheduling_type(view)
+                })
+                .ok()
+                .flatten()
+                .map_or(0, |ty| ty.as_u32()),
+            };
+        }
+        if item.delivery_state == QueuedDelivery::Untracked
+            && matches!(&item.item, RouterTxItem::Broadcast(_))
+        {
+            item.delivery_state = match reliable_mode(DataType(item.accepted_type)) {
+                crate::ReliableMode::Ordered => QueuedDelivery::Ordered,
+                crate::ReliableMode::Unordered => QueuedDelivery::Unordered,
+                crate::ReliableMode::None => QueuedDelivery::Untracked,
+            };
+        }
+        // A partial schema merge may raise priority while an Ordered stream
+        // is queued. Preserve its original service band until its tail drains.
+        if matches!(
+            item.delivery_state,
+            QueuedDelivery::Ordered | QueuedDelivery::DeferredOrdered
+        ) && let Some(priority) = self.transmit_queue.iter().find_map(|queued| {
+            (Self::ordered_original_type(queued).is_some()
+                && queued.accepted_type == item.accepted_type)
+                .then_some(queued.priority)
+        }) {
+            item.priority = priority;
+            item.delivery_state = QueuedDelivery::OrderedTail;
+        }
+        item.disposable = if item.delivery_state != QueuedDelivery::Untracked {
+            false
+        } else {
+            Self::classify_transmit_disposable(&item)
+        };
+        let ordered_retry = Self::ordered_original_type(&item).is_some()
+            && item.delivery_state == QueuedDelivery::DeferredOrdered;
         let replay = item.item.replay_marker_key();
         // Admission, eviction and the reservation change share this state lock.
         // An acknowledged/orphan marker has no payload left to retransmit.
@@ -3060,6 +3192,9 @@ impl RouterInner {
                 )
             }
         };
+        if result.is_ok() && ordered_retry {
+            self.has_ordered_retry = true;
+        }
         if result.is_ok()
             && let Some(key) = replay
         {
@@ -5766,6 +5901,9 @@ impl Router {
                 },
                 ignore_local,
                 priority,
+                delivery_state: QueuedDelivery::Untracked,
+                accepted_type: 0,
+                deferred_since_ms: 0,
                 retry_after_ms: 0,
             })?;
         }
@@ -11565,6 +11703,8 @@ impl Router {
                     memory.queue_grow_step,
                 ),
                 tx_priority_burst: 0,
+                has_ordered_retry: false,
+                ordered_claim_seq: 0,
                 rx_priority_burst: 0,
                 recent_rx: BoundedDeque::new(
                     memory.recent_rx_queue_bytes(),
@@ -13585,6 +13725,7 @@ impl Router {
     pub fn clear_queues(&self) {
         let mut st = self.state.lock();
         st.retain_transmit(|_| false);
+        st.has_ordered_retry = false;
         st.received_queue.clear();
         st.rx_priority_burst = 0;
         drop(st);
@@ -13607,6 +13748,7 @@ impl Router {
         let mut st = self.state.lock();
         st.retain_transmit(|_| false);
         st.tx_priority_burst = 0;
+        st.has_ordered_retry = false;
     }
 
     #[inline(never)]
@@ -13614,13 +13756,56 @@ impl Router {
         st: &mut RouterInner,
         now_ms: u64,
         control_only: bool,
-    ) -> Option<TxQueued> {
-        st.transmit_queue.pop_front_fair_if(
+    ) -> Option<TxWork> {
+        let slow = st.has_ordered_retry;
+        let mut next_token = st.ordered_claim_seq.wrapping_add(1).max(1);
+        if slow {
+            while st.claim_index(next_token).is_some() {
+                next_token = next_token.wrapping_add(1).max(1);
+            }
+        }
+        let selected = st.transmit_queue.select_front_fair_with_context(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
             |item| item.priority,
-            |item| item.retry_after_ms <= now_ms && (!control_only || item.priority >= 200),
-        )
+            |_queue, item| {
+                !matches!(item.delivery_state,
+                    QueuedDelivery::ClaimedOrdered | QueuedDelivery::ClaimedUnordered
+                        | QueuedDelivery::OrderedTail)
+                    && item.retry_after_ms <= now_ms
+                    && (!control_only || item.priority >= 200)
+            },
+        )?;
+        let current = st.transmit_queue.get(selected)?;
+        let reliable = RouterInner::reliable_original_type(current).is_some();
+        let ordered = reliable && RouterInner::ordered_original_type(current).is_some();
+        let (queued, claim) = if reliable {
+            let queued = current.clone();
+            st.transmit_queue.update_metadata(selected, |item| {
+                item.delivery_state = if ordered {
+                    QueuedDelivery::ClaimedOrdered
+                } else {
+                    QueuedDelivery::ClaimedUnordered
+                };
+                item.deferred_since_ms = u64::from(next_token);
+            });
+            st.ordered_claim_seq = next_token;
+            (
+                queued,
+                Some(TxClaim {
+                    token: next_token,
+                    ordered,
+                }),
+            )
+        } else {
+            (st.transmit_queue.remove_pos(selected)?, None)
+        };
+        if claim.is_some() {
+            st.has_ordered_retry = true;
+        } else if slow {
+            st.refresh_retry_hint();
+        }
+        Some(TxWork { queued, claim })
     }
 
     /// Process packets in the transmit queue for up to `timeout_ms` milliseconds.
@@ -13647,7 +13832,7 @@ impl Router {
                 Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false)
             };
             let Some(pkt) = pkt_opt else { break };
-            self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
+            self.dispatch_queued_item(pkt)?;
             if timeout_ms != 0 && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
                 break;
             }
@@ -13738,7 +13923,7 @@ impl Router {
                 // Priority burst limits still prefer and protect queued ACKs.
                 Self::pop_transmit_queue_locked(&mut st, now, false)
             } {
-                self.tx_item_impl(pkt.item, pkt.ignore_local, true)?;
+                self.dispatch_queued_item(pkt)?;
                 did_any = true;
             }
             // Control reception must not starve queued ACKs/transmissions.
@@ -13840,7 +14025,198 @@ impl Router {
             item,
             ignore_local,
             priority,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
             retry_after_ms: self.clock.now_ms().saturating_add(1),
+        })
+    }
+
+    fn claim_schema_is_current(
+        &self,
+        ty: DataType,
+        claim: Option<TxClaim>,
+    ) -> TelemetryResult<bool> {
+        let Some(claim) = claim else {
+            return Ok(true);
+        };
+        let expected = if claim.ordered {
+            crate::ReliableMode::Ordered
+        } else {
+            crate::ReliableMode::Unordered
+        };
+        let current = reliable_mode(ty);
+        let mut st = self.state.lock();
+        let owned = st.claim_index(claim.token).is_some();
+        if !owned {
+            return Ok(false);
+        }
+        if current == expected {
+            return Ok(true);
+        }
+        st.cancel_accepted_type(ty.as_u32());
+        st.refresh_retry_hint();
+        Err(TelemetryError::HandlerError(
+            "accepted reliable schema changed before dispatch",
+        ))
+    }
+
+    fn mark_claim_local_delivered(&self, claim: Option<TxClaim>) -> bool {
+        let Some(claim) = claim else {
+            return true;
+        };
+        let mut st = self.state.lock();
+        let index = st.claim_index(claim.token);
+        let Some(index) = index else {
+            return false;
+        };
+        st.transmit_queue
+            .update_metadata(index, |item| item.ignore_local = true);
+        true
+    }
+
+    fn dispatch_queued_item(&self, work: TxWork) -> TelemetryResult<()> {
+        let queued = work.queued;
+        let since = matches!(
+            queued.delivery_state,
+            QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
+        )
+        .then_some(queued.deferred_since_ms);
+        if !self.claim_schema_is_current(DataType(queued.accepted_type), work.claim)? {
+            return Ok(());
+        }
+        let mut context = DispatchContext {
+            claim: work.claim,
+            since,
+            terminal: false,
+            owner_transferred: false,
+        };
+        let mut result =
+            self.tx_item_impl_with_retry(queued.item, queued.ignore_local, true, &mut context);
+        if let Some(claim) = work.claim {
+            let mut st = self.state.lock();
+            if result.is_err() && !context.terminal && !context.owner_transferred {
+                let Some(index) = st.claim_index(claim.token) else {
+                    return result;
+                };
+                let original = st.transmit_queue.get(index).expect("claimed owner");
+                if !original.ignore_local
+                    && let RouterTxItem::Broadcast(data) = &original.item
+                {
+                    let id = Self::get_hash(data);
+                    st.recent_rx.remove_value(&id);
+                }
+                drop(st);
+                result = self.defer_accepted_original(&mut context);
+                if result.is_ok() {
+                    return Ok(());
+                }
+                st = self.state.lock();
+            }
+            if let Some(index) = st.claim_index(claim.token) {
+                if context.terminal && claim.ordered {
+                    let ty = st
+                        .transmit_queue
+                        .get(index)
+                        .expect("claimed owner")
+                        .accepted_type;
+                    st.cancel_accepted_type(ty);
+                } else {
+                    let ty = st.transmit_queue.get(index).expect("claimed owner").accepted_type;
+                    let _ = st.transmit_queue.remove_pos(index);
+                    if claim.ordered {
+                        // Exactly one FIFO head per Ordered type can be eligible.
+                        // Promotion changes metadata only, retaining the admitted payload.
+                        let next = st.transmit_queue.iter().position(|item|
+                            item.delivery_state == QueuedDelivery::OrderedTail && item.accepted_type == ty);
+                        if let Some(next) = next {
+                            st.transmit_queue.update_metadata(next, |item| item.delivery_state = QueuedDelivery::Ordered);
+                        }
+                    }
+                }
+            }
+            st.refresh_retry_hint();
+        }
+        result
+    }
+
+    fn expire_deferred_original(
+        &self,
+        ty: DataType,
+        since: u64,
+        ordered: bool,
+    ) -> TelemetryResult<()> {
+        let lifetime = runtime_reliable_retransmit_ms()
+            .saturating_mul(u64::from(runtime_reliable_max_retries()) + 1);
+        let now = self.clock.now_ms();
+        if now >= since && now - since < lifetime {
+            return Ok(());
+        }
+        if ordered {
+            let mut st = self.state.lock();
+            st.cancel_accepted_type(ty.as_u32());
+            st.refresh_retry_hint();
+        }
+        Err(TelemetryError::HandlerError(
+            "accepted reliable delivery expired before dispatch",
+        ))
+    }
+
+    fn defer_accepted_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
+        let Some(claim) = context.claim else {
+            return Err(TelemetryError::Io("reliable owner unavailable"));
+        };
+        let now = self.clock.now_ms();
+        let Some(retry_after_ms) = now.checked_add(1) else {
+            context.terminal = true;
+            return Err(TelemetryError::HandlerError(
+                "accepted reliable clock exhausted",
+            ));
+        };
+        let mut st = self.state.lock();
+        let Some(index) = st.claim_index(claim.token) else {
+            return Ok(());
+        };
+        st.transmit_queue.update_metadata(index, |item| {
+            item.delivery_state = if claim.ordered {
+                QueuedDelivery::DeferredOrdered
+            } else {
+                QueuedDelivery::DeferredUnordered
+            };
+            item.deferred_since_ms = context.since.unwrap_or(now);
+            item.retry_after_ms = retry_after_ms;
+        });
+        st.has_ordered_retry = true;
+        Ok(())
+    }
+
+    #[allow(unused_mut)]
+    fn replace_claim_payload(&self, claim: TxClaim, mut data: RouterItem) -> TelemetryResult<()> {
+        #[cfg(feature = "compact-packet-store")]
+        data.park_for_queue()?;
+        let payload_cost = match &data {
+            RouterItem::Packet(packet) => packet.byte_cost(),
+            RouterItem::Packed(bytes) => size_of::<crate::SharedBytes>() + bytes.len(),
+        };
+        let mut st = self.state.lock();
+        let Some(index) = st.claim_index(claim.token) else {
+            return Ok(());
+        };
+        let original = st.transmit_queue.get(index).expect("claimed owner");
+        let old_cost = original.byte_cost();
+        let new_cost = old_cost
+            .saturating_sub(original.item.byte_cost())
+            .saturating_add(payload_cost);
+        let priority = original.priority;
+        let growth = new_cost.saturating_sub(old_cost);
+        if growth != 0 {
+            st.make_shared_queue_room(growth, priority, None)?;
+        }
+        let Some(index) = st.claim_index(claim.token) else {
+            return Ok(());
+        };
+        st.transmit_queue.update_admitted(index, new_cost, |item| {
+            item.item = RouterTxItem::Broadcast(data)
         })
     }
 
@@ -13892,6 +14268,9 @@ impl Router {
             item,
             ignore_local,
             priority,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
             retry_after_ms,
         })?;
         Ok(())
@@ -15258,52 +15637,97 @@ impl Router {
         ignore_local: bool,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
+        self.tx_item_impl_with_retry(
+            item,
+            ignore_local,
+            called_from_queue,
+            &mut DispatchContext::default(),
+        )
+    }
+
+    fn tx_item_impl_with_retry(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        called_from_queue: bool,
+        context: &mut DispatchContext,
+    ) -> TelemetryResult<()> {
         match item {
             RouterTxItem::Broadcast(data) => {
-                self.ensure_e2e_policy_supported_for_type(Self::item_data_type(&data)?)?;
+                let claim = context.claim;
+                let deferred_since = context.since;
+                let ty = Self::item_data_type(&data)?;
+
+                if let Some(since) = deferred_since
+                    && let Err(error) = self.expire_deferred_original(
+                        ty, since, claim.is_some_and(|claim| claim.ordered))
+                {
+                    context.terminal = true;
+                    return Err(error);
+                }
+                if !called_from_queue
+                    && !ignore_local
+                    && matches!(reliable_mode(ty), crate::ReliableMode::Ordered)
+                    && self
+                        .state
+                        .lock()
+                        .transmit_queue
+                        .iter()
+                        .any(|queued| RouterInner::ordered_original_type(queued) == Some(ty))
+                {
+                    return self.tx_queue_item(RouterTxItem::Broadcast(data));
+                }
+
+                self.ensure_e2e_policy_supported_for_type(ty)?;
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
                     self.remember_managed_variable_packet(pkt)?;
                 }
                 #[cfg(feature = "discovery")]
-                let is_discovery = matches!(&data, RouterItem::Packet(pkt) if discovery::is_discovery_type(pkt.data_type()))
-                    || matches!(&data, RouterItem::Packed(bytes)
-                        if wire_format::peek_envelope(bytes.as_ref())
-                            .map(|env| discovery::is_discovery_type(env.ty))
-                            .unwrap_or(false));
+                let is_discovery = discovery::is_discovery_type(ty);
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {
                         return Ok(());
                     }
                     #[cfg(feature = "discovery")]
-                    if !is_discovery
-                        && !matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        && !matches!(&data, RouterItem::Packed(bytes)
-                            if wire_format::peek_routing_envelope(bytes.as_ref())
-                                .map(|env| is_internal_control_type(env.ty))
-                                .unwrap_or(false))
+                    if !is_discovery && !is_internal_control_type(ty)
+                        && let Err(error) = self.dispatch_local_for_item(&data, called_from_queue)
                     {
-                        self.dispatch_local_for_item(&data, called_from_queue)?;
+                        // Never repeat a partially applied local side effect.
+                        if claim.is_some() {
+                            context.terminal = true;
+                            return Err(TelemetryError::HandlerError("accepted local delivery failed"));
+                        }
+                        return Err(error);
                     }
                     #[cfg(not(feature = "discovery"))]
-                    if !matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        && !matches!(&data, RouterItem::Packed(bytes)
-                            if wire_format::peek_routing_envelope(bytes.as_ref())
-                                .map(|env| is_internal_control_type(env.ty))
-                                .unwrap_or(false))
+                    if !is_internal_control_type(ty)
+                        && let Err(error) = self.dispatch_local_for_item(&data, called_from_queue)
                     {
-                        self.dispatch_local_for_item(&data, called_from_queue)?;
+                        // Never repeat a partially applied local side effect.
+                        if claim.is_some() {
+                            context.terminal = true;
+                            return Err(TelemetryError::HandlerError("accepted local delivery failed"));
+                        }
+                        return Err(error);
                     }
+                }
+
+                if !ignore_local && !self.mark_claim_local_delivered(claim) {
+                    // An explicit queue clear cancelled the publication during its callback.
+                    return Ok(());
+                }
+
+                if !self.claim_schema_is_current(ty, claim)? {
+                    return Ok(());
                 }
 
                 match &data {
                     RouterItem::Packet(packet) => packet.validate()?,
-                    RouterItem::Packed(bytes) => {
-                        let _ = wire_format::peek_routing_envelope(bytes.as_ref())?;
-                    }
+                    // item_data_type already validated the same immutable packed bytes.
+                    RouterItem::Packed(_) => {}
                 }
-                let ty = Self::item_data_type(&data)?;
                 // Skipping local delivery does not waive a remote receipt
                 // contract: a queued credit retry must still be registered.
                 let freezes_contract = !is_internal_control_type(ty)
@@ -15329,8 +15753,7 @@ impl Router {
 
                 if !send_remote {
                     let (endpoints, ty) = self.item_route_info(&data)?;
-                    if !ignore_local
-                        && !is_internal_control_type(ty)
+                    if !is_internal_control_type(ty)
                         && is_reliable_type(ty)
                         && has_nonlocal_endpoint(&endpoints, &self.cfg)
                         && !self
@@ -15343,6 +15766,9 @@ impl Router {
                         // here loses application state during route expiry.
                         // Permit retry of the same packet after discovery heals.
                         self.remove_pkt_id(&data);
+                        if called_from_queue {
+                            return self.defer_accepted_original(context);
+                        }
                         return Err(TelemetryError::Io("no discovered route"));
                     }
                     return Ok(());
@@ -15370,8 +15796,12 @@ impl Router {
                             let targets: Vec<u64> = pending.keys().copied().collect();
                             data = self.attach_wire_contract_to_item(data, &targets)?;
                             match self.register_end_to_end_reliable_tx(&data, Some(pending)) {
-                                Ok(false) => return Ok(()),
-                                Ok(true) => {}
+                                Ok(ready) => {
+                                    context.owner_transferred = true;
+                                    if !ready {
+                                        return Ok(());
+                                    }
+                                }
                                 Err(error) => {
                                     // Freezing destinations preserves the logical packet ID.
                                     // Clear its dedupe mark without retaining/cloning the old item.
@@ -15385,10 +15815,10 @@ impl Router {
                                         // Acceptance transferred ownership to this queue. A full
                                         // receipt window is temporary credit pressure, not loss.
                                         // Retain the frozen identity and skip local delivery on retry.
-                                        self.tx_queue_item_for_retry(
-                                            RouterTxItem::Broadcast(data),
-                                            true,
-                                        )?;
+                                        if let Some(claim) = claim {
+                                            self.replace_claim_payload(claim, data)?;
+                                        }
+                                        self.defer_accepted_original(context)?;
                                         return Ok(());
                                     }
                                     return Err(error);
@@ -15458,7 +15888,8 @@ impl Router {
             RouterTxItem::ToSide { src, dst, data } => {
                 #[cfg(feature = "compression")]
                 let mut data = data;
-                self.ensure_e2e_policy_supported_for_type(Self::item_data_type(&data)?)?;
+                let ty = Self::item_data_type(&data)?;
+                self.ensure_e2e_policy_supported_for_type(ty)?;
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
@@ -15468,23 +15899,14 @@ impl Router {
                     if self.is_duplicate_pkt(&data)? {
                         return Ok(());
                     }
-                    let suppress_local = matches!(&data, RouterItem::Packet(pkt) if is_internal_control_type(pkt.data_type()))
-                        || matches!(&data, RouterItem::Packed(bytes)
-                            if wire_format::peek_routing_envelope(bytes.as_ref())
-                                .map(|env| is_internal_control_type(env.ty))
-                                .unwrap_or(false));
+                    let suppress_local = is_internal_control_type(ty);
                     if !suppress_local {
                         self.dispatch_local_for_item(&data, called_from_queue)?;
                     }
                 }
                 let allowed = {
                     let st = self.state.lock();
-                    let ty = match &data {
-                        RouterItem::Packet(pkt) => Some(pkt.data_type()),
-                        RouterItem::Packed(bytes) => {
-                            Some(wire_format::peek_routing_envelope(bytes.as_ref())?.ty)
-                        }
-                    };
+                    let ty = Some(ty);
                     let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
                     #[cfg(all(feature = "discovery", feature = "timesync"))]
                     let timesync_allowed = ty
@@ -15989,6 +16411,9 @@ mod queued_schema_identity_tests {
             },
             ignore_local: true,
             priority: 255,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
             retry_after_ms: 123,
         };
         st.push_transmit(queued(side, original.clone())).unwrap();
@@ -16070,6 +16495,9 @@ mod queued_schema_identity_tests {
                     },
                     ignore_local: true,
                     priority: 255,
+                    delivery_state: QueuedDelivery::Untracked,
+                    accepted_type: 0,
+                    deferred_since_ms: 0,
                     retry_after_ms: 0,
                 })
                 .unwrap();
@@ -16527,6 +16955,9 @@ mod queued_schema_identity_tests {
                 },
                 ignore_local: true,
                 priority: 250,
+                delivery_state: QueuedDelivery::Untracked,
+                accepted_type: 0,
+                deferred_since_ms: 0,
                 retry_after_ms: 0,
             })
             .unwrap();
@@ -16587,6 +17018,9 @@ mod queued_schema_identity_tests {
                 },
                 ignore_local: true,
                 priority: 1,
+                delivery_state: QueuedDelivery::Untracked,
+                accepted_type: 0,
+                deferred_since_ms: 0,
                 retry_after_ms: 0,
             })
             .unwrap();
@@ -16713,6 +17147,9 @@ mod bounded_fair_queue_tests {
                     item: RouterTxItem::Broadcast(data),
                     ignore_local: true,
                     priority: 0,
+                    delivery_state: QueuedDelivery::Untracked,
+                    accepted_type: 0,
+                    deferred_since_ms: 0,
                     retry_after_ms: 0,
                 };
                 let mut st = node.state.lock();
@@ -16812,6 +17249,9 @@ mod bounded_fair_queue_tests {
                         item: RouterTxItem::Broadcast(data),
                         ignore_local: true,
                         priority: 0,
+                        delivery_state: QueuedDelivery::Untracked,
+                        accepted_type: 0,
+                        deferred_since_ms: 0,
                         retry_after_ms: 0,
                     };
                     let mut st = node.state.lock();
@@ -16917,6 +17357,9 @@ mod bounded_fair_queue_tests {
                             item: RouterTxItem::Broadcast(data),
                             ignore_local: true,
                             priority: 0,
+                            delivery_state: QueuedDelivery::Untracked,
+                            accepted_type: 0,
+                            deferred_since_ms: 0,
                             retry_after_ms: 0,
                         };
                         let order = if slow_last {
