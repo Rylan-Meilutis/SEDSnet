@@ -2779,6 +2779,28 @@ fn compressed_opaque_transit_uses_bounded_admission_on_router_and_relay() {
         }],
     )
     .unwrap();
+    // This test intentionally exercises retained compressed transit. Its sink
+    // must advertise that codec; legacy/unknown sinks now require raw payloads.
+    let mut capabilities = RouterSideOptions::default().link_capabilities();
+    capabilities.flags |= sedsnet::discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
+    let sink_address = sedsnet::discovery::build_discovery_address(
+        "GS",
+        0,
+        &sedsnet::discovery::AddressAdvertisement {
+            hostname: "GS".into(),
+            address: 42,
+            requested_address: 42,
+            mode: sedsnet::discovery::ADDRESS_MODE_STATIC,
+            state: sedsnet::discovery::ADDRESS_STATE_APPROVED,
+            birth_ms: 1,
+            owner_hash: 42,
+            reachable_endpoints: vec![ep],
+            reachable_network_variables: vec![],
+            reachable_timesync_sources: vec![],
+            link_capabilities: capabilities,
+        },
+    )
+    .unwrap();
     let announce = build_discovery_announce("COMPRESSED_TRANSIT_SOURCE", 0, &[]).unwrap();
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
     let opts = RouterSideOptions::default();
@@ -2793,6 +2815,7 @@ fn compressed_opaque_transit_uses_bounded_admission_on_router_and_relay() {
         },
         opts,
     );
+    router.rx_from_side(&sink_address, ro).unwrap();
     router.rx_from_side(&topology, ro).unwrap();
     router.rx_from_side(&announce, ri).unwrap();
     router.drain_queues_with_timeout(0).unwrap();
@@ -2812,6 +2835,7 @@ fn compressed_opaque_transit_uses_bounded_admission_on_router_and_relay() {
         },
         opts,
     );
+    relay.rx_from_side(lo, sink_address).unwrap();
     relay.rx_from_side(lo, topology).unwrap();
     relay.rx_from_side(li, announce).unwrap();
     relay.drain_queues_with_timeout(0).unwrap();
@@ -3623,4 +3647,117 @@ fn full_topology_response_has_bounded_snapshot_allocation_peak() {
         peak <= 17500,
         "discovery response retained excess graph scratch: {peak} bytes"
     );
+}
+
+#[cfg(feature = "compression")]
+#[test]
+fn codec_metadata_yields_before_physical_route_scratch_admission() {
+    use sedsnet::discovery::{self, AddressAdvertisement};
+    use sedsnet::relay::Relay;
+    use sedsnet::router::RouterSideOptions;
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+    static REFUSALS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn after_cache_free(_additional: usize, _largest: usize) -> bool {
+        if RELEASED.load(Ordering::Relaxed) {
+            return true;
+        }
+        if LIVE_ALLOCATION_DELTA.with(|delta| delta.get().is_some_and(|bytes| bytes <= -256)) {
+            RELEASED.store(true, Ordering::Relaxed);
+            true
+        } else {
+            REFUSALS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+    struct TrackingReset;
+    impl Drop for TrackingReset {
+        fn drop(&mut self) {
+            LIVE_ALLOCATION_DELTA.with(|delta| delta.set(None));
+            sedsnet::memory_admission::set_probe(None);
+        }
+    }
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _reset = Reset;
+    let _tracking = TrackingReset;
+    let endpoint = register_endpoint_with_description("CODEC_PHYSICAL_ROUTE", "", false).unwrap();
+    let mut caps = RouterSideOptions::default().link_capabilities();
+    caps.flags |= discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
+    let address = |name: &str, index| {
+        discovery::build_discovery_address(
+            name,
+            100,
+            &AddressAdvertisement {
+                hostname: name.into(),
+                address: index,
+                requested_address: 0,
+                mode: discovery::ADDRESS_MODE_STATIC,
+                state: discovery::ADDRESS_STATE_APPROVED,
+                birth_ms: 1,
+                owner_hash: u64::from(index),
+                reachable_endpoints: vec![endpoint],
+                reachable_network_variables: vec![],
+                reachable_timesync_sources: vec![],
+                link_capabilities: caps,
+            },
+        )
+        .unwrap()
+    };
+    for relay_mode in [false, true] {
+        let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 100));
+        let relay = Relay::new(Box::new(|| 100));
+        let side = if relay_mode {
+            relay.add_side_packed("wire", |_| Ok(()))
+        } else {
+            router.add_side_packed("wire", |_| Ok(()))
+        };
+        for index in 1..=16 {
+            let packet = address(&format!("PHYSICAL_CODEC_PEER_{index}"), index);
+            if relay_mode {
+                relay.rx_from_side(side, packet).unwrap();
+                relay.drain_queues_with_timeout(0).unwrap();
+            } else {
+                router.rx_from_side(&packet, side).unwrap();
+                router.drain_queues_with_timeout(0).unwrap();
+            }
+        }
+        if relay_mode {
+            relay.clear_queues()
+        } else {
+            router.clear_queues()
+        }
+        let packet = address("PHYSICAL_NEW_REQUIRED_ROUTE", 1000);
+        let wire = sedsnet::wire_format::pack_packet(&packet);
+        RELEASED.store(false, Ordering::Relaxed);
+        REFUSALS.store(0, Ordering::Relaxed);
+        LIVE_ALLOCATION_DELTA.with(|delta| delta.set(Some(0)));
+        sedsnet::memory_admission::set_probe(Some(after_cache_free));
+        if relay_mode {
+            relay.rx_packed_from_side(side, &wire).unwrap();
+            relay.drain_queues_with_timeout(0).unwrap();
+        } else {
+            router.rx_packed_from_side(&wire, side).unwrap();
+            router.drain_queues_with_timeout(0).unwrap();
+        }
+        sedsnet::memory_admission::set_probe(None);
+        LIVE_ALLOCATION_DELTA.with(|delta| delta.set(None));
+        assert!(REFUSALS.load(Ordering::Relaxed) >= 1);
+        assert!(RELEASED.load(Ordering::Relaxed));
+        let topology = if relay_mode {
+            relay.export_topology()
+        } else {
+            router.export_topology()
+        };
+        let names: Vec<_> = topology
+            .routes
+            .iter()
+            .flat_map(|route| &route.announcers)
+            .map(|announcer| announcer.sender_id.as_str())
+            .collect();
+        assert_eq!(
+            names.len(),
+            17,
+            "existing routes were discarded to admit metadata"
+        );
+        assert!(names.contains(&"PHYSICAL_NEW_REQUIRED_ROUTE"));
+    }
 }

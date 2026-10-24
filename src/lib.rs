@@ -177,6 +177,8 @@ mod lock;
 mod macros;
 pub mod memory_admission;
 pub mod packet;
+#[cfg(feature = "compression")]
+mod payload_codec;
 mod shared_bytes;
 pub use shared_bytes::SharedBytes;
 #[cfg(feature = "compact-packet-store")]
@@ -185,9 +187,9 @@ mod queue;
 pub mod relay;
 pub mod router;
 mod side_transport;
-mod small_payload;
 #[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
 mod small_map;
+mod small_payload;
 mod small_sort;
 #[cfg(feature = "timesync")]
 pub mod timesync;

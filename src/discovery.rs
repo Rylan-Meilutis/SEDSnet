@@ -172,6 +172,8 @@ pub const LINK_CAPABILITY_RELIABILITY: u32 = 0x0000_0004;
 pub const LINK_CAPABILITY_CRYPTO: u32 = 0x0000_0008;
 pub const LINK_CAPABILITY_END_TO_END_RELIABILITY: u32 = 0x0000_0010;
 pub const LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS: u32 = 0x0000_0020;
+/// Can decode optional canonical payload compression. Absence means raw payloads.
+pub const LINK_CAPABILITY_PAYLOAD_COMPRESSION: u32 = 0x0000_0040;
 
 pub const LINK_PROFILE_CANONICAL: u8 = 0;
 pub const LINK_PROFILE_TEMPLATE: u8 = 1;

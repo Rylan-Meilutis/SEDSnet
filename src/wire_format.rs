@@ -932,6 +932,17 @@ pub fn pack_reliable_ack(sender: &str, ty: DataType, timestamp_ms: u64, ack: u32
 // Discovery must bootstrap across peers before optional codec support is known.
 // A host with compression enabled must still seed an empty no-compression MCU.
 fn payload_for_wire(pkt: &Packet) -> (bool, alloc::borrow::Cow<'_, [u8]>) {
+    payload_for_encoding(pkt, true)
+}
+
+fn payload_for_encoding(
+    pkt: &Packet,
+    #[cfg_attr(not(feature = "compression"), allow(unused_variables))] compression_allowed: bool,
+) -> (bool, alloc::borrow::Cow<'_, [u8]>) {
+    #[cfg(feature = "compression")]
+    if !compression_allowed {
+        return (false, alloc::borrow::Cow::Borrowed(pkt.payload()));
+    }
     #[cfg(feature = "discovery")]
     if crate::discovery::is_discovery_type(pkt.data_type()) {
         return (false, alloc::borrow::Cow::Borrowed(pkt.payload()));
@@ -969,6 +980,7 @@ fn pack_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]
 /// # Returns
 /// - `Ok(Arc<[u8]>)` containing the packed frame bytes.
 /// - `Err(TelemetryError)` if contract encoding fails.
+#[cfg(any(test, not(feature = "compression")))]
 pub(crate) fn pack_packet_with_wire_contract(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
@@ -984,7 +996,7 @@ pub(crate) struct E2eSealConfig {
     pub key_id: u32,
 }
 
-#[cfg(feature = "cryptography")]
+#[cfg(all(feature = "cryptography", not(feature = "compression")))]
 pub(crate) fn pack_packet_with_wire_contract_e2e(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
@@ -1008,8 +1020,157 @@ fn pack_packet_inner_with_contract(
         shape,
         target_senders,
         e2e,
+        true,
         |header, payload| Ok(join_frame_with_crc(header, payload)),
     )
+}
+
+/// Router/relay replay basis is independent of the current outgoing peer set.
+/// Sealed packets also keep their inner payload codec-free: transit nodes cannot
+/// rewrite authenticated ciphertext without the recipient's key.
+#[cfg(feature = "compression")]
+pub(crate) fn pack_routed_packet(
+    pkt: &Packet,
+    reliable: Option<ReliableHeader>,
+    shape: Option<MessageElement>,
+    target_senders: &[u64],
+    e2e: Option<E2eSealConfig>,
+) -> TelemetryResult<Arc<[u8]>> {
+    with_packet_frame_parts(
+        pkt,
+        reliable,
+        shape,
+        target_senders,
+        e2e,
+        false,
+        |header, payload| Ok(join_frame_with_crc(header, payload)),
+    )
+}
+
+/// Re-encode only an ordinary plaintext payload, preserving its complete header,
+/// frozen delivery contract, nonce and reliable sequence. No schema registration
+/// or application decoding is needed. `None` retains the existing shared frame.
+#[cfg(feature = "compression")]
+pub(crate) fn payload_encoding_for_side(
+    raw: &[u8],
+    allowed: bool,
+    max_decoded_bytes: usize,
+) -> TelemetryResult<Option<Arc<[u8]>>> {
+    let flags = *raw.first().ok_or(TelemetryError::Unpack("short prelude"))?;
+    let compressed = flags & FLAG_COMPRESSED_PAYLOAD != 0;
+    if flags & 0x10 != 0 {
+        if compressed && !allowed {
+            return Err(TelemetryError::Io(
+                "opaque compressed payload requires codec-capable peers",
+            ));
+        }
+        return Ok(None);
+    }
+    if !compressed && !allowed {
+        return Ok(None);
+    }
+    // Small plaintext samples need neither a second CRC pass nor codec scratch.
+    // This is an optional transformation; ordinary ingress validation remains
+    // authoritative when the original shared bytes are retained unchanged.
+    if !compressed {
+        let mut prelude = ByteReader::new(raw);
+        prelude.read_bytes(2)?;
+        read_uleb128(&mut prelude)?;
+        if read_uleb128(&mut prelude)? < crate::config::runtime_payload_compress_threshold() as u64
+        {
+            return Ok(None);
+        }
+    }
+    let data = verify_crc32(raw)?;
+    let mut reader = ByteReader::new(data);
+    let envelope = read_routing_envelope(&mut reader)?;
+    #[cfg(feature = "discovery")]
+    let allowed = allowed && !crate::discovery::is_discovery_type(envelope.ty);
+    if envelope.is_reliable || envelope.has_reliable_header {
+        read_reliable_header_encoded(&mut reader, flags & FLAG_COMPACT_RELIABLE_HEADER != 0)?;
+    }
+    let header = &data[..reader.off];
+    let payload = &data[reader.off..];
+    if compressed && allowed {
+        return Ok(None);
+    }
+    if !compressed && !allowed {
+        return Ok(None);
+    }
+    let mut prelude = ByteReader::new(data);
+    prelude.read_bytes(2)?;
+    read_uleb128(&mut prelude)?;
+    let logical = usize::try_from(read_uleb128(&mut prelude)?)
+        .map_err(|_| TelemetryError::Unpack("payload too large"))?;
+    if logical > max_decoded_bytes || logical > isize::MAX as usize - header.len() - CRC32_BYTES {
+        if !compressed {
+            return Ok(None);
+        }
+        return Err(TelemetryError::Io("payload exceeds routing memory budget"));
+    }
+    let bytes = logical
+        .saturating_mul(2)
+        .saturating_add(header.len().saturating_mul(2))
+        .saturating_add(64);
+    let largest = logical
+        .saturating_add(header.len())
+        .saturating_add(CRC32_BYTES)
+        .saturating_add(32);
+    if let Err(error) = crate::memory_admission::check(bytes, largest) {
+        // Compression is optional; required decompression must retain ownership
+        // and backpressure rather than emitting an undecodable frame.
+        if !compressed {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let (new_flag, new_payload) = if compressed {
+        (
+            flags & !FLAG_COMPRESSED_PAYLOAD,
+            alloc::borrow::Cow::Owned(payload_compression::decompress(payload, logical)?),
+        )
+    } else {
+        if payload.len() != logical {
+            return Err(TelemetryError::Unpack("payload length mismatch"));
+        }
+        let (beneficial, value) = payload_compression::compress_if_beneficial(payload);
+        if !beneficial {
+            return Ok(None);
+        }
+        (flags | FLAG_COMPRESSED_PAYLOAD, value)
+    };
+    let mut prefix = header.to_vec();
+    prefix[0] = new_flag;
+    Ok(Some(join_frame_with_crc(&prefix, &new_payload)))
+}
+
+/// Conservative size credit before retaining a compressed-to-raw conversion.
+/// Includes the complete original header/CRC and the logical payload, so the
+/// bounded queue reservation never depends on optimistic compression ratios.
+#[cfg(feature = "compression")]
+pub(crate) fn decoded_frame_upper_bound(raw: &[u8]) -> TelemetryResult<usize> {
+    let mut reader = ByteReader::new(raw);
+    reader.read_bytes(2)?;
+    read_uleb128(&mut reader)?;
+    let logical = usize::try_from(read_uleb128(&mut reader)?)
+        .map_err(|_| TelemetryError::Unpack("payload too large"))?;
+    raw.len()
+        .checked_add(logical)
+        .ok_or(TelemetryError::Io("memory pressure"))
+}
+
+/// Keep replay ownership independent of a transient side codec choice. Sealed
+/// frames cannot be rewritten without their key; their side compatibility is
+/// checked before dispatch instead.
+#[cfg(feature = "compression")]
+pub(crate) fn payload_encoding_for_retention(
+    raw: &[u8],
+    budget: usize,
+) -> TelemetryResult<Option<Arc<[u8]>>> {
+    if raw.first().is_some_and(|flags| flags & 0x10 != 0) {
+        return Ok(None);
+    }
+    payload_encoding_for_side(raw, false, budget)
 }
 
 /// Serialize the normal plaintext header while retaining the existing payload.
@@ -1029,6 +1190,7 @@ pub(crate) fn with_plain_packet_parts<T>(
         pkt.wire_shape(),
         pkt.wire_target_senders(),
         None,
+        true,
         consume,
     )
 }
@@ -1061,6 +1223,7 @@ fn with_packet_frame_parts<T>(
     shape: Option<MessageElement>,
     target_senders: &[u64],
     #[cfg_attr(not(feature = "cryptography"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
+    compression_allowed: bool,
     consume: impl FnOnce(&[u8], &[u8]) -> TelemetryResult<T>,
 ) -> TelemetryResult<T> {
     let carries_wire_contract = shape.is_some() || !target_senders.is_empty();
@@ -1078,7 +1241,7 @@ fn with_packet_frame_parts<T>(
     let source_address = source_address_for_sender(pkt.sender());
 
     // Decide whether to compress the payload.
-    let (payload_compressed, payload_wire) = payload_for_wire(pkt);
+    let (payload_compressed, payload_wire) = payload_for_encoding(pkt, compression_allowed);
 
     // Size the variable-length prefix exactly. A 16-byte estimate can be
     // too small for real timestamps/nonces, doubling a multi-KiB schema

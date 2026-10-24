@@ -205,11 +205,17 @@ Development source; package publication and long-duration simulator qualificatio
   template and reliable replay maps on B-trees; desktop production is unchanged.
 - Preserve ordered iteration, borrowed lookup and entry semantics, and release
   empty index allocations. Add randomized equivalence and ownership regressions.
-- Send discovery/bootstrap control packets without optional compression so
-  codec-free peers can still merge runtime schemas. Match encoded-size accounting
-  to this policy; ordinary payload compression is unchanged.
-- Validate the current full-feature FC Release/TLSF/compact factory image at
-  449,820 of 474,624 application FLASH bytes (94.774%).
+- Keep discovery/bootstrap control packets raw so codec-free peers can merge
+  runtime schemas. Router/relay payload compression now requires a live,
+  incarnation-scoped codec advertisement from every peer on a shared side;
+  unknown and legacy receivers use raw payloads. Explicit standalone packing
+  keeps its existing optional compression behavior.
+- Preserve reliable receipt identities and sequence numbers across codec changes.
+  Retain admitted raw fallbacks for retry, reserve their expanded queue credits,
+  and reclaim optional codec metadata before required route or schema growth.
+  Liveness uses existing traffic and leases without periodic schema broadcasts.
+- Gate the full-feature FC Release/TLSF/compact factory image below 450,892 of
+  474,624 application FLASH bytes (95%).
 
 ### Version 4.2.5 highlights
 

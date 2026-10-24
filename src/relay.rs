@@ -1,6 +1,9 @@
 #[cfg(all(test, feature = "std"))]
 #[path = "tests/independent_side_tx_relay.rs"]
 mod independent_side_tx;
+#[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
+#[path = "tests/payload_codec_relay.rs"]
+mod payload_codec_negotiation;
 #[cfg(all(test, feature = "std"))]
 #[path = "tests/reliable_tx_window_backpressure_relay.rs"]
 mod reliable_tx_window_backpressure_tests;
@@ -354,6 +357,10 @@ impl RelaySideOptions {
         {
             flags |= discovery::LINK_CAPABILITY_CRYPTO;
         }
+        #[cfg(feature = "compression")]
+        {
+            flags |= discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
+        }
         discovery::LinkCapabilities {
             version: 1,
             flags,
@@ -545,6 +552,10 @@ struct SideTransportState {
     #[cfg(feature = "std")]
     tx_callback_gate: Arc<ReentryGate>,
     tx_chunk_progress: Option<Box<crate::side_transport::SideTxProgress>>,
+    #[cfg(all(feature = "compression", feature = "discovery"))]
+    payload_codec: crate::payload_codec::Ledger,
+    #[cfg(all(feature = "compression", feature = "discovery"))]
+    payload_codec_choice: u64,
     tx_template_ids: BTreeMap<u64, u32>,
     tx_templates: BTreeMap<u64, SideHeaderTemplate>,
     tx_last_timestamps: BTreeMap<u32, u64>,
@@ -979,6 +990,8 @@ enum RouteSelectionOrigin {
 
 /// Internal state, protected by RouterMutex so all public methods can take &self.
 struct RelayInner {
+    #[cfg(feature = "compression")]
+    codec_reserved_bytes: usize,
     memory: RuntimeMemoryConfig,
     sides: Vec<Option<RelaySide>>,
     route_overrides: BTreeMap<(Option<RelaySideId>, RelaySideId), bool>,
@@ -1023,7 +1036,77 @@ enum RelayQueueKind {
     Replay,
 }
 
+#[cfg(feature = "compression")]
+impl crate::payload_codec::QueueBudget for RelayInner {
+    fn codec_reserved(&mut self) -> &mut usize {
+        &mut self.codec_reserved_bytes
+    }
+    fn codec_used(&self) -> usize {
+        self.shared_queue_bytes_used()
+    }
+    fn codec_limit(&self) -> usize {
+        self.memory.max_queue_budget
+    }
+}
+
 impl RelayInner {
+    #[cfg(all(feature = "compression", feature = "discovery"))]
+    fn reclaim_codec_metadata(&mut self) -> bool {
+        self.side_transport.values_mut().any(|transport| {
+            transport
+                .payload_codec
+                .evict_for_budget(DISCOVERY_ROUTE_TTL_MS)
+        })
+    }
+
+    /// Prepare required plaintext before publishing its queue owner. The state
+    /// lock prevents another producer taking the checked expanded byte credit.
+    /// A refused optional preparation leaves the original accepted work owned;
+    /// dispatch will backpressure it until the required decoder scratch fits.
+    #[cfg(feature = "compression")]
+    fn prepare_codec_queue_owner(&mut self, side: Option<usize>, data: &mut RelayItem) {
+        let RelayItem::Packed(bytes) = data else {
+            return;
+        };
+        if !bytes.first().is_some_and(|flags| flags & 0x11 == 1) {
+            return;
+        }
+        let capable = {
+            #[cfg(feature = "discovery")]
+            {
+                side.and_then(|side| self.side_transport.get(&side))
+                    .is_some_and(|transport| {
+                        transport.payload_codec.retention_can_stay_compressed()
+                    })
+            }
+            #[cfg(not(feature = "discovery"))]
+            {
+                let _ = side;
+                false
+            }
+        };
+        if capable {
+            return;
+        }
+        let Ok(required) = wire_format::decoded_frame_upper_bound(bytes.as_ref()) else {
+            return;
+        };
+        if self
+            .shared_queue_bytes_used()
+            .checked_add(required)
+            .and_then(|used| used.checked_add(size_of::<u64>()))
+            .is_none_or(|used| used > self.memory.max_queue_budget)
+        {
+            return;
+        }
+        if let Ok(Some(raw)) = wire_format::payload_encoding_for_retention(
+            bytes.as_ref(),
+            self.memory.max_queue_budget,
+        ) {
+            *bytes = crate::shared_bytes::convert(raw);
+        }
+    }
+
     fn retain_replays<F>(&mut self, keep: F)
     where
         F: FnMut(&RelayReplayItem) -> bool,
@@ -1321,20 +1404,35 @@ impl RelayInner {
 
     #[inline(never)]
     fn protected_metadata_bytes_used(&self) -> usize {
-        self.recent_rx
-            .max_bytes()
-            .saturating_add(self.reliable_rx_buffered_bytes())
-            .saturating_add(crate::config::schema_bytes_used())
-            .saturating_add({
-                #[cfg(feature = "discovery")]
-                {
-                    self.discovery_bytes_used()
-                }
-                #[cfg(not(feature = "discovery"))]
-                {
-                    0
-                }
-            })
+        let codec_bytes = {
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            {
+                self.side_transport
+                    .values()
+                    .map(|side| side.payload_codec.heap_bytes())
+                    .sum::<usize>()
+            }
+            #[cfg(not(all(feature = "compression", feature = "discovery")))]
+            {
+                0usize
+            }
+        };
+        codec_bytes.saturating_add(
+            self.recent_rx
+                .max_bytes()
+                .saturating_add(self.reliable_rx_buffered_bytes())
+                .saturating_add(crate::config::schema_bytes_used())
+                .saturating_add({
+                    #[cfg(feature = "discovery")]
+                    {
+                        self.discovery_bytes_used()
+                    }
+                    #[cfg(not(feature = "discovery"))]
+                    {
+                        0
+                    }
+                }),
+        )
     }
     #[inline]
     fn shared_queue_bytes_used(&self) -> usize {
@@ -1344,6 +1442,16 @@ impl RelayInner {
             .saturating_add(self.replay_queue.bytes_used())
             .saturating_add(self.side_chunk_bytes_used())
             .saturating_add(self.protected_metadata_bytes_used())
+            .saturating_add({
+                #[cfg(feature = "compression")]
+                {
+                    self.codec_reserved_bytes
+                }
+                #[cfg(not(feature = "compression"))]
+                {
+                    0
+                }
+            })
     }
 
     fn reliable_rx_buffer_len(&self) -> usize {
@@ -1422,6 +1530,11 @@ impl RelayInner {
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            if self.reclaim_codec_metadata() {
+                continue;
+            }
+
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             {
                 let incoming =
@@ -1472,7 +1585,17 @@ impl RelayInner {
             .recent_rx
             .max_bytes()
             .saturating_add(self.discovery_bytes_used())
-            .saturating_add(self.reliable_rx_buffered_bytes());
+            .saturating_add(self.reliable_rx_buffered_bytes())
+            .saturating_add({
+                #[cfg(feature = "compression")]
+                {
+                    self.codec_reserved_bytes
+                }
+                #[cfg(not(feature = "compression"))]
+                {
+                    0
+                }
+            });
         self.memory.max_queue_budget.saturating_sub(protected)
     }
 
@@ -1489,6 +1612,11 @@ impl RelayInner {
         let incoming = Self::discovery_route_byte_cost(&route);
         let growth = incoming.saturating_sub(previous);
         while self.shared_queue_bytes_used().saturating_add(growth) > self.memory.max_queue_budget {
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            if self.reclaim_codec_metadata() {
+                continue;
+            }
+
             if !self.pop_lowest_packet_queue_item(256) {
                 return Err(TelemetryError::Io("shared priority queue saturated"));
             }
@@ -1500,6 +1628,11 @@ impl RelayInner {
     #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
         while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            if self.reclaim_codec_metadata() {
+                continue;
+            }
+
             if self.pop_lowest_packet_queue_item(256) {
                 continue;
             }
@@ -1549,6 +1682,10 @@ impl RelayInner {
     }
 
     fn push_tx(&mut self, item: RelayTxItem) -> TelemetryResult<()> {
+        #[cfg(feature = "compression")]
+        let mut item = item;
+        #[cfg(feature = "compression")]
+        self.prepare_codec_queue_owner(Some(item.dst), &mut item.data);
         #[cfg(feature = "discovery")]
         {
             // Preserve the transfer identity of an unchanged queued catalog.
@@ -1888,6 +2025,8 @@ impl Relay {
         Self {
             sender: RouterMutex::new(cfg.sender()),
             state: RouterMutex::new(RelayInner {
+                #[cfg(feature = "compression")]
+                codec_reserved_bytes: 0,
                 memory,
                 sides: Vec::new(),
                 route_overrides: BTreeMap::new(),
@@ -2859,6 +2998,20 @@ impl Relay {
             return Ok(());
         }
 
+        #[cfg(feature = "compression")]
+        let data = match data {
+            RelayItem::Packed(bytes) => {
+                let budget = self.state.lock().memory.max_queue_budget;
+                let normalized =
+                    wire_format::payload_encoding_for_retention(bytes.as_ref(), budget)?;
+                RelayItem::Packed(
+                    normalized
+                        .map(crate::shared_bytes::convert)
+                        .unwrap_or(bytes),
+                )
+            }
+            packet => packet,
+        };
         let (seq, flags) = {
             let mut st = self.state.lock();
             let tx_state = self.reliable_tx_state_mut(&mut st, side, ty);
@@ -2875,12 +3028,22 @@ impl Relay {
             (seq, flags)
         };
 
-        let mut bytes: crate::SharedBytes = match data {
+        let bytes: crate::SharedBytes = match data {
             RelayItem::Packet(pkt) => {
-                crate::shared_bytes::convert(wire_format::pack_packet_with_reliable(
-                    &pkt,
-                    wire_format::ReliableHeader { flags, seq, ack: 0 },
-                ))
+                #[cfg(feature = "compression")]
+                {
+                    crate::shared_bytes::convert(self.pack_relay_packet(
+                        &pkt,
+                        Some(wire_format::ReliableHeader { flags, seq, ack: 0 }),
+                    )?)
+                }
+                #[cfg(not(feature = "compression"))]
+                {
+                    crate::shared_bytes::convert(wire_format::pack_packet_with_reliable(
+                        &pkt,
+                        wire_format::ReliableHeader { flags, seq, ack: 0 },
+                    ))
+                }
             }
             RelayItem::Packed(bytes) => {
                 let Some(rewritten) =
@@ -2905,6 +3068,9 @@ impl Relay {
                 crate::shared_bytes::convert(rewritten)
             }
         };
+
+        #[cfg(feature = "compact-packet-store")]
+        let mut bytes = bytes;
 
         let Some(_side_tx_guard) = self.try_enter_side_tx(side) else {
             return Err(TelemetryError::Io("side tx busy"));
@@ -3964,6 +4130,11 @@ impl Relay {
         peer.last_seen_ms = now;
         route.last_seen_ms = route.last_seen_ms.max(now);
 
+        #[cfg(feature = "compression")]
+        {
+            drop(st);
+            self.note_payload_codec_address(side, payload, true);
+        }
         Ok(true)
     }
 
@@ -4550,6 +4721,8 @@ impl Relay {
             }
         };
 
+        #[cfg(feature = "compression")]
+        self.note_payload_codec_packet(src, &pkt, false);
         if self.refresh_known_discovery_liveness(&pkt, src)? {
             return Ok(());
         }
@@ -4678,6 +4851,11 @@ impl Relay {
                 return Err(err);
             }
             let mut st = self.state.lock();
+            #[cfg(feature = "compression")]
+            if st.reclaim_codec_metadata() {
+                continue;
+            }
+
             if !st.pop_lowest_packet_queue_item(256) {
                 return Err(err);
             }
@@ -4686,6 +4864,10 @@ impl Relay {
 
         #[cfg(feature = "std")]
         if pkt.data_type() == crate::DataType::DiscoverySchema {
+            #[cfg(feature = "compression")]
+            let snapshot =
+                self.decode_required_schema(|| discovery::decode_discovery_schema(&pkt))?;
+            #[cfg(not(feature = "compression"))]
             let snapshot = discovery::decode_discovery_schema(&pkt)?;
             let mut st = self.state.lock();
             let budget = st.schema_growth_budget();
@@ -4700,6 +4882,8 @@ impl Relay {
         }
         if pkt.data_type() == crate::DataType::DiscoveryLinkCapabilities {
             let _ = discovery::decode_discovery_link_capabilities(&pkt)?;
+            #[cfg(feature = "compression")]
+            self.note_payload_codec_packet(src, &pkt, true);
             return Ok(());
         }
         let mut st = self.state.lock();
@@ -4725,6 +4909,11 @@ impl Relay {
             }
             let _ = Self::prune_discovery_routes_locked(&mut st, now_ms);
             self.reconcile_end_to_end_acked_destinations_locked(&mut st);
+            #[cfg(feature = "compression")]
+            {
+                drop(st);
+                self.note_payload_codec_packet(src, &pkt, true);
+            }
             return Ok(());
         }
         let address_ad = if pkt.data_type() == crate::DataType::DiscoveryAddress {
@@ -4873,6 +5062,11 @@ impl Relay {
         }
         let _ = Self::prune_discovery_routes_locked(&mut st, now_ms);
         self.reconcile_end_to_end_acked_destinations_locked(&mut st);
+        #[cfg(feature = "compression")]
+        {
+            drop(st);
+            self.note_payload_codec_packet(src, &pkt, true);
+        }
         Ok(())
     }
 
@@ -6396,12 +6590,178 @@ impl Relay {
         SideTransportFrames::split(frame, max_frame_bytes, self.sender_arc().as_bytes())
     }
 
+    #[cfg(all(feature = "compression", feature = "discovery"))]
+    fn note_payload_codec_packet(&self, side: RelaySideId, pkt: &Packet, accepted: bool) {
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if !st
+            .sides
+            .get(side)
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|entry| matches!(entry.tx_handler, RelayTxHandlerFn::Packed(_)))
+        {
+            return;
+        }
+        if accepted && pkt.data_type() == crate::DataType::DiscoveryLeave {
+            for transport in st.side_transport.values_mut() {
+                let _ = transport.payload_codec.discovery_packet(
+                    pkt,
+                    true,
+                    now,
+                    DISCOVERY_ROUTE_TTL_MS,
+                );
+            }
+        } else if let Some(transport) = st.side_transport.get_mut(&side) {
+            let _ = transport.payload_codec.discovery_packet(
+                pkt,
+                accepted,
+                now,
+                DISCOVERY_ROUTE_TTL_MS,
+            );
+        }
+        if st.shared_queue_bytes_used() > st.memory.max_queue_budget
+            && let Some(transport) = st.side_transport.get_mut(&side)
+        {
+            transport.payload_codec.evict(now, DISCOVERY_ROUTE_TTL_MS);
+        }
+    }
+    #[cfg(all(feature = "compression", feature = "discovery"))]
+    fn note_payload_codec_address(&self, side: RelaySideId, payload: &[u8], accepted: bool) {
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if !st
+            .sides
+            .get(side)
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|entry| matches!(entry.tx_handler, RelayTxHandlerFn::Packed(_)))
+        {
+            return;
+        }
+        if let Some(transport) = st.side_transport.get_mut(&side) {
+            let _ = transport.payload_codec.address_payload(
+                payload,
+                accepted,
+                now,
+                DISCOVERY_ROUTE_TTL_MS,
+            );
+        }
+        if st.shared_queue_bytes_used() > st.memory.max_queue_budget
+            && let Some(transport) = st.side_transport.get_mut(&side)
+        {
+            transport.payload_codec.evict(now, DISCOVERY_ROUTE_TTL_MS);
+        }
+    }
+
+    #[cfg(feature = "compression")]
+    fn payload_for_transport_side(
+        &self,
+        side: RelaySideId,
+        raw: crate::SharedBytes,
+    ) -> TelemetryResult<crate::SharedBytes> {
+        #[cfg(not(feature = "discovery"))]
+        let _ = side;
+        let (allowed, budget) = {
+            #[cfg(feature = "discovery")]
+            let mut st = self.state.lock();
+            #[cfg(not(feature = "discovery"))]
+            let st = self.state.lock();
+            let budget = st.memory.max_queue_budget;
+            #[cfg(feature = "discovery")]
+            let allowed = {
+                let transport = st
+                    .side_transport
+                    .get_mut(&side)
+                    .ok_or(TelemetryError::BadArg)?;
+                let generation = transport.payload_codec.generation();
+                if transport.payload_codec_choice != generation {
+                    transport.payload_codec_choice = generation;
+                    transport.tx_chunk_progress = None;
+                    transport.refresh_transmit_header_templates();
+                }
+                transport.payload_codec.allowed(self.clock.now_ms())
+            };
+            #[cfg(not(feature = "discovery"))]
+            let allowed = false;
+            (allowed, budget)
+        };
+        Ok(
+            match wire_format::payload_encoding_for_side(raw.as_ref(), allowed, budget)? {
+                Some(frame) => crate::shared_bytes::convert(frame),
+                None => raw,
+            },
+        )
+    }
+
+    #[cfg(feature = "compression")]
+    fn pack_relay_packet(
+        &self,
+        pkt: &Packet,
+        reliable: Option<wire_format::ReliableHeader>,
+    ) -> TelemetryResult<Arc<[u8]>> {
+        let reliable = reliable.or_else(|| {
+            is_reliable_type(pkt.data_type()).then_some(wire_format::ReliableHeader {
+                flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 0,
+            })
+        });
+        wire_format::pack_routed_packet(
+            pkt,
+            reliable,
+            pkt.wire_shape(),
+            pkt.wire_target_senders(),
+            None,
+        )
+    }
+
+    /// Persist an admitted downgrade in the queue owner before a handler can
+    /// backpressure it. Retrying retained traffic must not need fresh decoder
+    /// scratch merely to reproduce the same already-admitted plaintext frame.
+    #[cfg(feature = "compression")]
+    fn prepare_queued_payload(
+        &self,
+        side: RelaySideId,
+        data: &mut RelayItem,
+    ) -> TelemetryResult<Option<crate::payload_codec::QueueReservation<'_, RelayInner>>> {
+        let RelayItem::Packed(bytes) = data else {
+            return Ok(None);
+        };
+        if !bytes.first().is_some_and(|flags| flags & 0x11 == 1) {
+            return Ok(None);
+        }
+        let capable = {
+            #[cfg(feature = "discovery")]
+            {
+                self.state
+                    .lock()
+                    .side_transport
+                    .get(&side)
+                    .is_some_and(|transport| transport.payload_codec.allowed(self.clock.now_ms()))
+            }
+            #[cfg(not(feature = "discovery"))]
+            {
+                false
+            }
+        };
+        if capable {
+            return Ok(None);
+        }
+        let required = wire_format::decoded_frame_upper_bound(bytes.as_ref())?
+            .checked_add(size_of::<u64>())
+            .ok_or(TelemetryError::Io("memory pressure"))?;
+        let reservation = crate::payload_codec::QueueReservation::acquire(&self.state, required)?;
+        *bytes = self.payload_for_transport_side(side, bytes.clone())?;
+        Ok(Some(reservation))
+    }
+
     fn encode_side_transport_frames(
         &self,
         side: RelaySideId,
         opts: RelaySideOptions,
         raw: crate::SharedBytes,
     ) -> TelemetryResult<SideTransportFrames> {
+        #[cfg(feature = "compression")]
+        let raw = self.payload_for_transport_side(side, raw)?;
         if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
             return Ok(SideTransportFrames::single(raw));
         }
@@ -6643,6 +7003,8 @@ impl Relay {
         let mut st = self.state.lock();
         for side in st.side_transport.values_mut() {
             let side = side.as_mut();
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            side.payload_codec.expire(now, DISCOVERY_ROUTE_TTL_MS);
             let reclaimed =
                 SideChunkAssembly::expire(&mut side.rx_chunks, &mut side.rx_chunk_bytes, now);
             side.rx_chunk_reclaims = side.rx_chunk_reclaims.saturating_add(reclaimed);
@@ -6660,6 +7022,13 @@ impl Relay {
     ) -> Option<wire_format::RoutingFrameInfo<'a>> {
         let frame = wire_format::peek_routing_frame_info(bytes).ok()?;
         self.refresh_peer_liveness(side, frame.envelope.source_address);
+        #[cfg(feature = "compression")]
+        if frame.envelope.ty == crate::DataType::DiscoveryAddress
+            && let Ok(Some((_, payload))) =
+                wire_format::peek_plain_discovery_payload(bytes, crate::DataType::DiscoveryAddress)
+        {
+            self.note_payload_codec_address(side, payload, false);
+        }
         Some(frame)
     }
 
@@ -6668,6 +7037,12 @@ impl Relay {
     fn refresh_peer_liveness(&self, side: RelaySideId, address: u32) {
         let now = self.clock.now_ms();
         let mut st = self.state.lock();
+        #[cfg(feature = "compression")]
+        if let Some(transport) = st.side_transport.get_mut(&side) {
+            transport
+                .payload_codec
+                .observe(address, now, DISCOVERY_ROUTE_TTL_MS);
+        }
         let Some(route) = st.discovery_routes.get_mut(&side) else {
             return;
         };
@@ -6754,11 +7129,31 @@ impl Relay {
         Ok(true)
     }
 
+    #[cfg(all(feature = "compression", feature = "discovery"))]
+    fn decode_required_schema<T>(
+        &self,
+        mut decode: impl FnMut() -> TelemetryResult<T>,
+    ) -> TelemetryResult<T> {
+        loop {
+            match decode() {
+                Err(error @ TelemetryError::Io("memory pressure")) => {
+                    if !self.state.lock().reclaim_codec_metadata() {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[cfg(all(feature = "discovery", not(feature = "std")))]
     #[inline(never)]
     fn merge_schema_changes(&self, payload: &[u8]) -> TelemetryResult<()> {
         // Validate the entire catalog, then materialize only changed entries.
         // Packed and already-decoded ingress share one atomic budgeted merge.
+        #[cfg(feature = "compression")]
+        let snapshot = self.decode_required_schema(|| discovery::decode_schema_changes(payload))?;
+        #[cfg(not(feature = "compression"))]
         let snapshot = discovery::decode_schema_changes(payload)?;
         let mut st = self.state.lock();
         let budget = st.schema_growth_budget();
@@ -6944,6 +7339,17 @@ impl Relay {
             && self.cached_transit_ready(side, bytes, view)?
         {
             let result = crate::memory_admission::check_cached_transit(bytes.len());
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            let result = {
+                let mut result = result;
+                while matches!(result, Err(TelemetryError::Io("memory pressure")))
+                    && self.state.lock().reclaim_codec_metadata()
+                {
+                    result = crate::memory_admission::check_cached_transit(bytes.len());
+                }
+                result
+            };
+
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             let result = {
                 let mut result = result;
@@ -6961,6 +7367,11 @@ impl Relay {
             loop {
                 match crate::memory_admission::check_receive(bytes) {
                     Err(TelemetryError::Io("memory pressure")) => {
+                        #[cfg(all(feature = "compression", feature = "discovery"))]
+                        if self.state.lock().reclaim_codec_metadata() {
+                            continue;
+                        }
+
                         let protected = *protected.get_or_insert_with(|| {
                             wire_format::peek_routing_frame_info(bytes)
                                 .ok()
@@ -7365,6 +7776,9 @@ impl Relay {
                     self.note_side_tx_success(side, ty, wire_len, 1);
                     return Ok(());
                 }
+                #[cfg(feature = "compression")]
+                let owned = self.pack_relay_packet(pkt, None)?;
+                #[cfg(not(feature = "compression"))]
                 let owned = wire_format::pack_packet(pkt);
                 let frames = self.encode_side_transport_frames(
                     side,
@@ -7517,7 +7931,21 @@ impl Relay {
             let Some((src, dst, handler, opts, data, priority)) = self.pop_ready_tx_item() else {
                 break;
             };
-            match self.send_tx_item(src, dst, handler, opts, data.clone()) {
+            #[cfg(feature = "compression")]
+            let mut data = data;
+            #[cfg(feature = "compression")]
+            let prepared = self.prepare_queued_payload(dst, &mut data);
+            #[cfg(feature = "compression")]
+            let (send_result, mut reservation) = match prepared {
+                Ok(reservation) => (
+                    self.send_tx_item(src, dst, handler, opts, data.clone()),
+                    reservation,
+                ),
+                Err(error) => (Err(error), None),
+            };
+            #[cfg(not(feature = "compression"))]
+            let send_result = self.send_tx_item(src, dst, handler, opts, data.clone());
+            match send_result {
                 Ok(sent) => {
                     if sent
                         && timeout_ms != 0
@@ -7528,6 +7956,10 @@ impl Relay {
                 }
                 Err(e) if Self::is_transient_tx_error(&e) => {
                     let mut st = self.state.lock();
+                    #[cfg(feature = "compression")]
+                    if let Some(reservation) = &mut reservation {
+                        reservation.release_locked(&mut st);
+                    }
                     st.push_tx(RelayTxItem {
                         src,
                         dst,
@@ -7621,10 +8053,29 @@ impl Relay {
             // Then send out TX
             let sent_one =
                 if let Some((src, dst, handler, opts, data, priority)) = self.pop_ready_tx_item() {
-                    match self.send_tx_item(src, dst, handler, opts, data.clone()) {
+                    #[cfg(feature = "compression")]
+                    let mut data = data;
+                    #[cfg(feature = "compression")]
+                    let prepared = self.prepare_queued_payload(dst, &mut data);
+                    #[cfg(feature = "compression")]
+                    let (send_result, mut reservation) = match prepared {
+                        Ok(reservation) => (
+                            self.send_tx_item(src, dst, handler, opts, data.clone()),
+                            reservation,
+                        ),
+                        Err(error) => (Err(error), None),
+                    };
+                    #[cfg(not(feature = "compression"))]
+                    let send_result = self.send_tx_item(src, dst, handler, opts, data.clone());
+                    match send_result {
                         Ok(sent) => sent,
                         Err(error) if Self::is_transient_tx_error(&error) => {
-                            self.state.lock().push_tx(RelayTxItem {
+                            let mut state = self.state.lock();
+                            #[cfg(feature = "compression")]
+                            if let Some(reservation) = &mut reservation {
+                                reservation.release_locked(&mut state);
+                            }
+                            state.push_tx(RelayTxItem {
                                 src,
                                 dst,
                                 data,
