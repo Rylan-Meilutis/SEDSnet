@@ -3354,9 +3354,20 @@ pub struct Router {
     side_tx_gate: ReentryGate,
     #[cfg(feature = "std")]
     side_tx_activity: crate::lock::SideTxActivity,
+    #[cfg(feature = "std")]
+    active_queued_tx: core::sync::atomic::AtomicUsize,
     clock: Box<dyn Clock + Send + Sync>,
     #[cfg(feature = "timesync")]
     timesync: RouterMutex<TimeSyncRuntime>,
+}
+
+#[cfg(feature = "std")]
+struct QueuedTxActivityGuard<'a>(&'a core::sync::atomic::AtomicUsize);
+#[cfg(feature = "std")]
+impl Drop for QueuedTxActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, core::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -11801,6 +11812,8 @@ impl Router {
             side_tx_gate: ReentryGate::new(),
             #[cfg(feature = "std")]
             side_tx_activity: crate::lock::SideTxActivity::default(),
+            #[cfg(feature = "std")]
+            active_queued_tx: core::sync::atomic::AtomicUsize::new(0),
             clock,
             #[cfg(feature = "timesync")]
             timesync: RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)),
@@ -13345,6 +13358,63 @@ impl Router {
         }
     }
 
+    /// Whether SDK delivery ownership remains for a reliable type submitted
+    /// through `tx_queue`/`tx_packed_queue`. Includes original/claimed work,
+    /// transport retries and reliable owners. A concurrent queued TX dispatch
+    /// conservatively returns true even for an unrelated type. This allocates
+    /// nothing and changes no queues. Packed work without a cached type is
+    /// conservatively pending, without materializing or pinning its payload.
+    /// It is NOT an RX-originated ownership or
+    /// external transport/modem-drain guarantee.
+    #[cfg(feature = "std")]
+    pub fn has_pending_reliable_tx_type(&self, ty: DataType) -> bool {
+        let st = self.state.lock();
+        if self
+            .active_queued_tx
+            .load(core::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return true;
+        }
+        let matches_data = |data: &RouterItem| match data {
+            RouterItem::Packet(packet) => packet.data_type() == ty,
+            RouterItem::Packed(_) => true,
+        };
+        st.transmit_queue.iter().any(|queued| {
+            if queued.accepted_type != 0 {
+                return queued.accepted_type == ty.as_u32();
+            }
+            match &queued.item {
+                RouterTxItem::Broadcast(data) | RouterTxItem::ToSide { data, .. } => {
+                    matches_data(data)
+                }
+                RouterTxItem::ReliableReplay { ty: found, .. } => *found == ty,
+                RouterTxItem::EndToEndReplay { packet_id } => st
+                    .end_to_end_reliable_tx
+                    .get(packet_id)
+                    .is_some_and(|owner| matches_data(&owner.data)),
+            }
+        }) || st
+            .end_to_end_reliable_tx
+            .values()
+            .any(|owner| matches_data(&owner.data))
+            || st
+                .reliable_tx
+                .iter()
+                .any(|((_, found), owner)| *found == ty.as_u32() && !owner.sent.is_empty())
+    }
+
+    // Called only while the same state lock that pops the work is still held.
+    // Thus inspection cannot observe a popped retry before this count exists.
+    #[cfg(feature = "std")]
+    fn track_queued_tx(&self, work: Option<TxWork>) -> Option<(TxWork, QueuedTxActivityGuard<'_>)> {
+        work.map(|work| {
+            self.active_queued_tx
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            (work, QueuedTxActivityGuard(&self.active_queued_tx))
+        })
+    }
+
     /// Allocation-free memory counters, version 1. Values saturate at u32::MAX.
     /// Approximate retained costs exclude allocator headers and shared ownership;
     /// they are component diagnostics, not an independent heap-size estimate.
@@ -13891,9 +13961,14 @@ impl Router {
 
             let pkt_opt = {
                 let mut st = self.state.lock();
-                Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false)
+                let work = Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false);
+                #[cfg(feature = "std")]
+                let work = self.track_queued_tx(work);
+                work
             };
             let Some(pkt) = pkt_opt else { break };
+            #[cfg(feature = "std")]
+            let (pkt, _activity) = pkt;
             self.dispatch_queued_item(pkt)?;
             if timeout_ms != 0 && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
                 break;
@@ -13983,8 +14058,13 @@ impl Router {
                 let now = self.clock.now_ms();
                 // Complete one fair TX even after RX uses the deadline.
                 // Priority burst limits still prefer and protect queued ACKs.
-                Self::pop_transmit_queue_locked(&mut st, now, false)
+                let work = Self::pop_transmit_queue_locked(&mut st, now, false);
+                #[cfg(feature = "std")]
+                let work = self.track_queued_tx(work);
+                work
             } {
+                #[cfg(feature = "std")]
+                let (pkt, _activity) = pkt;
                 self.dispatch_queued_item(pkt)?;
                 did_any = true;
             }
@@ -17635,3 +17715,7 @@ mod bounded_rx_priority_tests {
         assert_eq!(node.state.lock().rx_priority_burst, 0);
     }
 }
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/accepted_tx_ownership.rs"]
+mod accepted_tx_ownership;
