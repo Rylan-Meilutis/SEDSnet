@@ -9,17 +9,23 @@
       "command": "python3 build.py test --full",
       "rust_tests_passed": 715,
       "rust_tests_skipped": 0,
-      "python_tests_passed": 72,
-      "duration_seconds": 168.38
+      "python_tests_passed": 63,
+      "duration_seconds": 168.38,
+      "python_tests_ran": 72,
+      "python_tests_skipped": 9,
+      "python_scope_correction": "Historical discovery skipped native-binding tests because defaultcargo build emittedstaticlib/rlib only; separate explicitcdylib/strictfull qualification follows. Rustcounts unchanged."
     },
     "compact_fair_crypto": {
       "command": "python3 build.py test --full --features cryptography,fair-admission,compact-packet-store,compact-packet-compression",
       "rust_tests_passed": 741,
       "rust_tests_skipped": 0,
-      "python_tests_passed": 72,
+      "python_tests_passed": 63,
       "duration_seconds": 721.8,
       "codec_pressure_soak_seconds": 600,
-      "duration_shortened": false
+      "duration_shortened": false,
+      "python_tests_ran": 72,
+      "python_tests_skipped": 9,
+      "python_scope_correction": "Historical discovery skipped native-binding tests because defaultcargo build emittedstaticlib/rlib only; separate explicitcdylib/strictfull qualification follows. Rustcounts unchanged."
     }
   },
   "also_passed": [
@@ -29,7 +35,8 @@
   ],
   "diagnostic_sha256": "735a958178de4f118d1792d908c21c20cf98d9727c6680be2865bb4eedcbf8ec",
   "remaining": [
-    "Matched corrected-clock MCU and hosted finite-radio two/three-node acceptance and600s source/SD/restart soaks",
+    "Finish separate nativebinding/full-runner and credential-log script qualification with no binding skips",
+    "Finish measured RRLS relayfreshness policy and ordinary operational sequence acceptance",
     "Final local Mac build and package publication after qualification"
   ],
   "credential_scope": "No real package credential is used by qualification; publication credentials are not included in source or reports.",
@@ -42,5 +49,62 @@
     "Repeated same-time absolute targets no longer accumulate phase error.",
     "Advancing targets converge within configured monotonic slew bounds.",
     "Remote samples remain accurate across independent read/poll cadences and leader replacement."
-  ]
+  ],
+  "matched_frozen_cohort": {
+    "result": "passed",
+    "image_id": "sha256:ab07941110da9b2d4163833acbe75e3548f37584a4296fa554c23718a7520b02",
+    "radios": [
+      2,
+      3
+    ],
+    "power_packet_stores": [
+      "heap",
+      "compact"
+    ],
+    "source_soak_seconds": 600,
+    "restart_seconds": 120,
+    "gates": [
+      "startup",
+      "network",
+      "source-preservation",
+      "DAQpressureSD",
+      "DAQrawSD",
+      "FCallSD",
+      "GSrestart"
+    ],
+    "rf_control_rounds_per_cohort": 59,
+    "rf_control_latency_ms_range": [
+      100,
+      210
+    ],
+    "evidence": "FirmwareSimulator/docs/qualification/radio-clock-fixed-600s-2026-10-25.json",
+    "scope": "Frozen correctedruntime source; subsequent script-only changes do not alter theseRust runtime hashes. Separate relay/operational additions notqualifiedbythisrun."
+  },
+  "python_script_stage_followup": {
+    "credential_logging_commit": "051c481",
+    "change_scope": "Build/release logging and test harness only; Rust runtime, API and existing frozen-image hashes unchanged. Historical Rust campaign counts remain separate.",
+    "command": "production build.python_test_environment + python_test_runner.py --require-bindings",
+    "python_tests_passed": 80,
+    "python_tests_skipped": 0,
+    "python_suite_duration_seconds": 15.717,
+    "total_duration_seconds": 26.1485,
+    "binding_features": "python,timesync with default features",
+    "binding_build": "cargo rustc --lib --features python,timesync --target x86_64-unknown-linux-gnu --crate-type cdylib",
+    "coverage": [
+      "Actual current native Python callback reentry, public API, topology and system suite; prior campaigns skipped these when the extension was absent.",
+      "All existing build/release/CMake/script tests plus fake-sentinel redaction and native-loader regressions.",
+      "Actual Ninja dependency fixture confirms release_logging.py edits invalidate the Rust build command.",
+      "Linux host build/load is real; macOS/Windows filename/profile/staging contracts use synthetic artifacts and do not replace physical platform build qualification."
+    ],
+    "isolation": "Explicit allowlisted environment, empty temporary HOME/XDG; offline Cargo cache exposes registry/git only, no credential files or OS store; no package installs/login/publish. Native extension copied to a temporary package, removed on exit.",
+    "evidence_log": ".workspace-progress/sdk-python-all-isolated.log",
+    "source_sha256": {
+      "build.py": "d40ff228bdab2021017b8b3de17b12cd2b84dfe9f96453b956a8bd1442bb1a49",
+      "release_logging.py": "5367ab32f1bda926320a04ba59850e1c2afeadc1ed0aa448855f8d1d1ab61873",
+      "python_test_runner.py": "29ed9145d61d24fac36c9fed36b06520d2625978d8964d6b0bdd2bcba00a2b86",
+      "CMakeLists.txt": "7e08997907f55465b1d8613fd011e47ddc8a7dd68e8903e3c5ac6e890525a9e5",
+      "tests/test_python_campaign_loader.py": "6323d558f7b45f545393311fa9a9a5df8671036db4b549bbffd8f73a089b002b",
+      "tests/test_cmake_inputs.py": "49b5f52742441f843f63830d8a3838567317023e157be2cd8e7203f67c1906a4"
+    }
+  }
 }

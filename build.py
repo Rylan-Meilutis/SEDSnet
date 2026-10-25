@@ -8,6 +8,10 @@ import shlex
 import subprocess
 import sys
 import time
+import tempfile
+import shutil
+import sysconfig
+from contextlib import contextmanager
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -451,6 +455,36 @@ def run_cmd(
         raise SystemExit(e.returncode) from None
     dt = time.monotonic() - t0
     _success(f"OK ({_fmt_secs(dt)}): {shown}")
+
+
+@contextmanager
+def python_test_environment(repo_root: Path, env: dict[str, str], features: str,
+                            build_mode: list[str], title: str):
+    """Build the current host ABI and expose a private copy without installing it."""
+    python_env = env.copy()
+    python_env["PYO3_PYTHON"] = sys.executable
+    verbose = subprocess.check_output(["rustc", "-vV"], env=python_env, text=True)
+    host = next((line.removeprefix("host: ").strip() for line in verbose.splitlines()
+                 if line.startswith("host: ")), "")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", host):
+        raise SystemExit("Could not determine the host target for Python API tests.")
+    run_cmd(["cargo", "rustc", "--lib", "--features", features, "--target", host,
+             "--crate-type", "cdylib", *build_mode], env=python_env, repo_root=repo_root,
+            title=title, target=host, release_build="--release" in build_mode)
+    profile = "release" if "--release" in build_mode else "debug"
+    filename = "sedsnet.dll" if sys.platform == "win32" else "libsedsnet.dylib" if sys.platform == "darwin" else "libsedsnet.so"
+    library = cargo_target_directory(repo_root, env=python_env) / host / profile / filename
+    if not library.is_file():
+        raise SystemExit("The host Python extension build did not produce its expected library.")
+    with tempfile.TemporaryDirectory(prefix="sedsnet-python-tests-") as directory:
+        package = Path(directory) / "sedsnet"
+        package.mkdir()
+        shutil.copy2(repo_root / "python-files/sedsnet/__init__.py", package / "__init__.py")
+        suffix = sysconfig.get_config_var("EXT_SUFFIX") or (".pyd" if sys.platform == "win32" else ".so")
+        # Copy rather than link: isolated schema tests rebuild the ordinary Cargo outputs.
+        shutil.copy2(library, package / ("sedsnet" + suffix))
+        python_env["PYTHONPATH"] = directory + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        yield python_env
 
 
 def ensure_rust_target_installed(target: str) -> None:
@@ -1040,38 +1074,14 @@ def main(argv: list[str]) -> None:
         _success("Benchmark smoke pass finished.")
         next_step += 1
 
-        run_cmd(
-            ["cargo", "build", "--features", f"python{feature_suffix}", *build_mode],
-            env=env,
-            repo_root=repo_root,
-            title=f"{next_step}/{total_steps} cargo build (python feature)",
-            release_build=release_build,
-        )
-        _success(f"Python-feature build finished. Output is under: {cargo_target_directory(repo_root, env=env)}")
-        print_artifact_sizes(
-            repo_root,
-            target=target,
-            profile="release" if release_build else "debug",
-            env=env,
-        )
-        next_step += 1
-
-        run_cmd(
-            [
-                sys.executable,
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_*.py",
-            ],
-            env=env,
-            repo_root=repo_root,
-            title=f"{next_step}/{total_steps} python unittest",
-        )
-        _success("Python unittest checks finished.")
+        with python_test_environment(repo_root, env, f"python{feature_suffix}", build_mode,
+                                     f"{next_step}/{total_steps} host Python extension") as python_env:
+            next_step += 1
+            run_cmd([sys.executable, str(repo_root / "python_test_runner.py"),
+                     *(["--require-bindings"] if test_full else [])],
+                    env=python_env, repo_root=repo_root,
+                    title=f"{next_step}/{total_steps} python unittest")
+        _success("Python unittest checks finished against the newly built host extension.")
         next_step += 1
 
         if can_check_embedded:
