@@ -6,18 +6,33 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 
 ## Version 4.2.6 highlights
 
-Development source; package publication and long-duration simulator qualification are pending.
+Publication, macOS builds and physical hardware acceptance remain pending. See
+[qualification scope and results](../qualification-4.2.6-2026-10-25.json).
 
-- Reduce embedded router FLASH use with sorted-vector indexes for small side and
-  scalar transport tables. Keep dynamic schema, address, timesync-source, large
-  template and reliable replay maps on B-trees; desktop production is unchanged.
-- Preserve ordered iteration, borrowed lookup and entry semantics, and release
-  empty index allocations. Add randomized equivalence and ownership regressions.
-- Send discovery/bootstrap control packets without optional compression so
-  codec-free peers can still merge runtime schemas. Match encoded-size accounting
-  to this policy; ordinary payload compression is unchanged.
-- Validate the current full-feature FC Release/TLSF/compact factory image at
-  449,820 of 474,624 application FLASH bytes (94.774%).
+- Retain accepted ordered and unordered reliable destinations, receipt identities
+  and replay ownership through route withdrawal and rediscovery. A topology change
+  cannot complete delivery without an actual receipt or the bounded timeout.
+- Negotiate optional payload compression with every live peer on a shared side.
+  Unknown, legacy and codec-free receivers get raw payloads; discovery/bootstrap
+  remains raw. Account for the selected wire size and reserve admitted raw retry
+  fallbacks without changing reliable identities or sequence numbers.
+- Advance remote UTC samples by elapsed monotonic time and replace residual
+  absolute phase corrections instead of accumulating them. Cover repeated polling,
+  source replacement and matched-board holdover/recovery behavior.
+- Reduce embedded router FLASH use with sorted-vector indexes for small tables,
+  while keeping dynamic schema, address, clock-source and reliable replay maps on
+  B-trees. Preserve ordered lookup/entry behavior and reclaim empty allocations.
+- Build and load the current host Python extension during test campaigns rather
+  than silently skipping binding tests. Respect Cargo's configured target directory,
+  isolate the loaded library from later builds and reject unavailable-binding skips
+  in full qualification. Include complete CI fixtures and headless schema validation.
+- Store local PyPI credentials in the OS credential store and redact build/release
+  commands, environment overrides and child diagnostics, including quoted headers
+  and encoded credential URLs. Credential files are excluded from source packages.
+- Pass both complete full campaigns: 715/741 Rust main-matrix tests and 80 native
+  Python/script tests per campaign, zero skipped; the codec pressure soak runs for
+  its full 600 seconds. Matched two/three-radio simulator source/SD and restart
+  evidence is recorded separately and does not claim physical RFD or Mac testing.
 
 ## Version 4.2.5 highlights
 

@@ -198,24 +198,18 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.2.6 highlights
 
-Development source; package publication and long-duration simulator qualification are pending.
+Publication, macOS builds and physical hardware acceptance remain pending. See the
+[release notes](CHANGELOG.md#426) and [qualification results](docs/qualification-4.2.6-2026-10-25.json).
 
-- Reduce embedded router FLASH use with sorted-vector indexes for small side and
-  scalar transport tables. Keep dynamic schema, address, timesync-source, large
-  template and reliable replay maps on B-trees; desktop production is unchanged.
-- Preserve ordered iteration, borrowed lookup and entry semantics, and release
-  empty index allocations. Add randomized equivalence and ownership regressions.
-- Keep discovery/bootstrap control packets raw so codec-free peers can merge
-  runtime schemas. Router/relay payload compression now requires a live,
-  incarnation-scoped codec advertisement from every peer on a shared side;
-  unknown and legacy receivers use raw payloads. Explicit standalone packing
-  keeps its existing optional compression behavior.
-- Preserve reliable receipt identities and sequence numbers across codec changes.
-  Retain admitted raw fallbacks for retry, reserve their expanded queue credits,
-  and reclaim optional codec metadata before required route or schema growth.
-  Liveness uses existing traffic and leases without periodic schema broadcasts.
-- Gate the full-feature FC Release/TLSF/compact factory image below 450,892 of
-  474,624 application FLASH bytes (95%).
+- Preserve reliable receipt owners through route changes; topology withdrawal is
+  not successful delivery.
+- Negotiate optional compression across mixed peers, retain raw bootstrap/retry
+  paths and account for actual encoded size.
+- Correct remote UTC steering and repeated phase updates; retain embedded index
+  FLASH savings and dynamic schema behavior.
+- Exercise the actual current Python extension in both full campaigns: 715/741
+  Rust main-matrix tests and 80 Python/script tests each, zero skipped; retain the
+  full 600-second codec soak. Harden credential storage and build/release logging.
 
 ### Version 4.2.5 highlights
 

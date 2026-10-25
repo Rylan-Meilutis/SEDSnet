@@ -174,5 +174,20 @@
       "No Rust runtime/API changes after the frozen corrected-clock cohort; no credentials, installs, physical devices, package uploads or publication used.",
       "Earlier historical full_campaigns counts remain corrected at63 passed/9 binding skips and are not replaced by these new proofs."
     ]
+  },
+  "release_source_manifest_check": {
+    "command": "cargo package --list --offline --allow-dirty",
+    "exit_code": 0,
+    "filenames_only": true,
+    "required_helpers_included": [
+      "build.py",
+      "publish_crates.py",
+      "python_test_runner.py",
+      "release_logging.py"
+    ],
+    "missing_required_helpers": [],
+    "credential_filenames_found": [],
+    "listed_files": 265,
+    "scope": "No credential contents, environment credentials or keychain read; isolated emptyHOME/XDG and offline registry/git-onlyCargo cache; no package build/upload/publication."
   }
 }
