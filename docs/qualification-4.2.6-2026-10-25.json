@@ -1,0 +1,36 @@
+{
+  "date": "2026-10-25",
+  "version": "4.2.6",
+  "production_base_commit": "6980f9b6f9594f785c157938a6aefd5647bbdb5f",
+  "release_ready": false,
+  "change_scope": "Test-only actual UART/side-codec trace diagnostics. Router test module is cfg(test); runtime API, routing and wire format are unchanged by this checkpoint.",
+  "full_campaigns": {
+    "default": {
+      "command": "python3 build.py test --full",
+      "rust_tests_passed": 710,
+      "rust_tests_skipped": 0,
+      "python_tests_passed": 72,
+      "duration_seconds": 194.57
+    },
+    "compact_fair_crypto": {
+      "command": "python3 build.py test --full --features cryptography,fair-admission,compact-packet-store,compact-packet-compression",
+      "rust_tests_passed": 736,
+      "rust_tests_skipped": 0,
+      "python_tests_passed": 72,
+      "duration_seconds": 734.53,
+      "codec_pressure_soak_seconds": 600,
+      "duration_shortened": false
+    }
+  },
+  "also_passed": [
+    "Benchmarks and compatibility examples through build.py test",
+    "Hosted no_std checks and thumbv7em-none-eabihf embedded build",
+    "Self-contained ignored trace diagnostic runs without external input in --full mode; partial explicit input is rejected"
+  ],
+  "diagnostic_sha256": "cf7a14ee13d321692fa26c46ac7fa3bc4348be90a478d0cec942223efcfd2766",
+  "remaining": [
+    "Integrated finite-radio two/three-host long soak with current firmware and GroundStation",
+    "Final release/package publication from the local Mac after qualification"
+  ],
+  "credential_scope": "No real package credential is used by qualification; publication credentials are not included in source or reports."
+}

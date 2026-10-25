@@ -9,6 +9,10 @@
 //! - De-duplication remains packet-id based and side-agnostic.
 
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/radio_trace_decoder.rs"]
+mod radio_trace_decoder;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/accepted_route_ownership.rs"]
 mod accepted_route_ownership;
 
