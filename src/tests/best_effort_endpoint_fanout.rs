@@ -17,19 +17,28 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str, coverage: &[&[usize]], reliable: crate::ReliableMode) -> Self {
         let names: Vec<String> = (0..3).map(|i| format!("{name}_ROLE_{i}")).collect();
-        Self::with_endpoint_names(name, &names, coverage, reliable)
+        Self::with_endpoint_names(name, &names, coverage, reliable, None)
     }
     fn with_endpoint_names(
         name: &str,
         names: &[String],
         coverage: &[&[usize]],
         reliable: crate::ReliableMode,
+        existing_type_id: Option<DataType>,
     ) -> Self {
         let endpoints: Vec<_> = names
             .iter()
-            .map(|name| crate::config::register_endpoint(name, false).unwrap())
+            .map(|name| {
+                if let Some(existing) = crate::config::endpoint_definition_by_name(name) {
+                    assert!(!existing.link_local_only);
+                    existing.id
+                } else {
+                    crate::config::register_endpoint(name, false).unwrap()
+                }
+            })
             .collect();
-        let ty = crate::config::register_data_type_with_description(
+        let ty = crate::config::register_data_type_id_with_description(
+            existing_type_id.unwrap_or_else(|| DataType::identity(name)),
             name,
             "",
             MessageElement::Static(
@@ -145,12 +154,31 @@ fn actual_gps_c_abi_reaches_can_roles_and_ground_station_once() {
         .iter()
         .map(|s| s.to_string())
         .collect();
+    // build.py seeds its generic GPS test definition (Ordered, SD+RADIO).
+    // This isolated child instead exercises the actual RF contract while
+    // retaining seeded canonical IDs and all endpoint metadata unchanged.
+    let existing_card = crate::config::endpoint_definition_by_name("SD_CARD");
+    let existing_type_id =
+        crate::config::data_type_definition_by_name("GPS_DATA").map(|definition| {
+            assert!(crate::config::remove_data_type(definition.id).unwrap());
+            definition.id
+        });
     let mut fixture = Fixture::with_endpoint_names(
         "GPS_DATA",
         &names,
         &[&[1, 2], &[0]],
         crate::ReliableMode::None,
+        existing_type_id,
     );
+    if let Some(expected) = existing_type_id {
+        assert_eq!(fixture.ty, expected);
+    }
+    if let Some(existing) = existing_card {
+        assert_eq!(fixture.endpoints[1], existing.id);
+        let retained = crate::config::endpoint_definition(existing.id).unwrap();
+        assert_eq!(retained.description, existing.description);
+        assert_eq!(retained.link_local_only, existing.link_local_only);
+    }
     fixture.publish(43.0);
     assert_eq!(fixture.counts(), [1, 1]);
     let capture = fixture.capture.lock().unwrap();
