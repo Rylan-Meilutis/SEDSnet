@@ -56,6 +56,34 @@ class PythonCampaignLoaderTests(unittest.TestCase):
                     with build.python_test_environment(root,{},'python',['--release'],'test') as env:
                         self.assertTrue(Path(env['PYTHONPATH'],'sedsnet','sedsnet'+('.pyd' if platform=='win32' else '.so')).is_file())
                     self.assertIn('--release',run.call_args.args[0])
+                    command = run.call_args.args[0]
+                    child_env = run.call_args.kwargs['env']
+                    if platform == 'darwin':
+                        self.assertEqual(command[-5:], ['--', '-C', 'link-arg=-undefined', '-C', 'link-arg=dynamic_lookup'])
+                        self.assertEqual(child_env['MACOSX_DEPLOYMENT_TARGET'], '11.0')
+                    else:
+                        self.assertNotIn('link-arg=dynamic_lookup', command)
+                        self.assertNotIn('MACOSX_DEPLOYMENT_TARGET', child_env)
+
+    def test_macos_extension_preserves_explicit_deployment_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'python-files/sedsnet').mkdir(parents=True)
+            (root/'python-files/sedsnet/__init__.py').write_text('')
+            library = root/'target/fake-host/debug/libsedsnet.dylib'
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b'fake')
+            original = {'MACOSX_DEPLOYMENT_TARGET': '13.0', 'RUSTFLAGS': '-C debuginfo=1'}
+            with mock.patch.object(build.subprocess, 'check_output', return_value='host: fake-host\n'), \
+                 mock.patch.object(build, 'cargo_target_directory', return_value=root/'target'), \
+                 mock.patch.object(build, 'run_cmd') as run, \
+                 mock.patch.object(build.sys, 'platform', 'darwin'), \
+                 mock.patch.object(build.sysconfig, 'get_config_var', return_value='.so'):
+                with build.python_test_environment(root, original, 'python', [], 'test'):
+                    child_env = run.call_args.kwargs['env']
+                    self.assertEqual(child_env['MACOSX_DEPLOYMENT_TARGET'], '13.0')
+                    self.assertEqual(child_env['RUSTFLAGS'], original['RUSTFLAGS'])
+            self.assertNotIn('PYO3_PYTHON', original)
 
     def test_missing_native_output_is_a_failure(self):
         with tempfile.TemporaryDirectory() as directory, \

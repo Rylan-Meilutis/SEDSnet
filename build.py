@@ -468,8 +468,15 @@ def python_test_environment(repo_root: Path, env: dict[str, str], features: str,
                  if line.startswith("host: ")), "")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", host):
         raise SystemExit("Could not determine the host target for Python API tests.")
+    extension_args: list[str] = []
+    if sys.platform == "darwin":
+        # Maturin supplies these for wheels, but this test-only direct Cargo
+        # build must let the loading interpreter resolve the Python symbols.
+        extension_args = ["--", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+        # Keep cc-built dependencies and rustc on the same minimum OS version.
+        python_env.setdefault("MACOSX_DEPLOYMENT_TARGET", "11.0")
     run_cmd(["cargo", "rustc", "--lib", "--features", features, "--target", host,
-             "--crate-type", "cdylib", *build_mode], env=python_env, repo_root=repo_root,
+             "--crate-type", "cdylib", *build_mode, *extension_args], env=python_env, repo_root=repo_root,
             title=title, target=host, release_build="--release" in build_mode)
     profile = "release" if "--release" in build_mode else "debug"
     filename = "sedsnet.dll" if sys.platform == "win32" else "libsedsnet.dylib" if sys.platform == "darwin" else "libsedsnet.so"
