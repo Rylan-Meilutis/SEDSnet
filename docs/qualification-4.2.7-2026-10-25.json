@@ -1,11 +1,73 @@
 {
   "date": "2026-10-25",
   "version": "4.2.7",
-  "qualified_sdk_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
+  "qualified_sdk_commit": "2b1983e6c31c9caffaa129ba8bc9f3b899f4fbd2",
   "release_ready": false,
   "publication_performed_by_this_qualification": false,
   "scope": "Best-effort routing preserves independent destination endpoint roles across CAN and radio without duplicating interchangeable routes; macOS direct Python-extension link configuration and deployment-target alignment. Reliable, managed and explicit route selection remain unchanged.",
   "full_campaigns": {
+    "default": {
+      "state": "passed",
+      "started": 1792959814.3815122,
+      "exit_code": 0,
+      "elapsed_seconds": 298.34,
+      "source_commit": "2b1983e6c31c9caffaa129ba8bc9f3b899f4fbd2",
+      "main_rust_tests_passed": 727,
+      "python_api_script_tests_passed": 81,
+      "skipped": 0,
+      "evidence_log": ".workspace-progress/sdk-full-accepted-tx-default.log",
+      "log_sha256": "84e95fe2ecf07ea4a109a9819aefe65da8aeec450117418e720fb7ba86ba646f",
+      "all_ten_build_py_stages_passed": true,
+      "durations_shortened": false,
+      "command": "python3 build.py test --full"
+    },
+    "compact-fair-crypto": {
+      "state": "passed",
+      "started": 1792960112.722566,
+      "exit_code": 0,
+      "elapsed_seconds": 780.4,
+      "source_commit": "2b1983e6c31c9caffaa129ba8bc9f3b899f4fbd2",
+      "main_rust_tests_passed": 753,
+      "python_api_script_tests_passed": 81,
+      "skipped": 0,
+      "evidence_log": ".workspace-progress/sdk-full-accepted-tx-compact-fair-crypto.log",
+      "log_sha256": "f2662bafedf78f257d250af39cbe8f2b77291a239be1600d6c605c27344dfad0",
+      "all_ten_build_py_stages_passed": true,
+      "durations_shortened": false,
+      "pressure_soak_seconds": 600,
+      "scope": "Full unshortened pressure case; exact elapsed value is recorded in the log.",
+      "command": "python3 build.py test --full --features cryptography,fair-admission,compact-packet-store,compact-packet-compression"
+    }
+  },
+  "runtime_sha256": {
+    "src/router.rs": "e705ffe5729d1d60df51f79e7bfe5f11315430f73c00cb7297733206497c2925",
+    "src/timesync.rs": "71214a1f9ef6e4b07848c92b5a956b8eb20f55c3bebd3eb489eb2e9b35be17ab",
+    "src/c_api.rs": "d7aca08bb616c2d978ea8dc98a0b5db5c0c02caefe65ad739ab6a194f53c81df"
+  },
+  "regression_evidence": {
+    "actual_rf_schema_c_abi": "Original independent-endpoint GPS publication returned success but reached CAN only; six C ABI regression cases cover per-role delivery, redundant coverage, partial overlap, shortest routes, retry after backpressure, and unchanged explicit/reliable route policy.",
+    "single_side_allocation": "Initial candidate failed existing two/three-endpoint allocation bounds. Final planner runs only when multiple candidate sides exist; original allocation limit is retained.",
+    "fixture_correction": "Full test seed already owns canonical endpoint IDs and GPS_DATA. Fixture now reuses identities and replaces only its own child-process GPS type with actual RF schema; no production metadata weakened."
+  },
+  "remaining": [
+    "Finish complete final-source backend mode matrices and resolve preserved Clear ordering / testing-HITL fixture / test-fire feature-gate failures.",
+    "Run fresh matched final-source two/three-radio600s, restart and relay qualification; older candidate prefixes are not final600s passes.",
+    "Verify final source packages and push qualified SDK main/dev/tag/release for maintainer local package publication.",
+    "Hold dependent GroundStation source push until public SDK4.2.7 exists; launcher refreshes the existing version4 range.",
+    "Native macOS and physical RF/modem/GPU acceptance remain explicit platform follow-up."
+  ],
+  "historical_failures_preserved": [
+    "Initial C ABI fixture collided with seeded full-test schema; isolated fixture corrected.",
+    "Initial multiple-endpoint path exceeded existing allocation bound; runtime fast path corrected.",
+    "Interrupted earlier codec pressure run is not counted as passing.",
+    "First final default campaign failed release-heading documentation contract; documentation corrected and complete default campaign rerun passed."
+  ],
+  "release_4_2_6": "Already published to crates.io by user; immutable version/tag is preserved. This patch is 4.2.7 and does not rewrite 4.2.6.",
+  "limitations": [
+    "Software modem timing is not physical RFD firmware or RF propagation acceptance.",
+    "No credentials, login, package installation, publication or physical actuator commands were used by these qualification runs."
+  ],
+  "prior_multicast_candidate_full_campaigns": {
     "default": {
       "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
       "command": [
@@ -53,7 +115,120 @@
       "log_sha256": "1046d7a682cddffd56e91c11c10fd740fe3b4e82cc8d53c0c7a825aec4912013"
     }
   },
-  "package_verification": {
+  "host_ownership_followup": {
+    "scope": "Host-only queued TX activity plus a conservative non-mutating reliable-type ownership query. Automatic GS abort uses TX admission; its Clear guard checks SDK ownership followed by GS software queue/active-write ownership.",
+    "sdk_source_commit": "2b1983e6c31c9caffaa129ba8bc9f3b899f4fbd2",
+    "host_router_added_bytes_on_this_64_bit_host": 8,
+    "embedded_layout_or_hot_path_added_bytes": 0,
+    "wire_format_changed": false,
+    "query_limitations": [
+      "Applies to TX-queued publications, not arbitrary RX-originated work.",
+      "Unrelated active TX or unclassified packed queued work conservatively reports pending; inspection never materializes/pins packed payloads.",
+      "SDK inspection does not assert external transport/modem drain or remote receipt."
+    ],
+    "tests": [
+      "Two dispatch pop sites retain visible activity through real callback barriers; historical queue/pending queries alone reproduce false idle.",
+      "Actual acknowledgements, chunk/codec retry, no-peer fallback, unwind cleanup, unrelated typed work and malformed packed input covered.",
+      "Existing forwarding bounds remain three allocations per packet and largest allocation64bytes; no threshold relaxed."
+    ],
+    "source_guard_files": 72
+  },
+  "mcu_factory_followup": {
+    "sdk_commit": "2b1983e6c31c9caffaa129ba8bc9f3b899f4fbd2",
+    "scope": "All eight frozen factory variants rebuilt. Flash size checks are separate from source/artifact identity: regenerated hashes remain distinct. Null comparison means prior artifact reference was indirect, not a claimed equality.",
+    "variants": [
+      {
+        "variant": "FlightComputer26",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release/FlightComputer26.bin",
+        "firmware_bytes": 453804,
+        "firmware_slot_percent": 95.61,
+        "prior_comparison_scope": "multicast-427-final-cohort-20261025",
+        "prior_firmware_bytes": 453804,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "RFBoard26",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release/RFBoard26.bin",
+        "firmware_bytes": 416820,
+        "firmware_slot_percent": 87.82,
+        "prior_comparison_scope": "multicast-427-final-cohort-20261025",
+        "prior_firmware_bytes": 416816,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "PowerBoard26",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release_Script/PowerBoard26.bin",
+        "firmware_bytes": 397556,
+        "firmware_slot_percent": 83.76,
+        "prior_comparison_scope": "multicast-427-final-cohort-20261025",
+        "prior_firmware_bytes": 397548,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "ActuatorBoard26",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release_Script/ActuationBoard.bin",
+        "firmware_bytes": 425080,
+        "firmware_slot_percent": 89.56,
+        "prior_comparison_scope": "multicast-427-status-cohort-20261025",
+        "prior_firmware_bytes": 425076,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "ValveBoard26",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release_Script/Valve_Board26.bin",
+        "firmware_bytes": 432268,
+        "firmware_slot_percent": 91.08,
+        "prior_comparison_scope": "multicast-427-status-cohort-20261025",
+        "prior_firmware_bytes": 432264,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "DAQ-Board",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release_Script/DAQ-Board.bin",
+        "firmware_bytes": 854160,
+        "firmware_slot_percent": 44.96,
+        "prior_comparison_scope": "multicast-427-final-cohort-20261025",
+        "prior_firmware_bytes": 854160,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "gateway-board26",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release_Script/gateway_board.bin",
+        "firmware_bytes": 445148,
+        "firmware_slot_percent": 90.66,
+        "prior_comparison_scope": "multicast-427-final-cohort-20261025",
+        "prior_firmware_bytes": 445152,
+        "prior_firmware_hash_equal": false
+      },
+      {
+        "variant": "PowerBoard26-compact",
+        "phase": "passed",
+        "warnings": 0,
+        "firmware_artifact": "build/Release_Script/PowerBoard26.bin",
+        "firmware_bytes": 405968,
+        "firmware_slot_percent": 85.53,
+        "prior_comparison_scope": "multicast-427-final-cohort-20261025",
+        "prior_firmware_bytes": 405964,
+        "prior_firmware_hash_equal": false
+      }
+    ]
+  },
+  "updated_utc": "2026-10-25T20:46:45.412547+00:00",
+  "prior_multicast_candidate_package_verification": {
     "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
     "no_publication": true,
     "credential_free_environment": true,
@@ -70,7 +245,7 @@
       }
     ]
   },
-  "source_package_manifest": {
+  "prior_multicast_candidate_source_package_manifest": {
     "package": "SEDSnet4.2.7",
     "files": 266,
     "bytes": 1008540,
@@ -85,31 +260,5 @@
     "runtime_credential_filenames": false,
     "no_publication": true
   },
-  "runtime_sha256": {
-    "src/router.rs": "2d7a2694830b5fecf6f8206e4d3444ec20a8a180099bf723d5c066689a93d281",
-    "src/timesync.rs": "71214a1f9ef6e4b07848c92b5a956b8eb20f55c3bebd3eb489eb2e9b35be17ab",
-    "src/c_api.rs": "d7aca08bb616c2d978ea8dc98a0b5db5c0c02caefe65ad739ab6a194f53c81df"
-  },
-  "regression_evidence": {
-    "actual_rf_schema_c_abi": "Original independent-endpoint GPS publication returned success but reached CAN only; six C ABI regression cases cover per-role delivery, redundant coverage, partial overlap, shortest routes, retry after backpressure, and unchanged explicit/reliable route policy.",
-    "single_side_allocation": "Initial candidate failed existing two/three-endpoint allocation bounds. Final planner runs only when multiple candidate sides exist; original allocation limit is retained.",
-    "fixture_correction": "Full test seed already owns canonical endpoint IDs and GPS_DATA. Fixture now reuses identities and replaces only its own child-process GPS type with actual RF schema; no production metadata weakened."
-  },
-  "remaining": [
-    "Fresh matched 4.2.7 two/three-radio endurance, route restart, relay and actual GPS-position delivery qualification.",
-    "Close separately reproduced GroundStation automatic-abort versus Fire ordering race and revalidate affected sequence policies.",
-    "Commit final qualification evidence and push source to main/dev before notifying local publisher.",
-    "Native macOS build and package publication are performed by the user; Linux and synthetic platform contracts do not claim physical macOS validation."
-  ],
-  "historical_failures_preserved": [
-    "Initial C ABI fixture collided with seeded full-test schema; isolated fixture corrected.",
-    "Initial multiple-endpoint path exceeded existing allocation bound; runtime fast path corrected.",
-    "Interrupted earlier codec pressure run is not counted as passing.",
-    "First final default campaign failed release-heading documentation contract; documentation corrected and complete default campaign rerun passed."
-  ],
-  "release_4_2_6": "Already published to crates.io by user; immutable version/tag is preserved. This patch is 4.2.7 and does not rewrite 4.2.6.",
-  "limitations": [
-    "Software modem timing is not physical RFD firmware or RF propagation acceptance.",
-    "No credentials, login, package installation, publication or physical actuator commands were used by these qualification runs."
-  ]
+  "final_source_packages": "Pending clean committed-source verification; prior candidate package checks are preserved separately."
 }

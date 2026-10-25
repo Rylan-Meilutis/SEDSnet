@@ -13,10 +13,14 @@ Qualification is in progress; this patch has not been published.
   policies unchanged.
 - Fix direct macOS Python test-extension linking and align Rust/C dependency
   deployment targets while preserving an explicitly configured minimum OS version.
+- Track queued host transmissions through active callbacks and expose a conservative
+  reliable-type ownership check for coordinated abort recovery. Keep packed queue
+  inspection free of payload pins; embedded layout and wire format stay unchanged.
 
 ## 4.2.6
 
-Publication, macOS builds and physical hardware acceptance remain pending. See
+The maintainer published the 4.2.6 crate on 2026-10-25. Its immutable version is
+preserved; macOS package completion and physical hardware acceptance are separate. See
 [qualification scope and results](docs/qualification-4.2.6-2026-10-25.json).
 
 - Retain accepted ordered and unordered reliable destinations, receipt identities
