@@ -106,5 +106,73 @@
       "tests/test_python_campaign_loader.py": "6323d558f7b45f545393311fa9a9a5df8671036db4b549bbffd8f73a089b002b",
       "tests/test_cmake_inputs.py": "49b5f52742441f843f63830d8a3838567317023e157be2cd8e7203f67c1906a4"
     }
+  },
+  "current_full_pipeline_followup": {
+    "default": {
+      "source_commit": "0c59e9c4e8cd502052491d0bb77ceb8b43a18a2b",
+      "command": [
+        "/usr/bin/python3",
+        "build.py",
+        "test",
+        "--full"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 241.47863716096617,
+      "isolation": "Allowlisted environment, empty HOME/XDG, offline registry/git-only Cargo cache, no credentials or login/publish/install; shared existing target artifacts; native extension copied per campaign",
+      "long_tests_shortened": false,
+      "rust_main_matrix_passed": 715,
+      "rust_main_matrix_skipped": 0,
+      "python_tests_passed": 80,
+      "python_tests_skipped": 0,
+      "python_suite_duration_seconds": 8.418,
+      "all_stages_passed": [
+        "default/python/embedded Clippy with warnings denied",
+        "main full Rust matrix",
+        "compatibility examples and hosted no_std/uncompressed memory regressions",
+        "benchmark smoke",
+        "current host native extension build + actual Python/script discovery",
+        "thumbv7em-none-eabihf embedded build"
+      ],
+      "evidence_log": ".workspace-progress/sdk-current-full-default.log",
+      "log_sha256": "13a43d0e1c44edce9f002bc08e9bf2b02347a37490ce44cfa37e0e707c61ab26"
+    },
+    "compact-fair-crypto": {
+      "source_commit": "0c59e9c4e8cd502052491d0bb77ceb8b43a18a2b",
+      "command": [
+        "/usr/bin/python3",
+        "build.py",
+        "test",
+        "--full",
+        "--features",
+        "cryptography,fair-admission,compact-packet-store,compact-packet-compression"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 759.9382268720074,
+      "isolation": "Allowlisted environment, empty HOME/XDG, offline registry/git-only Cargo cache, no credentials or login/publish/install; shared existing target artifacts; native extension copied per campaign",
+      "long_tests_shortened": false,
+      "rust_main_matrix_passed": 741,
+      "rust_main_matrix_skipped": 0,
+      "python_tests_passed": 80,
+      "python_tests_skipped": 0,
+      "python_suite_duration_seconds": 7.808,
+      "all_stages_passed": [
+        "default/python/embedded Clippy with warnings denied",
+        "main full Rust matrix",
+        "compatibility examples and hosted no_std/uncompressed memory regressions",
+        "benchmark smoke",
+        "current host native extension build + actual Python/script discovery",
+        "thumbv7em-none-eabihf embedded build"
+      ],
+      "evidence_log": ".workspace-progress/sdk-current-full-compact-fair-crypto.log",
+      "log_sha256": "d38c92fdac7bee58c62d0a873e8487554470e247a0a4c859b91deb67b77920e5",
+      "codec_pressure_soak_seconds": 600.005
+    },
+    "notes": [
+      "Current full pipeline invoked end-to-end after the logging and native-loader fixes; this is not a helpers-only run.",
+      "Rust main-matrix counts exclude additional passing hosted-memory/example invocations already listed among stages.",
+      "Parallel campaigns share existing Cargo artifacts and compilation locks; elapsed times include contention and are not a performance benchmark.",
+      "No Rust runtime/API changes after the frozen corrected-clock cohort; no credentials, installs, physical devices, package uploads or publication used.",
+      "Earlier historical full_campaigns counts remain corrected at63 passed/9 binding skips and are not replaced by these new proofs."
+    ]
   }
 }
