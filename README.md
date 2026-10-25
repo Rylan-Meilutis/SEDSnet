@@ -649,6 +649,22 @@ cargo bench --bench packet_paths -- --profile-time=5
   system-suite scenario
 - a `cargo build` validation for the `embedded` feature when a matching cross C toolchain is available
 
+Use `python3 build.py test --all --full` for the release qualification matrix.
+`--all` selects two profiles: normal packet storage, then experimental compact compression
+with fair admission. Both include cryptography (already a Cargo default), including the
+explicit embedded checks. Common `--features` choices apply to both; the matrix selects
+the storage/fair flags. This is not Cargo `--all-features`, which would combine incompatible
+embedded and Python builds. `--full` also runs ignored long-duration tests in both profiles,
+including the full compact memory-pressure campaign.
+
+Each profile keeps its own strict lint, Rust, hosted embedded-memory, native Python API,
+and embedded cross-build checks. The unchanged uncompressed-memory regression, fixed
+benchmark smoke, and Python build/release/editor script contracts run once. New or unknown
+Python test modules still run in both profiles. `publish_crates.py` invokes this combined
+matrix once; `--quick-tests` omits ignored long-duration cases while retaining both profiles.
+Publisher `--docker-all-wheels` selects wheel platforms, independently of test coverage.
+Publisher `--all` is rejected; flags require their full spelling, including `--allow-dirty`.
+
 The benchmark smoke pass uses Cargo `--profile release`, saves into a dedicated `sedsnet_smoke` baseline, disables
 plot generation, and uses a longer timing window plus a wider smoke-test noise threshold so host variance does not print
 alternating regression/improvement noise. The C system-test harness waits for all asserted endpoint hits before exiting,

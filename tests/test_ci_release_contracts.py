@@ -1,5 +1,10 @@
 import unittest
 import tomllib
+import contextlib
+import io
+import sys
+from unittest import mock
+import publish_crates
 from pathlib import Path
 
 
@@ -29,11 +34,28 @@ class CiReleaseContracts(unittest.TestCase):
         self.assertIn("python3 publish_crates.py", workflow)
 
     def test_release_gate_checks_experimental_storage(self) -> None:
-        publisher = (REPO_ROOT / "publish_crates.py").read_text()
-        self.assertIn(
-            'run(["python3", "build.py", "test", "--features", "compact-packet-compression,fair-admission"])',
-            publisher,
-        )
+        for quick in (False, True):
+            with self.subTest(quick=quick), mock.patch.object(sys, 'argv',
+                 ['publish_crates.py', '--skip-crates', *(['--quick-tests'] if quick else [])]), \
+                 mock.patch.dict(publish_crates.os.environ, {}, clear=True), \
+                 mock.patch.object(publish_crates, 'require_clean_tree'), \
+                 mock.patch.object(publish_crates, 'run') as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(publish_crates.main(), 0)
+            run.assert_called_once_with(['python3', 'build.py', 'test', '--all',
+                                         *([] if quick else ['--full'])])
+
+    def test_publish_all_is_not_an_abbreviation_for_allow_dirty(self) -> None:
+        for flag in ['--all', '--allow-d', '--docker-all']:
+            with mock.patch.object(sys, 'argv', ['publish_crates.py', flag]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                publish_crates.parse_args()
+        with mock.patch.object(sys, 'argv', ['publish_crates.py', '--allow-dirty']):
+            self.assertTrue(publish_crates.parse_args().allow_dirty)
+        with mock.patch.object(sys, 'argv', ['publish_crates.py', '--docker-all-wheels']):
+            args = publish_crates.parse_args()
+            self.assertTrue(args.docker_all_wheels)
+            self.assertFalse(args.allow_dirty)
 
     def test_release_upload_is_safe_to_retry_after_manual_publication(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text()

@@ -105,6 +105,21 @@ It covers four layers:
 - Build validation: host `python` feature build and embedded-feature build when an embedded cross C toolchain is
   present.
 
+For release qualification, run `python3 build.py test --all --full` once. `--all` means
+the qualification matrix, not Cargo `--all-features`: normal storage and experimental
+compact compression/fair admission run separately. Both include cryptography, including
+explicit embedded checks. Common selected features remain enabled in both profiles;
+the matrix controls the compact/fair selectors. `--full` includes ignored long-duration
+tests in both profiles without shortening the compact memory-pressure test.
+
+Feature-dependent lint, Rust, embedded-memory, native Python API and embedded cross-build
+checks run for each profile. Identical uncompressed-memory tests, fixed benchmark smoke,
+and Python tooling contracts run once. Additional-profile Python checks omit only named
+binding-independent script modules; unknown modules remain included. The publisher uses
+this single command; `--quick-tests` retains the matrix but omits ignored long tests.
+`publish_crates.py --docker-all-wheels` selects wheel builds separately. Publisher `--all`
+is invalid and cannot abbreviate `--allow-dirty`; all flags require exact spelling.
+
 The C system tests exercise the static C ABI, multi-endpoint routing, relay forwarding, discovery, and time-sync
 behavior through compiled executables in `c-system-test/`. The main multi-node C test now waits for every asserted
 endpoint count before shutdown so it does not fail early when one simulated board drains slightly slower than another.

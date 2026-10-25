@@ -595,7 +595,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Build/package/publish SEDSnet crates in the required order. "
             "Default mode is a dry-run and will not upload anything."
-        )
+        ),
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--publish",
@@ -717,7 +718,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quick-tests",
         action="store_true",
-        help="Run python3 build.py test instead of python3 build.py test --full.",
+        help="Run the build.py test --all matrix without ignored long-duration tests.",
     )
     parser.add_argument(
         "--skip-package",
@@ -823,12 +824,10 @@ def main() -> int:
         print("Dry-run mode: no crates will be uploaded. Pass --publish to upload.")
 
     if not args.skip_tests:
-        test_cmd = ["python3", "build.py", "test"]
+        test_cmd = ["python3", "build.py", "test", "--all"]
         if not args.quick_tests:
             test_cmd.append("--full")
         run(test_cmd)
-        # Check the opt-in arena/codec as well as the unchanged default build.
-        run(["python3", "build.py", "test", "--features", "compact-packet-compression,fair-admission"])
 
     if not args.skip_crates:
         if not args.skip_package:

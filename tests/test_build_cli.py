@@ -1,10 +1,50 @@
 import importlib.util
 import unittest
+import contextlib
+import io
+from unittest import mock
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("sedsnet_build", Path(__file__).parents[1] / "build.py")
 build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 class BuildCliTests(unittest.TestCase):
+    def test_all_runs_distinct_profiles_but_shared_checks_once(self):
+        with mock.patch.object(build, 'has_embedded_c_toolchain', return_value=True), \
+             mock.patch.object(build, 'ensure_rust_target_installed'), \
+             mock.patch.object(build, 'apply_embedded_cflags_defaults'), \
+             mock.patch.object(build, 'collect_artifact_sizes', return_value={}), \
+             mock.patch.object(build, 'print_artifact_sizes'), \
+             mock.patch.object(build, 'cargo_target_directory', return_value=Path('/tmp/fixture-target')), \
+             mock.patch.object(build, 'cargo_nextest_available', return_value=False), \
+             mock.patch.object(build, 'python_test_environment', side_effect=lambda *a: contextlib.nullcontext({})) as bindings, \
+             mock.patch.object(build, 'run_cmd') as run, contextlib.redirect_stdout(io.StringIO()):
+            build.main(['test', '--all', '--full', '--features', 'ingress-target-filter'])
+        commands = [call.args[0] for call in run.call_args_list]
+        native = [c for c in commands if c[:2] == ['cargo', 'test'] and '--no-default-features' not in c]
+        self.assertEqual(len(native), 2)
+        self.assertTrue(all('--include-ignored' in c for c in native))
+        profiles = [set(c[c.index('--features') + 1].split(',')) for c in native]
+        self.assertIn('cryptography', profiles[0])
+        self.assertIn('ingress-target-filter', profiles[0])
+        self.assertNotIn('compact-packet-compression', profiles[0])
+        self.assertEqual(profiles[1] - profiles[0], {'compact-packet-compression', 'fair-admission'})
+        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 6)
+        self.assertEqual(sum('embedded_memory_behavior_test' in c for c in commands), 2)
+        self.assertEqual(sum('packet_packing_memory' in c for c in commands), 1)
+        self.assertEqual(sum(c[:2] == ['cargo', 'bench'] for c in commands), 1)
+        self.assertEqual(sum(c[:2] == ['cargo', 'build'] for c in commands), 2)
+        self.assertEqual(bindings.call_count, 2)
+        python = [c for c in commands if any(str(v).endswith('python_test_runner.py') for v in c)]
+        self.assertEqual(len(python), 2)
+        self.assertTrue(all('--require-bindings' in c for c in python))
+        self.assertNotIn('--bindings-only', python[0])
+        self.assertIn('--bindings-only', python[1])
+
+    def test_matrix_selects_storage_profiles_and_keeps_common_features(self):
+        profiles = build.qualification_profiles(['compact-packet-store', 'fair-admission', 'ingress-target-filter'])
+        self.assertEqual(profiles, [['ingress-target-filter', 'cryptography'],
+            ['ingress-target-filter', 'cryptography', 'compact-packet-compression', 'fair-admission']])
+
     def test_wheel_install_uses_selected_target_features_and_cargo_output(self):
         import tempfile
         from unittest.mock import patch
@@ -69,6 +109,6 @@ class BuildCliTests(unittest.TestCase):
         self.assertEqual(build.parse_args([]).command, "build")
         self.assertTrue(build.parse_args(["--release"]).release)
     def test_rejects_invalid_or_obsolete_options(self):
-        for args in [["release"], ["embedded"], ["build", "--full"], ["--max-queue-budget", "0"], ["--env", "BAD KEY=x"], ["--features", "unknown"], ["--features", "embedded,python"]]:
+        for args in [["release"], ["embedded"], ["build", "--full"], ['build', '--all'], ['test', '--fu'], ["--max-queue-budget", "0"], ["--env", "BAD KEY=x"], ["--features", "unknown"], ["--features", "embedded,python"]]:
             with self.subTest(args=args), self.assertRaises(SystemExit): build.parse_args(args)
 if __name__ == "__main__": unittest.main()

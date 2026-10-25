@@ -29,14 +29,21 @@ PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression")
 
+def qualification_profiles(features: list[str]) -> list[list[str]]:
+    """Exercise both storage implementations, retaining common feature choices."""
+    storage = {"compact-packet-store", "compact-packet-compression", "fair-admission"}
+    common = list(dict.fromkeys([*(f for f in features if f not in storage), "cryptography"]))
+    return [common, [*common, "compact-packet-compression", "fair-admission"]]
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build and validate SEDSnet with Cargo-style commands and flags.")
+    parser = argparse.ArgumentParser(description="Build and validate SEDSnet with Cargo-style commands and flags.", allow_abbrev=False)
     parser.add_argument("command", nargs="?", default="build", choices=("build", "check", "test", "maturin-build", "maturin-develop", "maturin-install", "maturin-login"), help="Action (default: build).")
     parser.add_argument("--release", action="store_true", help="Use the release profile (release-embedded on embedded targets).")
     parser.add_argument("--features", action="append", default=[], metavar="FEATURES", help="Comma/space-separated features; repeatable: " + ", ".join(FEATURE_OPTIONS))
     parser.add_argument("--target", default="", help="Rust target triple (host by default).")
     parser.add_argument("--device-id", default="", help="Compile-time DEVICE_IDENTIFIER.")
     parser.add_argument("--full", action="store_true", help="Include ignored long-duration tests with test.")
+    parser.add_argument("--all", action="store_true", help="With test, run the normal and compact/fair qualification matrix; not Cargo --all-features. Common --features apply to both profiles.")
     parser.add_argument("--static-schema-path", help="Runtime registry seed JSON path.")
     parser.add_argument("--static-ipc-schema-path", help="Runtime IPC overlay seed JSON path.")
     for flag, description in (("max-stack-payload", "Maximum stack payload bytes"), ("max-queue-budget", "Shared router/relay queue budget bytes"), ("max-recent-rx-ids", "Preallocated recent packet-ID entries")):
@@ -48,6 +55,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if unknown: parser.error("unsupported features: " + ", ".join(sorted(unknown)))
     if "embedded" in args.features and "python" in args.features: parser.error("build embedded and python targets separately")
     if args.full and args.command != "test": parser.error("--full requires test")
+    if args.all and args.command != "test": parser.error("--all requires test")
     args.env_overrides = {}
     for key in ("max_stack_payload", "max_queue_budget", "max_recent_rx_ids"):
         value = getattr(args, key)
@@ -921,11 +929,20 @@ def run_clippy_checks(
         )
 
 
-def main(argv: list[str]) -> None:
+def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
+         _shared_test_steps: bool = True) -> None:
     repo_root = Path(__file__).parent.resolve()
     os.chdir(repo_root)
 
     args = parse_args(argv)
+    if args.all and _qualification_profile is None:
+        for index, profile in enumerate(qualification_profiles(args.features)):
+            _banner("QUALIFICATION PROFILE " + str(index + 1) + "/2: " + ",".join(profile))
+            main(argv, _qualification_profile=profile, _shared_test_steps=index == 0)
+        _success("All qualification profiles passed.")
+        return
+    if _qualification_profile is not None:
+        args.features = _qualification_profile
     build_mode: list[str] = []
     checks = args.command == "check"
     tests = args.command == "test"
@@ -1001,7 +1018,7 @@ def main(argv: list[str]) -> None:
                 "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
-        total_steps = 10 if can_check_embedded else 9
+        total_steps = (10 if can_check_embedded else 9) - (0 if _shared_test_steps else 2)
 
         run_clippy_checks(
             env=env,
@@ -1060,32 +1077,33 @@ def main(argv: list[str]) -> None:
         _success("Hosted no_std memory regression passed.")
         next_step += 1
 
-        run_cmd(
-            ["cargo", "test", *build_mode, "--no-default-features",
-             "--features", "std,discovery,timesync",
-             "--test", "packet_packing_memory", "--test", "packet_routing_memory",
-             "--test", "accepted_queue_delivery"],
-            env=env, repo_root=repo_root,
-            title=f"{next_step}/{total_steps} cargo test (uncompressed forwarding memory)",
-            release_build=release_build,
-        )
-        next_step += 1
-
-        run_cmd(
-            cargo_bench_smoke_cmd(),
-            env=env,
-            repo_root=repo_root,
-            title=f"{next_step}/{total_steps} cargo bench (smoke)",
-            release_build=True,
-        )
-        _success("Benchmark smoke pass finished.")
-        next_step += 1
+        if _shared_test_steps:
+            run_cmd(
+                ["cargo", "test", *build_mode, "--no-default-features",
+                 "--features", "std,discovery,timesync",
+                 "--test", "packet_packing_memory", "--test", "packet_routing_memory",
+                 "--test", "accepted_queue_delivery"],
+                env=env, repo_root=repo_root,
+                title=f"{next_step}/{total_steps} cargo test (uncompressed forwarding memory)",
+                release_build=release_build,
+            )
+            next_step += 1
+            run_cmd(
+                cargo_bench_smoke_cmd(),
+                env=env,
+                repo_root=repo_root,
+                title=f"{next_step}/{total_steps} cargo bench (smoke)",
+                release_build=True,
+            )
+            _success("Benchmark smoke pass finished.")
+            next_step += 1
 
         with python_test_environment(repo_root, env, f"python{feature_suffix}", build_mode,
                                      f"{next_step}/{total_steps} host Python extension") as python_env:
             next_step += 1
             run_cmd([sys.executable, str(repo_root / "python_test_runner.py"),
-                     *(["--require-bindings"] if test_full else [])],
+                     *(["--require-bindings"] if test_full else []),
+                     *([] if _shared_test_steps else ["--bindings-only"])],
                     env=python_env, repo_root=repo_root,
                     title=f"{next_step}/{total_steps} python unittest")
         _success("Python unittest checks finished against the newly built host extension.")

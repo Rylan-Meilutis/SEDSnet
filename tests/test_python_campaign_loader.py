@@ -11,6 +11,30 @@ import python_test_runner
 
 
 class PythonCampaignLoaderTests(unittest.TestCase):
+    def test_additional_binding_profile_skips_only_named_shared_contracts(self):
+        calls = []
+        def case(module, label):
+            cls = type('Fixture', (unittest.TestCase,), {
+                '__module__': module, 'runTest': lambda self: calls.append(label)})
+            return cls()
+        suite = unittest.TestSuite([
+            unittest.TestSuite([case('test_build_cli', 'shared')]),
+            case('test_python_current_api', 'native'),
+            case('test_future_module', 'unknown'),
+        ])
+        selected = python_test_runner.binding_suite(suite)
+        self.assertEqual(selected.countTestCases(), 2)
+        result = unittest.TestResult()
+        selected.run(result)
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(calls, ['native', 'unknown'])
+
+    def test_empty_additional_binding_profile_is_rejected(self):
+        with mock.patch.object(python_test_runner.importlib, 'import_module'), \
+             mock.patch.object(unittest.defaultTestLoader, 'discover', return_value=unittest.TestSuite()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(python_test_runner.main(['--require-bindings', '--bindings-only']), 1)
+
     def test_private_copy_uses_cargo_output_and_host_abi_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
