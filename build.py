@@ -17,6 +17,7 @@ from getpass import getpass
 from pathlib import Path
 from cargo_paths import cargo_target_directory
 import release_credentials
+from release_logging import redact_output, safe_command
 
 RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
@@ -243,7 +244,7 @@ def print_artifact_size_delta(before: dict[str, int], after: dict[str, int]) -> 
 
 
 def _format_cmd(cmd: list[str]) -> str:
-    return " ".join(cmd)
+    return " ".join(safe_command(cmd))
 
 
 def output_hint_for_cmd(
@@ -407,10 +408,11 @@ def run_cmd(
     - PASS/FAIL
     - Output location hints
     """
+    shown = " ".join(safe_command(cmd, env))
     if title:
-        _banner(title)
+        _banner(redact_output(title, env))
     else:
-        _banner("Running: " + " ".join(cmd))
+        _banner("Running: " + shown)
 
     hint = output_hint_for_cmd(
         cmd,
@@ -421,27 +423,34 @@ def run_cmd(
         env=env,
     )
     if hint:
-        print(f"info: {hint}")
+        print(redact_output(f"info: {hint}", env))
 
-    print("Running:", " ".join(cmd))
+    print("Running:", shown)
     t0 = time.monotonic()
     try:
-        subprocess.run(cmd, check=True, env=env)
+        with subprocess.Popen(cmd, env=env, text=True, errors="replace",
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+            assert child.stdout is not None
+            for line in child.stdout:
+                print(redact_output(line, env), end="", flush=True)
+            code = child.wait()
+        if code:
+            raise subprocess.CalledProcessError(code, safe_command(cmd, env))
     except FileNotFoundError as e:
-        _fail(f"Command not found: {e.filename}")
-        _fail(f"While running: {_format_cmd(cmd)}")
-        raise SystemExit(127) from e
+        _fail(f"Command not found: {redact_output(str(e.filename), env)}")
+        _fail(f"While running: {shown}")
+        raise SystemExit(127) from None
     except PermissionError as e:
-        _fail(f"Permission denied when running command: {e}")
-        _fail(f"While running: {_format_cmd(cmd)}")
-        raise SystemExit(1) from e
+        _fail(f"Permission denied when running command: {redact_output(str(e), env)}")
+        _fail(f"While running: {shown}")
+        raise SystemExit(1) from None
     except subprocess.CalledProcessError as e:
         dt = time.monotonic() - t0
-        _fail(f"FAILED ({_fmt_secs(dt)}): {' '.join(cmd)}")
+        _fail(f"FAILED ({_fmt_secs(dt)}): {shown}")
         # Keep the same exit code
-        raise SystemExit(e.returncode) from e
+        raise SystemExit(e.returncode) from None
     dt = time.monotonic() - t0
-    _success(f"OK ({_fmt_secs(dt)}): {' '.join(cmd)}")
+    _success(f"OK ({_fmt_secs(dt)}): {shown}")
 
 
 def ensure_rust_target_installed(target: str) -> None:
@@ -548,15 +557,11 @@ def has_embedded_c_toolchain(target: str, env: dict[str, str]) -> bool:
 
 
 def _run_install_cmd(cmd: list[str]) -> bool:
-    print("info: running install command:", " ".join(cmd))
     try:
-        subprocess.run(cmd, check=True)
+        run_cmd(cmd, env=os.environ.copy(), repo_root=Path(__file__).parent,
+                title="Installing embedded C toolchain")
         return True
-    except FileNotFoundError as e:
-        print(f"warning: install command not found: {e.filename}", file=sys.stderr)
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f"warning: install command failed ({e.returncode}): {' '.join(cmd)}", file=sys.stderr)
+    except SystemExit:
         return False
 
 
@@ -740,7 +745,7 @@ def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root:
 def _apply_env_overrides(env: dict[str, str], overrides: dict[str, str]) -> None:
     for k, v in overrides.items():
         env[k] = v
-        print(f"info: env override: {k}={v}")
+        print(redact_output(f"info: env override: {k}={v}", env))
 
 
 def cargo_bench_smoke_cmd() -> list[str]:

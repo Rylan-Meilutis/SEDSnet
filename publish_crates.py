@@ -28,6 +28,7 @@ MAIN_MANIFEST = REPO_ROOT / "Cargo.toml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 RELEASE_CONFIG = REPO_ROOT / ".sedsnet-release.toml"
 import release_credentials
+from release_logging import redact_output, safe_command
 
 DEFAULT_LINUX_DOCKER_TARGETS = [
     "x86_64-unknown-linux-gnu",
@@ -59,38 +60,6 @@ PUBLISH_ALREADY_EXISTS = "already_exists"
 PUBLISH_FAILED = "failed"
 
 
-def redact_output(text: str, env: dict[str, str] | None = None) -> str:
-    """Sanitize logs even when a publishing subprocess echoes its credentials."""
-    values = dict(os.environ)
-    if env is not None:
-        values.update(env)
-    secrets = {
-        value for key, value in values.items()
-        if value and (key.endswith(("_TOKEN", "_PASSWORD")) or key == "CARGO_REGISTRY_TOKEN")
-    }
-    for secret in sorted(secrets, key=len, reverse=True):
-        text = text.replace(secret, "[REDACTED]")
-    # Cover registry token formats, including a locally saved Cargo login that
-    # never passed through this process's environment.
-    text = re.sub(r"\b(?:pypi-|cio)[A-Za-z0-9_-]+", "[REDACTED]", text)
-    text = re.sub(r"(?i)(authorization\s*[:=]\s*(?:basic|bearer)\s+)\S+", r"\1[REDACTED]", text)
-    return text
-
-
-def safe_command(cmd: list[str], env: dict[str, str] | None = None) -> list[str]:
-    safe = []
-    hide_next = False
-    for arg in cmd:
-        if hide_next:
-            safe.append("[REDACTED]")
-            hide_next = False
-            continue
-        hide_next = arg in ("--token", "--password", "-p")
-        arg = re.sub(r"^(--(?:token|password)=).*", r"\1[REDACTED]", arg)
-        safe.append(redact_output(arg, env))
-    return safe
-
-
 def run(
     cmd: list[str],
     *,
@@ -100,7 +69,7 @@ def run(
     shown = safe_command(display_cmd if display_cmd is not None else cmd, env)
     print(f"\n$ {' '.join(shown)}", flush=True)
     # Stream sanitized output rather than handing the child our log handles.
-    with subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, text=True,
+    with subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, text=True, errors="replace",
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
         assert child.stdout is not None
         for line in child.stdout:

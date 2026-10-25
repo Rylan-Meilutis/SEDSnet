@@ -86,6 +86,43 @@ class ReleaseRedactionTests(unittest.TestCase):
         self.assertNotIn(self.secret, str(error.exception))
         self.assertTrue(error.exception.__suppress_context__)
 
+    def test_quoted_headers_urls_and_encoded_known_credentials(self):
+        import urllib.parse
+        secret = "fake sentinel/+?=@&"
+        env = {"TWINE_PASSWORD": secret}
+        inputs = [
+            '{"Authorization": "Basic ZmFrZS1zZW50aW5lbA=="}',
+            "{'Authorization': 'Bearer another-fake-sentinel'}",
+            'https://fake-user:another-fake-password@example.invalid/path',
+            'https://example.invalid/?access_token=another-fake-sentinel&x=1',
+            '{"password":"another-fake-password"}',
+            urllib.parse.quote(secret, safe=''),
+            urllib.parse.quote_plus(secret, safe=''),
+            urllib.parse.quote(secret, safe='').replace('%2F', '%2f'),
+        ]
+        for text in inputs:
+            with self.subTest(text=text), mock.patch.dict(os.environ, {}, clear=True):
+                safe = publisher.redact_output(text, env)
+                self.assertNotIn('another-fake', safe)
+                self.assertNotIn('ZmFrZS1zZW50aW5lbA==', safe)
+                self.assertNotIn(secret, safe)
+                self.assertIn('[REDACTED]', safe)
+                self.assertEqual(publisher.redact_output(safe, env), safe)
+
+    def test_build_env_override_and_child_output_are_redacted(self):
+        env = {}
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            build._apply_env_overrides(env, {"MATURIN_PYPI_TOKEN": self.secret, "MAX_QUEUE_BUDGET": "8192"})
+            code = "import os,sys; print(os.environ['MATURIN_PYPI_TOKEN']); print(os.environ['MATURIN_PYPI_TOKEN'],file=sys.stderr); sys.exit(7)"
+            with self.assertRaises(SystemExit) as error:
+                build.run_cmd([sys.executable, '-c', code, '--password', self.secret],
+                              env=env, repo_root=publisher.Path('.'))
+        self.assertEqual(error.exception.code, 7)
+        self.assertNotIn(self.secret, output.getvalue())
+        self.assertIn('MAX_QUEUE_BUDGET=8192', output.getvalue())
+        self.assertIn('[REDACTED]', output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
