@@ -27,10 +27,14 @@ from typing import Any, Dict, List, Optional
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-except ModuleNotFoundError as e:
-    raise SystemExit(
-        "Tkinter is required for telemetry_config_editor.py but is not available in this Python runtime."
-    ) from e
+except ModuleNotFoundError:
+    # Schema loading/validation must also work on headless hosts and CI.
+    # Only constructing the interactive editor requires the optional Tk module.
+    tk = None
+    filedialog = messagebox = ttk = None
+
+_TK_REQUIRED = "Tkinter is required to open the schema editor. Install Tk for this Python runtime."
+_TK_ERRORS = (tk.TclError,) if tk is not None else ()
 
 DATA_TYPE_OPTIONS = [
     "Float64",
@@ -234,7 +238,7 @@ def _lb_add_unique(lb: tk.Listbox, items: List[str]) -> None:
             existing.add(v)
 
 
-class TelemetryConfigEditor(tk.Tk):
+class TelemetryConfigEditor(tk.Tk if tk is not None else object):
     def __init__(
             self,
             crate_root: Path,
@@ -242,6 +246,8 @@ class TelemetryConfigEditor(tk.Tk):
             base_json_path: Optional[Path],
             ipc_json_path: Optional[Path],
     ):
+        if tk is None:
+            raise RuntimeError(_TK_REQUIRED)
         super().__init__()
         self.title("Telemetry Config Editor (sedsnet)")
         self.geometry("1200x760")
@@ -1532,6 +1538,8 @@ class TelemetryConfigEditor(tk.Tk):
 
 
 def main():
+    if tk is None:
+        raise SystemExit(_TK_REQUIRED)
     start = Path(__file__).resolve().parent
     crate_root = find_project_root(start)
 
@@ -1565,7 +1573,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\nexiting...")
         exit(0)
-    except tk.TclError as e:
+    except _TK_ERRORS as e:
         print(f"error: Failed to start Tk UI: {e}", file=sys.stderr)
         print(
             "hint: Ensure a desktop display is available and Tk is properly installed.",
