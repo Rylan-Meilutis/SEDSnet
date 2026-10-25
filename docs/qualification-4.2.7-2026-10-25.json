@@ -1,0 +1,115 @@
+{
+  "date": "2026-10-25",
+  "version": "4.2.7",
+  "qualified_sdk_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
+  "release_ready": false,
+  "publication_performed_by_this_qualification": false,
+  "scope": "Best-effort routing preserves independent destination endpoint roles across CAN and radio without duplicating interchangeable routes; macOS direct Python-extension link configuration and deployment-target alignment. Reliable, managed and explicit route selection remain unchanged.",
+  "full_campaigns": {
+    "default": {
+      "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
+      "command": [
+        "/usr/bin/python3",
+        "build.py",
+        "test",
+        "--full"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 297.6241671909811,
+      "isolation": "Allowlisted environment, empty HOME/XDG, offline registry/git-only Cargo cache, no credentials or login/publish/install; shared existing target artifacts; native extension copied per campaign",
+      "long_tests_shortened": false,
+      "main_rust_tests_passed": 721,
+      "python_api_script_tests_passed": 81,
+      "skipped": 0,
+      "evidence_log": ".workspace-progress/sdk-427-docs-full-default.log",
+      "log_sha256": "d27f2150ece64800059b19f6dfb973704e13f818ef825ddb4803bb588e6555fc"
+    },
+    "compact_fair_crypto": {
+      "source_commit": "8a82f55",
+      "command": [
+        "/usr/bin/python3",
+        "build.py",
+        "test",
+        "--full",
+        "--features",
+        "cryptography,fair-admission,compact-packet-store,compact-packet-compression"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 817.0901486129733,
+      "isolation": "Allowlisted environment, empty HOME/XDG, offline registry/git-only Cargo cache, no credentials or login/publish/install; shared existing target artifacts; native extension copied per campaign",
+      "long_tests_shortened": false,
+      "started_source_commit": "8a82f553df64187fe839d335e6badb333f121d1d",
+      "completed_source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
+      "documentation_only_update_during_campaign": [
+        "README.md",
+        "docs/wiki/Changelogs.md"
+      ],
+      "runtime_and_scripts_unchanged_during_campaign": true,
+      "pressure_soak_seconds": 600.005,
+      "main_rust_tests_passed": 747,
+      "python_api_script_tests_passed": 81,
+      "skipped": 0,
+      "evidence_log": ".workspace-progress/sdk-427-final-full-compact-fair-crypto.log",
+      "log_sha256": "1046d7a682cddffd56e91c11c10fd740fe3b4e82cc8d53c0c7a825aec4912013"
+    }
+  },
+  "package_verification": {
+    "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
+    "no_publication": true,
+    "credential_free_environment": true,
+    "results": [
+      {
+        "manifest": "sedsnet_macros/Cargo.toml",
+        "exit_code": 0,
+        "seconds": 2.4599319469416514
+      },
+      {
+        "manifest": "Cargo.toml",
+        "exit_code": 0,
+        "seconds": 6.831411079969257
+      }
+    ]
+  },
+  "source_package_manifest": {
+    "package": "SEDSnet4.2.7",
+    "files": 266,
+    "bytes": 1008540,
+    "sha256": "a7cadff503092c5a5ce13145b9cb312f6b8c6a6da39231ba0a4f2481b62cb10b",
+    "required_helpers_and_regression_present": [
+      "src/tests/best_effort_endpoint_fanout.rs",
+      "release_logging.py",
+      "python_test_runner.py",
+      "publish_crates.py",
+      "build.py"
+    ],
+    "runtime_credential_filenames": false,
+    "no_publication": true
+  },
+  "runtime_sha256": {
+    "src/router.rs": "2d7a2694830b5fecf6f8206e4d3444ec20a8a180099bf723d5c066689a93d281",
+    "src/timesync.rs": "71214a1f9ef6e4b07848c92b5a956b8eb20f55c3bebd3eb489eb2e9b35be17ab",
+    "src/c_api.rs": "d7aca08bb616c2d978ea8dc98a0b5db5c0c02caefe65ad739ab6a194f53c81df"
+  },
+  "regression_evidence": {
+    "actual_rf_schema_c_abi": "Original independent-endpoint GPS publication returned success but reached CAN only; six C ABI regression cases cover per-role delivery, redundant coverage, partial overlap, shortest routes, retry after backpressure, and unchanged explicit/reliable route policy.",
+    "single_side_allocation": "Initial candidate failed existing two/three-endpoint allocation bounds. Final planner runs only when multiple candidate sides exist; original allocation limit is retained.",
+    "fixture_correction": "Full test seed already owns canonical endpoint IDs and GPS_DATA. Fixture now reuses identities and replaces only its own child-process GPS type with actual RF schema; no production metadata weakened."
+  },
+  "remaining": [
+    "Fresh matched 4.2.7 two/three-radio endurance, route restart, relay and actual GPS-position delivery qualification.",
+    "Close separately reproduced GroundStation automatic-abort versus Fire ordering race and revalidate affected sequence policies.",
+    "Commit final qualification evidence and push source to main/dev before notifying local publisher.",
+    "Native macOS build and package publication are performed by the user; Linux and synthetic platform contracts do not claim physical macOS validation."
+  ],
+  "historical_failures_preserved": [
+    "Initial C ABI fixture collided with seeded full-test schema; isolated fixture corrected.",
+    "Initial multiple-endpoint path exceeded existing allocation bound; runtime fast path corrected.",
+    "Interrupted earlier codec pressure run is not counted as passing.",
+    "First final default campaign failed release-heading documentation contract; documentation corrected and complete default campaign rerun passed."
+  ],
+  "release_4_2_6": "Already published to crates.io by user; immutable version/tag is preserved. This patch is 4.2.7 and does not rewrite 4.2.6.",
+  "limitations": [
+    "Software modem timing is not physical RFD firmware or RF propagation acceptance.",
+    "No credentials, login, package installation, publication or physical actuator commands were used by these qualification runs."
+  ]
+}
