@@ -378,19 +378,11 @@ impl SlewedNetworkClock {
         }
 
         let current_unix_ns = self.read_unix_ns(now_mono_ns).unwrap_or(target_unix_ns);
-        let elapsed_ns = now_mono_ns.saturating_sub(self.anchor_mono_ns) as i128;
-        let max_adjust_ns = elapsed_ns.saturating_mul(self.max_slew_ppm as i128) / 1_000_000;
-        let applied_adjust_ns = if self.pending_adjust_ns >= 0 {
-            self.pending_adjust_ns.min(max_adjust_ns)
-        } else {
-            -(-self.pending_adjust_ns).min(max_adjust_ns)
-        };
-        let remaining_adjust_ns = self.pending_adjust_ns.saturating_sub(applied_adjust_ns);
-
         self.anchor_mono_ns = now_mono_ns;
         self.anchor_unix_ns = current_unix_ns;
-        self.pending_adjust_ns =
-            remaining_adjust_ns.saturating_add(target_unix_ns.saturating_sub(current_unix_ns));
+        // The target is an absolute observation at `now`, not an incremental
+        // correction. Repeated observations must replace the residual error.
+        self.pending_adjust_ns = target_unix_ns.saturating_sub(current_unix_ns);
         self.initialized = true;
     }
 }
@@ -964,5 +956,92 @@ mod calendar_tests {
         .as_unix_ns()
         .unwrap();
         assert_eq!(NetworkTime::from_unix_ns(last + 1), None);
+    }
+}
+
+#[cfg(test)]
+mod slew_absolute_target_tests {
+    use super::SlewedNetworkClock;
+
+    #[test]
+    fn remote_source_projection_survives_embedded_polling_and_source_updates() {
+        use super::{TimeSyncConfig, TimeSyncRole, build_timesync_announce_with_sender};
+        use crate::router::{Router, RouterConfig};
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        const EPOCH: u64 = 1_767_225_600_000;
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::default().with_timesync(TimeSyncConfig {
+                role: TimeSyncRole::Consumer,
+                priority: 50,
+                source_timeout_ms: 10_000,
+                consumer_promotion_enabled: false,
+                ..Default::default()
+            }),
+            alloc::boxed::Box::new(move || clock.load(Ordering::SeqCst)),
+        );
+        for elapsed_ms in (0..=20_000).step_by(10) {
+            now.store(elapsed_ms, Ordering::SeqCst);
+            if elapsed_ms % 5_000 == 0 {
+                // Exercise a replacement leader as well as repeated updates.
+                let (source, priority) = if elapsed_ms < 10_000 {
+                    ("SOURCE_A", 2)
+                } else {
+                    ("SOURCE_B", 1)
+                };
+                router
+                    .rx(
+                        &build_timesync_announce_with_sender(source, priority, EPOCH + elapsed_ms)
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..5 {
+                router.poll_timesync().unwrap();
+                assert_eq!(router.network_time_ms(), Some(EPOCH + elapsed_ms));
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_absolute_target_does_not_accumulate_phase_error() {
+        for target in [9_900, 10_100] {
+            let mut once = SlewedNetworkClock::new(50_000);
+            once.steer_unix_ms(0, 10_000);
+            once.steer_unix_ms(0, target);
+            let mut repeated = once;
+            for _ in 0..100 {
+                repeated.steer_unix_ms(0, target);
+            }
+            for elapsed_ms in [1, 100, 1_000, 2_000, 3_000, 10_000] {
+                assert_eq!(
+                    repeated.read_unix_ms(elapsed_ms * 1_000_000),
+                    once.read_unix_ms(elapsed_ms * 1_000_000)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn advancing_absolute_targets_converge_with_bounded_monotonic_slew() {
+        for offset_ms in [-100i64, 100] {
+            let mut clock = SlewedNetworkClock::new(50_000);
+            clock.steer_unix_ms(0, 10_000);
+            let mut previous = 10_000_000_000i128;
+            for elapsed_ms in 1..=5_000u64 {
+                let now_ns = elapsed_ms * 1_000_000;
+                let target_ms = (10_000 + elapsed_ms as i64 + offset_ms) as u64;
+                clock.steer_unix_ms(now_ns, target_ms);
+                let current = clock.read_unix_ns(now_ns).unwrap();
+                assert!((950_000..=1_050_000).contains(&(current - previous)));
+                previous = current;
+            }
+            assert_eq!(
+                clock.read_unix_ms(5_000_000_000),
+                Some((15_000 + offset_ms) as u64)
+            );
+        }
     }
 }

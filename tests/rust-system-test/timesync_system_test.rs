@@ -375,6 +375,49 @@ mod timesync_system_test {
     }
 
     #[test]
+    fn remote_clock_projection_is_independent_of_poll_and_read_cadence() {
+        const EPOCH: u64 = 1_767_225_600_000;
+        for poll in [false, true] {
+            for reads_per_tick in [1, 20] {
+                let now = Arc::new(AtomicU64::new(0));
+                let router = Router::new_with_clock(
+                    RouterConfig::default().with_timesync(TimeSyncConfig {
+                        role: TimeSyncRole::Consumer,
+                        priority: 50,
+                        source_timeout_ms: 10_000,
+                        consumer_promotion_enabled: false,
+                        ..Default::default()
+                    }),
+                    shared_clock(now.clone()),
+                );
+                for elapsed_ms in (0..=20_000).step_by(10) {
+                    now.store(elapsed_ms, Ordering::SeqCst);
+                    if elapsed_ms % 5_000 == 0 {
+                        router
+                            .rx(&build_timesync_announce_with_sender(
+                                "PROJECTED_SOURCE",
+                                1,
+                                EPOCH + elapsed_ms,
+                            )
+                            .unwrap())
+                            .unwrap();
+                    }
+                    if poll {
+                        router.poll_timesync().unwrap();
+                    }
+                    for _ in 0..reads_per_tick {
+                        assert_eq!(
+                            router.network_time_ms(),
+                            Some(EPOCH + elapsed_ms),
+                            "poll={poll}, reads={reads_per_tick}, elapsed={elapsed_ms}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn router_failover_slews_without_jumping_backwards() {
         let now = Arc::new(AtomicU64::new(1_000));
         let router = Router::new_with_clock(

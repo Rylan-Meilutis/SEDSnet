@@ -10991,10 +10991,12 @@ impl Router {
         };
         Self::reconcile_pending_timesync_request_locked(&mut st, &leader, now_mono_ms);
         if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref() {
-            let target_ms = st
-                .remote_sources
-                .get(remote.sender.as_str())
-                .map(|src| src.sample_unix_ms);
+            // Remote samples are anchored at receipt, just like local sources.
+            // Steering repeatedly toward the unprojected sample slows the clock.
+            let target_ms = st.remote_sources.get(remote.sender.as_str()).map(|src| {
+                src.sample_unix_ms
+                    .saturating_add(now_mono_ms.saturating_sub(src.last_sample_mono_ms))
+            });
             if let Some(target_ms) = target_ms {
                 st.disciplined_clock.steer_unix_ms(now_mono_ns, target_ms);
             }
@@ -11421,10 +11423,10 @@ impl Router {
             Self::reconcile_pending_timesync_request_locked(&mut st, &leader, now_ms);
 
             if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref() {
-                let target_ms = st
-                    .remote_sources
-                    .get(&remote.sender)
-                    .map(|src| src.sample_unix_ms);
+                let target_ms = st.remote_sources.get(&remote.sender).map(|src| {
+                    src.sample_unix_ms
+                        .saturating_add(now_ms.saturating_sub(src.last_sample_mono_ms))
+                });
                 if let Some(target_ms) = target_ms {
                     st.disciplined_clock.steer_unix_ms(now_ns, target_ms);
                 }

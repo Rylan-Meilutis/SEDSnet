@@ -3,21 +3,21 @@
   "version": "4.2.6",
   "production_base_commit": "6980f9b6f9594f785c157938a6aefd5647bbdb5f",
   "release_ready": false,
-  "change_scope": "Test-only actual UART/side-codec trace diagnostics. Router test module is cfg(test); runtime API, routing and wire format are unchanged by this checkpoint.",
+  "change_scope": "Advance remote UTC samples by elapsed monotonic time and replace residual absolute phase error; test-only actual wire/UTC diagnostics. No wire-format, schema, public API or state-size changes.",
   "full_campaigns": {
     "default": {
       "command": "python3 build.py test --full",
-      "rust_tests_passed": 710,
+      "rust_tests_passed": 715,
       "rust_tests_skipped": 0,
       "python_tests_passed": 72,
-      "duration_seconds": 194.57
+      "duration_seconds": 168.38
     },
     "compact_fair_crypto": {
       "command": "python3 build.py test --full --features cryptography,fair-admission,compact-packet-store,compact-packet-compression",
-      "rust_tests_passed": 736,
+      "rust_tests_passed": 741,
       "rust_tests_skipped": 0,
       "python_tests_passed": 72,
-      "duration_seconds": 734.53,
+      "duration_seconds": 721.8,
       "codec_pressure_soak_seconds": 600,
       "duration_shortened": false
     }
@@ -27,10 +27,20 @@
     "Hosted no_std checks and thumbv7em-none-eabihf embedded build",
     "Self-contained ignored trace diagnostic runs without external input in --full mode; partial explicit input is rejected"
   ],
-  "diagnostic_sha256": "cf7a14ee13d321692fa26c46ac7fa3bc4348be90a478d0cec942223efcfd2766",
+  "diagnostic_sha256": "735a958178de4f118d1792d908c21c20cf98d9727c6680be2865bb4eedcbf8ec",
   "remaining": [
-    "Integrated finite-radio two/three-host long soak with current firmware and GroundStation",
-    "Final release/package publication from the local Mac after qualification"
+    "Matched corrected-clock MCU and hosted finite-radio two/three-node acceptance and600s source/SD/restart soaks",
+    "Final local Mac build and package publication after qualification"
   ],
-  "credential_scope": "No real package credential is used by qualification; publication credentials are not included in source or reports."
+  "credential_scope": "No real package credential is used by qualification; publication credentials are not included in source or reports.",
+  "corrected_clock_source_sha256": {
+    "src/router.rs": "5403896bf4852db6abd8c8e4beec672a97475de0806c3febffd155c4770f29a6",
+    "src/timesync.rs": "71214a1f9ef6e4b07848c92b5a956b8eb20f55c3bebd3eb489eb2e9b35be17ab",
+    "tests/rust-system-test/timesync_system_test.rs": "1d48d7b3eb99df57afe1169b17280aa9a8e8c23a305dc09473be14f2eeb4a328"
+  },
+  "clock_red_green": [
+    "Repeated same-time absolute targets no longer accumulate phase error.",
+    "Advancing targets converge within configured monotonic slew bounds.",
+    "Remote samples remain accurate across independent read/poll cadences and leader replacement."
+  ]
 }
