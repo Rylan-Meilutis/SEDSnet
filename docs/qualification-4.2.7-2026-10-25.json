@@ -226,7 +226,7 @@
       }
     ]
   },
-  "updated_utc": "2026-10-25T22:20:45.024825+00:00",
+  "updated_utc": "2026-10-25T22:30:35.401117+00:00",
   "prior_multicast_candidate_package_verification": {
     "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
     "no_publication": true,
@@ -259,9 +259,89 @@
     "runtime_credential_filenames": false,
     "no_publication": true
   },
-  "final_source_packages": "Pending clean committed-source verification; prior candidate package checks are preserved separately.",
+  "final_source_packages": {
+    "source_commit": "b38b017c8e4c963682362d34fa1362c67607d4d1",
+    "no_publication": true,
+    "credential_free_environment": true,
+    "environment_keys": [
+      "CARGO_BUILD_JOBS",
+      "CARGO_HOME",
+      "CARGO_INCREMENTAL",
+      "CARGO_NET_OFFLINE",
+      "HOME",
+      "LANG",
+      "PATH",
+      "RUSTC",
+      "TMPDIR"
+    ],
+    "empty_home_remained_empty": true,
+    "cargo_home_entries": [
+      "registry cache symlink",
+      "git cache symlink"
+    ],
+    "source_rs_files_unchanged": 73,
+    "package_verification_enabled": true,
+    "results": [
+      {
+        "manifest": "sedsnet_macros/Cargo.toml",
+        "command": [
+          "cargo",
+          "package",
+          "--offline",
+          "--manifest-path",
+          "sedsnet_macros/Cargo.toml"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 3.32
+      },
+      {
+        "manifest": "Cargo.toml",
+        "command": [
+          "cargo",
+          "package",
+          "--offline",
+          "--manifest-path",
+          "Cargo.toml"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 11.76
+      }
+    ],
+    "artifacts": [
+      {
+        "name": "sedsnet_macros-2.1.1.crate",
+        "preserved_path": ".workspace-progress/sdk-427-final-source-package-check/sedsnet_macros-2.1.1-b38b017.crate",
+        "files": 5,
+        "bytes": 9720,
+        "sha256": "d54852c15aa014ac506b338745805a68af9e90d76a0404686888dbdd3e2d472f",
+        "credential_filenames_present": false,
+        "required_helpers_and_contracts_present": []
+      },
+      {
+        "name": "SEDSnet-4.2.7.crate",
+        "preserved_path": ".workspace-progress/sdk-427-final-source-package-check/SEDSnet-4.2.7-b38b017.crate",
+        "files": 268,
+        "bytes": 1018781,
+        "sha256": "76b962a7e144c4e02bdeb12abd34e69e6d39d56eeab0033c182780e691a51250",
+        "credential_filenames_present": false,
+        "required_helpers_and_contracts_present": [
+          "build.py",
+          "publish_crates.py",
+          "python_test_runner.py",
+          "release_logging.py",
+          "release_credentials.py",
+          "tests/test_build_cli.py",
+          "tests/test_publish_crates.py",
+          "src/tests/accepted_route_ownership.rs",
+          "src/tests/accepted_tx_ownership.rs"
+        ]
+      }
+    ],
+    "log_sha256": "2a29e56820cf5e7099ecbf5328fa440bbbb451dd7d6705c326352e6ddb669dd2",
+    "scope": "Verified b38b017 packaged code and scripts; subsequent qualification-document-only updates do not change compiled or tested code."
+  },
   "unified_release_matrix": {
-    "phase": "running",
+    "phase": "passed",
     "commit": "a1e4b8415dd88a9e23a6e819f91d46cc96333562",
     "command": [
       "python3",
@@ -322,7 +402,15 @@
       "source_head_unchanged": true,
       "log_sha256": "72951294363f7df79bd045dc146be3a9e79bc0f44e6806c7b94c4fa021f57d05"
     },
-    "pipeline_log_sha256": "72951294363f7df79bd045dc146be3a9e79bc0f44e6806c7b94c4fa021f57d05"
+    "pipeline_log_sha256": "72951294363f7df79bd045dc146be3a9e79bc0f44e6806c7b94c4fa021f57d05",
+    "completed_utc": "2026-10-25T22:12:38.036345+00:00",
+    "elapsed_wall_seconds": 1001.7251479859697,
+    "exit_code": 0,
+    "source_unchanged": true,
+    "changed_source": [],
+    "result_file": "result.json",
+    "stage_summary_file": "stage-summary.json",
+    "initial_running_metadata": "campaign-started.json"
   },
   "i686_wheel_build": {
     "exit_code": 0,
