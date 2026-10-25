@@ -1,7 +1,7 @@
 {
   "date": "2026-10-25",
   "version": "4.2.7",
-  "qualified_sdk_commit": "2b1983e6c31c9caffaa129ba8bc9f3b899f4fbd2",
+  "qualified_sdk_commit": "a1e4b8415dd88a9e23a6e819f91d46cc96333562",
   "release_ready": false,
   "publication_performed_by_this_qualification": false,
   "scope": "Best-effort routing preserves independent destination endpoint roles across CAN and radio without duplicating interchangeable routes; macOS direct Python-extension link configuration and deployment-target alignment. Reliable, managed and explicit route selection remain unchanged.",
@@ -50,11 +50,10 @@
     "fixture_correction": "Full test seed already owns canonical endpoint IDs and GPS_DATA. Fixture now reuses identities and replaces only its own child-process GPS type with actual RF schema; no production metadata weakened."
   },
   "remaining": [
-    "Finish complete final-source backend mode matrices and resolve preserved Clear ordering / testing-HITL fixture / test-fire feature-gate failures.",
-    "Run fresh matched final-source two/three-radio600s, restart and relay qualification; older candidate prefixes are not final600s passes.",
-    "Verify final source packages and push qualified SDK main/dev/tag/release for maintainer local package publication.",
-    "Hold dependent GroundStation source push until public SDK4.2.7 exists; launcher refreshes the existing version4 range.",
-    "Native macOS and physical RF/modem/GPU acceptance remain explicit platform follow-up."
+    "Finish current two/three-radio600s source/SD/latency/GPS campaigns, then restart and relay acceptance. No prefix is a full pass.",
+    "Finalize source packages and release evidence before creating4.2.7tag/release for maintainer publication.",
+    "Dependent GroundStation push waits for public4.2.7 crate availability; manifest constraint remains4.",
+    "Native macOS final publication and physical RF/modem/GPU acceptance remain platform follow-up."
   ],
   "historical_failures_preserved": [
     "Initial C ABI fixture collided with seeded full-test schema; isolated fixture corrected.",
@@ -227,7 +226,7 @@
       }
     ]
   },
-  "updated_utc": "2026-10-25T20:46:45.412547+00:00",
+  "updated_utc": "2026-10-25T22:20:45.024825+00:00",
   "prior_multicast_candidate_package_verification": {
     "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
     "no_publication": true,
@@ -260,5 +259,92 @@
     "runtime_credential_filenames": false,
     "no_publication": true
   },
-  "final_source_packages": "Pending clean committed-source verification; prior candidate package checks are preserved separately."
+  "final_source_packages": "Pending clean committed-source verification; prior candidate package checks are preserved separately.",
+  "unified_release_matrix": {
+    "phase": "running",
+    "commit": "a1e4b8415dd88a9e23a6e819f91d46cc96333562",
+    "command": [
+      "python3",
+      "build.py",
+      "test",
+      "--all",
+      "--full"
+    ],
+    "source_files": 267,
+    "environment_keys": [
+      "CARGO_BUILD_JOBS",
+      "CARGO_HOME",
+      "CARGO_INCREMENTAL",
+      "CARGO_NET_OFFLINE",
+      "CARGO_TARGET_DIR",
+      "CMAKE_BUILD_PARALLEL_LEVEL",
+      "LANG",
+      "PATH",
+      "PYTHONUNBUFFERED",
+      "RUSTUP_HOME",
+      "SEDSNET_TEST_RUNNER"
+    ],
+    "credentials_forwarded": false,
+    "cargo_offline": true,
+    "pressure_duration_shortened": false,
+    "started_utc": "2026-10-25T21:55:56.311061+00:00",
+    "stage_summary": {
+      "profiles": [
+        {
+          "profile": "1/2: cryptography",
+          "native_rust_passed": 727,
+          "native_rust_failed": 0,
+          "native_rust_ignored": 0,
+          "python": [
+            [
+              "86",
+              "35.528",
+              "OK"
+            ]
+          ]
+        },
+        {
+          "profile": "2/2: cryptography,compact-packet-compression,fair-admission",
+          "native_rust_passed": 753,
+          "native_rust_failed": 0,
+          "native_rust_ignored": 0,
+          "python": [
+            [
+              "14",
+              "32.718",
+              "OK"
+            ]
+          ]
+        }
+      ],
+      "shared_uncompressed_stages": 1,
+      "shared_benchmark_stages": 1,
+      "source_head_unchanged": true,
+      "log_sha256": "72951294363f7df79bd045dc146be3a9e79bc0f44e6806c7b94c4fa021f57d05"
+    },
+    "pipeline_log_sha256": "72951294363f7df79bd045dc146be3a9e79bc0f44e6806c7b94c4fa021f57d05"
+  },
+  "i686_wheel_build": {
+    "exit_code": 0,
+    "elapsed_seconds": 177.81109384191222,
+    "source_files_unchanged": true,
+    "source_files": 267,
+    "source_commit": "a1e4b8415dd88a9e23a6e819f91d46cc96333562",
+    "no_publication": true,
+    "no_credentials_mounted": true
+  },
+  "i686_wheel_artifact": {
+    "wheel": "sedsnet-4.2.7-cp39-abi3-manylinux_2_34_i686.whl",
+    "sha256": "9fcefb652c9c28b0f6e368a763082ab198128b1c89bad86ee4a6c989a93da200",
+    "bytes": 1751175,
+    "extension": "sedsnet/sedsnet.abi3.so",
+    "elf_class": "ELF32",
+    "machine_line": "Machine:                           Intel 80386",
+    "wheel_metadata": "Wheel-Version: 1.0\nGenerator: maturin (1.15.0)\nRoot-Is-Purelib: false\nTag: cp39-abi3-manylinux_2_34_i686\n",
+    "runtime_import_verified": false,
+    "no_publication": true
+  },
+  "i686_runtime_followup": "Actual32-bit Python3.12.15/glibc2.36 import, four publicAPI/callback tests and payload/64-bit timestamp roundtrip pass without skips. See FirmwareSimulator/docs/qualification/i686-python-wheel-runtime-2026-10-25.json; build-only snapshot retained separately.",
+  "layout_fix_scope": "Compile-time assertions and test only: no TxQueued fields, accounting, routing, transport or other runtime function changed from2b. i686156B vslegacy144B (alignment4); native208B vslegacy200B (alignment8). Guard preserves complete metadata padding/budget rather than imposing+8 on everyABI.",
+  "source_push_scope": "Validated source to main/dev for CI; no new tag or package publication while final network/restart/relay acceptance remains pending."
 }
