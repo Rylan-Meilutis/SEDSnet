@@ -196,6 +196,16 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.2.7 highlights
+
+Qualification is in progress; this patch is not yet published.
+
+- Preserve every distinct destination role for best-effort multicast, including
+  GPS sent to Flight Computer, SD logging and GroundStation across CAN and radio.
+- Keep one route among redundant alternatives, preserve accepted retry ownership,
+  and retain the existing single-egress allocation budget.
+- Fix direct macOS Python test-extension linking and deployment-target consistency.
+
 ### Version 4.2.6 highlights
 
 Publication, macOS builds and physical hardware acceptance remain pending. See the

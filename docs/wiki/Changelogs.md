@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 4.2.7
+## Version 4.2.7 highlights
 
 Qualification is in progress; this patch has not been published.
 
