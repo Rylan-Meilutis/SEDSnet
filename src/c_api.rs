@@ -8099,3 +8099,7 @@ mod pending_copy_contract_tests {
         assert_eq!(row, ReliablePendingRow::default());
     }
 }
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/best_effort_endpoint_fanout.rs"]
+mod best_effort_endpoint_fanout;

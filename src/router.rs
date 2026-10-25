@@ -5242,6 +5242,60 @@ impl Router {
         }
     }
 
+    /// Distinct endpoint roles are multicast destinations, not interchangeable
+    /// paths. Pick one shortest path per role and reuse an already selected side
+    /// when it covers that role; adaptive choice remains within redundant paths.
+    #[cfg(feature = "discovery")]
+    fn select_endpoint_role_sides_locked(
+        &self,
+        st: &mut RouterInner,
+        exclude: Option<RouterSideId>,
+        endpoints: &[DataEndpoint],
+        matches: &[DiscoveryCandidateMatch],
+        now_ms: u64,
+    ) -> Vec<RouterSideId> {
+        let mut selected = Vec::new();
+        for endpoint in endpoints {
+            let mut candidates: Vec<_> = matches
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    st.discovery_routes
+                        .get(&candidate.side)
+                        .is_some_and(|route| route.reachable.contains(endpoint))
+                })
+                .collect();
+            Self::retain_shortest_discovery_candidates_locked(
+                st,
+                &mut candidates,
+                core::slice::from_ref(endpoint),
+                wire_format::TargetSenderSet::Hashes(&[]),
+                now_ms,
+            );
+            if candidates
+                .iter()
+                .any(|candidate| selected.contains(&candidate.side))
+            {
+                continue;
+            }
+            let sides = self.apply_route_selection_locked(
+                st,
+                exclude,
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.side)
+                    .collect(),
+                RouteSelectionOrigin::Discovered,
+            );
+            for side in sides {
+                if !selected.contains(&side) {
+                    selected.push(side);
+                }
+            }
+        }
+        selected
+    }
+
     #[cfg(feature = "discovery")]
     fn select_discovered_candidate_sides_locked(
         &self,
@@ -5279,9 +5333,9 @@ impl Router {
         /* Heartbeats represent network-wide liveness rather than a request for
          * one interchangeable endpoint owner.  When discovery finds the
          * heartbeat endpoint on multiple independent shortest-path sides,
-         * every segment must receive it.  Ordinary data continues through the
-         * adaptive single-path selector so a multi-homed router does not
-         * duplicate application traffic. */
+         * every segment must receive it. Other packets reaching this selector
+         * retain adaptive path selection; independent best-effort endpoint
+         * roles are planned separately before this fallback. */
         let has_distributed_variable_owners = selected.iter().any(|side| {
             st.discovery_routes
                 .get(side)
@@ -6651,6 +6705,28 @@ impl Router {
                     .is_some_and(|route| route.reachable_network_variables.contains(&ty))
             });
             if DataType::try_named("HEARTBEAT") != Some(ty) && !has_distributed_variable_owners {
+                if eps.len() > 1
+                    && !matches.is_empty()
+                    && !is_reliable_type(ty)
+                    && !st.managed_variable_types.contains(&ty.as_u32())
+                    && routing_target_senders.is_empty()
+                    && preferred_packet_id.is_none()
+                    && preferred_timesync_source.is_none()
+                    && !Self::has_explicit_route_policy_locked(&st, exclude, ty)
+                    && !st.source_route_modes.contains_key(&exclude)
+                {
+                    if !select_routes {
+                        return Ok(RemoteSidePlan::Target(vec![matches[0].side]));
+                    }
+                    let sides = self.select_endpoint_role_sides_locked(
+                        &mut st,
+                        exclude,
+                        &eps,
+                        &matches,
+                        self.clock.now_ms(),
+                    );
+                    return Ok(RemoteSidePlan::Target(sides));
+                }
                 Self::retain_shortest_discovery_candidates_locked(
                     &st,
                     &mut matches,
