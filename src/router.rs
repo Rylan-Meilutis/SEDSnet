@@ -6705,8 +6705,11 @@ impl Router {
                     .is_some_and(|route| route.reachable_network_variables.contains(&ty))
             });
             if DataType::try_named("HEARTBEAT") != Some(ty) && !has_distributed_variable_owners {
+                // A single eligible physical side has no role/path ambiguity.
+                // Keep the allocation-bounded transit path instead of building
+                // per-role candidate vectors for the same sole destination.
                 if eps.len() > 1
-                    && !matches.is_empty()
+                    && matches.len() > 1
                     && !is_reliable_type(ty)
                     && !st.managed_variable_types.contains(&ty.as_u32())
                     && routing_target_senders.is_empty()
