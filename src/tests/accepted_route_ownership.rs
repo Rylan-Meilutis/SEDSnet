@@ -22,9 +22,23 @@ fn generic_retry_at_high_uptime_starts_its_own_deferral_clock() {
 }
 
 #[test]
-fn queue_metadata_growth_is_eight_bytes() {
-    assert_eq!(size_of::<TxQueued>(),size_of::<(RouterTxItem,bool,u8,u64)>()+8);
-    println!("TxQueued={} RouterInner={}",size_of::<TxQueued>(),size_of::<RouterInner>());
+fn queue_metadata_growth_respects_target_alignment() {
+    let alignment = core::mem::align_of::<TxQueued>();
+    // Freeze the intended field budget independently of Rust's tuple ordering.
+    let metadata_bytes = 24usize;
+    let expected = (size_of::<RouterTxItem>() + metadata_bytes)
+        .div_ceil(alignment) * alignment;
+    assert_eq!(size_of::<TxQueued>(), expected);
+    assert_eq!(size_of::<TxQueued>(),
+        size_of::<(RouterTxItem, bool, u8, QueuedDelivery, u32, u64, u64)>());
+    let legacy = size_of::<(RouterTxItem, bool, u8, u64)>();
+    let legacy_metadata = (size_of::<bool>() + size_of::<u8>() + size_of::<u64>())
+        .div_ceil(alignment) * alignment;
+    assert_eq!(legacy, size_of::<RouterTxItem>() + legacy_metadata);
+    let aligned_metadata = metadata_bytes.div_ceil(alignment) * alignment;
+    assert_eq!(size_of::<TxQueued>() - legacy, aligned_metadata - legacy_metadata);
+    println!("TxQueued={} legacy={} alignment={} RouterInner={}",
+        size_of::<TxQueued>(), legacy, alignment, size_of::<RouterInner>());
 }
 
 #[test]

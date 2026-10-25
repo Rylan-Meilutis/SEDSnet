@@ -779,8 +779,20 @@ struct TxWork {
 const MAX_PRIORITY_BURST: u8 = 8;
 
 /// ByteCost implementation for TxQueued.
-// The cached bit must fit the old metadata padding on host and MCU targets.
-const _: () = assert!(size_of::<TxQueued>() == size_of::<(RouterTxItem, bool, u8, u64)>() + 8);
+// Compare against the complete ownership metadata before the cached bit was
+// added. Its padding absorbs that bit on supported ABIs. The older four-field
+// tuple has different padding on i686 (u64 alignment 4) and ARM/64-bit targets
+// (alignment 8), so its growth is not universally eight bytes.
+const _: () = {
+    assert!(size_of::<TxQueued>()
+        == size_of::<(RouterTxItem, bool, u8, QueuedDelivery, u32, u64, u64)>());
+    let metadata_bytes = 2 * size_of::<u64>() + size_of::<u32>()
+        + size_of::<QueuedDelivery>() + 2 * size_of::<bool>() + size_of::<u8>();
+    let alignment = core::mem::align_of::<TxQueued>();
+    let expected = (size_of::<RouterTxItem>() + metadata_bytes)
+        .div_ceil(alignment) * alignment;
+    assert!(size_of::<TxQueued>() == expected);
+};
 
 impl ByteCost for TxQueued {
     #[cfg(feature = "compact-packet-store")]
