@@ -2126,7 +2126,7 @@ fn reliable_command_re_resolves_at_an_aggregated_discovery_next_hop() {
 }
 
 #[test]
-fn end_to_end_expiry_clears_unordered_but_does_not_ack_ordered_data() {
+fn route_expiry_does_not_acknowledge_either_reliable_mode() {
     use std::sync::Arc;
 
     ensure_topology_test_schema();
@@ -2205,11 +2205,9 @@ fn end_to_end_expiry_clears_unordered_but_does_not_ack_ordered_data() {
         router.periodic_no_timesync(0).unwrap();
         assert_eq!(
             router.debug_end_to_end_pending_destination_count(packet_id),
-            if mode == crate::ReliableMode::Ordered {
-                Some(1)
-            } else {
-                None
-            }
+            // Neither an ordered nor an unordered destination has ACKed.
+            // Route expiry may change retry routing, never delivery success.
+            Some(1)
         );
     }
 }

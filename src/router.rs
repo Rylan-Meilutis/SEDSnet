@@ -5439,7 +5439,6 @@ impl Router {
         }
         let active_destinations = self.active_end_to_end_destinations_locked(st);
         let packet_ids: Vec<u64> = st.end_to_end_reliable_tx.keys().copied().collect();
-        let mut completed = Vec::new();
 
         for packet_id in packet_ids {
             let Some(data) = st
@@ -5462,40 +5461,18 @@ impl Router {
             if !sent.tracked_destinations {
                 continue;
             }
-            // Route churn is not a delivery acknowledgement for ordered data.
-            if sent.ordered_type.is_some() {
-                for (sender, side) in &mut sent.pending_destinations {
-                    if let Some(next_side) = expected.get(sender).or_else(|| {
-                        active_destinations
-                            .get(sender)
-                            .filter(|side| Some(**side) != excluded)
-                    }) {
-                        *side = *next_side;
-                    }
-                }
-                continue;
-            }
-            sent.pending_destinations.retain(|sender_hash, side| {
-                match (
-                    expected.get(sender_hash),
+            // A topology withdrawal is not a destination receipt, for either
+            // reliable mode. Keep the frozen cohort until a real ACK or the
+            // bounded delivery timeout; only update a known owner's next hop.
+            for (sender, side) in &mut sent.pending_destinations {
+                if let Some(next_side) = expected.get(sender).or_else(|| {
                     active_destinations
-                        .get(sender_hash)
-                        .filter(|side| Some(**side) != excluded),
-                ) {
-                    (Some(next_side), _) | (None, Some(next_side)) => {
-                        *side = *next_side;
-                        true
-                    }
-                    (None, None) => false,
+                        .get(sender)
+                        .filter(|side| Some(**side) != excluded)
+                }) {
+                    *side = *next_side;
                 }
-            });
-            if sent.pending_destinations.is_empty() {
-                completed.push(packet_id);
             }
-        }
-
-        for packet_id in completed {
-            st.end_to_end_reliable_tx.remove(&packet_id);
         }
 
         Ok(())
