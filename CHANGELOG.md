@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 4.2.7
+
+Qualification is in progress; this patch has not been published.
+
+- Route best-effort packets to every distinct destination endpoint role across
+  independent sides. GPS addressed to Flight Computer, SD logging and GroundStation
+  must reach both CAN and radio. Preserve a single selected path among redundant
+  routes for the same role, with reliable, managed-variable and explicit routing
+  policies unchanged.
+- Fix direct macOS Python test-extension linking and align Rust/C dependency
+  deployment targets while preserving an explicitly configured minimum OS version.
+
 ## 4.2.6
 
 Publication, macOS builds and physical hardware acceptance remain pending. See
