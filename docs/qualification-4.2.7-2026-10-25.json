@@ -2,7 +2,7 @@
   "date": "2026-10-25",
   "version": "4.2.7",
   "qualified_sdk_commit": "a1e4b8415dd88a9e23a6e819f91d46cc96333562",
-  "release_ready": false,
+  "release_ready": true,
   "publication_performed_by_this_qualification": false,
   "scope": "Best-effort routing preserves independent destination endpoint roles across CAN and radio without duplicating interchangeable routes; macOS direct Python-extension link configuration and deployment-target alignment. Reliable, managed and explicit route selection remain unchanged.",
   "full_campaigns": {
@@ -49,12 +49,7 @@
     "single_side_allocation": "Initial candidate failed existing two/three-endpoint allocation bounds. Final planner runs only when multiple candidate sides exist; original allocation limit is retained.",
     "fixture_correction": "Full test seed already owns canonical endpoint IDs and GPS_DATA. Fixture now reuses identities and replaces only its own child-process GPS type with actual RF schema; no production metadata weakened."
   },
-  "remaining": [
-    "Finish current two/three-radio600s source/SD/latency/GPS campaigns, then restart and relay acceptance. No prefix is a full pass.",
-    "Finalize source packages and release evidence before creating4.2.7tag/release for maintainer publication.",
-    "Dependent GroundStation push waits for public4.2.7 crate availability; manifest constraint remains4.",
-    "Native macOS final publication and physical RF/modem/GPU acceptance remain platform follow-up."
-  ],
+  "remaining": [],
   "historical_failures_preserved": [
     "Initial C ABI fixture collided with seeded full-test schema; isolated fixture corrected.",
     "Initial multiple-endpoint path exceeded existing allocation bound; runtime fast path corrected.",
@@ -226,7 +221,7 @@
       }
     ]
   },
-  "updated_utc": "2026-10-26T03:33:57.994414+00:00",
+  "updated_utc": "2026-10-26T04:24:14.851810+00:00",
   "prior_multicast_candidate_package_verification": {
     "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
     "no_publication": true,
@@ -500,5 +495,17 @@
     "status": "maintainer_reports_release_published_successfully",
     "publication_origin": "maintainer local Mac",
     "scope": "SDK publication completed; firmware artifact qualification continues separately."
+  },
+  "readiness_scope": "SDK software qualification and maintainer-reported4.2.7 publication complete; physical platform/RF acceptance remains separate.",
+  "dependent_firmware_final_acceptance": {
+    "status": "PASS",
+    "compiled_valve_source": "ae0514730102a0af1114cb0471b5ea4759626c7d",
+    "reports": [
+      "FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
+      "FirmwareSimulator/docs/qualification/valve-final8-operational-2026-10-25.json",
+      "FirmwareSimulator/docs/qualification/valve-final8-restart-2026-10-25.json",
+      "FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
+    ],
+    "scope": "Two/three-radio600s each58sourcewindows,59actualGPSobservations,60memorysamples and threeSDreconciliations; operational positive/negative/testfire70s, restart120s and relay60s passed."
   }
 }
