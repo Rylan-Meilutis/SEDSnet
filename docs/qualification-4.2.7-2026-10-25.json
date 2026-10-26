@@ -226,7 +226,7 @@
       }
     ]
   },
-  "updated_utc": "2026-10-25T22:30:35.401117+00:00",
+  "updated_utc": "2026-10-26T00:44:31.376184+00:00",
   "prior_multicast_candidate_package_verification": {
     "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
     "no_publication": true,
@@ -434,5 +434,51 @@
   },
   "i686_runtime_followup": "Actual32-bit Python3.12.15/glibc2.36 import, four publicAPI/callback tests and payload/64-bit timestamp roundtrip pass without skips. See FirmwareSimulator/docs/qualification/i686-python-wheel-runtime-2026-10-25.json; build-only snapshot retained separately.",
   "layout_fix_scope": "Compile-time assertions and test only: no TxQueued fields, accounting, routing, transport or other runtime function changed from2b. i686156B vslegacy144B (alignment4); native208B vslegacy200B (alignment8). Guard preserves complete metadata padding/budget rather than imposing+8 on everyABI.",
-  "source_push_scope": "Validated source to main/dev for CI; no new tag or package publication while final network/restart/relay acceptance remains pending."
+  "source_push_scope": "Validated SDK source main/dev; maintainer has published crates.io4.2.7 locally. No new tag or package upload from this host. Linked two-source battery freshness issue remains under ValveBoard configuration qualification; GitLab latest-source failure requires job-log diagnosis.",
+  "source_ci": {
+    "github": {
+      "commit": "b38b017c8e4c963682362d34fa1362c67607d4d1",
+      "status": "success",
+      "url": "https://github.com/Rylan-Meilutis/SEDSnet/actions/runs/40240018125",
+      "evidence": "FirmwareSimulator/docs/qualification/sdk-427-final-ci-source-packages-2026-10-25.json"
+    },
+    "gitlab": {
+      "status": "mirrored_latest_pipeline_failed",
+      "main": "b38b017c8e4c963682362d34fa1362c67607d4d1",
+      "tested_b38_commit_present": true,
+      "latest_source_pipeline_status": "failed",
+      "pipeline_url": "https://gitlab.rylanswebsite.com/rylan-meilutis/SEDSnet/-/pipelines/7684",
+      "jobs": [
+        {
+          "id": 29023,
+          "name": "rust-tests",
+          "status": "failed",
+          "failure_reason": "script_failure",
+          "web_url": "https://gitlab.rylanswebsite.com/rylan-meilutis/SEDSnet/-/jobs/29023"
+        },
+        {
+          "id": 29022,
+          "name": "secret_detection",
+          "status": "success",
+          "failure_reason": null,
+          "web_url": "https://gitlab.rylanswebsite.com/rylan-meilutis/SEDSnet/-/jobs/29022"
+        },
+        {
+          "id": 29021,
+          "name": "semgrep-sast",
+          "status": "success",
+          "failure_reason": null,
+          "web_url": "https://gitlab.rylanswebsite.com/rylan-meilutis/SEDSnet/-/jobs/29021"
+        }
+      ],
+      "access": "Public branch/pipeline/job metadata read succeeds. Failed job trace requires authentication (HTTP401); maintainer asked for final error. Automatic GitHub mirror sync confirmed; no direct GitLab write attempted.",
+      "evidence": ".workspace-progress/gitlab-b38-autosync-ci-20261025.json"
+    }
+  },
+  "external_publication_check": {
+    "checked_utc": "2026-10-26T00:44:31.376184+00:00",
+    "crates_io_4_2_7": "available",
+    "pypi_4_2_7": "HTTP404",
+    "publication_origin": "maintainer Mac; no package upload from qualification host"
+  }
 }
