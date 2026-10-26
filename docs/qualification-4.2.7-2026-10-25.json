@@ -443,7 +443,7 @@
       "evidence": "FirmwareSimulator/docs/qualification/sdk-427-final-ci-source-packages-2026-10-25.json"
     },
     "gitlab": {
-      "status": "mirrored_latest_pipeline_failed",
+      "status": "mirrored_runner_dns_failure_before_tests",
       "main": "b38b017c8e4c963682362d34fa1362c67607d4d1",
       "tested_b38_commit_present": true,
       "latest_source_pipeline_status": "failed",
@@ -471,8 +471,10 @@
           "web_url": "https://gitlab.rylanswebsite.com/rylan-meilutis/SEDSnet/-/jobs/29021"
         }
       ],
-      "access": "Public branch/pipeline/job metadata read succeeds. Failed job trace requires authentication (HTTP401); maintainer asked for final error. Automatic GitHub mirror sync confirmed; no direct GitLab write attempted.",
-      "evidence": ".workspace-progress/gitlab-b38-autosync-ci-20261025.json"
+      "access": "Normal public raw-log route accessible without credentials; maintainer log paste no longer needed.",
+      "evidence": "FirmwareSimulator/docs/qualification/gitlab-sdk-b38-setup-failure-2026-10-25.json",
+      "failure_cause": "Runner DNS resolution failed downloading Clippy from static.rust-lang.org during rustup setup.",
+      "public_log_url": "https://gitlab.rylanswebsite.com/rylan-meilutis/SEDSnet/-/jobs/29023/raw"
     }
   },
   "external_publication_check": {
