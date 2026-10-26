@@ -226,7 +226,7 @@
       }
     ]
   },
-  "updated_utc": "2026-10-26T00:44:31.376184+00:00",
+  "updated_utc": "2026-10-26T03:33:57.994414+00:00",
   "prior_multicast_candidate_package_verification": {
     "source_commit": "b6bdac457a8d06996ffc449b76e160d9ea208add",
     "no_publication": true,
@@ -493,5 +493,12 @@
     "local_rust_source_mismatches": [],
     "scope": "Read-only public archive source comparison; no package execution/publication.",
     "evidence": "FirmwareSimulator/docs/qualification/public-sdk-427-source-2026-10-25.json"
+  },
+  "maintainer_release_completion": {
+    "reported_utc": "2026-10-26T03:33:57.994414+00:00",
+    "version": "4.2.7",
+    "status": "maintainer_reports_release_published_successfully",
+    "publication_origin": "maintainer local Mac",
+    "scope": "SDK publication completed; firmware artifact qualification continues separately."
   }
 }
