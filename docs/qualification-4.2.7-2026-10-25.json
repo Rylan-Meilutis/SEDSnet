@@ -480,5 +480,16 @@
     "crates_io_4_2_7": "available",
     "pypi_4_2_7": "HTTP404",
     "publication_origin": "maintainer Mac; no package upload from qualification host"
+  },
+  "public_crate_source_verification": {
+    "checked_utc": "2026-10-26T00:53:30.026873+00:00",
+    "public_crate": "SEDSnet4.2.7",
+    "bytes": 1018774,
+    "sha256": "3803161191fd948007249c1b7315de7ead0c3b2a90c510221353e1a775b1b1f3",
+    "registry_checksum_matched": true,
+    "rust_source_files": 72,
+    "local_rust_source_mismatches": [],
+    "scope": "Read-only public archive source comparison; no package execution/publication.",
+    "evidence": "FirmwareSimulator/docs/qualification/public-sdk-427-source-2026-10-25.json"
   }
 }
