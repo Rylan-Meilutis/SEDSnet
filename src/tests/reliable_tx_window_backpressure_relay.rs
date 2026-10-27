@@ -63,7 +63,7 @@ fn relay_accepted_hop_queue_waits_for_ack_credit() {
                 )
                 .unwrap();
                 relay
-                    .send_reliable_to_side(side, RelayItem::Packet(Arc::new(packet)))
+                    .send_reliable_to_side(side, RouterItem::Packet(packet), true)
                     .unwrap();
             }
             let packet =
@@ -71,11 +71,11 @@ fn relay_accepted_hop_queue_waits_for_ack_credit() {
             let id = packet.packet_id();
             wanted.store(id, Ordering::Relaxed);
             let data = if packed {
-                RelayItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(
+                RouterItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(
                     &packet,
                 )))
             } else {
-                RelayItem::Packet(Arc::new(packet))
+                RouterItem::Packet(packet)
             };
             relay
                 .state
@@ -92,7 +92,7 @@ fn relay_accepted_hop_queue_waits_for_ack_credit() {
                 .process_tx_queue()
                 .expect("relay hop pressure must preserve accepted data");
             assert!(frames.lock().unwrap().is_empty());
-            assert_eq!(relay.state.lock().tx_queue.len(), 1);
+            assert_eq!(relay.state.lock().transmit_queue.len(), 1);
             relay
                 .rx_packed_from_side(side, &wire_format::pack_reliable_ack("sink", ty, 1000, 1))
                 .unwrap();

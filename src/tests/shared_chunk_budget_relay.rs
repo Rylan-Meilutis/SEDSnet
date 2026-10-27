@@ -261,10 +261,10 @@ fn shared_chunk_budget_oversized_metadata_cannot_evict_another_transfer() {
 fn packet_rows(node: &Relay) -> Vec<(String, DataType)> {
     node.state
         .lock()
-        .rx_queue
+        .received_queue
         .iter()
         .filter_map(|q| match &q.data {
-            RelayItem::Packet(p) => Some((p.sender().to_owned(), p.data_type())),
+            RouterItem::Packet(p) => Some((p.sender().to_owned(), p.data_type())),
             _ => None,
         })
         .collect::<Vec<_>>()

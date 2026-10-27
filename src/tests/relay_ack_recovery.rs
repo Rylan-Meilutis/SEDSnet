@@ -51,9 +51,9 @@ fn compact_ack_uses_frozen_owner_and_returns_after_cache_churn() {
                     Arc::<[u8]>::from(packet_id.to_le_bytes()),
                 )
                 .unwrap();
-                let mut targets = vec![Relay::sender_hash("VB")];
+                let mut targets = vec![Router::sender_hash("VB")];
                 if original {
-                    targets.push(Relay::sender_hash("GS"));
+                    targets.push(Router::sender_hash("GS"));
                 }
                 let raw = wire_format::pack_packet_with_wire_contract(&ack, None, None, &targets)
                     .unwrap();
@@ -130,7 +130,7 @@ fn reliable_data_retry_survives_return_route_cache_churn() {
             &packet,
             None,
             None,
-            &[Relay::sender_hash("GS")],
+            &[Router::sender_hash("GS")],
         )
         .unwrap();
         let deliver = || {

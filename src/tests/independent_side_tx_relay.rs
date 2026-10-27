@@ -50,12 +50,12 @@ fn blocked_transport_does_not_block_an_independent_side_but_serializes_itself() 
         crate::config::StandardSmallPayload::new(&[1]),
     )
     .unwrap();
-    let data = RelayItem::Packet(Arc::new(packet));
+    let data = RouterItem::Packet(packet);
     let data_a = data.clone();
     let rc = r.clone();
     let worker = std::thread::spawn(move || {
         let r = rc;
-        r.send_reliable_to_side(a, data_a)
+        r.send_reliable_to_side(a, data_a, true)
     });
     entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(r.side_tx_active());
@@ -63,8 +63,8 @@ fn blocked_transport_does_not_block_an_independent_side_but_serializes_itself() 
         r.remove_side(a).is_err(),
         "busy side must not be replaced mid-callback"
     );
-    let other = r.send_reliable_to_side(b, data.clone());
-    let same = r.send_reliable_to_side(a, data.clone());
+    let other = r.send_reliable_to_side(b, data.clone(), true);
+    let same = r.send_reliable_to_side(a, data.clone(), true);
     assert!(
         r.side_tx_active(),
         "finishing B must not clear the still-active A callback"
@@ -82,6 +82,6 @@ fn blocked_transport_does_not_block_an_independent_side_but_serializes_itself() 
         Ok(())
     });
     assert_eq!(reused, a);
-    r.send_reliable_to_side(reused, data).unwrap();
+    r.send_reliable_to_side(reused, data, true).unwrap();
     assert_eq!(hits.load(Ordering::Relaxed), 2);
 }

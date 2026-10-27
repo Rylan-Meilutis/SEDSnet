@@ -34,7 +34,8 @@ fn packed_forwarding_and_reliable_replay_follow_side_capabilities() {
     relay
         .send_reliable_to_side(
             side,
-            RelayItem::Packed(crate::shared_bytes::convert(packed.clone())),
+            RouterItem::Packed(crate::shared_bytes::convert(packed.clone())),
+            true,
         )
         .unwrap();
     assert_eq!(output.lock().unwrap().last().unwrap()[0] & 1, 0);
@@ -82,7 +83,7 @@ fn packed_forwarding_and_reliable_replay_follow_side_capabilities() {
         .tx_handler
         .clone();
     relay
-        .call_tx_handler(side, &handler, &RelayItem::Packed(retained.clone()))
+        .call_side_tx_handler(side, &handler, &RouterItem::Packed(retained.clone()), true)
         .unwrap();
     assert_ne!(output.lock().unwrap().last().unwrap()[0] & 1, 0);
     caps.flags &= !discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
@@ -94,7 +95,7 @@ fn packed_forwarding_and_reliable_replay_follow_side_capabilities() {
         .unwrap();
     relay.process_rx_queue().unwrap();
     relay
-        .call_tx_handler(side, &handler, &RelayItem::Packed(retained.clone()))
+        .call_side_tx_handler(side, &handler, &RouterItem::Packed(retained.clone()), true)
         .unwrap();
     assert_eq!(output.lock().unwrap().last().unwrap()[0] & 1, 0);
     let frames = output.lock().unwrap();
@@ -135,7 +136,7 @@ fn optional_codec_ledger_is_reclaimed_before_relay_route_admission() {
         )
         .unwrap();
         relay
-            .learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+            .learn_discovery_item(side, &RouterItem::Packet(packet))
             .unwrap();
     }
     let mut state = relay.state.lock();
@@ -145,8 +146,8 @@ fn optional_codec_ledger_is_reclaimed_before_relay_route_admission() {
     updated
         .announcers
         .insert("NEW_RELAY_REQUIRED_PEER".into(), template);
-    let growth = RelayInner::discovery_route_byte_cost(&updated)
-        - RelayInner::discovery_route_byte_cost(&before);
+    let growth = RouterInner::discovery_route_byte_cost(side, &updated)
+        - RouterInner::discovery_route_byte_cost(side, &before);
     let cached = state.side_transport[&side].payload_codec.heap_bytes();
     assert!(cached > growth);
     let used = state.shared_queue_bytes_used();

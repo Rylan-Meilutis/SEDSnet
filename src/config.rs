@@ -14,6 +14,7 @@ use crate::{
 };
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+#[cfg(any(feature = "std", feature = "discovery"))]
 use alloc::sync::Arc;
 use alloc::{
     string::{String, ToString},
@@ -2958,7 +2959,7 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
     OwnedRuntimeSchemaSnapshot { endpoints, types }
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "discovery"))]
 pub(crate) fn encode_embedded_schema_payload() -> TelemetryResult<Arc<[u8]>> {
     struct SchemaWriter<'a> {
         bytes: Option<&'a mut [core::mem::MaybeUninit<u8>]>,
@@ -3605,6 +3606,7 @@ struct JsonType {
     e2e_encryption: Option<String>,
 }
 
+#[cfg(feature = "serde")]
 fn parse_e2e_encryption_policy(raw: Option<&str>) -> TelemetryResult<E2eEncryptionPolicy> {
     match raw.unwrap_or("PreferOff") {
         "PreferOff" | "prefer_off" | "off" | "false" => Ok(E2eEncryptionPolicy::PreferOff),
