@@ -807,13 +807,17 @@ const MAX_PRIORITY_BURST: u8 = 8;
 // tuple has different padding on i686 (u64 alignment 4) and ARM/64-bit targets
 // (alignment 8), so its growth is not universally eight bytes.
 const _: () = {
-    assert!(size_of::<TxQueued>()
-        == size_of::<(RouterTxItem, bool, u8, QueuedDelivery, u32, u64, u64)>());
-    let metadata_bytes = 2 * size_of::<u64>() + size_of::<u32>()
-        + size_of::<QueuedDelivery>() + 2 * size_of::<bool>() + size_of::<u8>();
+    assert!(
+        size_of::<TxQueued>()
+            == size_of::<(RouterTxItem, bool, u8, QueuedDelivery, u32, u64, u64)>()
+    );
+    let metadata_bytes = 2 * size_of::<u64>()
+        + size_of::<u32>()
+        + size_of::<QueuedDelivery>()
+        + 2 * size_of::<bool>()
+        + size_of::<u8>();
     let alignment = core::mem::align_of::<TxQueued>();
-    let expected = (size_of::<RouterTxItem>() + metadata_bytes)
-        .div_ceil(alignment) * alignment;
+    let expected = (size_of::<RouterTxItem>() + metadata_bytes).div_ceil(alignment) * alignment;
     assert!(size_of::<TxQueued>() == expected);
 };
 
@@ -7836,18 +7840,19 @@ impl Router {
             let count = self.state.lock().sides.len();
             let mut first_error = None;
             for side in 0..count {
-                if self.state.lock().sides[side].is_some() {
-                    if let Err(error) = self.emit_discovery_snapshot_on_side(
-                        called_from_queue,
-                        include_schema,
-                        include_topology,
-                        skip_in_flight_sides,
-                        Some(side),
-                    ) {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
+                // Release the state lock before recursively emitting on a side.
+                if self.state.lock().sides[side].is_none() {
+                    continue;
+                }
+                if let Err(error) = self.emit_discovery_snapshot_on_side(
+                    called_from_queue,
+                    include_schema,
+                    include_topology,
+                    skip_in_flight_sides,
+                    Some(side),
+                ) && first_error.is_none()
+                {
+                    first_error = Some(error);
                 }
             }
             return first_error.map_or(Ok(()), Err);
@@ -9637,10 +9642,7 @@ impl Router {
             {
                 // Transient partial IO retains this exact owner in the outer
                 // queue path. It is not a new request for another catalog.
-                if !result
-                    .as_ref()
-                    .is_err_and(|error| Self::is_transient_tx_error(error))
-                {
+                if !result.as_ref().is_err_and(Self::is_transient_tx_error) {
                     throttle.schema_response_active = false;
                     throttle.schema_response_phase = SchemaResponsePhase::Idle;
                     throttle.schema_response_pending |= result.is_err();

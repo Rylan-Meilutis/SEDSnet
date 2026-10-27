@@ -136,7 +136,8 @@ fn unrelated_typed_queue_does_not_block_and_packed_unknown_fails_closed() {
         .push_transmit(TxQueued {
             disposable: false,
             item: RouterTxItem::ToSide {
-                src: None, dst: 0,
+                src: None,
+                dst: 0,
                 data: RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(
                     [0xffu8; 64],
                 ))),

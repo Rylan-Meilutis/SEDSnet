@@ -64,8 +64,10 @@ pub struct BoundedDeque<T> {
 }
 
 // Hint bytes occupy the old queue padding on hosted and ARM targets.
-const _: () = assert!(core::mem::size_of::<BoundedDeque<u8>>() ==
-    core::mem::size_of::<(VecDeque<u8>, usize, usize, usize, usize, usize, bool, u8)>());
+const _: () = assert!(
+    core::mem::size_of::<BoundedDeque<u8>>()
+        == core::mem::size_of::<(VecDeque<u8>, usize, usize, usize, usize, usize, bool, u8)>()
+);
 
 #[cfg(feature = "compact-packet-store")]
 impl<T: Clone> Clone for BoundedDeque<T> {
@@ -319,17 +321,27 @@ impl<T: ByteCost> BoundedDeque<T> {
 
     /// Preserve priority fairness while leaving deferred work in owned storage.
     pub(crate) fn pop_front_fair_if<F, G>(
-        &mut self, priority_burst: &mut u8, max_priority_burst: u8,
-        priority_of: F, mut eligible: G,
+        &mut self,
+        priority_burst: &mut u8,
+        max_priority_burst: u8,
+        priority_of: F,
+        mut eligible: G,
     ) -> Option<T>
-    where F: FnMut(&T) -> u8, G: FnMut(&T) -> bool,
+    where
+        F: FnMut(&T) -> u8,
+        G: FnMut(&T) -> bool,
     {
-        self.pop_front_fair_with_context(priority_burst, max_priority_burst,
-            priority_of, |_, item| eligible(item))
+        self.pop_front_fair_with_context(
+            priority_burst,
+            max_priority_burst,
+            priority_of,
+            |_, item| eligible(item),
+        )
     }
 
     pub(crate) fn update_metadata<F>(&mut self, index: usize, update: F)
-    where F: FnOnce(&mut T),
+    where
+        F: FnOnce(&mut T),
     {
         if let Some(item) = self.q.get_mut(index) {
             #[cfg(debug_assertions)]
@@ -351,8 +363,12 @@ impl<T: ByteCost> BoundedDeque<T> {
         F: FnMut(&T) -> u8,
         G: FnMut(&VecDeque<T>, &T) -> bool,
     {
-        let selected = self.select_front_fair_with_context(priority_burst,
-            max_priority_burst, priority_of, eligible)?;
+        let selected = self.select_front_fair_with_context(
+            priority_burst,
+            max_priority_burst,
+            priority_of,
+            eligible,
+        )?;
         self.remove_pos(selected)
     }
 
@@ -372,15 +388,14 @@ impl<T: ByteCost> BoundedDeque<T> {
         {
             // A newly queued receipt/replay retains its existing control band,
             // but cannot postpone the owed lower band beyond the same bound.
-            if *priority_burst < max_priority_burst {
-                if let Some(index) = self
+            if *priority_burst < max_priority_burst
+                && let Some(index) = self
                     .q
                     .iter()
                     .position(|item| priority_of(item) == u8::MAX && eligible(&self.q, item))
-                {
-                    *priority_burst = priority_burst.saturating_add(1);
-                    return Some((index, false));
-                }
+            {
+                *priority_burst = priority_burst.saturating_add(1);
+                return Some((index, false));
             }
             if let Some(index) = self.q.iter().position(|item| {
                 priority_of(item) == self.fair_owed_priority && eligible(&self.q, item)
@@ -458,10 +473,15 @@ impl<T: ByteCost> BoundedDeque<T> {
     /// Select a service slot without copying/removing its owned payload.
     /// Fairness cursor/burst updates match a normal pop; caller decides ownership.
     pub(crate) fn select_front_fair_with_context<F, G>(
-        &mut self, priority_burst: &mut u8, max_priority_burst: u8,
-        mut priority_of: F, mut eligible: G,
+        &mut self,
+        priority_burst: &mut u8,
+        max_priority_burst: u8,
+        mut priority_of: F,
+        mut eligible: G,
     ) -> Option<usize>
-    where F: FnMut(&T) -> u8, G: FnMut(&VecDeque<T>, &T) -> bool,
+    where
+        F: FnMut(&T) -> u8,
+        G: FnMut(&VecDeque<T>, &T) -> bool,
     {
         let selected = {
             let mut first_ready = None;
@@ -476,10 +496,17 @@ impl<T: ByteCost> BoundedDeque<T> {
             let mut lower_priority = front_priority;
             let mut best_distance = u8::MAX;
             for (index, item) in self.q.iter().enumerate().skip(front + 1) {
-                if !eligible(&self.q, item) { continue; }
+                if !eligible(&self.q, item) {
+                    continue;
+                }
                 let priority = priority_of(item);
-                if priority >= front_priority { continue; }
-                let distance = self.fair_priority_cursor.wrapping_sub(priority).wrapping_sub(1);
+                if priority >= front_priority {
+                    continue;
+                }
+                let distance = self
+                    .fair_priority_cursor
+                    .wrapping_sub(priority)
+                    .wrapping_sub(1);
                 if lower == front || distance < best_distance {
                     lower = index;
                     lower_priority = priority;
@@ -503,12 +530,23 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     #[inline]
-    pub(crate) fn update_admitted<F>(&mut self, index: usize, new_cost: usize, update: F) -> TelemetryResult<()>
-    where F: FnOnce(&mut T),
+    pub(crate) fn update_admitted<F>(
+        &mut self,
+        index: usize,
+        new_cost: usize,
+        update: F,
+    ) -> TelemetryResult<()>
+    where
+        F: FnOnce(&mut T),
     {
         let old_cost = self.q.get(index).ok_or(TelemetryError::BadArg)?.byte_cost();
-        let used = self.cur_bytes.saturating_sub(old_cost).saturating_add(new_cost);
-        if used > self.max_bytes { return Err(TelemetryError::Io("queue full")); }
+        let used = self
+            .cur_bytes
+            .saturating_sub(old_cost)
+            .saturating_add(new_cost);
+        if used > self.max_bytes {
+            return Err(TelemetryError::Io("queue full"));
+        }
         let item = self.q.get_mut(index).expect("admitted queue entry");
         update(item);
         debug_assert_eq!(item.byte_cost(), new_cost);

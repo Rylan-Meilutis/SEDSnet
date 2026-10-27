@@ -1056,7 +1056,7 @@ fn owed_radio_progress_survives_continuously_ready_reentrant_metadata() {
     let weak = Arc::downgrade(&node);
     let radio = node.add_side_packed("periodic", move |_| {
         let at = time.load(Ordering::Relaxed);
-        if at != 0 && at % 40 == 0 {
+        if at != 0 && at.is_multiple_of(40) {
             effect.store(at, Ordering::Relaxed);
             time.fetch_add(1, Ordering::Relaxed);
             Ok(())

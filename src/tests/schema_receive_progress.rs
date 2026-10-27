@@ -191,10 +191,11 @@ fn unrelated_peer_or_transfer_cannot_defer_schema_recovery() {
             )
             .unwrap();
             let canonical = wire_format::pack_packet(&packet);
-            let first = SideTransportFrames::split(crate::shared_bytes::convert(canonical), 192, b"RF")
-                .unwrap()
-                .next()
-                .unwrap();
+            let first =
+                SideTransportFrames::split(crate::shared_bytes::convert(canonical), 192, b"RF")
+                    .unwrap()
+                    .next()
+                    .unwrap();
             router.decode_side_transport_frame(side, &first).unwrap();
         }
         clock.store(1500, Ordering::Relaxed);
