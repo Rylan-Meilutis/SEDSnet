@@ -39,6 +39,16 @@ class BuildCliTests(unittest.TestCase):
         self.assertTrue(all('--require-bindings' in c for c in python))
         self.assertNotIn('--bindings-only', python[0])
         self.assertIn('--bindings-only', python[1])
+        cross = [call for call in run.call_args_list
+                 if call.args[0][:2] == ['cargo', 'check']]
+        self.assertEqual(len(cross), 2)
+        for call, profile in zip(cross, profiles):
+            command = call.args[0]
+            self.assertEqual(command[command.index('--target') + 1], 'i686-unknown-linux-gnu')
+            self.assertEqual(set(command[command.index('--features') + 1].split(',')), profile | {'python'})
+            self.assertEqual(call.kwargs['env']['PYO3_CROSS_PYTHON_VERSION'], '3.9')
+            self.assertEqual(call.kwargs['env']['PYO3_CROSS'], '1')
+            self.assertEqual(call.kwargs['env']['PYO3_NO_PYTHON'], '1')
 
     def test_matrix_selects_storage_profiles_and_keeps_common_features(self):
         profiles = build.qualification_profiles(['compact-packet-store', 'fair-admission', 'ingress-target-filter'])

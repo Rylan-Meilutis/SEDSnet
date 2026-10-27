@@ -6,6 +6,9 @@
 
 Candidate under qualification; no release or package publication yet.
 
+- Pack dispatch completion flags into one byte so the existing stack-size
+  assertion holds on i686 Python wheel builds as well as 64-bit hosts and ARM.
+  Full qualification now checks i686 Python compilation in both profiles.
 - Retain completed proxy delivery in the bounded return-route cache. Delayed
   publisher retries replay the aggregate receipt instead of reopening an ordered
   child cohort, and late child receipts remain consumed by the proxy. Completion

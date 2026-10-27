@@ -786,11 +786,28 @@ struct DispatchContext {
     priority: u8,
     claim: Option<TxClaim>,
     since: Option<u64>,
-    terminal: bool,
-    owner_transferred: bool,
+    completion_flags: u8,
     refused: bool,
     admitted: bool,
 }
+impl DispatchContext {
+    const TERMINAL: u8 = 1;
+    const OWNER_TRANSFERRED: u8 = 2;
+
+    fn is_terminal(&self) -> bool {
+        self.completion_flags & Self::TERMINAL != 0
+    }
+    fn owner_transferred(&self) -> bool {
+        self.completion_flags & Self::OWNER_TRANSFERRED != 0
+    }
+    fn mark_terminal(&mut self) {
+        self.completion_flags |= Self::TERMINAL;
+    }
+    fn mark_owner_transferred(&mut self) {
+        self.completion_flags |= Self::OWNER_TRANSFERRED;
+    }
+}
+// Pack completion flags so priority fits existing padding on i686 too.
 // The dispatch-only priority uses existing stack padding; retained queue,
 // reliable maps and packet ownership metadata do not grow.
 const _: () = assert!(
@@ -15340,8 +15357,7 @@ impl Router {
             priority: queued.priority,
             claim: work.claim,
             since,
-            terminal: false,
-            owner_transferred: false,
+            completion_flags: 0,
             refused: false,
             admitted: false,
         };
@@ -15354,7 +15370,7 @@ impl Router {
             self.tx_item_impl_with_retry(queued.item, queued.ignore_local, true, &mut context);
         if let Some(claim) = work.claim {
             let mut st = self.state.lock();
-            if result.is_err() && !context.terminal && !context.owner_transferred {
+            if result.is_err() && !context.is_terminal() && !context.owner_transferred() {
                 let Some(index) = st.claim_index(claim.token) else {
                     drop(st);
                     self.finish_dispatch_turn(owed_turn, &context);
@@ -15376,7 +15392,7 @@ impl Router {
                 st = self.state.lock();
             }
             if let Some(index) = st.claim_index(claim.token) {
-                if context.terminal && claim.ordered {
+                if context.is_terminal() && claim.ordered {
                     let ty = st
                         .transmit_queue
                         .get(index)
@@ -15452,7 +15468,7 @@ impl Router {
         };
         let now = self.clock.now_ms();
         let Some(retry_after_ms) = now.checked_add(1) else {
-            context.terminal = true;
+            context.mark_terminal();
             return Err(TelemetryError::HandlerError(
                 "accepted reliable clock exhausted",
             ));
@@ -17035,7 +17051,7 @@ impl Router {
                         claim.is_some_and(|claim| claim.ordered),
                     )
                 {
-                    context.terminal = true;
+                    context.mark_terminal();
                     return Err(error);
                 }
                 if !called_from_queue
@@ -17070,7 +17086,7 @@ impl Router {
                     {
                         // Never repeat a partially applied local side effect.
                         if claim.is_some() {
-                            context.terminal = true;
+                            context.mark_terminal();
                             return Err(TelemetryError::HandlerError(
                                 "accepted local delivery failed",
                             ));
@@ -17083,7 +17099,7 @@ impl Router {
                     {
                         // Never repeat a partially applied local side effect.
                         if claim.is_some() {
-                            context.terminal = true;
+                            context.mark_terminal();
                             return Err(TelemetryError::HandlerError(
                                 "accepted local delivery failed",
                             ));
@@ -17171,7 +17187,7 @@ impl Router {
                             data = self.attach_wire_contract_to_item(data, &targets)?;
                             match self.register_end_to_end_reliable_tx(&data, Some(pending)) {
                                 Ok(ready) => {
-                                    context.owner_transferred = true;
+                                    context.mark_owner_transferred();
                                     if !ready {
                                         return Ok(());
                                     }

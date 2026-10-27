@@ -1018,7 +1018,7 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
                 "(set SEDSNET_INSTALL_C_TOOLCHAIN_CMD to override)."
             )
             can_check_embedded = try_install_embedded_c_toolchain(embedded_target, env)
-        total_steps = (10 if can_check_embedded else 9) - (0 if _shared_test_steps else 2)
+        total_steps = (10 if can_check_embedded else 9) - (0 if _shared_test_steps else 2) + int(test_full)
 
         run_clippy_checks(
             env=env,
@@ -1109,6 +1109,23 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
                     title=f"{next_step}/{total_steps} python unittest")
         _success("Python unittest checks finished against the newly built host extension.")
         next_step += 1
+
+        if test_full:
+            # Rust field layout differs between 32-bit x86 and ARM. Check the
+            # Python release target even when the host extension is 64-bit;
+            # cargo check needs no cross linker or target Python interpreter.
+            python_target = "i686-unknown-linux-gnu"
+            ensure_rust_target_installed(python_target)
+            python_cross_env = dict(env)
+            python_cross_env.update(PYO3_CROSS="1", PYO3_CROSS_PYTHON_VERSION="3.9", PYO3_NO_PYTHON="1")
+            run_cmd(
+                ["cargo", "check", *build_mode, "--target", python_target,
+                 "--features", f"python{feature_suffix}"],
+                env=python_cross_env, repo_root=repo_root,
+                title=f"{next_step}/{total_steps} i686 Python release compile check",
+                release_build=release_build,
+            )
+            next_step += 1
 
         if can_check_embedded:
             ensure_rust_target_installed(embedded_target)
