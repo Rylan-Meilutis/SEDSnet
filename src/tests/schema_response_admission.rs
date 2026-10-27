@@ -1180,14 +1180,21 @@ fn lost_partial_schema_owner_can_recover_after_clear_eviction_or_readmission_fai
         {
             let st = node.state.lock();
             let state = &st.discovery_side_throttle[&side];
-            assert!(
-                !state.schema_response_active,
-                "lost owner must not latch active forever: {loss}"
-            );
-            assert!(
-                state.schema_response_pending,
-                "genuine lost admission retains a pending response: {loss}"
-            );
+            if loss == "clear" {
+                assert!(!state.schema_response_active);
+                assert!(
+                    state.schema_response_pending,
+                    "explicit clear requests a fresh prefix"
+                );
+            } else {
+                assert!(state.schema_response_active);
+                assert_eq!(
+                    state.schema_response_phase,
+                    SchemaResponsePhase::CatalogWaiting,
+                    "quota/policy retirement preserves the already admitted prefix: {loss}"
+                );
+                assert_eq!(state.schema_response_packet_id, 0);
+            }
         }
         if loss == "policy" {
             node.set_typed_route(None, DataType::DiscoverySchema, side, true)
