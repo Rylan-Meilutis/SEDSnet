@@ -1,7 +1,7 @@
 # Migrating to 4.3
 
-Version 4.3.0 and macros 2.2.0 are candidates under qualification. The complete
-test matrix and application simulator qualification must pass before release.
+Use SEDSnet 4.3.0 with macros 2.2.0. Package uploads are a separate
+maintainer action from the GitHub source release.
 
 ## Application IDs belong to the application schema
 
@@ -27,6 +27,11 @@ application name unless an `id` is supplied:
 | Endpoint | SD_CARD | 100 |
 | Endpoint | RADIO | 101 |
 | Endpoint | SOFTWARE_BUS | 102 |
+
+A coordinated upgrade using name-derived IDs needs no manual schema-ID migration.
+Register or generate the application definitions before publishing their typed
+data; runtime discovery can distribute those definitions to peers. Constructors
+do not translate packets or persisted numeric IDs from older versions.
 
 To retain an existing network's wire identities, add `"id": 100` to its GPS_DATA
 type definition and SD_CARD endpoint definition, and likewise configure each

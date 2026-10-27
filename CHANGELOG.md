@@ -4,7 +4,7 @@
 
 ## 4.3.0
 
-Candidate under qualification; no 4.3.0 release or package upload yet.
+Source release; crates.io and PyPI publication remain separate maintainer actions.
 
 - Reserve schema identities only for network protocol messages and endpoints.
   Application names such as GPS_DATA, IMU_DATA, HEARTBEAT, SD_CARD and RADIO now
@@ -42,8 +42,7 @@ subsequent source changes are being qualified for 4.3.0.
 ## 4.2.6
 
 The maintainer published the 4.2.6 crate on 2026-10-25. Its immutable version is
-preserved; macOS package completion and physical hardware acceptance are separate. See
-[qualification scope and results](docs/qualification-4.2.6-2026-10-25.json).
+preserved; macOS package completion and physical hardware acceptance are separate.
 
 - Retain accepted ordered and unordered reliable destinations, receipt identities
   and replay ownership through route withdrawal and rediscovery. A topology change
