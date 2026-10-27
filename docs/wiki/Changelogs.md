@@ -4,7 +4,7 @@
 
 ## Version 4.3.1 highlights
 
-Candidate under qualification; no release or package publication yet.
+Wire format and application identities remain compatible with 4.3.0.
 
 - Keep receipt-reserved transport capacity usable during general backpressure.
   Retry refused lower-band service without blocking reserved receipt capacity.

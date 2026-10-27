@@ -4,7 +4,7 @@
 
 ## 4.3.1
 
-Candidate under qualification; no release or package publication yet.
+Wire format and application identities remain compatible with 4.3.0.
 
 - Accept Linux keyring chains by selecting the first supported OS credential
   store in configured order. Login and later package publication no longer need

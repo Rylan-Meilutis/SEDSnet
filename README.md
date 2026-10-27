@@ -198,7 +198,7 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ### Version 4.3.1 highlights
 
-Candidate under qualification; no release or package publication yet.
+Wire format and application identities remain compatible with 4.3.0.
 
 - Allow receipt traffic to use reserved transport capacity while general traffic
   is backpressured. Retain bounded service opportunities for lower bands and
