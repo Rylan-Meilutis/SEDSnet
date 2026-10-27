@@ -320,6 +320,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     /// Preserve priority fairness while leaving deferred work in owned storage.
+    #[cfg(test)]
     pub(crate) fn pop_front_fair_if<F, G>(
         &mut self,
         priority_burst: &mut u8,
@@ -352,6 +353,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn pop_front_fair_with_context<F, G>(
         &mut self,
         priority_burst: &mut u8,
@@ -530,6 +532,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     #[inline]
+    #[cfg(feature = "discovery")]
     pub(crate) fn update_admitted<F>(
         &mut self,
         index: usize,

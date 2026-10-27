@@ -1,0 +1,141 @@
+{
+  "status": "focused_source_qualification_pass_full_matrix_and_all7_pending",
+  "version": "4.3.0 / macros 2.2.0 candidate; no publication authorized by this artifact",
+  "architecture": {
+    "engine": "Relay contains one Router. No RelayInner, separate transport/discovery/reliability/queues remain.",
+    "config": "One RouterConfig implementation and shared SideOptions. RelayConfig is a compatibility adapter into immutable forwarding-only role. No public role switch.",
+    "optional_services": "Forwarding role allocates no local application config, managed-variable/P2P service state, ISR ingress service, or local timesync runtime. Transit protocol discovery/clock allowance/ACK/replay still use shared engine.",
+    "receipt_cache": "Lazy forwarded receipt cache uses pre-existing reliable entry/sender count limits. Like the old Relay cache, its map allocation is allocator-visible and count-bounded, not included in max_queue_budget; queue/replay payloads remain charged once.",
+    "legacy_protocol_namespace": "E2EACK sender namespace remains protocol compatibility, not an application-name routing heuristic. No literal RELAY destination exclusion."
+  },
+  "compatibility": {
+    "public_apis": "Legacy Rust Relay constructors/methods/2-variant TX enum/config aliases remain; C/Python adapters use canonical shared config.",
+    "queued_ingress": "Relay RX remains enqueue-only and drain does not initiate periodic discovery.",
+    "callback": "Busy/refusal ownership, hard errors, same-side serialization, independent-side progress and reentrant RX deferral are covered by retained regressions.",
+    "sender": "Relay rename changes protocol sender without originating application address-change notification.",
+    "stats": "One retained queue projects original TX and ReliableReplay markers into legacy separate stats, with no double budget charge. Public runtime and memory-JSON regression included.",
+    "wire": "Five public old/new constructor profiles, ten canonical packet identities each direction. Actual frozen old c324 receiver consumes new frames byte-identically after full CRC decode. Default, explicit header=false + chunks110, template, small_packet110, header=false frame400 FULL/COMPACT.",
+    "wire_tradeoff": "Side-local template/transfer IDs differ; hashed template IDs can add four wire bytes versus old incremental IDs. No canonical payload/ID/source/timestamp changes. Throughput still requires all7 qualification.",
+    "synthetic_fixture_correction": "Private synthetic FULL/chunk fixtures now explicitly declare templates they construct. Public old constructor implicit-template behavior is separately preserved by thin options normalization. No loss/identity assertion removed."
+  },
+  "tests": {
+    "default": {
+      "passed": 628,
+      "existing_ignored": 3
+    },
+    "compact": {
+      "passed": 635,
+      "existing_ignored": 3
+    },
+    "no_compression": {
+      "passed": 613,
+      "existing_ignored": 2
+    },
+    "public_side_config": 2,
+    "public_wire_and_stats": 1,
+    "clippy": "default all-targets -D warnings PASS",
+    "arm128": "embedded + compact-packet-store, MAX_STACK_PAYLOAD=128, thumbv7em-none-eabihf strict Clippy PASS",
+    "minimal": "no-default-features rlib panic=abort PASS zero warnings; unused helpers genuinely feature-gated, no blanket allowance",
+    "earlier_failures": "First through fourth shared-engine parity failures and overstrict new wire equality test logs are preserved; final assertions cover actual shared owners and both full decoders."
+  },
+  "memory": {
+    "compiler_layout": {
+      "scope": "Compiler object layout, not linked all-seven or peak allocator qualification. Heap boxes and lazy receipt caches must also be charged; descriptor sizes can change fixed-byte queue capacities.",
+      "results": {
+        "baseline": {
+          "base_commit": "266778e5e6d27aa339bfa2bb2abbd4d8a305c204",
+          "source_sha256": {},
+          "profiles": {
+            "host": {
+              "Router": 1744,
+              "RouterInner": 1096,
+              "TxQueued": 208,
+              "RouterRxItem": 184,
+              "IsrRxQueue": 88,
+              "RouterConfig": 152,
+              "TimeSyncRuntime": 320,
+              "crate::relay::Relay": 928,
+              "LegacyRelayTxItem": 56,
+              "LegacyRelayRxItem": 32,
+              "LegacyRelayReplayItem": 48
+            },
+            "arm_compact_payload128": {
+              "Router": 1024,
+              "RouterInner": 600,
+              "TxQueued": 224,
+              "RouterRxItem": 200,
+              "IsrRxQueue": 44,
+              "RouterConfig": 112,
+              "TimeSyncRuntime": 248,
+              "crate::relay::Relay": 488,
+              "LegacyRelayTxItem": 56,
+              "LegacyRelayRxItem": 40,
+              "LegacyRelayReplayItem": 56
+            }
+          }
+        },
+        "candidate": {
+          "base_commit": "62512ecaa0c5e6335c64724b1b33fa70a62f9c27",
+          "source_sha256": {
+            "src/config.rs": "6498cd9092dec8c47d8702f1e2a4ebe64a5835c45ea076f2cf466bd5d4eb6dc9",
+            "src/queue.rs": "f0c4696fcbdade68ba4160c9e050f01de5c4d8889de7d7fe86daeb9a38327384",
+            "src/router.rs": "46f3f5d95e0b92e55c9b56d9faabe3ef7d13364eeb9a77f385477d493283c8df",
+            "src/relay.rs": "407536558ac2fe4533218f2a1df01146ae72e27dd97b4c30fa8411b645ba1803"
+          },
+          "profiles": {
+            "host": {
+              "Router": 1032,
+              "RouterInner": 936,
+              "TxQueued": 208,
+              "RouterRxItem": 184,
+              "IsrRxQueue": 88,
+              "RouterConfig": 152,
+              "TimeSyncRuntime": 320,
+              "crate::relay::Relay": 1032,
+              "LocalServicesState": 176,
+              "ActiveRoutingConfig": 16,
+              "ForwardedReceiptCache": 56
+            },
+            "arm_compact_payload128": {
+              "Router": 560,
+              "RouterInner": 520,
+              "TxQueued": 224,
+              "RouterRxItem": 200,
+              "IsrRxQueue": 44,
+              "RouterConfig": 112,
+              "TimeSyncRuntime": 248,
+              "crate::relay::Relay": 560,
+              "LocalServicesState": 88,
+              "ActiveRoutingConfig": 8,
+              "ForwardedReceiptCache": 28
+            }
+          }
+        }
+      }
+    },
+    "arm128_summary": "Router raw object1024\u2192560, separately allocated participating config112 +local88 +timesync248 +ISR44 =1052 (+28 before allocator headers). Relay488\u2192560 but allocates none of those four boxes. Lazy forwarded receipt cache28 plus count-bounded map entries are allocator-visible, not included in max_queue_budget (same old Relay accounting scope).",
+    "host_summary": "Router1744\u21921032 plus participating config152/local176/clock320/ISR88 =1768 (+24 before allocator headers).",
+    "descriptor_tradeoff": "ARM128 common TxQueued224/Rx200 versus old RelayTx56/Rx40/Replay56. Existing byte budgets stay bounded, but identical fixed-byte Relay queues can retain fewer descriptors. No unchanged-capacity or peak-memory claim.",
+    "mandatory_followup": "All seven linked static/allocator highwater and throughput/latency campaigns, TLSF+compact ON, including gateway DAQ; no pool/rate/gate inflation."
+  },
+  "source_sha256": {
+    "src/router.rs": "46f3f5d95e0b92e55c9b56d9faabe3ef7d13364eeb9a77f385477d493283c8df",
+    "src/relay.rs": "407536558ac2fe4533218f2a1df01146ae72e27dd97b4c30fa8411b645ba1803",
+    "src/config.rs": "6498cd9092dec8c47d8702f1e2a4ebe64a5835c45ea076f2cf466bd5d4eb6dc9",
+    "src/queue.rs": "f0c4696fcbdade68ba4160c9e050f01de5c4d8889de7d7fe86daeb9a38327384",
+    "src/routing_config.rs": "e993c7fd06532cfe3dc0e22d36ea9efea13af398444e1954c5eea49a375c783e",
+    "src/tests/relay_legacy_contracts.rs": "b08a7de8b11e184434e736a79a47eb194a5a4829974995be0267529f1200b1a1",
+    "tests/relay_wire_compatibility.rs": "3bdd9537c61dd790faed666346fe5f81ffd36a15522aa6f445cff61d062164c4",
+    "tests/fixtures/relay-wire-c324.json": "bfe16722eb4ae2cb937e302dc1f38e2d3cb526d050340f284cacd80e6a6d171a"
+  },
+  "evidence": {
+    "checks": "FirmwareSimulator/build/shared-routing-core-20261027/final-source-checks",
+    "public_interop": "FirmwareSimulator/build/shared-routing-core-20261027/public-relay-wire-interop/qualification.json",
+    "layout": "FirmwareSimulator/build/shared-routing-core-20261027/final-shared-core-layout/layout-comparison.json"
+  },
+  "limits": [
+    "Full build.py test --all --full not run on final combined source yet.",
+    "No final all7 factory/link/simulation qualification on this core yet.",
+    "No hardware changes, pushes, tags, releases or package uploads."
+  ]
+}

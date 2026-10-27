@@ -2,9 +2,23 @@
 
 ## Unreleased
 
+## Version 4.3.0 highlights
+
+Candidate under qualification; package publication is pending.
+
+- Reserve only network protocol IDs and use canonical `SEDSNET_` protocol names.
+  Application identities use ordinary hashes or explicit configuration IDs.
+- Share Router/Relay routing and side configuration, with role capabilities
+  restricting relay application origination and local services.
+- Validate identities across runtime schemas, embedded generation, macros and
+  Python tooling, retaining idempotent wire definitions and atomic conflict refusal.
+
+See [the migration guide](../migration-4.3.md) before upgrading existing nodes.
+
 ## Version 4.2.7 highlights
 
-Qualification is in progress; this patch has not been published.
+Version 4.2.7 is published on crates.io and PyPI. Published artifacts remain
+unchanged; newer source changes are being qualified for 4.3.0.
 
 - Route best-effort packets to every distinct destination endpoint role across
   independent sides. GPS addressed to Flight Computer, SD logging and GroundStation

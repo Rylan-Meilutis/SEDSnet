@@ -71,7 +71,7 @@ fn relay_backpressure_retains_the_original_queue_priority() {
             .push_tx(RelayTxItem {
                 src: None,
                 dst: side,
-                data: RelayItem::Packet(Arc::new(packet)),
+                data: RouterItem::Packet(packet),
                 priority: 254,
                 retry_after_ms: 0,
             })
@@ -81,8 +81,8 @@ fn relay_backpressure_retains_the_original_queue_priority() {
         } else {
             relay.process_tx_queue_with_timeout(1).unwrap();
         }
-        let (priority, retry_after_ms) = relay.state.lock().tx_queue.iter()
-            .find(|queued| matches!(&queued.data, RelayItem::Packet(packet) if packet.data_type() == ty))
+        let (priority, retry_after_ms) = relay.state.lock().transmit_queue.iter()
+            .find(|queued| matches!(queued_data(queued), RouterItem::Packet(packet) if packet.data_type() == ty))
             .map(|queued| (queued.priority, queued.retry_after_ms)).expect("control is retained after backpressure");
         assert_eq!(
             priority, 254,
@@ -158,7 +158,7 @@ fn relay_queued_receipt_keeps_its_destination_after_return_cache_churn() {
         1,
         Arc::<[u8]>::from([1]),
         None,
-        Arc::from([Relay::sender_hash("VB")]),
+        Arc::from([Router::sender_hash("VB")]),
     )
     .unwrap();
     let id = packet.packet_id();
@@ -172,7 +172,7 @@ fn relay_queued_receipt_keeps_its_destination_after_return_cache_churn() {
         2,
         Arc::<[u8]>::from(id.to_le_bytes()),
         None,
-        Arc::from([Relay::sender_hash("VB"), Relay::sender_hash("GS")]),
+        Arc::from([Router::sender_hash("VB"), Router::sender_hash("GS")]),
     )
     .unwrap();
     relay.rx_from_side(can, ack).unwrap();

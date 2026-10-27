@@ -8,6 +8,14 @@
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
 
+#[cfg(test)]
+#[path = "tests/relay_legacy_contracts.rs"]
+mod relay_legacy_contracts;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/shared_routing_roles.rs"]
+mod shared_routing_roles;
+
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/schema_prefix_admission.rs"]
 mod schema_prefix_admission;
@@ -1269,185 +1277,7 @@ impl Debug for RouterTxHandlerFn {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct RouterSideOptions {
-    /// Enables the router's per-link reliable transport layer on this side.
-    ///
-    /// When `true` and the side uses a packed TX handler, reliable schema types gain
-    /// sequence numbers, ACKs, packet requests, and retransmits on this specific hop.
-    /// When `false`, the router strips the reliable framing for that side and sends only the
-    /// application packet payload once.
-    ///
-    /// This setting only affects the hop between this router and the side's TX callback. It does
-    /// not change whether a schema `DataType` is defined as reliable, and it does not disable the
-    /// router's end-to-end reliable tracking for packets originated elsewhere in the network.
-    pub reliable_enabled: bool,
-    /// Marks the side as eligible for link-local-only endpoints and discovery routes.
-    pub link_local_enabled: bool,
-    /// Enables a side-local header-template dictionary for packed transport.
-    ///
-    /// The first frame for a stable header shape is sent in full. Later frames
-    /// on the same side can replace the repeated static header bytes with a
-    /// compact template hash plus only the fields that still vary packet to
-    /// packet.
-    pub header_template_enabled: bool,
-    /// Maximum number of bytes to emit per packed TX callback.
-    ///
-    /// When non-zero and a wrapped packed frame would exceed this size, the
-    /// router splits it into ordered chunks and reassembles those chunks on RX
-    /// before normal packet processing.
-    pub max_frame_bytes: usize,
-    /// Target total side-transport overhead for compact follow-up frames.
-    ///
-    /// This is a profiling/negotiation target rather than a hard limit. The
-    /// canonical packet is still reconstructed before normal router handling,
-    /// so constrained links should watch runtime stats to confirm compact
-    /// frames are meeting their IPv4/IPv6-like overhead budget.
-    pub compact_header_target_bytes: usize,
-    /// Maximum side-local header templates retained for TX and RX dictionaries.
-    ///
-    /// This keeps compact-link state bounded. When the dictionary is full, the
-    /// oldest deterministic entry is evicted and a later packet with that
-    /// shape will refresh the receiver with a full template frame.
-    pub max_side_transport_templates: usize,
-    /// Omits the timestamp field from compact follow-up frames when it is unchanged.
-    ///
-    /// The receiver reconstructs the canonical packet from the previous timestamp for that
-    /// side-local template. This is only used after a full or compact frame has established
-    /// timestamp context.
-    pub omit_unchanged_compact_timestamps: bool,
-    /// Optional per-data-type timestamp omission policy for compact follow-up frames.
-    ///
-    /// This allows a side to omit unchanged timestamps only for selected traffic while keeping
-    /// absolute/delta timestamps for other data types on the same link.
-    pub compact_timestamp_omission_types: CompactTimestampOmissionPolicy,
-    /// Declared compact-link profile for stats and future negotiation.
-    pub side_transport_profile: SideTransportProfile,
-    /// Allows packets received from this side to enter router processing.
-    pub ingress_enabled: bool,
-    /// Allows the router to transmit packets toward this side.
-    pub egress_enabled: bool,
-}
-
-impl Default for RouterSideOptions {
-    fn default() -> Self {
-        Self {
-            reliable_enabled: false,
-            link_local_enabled: false,
-            header_template_enabled: false,
-            max_frame_bytes: 0,
-            compact_header_target_bytes: 0,
-            max_side_transport_templates: DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT,
-            omit_unchanged_compact_timestamps: false,
-            compact_timestamp_omission_types: CompactTimestampOmissionPolicy::none(),
-            side_transport_profile: SideTransportProfile::Canonical,
-            ingress_enabled: true,
-            egress_enabled: true,
-        }
-    }
-}
-
-impl RouterSideOptions {
-    /// Convenience preset for compact packed-side transport.
-    ///
-    /// This enables header-template reuse and, when `max_frame_bytes > 0`,
-    /// router-managed chunking/reassembly for fixed-size transports.
-    #[inline]
-    pub fn with_small_packet_transport(mut self, max_frame_bytes: usize) -> Self {
-        self.header_template_enabled = true;
-        self.max_frame_bytes = max_frame_bytes;
-        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
-        self.side_transport_profile = SideTransportProfile::Ipv6Like;
-        self
-    }
-
-    #[inline]
-    pub fn with_ipv4_like_compact_header_target(mut self) -> Self {
-        self.header_template_enabled = true;
-        self.compact_header_target_bytes = IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES;
-        self.omit_unchanged_compact_timestamps = true;
-        self.side_transport_profile = SideTransportProfile::Ipv4Like;
-        self
-    }
-
-    #[inline]
-    pub fn with_ipv6_like_compact_header_target(mut self) -> Self {
-        self.header_template_enabled = true;
-        self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
-        self.side_transport_profile = SideTransportProfile::Ipv6Like;
-        self
-    }
-
-    #[inline]
-    pub fn with_template_transport(mut self) -> Self {
-        self.header_template_enabled = true;
-        self.side_transport_profile = SideTransportProfile::Template;
-        self
-    }
-
-    #[inline]
-    pub fn with_omitted_unchanged_compact_timestamps(mut self) -> Self {
-        self.header_template_enabled = true;
-        self.omit_unchanged_compact_timestamps = true;
-        self
-    }
-
-    #[inline]
-    pub fn with_omitted_unchanged_compact_timestamps_for_type(mut self, ty: DataType) -> Self {
-        self.header_template_enabled = true;
-        self.compact_timestamp_omission_types.insert(ty);
-        self
-    }
-
-    #[inline]
-    pub fn effective_transport_profile(&self) -> SideTransportProfile {
-        if !self.header_template_enabled && self.max_frame_bytes == 0 {
-            SideTransportProfile::Canonical
-        } else if self.side_transport_profile == SideTransportProfile::Canonical {
-            SideTransportProfile::Template
-        } else {
-            self.side_transport_profile
-        }
-    }
-
-    #[cfg(feature = "discovery")]
-    #[inline]
-    pub fn link_capabilities(&self) -> discovery::LinkCapabilities {
-        let mut flags = discovery::LINK_CAPABILITY_END_TO_END_RELIABILITY;
-        if self.header_template_enabled {
-            flags |= discovery::LINK_CAPABILITY_HEADER_TEMPLATES;
-        }
-        if self.max_frame_bytes != 0 {
-            flags |= discovery::LINK_CAPABILITY_CHUNKING;
-        }
-        if self.reliable_enabled {
-            flags |= discovery::LINK_CAPABILITY_RELIABILITY;
-        }
-        if self.omit_unchanged_compact_timestamps
-            || !self.compact_timestamp_omission_types.is_empty()
-        {
-            flags |= discovery::LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS;
-        }
-        #[cfg(feature = "cryptography")]
-        {
-            flags |= discovery::LINK_CAPABILITY_CRYPTO;
-        }
-        #[cfg(feature = "compression")]
-        {
-            flags |= discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
-        }
-        discovery::LinkCapabilities {
-            version: 1,
-            flags,
-            profile: self.effective_transport_profile().discovery_code(),
-            max_frame_bytes: self.max_frame_bytes.min(u32::MAX as usize) as u32,
-            compact_header_target_bytes: self.compact_header_target_bytes.min(u32::MAX as usize)
-                as u32,
-            max_side_transport_templates: self.max_side_transport_templates.min(u32::MAX as usize)
-                as u32,
-        }
-    }
-}
+pub use crate::routing_config::SideOptions as RouterSideOptions;
 
 /// One side of the router – a name + TX handler.
 #[derive(Clone, Debug)]
@@ -1830,6 +1660,7 @@ struct PendingP2pStreamEvent {
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
+    role: crate::routing_config::RoutingRole,
     /// Handlers for local endpoints.
     handlers: Arc<[EndpointHandler]>,
     /// Whether to enable reliable ordering/ACKs for reliable data types.
@@ -1853,6 +1684,18 @@ pub struct RouterConfig {
 }
 
 impl RouterConfig {
+    pub(crate) fn relay() -> Self {
+        let mut cfg = Self::default().with_sender("RELAY");
+        cfg.role = crate::routing_config::RoutingRole::Relay;
+        cfg
+    }
+
+    pub(crate) fn configured_sender(&self) -> Arc<str> {
+        self.sender
+            .clone()
+            .unwrap_or_else(|| Arc::from(runtime_device_identifier()))
+    }
+
     /// Default router E2E mode for this build.
     ///
     /// Builds with cryptography prefer encrypted payloads automatically for data types that request
@@ -1881,6 +1724,7 @@ impl RouterConfig {
             "reserved internal endpoint handlers must not be user-registered"
         );
         Self {
+            role: crate::routing_config::RoutingRole::Router,
             handlers,
             reliable_enabled: true,
             sender: None,
@@ -2001,14 +1845,6 @@ impl RouterConfig {
     }
 
     #[inline]
-    fn sender(&self) -> String {
-        self.sender
-            .as_deref()
-            .map(ToString::to_string)
-            .unwrap_or_else(runtime_device_identifier)
-    }
-
-    #[inline]
     fn address_mode(&self) -> AddressAssignmentMode {
         self.address_mode
     }
@@ -2031,7 +1867,7 @@ impl RouterConfig {
     }
 
     #[inline]
-    fn memory_config(&self) -> RuntimeMemoryConfig {
+    pub(crate) fn memory_config(&self) -> RuntimeMemoryConfig {
         self.memory
     }
 }
@@ -2039,6 +1875,7 @@ impl RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
+            role: crate::routing_config::RoutingRole::Router,
             handlers: Arc::from([]),
             reliable_enabled: true,
             sender: None,
@@ -2052,6 +1889,57 @@ impl Default for RouterConfig {
             #[cfg(feature = "timesync")]
             timesync: None,
         }
+    }
+}
+
+/// Retain application configuration only for a participating router. Both
+/// roles consume the same builder; a forwarding-only core keeps no dormant
+/// handler, address-assignment, encryption-origin or local-clock configuration.
+#[derive(Debug)]
+struct ActiveRoutingConfig {
+    role: crate::routing_config::RoutingRole,
+    reliable_enabled: bool,
+    local: Option<Box<RouterConfig>>,
+}
+impl ActiveRoutingConfig {
+    fn new(cfg: RouterConfig) -> Self {
+        let role = cfg.role;
+        Self {
+            role,
+            reliable_enabled: cfg.reliable_enabled(),
+            local: role.local_services().then(|| Box::new(cfg)),
+        }
+    }
+    fn handlers(&self) -> &[EndpointHandler] {
+        self.local.as_ref().map_or(&[], |cfg| cfg.handlers.as_ref())
+    }
+    fn address_change_handlers(&self) -> &[AddressChangeHandler] {
+        self.local
+            .as_ref()
+            .map_or(&[], |cfg| cfg.address_change_handlers.as_ref())
+    }
+    fn is_local_endpoint(&self, ep: DataEndpoint) -> bool {
+        self.local
+            .as_ref()
+            .is_some_and(|cfg| cfg.is_local_endpoint(ep))
+    }
+    fn reliable_enabled(&self) -> bool {
+        self.reliable_enabled
+    }
+    fn e2e_encryption(&self) -> RouterE2eEncryptionMode {
+        self.local
+            .as_ref()
+            .map_or(RouterE2eEncryptionMode::Disabled, |cfg| {
+                cfg.e2e_encryption()
+            })
+    }
+    #[cfg(feature = "cryptography")]
+    fn e2e_key_id(&self) -> u32 {
+        self.local.as_ref().map_or(0, |cfg| cfg.e2e_key_id())
+    }
+    #[cfg(feature = "timesync")]
+    fn timesync_config(&self) -> Option<TimeSyncConfig> {
+        self.local.as_ref().and_then(|cfg| cfg.timesync_config())
     }
 }
 
@@ -2207,6 +2095,25 @@ fn fallback_stdout(_msg: &str) {
 /// Internal mutable state of the Router, protected by `RouterMutex`.
 /// Holds the RX/TX queues and the recent-RX de-duplication set.
 #[derive(Debug, Clone)]
+/// Application services are allocated only for participating router roles.
+/// Forwarding state and all wire ownership remain in the shared engine.
+struct LocalServicesState {
+    managed_variable_types: BTreeSet<u32>,
+    managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
+    managed_variable_latest: BTreeMap<u32, Box<ManagedVariableCacheEntry>>,
+    network_variable_update_handlers: BTreeMap<u32, Vec<NetworkVariableUpdateHandler>>,
+    p2p_port_handlers: BTreeMap<P2pPort, Vec<P2pPortHandler>>,
+    p2p_stream_handlers: BTreeMap<P2pPort, Vec<P2pStreamHandler>>,
+    p2p_stream_sessions: BTreeMap<P2pStreamId, P2pStreamSession>,
+    next_p2p_stream_id: P2pStreamId,
+}
+
+#[derive(Default)]
+struct ForwardedReceiptCache {
+    destinations: BTreeMap<u64, BTreeSet<u64>>,
+    order: VecDeque<u64>,
+}
+
 struct RouterInner {
     #[cfg(feature = "compression")]
     codec_reserved_bytes: usize,
@@ -2223,17 +2130,10 @@ struct RouterInner {
     // Embedded side indexes use compact sorted vectors; desktop indexes use B-trees.
     side_runtime_stats: RouterMap<RouterSideId, Box<SideRuntimeStatsInner>>,
     side_transport: RouterMap<RouterSideId, Box<SideTransportState>>,
-    managed_variable_types: BTreeSet<u32>,
-    managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
-    managed_variable_latest: BTreeMap<u32, Box<ManagedVariableCacheEntry>>,
-    network_variable_update_handlers: BTreeMap<u32, Vec<NetworkVariableUpdateHandler>>,
+    local_services: Option<Box<LocalServicesState>>,
     local_address: AddressBookEntry,
     address_book: BTreeMap<String, AddressBookEntry>,
     address_by_value: BTreeMap<NodeAddress, String>,
-    p2p_port_handlers: BTreeMap<P2pPort, Vec<P2pPortHandler>>,
-    p2p_stream_handlers: BTreeMap<P2pPort, Vec<P2pStreamHandler>>,
-    p2p_stream_sessions: BTreeMap<P2pStreamId, P2pStreamSession>,
-    next_p2p_stream_id: P2pStreamId,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     tx_priority_burst: u8,
@@ -2245,6 +2145,7 @@ struct RouterInner {
     reliable_rx: BTreeMap<(RouterSideId, u32), ReliableRxState>,
     reliable_return_routes: BTreeMap<u64, ReliableReturnRouteState>,
     reliable_return_route_order: VecDeque<u64>,
+    forwarded_receipts: Option<Box<ForwardedReceiptCache>>,
     end_to_end_reliable_tx: BTreeMap<u64, EndToEndReliableSent>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
@@ -2262,7 +2163,6 @@ struct RouterInner {
     #[cfg(all(feature = "discovery", feature = "timesync"))]
     timesync_side_throttle: RouterMap<RouterSideId, TimeSyncSideThrottleState>,
 }
-
 #[derive(Debug, Clone)]
 struct ManagedVariableCacheEntry {
     packet: Packet,
@@ -2330,6 +2230,35 @@ impl crate::payload_codec::QueueBudget for RouterInner {
 }
 
 impl RouterInner {
+    fn is_managed_variable(&self, ty: u32) -> bool {
+        self.local_services
+            .as_ref()
+            .is_some_and(|local| local.managed_variable_types.contains(&ty))
+    }
+
+    fn local_cache_bytes(&self) -> usize {
+        self.local_services
+            .iter()
+            .flat_map(|local| local.managed_variable_latest.values())
+            .map(|entry| entry.packet.byte_cost())
+            .sum()
+    }
+
+    fn replay_counters(&self) -> (usize, usize) {
+        self.transmit_queue
+            .iter()
+            .filter(|q| q.item.replay_marker_key().is_some())
+            .fold((0usize, 0usize), |(n, bytes), q| {
+                (n + 1, bytes.saturating_add(q.byte_cost()))
+            })
+    }
+
+    fn local_cache_len(&self) -> usize {
+        self.local_services
+            .as_ref()
+            .map_or(0, |local| local.managed_variable_latest.len())
+    }
+
     #[cfg(all(feature = "compression", feature = "discovery"))]
     fn reclaim_codec_metadata(&mut self) -> bool {
         self.side_transport.values_mut().any(|transport| {
@@ -3461,9 +3390,9 @@ impl IsrRxQueue {
 /// Thread-safe via internal locking.
 pub struct Router {
     sender: RouterMutex<Arc<str>>,
-    cfg: RouterConfig,
+    cfg: ActiveRoutingConfig,
     state: RouterMutex<RouterInner>,
-    isr_rx_queue: IsrRxQueue,
+    isr_rx_queue: Option<Box<IsrRxQueue>>,
     #[cfg(not(feature = "std"))]
     side_tx_gate: ReentryGate,
     #[cfg(feature = "std")]
@@ -3472,7 +3401,7 @@ pub struct Router {
     active_queued_tx: core::sync::atomic::AtomicUsize,
     clock: Box<dyn Clock + Send + Sync>,
     #[cfg(feature = "timesync")]
-    timesync: RouterMutex<TimeSyncRuntime>,
+    timesync: Option<Box<RouterMutex<TimeSyncRuntime>>>,
 }
 
 #[cfg(feature = "std")]
@@ -3547,19 +3476,18 @@ struct DiscoveryCandidateMatch {
 
 #[cfg(feature = "discovery")]
 #[inline]
-const fn discovery_is_hop_local_advertisement(ty: DataType) -> bool {
+const fn discovery_is_hop_local_advertisement(ty: DataType, transparent: bool) -> bool {
     matches!(
         ty,
         DataType::DiscoveryAnnounce
             | DataType::DiscoveryTimeSyncSources
             | DataType::DiscoveryTopology
-            | DataType::DiscoveryAddress
             | DataType::DiscoveryLinkCapabilities
-    )
+    ) || (matches!(ty, DataType::DiscoveryAddress) && !transparent)
 }
 
 #[cfg(not(feature = "discovery"))]
-const fn discovery_is_hop_local_advertisement(_ty: DataType) -> bool {
+const fn discovery_is_hop_local_advertisement(_ty: DataType, _transparent: bool) -> bool {
     false
 }
 
@@ -3578,7 +3506,7 @@ impl Debug for Router {
 /// Check if any of the provided endpoints require remote forwarding when
 /// discovery is unavailable and routing falls back to local-vs-remote schema.
 #[inline]
-fn has_nonlocal_endpoint(eps: &[DataEndpoint], cfg: &RouterConfig) -> bool {
+fn has_nonlocal_endpoint(eps: &[DataEndpoint], cfg: &ActiveRoutingConfig) -> bool {
     eps.iter().copied().any(|ep| !cfg.is_local_endpoint(ep))
 }
 
@@ -3762,13 +3690,15 @@ impl Router {
             .unwrap_or_else(|| sender_address_u32(pkt.sender()));
         let handlers = {
             let mut st = self.state.lock();
-            if !st
-                .managed_variable_types
-                .contains(&pkt.data_type().as_u32())
-            {
+            if !st.is_managed_variable(pkt.data_type().as_u32()) {
                 return Ok(());
             }
-            let existing = st.managed_variable_latest.get(&pkt.data_type().as_u32());
+            let existing = st
+                .local_services
+                .as_ref()
+                .expect("local services enabled")
+                .managed_variable_latest
+                .get(&pkt.data_type().as_u32());
             // Sender-local timestamps can order updates from one authoritative
             // writer even before network time is available. They cannot order
             // a restored local seed against a remote writer, and packet nonces
@@ -3792,16 +3722,25 @@ impl Router {
                 cached_at_ms: self.clock.now_ms(),
             };
             if let Some(entry) = st
+                .local_services
+                .as_mut()
+                .expect("local services enabled")
                 .managed_variable_latest
                 .get_mut(&pkt.data_type().as_u32())
             {
                 **entry = updated;
             } else {
-                st.managed_variable_latest
+                st.local_services
+                    .as_mut()
+                    .expect("local services enabled")
+                    .managed_variable_latest
                     .insert(pkt.data_type().as_u32(), Box::new(updated));
             }
             if notify_handlers && changed {
-                st.network_variable_update_handlers
+                st.local_services
+                    .as_ref()
+                    .expect("local services enabled")
+                    .network_variable_update_handlers
                     .get(&pkt.data_type().as_u32())
                     .cloned()
                     .unwrap_or_default()
@@ -3821,7 +3760,9 @@ impl Router {
 
     fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
         let st = self.state.lock();
-        st.managed_variable_latest
+        st.local_services
+            .as_ref()?
+            .managed_variable_latest
             .get(&ty.as_u32())
             .map(|entry| entry.packet.clone())
     }
@@ -3830,24 +3771,32 @@ impl Router {
     fn managed_variable_latest_with_age(&self, ty: DataType) -> Option<(Packet, u64)> {
         let now_ms = self.clock.now_ms();
         let st = self.state.lock();
-        st.managed_variable_latest.get(&ty.as_u32()).map(|entry| {
-            (
-                entry.packet.clone(),
-                now_ms.saturating_sub(entry.cached_at_ms),
-            )
-        })
+        st.local_services
+            .as_ref()?
+            .managed_variable_latest
+            .get(&ty.as_u32())
+            .map(|entry| {
+                (
+                    entry.packet.clone(),
+                    now_ms.saturating_sub(entry.cached_at_ms),
+                )
+            })
     }
 
     fn is_managed_variable_type(&self, ty: DataType) -> bool {
         let st = self.state.lock();
-        st.managed_variable_types.contains(&ty.as_u32())
+        st.is_managed_variable(ty.as_u32())
     }
 
     fn managed_variable_permissions_locked(
         st: &RouterInner,
         ty: DataType,
     ) -> NetworkVariablePermissions {
-        st.managed_variable_permissions
+        let Some(local) = st.local_services.as_ref() else {
+            return NetworkVariablePermissions::NONE;
+        };
+        local
+            .managed_variable_permissions
             .get(&ty.as_u32())
             .copied()
             .unwrap_or(NetworkVariablePermissions::READ_WRITE)
@@ -3978,9 +3927,11 @@ impl Router {
     }
 
     fn pop_next_queued_control_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
-        {
-            let mut isr_rx = self.isr_rx_queue.try_lock()?;
-            let idx = isr_rx.iter().position(Self::queued_rx_item_is_control);
+        if let Some(queue) = self.isr_rx_queue.as_ref() {
+            let mut isr_rx = queue.try_lock()?;
+            let idx = isr_rx
+                .iter()
+                .position(|item| self.queued_rx_item_is_control(item));
             if let Some(idx) = idx {
                 return Ok(isr_rx.remove_pos(idx));
             }
@@ -3990,14 +3941,22 @@ impl Router {
         let idx = st
             .received_queue
             .iter()
-            .position(Self::queued_rx_item_is_control);
+            .position(|item| self.queued_rx_item_is_control(item));
         if let Some(idx) = idx {
             return Ok(st.received_queue.remove_pos(idx));
         }
         Ok(None)
     }
 
-    fn queued_rx_item_is_control(item: &RouterRxItem) -> bool {
+    fn queued_rx_item_is_control(&self, item: &RouterRxItem) -> bool {
+        // The forwarding facade historically predrains only receipts. Other
+        // ingress remains ordinary RX work, whose admission refusal must reach
+        // the caller rather than be treated as background maintenance.
+        if !self.cfg.role.local_services()
+            && item.priority < crate::transport_priority(DataType::ReliableAck)
+        {
+            return false;
+        }
         // Admission computes and retains the reserved service band once.
         // Bulk queues can contain hundreds of entries: do not reparse every
         // packed header just to rediscover that none is a control packet.
@@ -4028,7 +3987,7 @@ impl Router {
                 | DataType::ReliablePacketRequest,
             ) => true,
             #[cfg(feature = "discovery")]
-            Some(ty) => discovery::is_discovery_type(ty),
+            Some(ty) => self.cfg.role.local_services() && discovery::is_discovery_type(ty),
             _ => false,
         }
     }
@@ -4445,7 +4404,7 @@ impl Router {
     }
 
     fn notify_address_change(&self, change: AddressChange) -> TelemetryResult<()> {
-        for handler in self.cfg.address_change_handlers.iter() {
+        for handler in self.cfg.address_change_handlers().iter() {
             (handler.handler)(change.clone())?;
         }
         Ok(())
@@ -4602,8 +4561,8 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn is_end_to_end_destination_sender(sender: &str) -> bool {
-        sender != "RELAY" && !Self::is_end_to_end_ack_sender(sender)
+    fn is_end_to_end_destination_sender(&self, sender: &str) -> bool {
+        sender != self.sender_arc().as_ref() && !Self::is_end_to_end_ack_sender(sender)
     }
 
     fn encode_p2p_payload(
@@ -4719,9 +4678,29 @@ impl Router {
 
     fn allocate_p2p_stream_id_locked(st: &mut RouterInner) -> P2pStreamId {
         for _ in 0..u32::MAX {
-            let id = st.next_p2p_stream_id.max(1);
-            st.next_p2p_stream_id = st.next_p2p_stream_id.wrapping_add(1).max(1);
-            if !st.p2p_stream_sessions.contains_key(&id) {
+            let id = st
+                .local_services
+                .as_ref()
+                .expect("local services enabled")
+                .next_p2p_stream_id
+                .max(1);
+            st.local_services
+                .as_mut()
+                .expect("local services enabled")
+                .next_p2p_stream_id = st
+                .local_services
+                .as_ref()
+                .expect("local services enabled")
+                .next_p2p_stream_id
+                .wrapping_add(1)
+                .max(1);
+            if !st
+                .local_services
+                .as_ref()
+                .expect("local services enabled")
+                .p2p_stream_sessions
+                .contains_key(&id)
+            {
                 return id;
             }
         }
@@ -4738,7 +4717,10 @@ impl Router {
         }
         let handlers = {
             let st = self.state.lock();
-            st.p2p_port_handlers
+            st.local_services
+                .as_ref()
+                .expect("local services enabled")
+                .p2p_port_handlers
                 .get(&decoded.destination_port)
                 .cloned()
                 .unwrap_or_default()
@@ -4766,14 +4748,20 @@ impl Router {
             let mut st = self.state.lock();
             if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK == 0 {
                 let peer_hostname: Arc<str> = Arc::from(msg.source_hostname);
-                let existing_id = st.p2p_stream_sessions.iter().find_map(|(id, session)| {
-                    (session.peer_stream_id == frame.source_stream_id
-                        && session.local_port == msg.destination_port
-                        && session.peer_port == msg.source_port
-                        && session.peer_address == msg.source_address
-                        && session.peer_hostname.as_ref() == msg.source_hostname)
-                        .then_some(*id)
-                });
+                let existing_id = st
+                    .local_services
+                    .as_ref()
+                    .expect("local services enabled")
+                    .p2p_stream_sessions
+                    .iter()
+                    .find_map(|(id, session)| {
+                        (session.peer_stream_id == frame.source_stream_id
+                            && session.local_port == msg.destination_port
+                            && session.peer_port == msg.source_port
+                            && session.peer_address == msg.source_address
+                            && session.peer_hostname.as_ref() == msg.source_hostname)
+                            .then_some(*id)
+                    });
                 let local_id = if let Some(local_id) = existing_id {
                     local_id
                 } else {
@@ -4781,19 +4769,26 @@ impl Router {
                     if local_id == 0 {
                         return Err(TelemetryError::Io("p2p stream id exhausted"));
                     }
-                    st.p2p_stream_sessions.insert(
-                        local_id,
-                        P2pStreamSession {
-                            peer_hostname: peer_hostname.clone(),
-                            peer_address: msg.source_address,
-                            local_port: msg.destination_port,
-                            peer_port: msg.source_port,
-                            peer_stream_id: frame.source_stream_id,
-                            next_sequence: 1,
-                            connected: true,
-                        },
-                    );
+                    st.local_services
+                        .as_mut()
+                        .expect("local services enabled")
+                        .p2p_stream_sessions
+                        .insert(
+                            local_id,
+                            P2pStreamSession {
+                                peer_hostname: peer_hostname.clone(),
+                                peer_address: msg.source_address,
+                                local_port: msg.destination_port,
+                                peer_port: msg.source_port,
+                                peer_stream_id: frame.source_stream_id,
+                                next_sequence: 1,
+                                connected: true,
+                            },
+                        );
                     let handlers = st
+                        .local_services
+                        .as_ref()
+                        .expect("local services enabled")
                         .p2p_stream_handlers
                         .get(&msg.destination_port)
                         .cloned()
@@ -4832,7 +4827,12 @@ impl Router {
                 )?;
                 reply = Some((dst, msg.source_port, msg.destination_port, payload));
             } else if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK != 0 {
-                if let Some(session) = st.p2p_stream_sessions.get_mut(&frame.destination_stream_id)
+                if let Some(session) = st
+                    .local_services
+                    .as_mut()
+                    .expect("local services enabled")
+                    .p2p_stream_sessions
+                    .get_mut(&frame.destination_stream_id)
                 {
                     session.peer_stream_id = frame.source_stream_id;
                     session.connected = true;
@@ -4841,6 +4841,9 @@ impl Router {
                     let local_port = session.local_port;
                     let peer_port = session.peer_port;
                     let handlers = st
+                        .local_services
+                        .as_ref()
+                        .expect("local services enabled")
                         .p2p_stream_handlers
                         .get(&local_port)
                         .cloned()
@@ -4867,19 +4870,32 @@ impl Router {
                 let session_id = if frame.destination_stream_id != 0 {
                     Some(frame.destination_stream_id)
                 } else {
-                    st.p2p_stream_sessions.iter().find_map(|(id, session)| {
-                        (session.peer_stream_id == frame.source_stream_id
-                            && session.local_port == msg.destination_port
-                            && session.peer_port == msg.source_port
-                            && session.peer_address == msg.source_address
-                            && session.peer_hostname.as_ref() == msg.source_hostname)
-                            .then_some(*id)
-                    })
+                    st.local_services
+                        .as_ref()
+                        .expect("local services enabled")
+                        .p2p_stream_sessions
+                        .iter()
+                        .find_map(|(id, session)| {
+                            (session.peer_stream_id == frame.source_stream_id
+                                && session.local_port == msg.destination_port
+                                && session.peer_port == msg.source_port
+                                && session.peer_address == msg.source_address
+                                && session.peer_hostname.as_ref() == msg.source_hostname)
+                                .then_some(*id)
+                        })
                 };
                 if let Some(session_id) = session_id
-                    && let Some(session) = st.p2p_stream_sessions.get(&session_id)
+                    && let Some(session) = st
+                        .local_services
+                        .as_ref()
+                        .expect("local services enabled")
+                        .p2p_stream_sessions
+                        .get(&session_id)
                 {
                     let handlers = st
+                        .local_services
+                        .as_ref()
+                        .expect("local services enabled")
                         .p2p_stream_handlers
                         .get(&session.local_port)
                         .cloned()
@@ -4895,7 +4911,11 @@ impl Router {
                         peer_port: session.peer_port,
                     });
                     if matches!(kind, P2pStreamEventKind::Closed | P2pStreamEventKind::Reset) {
-                        st.p2p_stream_sessions.remove(&session_id);
+                        st.local_services
+                            .as_mut()
+                            .expect("local services enabled")
+                            .p2p_stream_sessions
+                            .remove(&session_id);
                     }
                 }
             }
@@ -5061,7 +5081,7 @@ impl Router {
          * Freeze one destination contract per advertising segment instead;
          * its announcer is the segment router that can ACK and replicate the
          * value to the owners behind it. */
-        if managed || st.managed_variable_types.contains(&ty.as_u32()) {
+        if managed || st.is_managed_variable(ty.as_u32()) {
             let mut out = BTreeMap::new();
             for (&side, route) in st.discovery_routes.iter() {
                 if Some(side) == exclude {
@@ -5082,7 +5102,7 @@ impl Router {
                 for (sender_id, sender_state) in route.announcers.iter() {
                     if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
                         || !sender_state.reachable_network_variables.contains(&ty)
-                        || !Self::is_end_to_end_destination_sender(sender_id)
+                        || !self.is_end_to_end_destination_sender(sender_id)
                     {
                         continue;
                     }
@@ -5125,7 +5145,7 @@ impl Router {
                     continue;
                 }
                 for board in sender_state.topology_boards.iter() {
-                    if !Self::is_end_to_end_destination_sender(&board.sender_id) {
+                    if !self.is_end_to_end_destination_sender(&board.sender_id) {
                         continue;
                     }
                     let owner = Self::sender_hash(&board.sender_id);
@@ -5425,14 +5445,16 @@ impl Router {
     fn select_discovered_candidate_sides_locked(
         &self,
         st: &mut RouterInner,
+        packet: (&RouterItem, DataType),
         exclude: Option<RouterSideId>,
-        ty: DataType,
         target_senders: wire_format::TargetSenderSet<'_>,
         prefer_best_overlap: bool,
         matches: Vec<DiscoveryCandidateMatch>,
     ) -> Vec<RouterSideId> {
+        let (data, ty) = packet;
         let discovered_origin = if Self::has_typed_route_overrides_locked(st, exclude, ty)
             || !target_senders.is_empty()
+            || (!self.cfg.role.local_services() && is_reliable_type(ty))
         {
             RouteSelectionOrigin::Flood
         } else {
@@ -5455,22 +5477,165 @@ impl Router {
             matches.into_iter().map(|m| m.side).collect()
         };
 
-        /* Heartbeats represent network-wide liveness rather than a request for
-         * one interchangeable endpoint owner.  When discovery finds the
-         * heartbeat endpoint on multiple independent shortest-path sides,
-         * every segment must receive it. Other packets reaching this selector
-         * retain adaptive path selection; independent best-effort endpoint
-         * roles are planned separately before this fallback. */
+        let selected = if st.forwarded_receipts.is_some() && is_reliable_type(ty) {
+            self.filter_end_to_end_satisfied_sides_locked(
+                st,
+                data,
+                selected,
+                &self
+                    .item_route_info(data)
+                    .map(|info| info.0)
+                    .unwrap_or_default(),
+                ty,
+            )
+        } else {
+            selected
+        };
+
+        // Replicated managed state follows its advertised owner contract.
+        // Ordinary application types use the same route selection regardless
+        // of their configured names.
         let has_distributed_variable_owners = selected.iter().any(|side| {
             st.discovery_routes
                 .get(side)
                 .is_some_and(|route| route.reachable_network_variables.contains(&ty))
         });
-        if DataType::try_named("HEARTBEAT") == Some(ty) || has_distributed_variable_owners {
+        if has_distributed_variable_owners {
             selected
         } else {
             self.apply_route_selection_locked(st, exclude, selected, discovered_origin)
         }
+    }
+
+    fn note_end_to_end_acked_destination_locked(
+        st: &mut RouterInner,
+        packet_id: u64,
+        sender_hash: u64,
+    ) {
+        let cache = st
+            .forwarded_receipts
+            .get_or_insert_with(|| Box::new(ForwardedReceiptCache::default()));
+        let entry_cap = crate::config::runtime_reliable_max_end_to_end_ack_cache().max(1);
+        cache
+            .order
+            .retain(|id| cache.destinations.contains_key(id) && *id != packet_id);
+        while cache.order.len() >= entry_cap {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.destinations.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        cache.order.push_back(packet_id);
+
+        let acked = cache.destinations.entry(packet_id).or_default();
+        let sender_cap = crate::config::runtime_reliable_max_end_to_end_pending().max(1);
+        if acked.len() < sender_cap || acked.contains(&sender_hash) {
+            acked.insert(sender_hash);
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn filter_end_to_end_satisfied_sides_locked(
+        &self,
+        st: &RouterInner,
+        data: &RouterItem,
+        sides: Vec<RouterSideId>,
+        eps: &[crate::DataEndpoint],
+        ty: crate::DataType,
+    ) -> Vec<RouterSideId> {
+        if !is_reliable_type(ty)
+            || Self::reliable_control_target_packet_id(data)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return sides;
+        }
+        let packet_id = match data {
+            RouterItem::Packet(pkt) => pkt.packet_id(),
+            RouterItem::Packed(bytes) => match wire_format::packet_id_from_wire(bytes.as_ref()) {
+                Ok(packet_id) => packet_id,
+                Err(TelemetryError::Unpack("reliable control frame")) => return sides,
+                Err(_) => return sides,
+            },
+        };
+        let Some(acked) = st
+            .forwarded_receipts
+            .as_ref()
+            .and_then(|cache| cache.destinations.get(&packet_id))
+        else {
+            return sides;
+        };
+        let now_ms = self.clock.now_ms();
+        let mut filtered = Vec::new();
+        for side in sides {
+            let Some(route) = st.discovery_routes.get(&side) else {
+                filtered.push(side);
+                continue;
+            };
+            let mut still_pending = false;
+            let mut had_destination_board = false;
+            for sender_state in route.announcers.values() {
+                if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                    continue;
+                }
+                for board in sender_state.topology_boards.iter() {
+                    if !self.is_end_to_end_destination_sender(&board.sender_id) {
+                        continue;
+                    }
+                    had_destination_board = true;
+                    let sender_hash = Self::sender_hash(&board.sender_id);
+                    if acked.contains(&sender_hash) {
+                        continue;
+                    }
+                    if eps
+                        .iter()
+                        .copied()
+                        .any(|ep| board.reachable_endpoints.contains(&ep))
+                    {
+                        still_pending = true;
+                        break;
+                    }
+                    // Keep forwarding while any discovered destination sender for this packet
+                    // remains unacked, even if topology/schema metadata changed for new packets.
+                    still_pending = true;
+                    break;
+                }
+                if still_pending {
+                    break;
+                }
+            }
+            if still_pending || !had_destination_board {
+                filtered.push(side);
+            }
+        }
+        filtered
+    }
+
+    #[cfg(feature = "discovery")]
+    fn reconcile_forwarded_receipts_locked(&self, st: &mut RouterInner) {
+        if st.forwarded_receipts.is_none() {
+            return;
+        }
+        let mut active_senders = BTreeSet::new();
+        for route in st.discovery_routes.values() {
+            for sender_state in route.announcers.values() {
+                for board in sender_state.topology_boards.iter() {
+                    if self.is_end_to_end_destination_sender(&board.sender_id) {
+                        active_senders.insert(Self::sender_hash(&board.sender_id));
+                    }
+                }
+            }
+        }
+        st.forwarded_receipts
+            .as_mut()
+            .expect("checked cache")
+            .destinations
+            .retain(|_, acked| {
+                acked.retain(|sender_hash| active_senders.contains(sender_hash));
+                !acked.is_empty()
+            });
     }
 
     #[cfg(feature = "discovery")]
@@ -5617,6 +5782,7 @@ impl Router {
         &self,
         st: &mut RouterInner,
     ) -> TelemetryResult<()> {
+        self.reconcile_forwarded_receipts_locked(st);
         if st.end_to_end_reliable_tx.is_empty() {
             return Ok(());
         }
@@ -5676,11 +5842,11 @@ impl Router {
                 if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
                     continue;
                 }
-                if Self::is_end_to_end_destination_sender(sender_name) {
+                if self.is_end_to_end_destination_sender(sender_name) {
                     out.insert(Self::sender_hash(sender_name), side);
                 }
                 for board in sender_state.topology_boards.iter() {
-                    if !Self::is_end_to_end_destination_sender(&board.sender_id) {
+                    if !self.is_end_to_end_destination_sender(&board.sender_id) {
                         continue;
                     }
                     out.insert(Self::sender_hash(&board.sender_id), side);
@@ -5712,22 +5878,13 @@ impl Router {
         pending: &mut BTreeMap<u64, RouterSideId>,
         frozen: bool,
     ) {
-        // A heartbeat describes current liveness. Retrying an old heartbeat
-        // until every discovered endpoint acknowledges it turns temporary
-        // congestion into an ACK/retransmit storm and can starve fresh
-        // heartbeats. Per-link reliability still applies where configured;
-        // the next periodic heartbeat is the end-to-end freshness retry.
-        if DataType::try_named("HEARTBEAT") == Some(ty) {
-            pending.clear();
-            return;
-        }
         if frozen {
             return;
         }
         let now_ms = self.clock.now_ms();
         pending.retain(|_, side| {
             Self::side_supports_end_to_end_tracking_locked(st, *side)
-                && (st.managed_variable_types.contains(&ty.as_u32())
+                && (st.is_managed_variable(ty.as_u32())
                     || is_reliable_type(ty)
                     || !self.side_has_multiple_announcers_locked(st, *side, now_ms))
         });
@@ -6044,7 +6201,7 @@ impl Router {
         let plan = self.remote_side_plan(&data, exclude)?;
         let mut st = self.state.lock();
         let ty = Self::item_data_type(&data)?;
-        let priority = if st.managed_variable_types.contains(&ty.as_u32()) {
+        let priority = if st.is_managed_variable(ty.as_u32()) {
             crate::transport_priority(DataType::ManagedVariableValue)
         } else {
             Self::router_item_priority(&data)?
@@ -6275,10 +6432,13 @@ impl Router {
         bytes: crate::SharedBytes,
         reliable_override: Option<Option<wire_format::ReliableHeader>>,
     ) -> TelemetryResult<crate::SharedBytes> {
-        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
-        if frame.ack_only() || self.e2e_seal_config_for_type(frame.envelope.ty).is_none() {
+        // Both peeks verify the CRC and parse the same canonical routing and
+        // reliable header. Only sealing needs owned endpoint/target arrays.
+        let routing = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+        if routing.ack_only() || self.e2e_seal_config_for_type(routing.envelope.ty).is_none() {
             return Ok(bytes);
         }
+        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
         let reliable = reliable_override.unwrap_or(frame.reliable);
         let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
         self.pack_packet_for_contract(
@@ -6636,7 +6796,11 @@ impl Router {
         exclude: Option<RouterSideId>,
         select_routes: bool,
     ) -> TelemetryResult<RemoteSidePlan> {
+        #[cfg(feature = "discovery")]
+        let (eps, ty) = self.item_route_info(data)?;
         let select_sides = |state: &mut RouterInner, sides: Vec<RouterSideId>, origin| {
+            #[cfg(feature = "discovery")]
+            let sides = self.filter_end_to_end_satisfied_sides_locked(state, data, sides, &eps, ty);
             if select_routes {
                 self.apply_route_selection_locked(state, exclude, sides, origin)
             } else {
@@ -6645,7 +6809,6 @@ impl Router {
         };
         #[cfg(feature = "discovery")]
         {
-            let (eps, ty) = self.item_route_info(data)?;
             let target_senders = self.item_target_senders(data)?;
             let resolve_beyond_local_hop =
                 self.item_targets_router_as_intermediate_hop(data, &eps)?;
@@ -6695,7 +6858,7 @@ impl Router {
             // variable. A router may own the same schema endpoint locally and
             // still need to replicate the value across an IPC/network boundary.
             let now_ms = self.clock.now_ms();
-            let has_remote_variable_owner = st.managed_variable_types.contains(&ty.as_u32())
+            let has_remote_variable_owner = st.is_managed_variable(ty.as_u32())
                 && st.discovery_routes.iter().any(|(&side, route)| {
                     exclude != Some(side)
                         && now_ms.saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
@@ -6819,24 +6982,22 @@ impl Router {
                         Self::filter_timesync_matches_locked(&st, ty, self.clock.now_ms(), matches);
                 }
             }
-            /* Heartbeats and replicated network variables are network-segment
-             * state, so a nearer owner on one side must not hide a farther
-             * independent segment. Discovery's split horizon prevents the
-             * advertisement from being reflected back onto its ingress side.
-             * Ordinary application data retains shortest-path suppression. */
+            // Replicated managed variables retain independent owner segments.
+            // All ordinary application types retain shortest-path suppression.
             let has_distributed_variable_owners = matches.iter().any(|candidate| {
                 st.discovery_routes
                     .get(&candidate.side)
                     .is_some_and(|route| route.reachable_network_variables.contains(&ty))
             });
-            if DataType::try_named("HEARTBEAT") != Some(ty) && !has_distributed_variable_owners {
+            if !has_distributed_variable_owners {
                 // A single eligible physical side has no role/path ambiguity.
                 // Keep the allocation-bounded transit path instead of building
                 // per-role candidate vectors for the same sole destination.
-                if eps.len() > 1
+                if self.cfg.role.local_services()
+                    && eps.len() > 1
                     && matches.len() > 1
                     && !is_reliable_type(ty)
-                    && !st.managed_variable_types.contains(&ty.as_u32())
+                    && !st.is_managed_variable(ty.as_u32())
                     && routing_target_senders.is_empty()
                     && preferred_packet_id.is_none()
                     && preferred_timesync_source.is_none()
@@ -6873,12 +7034,31 @@ impl Router {
                 Ok(RemoteSidePlan::Target(
                     self.select_discovered_candidate_sides_locked(
                         &mut st,
+                        (data, ty),
                         exclude,
-                        ty,
                         routing_target_senders,
                         prefer_best_overlap,
                         matches,
                     ),
+                ))
+            } else if !self.cfg.role.local_services() && exclude.is_some() {
+                let fallback =
+                    self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
+                let known_elsewhere = !routing_target_senders.is_empty()
+                    && st.discovery_routes.keys().any(|&side| {
+                        Self::side_matches_target_senders_locked(
+                            &st,
+                            side,
+                            routing_target_senders,
+                            self.clock.now_ms(),
+                        )
+                    });
+                Ok(RemoteSidePlan::Target(
+                    if fallback.len() == 1 && !known_elsewhere {
+                        select_sides(&mut st, fallback, RouteSelectionOrigin::Flood)
+                    } else {
+                        Vec::new()
+                    },
                 ))
             } else if prefer_best_overlap {
                 Ok(RemoteSidePlan::Target(Vec::new()))
@@ -6941,7 +7121,7 @@ impl Router {
 
     #[cfg(feature = "discovery")]
     fn local_discovery_endpoints(&self, st: &RouterInner) -> Vec<DataEndpoint> {
-        let mut eps: Vec<DataEndpoint> = self.cfg.handlers.iter().map(|h| h.endpoint).collect();
+        let mut eps: Vec<DataEndpoint> = self.cfg.handlers().iter().map(|h| h.endpoint).collect();
         // Managed-variable ownership has its own discovery field. Its message
         // endpoints describe delivery sinks, not ownership: treating them as
         // local endpoints makes every flight-state replica claim that it is
@@ -6961,8 +7141,17 @@ impl Router {
     #[cfg(feature = "discovery")]
     fn local_discovery_timesync_sources(&self, now_ms: u64) -> Vec<String> {
         #[cfg(feature = "timesync")]
+        if self.timesync.is_none() {
+            return Vec::new();
+        }
+
+        #[cfg(feature = "timesync")]
         {
-            let st = self.timesync.lock();
+            let st = self
+                .timesync
+                .as_ref()
+                .expect("local time service enabled")
+                .lock();
             if let Some(tracker) = st.tracker.as_ref()
                 && tracker.should_serve(
                     now_ms,
@@ -6993,8 +7182,10 @@ impl Router {
                 DataType::TimeSyncRequest => {
                     let local_sender = self.sender_arc();
                     if pkt.sender() == local_sender.as_ref() {
-                        Ok(self.timesync.lock().tracker.as_ref().and_then(|tracker| {
-                            tracker.current_source().map(|src| src.sender.clone())
+                        Ok(self.timesync.as_ref().and_then(|runtime| {
+                            runtime.lock().tracker.as_ref().and_then(|tracker| {
+                                tracker.current_source().map(|src| src.sender.clone())
+                            })
                         }))
                     } else {
                         Ok(None)
@@ -7371,8 +7562,9 @@ impl Router {
         exclude_side: Option<RouterSideId>,
     ) -> Vec<DataType> {
         let mut types: Vec<DataType> = st
-            .managed_variable_types
+            .local_services
             .iter()
+            .flat_map(|local| local.managed_variable_types.iter())
             .copied()
             .map(DataType)
             .collect();
@@ -7872,19 +8064,23 @@ impl Router {
             let now = self.clock.now_ms();
             let sender = self.sender_arc();
             let st = self.state.lock();
-            let election_required = self
-                .preferred_discovery_master_present_locked(&st, now)
-                .is_none();
+            let election_required = self.cfg.role.local_services()
+                && self
+                    .preferred_discovery_master_present_locked(&st, now)
+                    .is_none();
             let snapshot = discovery::topology_snapshot_scratch(
                 sender.as_ref(),
-                self.cfg.handlers.len(),
-                st.managed_variable_types.len().saturating_add(
-                    st.discovery_routes
-                        .iter()
-                        .filter(|(side, _)| Some(**side) != requested_side)
-                        .map(|(_, r)| r.reachable_network_variables.len())
-                        .sum::<usize>(),
-                ),
+                self.cfg.handlers().len(),
+                st.local_services
+                    .as_ref()
+                    .map_or(0, |local| local.managed_variable_types.len())
+                    .saturating_add(
+                        st.discovery_routes
+                            .iter()
+                            .filter(|(side, _)| Some(**side) != requested_side)
+                            .map(|(_, r)| r.reachable_network_variables.len())
+                            .sum::<usize>(),
+                    ),
                 4,
                 true,
                 st.discovery_routes
@@ -7911,7 +8107,7 @@ impl Router {
             } else {
                 let election = discovery::topology_snapshot_scratch(
                     sender.as_ref(),
-                    self.cfg.handlers.len(),
+                    self.cfg.handlers().len(),
                     0,
                     2,
                     false,
@@ -7971,8 +8167,8 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
             st.fit_discovery_budget();
-            let local_is_master =
-                self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
+            let local_is_master = self.cfg.role.local_services()
+                && self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
             // The caller selects one side; keep its plan on the stack.
             let mut per_side = None;
             for side_id in 0..st.sides.len() {
@@ -8132,19 +8328,28 @@ impl Router {
             if matches!(
                 level,
                 DiscoveryAdvertiseLevel::Full | DiscoveryAdvertiseLevel::Incremental
-            ) {
-                let address = self.local_address_advertisement(
-                    endpoints.clone(),
-                    network_variables.clone(),
-                    timesync_sources.clone(),
-                    capabilities,
-                    if local_is_master {
-                        discovery::ADDRESS_STATE_APPROVED
-                    } else {
-                        discovery::ADDRESS_STATE_REQUEST
-                    },
-                );
-                let pkt = discovery::build_discovery_address(sender.as_ref(), now_ms, &address)?;
+            ) && (self.cfg.role.local_services() || level == DiscoveryAdvertiseLevel::Full)
+            {
+                let pkt = if self.cfg.role.local_services() {
+                    let address = self.local_address_advertisement(
+                        endpoints.clone(),
+                        network_variables.clone(),
+                        timesync_sources.clone(),
+                        capabilities,
+                        if local_is_master {
+                            discovery::ADDRESS_STATE_APPROVED
+                        } else {
+                            discovery::ADDRESS_STATE_REQUEST
+                        },
+                    );
+                    discovery::build_discovery_address(sender.as_ref(), now_ms, &address)?
+                } else {
+                    discovery::build_discovery_link_capabilities(
+                        sender.as_ref(),
+                        now_ms,
+                        capabilities,
+                    )?
+                };
                 self.emit_discovery_prefix_item(
                     RouterTxItem::ToSide {
                         src: None,
@@ -8156,11 +8361,34 @@ impl Router {
                     prefix_claim.map(|claim| (side_id, claim)),
                 )?;
             }
-            if level == DiscoveryAdvertiseLevel::MinimalPing {
+            if level == DiscoveryAdvertiseLevel::MinimalPing
+                || (!self.cfg.role.local_services()
+                    && (!endpoints.is_empty() || level != DiscoveryAdvertiseLevel::Full))
+            {
                 let pkt = discovery::build_discovery_announce(
                     sender.as_ref(),
                     now_ms,
                     endpoints.as_slice(),
+                )?;
+                self.emit_discovery_prefix_item(
+                    RouterTxItem::ToSide {
+                        src: None,
+                        dst: side_id,
+                        data: RouterItem::Packet(pkt),
+                    },
+                    true,
+                    called_from_queue,
+                    prefix_claim.map(|claim| (side_id, claim)),
+                )?;
+            }
+            if !self.cfg.role.local_services()
+                && level != DiscoveryAdvertiseLevel::MinimalPing
+                && !timesync_sources.is_empty()
+            {
+                let pkt = discovery::build_discovery_timesync_sources(
+                    sender.as_ref(),
+                    now_ms,
+                    &timesync_sources,
                 )?;
                 self.emit_discovery_prefix_item(
                     RouterTxItem::ToSide {
@@ -8992,7 +9220,9 @@ impl Router {
                 .iter()
                 .filter(|ty| Self::managed_variable_permissions_locked(&st, **ty).write)
                 .filter_map(|ty| {
-                    st.managed_variable_latest
+                    st.local_services
+                        .as_ref()?
+                        .managed_variable_latest
                         .get(&ty.as_u32())
                         .map(|entry| entry.packet.clone())
                 })
@@ -10632,7 +10862,7 @@ impl Router {
         }
         let local_hash = Self::sender_hash(self.sender_arc().as_ref());
         let st = self.state.lock();
-        if st.managed_variable_types.contains(&ty.as_u32())
+        if st.is_managed_variable(ty.as_u32())
             || Self::has_explicit_route_policy_locked(&st, Some(side), ty)
         {
             return false;
@@ -10942,6 +11172,7 @@ impl Router {
                     Ok(Some((address, payload))) => {
                         self.refresh_peer_liveness(side, address);
                         self.refresh_known_address_payload(payload, side)
+                            .map(|known| known && self.cfg.role.local_services())
                     }
                     Ok(None) => Ok(false),
                     Err(error) => Err(error),
@@ -11076,6 +11307,9 @@ impl Router {
                  * Drop this compact frame without tearing down the transport;
                  * the sender periodically emits a full refresh. */
                 let Some(template) = template else {
+                    if !self.cfg.role.local_services() {
+                        return Err(TelemetryError::Unpack("unknown side compact template"));
+                    }
                     return Ok(None);
                 };
                 // The wrapper CRC and known template identify this peer even
@@ -11627,8 +11861,16 @@ impl Router {
 
     #[cfg(feature = "timesync")]
     fn refresh_timesync_state(&self, now_mono_ms: u64) {
+        if self.timesync.is_none() {
+            return;
+        }
+
         let now_mono_ns = self.monotonic_now_ns();
-        let mut st = self.timesync.lock();
+        let mut st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         st.clock.prune_expired(now_mono_ms);
         let timeout_ms = st.cfg.map(|cfg| cfg.source_timeout_ms).unwrap_or(0);
         st.remote_sources
@@ -11663,9 +11905,17 @@ impl Router {
         time: PartialNetworkTime,
         ttl_ms: Option<u64>,
     ) {
+        if self.timesync.is_none() {
+            return;
+        }
+
         let now_ms = self.monotonic_now_ms();
         let now_ns = self.monotonic_now_ns();
-        let mut st = self.timesync.lock();
+        let mut st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         st.clock
             .update_source(source, priority, time, now_ms, now_ns, ttl_ms);
         if let Some(unix_ms) = time.to_network_time().and_then(|t| t.as_unix_ms()) {
@@ -11681,9 +11931,17 @@ impl Router {
         time: PartialNetworkTime,
         ttl_ms: Option<u64>,
     ) {
+        if self.timesync.is_none() {
+            return;
+        }
+
         let observed_mono_ms = self.monotonic_now_ms();
         let observed_mono_ns = self.monotonic_now_ns();
-        let mut st = self.timesync.lock();
+        let mut st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         let commit_mono_ms = self.monotonic_now_ms();
         let commit_mono_ns = self.monotonic_now_ns();
         let adjusted = if let Some(base) = time.to_network_time() {
@@ -11711,17 +11969,33 @@ impl Router {
 
     #[cfg(feature = "timesync")]
     fn local_network_time_priority(&self) -> u64 {
-        let st = self.timesync.lock();
+        if self.timesync.is_none() {
+            return 0;
+        }
+
+        let st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         st.cfg.map(|cfg| cfg.priority).unwrap_or(0)
     }
 
     #[cfg(feature = "timesync")]
     /// Sets the local node's network time using any combination of date, time, and sub-second fields.
     pub fn set_local_network_time(&self, time: PartialNetworkTime) {
+        if self.timesync.is_none() {
+            return;
+        }
+
         let priority = self.local_network_time_priority();
         if time.is_complete_date() && time.is_complete_time() {
             self.set_network_time_source_impl(LOCAL_TIMESYNC_FULL_SOURCE_ID, priority, time, None);
-            let mut st = self.timesync.lock();
+            let mut st = self
+                .timesync
+                .as_ref()
+                .expect("local time service enabled")
+                .lock();
             st.clock.remove_source(LOCAL_TIMESYNC_DATE_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_TOD_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_SUBSEC_SOURCE_ID);
@@ -11729,7 +12003,11 @@ impl Router {
         }
 
         {
-            let mut st = self.timesync.lock();
+            let mut st = self
+                .timesync
+                .as_ref()
+                .expect("local time service enabled")
+                .lock();
             st.clock.remove_source(LOCAL_TIMESYNC_FULL_SOURCE_ID);
         }
 
@@ -11778,7 +12056,15 @@ impl Router {
     #[cfg(feature = "timesync")]
     /// Removes all locally supplied network-time fragments from the assembled clock.
     pub fn clear_local_network_time(&self) {
-        let mut st = self.timesync.lock();
+        if self.timesync.is_none() {
+            return;
+        }
+
+        let mut st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         st.clock.remove_source(LOCAL_TIMESYNC_FULL_SOURCE_ID);
         st.clock.remove_source(LOCAL_TIMESYNC_DATE_SOURCE_ID);
         st.clock.remove_source(LOCAL_TIMESYNC_TOD_SOURCE_ID);
@@ -11926,14 +12212,30 @@ impl Router {
     #[cfg(feature = "timesync")]
     /// Removes a previously registered named network-time source.
     pub fn clear_network_time_source(&self, source: &str) {
-        let mut st = self.timesync.lock();
+        if self.timesync.is_none() {
+            return;
+        }
+
+        let mut st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         st.clock.remove_source(source);
     }
 
     #[cfg(feature = "timesync")]
     /// Replaces the active time sync configuration and resets runtime state derived from it.
     pub fn set_timesync_config(&self, cfg: Option<TimeSyncConfig>) {
-        let mut st = self.timesync.lock();
+        if self.timesync.is_none() {
+            return;
+        }
+
+        let mut st = self
+            .timesync
+            .as_ref()
+            .expect("local time service enabled")
+            .lock();
         let stale_remote_sources: Vec<String> = st.remote_sources.keys().cloned().collect();
         st.cfg = cfg;
         st.tracker = cfg.map(TimeSyncTracker::new);
@@ -11959,10 +12261,12 @@ impl Router {
     #[cfg(feature = "timesync")]
     /// Returns the best currently known network-time reading, if any.
     pub fn network_time(&self) -> Option<NetworkTimeReading> {
+        let runtime = self.timesync.as_ref()?;
+
         let now_ms = self.monotonic_now_ms();
         let now_ns = self.monotonic_now_ns();
         self.refresh_timesync_state(now_ms);
-        let st = self.timesync.lock();
+        let st = runtime.lock();
         if let Some(unix_ms) = st.disciplined_clock.read_unix_ms(now_ns) {
             return Some(NetworkTimeReading {
                 time: PartialNetworkTime::from_unix_ms(unix_ms),
@@ -12045,6 +12349,10 @@ impl Router {
     #[cfg(feature = "timesync")]
     /// Runs one time sync maintenance cycle and queues any required announce or request packets.
     pub fn poll_timesync(&self) -> TelemetryResult<bool> {
+        if self.timesync.is_none() {
+            return Ok(false);
+        }
+
         let now_ms = self.monotonic_now_ms();
         let now_ns = self.monotonic_now_ns();
         let mut queued_any = false;
@@ -12052,7 +12360,11 @@ impl Router {
         let mut request = None;
 
         {
-            let mut st = self.timesync.lock();
+            let mut st = self
+                .timesync
+                .as_ref()
+                .expect("local time service enabled")
+                .lock();
             st.clock.prune_expired(now_ms);
             let timeout_ms = st.cfg.map(|cfg| cfg.source_timeout_ms).unwrap_or(0);
             st.remote_sources
@@ -12140,7 +12452,11 @@ impl Router {
         let mut poll_after = false;
 
         {
-            let mut st = self.timesync.lock();
+            let mut st = self
+                .timesync
+                .as_ref()
+                .expect("local time service enabled")
+                .lock();
             st.clock.prune_expired(now_mono_ms);
             let timeout_ms = st.cfg.map(|cfg| cfg.source_timeout_ms).unwrap_or(0);
             st.remote_sources
@@ -12275,7 +12591,8 @@ impl Router {
         #[cfg(feature = "discovery")]
         let preferred_discovery_master = cfg.preferred_discovery_master.clone();
         let memory = cfg.memory_config();
-        let hostname: Arc<str> = Arc::from(cfg.sender());
+        let local_services_enabled = cfg.role.local_services();
+        let hostname: Arc<str> = cfg.configured_sender();
         let address_mode = cfg.address_mode();
         let instance_seq = u64::from(ROUTER_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed));
         let owner_hash = Self::sender_hash(hostname.as_ref()) ^ instance_seq;
@@ -12295,12 +12612,16 @@ impl Router {
             last_seen_ms: clock.now_ms(),
         };
         let mut address_book = BTreeMap::new();
-        address_book.insert(hostname.to_string(), local_address.clone());
+        if local_services_enabled {
+            address_book.insert(hostname.to_string(), local_address.clone());
+        }
         let mut address_by_value = BTreeMap::new();
-        address_by_value.insert(address, hostname.to_string());
+        if local_services_enabled {
+            address_by_value.insert(address, hostname.to_string());
+        }
         Self {
             sender: RouterMutex::new(hostname),
-            cfg,
+            cfg: ActiveRoutingConfig::new(cfg),
             state: RouterMutex::new(RouterInner {
                 #[cfg(feature = "compression")]
                 codec_reserved_bytes: 0,
@@ -12315,17 +12636,21 @@ impl Router {
                 adaptive_route_stats: Default::default(),
                 side_runtime_stats: Default::default(),
                 side_transport: Default::default(),
-                managed_variable_types: BTreeSet::new(),
-                managed_variable_permissions: Default::default(),
-                managed_variable_latest: Default::default(),
-                network_variable_update_handlers: Default::default(),
+                local_services: local_services_enabled.then(|| {
+                    Box::new(LocalServicesState {
+                        managed_variable_types: BTreeSet::new(),
+                        managed_variable_permissions: Default::default(),
+                        managed_variable_latest: Default::default(),
+                        network_variable_update_handlers: Default::default(),
+                        p2p_port_handlers: Default::default(),
+                        p2p_stream_handlers: Default::default(),
+                        p2p_stream_sessions: Default::default(),
+                        next_p2p_stream_id: 1,
+                    })
+                }),
                 local_address,
                 address_book,
                 address_by_value,
-                p2p_port_handlers: Default::default(),
-                p2p_stream_handlers: Default::default(),
-                p2p_stream_sessions: Default::default(),
-                next_p2p_stream_id: 1,
                 received_queue: BoundedDeque::new(
                     memory.max_queue_budget,
                     memory.starting_queue_size,
@@ -12349,6 +12674,7 @@ impl Router {
                 reliable_rx: Default::default(),
                 reliable_return_routes: Default::default(),
                 reliable_return_route_order: VecDeque::new(),
+                forwarded_receipts: None,
                 end_to_end_reliable_tx: Default::default(),
                 end_to_end_reliable_tx_order: VecDeque::new(),
                 total_handler_failures: 0,
@@ -12366,11 +12692,13 @@ impl Router {
                 #[cfg(all(feature = "discovery", feature = "timesync"))]
                 timesync_side_throttle: Default::default(),
             }),
-            isr_rx_queue: IsrRxQueue::new(
-                memory.max_queue_budget,
-                memory.starting_queue_size,
-                memory.queue_grow_step,
-            ),
+            isr_rx_queue: local_services_enabled.then(|| {
+                Box::new(IsrRxQueue::new(
+                    memory.max_queue_budget,
+                    memory.starting_queue_size,
+                    memory.queue_grow_step,
+                ))
+            }),
             #[cfg(not(feature = "std"))]
             side_tx_gate: ReentryGate::new(),
             #[cfg(feature = "std")]
@@ -12379,7 +12707,8 @@ impl Router {
             active_queued_tx: core::sync::atomic::AtomicUsize::new(0),
             clock,
             #[cfg(feature = "timesync")]
-            timesync: RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)),
+            timesync: local_services_enabled
+                .then(|| Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)))),
         }
     }
 
@@ -12506,7 +12835,10 @@ impl Router {
             return Err(TelemetryError::BadArg);
         }
         let mut st = self.state.lock();
-        st.p2p_port_handlers
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .p2p_port_handlers
             .entry(port)
             .or_default()
             .push(P2pPortHandler {
@@ -12516,7 +12848,13 @@ impl Router {
     }
 
     pub fn clear_p2p_port(&self, port: P2pPort) {
-        self.state.lock().p2p_port_handlers.remove(&port);
+        self.state
+            .lock()
+            .local_services
+            .as_mut()
+            .expect("local services enabled")
+            .p2p_port_handlers
+            .remove(&port);
     }
 
     pub fn bind_p2p_stream_port<F>(&self, port: P2pPort, f: F) -> TelemetryResult<()>
@@ -12527,7 +12865,10 @@ impl Router {
             return Err(TelemetryError::BadArg);
         }
         let mut st = self.state.lock();
-        st.p2p_stream_handlers
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .p2p_stream_handlers
             .entry(port)
             .or_default()
             .push(P2pStreamHandler {
@@ -12537,7 +12878,13 @@ impl Router {
     }
 
     pub fn clear_p2p_stream_port(&self, port: P2pPort) {
-        self.state.lock().p2p_stream_handlers.remove(&port);
+        self.state
+            .lock()
+            .local_services
+            .as_mut()
+            .expect("local services enabled")
+            .p2p_stream_handlers
+            .remove(&port);
     }
 
     fn send_p2p_to_entry(
@@ -12615,18 +12962,22 @@ impl Router {
             if stream_id == 0 {
                 return Err(TelemetryError::Io("p2p stream id exhausted"));
             }
-            st.p2p_stream_sessions.insert(
-                stream_id,
-                P2pStreamSession {
-                    peer_hostname: dst.hostname.clone(),
-                    peer_address: dst.address,
-                    local_port: src_port,
-                    peer_port: dst_port,
-                    peer_stream_id: 0,
-                    next_sequence: 1,
-                    connected: false,
-                },
-            );
+            st.local_services
+                .as_mut()
+                .expect("local services enabled")
+                .p2p_stream_sessions
+                .insert(
+                    stream_id,
+                    P2pStreamSession {
+                        peer_hostname: dst.hostname.clone(),
+                        peer_address: dst.address,
+                        local_port: src_port,
+                        peer_port: dst_port,
+                        peer_stream_id: 0,
+                        next_sequence: 1,
+                        connected: false,
+                    },
+                );
             stream_id
         };
         let payload = Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
@@ -12666,7 +13017,13 @@ impl Router {
     ) -> TelemetryResult<()> {
         let (dst, dst_port, src_port, peer_stream_id, seq, refresh_syn) = {
             let mut st = self.state.lock();
-            let Some(session) = st.p2p_stream_sessions.get_mut(&stream_id) else {
+            let Some(session) = st
+                .local_services
+                .as_mut()
+                .expect("local services enabled")
+                .p2p_stream_sessions
+                .get_mut(&stream_id)
+            else {
                 return Err(TelemetryError::BadArg);
             };
             let peer_hostname = session.peer_hostname.clone();
@@ -12701,7 +13058,13 @@ impl Router {
             Self::encode_p2p_stream_payload(flags, stream_id, peer_stream_id, seq, payload)?;
         self.send_p2p_to_entry(dst, dst_port, src_port, &stream_payload)?;
         if flags & (P2P_STREAM_FIN | P2P_STREAM_RST) != 0 {
-            self.state.lock().p2p_stream_sessions.remove(&stream_id);
+            self.state
+                .lock()
+                .local_services
+                .as_mut()
+                .expect("local services enabled")
+                .p2p_stream_sessions
+                .remove(&stream_id);
         }
         Ok(())
     }
@@ -12720,6 +13083,12 @@ impl Router {
 
     pub fn set_sender<S: AsRef<str>>(&self, sender: S) {
         let hostname: Arc<str> = Arc::from(sender.as_ref());
+        if !self.cfg.role.local_services() {
+            // A transparent relay renames its protocol sender without claiming
+            // a local application address or changing accepted wire owners.
+            *self.sender.lock() = hostname;
+            return;
+        }
         let mut st = self.state.lock();
         let mut local = st.local_address.clone();
         local.hostname = hostname.clone();
@@ -12992,8 +13361,10 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
         }
-        let mut isr_rx = self.isr_rx_queue.try_lock()?;
-        isr_rx.retain(|queued| queued.src != Some(side));
+        if let Some(queue) = self.isr_rx_queue.as_ref() {
+            let mut isr_rx = queue.try_lock()?;
+            isr_rx.retain(|queued| queued.src != Some(side));
+        }
         Ok(())
     }
 
@@ -13327,10 +13698,22 @@ impl Router {
         }
         let mut st = self.state.lock();
         #[cfg(feature = "discovery")]
-        let newly_advertised = st.managed_variable_types.insert(ty.as_u32());
+        let newly_advertised = st
+            .local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_types
+            .insert(ty.as_u32());
         #[cfg(not(feature = "discovery"))]
-        st.managed_variable_types.insert(ty.as_u32());
-        st.managed_variable_permissions
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_types
+            .insert(ty.as_u32());
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_permissions
             .insert(ty.as_u32(), permissions);
         #[cfg(feature = "discovery")]
         if newly_advertised {
@@ -13353,10 +13736,22 @@ impl Router {
         }
         let mut st = self.state.lock();
         #[cfg(feature = "discovery")]
-        let newly_advertised = st.managed_variable_types.insert(ty.as_u32());
+        let newly_advertised = st
+            .local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_types
+            .insert(ty.as_u32());
         #[cfg(not(feature = "discovery"))]
-        st.managed_variable_types.insert(ty.as_u32());
-        st.network_variable_update_handlers
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_types
+            .insert(ty.as_u32());
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .network_variable_update_handlers
             .entry(ty.as_u32())
             .or_default()
             .push(NetworkVariableUpdateHandler {
@@ -13372,12 +13767,33 @@ impl Router {
     pub fn disable_managed_variable(&self, ty: DataType) {
         let mut st = self.state.lock();
         #[cfg(feature = "discovery")]
-        let was_advertised = st.managed_variable_types.remove(&ty.as_u32());
+        let was_advertised = st
+            .local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_types
+            .remove(&ty.as_u32());
         #[cfg(not(feature = "discovery"))]
-        st.managed_variable_types.remove(&ty.as_u32());
-        st.managed_variable_permissions.remove(&ty.as_u32());
-        st.managed_variable_latest.remove(&ty.as_u32());
-        st.network_variable_update_handlers.remove(&ty.as_u32());
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_types
+            .remove(&ty.as_u32());
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_permissions
+            .remove(&ty.as_u32());
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .managed_variable_latest
+            .remove(&ty.as_u32());
+        st.local_services
+            .as_mut()
+            .expect("local services enabled")
+            .network_variable_update_handlers
+            .remove(&ty.as_u32());
         #[cfg(feature = "discovery")]
         if was_advertised {
             Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
@@ -13392,9 +13808,18 @@ impl Router {
         {
             let mut st = self.state.lock();
             #[cfg(feature = "discovery")]
-            let newly_advertised = st.managed_variable_types.insert(pkt.data_type().as_u32());
+            let newly_advertised = st
+                .local_services
+                .as_mut()
+                .expect("local services enabled")
+                .managed_variable_types
+                .insert(pkt.data_type().as_u32());
             #[cfg(not(feature = "discovery"))]
-            st.managed_variable_types.insert(pkt.data_type().as_u32());
+            st.local_services
+                .as_mut()
+                .expect("local services enabled")
+                .managed_variable_types
+                .insert(pkt.data_type().as_u32());
             #[cfg(feature = "discovery")]
             if newly_advertised {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
@@ -13420,7 +13845,11 @@ impl Router {
         let ty = pkt.data_type();
         {
             let mut st = self.state.lock();
-            st.managed_variable_types.insert(ty.as_u32());
+            st.local_services
+                .as_mut()
+                .expect("local services enabled")
+                .managed_variable_types
+                .insert(ty.as_u32());
             let perms = Self::managed_variable_permissions_locked(&st, ty);
             if !perms.write {
                 return Err(TelemetryError::PermissionDenied);
@@ -13457,7 +13886,11 @@ impl Router {
         }
         {
             let mut st = self.state.lock();
-            st.managed_variable_types.insert(ty.as_u32());
+            st.local_services
+                .as_mut()
+                .expect("local services enabled")
+                .managed_variable_types
+                .insert(ty.as_u32());
             let perms = Self::managed_variable_permissions_locked(&st, ty);
             if !perms.read {
                 return Err(TelemetryError::PermissionDenied);
@@ -13702,9 +14135,18 @@ impl Router {
 
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
         let now_ms = self.clock.now_ms();
-        let isr_rx = self.isr_rx_queue.snapshot().unwrap_or((0, 0));
+        let isr_rx = self
+            .isr_rx_queue
+            .as_ref()
+            .and_then(|queue| queue.snapshot())
+            .unwrap_or((0, 0));
         let st = self.state.lock();
 
+        let (replay_len, replay_bytes) = if self.cfg.role.local_services() {
+            (0, 0)
+        } else {
+            st.replay_counters()
+        };
         let mut sides = Vec::new();
         for (side_id, side) in st.sides.iter().enumerate() {
             let Some(side) = side.as_ref() else { continue };
@@ -13903,10 +14345,10 @@ impl Router {
             queues: QueueRuntimeStats {
                 rx_len: isr_rx.0.saturating_add(st.received_queue.len()),
                 rx_bytes: isr_rx.1.saturating_add(st.received_queue.bytes_used()),
-                tx_len: st.transmit_queue.len(),
-                tx_bytes: st.transmit_queue.bytes_used(),
-                replay_len: 0,
-                replay_bytes: 0,
+                tx_len: st.transmit_queue.len().saturating_sub(replay_len),
+                tx_bytes: st.transmit_queue.bytes_used().saturating_sub(replay_bytes),
+                replay_len,
+                replay_bytes,
                 recent_rx_len: st.recent_rx.len(),
                 recent_rx_bytes: st.recent_rx.bytes_used(),
                 reliable_rx_buffered_len: st.reliable_rx_buffer_len(),
@@ -13921,7 +14363,10 @@ impl Router {
                     .values()
                     .map(|sent| sent.pending_destinations.len())
                     .sum(),
-                end_to_end_acked_cache_count: 0,
+                end_to_end_acked_cache_count: st
+                    .forwarded_receipts
+                    .as_ref()
+                    .map_or(0, |cache| cache.destinations.len()),
             },
             discovery,
             total_handler_failures: st.total_handler_failures,
@@ -13995,8 +14440,8 @@ impl Router {
     pub fn has_queued_work(&self) -> bool {
         if self
             .isr_rx_queue
-            .try_lock()
-            .map_or(true, |queue| !queue.is_empty())
+            .as_ref()
+            .is_some_and(|queue| queue.try_lock().map_or(true, |queue| !queue.is_empty()))
         {
             return true;
         }
@@ -14131,11 +14576,7 @@ impl Router {
             .values()
             .map(|side| side.data_types.len())
             .sum::<usize>();
-        let managed = st
-            .managed_variable_latest
-            .values()
-            .map(|entry| entry.packet.byte_cost())
-            .sum::<usize>();
+        let managed = st.local_cache_bytes();
         let pending = st
             .end_to_end_reliable_tx
             .values()
@@ -14173,33 +14614,44 @@ impl Router {
 
     /// Export current router memory usage/layout as JSON for profiling.
     pub fn export_memory_layout_json(&self) -> String {
-        let isr_rx = self.isr_rx_queue.snapshot().unwrap_or((0, 0));
+        let isr_rx = self
+            .isr_rx_queue
+            .as_ref()
+            .and_then(|queue| queue.snapshot())
+            .unwrap_or((0, 0));
         let st = self.state.lock();
         #[cfg(feature = "discovery")]
         let discovery_bytes = st.discovery_bytes_used();
         #[cfg(not(feature = "discovery"))]
         let discovery_bytes = 0usize;
         let schema_bytes = crate::config::schema_bytes_used();
-        let network_variable_cache_bytes = st
-            .managed_variable_latest
-            .values()
-            .map(|entry| entry.packet.byte_cost())
-            .sum::<usize>();
+        let network_variable_cache_bytes = st.local_cache_bytes();
+        let (replay_len, replay_bytes) = if self.cfg.role.local_services() {
+            (0, 0)
+        } else {
+            st.replay_counters()
+        };
         let mut out = String::new();
         let memory = st.memory;
         let _ = fmt::Write::write_fmt(
             &mut out,
             format_args!(
-                "{{\"kind\":\"router\",\
+                "{{\"kind\":\"{}\",\
                  \"shared_queue_bytes_used\":{},\"shared_queue_bytes_allocated\":{},\
                  \"rx_queue_bytes_used\":{},\"rx_queue_bytes_allocated\":{},\"rx_queue_len\":{},\
                  \"isr_rx_queue_bytes_used\":{},\"isr_rx_queue_bytes_allocated\":{},\"isr_rx_queue_len\":{},\
                  \"tx_queue_bytes_used\":{},\"tx_queue_bytes_allocated\":{},\"tx_queue_len\":{},\
+                 \"replay_queue_bytes_used\":{},\"replay_queue_bytes_allocated\":{},\"replay_queue_len\":{},\
                  \"recent_rx_bytes_used\":{},\"recent_rx_bytes_allocated\":{},\"recent_rx_len\":{},\
                  \"reliable_rx_buffer_bytes_used\":{},\"reliable_rx_buffer_bytes_allocated\":{},\"reliable_rx_buffer_len\":{},\
                  \"discovery_bytes_used\":{},\"discovery_bytes_allocated\":{},\
                  \"schema_bytes_used\":{},\"schema_bytes_allocated\":{},\
                  \"network_variable_cache_bytes_used\":{},\"network_variable_cache_bytes_allocated\":{},\"network_variable_cache_len\":{}}}",
+                if self.cfg.role.local_services() {
+                    "router"
+                } else {
+                    "relay"
+                },
                 st.shared_queue_bytes_used(),
                 memory.max_queue_budget,
                 st.received_queue.bytes_used(),
@@ -14208,9 +14660,12 @@ impl Router {
                 isr_rx.1,
                 memory.max_queue_budget,
                 isr_rx.0,
-                st.transmit_queue.bytes_used(),
+                st.transmit_queue.bytes_used().saturating_sub(replay_bytes),
                 st.transmit_queue.max_bytes(),
-                st.transmit_queue.len(),
+                st.transmit_queue.len().saturating_sub(replay_len),
+                replay_bytes,
+                memory.max_queue_budget,
+                replay_len,
                 st.recent_rx.bytes_used(),
                 st.recent_rx.max_bytes(),
                 st.recent_rx.len(),
@@ -14223,7 +14678,7 @@ impl Router {
                 memory.max_queue_budget,
                 network_variable_cache_bytes,
                 memory.max_queue_budget,
-                st.managed_variable_latest.len(),
+                st.local_cache_len(),
             ),
         );
         out
@@ -14339,6 +14794,10 @@ impl Router {
         e: TelemetryError,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
+        if !self.cfg.role.local_services() {
+            return Err(e);
+        }
+
         // Allocator refusal is backpressure, not a diagnostic packet. Even
         // formatting an error string can exhaust the remaining small blocks.
         if matches!(&e, TelemetryError::Io("memory pressure")) {
@@ -14441,7 +14900,7 @@ impl Router {
         st.received_queue.clear();
         st.rx_priority_burst = 0;
         drop(st);
-        let _ = self.isr_rx_queue.clear();
+        let _ = self.isr_rx_queue.as_ref().map(|queue| queue.clear());
     }
 
     /// Clear only the receive queue without processing.
@@ -14451,7 +14910,7 @@ impl Router {
         st.received_queue.clear();
         st.rx_priority_burst = 0;
         drop(st);
-        let _ = self.isr_rx_queue.clear();
+        let _ = self.isr_rx_queue.as_ref().map(|queue| queue.clear());
     }
 
     /// Clear queued TX without processing; retained reliable delivery can retry later.
@@ -14603,10 +15062,14 @@ impl Router {
         self.expire_side_chunks();
         let start = self.clock.now_ms();
         loop {
-            let item_opt = self.isr_rx_queue.pop_front().unwrap_or(None).or_else(|| {
-                let mut st = self.state.lock();
-                st.pop_received_fair()
-            });
+            let item_opt = self
+                .isr_rx_queue
+                .as_ref()
+                .and_then(|queue| queue.pop_front().unwrap_or(None))
+                .or_else(|| {
+                    let mut st = self.state.lock();
+                    st.pop_received_fair()
+                });
             let Some(item) = item_opt else { break };
             self.process_rx_queue_item(item)?;
             if timeout_ms != 0 && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
@@ -14628,12 +15091,26 @@ impl Router {
 
     /// Process both transmit and receive queues for up to `timeout_ms` milliseconds.
     /// If `timeout_ms == 0`, drains both queues fully.
+    fn process_one_queued_rx(&self) -> TelemetryResult<bool> {
+        let item = self
+            .isr_rx_queue
+            .as_ref()
+            .and_then(|queue| queue.pop_front().unwrap_or(None))
+            .or_else(|| self.state.lock().pop_received_fair());
+        let Some(item) = item else {
+            return Ok(false);
+        };
+        self.process_rx_queue_item(item)?;
+        Ok(true)
+    }
+
     fn process_all_queues_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
         self.expire_side_chunks();
         // Share the deadline between directions. Splitting a 1 ms budget in
         // half rounded TX down to zero and serviced only one transmit item,
         // even when the remainder of the pass was idle. One TX/RX pair is
         // atomic for fairness; a slow handler may overrun the deadline.
+        let receive_first = !self.cfg.role.local_services();
         let start = self.clock.now_ms();
         loop {
             let received_control = crate::memory_admission::allow_drain(
@@ -14646,6 +15123,10 @@ impl Router {
             if !control_budget_used {
                 crate::memory_admission::allow_drain(self.process_reliable_timeouts())?;
                 crate::memory_admission::allow_drain(self.process_end_to_end_reliable_timeouts())?;
+            }
+
+            if receive_first && !control_budget_used {
+                did_any |= self.process_one_queued_rx()?;
             }
 
             if let Some(pkt) = {
@@ -14667,12 +15148,8 @@ impl Router {
             if control_budget_used {
                 return Ok(());
             }
-            if let Some(item) = self.isr_rx_queue.pop_front().unwrap_or(None).or_else(|| {
-                let mut st = self.state.lock();
-                st.pop_received_fair()
-            }) {
-                self.process_rx_queue_item(item)?;
-                did_any = true;
+            if !receive_first {
+                did_any |= self.process_one_queued_rx()?;
             }
             if !did_any
                 || (timeout_ms != 0
@@ -14979,6 +15456,7 @@ impl Router {
         Ok(())
     }
 
+    #[cfg(feature = "discovery")]
     #[allow(unused_mut)]
     fn replace_claim_payload(&self, claim: TxClaim, mut data: RouterItem) -> TelemetryResult<()> {
         #[cfg(feature = "compact-packet-store")]
@@ -15157,11 +15635,14 @@ impl Router {
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
-        self.isr_rx_queue.push_back_prioritized(RouterRxItem {
-            src: None,
-            data,
-            priority,
-        })
+        self.isr_rx_queue
+            .as_ref()
+            .ok_or(TelemetryError::PermissionDenied)?
+            .push_back_prioritized(RouterRxItem {
+                src: None,
+                data,
+                priority,
+            })
     }
 
     /// Enqueue a decoded packet for RX processing as locally-originated input.
@@ -15188,11 +15669,14 @@ impl Router {
         pkt.validate()?;
         let data = RouterItem::Packet(pkt);
         let priority = Self::router_item_priority(&data)?;
-        self.isr_rx_queue.push_back_prioritized(RouterRxItem {
-            src: None,
-            data,
-            priority,
-        })
+        self.isr_rx_queue
+            .as_ref()
+            .ok_or(TelemetryError::PermissionDenied)?
+            .push_back_prioritized(RouterRxItem {
+                src: None,
+                data,
+                priority,
+            })
     }
 
     /// Enqueue a decoded packet for RX processing with an explicit ingress side.
@@ -15221,11 +15705,14 @@ impl Router {
         pkt.validate()?;
         let data = RouterItem::Packet(pkt);
         let priority = Self::router_item_priority(&data)?;
-        self.isr_rx_queue.push_back_prioritized(RouterRxItem {
-            src: Some(side),
-            data,
-            priority,
-        })
+        self.isr_rx_queue
+            .as_ref()
+            .ok_or(TelemetryError::PermissionDenied)?
+            .push_back_prioritized(RouterRxItem {
+                src: Some(side),
+                data,
+                priority,
+            })
     }
 
     /// Enqueue packed bytes for RX processing with an explicit ingress side.
@@ -15264,11 +15751,14 @@ impl Router {
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
-        self.isr_rx_queue.push_back_prioritized(RouterRxItem {
-            src: Some(side),
-            data,
-            priority,
-        })
+        self.isr_rx_queue
+            .as_ref()
+            .ok_or(TelemetryError::PermissionDenied)?
+            .push_back_prioritized(RouterRxItem {
+                src: Some(side),
+                data,
+                priority,
+            })
     }
 
     fn retry_with_attempts<F, T>(
@@ -15279,6 +15769,11 @@ impl Router {
     where
         F: Fn() -> TelemetryResult<T>,
     {
+        let times = if self.cfg.role.local_services() {
+            times
+        } else {
+            times.min(1)
+        };
         let mut last_err = None;
         for attempt in 0..times {
             match f() {
@@ -15296,7 +15791,7 @@ impl Router {
     #[inline]
     fn endpoint_has_packet_handler(&self, ep: DataEndpoint) -> bool {
         self.cfg
-            .handlers
+            .handlers()
             .iter()
             .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Packet(_)))
     }
@@ -15305,7 +15800,7 @@ impl Router {
     #[inline]
     fn endpoint_has_packed_handler(&self, ep: DataEndpoint) -> bool {
         self.cfg
-            .handlers
+            .handlers()
             .iter()
             .any(|h| h.endpoint == ep && matches!(h.handler, EndpointHandlerFn::Packed(_)))
     }
@@ -15402,6 +15897,10 @@ impl Router {
         e: TelemetryError,
         called_from_queue: bool,
     ) -> TelemetryResult<()> {
+        if !self.cfg.role.local_services() {
+            return Err(e);
+        }
+
         // Allocator refusal is backpressure, not a diagnostic packet. Even
         // formatting an error string can exhaust the remaining small blocks.
         if matches!(&e, TelemetryError::Io("memory pressure")) {
@@ -15481,6 +15980,18 @@ impl Router {
         if Self::is_end_to_end_ack_packet(pkt)
             && let Ok(packet_id) = Self::decode_end_to_end_reliable_ack(pkt.payload())
         {
+            let targets_local_sender = self.cfg.role.local_services()
+                && (pkt.wire_target_senders().is_empty()
+                    || pkt
+                        .wire_target_senders()
+                        .contains(&Self::sender_hash(self.sender_arc().as_ref())));
+            if !targets_local_sender && let Some(owner) = Self::end_to_end_ack_sender_hash(pkt) {
+                Self::note_end_to_end_acked_destination_locked(
+                    &mut self.state.lock(),
+                    packet_id,
+                    owner,
+                );
+            }
             let alias = {
                 let st = self.state.lock();
                 st.reliable_return_routes
@@ -15542,10 +16053,6 @@ impl Router {
             // router; it still has to travel back along the learned return
             // route. This occurs when a router is itself one managed-variable
             // owner while additional owners sit behind another side.
-            let targets_local_sender = pkt.wire_target_senders().is_empty()
-                || pkt
-                    .wire_target_senders()
-                    .contains(&Self::sender_hash(self.sender_arc().as_ref()));
             let mut st = self.state.lock();
             if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&packet_id) {
                 if sent.waiting_for_predecessor {
@@ -15860,13 +16367,40 @@ impl Router {
         }
 
         if self.is_duplicate_pkt(&item.data)? {
+            #[cfg(feature = "discovery")]
+            let shared_pending = if item.src.is_some()
+                // SDK protocols use reliable transport too, but their echoed
+                // identities are not outstanding application-owner retries.
+                // Re-forwarding catalogs here lets parallel bridges amplify
+                // the same packet without bound.
+                && Self::item_data_type(&item.data).is_ok_and(|ty| {
+                    is_reliable_type(ty) && !is_internal_control_type(ty)
+                })
+                && self.item_target_senders(&item.data)?.is_empty()
+            {
+                let RemoteSidePlan::Target(sides) =
+                    self.remote_side_plan_with_selection(&item.data, item.src, false)?;
+                let st = self.state.lock();
+                sides.into_iter().any(|side| {
+                    self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms())
+                })
+            } else {
+                false
+            };
+            #[cfg(not(feature = "discovery"))]
+            let shared_pending = false;
+            if shared_pending {
+                self.relay_send(item.data.clone(), item.src, called_from_queue)?;
+            }
+
             // A final-ACK retry must cross a router again. Do not redeliver it
             // locally, and rate-limit repeated forwarding to avoid echo loops.
-            if (item.src.is_some() && self.item_targets_another_sender(&item.data)?)
-                || (item.src.is_some() && self.should_route_remote(&item.data, item.src)? && {
-                    let (endpoints, _) = self.item_route_info(&item.data)?;
-                    self.item_targets_router_as_intermediate_hop(&item.data, &endpoints)?
-                })
+            if !shared_pending
+                && ((item.src.is_some() && self.item_targets_another_sender(&item.data)?)
+                    || (item.src.is_some() && self.should_route_remote(&item.data, item.src)? && {
+                        let (endpoints, _) = self.item_route_info(&item.data)?;
+                        self.item_targets_router_as_intermediate_hop(&item.data, &endpoints)?
+                    }))
             {
                 let id = Self::get_hash(&item.data);
                 let replay = {
@@ -15999,8 +16533,10 @@ impl Router {
                     // schedules this Router's own aggregated, split-horizon
                     // snapshot; transparently relaying the original packet
                     // would make a distant sender look physically adjacent.
-                    if !discovery_is_hop_local_advertisement(pkt.data_type())
-                        && self.should_route_remote(&item.data, item.src)?
+                    if !discovery_is_hop_local_advertisement(
+                        pkt.data_type(),
+                        !self.cfg.role.local_services(),
+                    ) && self.should_route_remote(&item.data, item.src)?
                     {
                         self.relay_send(
                             RouterItem::Packet(pkt.to_owned()),
@@ -16036,7 +16572,7 @@ impl Router {
                 let mut local_delivery_error = None;
                 if targets_local {
                     for dest in eps {
-                        for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
+                        for h in self.cfg.handlers().iter().filter(|h| h.endpoint == dest) {
                             let result = match (&h.handler, &bytes_opt) {
                                 (EndpointHandlerFn::Packed(_), Some(bytes)) => self
                                     .call_handler_with_retries(
@@ -16190,8 +16726,10 @@ impl Router {
                     let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     let _ = self.learn_discovery_packet(&pkt, item.src, called_from_queue)?;
-                    if !discovery_is_hop_local_advertisement(env.ty)
-                        && self.should_route_remote(&item.data, item.src)?
+                    if !discovery_is_hop_local_advertisement(
+                        env.ty,
+                        !self.cfg.role.local_services(),
+                    ) && self.should_route_remote(&item.data, item.src)?
                     {
                         self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
                     }
@@ -16226,7 +16764,7 @@ impl Router {
                 let mut local_delivery_error = None;
                 if targets_local {
                     for dest in eps {
-                        for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
+                        for h in self.cfg.handlers().iter().filter(|h| h.endpoint == dest) {
                             let result = match &h.handler {
                                 EndpointHandlerFn::Packed(_) => self.call_handler_with_retries(
                                     dest,
@@ -16337,7 +16875,7 @@ impl Router {
                 };
 
                 for dest in eps {
-                    for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
+                    for h in self.cfg.handlers().iter().filter(|h| h.endpoint == dest) {
                         match (&h.handler, &bytes_opt) {
                             (EndpointHandlerFn::Packed(_), Some(bytes)) => {
                                 self.call_handler_with_retries(
@@ -16403,7 +16941,7 @@ impl Router {
                 eps.dedup();
 
                 for dest in eps {
-                    for h in self.cfg.handlers.iter().filter(|h| h.endpoint == dest) {
+                    for h in self.cfg.handlers().iter().filter(|h| h.endpoint == dest) {
                         match &h.handler {
                             EndpointHandlerFn::Packed(_) => {
                                 self.call_handler_with_retries(
@@ -16578,11 +17116,7 @@ impl Router {
                     if !is_internal_control_type(ty)
                         && is_reliable_type(ty)
                         && has_nonlocal_endpoint(&endpoints, &self.cfg)
-                        && !self
-                            .state
-                            .lock()
-                            .managed_variable_types
-                            .contains(&ty.as_u32())
+                        && !self.state.lock().is_managed_variable(ty.as_u32())
                     {
                         // Nothing was queued or transmitted. Reporting success
                         // here loses application state during route expiry.
@@ -16798,6 +17332,9 @@ impl Router {
                             retry_priority,
                         )?;
                         return Ok(());
+                    }
+                    if !self.cfg.role.local_services() {
+                        return Err(e);
                     }
                     match &data {
                         RouterItem::Packet(pkt) => {
@@ -17023,6 +17560,33 @@ impl Router {
         self.rx_item(&item, false)
     }
 
+    fn ensure_application_origin_allowed(&self) -> TelemetryResult<()> {
+        if self.cfg.role.local_services() {
+            Ok(())
+        } else {
+            Err(TelemetryError::PermissionDenied)
+        }
+    }
+
+    #[cfg(all(test, feature = "discovery"))]
+    pub(crate) fn debug_end_to_end_acked_destination_count(&self, id: u64) -> Option<usize> {
+        self.state
+            .lock()
+            .forwarded_receipts
+            .as_ref()?
+            .destinations
+            .get(&id)
+            .map(BTreeSet::len)
+    }
+    #[cfg(all(test, feature = "discovery"))]
+    pub(crate) fn debug_end_to_end_acked_packet_count(&self) -> usize {
+        self.state
+            .lock()
+            .forwarded_receipts
+            .as_ref()
+            .map_or(0, |cache| cache.destinations.len())
+    }
+
     // ---------- PUBLIC API: TX immediate ----------
 
     /// Transmit a decoded packet immediately.
@@ -17031,6 +17595,7 @@ impl Router {
     /// from inside a side TX callback, the packet is queued instead of being sent re-entrantly.
     #[inline]
     pub fn tx(&self, pkt: Packet) -> TelemetryResult<()> {
+        self.ensure_application_origin_allowed()?;
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
@@ -17045,6 +17610,7 @@ impl Router {
     /// re-entrantly.
     #[inline]
     pub fn tx_packed(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
+        self.ensure_application_origin_allowed()?;
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
@@ -17064,12 +17630,14 @@ impl Router {
     /// Enqueueing must not serialize topology on a producer's small stack.
     #[inline]
     pub fn tx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
+        self.ensure_application_origin_allowed()?;
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
     /// Queue packed bytes for later transmission.
     #[inline]
     pub fn tx_packed_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
+        self.ensure_application_origin_allowed()?;
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(
             crate::shared_bytes::convert(data),
         )))
@@ -17088,6 +17656,7 @@ impl Router {
         timestamp: Option<u64>,
         mut queued: bool,
     ) -> TelemetryResult<()> {
+        self.ensure_application_origin_allowed()?;
         if !queued {
             #[cfg(feature = "discovery")]
             let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;

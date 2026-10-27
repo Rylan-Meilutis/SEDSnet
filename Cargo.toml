@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "4.2.7"
+version = "4.3.0"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -96,7 +96,7 @@ name = "route_selection_paths"
 harness = false
 
 [dependencies]
-sedsnet_macros = { version = "2.1.1", path = "sedsnet_macros" }
+sedsnet_macros = { version = "2.2.0", path = "sedsnet_macros" }
 crc32fast = { version = "1.5.2", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1.0.154", default-features = false, optional = true }
@@ -108,6 +108,7 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 criterion = "0.8.2"
+strum = { version = "0.28", features = ["derive"] }
 
 # Release profile for standard builds, performance optimized
 [profile.release]

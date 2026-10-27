@@ -3,7 +3,8 @@
     {
       "rust": "SoftwareBus",
       "name": "SOFTWARE_BUS",
-      "doc": "Link-local software bus endpoint for IPC between local processes."
+      "doc": "Link-local software bus endpoint for IPC between local processes.",
+      "id": 102
     }
   ],
   "types": [
@@ -18,6 +19,9 @@
       },
       "endpoints": [
         "SoftwareBus"
-      ], "reliable": "Off"}
+      ],
+      "reliable": "Off",
+      "id": 107
+    }
   ]
 }

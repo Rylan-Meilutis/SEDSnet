@@ -196,9 +196,24 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.0 highlights
+
+Candidate under qualification; package publication is pending.
+
+- Keep only network protocol identities reserved, with canonical `SEDSNET_`
+  message names. Application IDs belong to configuration, including IDs retained
+  for compatibility with existing firmware.
+- Use the shared routing engine and side configuration for Router and Relay,
+  with relay capabilities disabling local application origination and services.
+- Resolve schema identities consistently across hosted/embedded registration,
+  macro generation and Python tooling; reject conflicting definitions atomically.
+
+Read [the 4.3 migration guide](docs/migration-4.3.md) before upgrading a network.
+
 ### Version 4.2.7 highlights
 
-Qualification is in progress; this patch is not yet published.
+Version 4.2.7 is published on crates.io and PyPI. Its published artifacts remain
+unchanged; newer source changes are being qualified for 4.3.0.
 
 - Preserve every distinct destination role for best-effort multicast, including
   GPS sent to Flight Computer, SD logging and GroundStation across CAN and radio.
@@ -882,6 +897,38 @@ use sedsnet::{DataEndpoint, DataType};
 let radio = DataEndpoint::named("RADIO");
 let gps = DataType::named("GPS_DATA");
 ```
+
+Application names have no built-in wire IDs. By default, each name receives a
+stable hash in its endpoint or type namespace, independent of registration order
+or which schema subset a node has loaded. A JSON endpoint or type may instead
+supply an optional unsigned 32-bit `id` to retain an existing application wire
+contract:
+
+```json
+{
+  "endpoints": [{"rust": "Destination", "name": "CUSTOM_DESTINATION", "id": 100}],
+  "types": [{
+    "name": "CUSTOM_READING", "id": 101, "class": "Data",
+    "element": {"kind": "Dynamic", "data_type": "Binary"},
+    "endpoints": ["Destination"], "reliable": "Off"
+  }]
+}
+```
+
+Runtime loading, the embedded flash generator, and the legacy schema macro use
+the same identity rules. Only SDK protocol types 0–18 and endpoints 200–202 are
+reserved, under their canonical `SEDSNET_` names. Application names such as
+`HEARTBEAT`, `IMU_DATA`, `RADIO`, and `SOFTWARE_BUS` are ordinary configured names.
+Conflicting IDs or names are rejected; a failed JSON load or fallible schema
+merge leaves existing registrations intact. The legacy infallible merge helpers
+panic on invalid schemas; use `merge_owned_schema_snapshot_with_budget` when
+handling untrusted definitions.
+
+After loading an explicit ID, use `DataType::named` or `DataEndpoint::named` to
+retrieve that configured identity. Their `identity(name)` functions compute the
+default hash and do not look up a configured override. Deploy matching explicit
+IDs across every participant before changing a live schema; old implicit legacy
+application IDs are no longer assigned by the SDK.
 
 You can add schema entries directly:
 

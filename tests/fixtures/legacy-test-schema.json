@@ -1,0 +1,86 @@
+{
+  "endpoints": [
+    {
+      "rust": "Radio",
+      "name": "RADIO",
+      "id": 101,
+      "description": "test radio endpoint"
+    },
+    {
+      "rust": "SdCard",
+      "name": "SD_CARD",
+      "id": 100,
+      "description": "test sd endpoint"
+    }
+  ],
+  "types": [
+    {
+      "name": "GPS_DATA",
+      "id": 100,
+      "description": "shared test fixture",
+      "element": {
+        "kind": "Static",
+        "count": 3,
+        "data_type": "Float32"
+      },
+      "class": "Data",
+      "endpoints": [
+        "Radio",
+        "SdCard"
+      ],
+      "reliable": "Ordered",
+      "priority": 1
+    },
+    {
+      "name": "IMU_DATA",
+      "id": 101,
+      "description": "shared test fixture",
+      "element": {
+        "kind": "Static",
+        "count": 6,
+        "data_type": "Float32"
+      },
+      "class": "Data",
+      "endpoints": [
+        "Radio",
+        "SdCard"
+      ],
+      "reliable": "Off",
+      "priority": 1
+    },
+    {
+      "name": "BATTERY_STATUS",
+      "id": 102,
+      "description": "shared test fixture",
+      "element": {
+        "kind": "Static",
+        "count": 2,
+        "data_type": "Float32"
+      },
+      "class": "Data",
+      "endpoints": [
+        "Radio",
+        "SdCard"
+      ],
+      "reliable": "Off",
+      "priority": 1
+    },
+    {
+      "name": "HEARTBEAT",
+      "id": 106,
+      "description": "shared test fixture",
+      "element": {
+        "kind": "Static",
+        "count": 0,
+        "data_type": "NoData"
+      },
+      "class": "Data",
+      "endpoints": [
+        "Radio",
+        "SdCard"
+      ],
+      "reliable": "Off",
+      "priority": 1
+    }
+  ]
+}

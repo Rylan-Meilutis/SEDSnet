@@ -3,12 +3,14 @@
     {
       "rust": "SdCard",
       "name": "SD_CARD",
-      "doc": "On-board storage (e.g. SD card / flash)."
+      "doc": "On-board storage (e.g. SD card / flash).",
+      "id": 100
     },
     {
       "rust": "Radio",
       "name": "RADIO",
-      "doc": "Radio or external link (telemetry uplink/downlink)."
+      "doc": "Radio or external link (telemetry uplink/downlink).",
+      "id": 101
     }
   ],
   "types": [
@@ -27,7 +29,8 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ]
+      ],
+      "id": 100
     },
     {
       "rust": "ImuData",
@@ -43,7 +46,10 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ], "reliable": "Off"},
+      ],
+      "reliable": "Off",
+      "id": 101
+    },
     {
       "rust": "BatteryStatus",
       "name": "BATTERY_STATUS",
@@ -58,7 +64,10 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ], "reliable": "Off"},
+      ],
+      "reliable": "Off",
+      "id": 102
+    },
     {
       "rust": "SystemStatus",
       "name": "SYSTEM_STATUS",
@@ -71,7 +80,10 @@
       },
       "endpoints": [
         "SdCard"
-      ], "reliable": "Off"},
+      ],
+      "reliable": "Off",
+      "id": 103
+    },
     {
       "rust": "BarometerData",
       "name": "BAROMETER_DATA",
@@ -85,7 +97,10 @@
       "endpoints": [
         "Radio",
         "SdCard"
-      ], "reliable": "Off"},
+      ],
+      "reliable": "Off",
+      "id": 104
+    },
     {
       "rust": "MessageData",
       "name": "MESSAGE_DATA",
@@ -98,7 +113,10 @@
       "endpoints": [
         "SdCard",
         "Radio"
-      ], "reliable": "Off"},
+      ],
+      "reliable": "Off",
+      "id": 105
+    },
     {
       "rust": "Heartbeat",
       "name": "HEARTBEAT",
@@ -113,6 +131,9 @@
       "endpoints": [
         "SdCard",
         "Radio"
-      ], "reliable": "Off"}
+      ],
+      "reliable": "Off",
+      "id": 106
+    }
   ]
 }

@@ -42,7 +42,7 @@ fn named_receipts_do_not_escape_the_publishers_ingress_segment() {
                 &ack,
                 None,
                 None,
-                &[Relay::sender_hash("DAQ"), Relay::sender_hash("VB")],
+                &[Router::sender_hash("DAQ"), Router::sender_hash("VB")],
             )
             .unwrap();
             if packed {

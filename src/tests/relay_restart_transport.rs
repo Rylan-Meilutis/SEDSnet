@@ -4,7 +4,11 @@ use super::*;
 fn relay_chunk_identity_and_loss_are_bounded() {
     crate::tests::ensure_common_test_schema();
     let relay = Relay::new(Box::new(|| 0));
-    let side = relay.add_side_packed_with_options("CAN", |_| Ok(()), RelaySideOptions::default());
+    let side = relay.add_side_packed_with_options(
+        "CAN",
+        |_| Ok(()),
+        RelaySideOptions::default().with_template_transport(),
+    );
     // Relay full frames include a leading one-byte template ID.
     let a = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 181]);
     let b = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 181]);
@@ -86,9 +90,7 @@ fn unacknowledged_topology_does_not_silence_relay_liveness() {
         now.store(ms, Ordering::Relaxed);
         relay.poll_discovery().unwrap();
         // Hold the baseline ACK outstanding; drain only new advertisements.
-        while let Some((src, dst, handler, opts, item, _priority)) = relay.pop_ready_tx_item() {
-            relay.send_tx_item(src, dst, handler, opts, item).unwrap();
-        }
+        drain_originals_without_reliable_timeouts(&relay).unwrap();
     }
     let frames = emitted.lock().unwrap();
     let types: Vec<_> = frames
@@ -281,7 +283,7 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
             discovery::build_discovery_topology_request("GS", 2)
         }
         .unwrap();
-        tx.learn_discovery_item(side, &RelayItem::Packet(Arc::new(request)))
+        tx.learn_discovery_item(side, &RouterItem::Packet(request))
             .unwrap();
         let restarted = Relay::new(Box::new(|| 100));
         let rx = restarted.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
@@ -472,7 +474,7 @@ fn short_budget_still_dispatches_retained_relay_tx() {
         .push_tx(RelayTxItem {
             src: None,
             dst: side,
-            data: RelayItem::Packet(Arc::new(packet)),
+            data: RouterItem::Packet(packet),
             priority: 255,
             retry_after_ms: 0,
         })
@@ -514,7 +516,7 @@ fn malformed_discovery_preserves_retained_relay_routes() {
     .unwrap();
     assert!(
         relay
-            .learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+            .learn_discovery_item(side, &RouterItem::Packet(packet))
             .is_err()
     );
     assert_eq!(relay.state.lock().discovery_routes[&side], route);
@@ -546,7 +548,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     st.push_tx(RelayTxItem {
         src: None,
         dst: side,
-        data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 512]))),
+        data: RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 512]))),
         priority: 1,
         retry_after_ms: 0,
     })
@@ -554,7 +556,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     st.push_tx(RelayTxItem {
         src: None,
         dst: side,
-        data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 32]))),
+        data: RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from([0; 32]))),
         priority: 255,
         retry_after_ms: 0,
     })
@@ -574,9 +576,9 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
         "a telemetry backlog erased AB and VB routes"
     );
     assert!(st.shared_queue_bytes_used() <= st.memory.max_queue_budget);
-    assert_eq!(st.tx_queue.len(), 1);
+    assert_eq!(st.transmit_queue.len(), 1);
     assert_eq!(
-        st.tx_queue.lowest_priority(|item| item.priority),
+        st.transmit_queue.lowest_priority(|item| item.priority),
         Some(255),
         "discard low-priority telemetry before control"
     );
@@ -640,7 +642,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         link_capabilities: RelaySideOptions::default().link_capabilities(),
     };
     let baseline = discovery::build_discovery_address("AB", 1, &ad).unwrap();
-    node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(baseline)))
+    node.learn_discovery_item(side, &RouterItem::Packet(baseline))
         .unwrap();
     {
         let mut st = node.state.lock();
@@ -681,10 +683,10 @@ fn known_discovery_survives_snapshot_memory_pressure() {
                 .has_sent_full = false;
         }
         let repeated = discovery::build_discovery_address("AB", ms, &ad).unwrap();
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(repeated)))
+        node.learn_discovery_item(side, &RouterItem::Packet(repeated))
             .unwrap();
         let ping = discovery::build_discovery_announce("AB", ms, &[]).unwrap();
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(ping)))
+        node.learn_discovery_item(side, &RouterItem::Packet(ping))
             .unwrap();
         node.queue_discovery_announce(false, true).unwrap();
         node.process_tx_queue().unwrap();
@@ -717,7 +719,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
     let before = node.state.lock().discovery_routes[&side].clone();
     let unknown = discovery::build_discovery_announce("UNKNOWN", 300_001, &[]).unwrap();
     assert!(
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(unknown)))
+        node.learn_discovery_item(side, &RouterItem::Packet(unknown))
             .is_err()
     );
     let mut changed = ad.clone();
@@ -726,7 +728,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         .push(crate::DataEndpoint::named("SD_CARD"));
     let update = discovery::build_discovery_address("AB", 300_001, &changed).unwrap();
     assert!(
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(update)))
+        node.learn_discovery_item(side, &RouterItem::Packet(update))
             .is_err()
     );
     assert_eq!(
@@ -739,7 +741,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         core::sync::atomic::Ordering::Relaxed,
     );
     let mut st = node.state.lock();
-    Relay::prune_discovery_routes_locked(&mut st, now.load(core::sync::atomic::Ordering::Relaxed));
+    Router::prune_discovery_routes_locked(&mut st, now.load(core::sync::atomic::Ordering::Relaxed));
     assert!(
         !st.discovery_routes.contains_key(&side),
         "a silent peer must still expire"
@@ -777,7 +779,7 @@ fn compact_address_bootstrap_survives_full_snapshot_refusal() {
             link_capabilities: RelaySideOptions::default().link_capabilities(),
         };
         let packet = discovery::build_discovery_address(name, 1, &ad).unwrap();
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+        node.learn_discovery_item(side, &RouterItem::Packet(packet))
             .unwrap();
         let st = node.state.lock();
         assert!(st.discovery_routes[&side].announcers.contains_key(name));
@@ -788,7 +790,7 @@ fn compact_address_bootstrap_survives_full_snapshot_refusal() {
     );
     let unknown = discovery::build_discovery_announce("UNKNOWN", 1, &[]).unwrap();
     assert!(
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(unknown)))
+        node.learn_discovery_item(side, &RouterItem::Packet(unknown))
             .is_err(),
         "full discovery admission remains guarded"
     );
@@ -841,9 +843,9 @@ fn chunked_schema_resumes_after_transport_backpressure() {
         .unwrap()
         .collect::<Vec<_>>();
         let item = if packed_input {
-            RelayItem::Packed(crate::shared_bytes::convert(raw))
+            RouterItem::Packed(crate::shared_bytes::convert(raw))
         } else {
-            RelayItem::Packet(Arc::new(packet))
+            RouterItem::Packet(packet)
         };
         let handler = node.state.lock().sides[side]
             .as_ref()
@@ -853,7 +855,7 @@ fn chunked_schema_resumes_after_transport_backpressure() {
         let mut complete = false;
         for _ in 0..100 {
             allowance.store(1, core::sync::atomic::Ordering::Relaxed);
-            match node.call_tx_handler(side, &handler, &item) {
+            match node.call_side_tx_handler(side, &handler, &item, true) {
                 Ok(()) => {
                     complete = true;
                     break;
@@ -900,7 +902,7 @@ fn new_peer_and_schema_cannot_evict_existing_routes() {
         link_capabilities: RelaySideOptions::default().link_capabilities(),
     };
     let packet = discovery::build_discovery_address("AB", 1, &ad).unwrap();
-    node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+    node.learn_discovery_item(side, &RouterItem::Packet(packet))
         .unwrap();
     let before = {
         let mut st = node.state.lock();
@@ -914,7 +916,7 @@ fn new_peer_and_schema_cannot_evict_existing_routes() {
     new_peer.owner_hash = 43;
     let packet = discovery::build_discovery_address("VB", 2, &new_peer).unwrap();
     assert!(
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+        node.learn_discovery_item(side, &RouterItem::Packet(packet))
             .is_err()
     );
     assert_eq!(node.state.lock().discovery_routes[&side], before);
@@ -931,7 +933,7 @@ fn new_peer_and_schema_cannot_evict_existing_routes() {
     let packet =
         discovery::build_discovery_schema_from_owned_snapshot("NEW_BOARD", 3, schema).unwrap();
     assert!(
-        node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+        node.learn_discovery_item(side, &RouterItem::Packet(packet))
             .is_err()
     );
     assert_eq!(
@@ -954,7 +956,7 @@ fn schema_reclaims_queued_data_before_refusing_update() {
         st.push_tx(RelayTxItem {
             src: None,
             dst: side,
-            data: RelayItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(vec![
+            data: RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(vec![
                 0;
                 2048
             ]))),
@@ -975,11 +977,11 @@ fn schema_reclaims_queued_data_before_refusing_update() {
     };
     let packet =
         discovery::build_discovery_schema_from_owned_snapshot("NEW_BOARD", 3, schema).unwrap();
-    node.learn_discovery_item(side, &RelayItem::Packet(Arc::new(packet)))
+    node.learn_discovery_item(side, &RouterItem::Packet(packet))
         .unwrap();
     let st = node.state.lock();
     assert!(
-        st.tx_queue.is_empty(),
+        st.transmit_queue.is_empty(),
         "queued data must give way to the new schema"
     );
     assert!(st.shared_queue_bytes_used() <= st.memory.max_queue_budget);
@@ -1078,7 +1080,7 @@ fn relay_busy_transport_retains_work_and_services_healthy_side() {
             .push_tx(RelayTxItem {
                 src: None,
                 dst,
-                data: RelayItem::Packet(packet.clone()),
+                data: RouterItem::Packet((*packet).clone()),
                 priority: 255,
                 retry_after_ms: 0,
             })
@@ -1262,7 +1264,7 @@ fn receipt_budget_does_not_starve_transmit() {
         .push_tx(RelayTxItem {
             src: None,
             dst: side,
-            data: RelayItem::Packet(Arc::new(packet.clone())),
+            data: RouterItem::Packet(packet.clone()),
             priority: 250,
             retry_after_ms: 0,
         })
