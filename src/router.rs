@@ -13,6 +13,10 @@
 mod radio_trace_decoder;
 
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/schema_response_admission.rs"]
+mod schema_response_admission_tests;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/accepted_route_ownership.rs"]
 mod accepted_route_ownership;
 
@@ -898,6 +902,13 @@ struct DiscoverySideState {
 struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
     next_schema_request_ms: u64,
+    // Request bursts share one active catalog and one fresh pending generation.
+    // No payload is retained here: the existing TX queue owns partial transfers.
+    next_schema_response_ms: u64,
+    schema_response_packet_id: u64,
+    schema_response_active: bool,
+    schema_response_started: bool,
+    schema_response_pending: bool,
     next_ping_ms: u64,
     // Scheduled and accepted sends differ when a constrained link is backed up.
     last_liveness_tx_ms: u64,
@@ -8058,6 +8069,12 @@ impl Router {
             // begins transferring the merged metadata catalog.
             if include_schema && level == DiscoveryAdvertiseLevel::Full {
                 let pkt = discovery::build_discovery_schema(sender.as_ref(), now_ms)?;
+                if let Some(throttle) = self.state.lock().discovery_side_throttle.get_mut(&side_id)
+                    && throttle.schema_response_active
+                    && throttle.schema_response_packet_id == 0
+                {
+                    throttle.schema_response_packet_id = pkt.packet_id();
+                }
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
                         src: None,
@@ -8123,6 +8140,59 @@ impl Router {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn poll_schema_response_on_side(&self, side: RouterSideId) -> TelemetryResult<bool> {
+        let now = self.clock.now_ms();
+        {
+            let mut st = self.state.lock();
+            // An already queued catalog may be a partial startup announcement.
+            // Preserve its wire prefix and wait before creating another owner.
+            let queued = st.transmit_queue.iter().any(|entry| {
+                matches!(
+                    &entry.item,
+                    RouterTxItem::ToSide { dst, data: RouterItem::Packet(pkt), .. }
+                    if *dst == side && pkt.data_type() == DataType::DiscoverySchema
+                )
+            });
+            let throttle = st.discovery_side_throttle.entry(side).or_default();
+            if !throttle.schema_response_pending
+                || throttle.schema_response_active
+                || now < throttle.next_schema_response_ms
+                || queued
+            {
+                return Ok(false);
+            }
+            throttle.schema_response_pending = false;
+            throttle.schema_response_active = true;
+            throttle.schema_response_packet_id = 0;
+            throttle.schema_response_started = false;
+            // Match the existing fast discovery cadence. A request arriving
+            // just after a catalog completes still joins the pending generation.
+            throttle.next_schema_response_ms =
+                now.saturating_add(discovery::DISCOVERY_FAST_INTERVAL_MS);
+            throttle.has_sent_full = false;
+            throttle.last_topology = Vec::new();
+            if let Some(transport) = st.side_transport.get_mut(&side) {
+                // Start a fresh generation with self-describing application
+                // headers immediately; coalesced requests never refresh an
+                // active/queued generation or erase RX dictionary history.
+                transport.refresh_transmit_header_templates();
+            }
+        }
+        let result = self.emit_discovery_snapshot_on_side(true, true, true, false, Some(side));
+        let mut st = self.state.lock();
+        if let Some(throttle) = st.discovery_side_throttle.get_mut(&side) {
+            if result.is_err() {
+                throttle.schema_response_pending = true;
+                throttle.schema_response_active = false;
+            } else if throttle.schema_response_packet_id == 0 {
+                // Links advertising only liveness do not have a schema reply.
+                throttle.schema_response_active = false;
+            }
+        }
+        result.map(|_| true)
     }
 
     #[cfg(feature = "discovery")]
@@ -8290,6 +8360,16 @@ impl Router {
         if pkt.data_type() == crate::DataType::DiscoverySchema {
             self.merge_schema_changes(pkt.payload())?;
             self.note_schema_received(side, pkt.sender());
+            return Ok(true);
+        }
+        if pkt.data_type() == DataType::DiscoverySchemaRequest {
+            self.state
+                .lock()
+                .discovery_side_throttle
+                .entry(side)
+                .or_default()
+                .schema_response_pending = true;
+            self.poll_schema_response_on_side(side)?;
             return Ok(true);
         }
         // A compact address summary does not clone the complete topology or
@@ -9129,6 +9209,58 @@ impl Router {
     }
 
     fn send_reliable_to_side(
+        &self,
+        side: RouterSideId,
+        data: RouterItem,
+        relayed: bool,
+    ) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let schema_id = match &data {
+            RouterItem::Packet(pkt) if pkt.data_type() == DataType::DiscoverySchema => {
+                Some(pkt.packet_id())
+            }
+            _ => None,
+        };
+        #[cfg(feature = "discovery")]
+        if let Some(id) = schema_id {
+            let mut st = self.state.lock();
+            if let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
+                && throttle.schema_response_active
+                && throttle.schema_response_packet_id == id
+                && !throttle.schema_response_started
+            {
+                throttle.schema_response_started = true;
+                throttle.next_schema_response_ms = self
+                    .clock
+                    .now_ms()
+                    .saturating_add(discovery::DISCOVERY_FAST_INTERVAL_MS);
+                // Another peer can restart after this generation was queued
+                // and after an application packet consumed its initial full
+                // header. Cover those coalesced requests at actual dispatch,
+                // once only; partial retries retain their existing templates.
+                if let Some(transport) = st.side_transport.get_mut(&side) {
+                    transport.refresh_transmit_header_templates();
+                }
+            }
+        }
+        let result = self.send_reliable_to_side_impl(side, data, relayed);
+        #[cfg(feature = "discovery")]
+        if let Some(id) = schema_id {
+            let mut st = self.state.lock();
+            if let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
+                && throttle.schema_response_active
+                && throttle.schema_response_packet_id == id
+            {
+                throttle.schema_response_active = false;
+                // A partial owner is requeued by the existing transport path.
+                // Keep a pending generation even if re-admission later fails.
+                throttle.schema_response_pending |= result.is_err();
+            }
+        }
+        result
+    }
+
+    fn send_reliable_to_side_impl(
         &self,
         side: RouterSideId,
         data: RouterItem,
@@ -12726,7 +12858,15 @@ impl Router {
     /// Queue a discovery advertisement if the adaptive cadence says one is due.
     #[cfg(feature = "discovery")]
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
-        self.poll_discovery_announce()
+        // Keep ordinary route/liveness cadence independent of schema pressure.
+        let mut emitted = self.poll_discovery_announce()?;
+        let side_count = self.state.lock().sides.len();
+        for side in 0..side_count {
+            if self.state.lock().sides[side].is_some() {
+                emitted |= self.poll_schema_response_on_side(side)?;
+            }
+        }
+        Ok(emitted)
     }
 
     #[cfg(feature = "discovery")]
