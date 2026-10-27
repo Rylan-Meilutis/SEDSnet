@@ -204,6 +204,10 @@ Candidate under qualification; no release or package publication yet.
   is backpressured. Retain bounded service opportunities for lower bands and
   preserve fairness accounting across reentrant callbacks.
 - Keep queue and allocator sizes, wire contracts, and source rates unchanged.
+- Replay a completed proxy's aggregate receipt without reopening its ordered
+  child cohort. Incomplete or expired cohorts still cannot acknowledge delivery.
+- Keep dispatch metadata compact on i686 and check that Python release target
+  during full qualification. Support secure Linux keyring chains for PyPI login.
 
 ### Version 4.3.0 highlights
 
@@ -680,6 +684,10 @@ explicit embedded checks. Common `--features` choices apply to both; the matrix 
 the storage/fair flags. This is not Cargo `--all-features`, which would combine incompatible
 embedded and Python builds. `--full` also runs ignored long-duration tests in both profiles,
 including the full compact memory-pressure campaign.
+The full run also compile-checks the i686 Python release target in both profiles.
+Its compression dependency needs a 32-bit x86 C toolchain and headers (on
+Debian/Ubuntu, `gcc-multilib`, or configure a suitable cross compiler). The check
+does not require a target Python interpreter. CI installs this prerequisite.
 
 Each profile keeps its own strict lint, Rust, hosted embedded-memory, native Python API,
 and embedded cross-build checks. The unchanged uncompressed-memory regression, fixed

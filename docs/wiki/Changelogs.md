@@ -11,6 +11,10 @@ Candidate under qualification; no release or package publication yet.
   Bound attempted control service so independently ready lower bands also make
   progress, including across reentrant callbacks.
 - Preserve allocator and queue sizes, source rates, and wire identities.
+- Retain completed proxy receipts across delayed retries without recreating an
+  ordered child cohort. Require every child receipt before completing delivery.
+- Fix i686 dispatch layout and check Python cross compilation in full runs.
+  Accept supported OS stores inside Linux keyring chains for local PyPI login.
 
 ## Version 4.3.0 highlights
 
