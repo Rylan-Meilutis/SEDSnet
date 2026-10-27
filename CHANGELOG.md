@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### 4.3.1 candidate
+
+- Keep reserved control capacity usable while a lower-priority transport
+  partition refuses traffic. Refused control attempts do not spend the admission
+  allowance, and a refused lower-band opportunity permits another bounded
+  control burst while retaining that band's reservation. Preserve admissions
+  made by reentrant callbacks rather than granting an additional burst over them.
+- Cover blocked general traffic, a newly available receipt slot, complete
+  fragmented schema recovery, and bounded ordinary service without changing
+  queue capacities, wire identities, or allocator requirements.
+
 ## 4.3.0
 
 Source release; crates.io and PyPI publication remain separate maintainer actions.

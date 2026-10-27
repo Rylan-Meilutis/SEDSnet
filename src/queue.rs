@@ -37,6 +37,7 @@ fn float_to_ratio(mult: f64) -> (usize, usize) {
 
 const PRIORITY_TURN_PENDING: u8 = 1;
 const PRIORITY_TURN_ACTIVE: u8 = 2;
+const PRIORITY_TURN_NESTED_ADMISSION: u8 = 4;
 
 /// A double-ended queue with a maximum byte budget.
 ///
@@ -451,6 +452,13 @@ impl<T: ByteCost> BoundedDeque<T> {
         retained: bool,
         priority_burst: &mut u8,
     ) {
+        if !owns && admitted && self.fair_owed_flags & PRIORITY_TURN_ACTIVE != 0 {
+            self.fair_owed_flags |= PRIORITY_TURN_NESTED_ADMISSION;
+        }
+        if !owns && priority == u8::MAX && !admitted && retained {
+            // Selection alone cannot spend the control admission allowance.
+            *priority_burst = priority_burst.saturating_sub(1);
+        }
         if !owns
             || self.fair_owed_flags & PRIORITY_TURN_ACTIVE == 0
             || self.fair_owed_priority != priority
@@ -464,7 +472,15 @@ impl<T: ByteCost> BoundedDeque<T> {
             }
             self.fair_owed_flags = 0;
         } else {
-            self.fair_owed_flags &= !PRIORITY_TURN_ACTIVE;
+            // The owed band had its opportunity, but its transport capacity
+            // can be independent of the control reserve. Keep its reservation
+            // and permit another bounded control burst before retrying it.
+            // A reentrant admission has already used that opportunity; do not
+            // grant a second burst over its updated fairness accounting.
+            if self.fair_owed_flags & PRIORITY_TURN_NESTED_ADMISSION == 0 {
+                *priority_burst = 0;
+            }
+            self.fair_owed_flags &= !(PRIORITY_TURN_ACTIVE | PRIORITY_TURN_NESTED_ADMISSION);
         }
     }
 
@@ -877,6 +893,64 @@ impl<T: ByteCost> BoundedDeque<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_general_band_does_not_block_available_control_reserve() {
+        // Match the RF transport's independent capacities: general traffic can
+        // remain full after one of its two control-reserved slots opens.
+        let capacity = 16 * core::mem::size_of::<Item>();
+        let mut queue = BoundedDeque::new(capacity, capacity, 1.0);
+        for priority in [255, 254] {
+            queue
+                .push_back_prioritized(
+                    Item {
+                        id: priority,
+                        cost: 1,
+                        priority,
+                    },
+                    |v| v.priority,
+                )
+                .unwrap();
+        }
+        let mut burst = 8;
+        let mut controls = 0;
+        let mut first_control = None;
+        let mut general_admitted = None;
+        for turn in 0..64 {
+            let (index, owns) = queue
+                .select_front_fair_deferred(&mut burst, 8, |v| v.priority, |_, _| true)
+                .unwrap();
+            let priority = queue.get(index).unwrap().priority;
+            // Both reserved slots start full, then one frees at turn 12.
+            // The general partition stays full until turn 40.
+            let admitted = if priority == 255 {
+                turn >= 12
+            } else {
+                turn >= 40
+            };
+            queue.finish_deferred_turn(priority, owns, admitted, !admitted, &mut burst);
+            if admitted && priority == 255 {
+                first_control.get_or_insert(turn);
+                controls += 1;
+            }
+            if admitted && priority == 254 {
+                general_admitted = Some(turn);
+                break;
+            }
+        }
+        assert!(
+            first_control.is_some_and(|turn| turn <= 13),
+            "a refused general frame blocked free control capacity: {first_control:?}"
+        );
+        assert!(
+            controls > 8,
+            "control reserve should remain usable during general backpressure"
+        );
+        assert!(
+            general_admitted.is_some_and(|turn| turn <= 48),
+            "general traffic lost its bounded service opportunity: {general_admitted:?}"
+        );
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Item {
