@@ -2,9 +2,18 @@
 
 ## Unreleased
 
+## Version 4.3.1 highlights
+
+Candidate under qualification; no release or package publication yet.
+
+- Keep receipt-reserved transport capacity usable during general backpressure.
+  Refused attempts do not spend the control admission allowance. Lower bands
+  retain bounded service opportunities, including across reentrant callbacks.
+- Preserve allocator and queue sizes, source rates, and wire identities.
+
 ## Version 4.3.0 highlights
 
-Candidate under qualification; package publication is pending.
+Version 4.3.0 is published. Its artifacts remain unchanged.
 
 - Reserve only network protocol IDs and use canonical `SEDSNET_` protocol names.
   Application identities use ordinary hashes or explicit configuration IDs.

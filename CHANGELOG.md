@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-### 4.3.1 candidate
+## 4.3.1
+
+Candidate under qualification; no release or package publication yet.
 
 - Keep reserved control capacity usable while a lower-priority transport
   partition refuses traffic. Refused control attempts do not spend the admission

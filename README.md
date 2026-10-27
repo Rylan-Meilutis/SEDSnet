@@ -196,9 +196,18 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.1 highlights
+
+Candidate under qualification; no release or package publication yet.
+
+- Allow receipt traffic to use reserved transport capacity while general traffic
+  is backpressured. Retain bounded service opportunities for lower bands and
+  preserve fairness accounting across reentrant callbacks.
+- Keep queue and allocator sizes, wire contracts, and source rates unchanged.
+
 ### Version 4.3.0 highlights
 
-Candidate under qualification; package publication is pending.
+Version 4.3.0 is published. Its artifacts remain unchanged.
 
 - Keep only network protocol identities reserved, with canonical `SEDSNET_`
   message names. Application IDs belong to configuration, including IDs retained
