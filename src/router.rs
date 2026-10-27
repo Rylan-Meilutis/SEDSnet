@@ -16365,7 +16365,13 @@ impl Router {
         if self.is_duplicate_pkt(&item.data)? {
             #[cfg(feature = "discovery")]
             let shared_pending = if item.src.is_some()
-                && Self::item_data_type(&item.data).is_ok_and(is_reliable_type)
+                // SDK protocols use reliable transport too, but their echoed
+                // identities are not outstanding application-owner retries.
+                // Re-forwarding catalogs here lets parallel bridges amplify
+                // the same packet without bound.
+                && Self::item_data_type(&item.data).is_ok_and(|ty| {
+                    is_reliable_type(ty) && !is_internal_control_type(ty)
+                })
                 && self.item_target_senders(&item.data)?.is_empty()
             {
                 let RemoteSidePlan::Target(sides) =

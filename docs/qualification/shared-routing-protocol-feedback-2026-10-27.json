@@ -1,0 +1,47 @@
+{
+  "status": "focused_source_checks_pass_full_matrix_pending",
+  "baseline": "f039c5fc8c503694c69e1e50459aaebd5d639a68",
+  "full_matrix_failure": "659pass/1fail/113notrun773: unchanged multibus stress shared priority queue saturated.",
+  "measured_first_failure": {
+    "node": "hub",
+    "max_budget": 102400,
+    "used": 101653,
+    "rx_count": 6,
+    "rx_bytes": 8046,
+    "tx_count": 64,
+    "tx_bytes": 87591,
+    "protected_metadata": 6016,
+    "schema_bytes": 2797,
+    "discovery_bytes": 2195,
+    "dominant_work": "Repeated SAME DiscoverySchema packetIDs fanned to both other sides atpriority254; queue trace saved. This is not Relay descriptor-slot saturation."
+  },
+  "cause": "The shared unaddressed reliable application retry exception also classified ordered SDKDiscoverySchema. Parallel shared-engine bridges then amplified identical catalogs instead of retaining normal duplicate suppression.",
+  "fix": "Only application reliable traffic qualifies for shared-owner retry exception. is_internal_control_type protocol traffic keeps normal identity dedup; first catalog forwarding/learning still occurs. Generic protocol classification, no name/endpoint heuristics.",
+  "deterministic_regression": {
+    "name": "repeated_protocol_catalog_cannot_amplify_across_parallel_bridges",
+    "cases": "Router/Relay immutable roles, each native and packed ingress; two output-side announcers, unchanged zero clock",
+    "red": "First catalog plus16same-IDechoes forwarded17times; assertionexpected1 failed.",
+    "green": "All four cases firstcatalogforwarded1, echoes0, queuesempty.",
+    "existing_guards": "Unchanged multibus systemtest PASS; application unacked-owner metadata recovery remains in full native suite unchanged."
+  },
+  "source_sha256": {
+    "src/router.rs": "4ad1f0d6c94452f81181467bff80e7628246a65773bd7cca107ab505d822c7fe",
+    "src/tests/shared_routing_roles.rs": "e581eb7b77088a6ef1da84b29b89dbcf4917721458ff3e889b9056157fd07c63"
+  },
+  "invariants": [
+    "No increase to queues/pools/rates/thresholds, no lower offered load or test sleep.",
+    "No descriptor/layout or codec change.",
+    "No application reliable retry suppression change in this scoped fix.",
+    "Existing bounded-workspace refusal fix remains intact."
+  ],
+  "evidence": "FirmwareSimulator/build/shared-routing-core-20261027/multibus-pressure-audit",
+  "limits": "Full final matrix/all7 simulation/throughput pending. No push/release.",
+  "tests": {
+    "production_integration": 10,
+    "default": 629,
+    "compact": 636,
+    "no_compression": 614,
+    "clippy_all_targets": "PASS -D warnings",
+    "arm128_embedded_compact_clippy": "PASS -D warnings"
+  }
+}

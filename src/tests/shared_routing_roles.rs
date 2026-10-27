@@ -82,3 +82,69 @@ fn relay_role_forwards_through_shared_engine_and_keeps_protocol_control_enabled(
     );
     assert!(node.state.lock().local_services.is_none());
 }
+
+#[test]
+fn repeated_protocol_catalog_cannot_amplify_across_parallel_bridges() {
+    crate::tests::ensure_common_test_schema();
+    for relay_role in [false, true] {
+        for packed in [false, true] {
+            let cfg = if relay_role {
+                RouterConfig::relay()
+            } else {
+                RouterConfig::default().with_sender("BRIDGE")
+            };
+            let node = Router::new_with_clock(cfg, Box::new(|| 0));
+            let ingress = node.add_side_packed("ingress", |_| Ok(()));
+            let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+            let capture = sent.clone();
+            let egress = node.add_side_packed("shared-egress", move |bytes| {
+                capture.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            });
+            for peer in ["SINK_A", "SINK_B"] {
+                node.rx_queue_from_side(
+                    discovery::build_discovery_announce(peer, 0, &[DataEndpoint::named("RADIO")])
+                        .unwrap(),
+                    egress,
+                )
+                .unwrap();
+                node.drain_queues_with_timeout(0).unwrap();
+            }
+            let catalog = discovery::build_discovery_schema("SOURCE", 0).unwrap();
+            let id = catalog.packet_id();
+            let wire = wire_format::pack_packet(&catalog);
+            let deliver = || {
+                if packed {
+                    node.rx_packed_queue_from_side(&wire, ingress).unwrap();
+                } else {
+                    node.rx_queue_from_side(catalog.clone(), ingress).unwrap();
+                }
+                node.drain_queues_with_timeout(0).unwrap();
+            };
+            deliver();
+            let count = || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b| wire_format::unpack_packet(b).ok())
+                    .filter(|p| p.packet_id() == id)
+                    .count()
+            };
+            assert_eq!(
+                count(),
+                1,
+                "first complete catalog must still cross the bridge"
+            );
+            for _ in 0..16 {
+                deliver();
+            }
+            assert_eq!(
+                count(),
+                1,
+                "protocol catalog echoes are not application owner retries: role={relay_role} packed={packed}"
+            );
+            assert_eq!(node.export_runtime_stats().queues.rx_len, 0);
+            assert_eq!(node.export_runtime_stats().queues.tx_len, 0);
+        }
+    }
+}
