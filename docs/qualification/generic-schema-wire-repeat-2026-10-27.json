@@ -1,0 +1,33 @@
+{
+  "result": "FOCUSED_PASS_FULL_MATRIX_PENDING",
+  "scope": "Follow-up from immutable generic e3d2fdf full matrix. No queue, memory budget, source rate or timing threshold changes.",
+  "failed_matrix": {
+    "source": "e3d2fdf948c773278cab7d186398cb1fd56c0201",
+    "command": "python3 build.py test --all --full",
+    "normal_native_passed": 767,
+    "includes_ignored": true,
+    "first_failure": "Hosted retained-delta fixture repeated one endpoint ID under160 different invented names. Generic identity validation correctly rejected it. Two later failures were poisoned-mutex cascades.",
+    "preservation": "Original source archive, log and FAIL provenance retained in FirmwareSimulator/build/sdk-generic-identity-e3d2fdf-20261027."
+  },
+  "correction": {
+    "wire": "Exact identical schema rows are idempotent. Conflicting real identity claims remain BadArg before publication.",
+    "configuration": "Duplicate rows in JSON/static application configuration remain invalid.",
+    "embedded": "Skip duplicate pending identities without importing host-only sorting machinery. Each new identity is published and charged once; known repeats add no retained bytes.",
+    "fixture": "Retained-delta case repeats exact known definitions, still exceeds free queue budget on wire and retains only actual new entries."
+  },
+  "regressions": [
+    "Five hosted memory cases and two embedded identity cases pass.",
+    "New duplicate-unknown-row test asserts one endpoint/type addition, zero additional retained bytes on replay, and atomic rejection of conflicting real names.",
+    "626/626 default library tests pass; three existing ignored cases remain unchanged.",
+    "No edits to concurrent shared-router implementation."
+  ],
+  "source_sha256": {
+    "src/config.rs": "8959b1cb94883196e291bc6870a151728a62af33eb9edfb538fa0b30e3e73c0c",
+    "tests/rust-system-test/embedded_memory_behavior_test.rs": "0438e9b8ac4f265371ea8de2100551eaa02c2850de520f999c1d6b4cc7290d54"
+  },
+  "logs": {
+    "/tmp/sdk-generic-wire-repeat-memory-final-20261027.log": "619b59b2beb46ae5ee5c4c757248412ff9781498d84f48499b2e943e0c62f61b",
+    "/tmp/sdk-generic-wire-repeat-default-20261027.log": "535d08fa3e989963acddaa7b983d323e6a2bb1c8d17695598a1dd2f27263a8ba"
+  },
+  "remaining": "A new immutable combined-source full matrix is required before push."
+}

@@ -1618,7 +1618,7 @@ pub fn merge_owned_schema_snapshot_with_budget(
     mut snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
-    validate_schema_identities(&snapshot)?;
+    validate_schema_identities(&snapshot, true)?;
     sort_owned_schema(&mut snapshot);
     snapshot.endpoints.dedup_by_key(|def| def.id.0);
     snapshot.types.dedup_by_key(|def| def.id.0);
@@ -3244,7 +3244,7 @@ pub fn merge_owned_schema_snapshot_with_budget(
     snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
-    validate_schema_identities(&snapshot)?;
+    validate_schema_identities(&snapshot, true)?;
     unsafe { telemetry_lock() };
     let result = (|| {
         for def in &snapshot.endpoints {
@@ -3274,6 +3274,12 @@ pub fn merge_owned_schema_snapshot_with_budget(
         let mut types = Vec::new();
         let mut added_bytes = 0usize;
         for incoming in snapshot.endpoints {
+            if endpoints
+                .iter()
+                .any(|pending: &OwnedEndpointDefinition| pending.id == incoming.id)
+            {
+                continue;
+            }
             let existing = endpoint_definition(incoming.id)
                 .or_else(|| endpoint_definition_by_name(&incoming.name));
             let merged = if let Some(existing) = &existing {
@@ -3296,6 +3302,12 @@ pub fn merge_owned_schema_snapshot_with_budget(
             endpoints.push(merged);
         }
         for incoming in snapshot.types {
+            if types
+                .iter()
+                .any(|pending: &OwnedDataTypeDefinition| pending.id == incoming.id)
+            {
+                continue;
+            }
             let existing = data_type_definition(incoming.id)
                 .or_else(|| data_type_definition_by_name(&incoming.name));
             let merged = if let Some(existing) = &existing {
@@ -3615,24 +3627,27 @@ enum JsonElement {
     },
 }
 
-fn validate_schema_identities(snapshot: &OwnedRuntimeSchemaSnapshot) -> TelemetryResult<()> {
+fn validate_schema_identities(
+    snapshot: &OwnedRuntimeSchemaSnapshot,
+    allow_identical_wire_repeats: bool,
+) -> TelemetryResult<()> {
     for (index, def) in snapshot.endpoints.iter().enumerate() {
         schema_identity::resolve_endpoint(&def.name, Some(def.id.0))
             .map_err(|_| TelemetryError::BadArg)?;
-        if snapshot.endpoints[..index]
-            .iter()
-            .any(|other| other.id == def.id || other.name == def.name)
-        {
+        if snapshot.endpoints[..index].iter().any(|other| {
+            (other.id == def.id || other.name == def.name)
+                && (!allow_identical_wire_repeats || other != def)
+        }) {
             return Err(TelemetryError::BadArg);
         }
     }
     for (index, def) in snapshot.types.iter().enumerate() {
         schema_identity::resolve_type(&def.name, Some(def.id.0))
             .map_err(|_| TelemetryError::BadArg)?;
-        if snapshot.types[..index]
-            .iter()
-            .any(|other| other.id == def.id || other.name == def.name)
-        {
+        if snapshot.types[..index].iter().any(|other| {
+            (other.id == def.id || other.name == def.name)
+                && (!allow_identical_wire_repeats || other != def)
+        }) {
             return Err(TelemetryError::BadArg);
         }
     }
@@ -4079,7 +4094,7 @@ fn json_config_to_snapshot(
         });
     }
     let snapshot = OwnedRuntimeSchemaSnapshot { endpoints, types };
-    validate_schema_identities(&snapshot)?;
+    validate_schema_identities(&snapshot, false)?;
     Ok(snapshot)
 }
 
@@ -4377,6 +4392,18 @@ mod generic_schema_identity_tests {
         let mut incoming = original.clone();
         incoming.link_local_only = true;
         assert_eq!(merge_endpoint_metadata(&original, &incoming), original);
+    }
+
+    #[test]
+    fn configured_duplicate_rows_are_rejected_even_when_identical() {
+        let bytes = br#"{"endpoints":[{"name":"REPEATED_CONFIG_DESTINATION","id":50},{"name":"REPEATED_CONFIG_DESTINATION","id":50}],"types":[]}"#;
+        assert!(schema_snapshot_from_json_bytes(bytes).is_err());
+        let mut registry = protocol_registry();
+        let before = registry.schema_byte_cost();
+        assert!(
+            register_schema_json_reader_into(&mut registry, &bytes[..], false, usize::MAX).is_err()
+        );
+        assert_eq!(registry.schema_byte_cost(), before);
     }
 
     #[test]

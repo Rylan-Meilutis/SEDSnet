@@ -84,10 +84,10 @@ fn embedded_router_charges_only_the_retained_schema_delta() {
     // RAM. Repetition makes the complete snapshot exceed the queue budget,
     // matching real boards with large overlapping schemas.
     let known_endpoint = endpoints[0].clone();
-    for index in 0..160 {
-        let mut repeated = known_endpoint.clone();
-        repeated.name = format!("KNOWN_ENDPOINT_COPY_{index:03}_WITH_WIRE_METADATA");
-        endpoints.push(repeated);
+    for _ in 0..160 {
+        // Duplicate wire rows are idempotent. A different name claiming this
+        // same ID is an identity collision, not overlapping schema metadata.
+        endpoints.push(known_endpoint.clone());
     }
     endpoints.push(OwnedEndpointDefinition {
         id: endpoint,
@@ -172,4 +172,51 @@ fn embedded_schema_budget_failure_is_atomic() {
     assert!(merge_owned_schema_snapshot_with_budget(oversized, before + 64).is_err());
     assert!(endpoint_definition(endpoint).is_none());
     assert_eq!(schema_bytes_used(), before);
+}
+
+#[test]
+fn identical_new_wire_rows_publish_and_charge_each_identity_once() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let endpoint = OwnedEndpointDefinition {
+        id: DataEndpoint(28_621),
+        name: "IDEMPOTENT_NEW_ENDPOINT".into(),
+        description: String::new(),
+        link_local_only: false,
+    };
+    let ty = OwnedDataTypeDefinition {
+        id: DataType(28_622),
+        name: "IDEMPOTENT_NEW_VALUE".into(),
+        description: String::new(),
+        element: MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+        endpoints: vec![endpoint.id],
+        reliable: ReliableMode::None,
+        priority: 4,
+        e2e_encryption: E2eEncryptionPolicy::PreferOff,
+    };
+    let snapshot = OwnedRuntimeSchemaSnapshot {
+        endpoints: vec![endpoint.clone(), endpoint.clone()],
+        types: vec![ty.clone(), ty],
+    };
+    let report = merge_owned_schema_snapshot_with_budget(snapshot.clone(), usize::MAX).unwrap();
+    assert_eq!(report.endpoints_added, 1);
+    assert_eq!(report.types_added, 1);
+    let retained = schema_bytes_used();
+    let repeated = merge_owned_schema_snapshot_with_budget(snapshot, usize::MAX).unwrap();
+    assert_eq!(repeated.endpoints_added, 0);
+    assert_eq!(repeated.types_added, 0);
+    assert_eq!(schema_bytes_used(), retained);
+    let mut conflicting = endpoint.clone();
+    conflicting.name = "DIFFERENT_REAL_CLAIM".into();
+    assert!(
+        merge_owned_schema_snapshot_with_budget(
+            OwnedRuntimeSchemaSnapshot {
+                endpoints: vec![endpoint.clone(), conflicting],
+                types: vec![]
+            },
+            usize::MAX
+        )
+        .is_err()
+    );
+    assert_eq!(endpoint_definition(endpoint.id).unwrap(), endpoint);
+    assert_eq!(schema_bytes_used(), retained);
 }
