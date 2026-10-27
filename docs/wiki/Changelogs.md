@@ -2,9 +2,23 @@
 
 ## Unreleased
 
+## Version 4.3.1 highlights
+
+Wire format and application identities remain compatible with 4.3.0.
+
+- Keep receipt-reserved transport capacity usable during general backpressure.
+  Retry refused lower-band service without blocking reserved receipt capacity.
+  Bound attempted control service so independently ready lower bands also make
+  progress, including across reentrant callbacks.
+- Preserve allocator and queue sizes, source rates, and wire identities.
+- Retain completed proxy receipts across delayed retries without recreating an
+  ordered child cohort. Require every child receipt before completing delivery.
+- Fix i686 dispatch layout and check Python cross compilation in full runs.
+  Accept supported OS stores inside Linux keyring chains for local PyPI login.
+
 ## Version 4.3.0 highlights
 
-Candidate under qualification; package publication is pending.
+Version 4.3.0 is published. Its artifacts remain unchanged.
 
 - Reserve only network protocol IDs and use canonical `SEDSNET_` protocol names.
   Application identities use ordinary hashes or explicit configuration IDs.

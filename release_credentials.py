@@ -20,6 +20,7 @@ CONFIG_FILE = ".sedsnet-release.toml"
 _SECURE_MODULES = frozenset({
     "keyring.backends.macOS", "keyring.backends.Windows",
     "keyring.backends.SecretService", "keyring.backends.kwallet",
+    "keyring.backends.libsecret",
 })
 
 
@@ -32,6 +33,12 @@ def _secure_backend():
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             import keyring
             backend = keyring.get_keyring()
+            if type(backend).__module__ == "keyring.backends.chainer":
+                # Linux commonly chains several installed OS stores. Select
+                # the first supported child in keyring's configured order;
+                # never delegate to a chain that may include plaintext stores.
+                backend = next((child for child in backend.backends
+                                if type(child).__module__ in _SECURE_MODULES), None)
     except Exception:
         raise CredentialStoreError(
             "OS credential storage is unavailable. Install keyring with "

@@ -1,6 +1,133 @@
 use super::*;
 
 #[test]
+fn completed_proxy_retry_replays_receipt_without_reopening_child_cohort() {
+    crate::tests::ensure_common_test_schema();
+    let endpoint = DataEndpoint::named("RADIO");
+    let ty = crate::config::register_data_type_with_description(
+        "PROXY_COMPLETION_RETRY",
+        "",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::Ordered,
+        16,
+    )
+    .unwrap();
+    for (relay, expire_incomplete) in [(false, false), (true, false), (false, true), (true, true)] {
+        let cfg = if relay {
+            RouterConfig::relay()
+        } else {
+            RouterConfig::new([])
+        };
+        let node = Router::new_with_clock(cfg.with_sender("BRIDGE"), Box::new(|| 1000));
+        let ingress = node.add_side_packed("upstream", |_| Ok(()));
+        let downstream = node.add_side_packed("children", |_| Ok(()));
+        node.clear_queues();
+        let publisher = Router::sender_hash("PUBLISHER");
+        let bridge = Router::sender_hash("BRIDGE");
+        let owners = [
+            Router::sender_hash("READER_A"),
+            Router::sender_hash("READER_B"),
+        ];
+        let packet = Packet::new_with_wire_contract(
+            ty,
+            &[endpoint],
+            "PUBLISHER",
+            1,
+            1,
+            Arc::<[u8]>::from([7u8]),
+            None,
+            Arc::from([bridge]),
+        )
+        .unwrap();
+        let item = RouterItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(
+            &packet,
+        )));
+        let id = Router::get_hash(&item);
+        node.note_reliable_return_route(ingress, id);
+        node.register_end_to_end_reliable_tx(
+            &item,
+            Some(BTreeMap::from([
+                (owners[0], downstream),
+                (owners[1], downstream),
+            ])),
+        )
+        .unwrap();
+        node.state
+            .lock()
+            .reliable_return_routes
+            .get_mut(&id)
+            .unwrap()
+            .upstream_contract = Some((id, publisher));
+        let receipt = |owner| {
+            Packet::new_with_wire_contract(
+                DataType::ReliableAck,
+                message_meta(DataType::ReliableAck).endpoints_ref(),
+                "E2EACK:READER",
+                2,
+                3,
+                Arc::<[u8]>::from(id.to_le_bytes()),
+                None,
+                Arc::from([owner, bridge]),
+            )
+            .unwrap()
+        };
+        assert!(
+            node.handle_internal_reliable_packet(&receipt(owners[0]), Some(downstream), true)
+                .unwrap()
+        );
+        assert_eq!(
+            node.state.lock().end_to_end_reliable_tx[&id]
+                .pending_destinations
+                .len(),
+            1
+        );
+        assert_eq!(
+            node.state.lock().transmit_queue.len(),
+            0,
+            "one child receipt must not complete a cohort"
+        );
+        assert!(!node.state.lock().reliable_return_routes[&id].delivery_completed);
+        if expire_incomplete {
+            node.state.lock().end_to_end_reliable_tx.remove(&id);
+            assert!(
+                node.handle_internal_reliable_packet(&receipt(owners[1]), Some(downstream), true)
+                    .unwrap()
+            );
+            assert!(
+                !node.state.lock().reliable_return_routes[&id].delivery_completed,
+                "an expired incomplete cohort is not evidence of delivery"
+            );
+            assert_eq!(node.state.lock().transmit_queue.len(), 0);
+            continue;
+        }
+        assert!(
+            node.handle_internal_reliable_packet(&receipt(owners[1]), Some(downstream), true)
+                .unwrap()
+        );
+        assert!(!node.state.lock().end_to_end_reliable_tx.contains_key(&id));
+        // Lose the aggregate receipt and churn the ordinary RX dedupe cache.
+        node.clear_queues();
+        node.state.lock().recent_rx.clear();
+        assert!(node.note_reliable_return_route(ingress, id));
+        assert!(
+            node.clear_intermediate_hop_targets(item, true)
+                .unwrap()
+                .is_none(),
+            "a completed proxy retry must replay its aggregate receipt instead of reopening downstream delivery (relay={relay})"
+        );
+        assert!(!node.state.lock().end_to_end_reliable_tx.contains_key(&id));
+        assert_eq!(node.state.lock().transmit_queue.len(), 1);
+        // Late duplicate child receipts stay consumed by the retained alias.
+        assert!(
+            node.handle_internal_reliable_packet(&receipt(owners[1]), Some(downstream), true)
+                .unwrap()
+        );
+        assert_eq!(node.state.lock().transmit_queue.len(), 1);
+    }
+}
+
+#[test]
 fn zero_template_capacity_does_not_retain_timestamp_entries() {
     crate::tests::ensure_common_test_schema();
     let ty = crate::config::register_data_type_with_description(

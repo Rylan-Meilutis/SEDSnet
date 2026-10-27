@@ -56,6 +56,9 @@ Use `python3 build.py maturin-login` to save a PyPI token locally through a hidd
 prompt. Do not print the ignored credential file. Cargo can use its saved local
 login. Publishing commands pass credentials through the child environment;
 command displays, child logs and failure/timeout reports redact tokens.
+On Linux, a configured keyring chain automatically selects its first supported
+OS store (Secret Service, KWallet or libsecret). No `PYTHON_KEYRING_BACKEND`
+override is needed. Existing tokens in that selected store remain usable.
 
 ## Cargo features
 

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 4.3.1
+
+Wire format and application identities remain compatible with 4.3.0.
+
+- Accept Linux keyring chains by selecting the first supported OS credential
+  store in configured order. Login and later package publication no longer need
+  a backend override; plaintext and unsupported child stores remain excluded.
+- Pack dispatch completion flags into one byte so the existing stack-size
+  assertion holds on i686 Python wheel builds as well as 64-bit hosts and ARM.
+  Full qualification now checks i686 Python compilation in both profiles.
+- Retain completed proxy delivery in the bounded return-route cache. Delayed
+  publisher retries replay the aggregate receipt instead of reopening an ordered
+  child cohort, and late child receipts remain consumed by the proxy. Completion
+  still requires every frozen child owner; expiry cannot acknowledge delivery.
+- Keep reserved control capacity usable while a lower-priority transport
+  partition refuses traffic. A refused lower-band opportunity permits another
+  bounded control burst while retaining that band's reservation. Bound attempted
+  control service so blocked urgent traffic cannot starve independently available
+  lower-band capacity. Preserve admissions
+  made by reentrant callbacks rather than granting an additional burst over them.
+- Cover blocked general traffic, a newly available receipt slot, complete
+  fragmented schema recovery, and bounded ordinary service without changing
+  queue capacities, wire identities, or allocator requirements.
+
 ## 4.3.0
 
 Source release; crates.io and PyPI publication remain separate maintainer actions.

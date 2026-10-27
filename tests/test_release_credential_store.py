@@ -157,6 +157,56 @@ class CredentialStoreTests(unittest.TestCase):
 
 
 class BackendSelectionTests(unittest.TestCase):
+    def test_linux_chain_selects_supported_os_store_in_configured_order(self):
+        stores = [type('Keyring', (MemoryStore,), {'__module__': module})()
+                  for module in ['keyring.backends.SecretService',
+                                 'keyring.backends.kwallet', 'keyring.backends.libsecret']]
+        chain = type('ChainerBackend', (), {'__module__': 'keyring.backends.chainer',
+                                          'backends': stores})()
+        with mock.patch.dict('sys.modules', {'keyring': types.SimpleNamespace(get_keyring=lambda: chain)}):
+            self.assertIs(credentials._secure_backend(), stores[0])
+
+    def test_chain_roundtrip_never_uses_plaintext_fallback(self):
+        plaintext = type('Plaintext', (MemoryStore,), {'__module__': 'keyrings.alt.file'})()
+        secure = type('Keyring', (MemoryStore,), {'__module__': 'keyring.backends.SecretService'})()
+        chain = type('ChainerBackend', (), {'__module__': 'keyring.backends.chainer',
+                                          'backends': [plaintext, secure]})()
+        fake = types.SimpleNamespace(get_keyring=lambda: chain)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.dict('sys.modules', {'keyring': fake}), \
+             mock.patch.dict(os.environ, {}, clear=True):
+            path = Path(directory) / credentials.CONFIG_FILE
+            secret = 'pypi-synthetic-chained-store-regression'
+            credentials.save_pypi_credentials(path, '__token__', secret)
+            with mock.patch.object(publisher, 'RELEASE_CONFIG', path):
+                self.assertEqual(publisher.load_pypi_credentials('PYPI_API_TOKEN'), ('__token__', secret))
+            self.assertEqual(plaintext.values, {})
+            self.assertNotIn(secret, path.read_text())
+
+    def test_chain_without_supported_store_is_refused(self):
+        stores = [type('Backend', (), {'__module__': module})()
+                  for module in ['keyrings.alt.file', 'keyring.backends.null']]
+        chain = type('ChainerBackend', (), {'__module__': 'keyring.backends.chainer',
+                                          'backends': stores})()
+        with mock.patch.dict('sys.modules', {'keyring': types.SimpleNamespace(get_keyring=lambda: chain)}):
+            with self.assertRaises(credentials.CredentialStoreError):
+                credentials._secure_backend()
+
+    def test_chain_initialization_output_and_errors_are_sanitized(self):
+        def backends(_):
+            print('synthetic-secret')
+            print('synthetic-secret', file=sys.stderr)
+            raise RuntimeError('synthetic-secret')
+        chain = type('ChainerBackend', (), {'__module__': 'keyring.backends.chainer',
+                                          'backends': property(backends)})()
+        output = io.StringIO()
+        with mock.patch.dict('sys.modules', {'keyring': types.SimpleNamespace(get_keyring=lambda: chain)}), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with self.assertRaises(credentials.CredentialStoreError) as error:
+                credentials._secure_backend()
+        self.assertNotIn('synthetic-secret', output.getvalue())
+        self.assertNotIn('synthetic-secret', ''.join(traceback.format_exception(error.exception)))
+
     def test_plaintext_null_and_fallback_backends_are_refused(self):
         for module in ['keyrings.alt.file', 'keyring.backends.null', 'keyring.backends.fail', 'keyring.backends.chainer']:
             backend = type('FakeBackend', (), {'__module__': module})()

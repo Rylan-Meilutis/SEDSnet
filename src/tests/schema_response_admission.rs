@@ -3,6 +3,129 @@
 use super::*;
 
 #[test]
+fn full_general_transport_does_not_hide_a_free_receipt_slot() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let node = Router::new_with_clock(
+        RouterConfig::new([]).with_sender("RESERVE_RF"),
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    );
+    let general_credit = Arc::new(AtomicUsize::new(1));
+    let credit = general_credit.clone();
+    let time = now.clone();
+    let receipt_at = Arc::new(AtomicU64::new(u64::MAX));
+    let received = receipt_at.clone();
+    let frames = Arc::new(RouterMutex::new(Vec::new()));
+    let capture = frames.clone();
+    let options = RouterSideOptions::default().with_small_packet_transport(128);
+    let side = node.add_side_packed_with_priority_and_options(
+        "finite-transport",
+        move |bytes, priority| {
+            // A C callback consumes the complete cooperative worker budget.
+            // The next worker turn arrives after the one-millisecond retry delay.
+            let tick = time.fetch_add(1, Ordering::Relaxed);
+            if priority == 255 {
+                if tick < 40 {
+                    return Err(TelemetryError::Io("side tx busy"));
+                }
+                received.store(tick, Ordering::Relaxed);
+            } else {
+                credit
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .map_err(|_| TelemetryError::Io("side tx busy"))?;
+            }
+            capture.lock().push(bytes.to_vec());
+            Ok(())
+        },
+        options.clone(),
+    );
+    // Use a fixed, valid catalog so other tests' process-wide registrations
+    // cannot change the fragment count or this transport-pressure fixture.
+    let catalog = discovery::build_discovery_schema_from_snapshot(
+        "RESERVE_RF",
+        0,
+        crate::config::RuntimeSchemaSnapshot {
+            endpoints: vec![crate::config::EndpointDefinition {
+                id: DataEndpoint(230),
+                name: "INDEPENDENT_SCHEMA",
+                description: concat!(
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                ),
+                link_local_only: false,
+            }],
+            types: vec![],
+        },
+    )
+    .unwrap();
+    // Start a real SDT transfer and retain its accepted prefix across refusals.
+    assert!(matches!(
+        node.send_reliable_to_side(side, RouterItem::Packet(catalog.clone()), false),
+        Err(TelemetryError::Io(_))
+    ));
+    let receipt = Packet::new_with_wire_contract(
+        DataType::ReliableAck,
+        message_meta(DataType::ReliableAck).endpoints_ref(),
+        "E2EACK:FC",
+        1,
+        1,
+        Arc::<[u8]>::from(42u64.to_le_bytes()),
+        None,
+        Arc::from([Router::sender_hash("FC"), Router::sender_hash("GS")]),
+    )
+    .unwrap();
+    for packet in [catalog.clone(), receipt.clone()] {
+        node.tx_queue_item_with_flags(
+            RouterTxItem::ToSide {
+                src: None,
+                dst: side,
+                data: RouterItem::Packet(packet),
+            },
+            true,
+        )
+        .unwrap();
+    }
+    node.state.lock().tx_priority_burst = MAX_PRIORITY_BURST;
+    for tick in (4..240).step_by(2) {
+        now.store(tick, Ordering::Relaxed);
+        general_credit.store(usize::from(tick >= 100), Ordering::Relaxed);
+        node.dispatch_tx_queue_with_timeout(1).unwrap();
+        if !node.has_queued_work() {
+            break;
+        }
+    }
+    assert!(
+        receipt_at.load(Ordering::Relaxed) <= 42,
+        "receipt missed free reserved capacity until {}ms",
+        receipt_at.load(Ordering::Relaxed)
+    );
+    assert!(
+        !node.has_queued_work(),
+        "schema must also finish after general capacity returns"
+    );
+    let decoder = Router::new(RouterConfig::default());
+    let decode_side = decoder.add_side_packed_with_options("decode", |_| Ok(()), options);
+    let mut ids = Vec::new();
+    for frame in frames.lock().iter() {
+        if let Some(canonical) = decoder
+            .decode_side_transport_frame(decode_side, frame)
+            .unwrap()
+        {
+            ids.push(wire_format::unpack_packet(&canonical).unwrap().packet_id());
+        }
+    }
+    assert_eq!(
+        ids,
+        vec![receipt.packet_id(), catalog.packet_id()],
+        "receipt bypass must preserve the complete schema transfer and both packet identities"
+    );
+}
+
+#[test]
 fn schema_request_capture_burst_has_one_active_and_one_pending_response() {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     crate::tests::ensure_common_test_schema();
