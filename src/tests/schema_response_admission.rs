@@ -23,9 +23,11 @@ fn full_general_transport_does_not_hide_a_free_receipt_slot() {
     let side = node.add_side_packed_with_priority_and_options(
         "finite-transport",
         move |bytes, priority| {
+            // A C callback consumes the complete cooperative worker budget.
+            // The next worker turn arrives after the one-millisecond retry delay.
+            let tick = time.fetch_add(1, Ordering::Relaxed);
             if priority == 255 {
-                let tick = time.load(Ordering::Relaxed);
-                if tick < 12 {
+                if tick < 40 {
                     return Err(TelemetryError::Io("side tx busy"));
                 }
                 received.store(tick, Ordering::Relaxed);
@@ -68,16 +70,16 @@ fn full_general_transport_does_not_hide_a_free_receipt_slot() {
         .unwrap();
     }
     node.state.lock().tx_priority_burst = MAX_PRIORITY_BURST;
-    for tick in 1..200 {
+    for tick in (4..240).step_by(2) {
         now.store(tick, Ordering::Relaxed);
-        general_credit.store(usize::from(tick >= 40), Ordering::Relaxed);
-        node.dispatch_tx_queue_with_timeout(0).unwrap();
+        general_credit.store(usize::from(tick >= 100), Ordering::Relaxed);
+        node.dispatch_tx_queue_with_timeout(1).unwrap();
         if !node.has_queued_work() {
             break;
         }
     }
     assert!(
-        receipt_at.load(Ordering::Relaxed) <= 13,
+        receipt_at.load(Ordering::Relaxed) <= 42,
         "receipt missed free reserved capacity until {}ms",
         receipt_at.load(Ordering::Relaxed)
     );
