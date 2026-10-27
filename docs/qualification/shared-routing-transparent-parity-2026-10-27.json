@@ -1,0 +1,64 @@
+{
+  "status": "focused_configured_checks_pass_full_matrix_pending",
+  "baseline": "0fc43b41701cee42df9900d63ad8f679f83d6f34",
+  "preflight": "Configured normalnative768pass/6fail/0skip774. Allsixrealfailures preserved in parentlog.",
+  "causes_and_fixes": [
+    {
+      "cause": "TransparentRelay inherited participatingRouter hop-local Address consumption, so unchanged advertisements never crossed to global collision arbitration.",
+      "fix": "The common role-aware advertisement classifier forwards Address for the forwarding role. Borrowed known-address liveness inspection still runs but cannot consume required forwarding or bypass admission.",
+      "proof": "Unchanged transparent address and zero-allocation/refusal51memorypressure tests pass; comprehensive multinode collision/churn now shifts requested VALVE address correctly."
+    },
+    {
+      "cause": "The forwarding role included unused master-election inspection and whole-network scratch when building a split-horizon topology reply. Under the existing 7000-byte/1024-byte probe, the reply degraded to a keepalive.",
+      "fix": "Only the participating role estimates and computes address-election master state. The forwarding role retains its own split-horizon topology scratch and normal admission.",
+      "proof": "The original pressured topology recovery test receives AB, DAQ, GB and VB unchanged."
+    },
+    {
+      "cause": "Common opaque crypto preparation constructed owned frame information before checking whether sealing was needed, allocating an endpoint Vec, endpoint Arc and empty-target Arc.",
+      "fix": "First use the CRC-checked borrowed routing and reliable-header parser. Construct owned header and payload state only when encryption sealing is required.",
+      "safety": "Both parsers call verify_crc32, read_routing_envelope and read_reliable_header_encoded. The owned variant then calls into_owned. No unknown-packet or payload-validation policy changes.",
+      "proof": "The unchanged limit of 64 allocations for 32 warmed packets passes, previously failing at 160. Allocation backtraces identify the three removed header allocations. Existing valid-CRC truncated-contract, frozen-shape and packet-identity guards pass."
+    },
+    {
+      "cause": "The new public replay-statistics helper selected explicit type 100, colliding with configured test GPS type 100.",
+      "fix": "Only that new helper now uses explicit type 900001. The original type-99 wire fixtures and canonical identities remain unchanged.",
+      "proof": "Configured public interoperability and the frozen old receiver consume ten new canonical packets byte-identically across five profiles."
+    }
+  ],
+  "tests": {
+    "memory_pressure": 51,
+    "frozen_shape_allocations": 1,
+    "packet_identity": 2,
+    "reliable_drop": {
+      "passed": 15,
+      "existing_ignored": 1
+    },
+    "public_interop": 1,
+    "default": 629,
+    "compact": 636,
+    "no_compression": 614,
+    "clippy_all_targets": "PASS -D warnings",
+    "arm128_embedded_compact_clippy": "PASS -D warnings"
+  },
+  "configured_env": [
+    "SEDSNET_STATIC_SCHEMA_PATH=telemetry_config.test.json",
+    "SEDSNET_STATIC_IPC_SCHEMA_PATH=telemetry_config.ipc.test.json"
+  ],
+  "source_sha256": {
+    "src/router.rs": "697bf0323d39a56d2393a87252b242ea9266eff7e62f0de8471f5dc773455aac",
+    "tests/relay_wire_compatibility.rs": "aaf55824f749cb34b4f210e5b7a6b820538cd91e8c4dc91abb6fda46d36973c9"
+  },
+  "unchanged_safety_tests": [
+    "tests/memory_pressure.rs",
+    "tests/rust-system-test/reliable_drop_test.rs",
+    "tests/frozen_shape_allocations.rs",
+    "tests/packet_identity.rs"
+  ],
+  "evidence": "FirmwareSimulator/build/shared-routing-core-20261027/remaining-parity-audit",
+  "limits": [
+    "No pools, queues, budgets, rates, gates, offered test load or safety assertions changed.",
+    "A full configured native preflight and complete build.py test --all --full are still required.",
+    "All-seven linked memory, throughput and network qualification remain required.",
+    "No push or release."
+  ]
+}

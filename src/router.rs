@@ -3476,19 +3476,18 @@ struct DiscoveryCandidateMatch {
 
 #[cfg(feature = "discovery")]
 #[inline]
-const fn discovery_is_hop_local_advertisement(ty: DataType) -> bool {
+const fn discovery_is_hop_local_advertisement(ty: DataType, transparent: bool) -> bool {
     matches!(
         ty,
         DataType::DiscoveryAnnounce
             | DataType::DiscoveryTimeSyncSources
             | DataType::DiscoveryTopology
-            | DataType::DiscoveryAddress
             | DataType::DiscoveryLinkCapabilities
-    )
+    ) || (matches!(ty, DataType::DiscoveryAddress) && !transparent)
 }
 
 #[cfg(not(feature = "discovery"))]
-const fn discovery_is_hop_local_advertisement(_ty: DataType) -> bool {
+const fn discovery_is_hop_local_advertisement(_ty: DataType, _transparent: bool) -> bool {
     false
 }
 
@@ -6433,10 +6432,13 @@ impl Router {
         bytes: crate::SharedBytes,
         reliable_override: Option<Option<wire_format::ReliableHeader>>,
     ) -> TelemetryResult<crate::SharedBytes> {
-        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
-        if frame.ack_only() || self.e2e_seal_config_for_type(frame.envelope.ty).is_none() {
+        // Both peeks verify the CRC and parse the same canonical routing and
+        // reliable header. Only sealing needs owned endpoint/target arrays.
+        let routing = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+        if routing.ack_only() || self.e2e_seal_config_for_type(routing.envelope.ty).is_none() {
             return Ok(bytes);
         }
+        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
         let reliable = reliable_override.unwrap_or(frame.reliable);
         let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
         self.pack_packet_for_contract(
@@ -8062,9 +8064,10 @@ impl Router {
             let now = self.clock.now_ms();
             let sender = self.sender_arc();
             let st = self.state.lock();
-            let election_required = self
-                .preferred_discovery_master_present_locked(&st, now)
-                .is_none();
+            let election_required = self.cfg.role.local_services()
+                && self
+                    .preferred_discovery_master_present_locked(&st, now)
+                    .is_none();
             let snapshot = discovery::topology_snapshot_scratch(
                 sender.as_ref(),
                 self.cfg.handlers().len(),
@@ -8164,8 +8167,8 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
             st.fit_discovery_budget();
-            let local_is_master =
-                self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
+            let local_is_master = self.cfg.role.local_services()
+                && self.discovery_master_sender_locked(&st, now_ms) == self.sender_arc().as_ref();
             // The caller selects one side; keep its plan on the stack.
             let mut per_side = None;
             for side_id in 0..st.sides.len() {
@@ -11169,6 +11172,7 @@ impl Router {
                     Ok(Some((address, payload))) => {
                         self.refresh_peer_liveness(side, address);
                         self.refresh_known_address_payload(payload, side)
+                            .map(|known| known && self.cfg.role.local_services())
                     }
                     Ok(None) => Ok(false),
                     Err(error) => Err(error),
@@ -16529,8 +16533,10 @@ impl Router {
                     // schedules this Router's own aggregated, split-horizon
                     // snapshot; transparently relaying the original packet
                     // would make a distant sender look physically adjacent.
-                    if !discovery_is_hop_local_advertisement(pkt.data_type())
-                        && self.should_route_remote(&item.data, item.src)?
+                    if !discovery_is_hop_local_advertisement(
+                        pkt.data_type(),
+                        !self.cfg.role.local_services(),
+                    ) && self.should_route_remote(&item.data, item.src)?
                     {
                         self.relay_send(
                             RouterItem::Packet(pkt.to_owned()),
@@ -16720,8 +16726,10 @@ impl Router {
                     let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
                     let _ = self.learn_discovery_packet(&pkt, item.src, called_from_queue)?;
-                    if !discovery_is_hop_local_advertisement(env.ty)
-                        && self.should_route_remote(&item.data, item.src)?
+                    if !discovery_is_hop_local_advertisement(
+                        env.ty,
+                        !self.cfg.role.local_services(),
+                    ) && self.should_route_remote(&item.data, item.src)?
                     {
                         self.relay_send(RouterItem::Packet(pkt), item.src, called_from_queue)?;
                     }

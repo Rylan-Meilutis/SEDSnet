@@ -91,7 +91,7 @@ fn receive(name: &str, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
 }
 fn assert_public_replay_statistics_partition_one_shared_queue() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    let ty = DataType(100);
+    let ty = DataType(900_001);
     config::register_data_type_id_with_description(
         ty,
         "INTEROP_RELIABLE_SAMPLE",
