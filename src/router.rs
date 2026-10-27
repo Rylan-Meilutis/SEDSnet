@@ -766,14 +766,25 @@ struct TxClaim {
 }
 #[derive(Default)]
 struct DispatchContext {
+    // Retain a denied queued replay's service band across side-owned retries.
+    priority: u8,
     claim: Option<TxClaim>,
     since: Option<u64>,
     terminal: bool,
     owner_transferred: bool,
+    refused: bool,
+    admitted: bool,
 }
+// The dispatch-only priority uses existing stack padding; retained queue,
+// reliable maps and packet ownership metadata do not grow.
+const _: () = assert!(
+    size_of::<DispatchContext>() == size_of::<(Option<TxClaim>, Option<u64>, bool, bool)>()
+);
+
 struct TxWork {
     queued: TxQueued,
     claim: Option<TxClaim>,
+    owed_turn: bool,
 }
 
 /// Do not allow a continuously replenished stream of control traffic to keep
@@ -2356,13 +2367,44 @@ impl RouterInner {
         }
     }
 
+    #[cfg(feature = "discovery")]
+    fn schema_response_owner(item: &RouterTxItem) -> Option<(RouterSideId, u64)> {
+        match item {
+            RouterTxItem::ToSide { dst, data, .. }
+                if Router::item_data_type(data).ok() == Some(DataType::DiscoverySchema) =>
+            {
+                Some((*dst, Router::get_hash(data)))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    fn schema_response_owner_lost(
+        responses: &mut RouterMap<RouterSideId, DiscoverySideThrottleState>,
+        owner: Option<(RouterSideId, u64)>,
+    ) {
+        if let Some((side, id)) = owner
+            && let Some(response) = responses.get_mut(&side)
+            && response.schema_response_active
+            && response.schema_response_packet_id == id
+        {
+            response.schema_response_active = false;
+            response.schema_response_pending = true;
+        }
+    }
+
     fn retain_transmit<F>(&mut self, keep: F)
     where
         F: FnMut(&TxQueued) -> bool,
     {
         let hop = &mut self.reliable_tx;
         let end = &mut self.end_to_end_reliable_tx;
+        #[cfg(feature = "discovery")]
+        let responses = &mut self.discovery_side_throttle;
         self.transmit_queue.retain_observed(keep, |evicted| {
+            #[cfg(feature = "discovery")]
+            Self::schema_response_owner_lost(responses, Self::schema_response_owner(&evicted.item));
             if let Some(key) = evicted.item.replay_marker_key() {
                 Self::set_replay_queued(hop, end, key, false);
             }
@@ -2838,6 +2880,11 @@ impl RouterInner {
                 let Some(item) = self.transmit_queue.remove_pos(index) else {
                     return false;
                 };
+                #[cfg(feature = "discovery")]
+                Self::schema_response_owner_lost(
+                    &mut self.discovery_side_throttle,
+                    Self::schema_response_owner(&item.item),
+                );
                 if let Some(key) = item.item.replay_marker_key() {
                     Self::set_replay_queued(
                         &mut self.reliable_tx,
@@ -3144,7 +3191,7 @@ impl RouterInner {
                 RouterItem::Packet(_) | RouterItem::Packed(_) => None,
             };
             if let Some((incoming_ty, incoming_sender)) = incoming {
-                self.transmit_queue.retain(|queued| {
+                self.retain_transmit(|queued| {
                     let RouterTxItem::ToSide {
                         dst: queued_dst,
                         data: queued_data,
@@ -3173,6 +3220,8 @@ impl RouterInner {
         )?;
         let reliable_tx = &mut self.reliable_tx;
         let end_to_end = &mut self.end_to_end_reliable_tx;
+        #[cfg(feature = "discovery")]
+        let responses = &mut self.discovery_side_throttle;
         let result = {
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             {
@@ -3199,6 +3248,11 @@ impl RouterInner {
                         }
                     },
                     |evicted: TxQueued| {
+                        #[cfg(feature = "discovery")]
+                        Self::schema_response_owner_lost(
+                            responses,
+                            Self::schema_response_owner(&evicted.item),
+                        );
                         if let Some(key) = evicted.item.replay_marker_key() {
                             Self::set_replay_queued(reliable_tx, end_to_end, key, false);
                         }
@@ -3212,6 +3266,11 @@ impl RouterInner {
                     |queued| queued.priority,
                     |queue, _| Self::transmit_eviction_candidate(queue),
                     |evicted: TxQueued| {
+                        #[cfg(feature = "discovery")]
+                        Self::schema_response_owner_lost(
+                            responses,
+                            Self::schema_response_owner(&evicted.item),
+                        );
                         if let Some(key) = evicted.item.replay_marker_key() {
                             Self::set_replay_queued(reliable_tx, end_to_end, key, false);
                         }
@@ -8152,8 +8211,8 @@ impl Router {
             let queued = st.transmit_queue.iter().any(|entry| {
                 matches!(
                     &entry.item,
-                    RouterTxItem::ToSide { dst, data: RouterItem::Packet(pkt), .. }
-                    if *dst == side && pkt.data_type() == DataType::DiscoverySchema
+                    RouterTxItem::ToSide { dst, data, .. }
+                    if *dst == side && Self::item_data_type(data).ok() == Some(DataType::DiscoverySchema)
                 )
             });
             let throttle = st.discovery_side_throttle.entry(side).or_default();
@@ -9122,6 +9181,7 @@ impl Router {
         side: RouterSideId,
         bytes: crate::SharedBytes,
         relayed: bool,
+        admitted: &mut bool,
     ) -> TelemetryResult<()> {
         let handler = {
             let st = self.state.lock();
@@ -9150,6 +9210,7 @@ impl Router {
                         Self::packed_handler_call(&packed, frame, priority)
                     }) {
                         Ok((_, attempts)) => {
+                            *admitted = true;
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
                         }
@@ -9176,6 +9237,7 @@ impl Router {
         };
         match result {
             Ok((_, attempts)) => {
+                *admitted = true;
                 self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
                 self.note_side_tx_success(side, ty, bytes.len(), relayed, attempts);
                 Ok(())
@@ -9189,6 +9251,7 @@ impl Router {
 
     #[allow(unused_mut)]
     #[cfg(feature = "compression")]
+    #[cfg(test)]
     fn send_queued_to_side(
         &self,
         side: RouterSideId,
@@ -9198,29 +9261,50 @@ impl Router {
         TelemetryResult<()>,
         Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
     ) {
+        self.send_queued_to_side_with_progress(side, data, relayed, &mut false)
+    }
+
+    #[cfg(feature = "compression")]
+    fn send_queued_to_side_with_progress(
+        &self,
+        side: RouterSideId,
+        data: &mut RouterItem,
+        relayed: bool,
+        admitted: &mut bool,
+    ) -> (
+        TelemetryResult<()>,
+        Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
+    ) {
         let reservation = match self.prepare_queued_payload(side, data) {
             Ok(reservation) => reservation,
             Err(error) => return (Err(error), None),
         };
         (
-            self.send_reliable_to_side(side, data.clone(), relayed),
+            self.send_reliable_to_side_with_progress(side, data.clone(), relayed, admitted),
             reservation,
         )
     }
 
+    #[cfg(test)]
     fn send_reliable_to_side(
         &self,
         side: RouterSideId,
         data: RouterItem,
         relayed: bool,
     ) -> TelemetryResult<()> {
+        self.send_reliable_to_side_with_progress(side, data, relayed, &mut false)
+    }
+
+    fn send_reliable_to_side_with_progress(
+        &self,
+        side: RouterSideId,
+        data: RouterItem,
+        relayed: bool,
+        admitted: &mut bool,
+    ) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
-        let schema_id = match &data {
-            RouterItem::Packet(pkt) if pkt.data_type() == DataType::DiscoverySchema => {
-                Some(pkt.packet_id())
-            }
-            _ => None,
-        };
+        let schema_id = (Self::item_data_type(&data).ok() == Some(DataType::DiscoverySchema))
+            .then(|| Self::get_hash(&data));
         #[cfg(feature = "discovery")]
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
@@ -9243,7 +9327,7 @@ impl Router {
                 }
             }
         }
-        let result = self.send_reliable_to_side_impl(side, data, relayed);
+        let result = self.send_reliable_to_side_impl(side, data, relayed, admitted);
         #[cfg(feature = "discovery")]
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
@@ -9251,10 +9335,15 @@ impl Router {
                 && throttle.schema_response_active
                 && throttle.schema_response_packet_id == id
             {
-                throttle.schema_response_active = false;
-                // A partial owner is requeued by the existing transport path.
-                // Keep a pending generation even if re-admission later fails.
-                throttle.schema_response_pending |= result.is_err();
+                // Transient partial IO retains this exact owner in the outer
+                // queue path. It is not a new request for another catalog.
+                if !result
+                    .as_ref()
+                    .is_err_and(|error| Self::is_transient_tx_error(error))
+                {
+                    throttle.schema_response_active = false;
+                    throttle.schema_response_pending |= result.is_err();
+                }
             }
         }
         result
@@ -9265,6 +9354,7 @@ impl Router {
         side: RouterSideId,
         data: RouterItem,
         relayed: bool,
+        admitted: &mut bool,
     ) -> TelemetryResult<()> {
         // Reliability needs only the type and frozen-owner presence; endpoint
         // normalization and an owned wire-owner array are unnecessary here.
@@ -9292,7 +9382,8 @@ impl Router {
             &handler,
             RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)
         ) {
-            return self.call_side_tx_handler(side, &handler, &data, relayed);
+            return self
+                .call_side_tx_handler_with_progress(side, &handler, &data, relayed, admitted);
         }
 
         if !hop_reliable_enabled {
@@ -9306,7 +9397,9 @@ impl Router {
             if let Some(adjusted) =
                 self.adjust_reliable_for_side(adjusted_opts, data, preserve_end_to_end_ack)?
             {
-                return self.call_side_tx_handler(side, &handler, &adjusted, relayed);
+                return self.call_side_tx_handler_with_progress(
+                    side, &handler, &adjusted, relayed, admitted,
+                );
             }
             return Ok(());
         }
@@ -9318,7 +9411,9 @@ impl Router {
 
         if !is_reliable_type(ty) {
             if let Some(adjusted) = self.adjust_reliable_for_side(opts, data, true)? {
-                self.call_side_tx_handler(side, &handler, &adjusted, relayed)?;
+                self.call_side_tx_handler_with_progress(
+                    side, &handler, &adjusted, relayed, admitted,
+                )?;
             }
             return Ok(());
         }
@@ -9382,6 +9477,7 @@ impl Router {
                                 Self::packed_handler_call(&handler, frame, priority)
                             }) {
                                 Ok((_, attempts)) => {
+                                    *admitted = true;
                                     attempts_total = attempts_total.saturating_add(attempts);
                                     sent_bytes = sent_bytes.saturating_add(frame.len());
                                 }
@@ -9426,6 +9522,7 @@ impl Router {
                                 Self::packed_handler_call(&handler, frame, priority)
                             }) {
                                 Ok((_, attempts)) => {
+                                    *admitted = true;
                                     attempts_total = attempts_total.saturating_add(attempts);
                                     sent_bytes = sent_bytes.saturating_add(frame.len());
                                 }
@@ -9470,6 +9567,7 @@ impl Router {
                 Self::packed_handler_call(&handler, frame, priority)
             }) {
                 Ok((_, attempts)) => {
+                    *admitted = true;
                     attempts_total = attempts_total.saturating_add(attempts);
                     sent_bytes = sent_bytes.saturating_add(frame.len());
                 }
@@ -10862,12 +10960,24 @@ impl Router {
         }
     }
 
+    #[cfg(test)]
     fn call_side_tx_handler(
         &self,
         side: RouterSideId,
         handler: &RouterTxHandlerFn,
         data: &RouterItem,
         relayed: bool,
+    ) -> TelemetryResult<()> {
+        self.call_side_tx_handler_with_progress(side, handler, data, relayed, &mut false)
+    }
+
+    fn call_side_tx_handler_with_progress(
+        &self,
+        side: RouterSideId,
+        handler: &RouterTxHandlerFn,
+        data: &RouterItem,
+        relayed: bool,
+        admitted: &mut bool,
     ) -> TelemetryResult<()> {
         let opts = {
             let st = self.state.lock();
@@ -10905,6 +11015,7 @@ impl Router {
                         Self::packed_handler_call(packed, frame, priority)
                     }) {
                         Ok((_, attempts)) => {
+                            *admitted = true;
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
                         }
@@ -10955,6 +11066,7 @@ impl Router {
                                     Self::packed_handler_call(packed, frame, priority)
                                 }) {
                                 Ok((_, attempts)) => {
+                                    *admitted = true;
                                     attempts_total += attempts;
                                     sent_bytes += frame.len();
                                     Ok(())
@@ -10994,6 +11106,7 @@ impl Router {
                         Self::packed_handler_call(packed, frame, priority)
                     }) {
                         Ok((_, attempts)) => {
+                            *admitted = true;
                             attempts_total = attempts_total.saturating_add(attempts);
                             sent_bytes = sent_bytes.saturating_add(frame.len());
                         }
@@ -11020,6 +11133,7 @@ impl Router {
         };
         match result {
             Ok((_, attempts)) => {
+                *admitted = true;
                 if let Ok(bytes) = Self::router_item_wire_len(data) {
                     self.record_side_tx_sample(side, bytes, started_ms, self.clock.now_ms());
                     self.note_side_tx_success(side, ty, bytes, relayed, attempts);
@@ -14009,6 +14123,14 @@ impl Router {
     pub fn clear_queues(&self) {
         let mut st = self.state.lock();
         st.retain_transmit(|_| false);
+        st.transmit_queue.cancel_deferred_turn();
+        #[cfg(feature = "discovery")]
+        for response in st.discovery_side_throttle.values_mut() {
+            if response.schema_response_active {
+                response.schema_response_active = false;
+                response.schema_response_pending = true;
+            }
+        }
         st.has_ordered_retry = false;
         st.received_queue.clear();
         st.rx_priority_burst = 0;
@@ -14031,6 +14153,14 @@ impl Router {
     pub fn clear_tx_queue(&self) {
         let mut st = self.state.lock();
         st.retain_transmit(|_| false);
+        st.transmit_queue.cancel_deferred_turn();
+        #[cfg(feature = "discovery")]
+        for response in st.discovery_side_throttle.values_mut() {
+            if response.schema_response_active {
+                response.schema_response_active = false;
+                response.schema_response_pending = true;
+            }
+        }
         st.tx_priority_burst = 0;
         st.has_ordered_retry = false;
     }
@@ -14048,15 +14178,17 @@ impl Router {
                 next_token = next_token.wrapping_add(1).max(1);
             }
         }
-        let selected = st.transmit_queue.select_front_fair_with_context(
+        let (selected, owed_turn) = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
             |item| item.priority,
             |_queue, item| {
-                !matches!(item.delivery_state,
-                    QueuedDelivery::ClaimedOrdered | QueuedDelivery::ClaimedUnordered
-                        | QueuedDelivery::OrderedTail)
-                    && item.retry_after_ms <= now_ms
+                !matches!(
+                    item.delivery_state,
+                    QueuedDelivery::ClaimedOrdered
+                        | QueuedDelivery::ClaimedUnordered
+                        | QueuedDelivery::OrderedTail
+                ) && item.retry_after_ms <= now_ms
                     && (!control_only || item.priority >= 200)
             },
         )?;
@@ -14089,7 +14221,11 @@ impl Router {
         } else if slow {
             st.refresh_retry_hint();
         }
-        Some(TxWork { queued, claim })
+        Some(TxWork {
+            queued,
+            claim,
+            owed_turn,
+        })
     }
 
     /// Process packets in the transmit queue for up to `timeout_ms` milliseconds.
@@ -14306,15 +14442,28 @@ impl Router {
         ignore_local: bool,
         reservation: &mut Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
     ) -> TelemetryResult<()> {
-        let priority = match &item {
+        self.retry_codec_owner_at_priority(item, ignore_local, reservation, 0)
+    }
+
+    #[cfg(feature = "compression")]
+    fn retry_codec_owner_at_priority(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        reservation: &mut Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
+        priority_floor: u8,
+    ) -> TelemetryResult<()> {
+        let priority = priority_floor.max(match &item {
             RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
             _ => return Err(TelemetryError::BadArg),
-        };
+        });
+        #[cfg(feature = "discovery")]
+        let schema_owner = RouterInner::schema_response_owner(&item);
         let mut state = self.state.lock();
         if let Some(reservation) = reservation {
             reservation.release_locked(&mut state);
         }
-        state.push_transmit(TxQueued {
+        let result = state.push_transmit(TxQueued {
             disposable: true,
             item,
             ignore_local,
@@ -14323,7 +14472,15 @@ impl Router {
             accepted_type: 0,
             deferred_since_ms: 0,
             retry_after_ms: self.clock.now_ms().saturating_add(1),
-        })
+        });
+        #[cfg(feature = "discovery")]
+        if result.is_err() {
+            RouterInner::schema_response_owner_lost(
+                &mut state.discovery_side_throttle,
+                schema_owner,
+            );
+        }
+        result
     }
 
     fn claim_schema_is_current(
@@ -14370,27 +14527,35 @@ impl Router {
     }
 
     fn dispatch_queued_item(&self, work: TxWork) -> TelemetryResult<()> {
+        let owed_turn = work.owed_turn;
         let queued = work.queued;
         let since = matches!(
             queued.delivery_state,
             QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
         )
         .then_some(queued.deferred_since_ms);
-        if !self.claim_schema_is_current(DataType(queued.accepted_type), work.claim)? {
-            return Ok(());
-        }
         let mut context = DispatchContext {
+            priority: queued.priority,
             claim: work.claim,
             since,
             terminal: false,
             owner_transferred: false,
+            refused: false,
+            admitted: false,
         };
+        let schema = self.claim_schema_is_current(DataType(queued.accepted_type), work.claim);
+        if !matches!(schema, Ok(true)) {
+            self.finish_dispatch_turn(owed_turn, &context);
+            return schema.map(|_| ());
+        }
         let mut result =
             self.tx_item_impl_with_retry(queued.item, queued.ignore_local, true, &mut context);
         if let Some(claim) = work.claim {
             let mut st = self.state.lock();
             if result.is_err() && !context.terminal && !context.owner_transferred {
                 let Some(index) = st.claim_index(claim.token) else {
+                    drop(st);
+                    self.finish_dispatch_turn(owed_turn, &context);
                     return result;
                 };
                 let original = st.transmit_queue.get(index).expect("claimed owner");
@@ -14403,6 +14568,7 @@ impl Router {
                 drop(st);
                 result = self.defer_accepted_original(&mut context);
                 if result.is_ok() {
+                    self.finish_dispatch_turn(owed_turn, &context);
                     return Ok(());
                 }
                 st = self.state.lock();
@@ -14416,22 +14582,43 @@ impl Router {
                         .accepted_type;
                     st.cancel_accepted_type(ty);
                 } else {
-                    let ty = st.transmit_queue.get(index).expect("claimed owner").accepted_type;
+                    let ty = st
+                        .transmit_queue
+                        .get(index)
+                        .expect("claimed owner")
+                        .accepted_type;
                     let _ = st.transmit_queue.remove_pos(index);
                     if claim.ordered {
                         // Exactly one FIFO head per Ordered type can be eligible.
                         // Promotion changes metadata only, retaining the admitted payload.
-                        let next = st.transmit_queue.iter().position(|item|
-                            item.delivery_state == QueuedDelivery::OrderedTail && item.accepted_type == ty);
+                        let next = st.transmit_queue.iter().position(|item| {
+                            item.delivery_state == QueuedDelivery::OrderedTail
+                                && item.accepted_type == ty
+                        });
                         if let Some(next) = next {
-                            st.transmit_queue.update_metadata(next, |item| item.delivery_state = QueuedDelivery::Ordered);
+                            st.transmit_queue.update_metadata(next, |item| {
+                                item.delivery_state = QueuedDelivery::Ordered
+                            });
                         }
                     }
                 }
             }
             st.refresh_retry_hint();
         }
+        self.finish_dispatch_turn(owed_turn, &context);
         result
+    }
+
+    fn finish_dispatch_turn(&self, owed_turn: bool, context: &DispatchContext) {
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        st.transmit_queue.finish_deferred_turn(
+            context.priority,
+            owed_turn,
+            context.admitted,
+            context.refused,
+            &mut st.tx_priority_burst,
+        );
     }
 
     fn expire_deferred_original(
@@ -14457,6 +14644,7 @@ impl Router {
     }
 
     fn defer_accepted_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
+        context.refused = true;
         let Some(claim) = context.claim else {
             return Err(TelemetryError::Io("reliable owner unavailable"));
         };
@@ -14520,6 +14708,31 @@ impl Router {
         ignore_local: bool,
     ) -> TelemetryResult<()> {
         self.tx_queue_item_with_flags_at(item, ignore_local, self.clock.now_ms().saturating_add(1))
+    }
+
+    #[cfg(not(feature = "compression"))]
+    fn tx_queue_item_for_retry_at_priority(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        priority: u8,
+    ) -> TelemetryResult<()> {
+        #[cfg(feature = "discovery")]
+        let schema_owner = RouterInner::schema_response_owner(&item);
+        let result = self.tx_queue_item_with_priority_at(
+            item,
+            ignore_local,
+            priority,
+            self.clock.now_ms().saturating_add(1),
+        );
+        #[cfg(feature = "discovery")]
+        if result.is_err() {
+            RouterInner::schema_response_owner_lost(
+                &mut self.state.lock().discovery_side_throttle,
+                schema_owner,
+            );
+        }
+        result
     }
 
     fn tx_queue_item_with_flags_at(
@@ -15954,7 +16167,10 @@ impl Router {
 
                 if let Some(since) = deferred_since
                     && let Err(error) = self.expire_deferred_original(
-                        ty, since, claim.is_some_and(|claim| claim.ordered))
+                        ty,
+                        since,
+                        claim.is_some_and(|claim| claim.ordered),
+                    )
                 {
                     context.terminal = true;
                     return Err(error);
@@ -15985,13 +16201,16 @@ impl Router {
                         return Ok(());
                     }
                     #[cfg(feature = "discovery")]
-                    if !is_discovery && !is_internal_control_type(ty)
+                    if !is_discovery
+                        && !is_internal_control_type(ty)
                         && let Err(error) = self.dispatch_local_for_item(&data, called_from_queue)
                     {
                         // Never repeat a partially applied local side effect.
                         if claim.is_some() {
                             context.terminal = true;
-                            return Err(TelemetryError::HandlerError("accepted local delivery failed"));
+                            return Err(TelemetryError::HandlerError(
+                                "accepted local delivery failed",
+                            ));
                         }
                         return Err(error);
                     }
@@ -16002,7 +16221,9 @@ impl Router {
                         // Never repeat a partially applied local side effect.
                         if claim.is_some() {
                             context.terminal = true;
-                            return Err(TelemetryError::HandlerError("accepted local delivery failed"));
+                            return Err(TelemetryError::HandlerError(
+                                "accepted local delivery failed",
+                            ));
                         }
                         return Err(error);
                     }
@@ -16133,12 +16354,22 @@ impl Router {
                     #[cfg(feature = "compression")]
                     let mut side_data = data.clone();
                     #[cfg(feature = "compression")]
-                    let (send_result, mut reservation) =
-                        self.send_queued_to_side(side, &mut side_data, false);
+                    let (send_result, mut reservation) = self.send_queued_to_side_with_progress(
+                        side,
+                        &mut side_data,
+                        false,
+                        &mut context.admitted,
+                    );
                     #[cfg(not(feature = "compression"))]
-                    let send_result = self.send_reliable_to_side(side, data.clone(), false);
+                    let send_result = self.send_reliable_to_side_with_progress(
+                        side,
+                        data.clone(),
+                        false,
+                        &mut context.admitted,
+                    );
                     if let Err(e) = send_result {
                         if Self::is_transient_tx_error(&e) {
+                            context.refused = true;
                             #[cfg(feature = "compression")]
                             self.retry_codec_owner(
                                 RouterTxItem::ToSide {
@@ -16218,25 +16449,46 @@ impl Router {
                     route_allowed && timesync_allowed
                 };
                 if !allowed {
+                    #[cfg(feature = "discovery")]
+                    if ty == DataType::DiscoverySchema {
+                        RouterInner::schema_response_owner_lost(
+                            &mut self.state.lock().discovery_side_throttle,
+                            Some((dst, Self::get_hash(&data))),
+                        );
+                    }
                     return Ok(());
                 }
                 #[cfg(feature = "compression")]
-                let (send_result, mut reservation) =
-                    self.send_queued_to_side(dst, &mut data, src.is_some());
+                let (send_result, mut reservation) = self.send_queued_to_side_with_progress(
+                    dst,
+                    &mut data,
+                    src.is_some(),
+                    &mut context.admitted,
+                );
                 #[cfg(not(feature = "compression"))]
-                let send_result = self.send_reliable_to_side(dst, data.clone(), src.is_some());
+                let send_result = self.send_reliable_to_side_with_progress(
+                    dst,
+                    data.clone(),
+                    src.is_some(),
+                    &mut context.admitted,
+                );
                 if let Err(e) = send_result {
                     if Self::is_transient_tx_error(&e) {
+                        context.refused = true;
+                        let retry_priority =
+                            context.priority.max(self.item_service_priority(&data)?);
                         #[cfg(feature = "compression")]
-                        self.retry_codec_owner(
+                        self.retry_codec_owner_at_priority(
                             RouterTxItem::ToSide { src, dst, data },
                             true,
                             &mut reservation,
+                            retry_priority,
                         )?;
                         #[cfg(not(feature = "compression"))]
-                        self.tx_queue_item_for_retry(
+                        self.tx_queue_item_for_retry_at_priority(
                             RouterTxItem::ToSide { src, dst, data },
                             true,
+                            retry_priority,
                         )?;
                         return Ok(());
                     }
@@ -16271,14 +16523,26 @@ impl Router {
                     #[cfg(feature = "compression")]
                     let mut side_data = data.clone();
                     #[cfg(feature = "compression")]
-                    let (send_result, mut reservation) =
-                        self.send_queued_to_side(side, &mut side_data, false);
+                    let (send_result, mut reservation) = self.send_queued_to_side_with_progress(
+                        side,
+                        &mut side_data,
+                        false,
+                        &mut context.admitted,
+                    );
                     #[cfg(not(feature = "compression"))]
-                    let send_result = self.send_reliable_to_side(side, data.clone(), false);
+                    let send_result = self.send_reliable_to_side_with_progress(
+                        side,
+                        data.clone(),
+                        false,
+                        &mut context.admitted,
+                    );
                     if let Err(e) = send_result {
                         if Self::is_transient_tx_error(&e) {
+                            context.refused = true;
+                            let retry_priority =
+                                Self::router_item_priority_bumped(DataType::ReliableAck);
                             #[cfg(feature = "compression")]
-                            self.retry_codec_owner(
+                            self.retry_codec_owner_at_priority(
                                 RouterTxItem::ToSide {
                                     src: None,
                                     dst: side,
@@ -16286,15 +16550,17 @@ impl Router {
                                 },
                                 true,
                                 &mut reservation,
+                                retry_priority,
                             )?;
                             #[cfg(not(feature = "compression"))]
-                            self.tx_queue_item_for_retry(
+                            self.tx_queue_item_for_retry_at_priority(
                                 RouterTxItem::ToSide {
                                     src: None,
                                     dst: side,
                                     data: data.clone(),
                                 },
                                 true,
+                                retry_priority,
                             )?;
                             continue;
                         }
@@ -16335,8 +16601,11 @@ impl Router {
                     sent.queued = false;
                     sent.last_send_ms = self.clock.now_ms();
                 }
-                if let Err(e) = self.send_reliable_raw_to_side(dst, bytes.clone(), false) {
+                if let Err(e) =
+                    self.send_reliable_raw_to_side(dst, bytes.clone(), false, &mut context.admitted)
+                {
                     if Self::is_transient_tx_error(&e) {
+                        context.refused = true;
                         self.tx_queue_item_for_retry(
                             RouterTxItem::ReliableReplay {
                                 dst,

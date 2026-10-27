@@ -1,0 +1,171 @@
+{
+  "date": "2026-10-27",
+  "status": "native_qualification_passed_embedded_board_rebuild_pending",
+  "source_version": "4.2.7",
+  "published": false,
+  "release_tag_or_push": false,
+  "base_commit": "7ea5a3003f8a3d85423a0e8e1d484306ef48082a",
+  "source_sha256": {
+    "src/router.rs": "e10139a523f2b98ac62c2eaa9d2fa912f3b02498292a7c69015694f38c89d009",
+    "src/queue.rs": "33c3a4a8372d37eda9f0999eedc65773d690dc93e4d884671dbfe1786c17b207",
+    "src/tests/schema_response_admission.rs": "0d69a616f64042ad4bf2c0dff369d93d8f607e7d068f5b28ef7f0835b5ace082"
+  },
+  "scope": "Private SDK scheduling and schema-response owner handling; no wire format, public ABI, version or dependency changes.",
+  "failures_caught_before_push": [
+    {
+      "cause": "A retained partial schema callback returning temporary IO marked a fresh catalog pending. Each new catalog repeated this, even with only one peer request.",
+      "red_regression": "/tmp/sdk-schema-storm-before-20261027.log",
+      "initial_full_app_failure": "FirmwareSimulator/build/schema-admission-cohort-20261027/host-schema-loan/build-full-hitl.log",
+      "initial_result": "557 passed,1 failed,2 ignored; first Ordered command at6000ms exhausted17retries before radio offload."
+    },
+    {
+      "cause": "A denied E2E replay had its255 service priority recomputed from the original UInt32 application priority16 on its side-owned continuation.",
+      "red_regression": "/tmp/sdk-replay-priority-before-20261027.log"
+    },
+    {
+      "cause": "Denied ordinary service consumed its fairness opportunity. RF GPS backlog grew10reports/s toward the unchanged102400byte shared budget.",
+      "red_regression": "/tmp/sdk-owed-turn-before-20261027.log",
+      "causal_trace": "FirmwareSimulator/build/schema-admission-cohort-20261027/host-schema-loan/native-air-replay-pressure.log"
+    },
+    {
+      "cause": "Checkpoint rollback could lose owed radio service during another side's real reentrant metadata admissions.",
+      "red_regression": "/tmp/sdk-owed-hint-two-side-before-20261027.log",
+      "final_result": "The first40ms-ready radio slot is admitted with continuously ready reentrant metadata; queue<=2 and schema priority0 unchanged."
+    },
+    {
+      "cause": "Policy retirement could remove a queued active schema owner before its send wrapper, leaving the response latched active forever.",
+      "red_regression": "/tmp/sdk-schema-policy-loss-before-20261027.log"
+    }
+  ],
+  "changes": [
+    "Retain the same active schema generation through transient partial or zero-progress IO for both Packet and Packed owners. Only a real new request creates a pending next generation.",
+    "Genuine failed re-admission, queue eviction, explicit TX clear and route-policy retirement release the lost response owner and preserve one pending recovery. Restart header refresh and existing partial transfer identity/order remain.",
+    "Preserve the already-declared replay service priority across repeated side-owned continuation attempts; original application schema priority and reliable ordering stay unchanged.",
+    "Use two bytes of existing BoundedDeque padding for one pending/inflight owed band. Refusal retains it; an actual fragment admitted by that selected dispatch settles it. Temporary absence/inflight work permits other bands to progress.",
+    "Pass a dispatch-local admission bool through private send helpers. Reentrant/concurrent admissions on other sides cannot credit the selected callback. No global epoch or counter rollback remains.",
+    "Existing highest control band keeps its bounded8turn allowance while an ordinary band is owed. An explicit clear invalidates the owed debt while keeping the old inflight reservation until its callback returns."
+  ],
+  "memory_and_bounds": {
+    "queue_entries": "unchanged; host TxQueued208bytes before/after; existing target-alignment assertion retained",
+    "router_state": "host RouterInner1088bytes before/after",
+    "queue_hint": "two bytes occupy existing queue padding; compile-time equality with the previous field tuple passes on host and thumbv7em-none-eabihf",
+    "dispatch_state": "private dispatch-local fields occupy existing DispatchContext padding; compile-time equality retained",
+    "growth": "No queue/map/cache/payload pool capacity or allocator growth; no new RouterInner fields",
+    "unchanged": "Source rates, queue quotas, side frame size, reliable retry/expiry settings,8turn fairness bound, airtime rate/share and UART packetization limits.",
+    "transient_work": "One owed-turn bool in the transient TxWork stack reservation; no stored queue entry or pool enlargement."
+  },
+  "native_tests": {
+    "default": {
+      "log": "/tmp/sdk-final-owner-loss-all-tests-20261027.log",
+      "sha256": "2d70d4f82066eb0df673c631cb72b83826c68e8150ee1edafc7f6ea882a8623a",
+      "warning_count": 0,
+      "passed": 735,
+      "failed": 0,
+      "ignored": 5
+    },
+    "no_compression": {
+      "log": "/tmp/sdk-final-owner-loss-no-compression-20261027.log",
+      "sha256": "af487194ad0ac05d63eca16752d4868940b1910a77f36d8935ea36bb598a6819",
+      "warning_count": 0,
+      "passed": 575,
+      "failed": 0,
+      "ignored": 1
+    },
+    "compact_fair_admission": {
+      "log": "/tmp/sdk-final-owner-loss-features-20261027.log",
+      "sha256": "69b44cb7f4f93044b418e98ebde2d8a6245e5f04b0b7608d084733f9f93e2236",
+      "warning_count": 0,
+      "passed": 610,
+      "failed": 0,
+      "ignored": 2
+    },
+    "embedded": {
+      "log": "/tmp/sdk-final-owner-loss-embedded-20261027.log",
+      "sha256": "b728bdb9a62b0356fe022846e0ae95c327f93a3f797aa6bd9f397d6039798021",
+      "warning_count": 0,
+      "status": "passed"
+    }
+  },
+  "shared_air": {
+    "log": "FirmwareSimulator/build/schema-admission-cohort-20261027/host-schema-loan/native-air-sdk-frozen-20261027.log",
+    "gs_commit": "8ed32cd00351938ccb6712bf2c40cd356dc223db",
+    "profiles": "Original six Ordered/Unordered profiles, FIFO4096/16384, air overhead0/160/512bits, virtual120s/600s",
+    "watchdog_seconds": 30,
+    "command_and_ack_gate_ms": 500,
+    "telemetry_gate_ms": 500,
+    "status": "passed",
+    "wall_seconds": 11.68,
+    "log_sha256": "9c81652c6b30bba80d46c9e7a05e57c42263b7f94c52e2c92fecbf01351a45b7",
+    "source_sha256": {
+      "src/router.rs": "e10139a523f2b98ac62c2eaa9d2fa912f3b02498292a7c69015694f38c89d009",
+      "src/queue.rs": "33c3a4a8372d37eda9f0999eedc65773d690dc93e4d884671dbfe1786c17b207"
+    },
+    "profile_results": [
+      {
+        "mode": "Ordered",
+        "fifo_bytes": 4096,
+        "overhead_bits": 0,
+        "virtual_ms": 120000,
+        "commands": 104,
+        "worst_stable_command_ms": 40,
+        "worst_stable_ack_ms": 60,
+        "telemetry": 1090
+      },
+      {
+        "mode": "Ordered",
+        "fifo_bytes": 4096,
+        "overhead_bits": 160,
+        "virtual_ms": 120000,
+        "commands": 104,
+        "worst_stable_command_ms": 40,
+        "worst_stable_ack_ms": 60,
+        "telemetry": 1090
+      },
+      {
+        "mode": "Ordered",
+        "fifo_bytes": 16384,
+        "overhead_bits": 512,
+        "virtual_ms": 600000,
+        "commands": 584,
+        "worst_stable_command_ms": 60,
+        "worst_stable_ack_ms": 80,
+        "telemetry": 5890
+      },
+      {
+        "mode": "Unordered",
+        "fifo_bytes": 4096,
+        "overhead_bits": 0,
+        "virtual_ms": 120000,
+        "commands": 104,
+        "worst_stable_command_ms": 40,
+        "worst_stable_ack_ms": 60,
+        "telemetry": 1090
+      },
+      {
+        "mode": "Unordered",
+        "fifo_bytes": 4096,
+        "overhead_bits": 160,
+        "virtual_ms": 120000,
+        "commands": 104,
+        "worst_stable_command_ms": 40,
+        "worst_stable_ack_ms": 60,
+        "telemetry": 1090
+      },
+      {
+        "mode": "Unordered",
+        "fifo_bytes": 16384,
+        "overhead_bits": 512,
+        "virtual_ms": 600000,
+        "commands": 584,
+        "worst_stable_command_ms": 60,
+        "worst_stable_ack_ms": 80,
+        "telemetry": 5890
+      }
+    ],
+    "fifo_drops": 0
+  },
+  "limits": [
+    "All seven target factory crossbuilds and the full linked hardware-path campaign must qualify the resulting frozen SDK commit.",
+    "This is native scheduling/ownership evidence, not proof of physical RFD settings or hardware deployment."
+  ]
+}

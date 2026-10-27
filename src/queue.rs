@@ -35,6 +35,9 @@ fn float_to_ratio(mult: f64) -> (usize, usize) {
     (num, DEN)
 }
 
+const PRIORITY_TURN_PENDING: u8 = 1;
+const PRIORITY_TURN_ACTIVE: u8 = 2;
+
 /// A double-ended queue with a maximum byte budget.
 ///
 /// Policy:
@@ -55,7 +58,14 @@ pub struct BoundedDeque<T> {
     fixed_capacity: bool,
     // Rotate bounded service opportunities through waiting lower bands.
     fair_priority_cursor: u8,
+    // Deferred router fairness lives in existing queue padding, not entries.
+    fair_owed_priority: u8,
+    fair_owed_flags: u8,
 }
+
+// Hint bytes occupy the old queue padding on hosted and ARM targets.
+const _: () = assert!(core::mem::size_of::<BoundedDeque<u8>>() ==
+    core::mem::size_of::<(VecDeque<u8>, usize, usize, usize, usize, usize, bool, u8)>());
 
 #[cfg(feature = "compact-packet-store")]
 impl<T: Clone> Clone for BoundedDeque<T> {
@@ -71,6 +81,8 @@ impl<T: Clone> Clone for BoundedDeque<T> {
             grow_den: self.grow_den,
             fixed_capacity: self.fixed_capacity,
             fair_priority_cursor: self.fair_priority_cursor,
+            fair_owed_priority: self.fair_owed_priority,
+            fair_owed_flags: self.fair_owed_flags,
         }
     }
 }
@@ -171,6 +183,8 @@ impl<T: ByteCost> BoundedDeque<T> {
             grow_den,
             fixed_capacity: grow_mult == 1.0 || cfg!(feature = "compact-packet-store"),
             fair_priority_cursor: u8::MAX,
+            fair_owed_priority: 0,
+            fair_owed_flags: 0,
         }
     }
 
@@ -209,6 +223,9 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.q.clear();
         self.cur_bytes = 0;
         self.fair_priority_cursor = u8::MAX;
+        // Invalidate the debt, but keep an active owner reserved until its
+        // callback returns; a reentrant clear cannot create a stale completion.
+        self.fair_owed_flags &= PRIORITY_TURN_ACTIVE;
     }
 
     /// Current used bytes (according to `ByteCost`).
@@ -339,6 +356,105 @@ impl<T: ByteCost> BoundedDeque<T> {
         self.remove_pos(selected)
     }
 
+    pub(crate) fn select_front_fair_deferred<F, G>(
+        &mut self,
+        priority_burst: &mut u8,
+        max_priority_burst: u8,
+        mut priority_of: F,
+        mut eligible: G,
+    ) -> Option<(usize, bool)>
+    where
+        F: FnMut(&T) -> u8,
+        G: FnMut(&VecDeque<T>, &T) -> bool,
+    {
+        if self.fair_owed_flags & PRIORITY_TURN_PENDING != 0
+            && self.fair_owed_flags & PRIORITY_TURN_ACTIVE == 0
+        {
+            // A newly queued receipt/replay retains its existing control band,
+            // but cannot postpone the owed lower band beyond the same bound.
+            if *priority_burst < max_priority_burst {
+                if let Some(index) = self
+                    .q
+                    .iter()
+                    .position(|item| priority_of(item) == u8::MAX && eligible(&self.q, item))
+                {
+                    *priority_burst = priority_burst.saturating_add(1);
+                    return Some((index, false));
+                }
+            }
+            if let Some(index) = self.q.iter().position(|item| {
+                priority_of(item) == self.fair_owed_priority && eligible(&self.q, item)
+            }) {
+                self.fair_owed_flags |= PRIORITY_TURN_ACTIVE;
+                return Some((index, true));
+            }
+            if !self
+                .q
+                .iter()
+                .any(|item| priority_of(item) == self.fair_owed_priority)
+            {
+                self.fair_owed_flags = 0;
+            }
+        }
+        let before = (*priority_burst, self.fair_priority_cursor);
+        let index = self.select_front_fair_with_context(
+            priority_burst,
+            max_priority_burst,
+            &mut priority_of,
+            &mut eligible,
+        )?;
+        let priority = priority_of(&self.q[index]);
+        if self.fair_owed_flags & PRIORITY_TURN_PENDING != 0 {
+            // Fallback work while the owner is temporarily absent/inflight
+            // cannot spend or reset that owner's bounded control allowance.
+            *priority_burst = before.0.max(*priority_burst).min(max_priority_burst);
+        }
+
+        // A temporarily ineligible/inflight owed band may not block other
+        // bands, or lose its reservation to one of their selections.
+        if self.fair_owed_flags == 0 && self.q.iter().any(|item| priority_of(item) > priority) {
+            self.fair_owed_priority = priority;
+            self.fair_owed_flags = PRIORITY_TURN_PENDING | PRIORITY_TURN_ACTIVE;
+            *priority_burst = before.0;
+            self.fair_priority_cursor = before.1;
+            return Some((index, true));
+        }
+        Some((index, false))
+    }
+
+    pub(crate) fn cancel_deferred_turn(&mut self) {
+        self.fair_owed_flags &= PRIORITY_TURN_ACTIVE;
+    }
+
+    pub(crate) fn finish_deferred_turn(
+        &mut self,
+        priority: u8,
+        owns: bool,
+        admitted: bool,
+        retained: bool,
+        priority_burst: &mut u8,
+    ) {
+        if !owns
+            || self.fair_owed_flags & PRIORITY_TURN_ACTIVE == 0
+            || self.fair_owed_priority != priority
+        {
+            return;
+        }
+        if admitted || !retained {
+            if self.fair_owed_flags & PRIORITY_TURN_PENDING != 0 {
+                self.fair_priority_cursor = priority;
+                *priority_burst = 0;
+            }
+            self.fair_owed_flags = 0;
+        } else {
+            self.fair_owed_flags &= !PRIORITY_TURN_ACTIVE;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn priority_fair_cursor(&self) -> u8 {
+        self.fair_priority_cursor
+    }
     /// Select a service slot without copying/removing its owned payload.
     /// Fairness cursor/burst updates match a normal pop; caller decides ownership.
     pub(crate) fn select_front_fair_with_context<F, G>(

@@ -477,3 +477,731 @@ fn coalesced_restarts_receive_full_headers_after_pending_dispatch() {
             .is_some()
     );
 }
+
+#[test]
+fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    for mode in [crate::ReliableMode::Ordered, crate::ReliableMode::Unordered] {
+        let endpoint = crate::config::register_endpoint("SCHEMA_REPLAY_OWNER", false).unwrap();
+        let ty = crate::config::register_data_type_with_description(
+            &format!("SCHEMA_REPLAY_{mode:?}"),
+            "",
+            MessageElement::Static(1, crate::MessageDataType::UInt32, crate::MessageClass::Data),
+            &[endpoint],
+            mode,
+            16,
+        )
+        .unwrap();
+        assert_eq!(crate::transport_priority(ty), 16);
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        );
+        let credit = Arc::new(AtomicUsize::new(1));
+        let allowance = credit.clone();
+        let frames = Arc::new(RouterMutex::new(Vec::new()));
+        let capture = frames.clone();
+        let side = router.add_side_packed_with_options(
+            "RFD",
+            move |bytes| {
+                allowance
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .map_err(|_| TelemetryError::Io("side tx busy"))?;
+                capture.lock().push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions::default().with_small_packet_transport(192),
+        );
+        let catalog = discovery::build_discovery_schema("GS", 0).unwrap();
+        assert!(matches!(
+            router.send_reliable_to_side(side, RouterItem::Packet(catalog.clone()), false),
+            Err(TelemetryError::Io(_))
+        ));
+        assert_eq!(&frames.lock()[0][..4], b"SDT\x03");
+        router
+            .tx_queue_item_with_flags(
+                RouterTxItem::ToSide {
+                    src: None,
+                    dst: side,
+                    data: RouterItem::Packet(catalog),
+                },
+                true,
+            )
+            .unwrap();
+        let packet = Packet::new(
+            ty,
+            &[endpoint],
+            "GS",
+            1,
+            Arc::<[u8]>::from(1u32.to_le_bytes()),
+        )
+        .unwrap();
+        let id = packet.packet_id();
+        router.state.lock().end_to_end_reliable_tx.insert(
+            id,
+            EndToEndReliableSent {
+                ordered_type: matches!(mode, crate::ReliableMode::Ordered).then_some(ty.as_u32()),
+                waiting_for_predecessor: false,
+                data: RouterItem::Packet(packet),
+                pending_destinations: BTreeMap::from([(Router::sender_hash("RF"), side)]),
+                tracked_destinations: true,
+                last_send_ms: 0,
+                retries: 1,
+                queued: false,
+            },
+        );
+        router.queue_end_to_end_reliable_retransmit(id).unwrap();
+        // The original high-priority replay callback is refused. Repeat that
+        // refusal before a transport slot opens, as in the captured campaign.
+        for tick in 1..=3 {
+            now.store(tick, Ordering::Relaxed);
+            router.dispatch_tx_queue_with_timeout(0).unwrap();
+        }
+        now.store(4, Ordering::Relaxed);
+        credit.store(1, Ordering::SeqCst);
+        router.dispatch_tx_queue_with_timeout(0).unwrap();
+        let captured = frames.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            wire_format::peek_frame_info(&captured[1])
+                .ok()
+                .map(|info| info.envelope.ty),
+            Some(ty),
+            "a denied replay must retain its service priority for the next ready slot instead of falling behind schema chunks"
+        );
+        drop(captured);
+        assert_eq!(
+            crate::message_priority(ty),
+            16,
+            "application schema priority stays unchanged"
+        );
+        // Resume the same partial catalog, proving the replay did not reset
+        // its prefix, transfer identity or chunk order.
+        for tick in 5..500 {
+            now.store(tick, Ordering::Relaxed);
+            credit.store(1, Ordering::SeqCst);
+            router.dispatch_tx_queue_with_timeout(0).unwrap();
+            if !router.has_queued_work() {
+                break;
+            }
+        }
+        let captured = frames.lock();
+        let chunks: Vec<_> = captured
+            .iter()
+            .filter(|bytes| bytes.starts_with(b"SDT\x03"))
+            .collect();
+        assert!(chunks.len() > 1);
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(&chunk[4..8], &chunks[0][4..8]);
+            assert_eq!(u16::from_le_bytes([chunk[8], chunk[9]]) as usize, index);
+        }
+    }
+}
+
+#[test]
+fn refused_ordinary_turn_survives_until_admission_during_partial_schema() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let endpoint = crate::config::register_endpoint("SCHEMA_ORDINARY_OWNER", false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        "SCHEMA_ORDINARY_REPORT",
+        "",
+        MessageElement::Static(1, crate::MessageDataType::UInt32, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::new([]).with_sender("RF"),
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    );
+    let credit = Arc::new(AtomicUsize::new(1));
+    let allowance = credit.clone();
+    let frames = Arc::new(RouterMutex::new(Vec::new()));
+    let capture = frames.clone();
+    let side = router.add_side_packed_with_options(
+        "RFD",
+        move |bytes| {
+            allowance
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .map_err(|_| TelemetryError::Io("side tx busy"))?;
+            capture.lock().push(bytes.to_vec());
+            Ok(())
+        },
+        RouterSideOptions::default().with_small_packet_transport(192),
+    );
+    let catalog = discovery::build_discovery_schema("RF", 0).unwrap();
+    assert!(matches!(
+        router.send_reliable_to_side(side, RouterItem::Packet(catalog.clone()), false),
+        Err(TelemetryError::Io(_))
+    ));
+    router
+        .tx_queue_item_with_flags(
+            RouterTxItem::ToSide {
+                src: None,
+                dst: side,
+                data: RouterItem::Packet(catalog),
+            },
+            true,
+        )
+        .unwrap();
+    let packet = Packet::new(
+        ty,
+        &[endpoint],
+        "RF",
+        1,
+        Arc::<[u8]>::from(1u32.to_le_bytes()),
+    )
+    .unwrap();
+    router
+        .tx_queue_item_with_flags(
+            RouterTxItem::ToSide {
+                src: None,
+                dst: side,
+                data: RouterItem::Packet(packet),
+            },
+            true,
+        )
+        .unwrap();
+    // Refusals and later one-frame opportunities match the fixed-capacity
+    // driver: failed attempts cannot use up an ordinary stream's owed turn.
+    for tick in 1..=10 {
+        now.store(tick, Ordering::Relaxed);
+        credit.store(usize::from(tick >= 4), Ordering::SeqCst);
+        router.dispatch_tx_queue_with_timeout(0).unwrap();
+    }
+    let decoder = Router::new(RouterConfig::default());
+    let decode_side = decoder.add_side_packed_with_options(
+        "trace",
+        |_| Ok(()),
+        RouterSideOptions::default().with_small_packet_transport(192),
+    );
+    let mut delivered = false;
+    for frame in frames.lock().iter() {
+        if let Some(canonical) = decoder
+            .decode_side_transport_frame(decode_side, frame)
+            .unwrap()
+        {
+            delivered |= wire_format::peek_frame_info(&canonical)
+                .unwrap()
+                .envelope
+                .ty
+                == ty;
+        }
+    }
+    assert!(
+        delivered,
+        "ordinary report must reach an actual ready slot before another full schema completes"
+    );
+    assert_eq!(crate::message_priority(ty), 0);
+    for tick in 11..500 {
+        now.store(tick, Ordering::Relaxed);
+        credit.store(1, Ordering::SeqCst);
+        router.dispatch_tx_queue_with_timeout(0).unwrap();
+        if !router.has_queued_work() {
+            break;
+        }
+    }
+    let capture = frames.lock();
+    let chunks: Vec<_> = capture
+        .iter()
+        .filter(|bytes| bytes.starts_with(b"SDT\x03"))
+        .collect();
+    assert!(chunks.len() > 1);
+    for (index, chunk) in chunks.iter().enumerate() {
+        assert_eq!(&chunk[4..8], &chunks[0][4..8]);
+        assert_eq!(u16::from_le_bytes([chunk[8], chunk[9]]) as usize, index);
+    }
+}
+
+#[test]
+fn refused_turn_cannot_overwrite_reentrant_side_admission() {
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let endpoint = crate::config::register_endpoint("FAIR_REENTRANT_OWNER", false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        "FAIR_REENTRANT_REPORT",
+        "",
+        MessageElement::Static(1, crate::MessageDataType::UInt32, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let node = Arc::new(Router::new_with_clock(
+        RouterConfig::new([]),
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    ));
+    let weak = Arc::downgrade(&node);
+    let open = Arc::new(AtomicBool::new(false));
+    let ready = open.clone();
+    let low = node.add_side_packed("blocked", move |_| {
+        if ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        weak.upgrade()
+            .unwrap()
+            .dispatch_tx_queue_with_timeout(0)
+            .unwrap();
+        Err(TelemetryError::Io("side tx busy"))
+    });
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let observed = accepted.clone();
+    let high = node.add_side_packet("other", move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    let catalog = discovery::build_discovery_schema("RF", 0).unwrap();
+    node.tx_queue_item_with_flags(
+        RouterTxItem::ToSide {
+            src: None,
+            dst: high,
+            data: RouterItem::Packet(catalog),
+        },
+        true,
+    )
+    .unwrap();
+    let packet = Packet::new(
+        ty,
+        &[endpoint],
+        "RF",
+        1,
+        Arc::<[u8]>::from(1u32.to_le_bytes()),
+    )
+    .unwrap();
+    node.tx_queue_item_with_flags(
+        RouterTxItem::ToSide {
+            src: None,
+            dst: low,
+            data: RouterItem::Packet(packet),
+        },
+        true,
+    )
+    .unwrap();
+    node.state.lock().tx_priority_burst = MAX_PRIORITY_BURST;
+    node.dispatch_tx_queue_with_timeout(0).unwrap();
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    let st = node.state.lock();
+    assert!(
+        st.transmit_queue.iter().any(|item| item.priority == 0),
+        "refused report retains its original band and owner"
+    );
+    drop(st);
+    open.store(true, Ordering::Relaxed);
+    now.store(1, Ordering::Relaxed);
+    node.dispatch_tx_queue_with_timeout(0).unwrap();
+    assert!(!node.has_queued_work());
+    assert_eq!(
+        node.state.lock().tx_priority_burst,
+        0,
+        "actual radio admission settles the owed turn after the independent side's admission"
+    );
+}
+
+#[test]
+fn unrelated_nested_admission_does_not_credit_selected_dispatch() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let endpoint = crate::config::register_endpoint("NESTED_PROGRESS_OWNER", false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        "NESTED_PROGRESS_REPORT",
+        "",
+        MessageElement::Static(1, crate::MessageDataType::UInt32, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let node = Arc::new(Router::new(RouterConfig::new([])));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let observed = accepted.clone();
+    let other = node.add_side_packet("other", move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    let nested = Packet::new(
+        ty,
+        &[endpoint],
+        "RF",
+        1,
+        Arc::<[u8]>::from(1u32.to_le_bytes()),
+    )
+    .unwrap();
+    let weak = Arc::downgrade(&node);
+    let blocked = node.add_side_packed("blocked", move |_| {
+        weak.upgrade()
+            .unwrap()
+            .send_reliable_to_side(other, RouterItem::Packet(nested.clone()), false)
+            .unwrap();
+        Err(TelemetryError::Io("side tx busy"))
+    });
+    let catalog = discovery::build_discovery_schema("RF", 0).unwrap();
+    let mut admitted = false;
+    assert!(matches!(
+        node.send_reliable_to_side_with_progress(
+            blocked,
+            RouterItem::Packet(catalog),
+            false,
+            &mut admitted
+        ),
+        Err(TelemetryError::Io(_))
+    ));
+    assert!(accepted.load(Ordering::Relaxed) > 0);
+    assert!(
+        !admitted,
+        "only the selected callback's successful admission counts, even during reentry"
+    );
+}
+
+#[test]
+fn refused_turn_cannot_roll_back_reentrant_clear() {
+    crate::tests::ensure_common_test_schema();
+    let endpoint = crate::config::register_endpoint("FAIR_CLEAR_OWNER", false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        "FAIR_CLEAR_REPORT",
+        "",
+        MessageElement::Static(1, crate::MessageDataType::UInt32, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let node = Arc::new(Router::new(RouterConfig::new([])));
+    let weak = Arc::downgrade(&node);
+    let side = node.add_side_packed("blocked", move |_| {
+        weak.upgrade().unwrap().clear_tx_queue();
+        Err(TelemetryError::Io("side tx busy"))
+    });
+    let packet = Packet::new(
+        ty,
+        &[endpoint],
+        "RF",
+        1,
+        Arc::<[u8]>::from(1u32.to_le_bytes()),
+    )
+    .unwrap();
+    node.tx_queue_item_with_flags(
+        RouterTxItem::ToSide {
+            src: None,
+            dst: side,
+            data: RouterItem::Packet(packet),
+        },
+        true,
+    )
+    .unwrap();
+    node.state.lock().tx_priority_burst = MAX_PRIORITY_BURST;
+    node.dispatch_tx_queue_with_timeout(0).unwrap();
+    let st = node.state.lock();
+    assert_eq!(st.tx_priority_burst, 0);
+    assert_eq!(st.transmit_queue.priority_fair_cursor(), u8::MAX);
+}
+
+#[test]
+fn one_partial_schema_request_completes_without_inventing_another_generation() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    for packed in [false, true] {
+        let now = Arc::new(AtomicU64::new(1000));
+        let clock = now.clone();
+        let node = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("SOURCE"),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        );
+        let credit = Arc::new(AtomicUsize::new(1));
+        let allowance = credit.clone();
+        let frames = Arc::new(RouterMutex::new(Vec::new()));
+        let capture = frames.clone();
+        let side = node.add_side_packed_with_options(
+            "slow",
+            move |bytes| {
+                allowance
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .map_err(|_| TelemetryError::Io("side tx busy"))?;
+                capture.lock().push(bytes.to_vec());
+                Ok(())
+            },
+            RouterSideOptions::default().with_small_packet_transport(192),
+        );
+        let request = discovery::build_discovery_schema_request("PEER", 1000).unwrap();
+        node.learn_discovery_packet(&request, Some(side), true)
+            .unwrap();
+        if packed {
+            let mut st = node.state.lock();
+            let index=st.transmit_queue.iter().position(|item|matches!(&item.item,RouterTxItem::ToSide{data:RouterItem::Packet(p),..}if p.data_type()==DataType::DiscoverySchema)).unwrap();
+            let old = st.transmit_queue.get(index).unwrap().clone();
+            let old_cost = old.byte_cost();
+            let RouterTxItem::ToSide {
+                src,
+                dst,
+                data: RouterItem::Packet(p),
+            } = old.item
+            else {
+                unreachable!()
+            };
+            let item = RouterTxItem::ToSide {
+                src,
+                dst,
+                data: RouterItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(
+                    &p,
+                ))),
+            };
+            let cost = old_cost
+                .saturating_sub(p.byte_cost())
+                .saturating_add(item.byte_cost());
+            st.transmit_queue
+                .update_admitted(index, cost, |entry| entry.item = item)
+                .unwrap();
+        }
+        for tick in 1000..2000 {
+            now.store(tick, Ordering::Relaxed);
+            credit.store(1, Ordering::Relaxed);
+            node.dispatch_tx_queue_with_timeout(0).unwrap();
+            if !node.has_queued_work() {
+                break;
+            }
+        }
+        assert!(!node.has_queued_work());
+        now.store(3000, Ordering::Relaxed);
+        assert!(
+            !node.poll_schema_response_on_side(side).unwrap(),
+            "retained partial IO is a continuation, not a fresh request (packed={packed})"
+        );
+        let state = node.state.lock();
+        assert!(!state.discovery_side_throttle[&side].schema_response_active);
+        assert!(!state.discovery_side_throttle[&side].schema_response_pending);
+        drop(state);
+        let decoder = Router::new(RouterConfig::default());
+        let rx = decoder.add_side_packed_with_options(
+            "trace",
+            |_| Ok(()),
+            RouterSideOptions::default().with_small_packet_transport(192),
+        );
+        let mut catalogs = 0;
+        for frame in frames.lock().iter() {
+            if let Some(bytes) = decoder.decode_side_transport_frame(rx, frame).unwrap() {
+                catalogs += usize::from(
+                    wire_format::peek_frame_info(&bytes).unwrap().envelope.ty
+                        == DataType::DiscoverySchema,
+                );
+            }
+        }
+        assert_eq!(catalogs, 1);
+        let restart = discovery::build_discovery_schema_request("PEER", 3001).unwrap();
+        now.store(3001, Ordering::Relaxed);
+        node.learn_discovery_packet(&restart, Some(side), true)
+            .unwrap();
+        assert!(
+            node.state.lock().discovery_side_throttle[&side].schema_response_active,
+            "a genuine restart still gets a fresh generation"
+        );
+    }
+}
+
+#[test]
+fn owed_radio_progress_survives_continuously_ready_reentrant_metadata() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let endpoint = crate::config::register_endpoint("SUSTAINED_RADIO_OWNER", false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        "SUSTAINED_RADIO_REPORT",
+        "",
+        MessageElement::Static(1, crate::MessageDataType::UInt32, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::None,
+        0,
+    )
+    .unwrap();
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let node = Arc::new(Router::new_with_clock(
+        RouterConfig::new([]),
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    ));
+    let metadata = discovery::build_discovery_topology_request("METADATA", 0).unwrap();
+    let refill = metadata.clone();
+    let weak = Arc::downgrade(&node);
+    let fill_side = Arc::new(AtomicUsize::new(usize::MAX));
+    let fill = fill_side.clone();
+    let time = now.clone();
+    let count = Arc::new(AtomicUsize::new(0));
+    let accepted = count.clone();
+    let high = node.add_side_packet("ready", move |_| {
+        accepted.fetch_add(1, Ordering::Relaxed);
+        time.fetch_add(1, Ordering::Relaxed);
+        weak.upgrade()
+            .unwrap()
+            .tx_queue_item_with_flags(
+                RouterTxItem::ToSide {
+                    src: None,
+                    dst: fill.load(Ordering::Relaxed),
+                    data: RouterItem::Packet(refill.clone()),
+                },
+                true,
+            )
+            .unwrap();
+        Ok(())
+    });
+    fill_side.store(high, Ordering::Relaxed);
+    let delivered = Arc::new(AtomicU64::new(u64::MAX));
+    let effect = delivered.clone();
+    let time = now.clone();
+    let weak = Arc::downgrade(&node);
+    let radio = node.add_side_packed("periodic", move |_| {
+        let at = time.load(Ordering::Relaxed);
+        if at != 0 && at % 40 == 0 {
+            effect.store(at, Ordering::Relaxed);
+            time.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        } else {
+            // Another side settles a real metadata admission during each
+            // refusal; it must not erase this radio's owed service band.
+            weak.upgrade()
+                .unwrap()
+                .dispatch_tx_queue_with_timeout(1)
+                .unwrap();
+            Err(TelemetryError::Io("side tx busy"))
+        }
+    });
+    node.tx_queue_item_with_flags(
+        RouterTxItem::ToSide {
+            src: None,
+            dst: high,
+            data: RouterItem::Packet(metadata),
+        },
+        true,
+    )
+    .unwrap();
+    let packet = Packet::new(
+        ty,
+        &[endpoint],
+        "RF",
+        1,
+        Arc::<[u8]>::from(1u32.to_le_bytes()),
+    )
+    .unwrap();
+    node.tx_queue_item_with_flags(
+        RouterTxItem::ToSide {
+            src: None,
+            dst: radio,
+            data: RouterItem::Packet(packet),
+        },
+        true,
+    )
+    .unwrap();
+    for _ in 0..100 {
+        node.dispatch_tx_queue_with_timeout(1).unwrap();
+        assert!(node.state.lock().transmit_queue.len() <= 2);
+        if delivered.load(Ordering::Relaxed) != u64::MAX {
+            break;
+        }
+    }
+    assert_eq!(
+        delivered.load(Ordering::Relaxed),
+        40,
+        "first ready40ms radio slot must survive independent metadata admissions"
+    );
+    assert!(count.load(Ordering::Relaxed) >= 40);
+    assert_eq!(crate::message_priority(ty), 0);
+}
+
+#[test]
+fn lost_partial_schema_owner_can_recover_after_clear_eviction_or_readmission_failure() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    crate::tests::ensure_common_test_schema();
+    for loss in ["clear", "eviction", "readmission", "policy"] {
+        let now = Arc::new(AtomicU64::new(1000));
+        let clock = now.clone();
+        let node = Router::new_with_clock(
+            RouterConfig::new([]),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        );
+        let credit = Arc::new(AtomicUsize::new(1));
+        let allowance = credit.clone();
+        let chunks = Arc::new(AtomicUsize::new(0));
+        let seen = chunks.clone();
+        let side = node.add_side_packed_with_options(
+            "slow",
+            move |bytes| {
+                allowance
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .map_err(|_| TelemetryError::Io("side tx busy"))?;
+                if bytes.starts_with(b"SDT\x03") {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            },
+            RouterSideOptions::default().with_small_packet_transport(192),
+        );
+        let request = discovery::build_discovery_schema_request("PEER", 1000).unwrap();
+        node.learn_discovery_packet(&request, Some(side), true)
+            .unwrap();
+        for tick in 1000..1100 {
+            now.store(tick, Ordering::Relaxed);
+            credit.store(1, Ordering::Relaxed);
+            node.dispatch_tx_queue_with_timeout(0).unwrap();
+            if chunks.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert!(chunks.load(Ordering::Relaxed) > 0);
+        let original = node.state.lock().discovery_side_throttle[&side].schema_response_packet_id;
+        assert!(node.state.lock().discovery_side_throttle[&side].schema_response_active);
+        match loss {
+            "clear" => node.clear_tx_queue(),
+            "eviction" => assert!(
+                node.state
+                    .lock()
+                    .pop_shared_queue_item(RouterQueueKind::Transmit)
+            ),
+            "policy" => {
+                node.set_typed_route(None, DataType::DiscoverySchema, side, false)
+                    .unwrap();
+                now.fetch_add(1, Ordering::Relaxed);
+                credit.store(0, Ordering::Relaxed);
+                node.dispatch_tx_queue_with_timeout(0).unwrap();
+            }
+            _ => {
+                let budget = node.state.lock().memory.max_queue_budget;
+                node.state.lock().memory.max_queue_budget = 1;
+                now.fetch_add(1, Ordering::Relaxed);
+                credit.store(0, Ordering::Relaxed);
+                assert!(node.dispatch_tx_queue_with_timeout(0).is_err());
+                node.state.lock().memory.max_queue_budget = budget;
+            }
+        }
+        {
+            let st = node.state.lock();
+            let state = &st.discovery_side_throttle[&side];
+            assert!(
+                !state.schema_response_active,
+                "lost owner must not latch active forever: {loss}"
+            );
+            assert!(
+                state.schema_response_pending,
+                "genuine lost admission retains a pending response: {loss}"
+            );
+        }
+        if loss == "policy" {
+            node.set_typed_route(None, DataType::DiscoverySchema, side, true)
+                .unwrap();
+        }
+        now.store(3000, Ordering::Relaxed);
+        credit.store(0, Ordering::Relaxed);
+        assert!(
+            node.poll_schema_response_on_side(side).unwrap(),
+            "restart after {loss}"
+        );
+        let st = node.state.lock();
+        let state = &st.discovery_side_throttle[&side];
+        assert!(state.schema_response_active);
+        assert_ne!(state.schema_response_packet_id, original);
+    }
+}
