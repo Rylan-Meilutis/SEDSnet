@@ -6,10 +6,10 @@
     "src/router.rs": "6993e70879753d152f45cc4b1d6b000d27b29fc80f6c6ddd68d3b5dea83cef63",
     "src/side_transport.rs": "02a35f22b2d35e462508eead08e4d14a54e08ee6e080a22a0c09777dd0b0cd18",
     "src/wire_format.rs": "7ed41a0a4d13bfa968dc2550cd5d971839128c2d9359a1b95c5db331f0ae42a5",
-    "src/tests/schema_receive_progress.rs": "92057b831413702cad32430805d53087024ba374a028c7b1b1e97e7d8f73fc78",
+    "src/tests/schema_receive_progress.rs": "263e2f48de3f1bd0bede56b8b45474529344d3cca92df0d251cf3c9ac71858c5",
     "src/tests/fixtures/schema-progress-20261027.json": "50a8c3281f252d19101c220833bc91a70504d13f9f8e59eb5dce83f1b2b9b1d8"
   },
-  "aggregate_source_sha256": "97d6939c14dfd38a8639f1d0da62938f4a5779a5fd2d85d7835eaec398ffc9fd",
+  "aggregate_source_sha256": "3887bc05c21430fcf0ce7ea99353df57cc8abb8e27476d4bb5506d7c0754c9cb",
   "change": "Defer due schema retry only while the same missing peer has a CRC-validated first schema chunk and recent unique-fragment progress",
   "policy": {
     "identity": "Assigned advertised numeric address OR legacy sender hash, matching note_schema_received completion compatibility",
@@ -45,12 +45,18 @@
     "scope": "Fresh process; exact captured3655B initial schema via actual queued partial transport and real receiver\u2192producer request handler; response uses native runtime catalog; one192B transport frame per100ms. No full-network savings inferred."
   },
   "tests": {
-    "SDK_default_pass": 608,
     "ignored": 3,
     "focused_behavior_cases": 5,
     "ARM_supported_embedded_fair_ingress_compact": "PASS zero warnings",
     "ARM_minimal_discovery": "PASS8warnings identical baseline8",
-    "host_no_std": "Unsupported check failed without allocator/panic runtime as baseline configuration; supported thumbv7em checks passed"
+    "host_no_std": "Unsupported check failed without allocator/panic runtime as baseline configuration; supported thumbv7em checks passed",
+    "SDK_default_lib_pass": 608,
+    "SDK_default_total_native_and_integration_pass": 740,
+    "SDK_default_total_ignored": 6,
+    "no_compression_lib_pass": 580,
+    "fair_ingress_compact_compression_lib_pass": 615,
+    "fair_integrations_pass": 28,
+    "fair_integrations_ignored": 1
   },
   "evidence_logs": [
     "/tmp/sdk-schema-progress-red-20261027.log",
@@ -60,7 +66,11 @@
     "/tmp/sdk-schema-progress-closed-loop-20261027.log",
     "/tmp/sdk-schema-progress-embedded-arm-final-20261027.log",
     "/tmp/sdk-schema-progress-minimal-arm-final-20261027.log",
-    "/tmp/sdk-schema-progress-minimal-arm-baseline-20261027.log"
+    "/tmp/sdk-schema-progress-minimal-arm-baseline-20261027.log",
+    "/tmp/sdk-schema-progress-default-full-20261027.log",
+    "/tmp/sdk-schema-progress-no-compression-20261027.log",
+    "/tmp/sdk-schema-progress-fair-matrix-20261027.log",
+    "/tmp/sdk-schema-progress-fair-integrations-20261027.log"
   ],
   "remaining_cause": "Offline0-error CAN discovery replay shows completedRFschemas setRFhas_schema true at2.226/7.189s whilePBremains full-topology true/has_schema false. Continuing FC broadcast requests for missingPB are legitimate and this guard must NOT suppress them merely because unrelatedRF catalogs progress. PB partial catalog diagnosis remains outstanding.",
   "limits": [
