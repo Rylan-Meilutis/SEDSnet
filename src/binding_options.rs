@@ -52,35 +52,11 @@ pub(crate) fn relay_side_options_for_profile(
     compact_header_target_bytes: usize,
     max_side_transport_templates: usize,
 ) -> RelaySideOptions {
-    let mut opts = RelaySideOptions {
+    router_side_options_for_profile(
         reliable_enabled,
+        profile,
         max_frame_bytes,
+        compact_header_target_bytes,
         max_side_transport_templates,
-        side_transport_profile: profile,
-        ..RelaySideOptions::default()
-    };
-    match profile {
-        SideTransportProfile::Canonical => {}
-        SideTransportProfile::Template => {
-            opts.header_template_enabled = true;
-        }
-        SideTransportProfile::Ipv6Like => {
-            opts.header_template_enabled = true;
-            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
-                crate::relay::IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES
-            } else {
-                compact_header_target_bytes
-            };
-        }
-        SideTransportProfile::Ipv4Like => {
-            opts.header_template_enabled = true;
-            opts.omit_unchanged_compact_timestamps = true;
-            opts.compact_header_target_bytes = if compact_header_target_bytes == 0 {
-                crate::relay::IPV4_LIKE_COMPACT_HEADER_TARGET_BYTES
-            } else {
-                compact_header_target_bytes
-            };
-        }
-    }
-    opts
+    )
 }

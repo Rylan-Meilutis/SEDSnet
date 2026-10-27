@@ -186,6 +186,7 @@ pub mod packet_store;
 mod queue;
 pub mod relay;
 pub mod router;
+pub mod routing_config;
 mod side_transport;
 #[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
 mod small_map;
