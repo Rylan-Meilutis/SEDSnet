@@ -1,0 +1,70 @@
+{
+  "date": "2026-10-27",
+  "base_commit": "6201162a5be4ad7e7fd6282249e056a5a930a7e5",
+  "result": "Native PASS; full linked campaign not run for this candidate",
+  "source_sha256": {
+    "src/router.rs": "6993e70879753d152f45cc4b1d6b000d27b29fc80f6c6ddd68d3b5dea83cef63",
+    "src/side_transport.rs": "02a35f22b2d35e462508eead08e4d14a54e08ee6e080a22a0c09777dd0b0cd18",
+    "src/wire_format.rs": "7ed41a0a4d13bfa968dc2550cd5d971839128c2d9359a1b95c5db331f0ae42a5",
+    "src/tests/schema_receive_progress.rs": "92057b831413702cad32430805d53087024ba374a028c7b1b1e97e7d8f73fc78",
+    "src/tests/fixtures/schema-progress-20261027.json": "50a8c3281f252d19101c220833bc91a70504d13f9f8e59eb5dce83f1b2b9b1d8"
+  },
+  "aggregate_source_sha256": "97d6939c14dfd38a8639f1d0da62938f4a5779a5fd2d85d7835eaec398ffc9fd",
+  "change": "Defer due schema retry only while the same missing peer has a CRC-validated first schema chunk and recent unique-fragment progress",
+  "policy": {
+    "identity": "Assigned advertised numeric address OR legacy sender hash, matching note_schema_received completion compatibility",
+    "inactivity_ms": 2000,
+    "expiry_rule": "Progress accepted at exactly2000ms age; resume original due retry after2000ms, matching existing chunk expiry",
+    "timer": "No change to1000ms initial grace or5000ms retry; deferred request deadline is not moved",
+    "memory": "No retained fields, queue growth or heap allocation in prefix inspection; existing bounded rx_chunks own fragments/progress clock",
+    "preserved": [
+      "Duplicate/refused chunks do not extend useful progress",
+      "Unrelated sender/type cannot defer",
+      "No first chunk or corrupt wrapper grants no deferral",
+      "Full schema CRC/decode/merge remain authoritative",
+      "Completion alone marks schema received",
+      "No sample rate, bandwidth, share, queue or protocol changes"
+    ]
+  },
+  "causal_fixture": {
+    "provenance": "SDK620 full-path-final-50ms station1 RX RF schema SDT3 fragments2.8926..5.6623s with original GS4.620s SchemaRequest overlap",
+    "frames": 21,
+    "seeded_state": "Only missing RF peer with actual assigned address3757742741; captured canonical source uses legacy RF hash3997908571",
+    "baseline_due_requests": 1,
+    "candidate_due_requests": 0,
+    "scope": "Native isolation establishes conditional same-peer recovery cause; does not assert actual runtime missingpeer list for that GS request"
+  },
+  "closed_loop": {
+    "baseline_requests": 1,
+    "candidate_requests": 0,
+    "baseline_completed_catalogs": 2,
+    "candidate_completed_catalogs": 1,
+    "baseline_sdt_bytes": 5786,
+    "candidate_sdt_bytes": 4012,
+    "saved_sdt_bytes": 1774,
+    "scope": "Fresh process; exact captured3655B initial schema via actual queued partial transport and real receiver\u2192producer request handler; response uses native runtime catalog; one192B transport frame per100ms. No full-network savings inferred."
+  },
+  "tests": {
+    "SDK_default_pass": 608,
+    "ignored": 3,
+    "focused_behavior_cases": 5,
+    "ARM_supported_embedded_fair_ingress_compact": "PASS zero warnings",
+    "ARM_minimal_discovery": "PASS8warnings identical baseline8",
+    "host_no_std": "Unsupported check failed without allocator/panic runtime as baseline configuration; supported thumbv7em checks passed"
+  },
+  "evidence_logs": [
+    "/tmp/sdk-schema-progress-red-20261027.log",
+    "/tmp/sdk-schema-progress-focused-20261027.log",
+    "/tmp/sdk-schema-progress-all-final-20261027.log",
+    "/tmp/sdk-schema-progress-closed-loop-baseline-20261027.log",
+    "/tmp/sdk-schema-progress-closed-loop-20261027.log",
+    "/tmp/sdk-schema-progress-embedded-arm-final-20261027.log",
+    "/tmp/sdk-schema-progress-minimal-arm-final-20261027.log",
+    "/tmp/sdk-schema-progress-minimal-arm-baseline-20261027.log"
+  ],
+  "remaining_cause": "Offline0-error CAN discovery replay shows completedRFschemas setRFhas_schema true at2.226/7.189s whilePBremains full-topology true/has_schema false. Continuing FC broadcast requests for missingPB are legitimate and this guard must NOT suppress them merely because unrelatedRF catalogs progress. PB partial catalog diagnosis remains outstanding.",
+  "limits": [
+    "This fix is scoped progress-aware retry efficiency, not proof of restored FC/PB freshness or500ms owner receipts.",
+    "Existing immutable620 cohort remains baseline; no release/version bump or push."
+  ]
+}

@@ -771,6 +771,19 @@ pub(crate) struct SideChunkAssembly {
 }
 
 impl SideChunkAssembly {
+    /// Unique admitted fragments already own the bounded progress clock.
+    /// A duplicate cannot extend it; missing first chunks prove no peer/type.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn schema_progress_for(&self, address: u32, now: u64) -> bool {
+        now.saturating_sub(self.last_seen_ms) <= 2000
+            && self
+                .received
+                .first()
+                .and_then(|chunk| chunk.as_ref())
+                .and_then(|prefix| wire_format::chunked_schema_source(prefix))
+                == Some(address)
+    }
+
     // Arc/allocator bookkeeping and padding, excluding the separately charged
     // descriptor vector. The former 64-byte estimate included B-tree entries.
     const FRAGMENT_OVERHEAD: usize = 48;

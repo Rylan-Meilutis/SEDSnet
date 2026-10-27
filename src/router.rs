@@ -9,6 +9,10 @@
 //! - De-duplication remains packet-id based and side-agnostic.
 
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/schema_receive_progress.rs"]
+mod schema_receive_progress;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/radio_trace_decoder.rs"]
 mod radio_trace_decoder;
 
@@ -8313,10 +8317,23 @@ impl Router {
             let mut due = Vec::new();
             for side in 0..st.sides.len() {
                 let missing = st.discovery_routes.get(&side).is_some_and(|route| {
-                    route.announcers.values().any(|peer| {
+                    route.announcers.iter().any(|(name, peer)| {
                         peer.has_full_topology
                             && !peer.has_schema
                             && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
+                            // Receiving this peer's catalog is already recovery.
+                            // Preserve the normal retry deadline: after useful
+                            // progress expires, the same due request can run.
+                            && !st.side_transport.get(&side).is_some_and(|transport| {
+                                transport.rx_chunks.values().any(|assembly| {
+                                    // Match note_schema_received's assigned-address
+                                    // and legacy hashed-sender compatibility.
+                                    assembly.schema_progress_for(sender_address_u32(name), now_ms)
+                                        || peer.advertised_address.is_some_and(|address| {
+                                            assembly.schema_progress_for(address, now_ms)
+                                        })
+                                })
+                            })
                     })
                 });
                 if !missing {

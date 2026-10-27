@@ -1815,6 +1815,15 @@ pub(crate) fn scheduling_type(buf: &[u8]) -> Option<DataType> {
     Some(DataType(id))
 }
 
+/// Identify only a schema sender in a retained, CRC-validated SDT first chunk.
+/// This borrowed prefix inspection neither validates a complete canonical CRC
+/// nor admits a packet, route, or schema. Incomplete headers give no credit.
+#[cfg(feature = "discovery")]
+pub(crate) fn chunked_schema_source(prefix: &[u8]) -> Option<u32> {
+    let envelope = read_routing_envelope(&mut ByteReader::new(prefix)).ok()?;
+    (envelope.ty == DataType::DiscoverySchema).then_some(envelope.source_address)
+}
+
 pub(crate) fn peek_routing_envelope(buf: &[u8]) -> TelemetryResult<RoutingEnvelope<'_>> {
     let data = verify_crc32(buf)?;
     read_routing_envelope(&mut ByteReader::new(data))
