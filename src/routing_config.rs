@@ -188,3 +188,16 @@ impl SideOptions {
         }
     }
 }
+
+/// Immutable internal presets for the shared engine. Public compatibility
+/// facades choose a preset; forwarding can never grant application ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoutingRole {
+    Router,
+    Relay,
+}
+impl RoutingRole {
+    pub(crate) fn local_services(self) -> bool {
+        self == Self::Router
+    }
+}

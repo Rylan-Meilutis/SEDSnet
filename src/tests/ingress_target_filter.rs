@@ -100,13 +100,25 @@ fn stale_routes_managed_values_and_explicit_policy_keep_normal_receive() {
     );
     route(&node, a, "DAQ");
     let ty = DataType::try_named("BATTERY_STATUS").unwrap();
-    node.state.lock().managed_variable_types.insert(ty.as_u32());
+    node.state
+        .lock()
+        .local_services
+        .as_mut()
+        .unwrap()
+        .managed_variable_types
+        .insert(ty.as_u32());
     assert!(
         node.decode_side_transport_frame(a, &bytes)
             .unwrap()
             .is_some()
     );
-    node.state.lock().managed_variable_types.clear();
+    node.state
+        .lock()
+        .local_services
+        .as_mut()
+        .unwrap()
+        .managed_variable_types
+        .clear();
     node.state.lock().route_overrides.insert((Some(a), b), true);
     assert!(
         node.decode_side_transport_frame(a, &bytes)

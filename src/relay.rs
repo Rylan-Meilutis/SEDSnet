@@ -786,10 +786,10 @@ impl SideRuntimeStatsInner {
     }
 }
 
+/// Compatibility builder backed by the same configuration as Router.
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
-    sender: Arc<str>,
-    memory: RuntimeMemoryConfig,
+    core: crate::router::RouterConfig,
 }
 
 impl RelayConfig {
@@ -798,30 +798,27 @@ impl RelayConfig {
     }
 
     pub fn with_sender<S: AsRef<str>>(mut self, sender: S) -> Self {
-        self.sender = Arc::from(sender.as_ref());
+        self.core = self.core.with_sender(sender);
         self
     }
 
     pub fn with_memory_config(mut self, memory: RuntimeMemoryConfig) -> TelemetryResult<Self> {
-        memory.validate()?;
-        self.memory = memory;
+        self.core = self.core.with_memory_config(memory)?;
         Ok(self)
     }
 
     fn sender(&self) -> Arc<str> {
-        self.sender.clone()
+        self.core.configured_sender()
     }
-
     fn memory_config(&self) -> RuntimeMemoryConfig {
-        self.memory
+        self.core.memory_config()
     }
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            sender: Arc::from("RELAY"),
-            memory: RuntimeMemoryConfig::default(),
+            core: crate::router::RouterConfig::relay(),
         }
     }
 }
