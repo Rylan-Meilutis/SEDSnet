@@ -3930,7 +3930,9 @@ impl Router {
     fn pop_next_queued_control_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
         if let Some(queue) = self.isr_rx_queue.as_ref() {
             let mut isr_rx = queue.try_lock()?;
-            let idx = isr_rx.iter().position(Self::queued_rx_item_is_control);
+            let idx = isr_rx
+                .iter()
+                .position(|item| self.queued_rx_item_is_control(item));
             if let Some(idx) = idx {
                 return Ok(isr_rx.remove_pos(idx));
             }
@@ -3940,14 +3942,22 @@ impl Router {
         let idx = st
             .received_queue
             .iter()
-            .position(Self::queued_rx_item_is_control);
+            .position(|item| self.queued_rx_item_is_control(item));
         if let Some(idx) = idx {
             return Ok(st.received_queue.remove_pos(idx));
         }
         Ok(None)
     }
 
-    fn queued_rx_item_is_control(item: &RouterRxItem) -> bool {
+    fn queued_rx_item_is_control(&self, item: &RouterRxItem) -> bool {
+        // The forwarding facade historically predrains only receipts. Other
+        // ingress remains ordinary RX work, whose admission refusal must reach
+        // the caller rather than be treated as background maintenance.
+        if !self.cfg.role.local_services()
+            && item.priority < crate::transport_priority(DataType::ReliableAck)
+        {
+            return false;
+        }
         // Admission computes and retains the reserved service band once.
         // Bulk queues can contain hundreds of entries: do not reparse every
         // packed header just to rediscover that none is a control packet.
@@ -3978,7 +3988,7 @@ impl Router {
                 | DataType::ReliablePacketRequest,
             ) => true,
             #[cfg(feature = "discovery")]
-            Some(ty) => discovery::is_discovery_type(ty),
+            Some(ty) => self.cfg.role.local_services() && discovery::is_discovery_type(ty),
             _ => false,
         }
     }
