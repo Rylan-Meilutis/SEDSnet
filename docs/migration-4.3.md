@@ -55,6 +55,13 @@ application heartbeat, flood it on every side, bypass its route selection or
 suppress its configured delivery tracking because of its name. Configure its
 endpoints, routes, reliability and publication cadence in the application.
 
+Regenerate macro-generated schemas with macros 2.2.0 before using them with
+SEDSnet 4.3. Older 2.1-generated schemas can contain unprefixed SDK protocol
+names at reserved IDs; do not register those definitions alongside the canonical
+`SEDSNET_` definitions. Version 4.3 rejects conflicting names at reserved IDs.
+This schema regeneration requirement does not imply wire incompatibility for
+correctly formed legacy C protocol frames with the existing reserved identities.
+
 ## Router and Relay configuration
 
 Router and Relay use one routing engine and the same side configuration type.
