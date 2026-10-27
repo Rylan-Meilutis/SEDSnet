@@ -12,7 +12,7 @@ mirror = b'// Generated mirror of src/schema_identity.rs; run scripts/sync-schem
 text = authoritative.decode()
 endpoints, types = text.split('pub const fn type_id', 1)
 def protocol_table(source):
-    return {name: int(value) for name, value in re.findall(r'=> \("([A-Z_]+)", (\d+)\)', source)}
+    return {name: int(value) for name, value in re.findall(r'=> \("([A-Z0-9_]+)", (\d+)\)', source)}
 py = '''# Generated from src/schema_identity.rs by scripts/sync-schema-identity.py.
 # No application or test identity belongs in the protocol tables.
 ENDPOINT_PROTOCOL = %r

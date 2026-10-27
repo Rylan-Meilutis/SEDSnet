@@ -15,6 +15,9 @@ class GenericIdentityTests(unittest.TestCase):
         subprocess.run([sys.executable, str(ROOT / 'scripts/sync-schema-identity.py'), '--check'], check=True)
 
     def test_only_network_protocol_ids_are_reserved(self):
+        self.assertEqual(set(schema_identity.TYPE_PROTOCOL.values()), set(range(19)))
+        self.assertEqual(set(schema_identity.ENDPOINT_PROTOCOL.values()), {200, 201, 202})
+        self.assertEqual(schema_identity.resolve_id('SEDSNET_P2P_MESSAGE'), 18)
         for table, endpoint in [(schema_identity.ENDPOINT_PROTOCOL, True), (schema_identity.TYPE_PROTOCOL, False)]:
             for name, value in table.items():
                 self.assertTrue(name.startswith('SEDSNET_'))
