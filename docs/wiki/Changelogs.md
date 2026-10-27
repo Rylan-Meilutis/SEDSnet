@@ -36,8 +36,7 @@ Full release history: [CHANGELOG.md](https://github.com/Rylan-Meilutis/SEDSnet/b
 ## Version 4.2.6 highlights
 
 The maintainer published the 4.2.6 crate on 2026-10-25. Its immutable version is
-preserved; macOS package completion and physical hardware acceptance are separate. See
-[qualification scope and results](../qualification-4.2.6-2026-10-25.json).
+preserved; macOS package completion and physical hardware acceptance are separate.
 
 - Retain accepted ordered and unordered reliable destinations, receipt identities
   and replay ownership through route withdrawal and rediscovery. A topology change

@@ -13,8 +13,7 @@ version is checked explicitly, after an older lockfile was found to have ignored
 a candidate path patch. The earlier passing firmware4.2.4/host4.2.3 run is retained
 as mixed-version evidence rather than relabelled as all-current qualification.
 
-See [the current qualification record](qualification-4.2.4-2026-10-19.json) and
-[the earlier mixed-version record](qualification-4.2.4-mixed-host423-2026-10-19.json).
+Detailed generated qualification records are maintained outside the source tree.
 Neither simulation nor native tests establish physical SD-card throughput,
 power-loss durability, lossless best-effort delivery or indefinite OOM immunity.
 The packet store remains opt-in; the indexed compression configuration requires

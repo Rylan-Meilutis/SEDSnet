@@ -223,8 +223,8 @@ unchanged; newer source changes are being qualified for 4.3.0.
 
 ### Version 4.2.6 highlights
 
-Publication, macOS builds and physical hardware acceptance remain pending. See the
-[release notes](CHANGELOG.md#426) and [qualification results](docs/qualification-4.2.6-2026-10-25.json).
+Version 4.2.6 is published. macOS package completion and physical hardware
+acceptance are separate; see the [release notes](CHANGELOG.md#426).
 
 - Preserve reliable receipt owners through route changes; topology withdrawal is
   not successful delivery.
