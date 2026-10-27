@@ -489,42 +489,31 @@ fn inline_wire_shape_keeps_old_payload_decodable_after_layout_change() {
 }
 
 #[test]
-fn conflicting_schema_endpoint_metadata_resolves_deterministically() {
+fn conflicting_schema_endpoint_identity_is_rejected_without_replacing_local() {
     let a = EndpointDefinition {
         id: DataEndpoint(9005),
         name: "SCHEMA_SYNC_EP_9005_A",
         description: "a",
         link_local_only: false,
     };
-    let b = EndpointDefinition {
-        id: DataEndpoint(9005),
-        name: "SCHEMA_SYNC_EP_9005_B",
-        description: "b",
-        link_local_only: true,
+    let _ = merge_schema_snapshot(RuntimeSchemaSnapshot {
+        endpoints: vec![a],
+        types: vec![],
+    });
+    let before = endpoint_definition_by_name(a.name).unwrap();
+    let conflict = crate::config::OwnedRuntimeSchemaSnapshot {
+        endpoints: vec![crate::config::OwnedEndpointDefinition {
+            id: a.id,
+            name: "SCHEMA_SYNC_EP_9005_B".into(),
+            description: "b".into(),
+            link_local_only: true,
+        }],
+        types: vec![],
     };
-
-    let _ = merge_schema_snapshot(RuntimeSchemaSnapshot {
-        endpoints: vec![a],
-        types: vec![],
-    });
-    let _ = merge_schema_snapshot(RuntimeSchemaSnapshot {
-        endpoints: vec![b],
-        types: vec![],
-    });
-    let first = endpoint_definition_by_name("SCHEMA_SYNC_EP_9005_A")
-        .or_else(|| endpoint_definition_by_name("SCHEMA_SYNC_EP_9005_B"))
-        .unwrap();
-    let _ = merge_schema_snapshot(RuntimeSchemaSnapshot {
-        endpoints: vec![a],
-        types: vec![],
-    });
-    let second = endpoint_definition_by_name("SCHEMA_SYNC_EP_9005_A")
-        .or_else(|| endpoint_definition_by_name("SCHEMA_SYNC_EP_9005_B"))
-        .unwrap();
-
-    assert_eq!(first.id, second.id);
-    assert_eq!(first.name, second.name);
-    assert_eq!(first.description, second.description);
-    assert_eq!(first.link_local_only, second.link_local_only);
-    assert!(first == a || first == b);
+    assert_eq!(
+        crate::config::merge_owned_schema_snapshot_with_budget(conflict, usize::MAX).unwrap_err(),
+        TelemetryError::BadArg
+    );
+    assert_eq!(endpoint_definition_by_name(a.name).unwrap(), before);
+    assert!(endpoint_definition_by_name("SCHEMA_SYNC_EP_9005_B").is_none());
 }

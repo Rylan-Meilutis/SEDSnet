@@ -24,8 +24,27 @@ unsafe impl GlobalAlloc for Counter {
 extern "C" fn telemetry_lock() {}
 #[unsafe(no_mangle)]
 extern "C" fn telemetry_unlock() {}
+// These cases intentionally inspect a process-global no_std schema overlay.
+// Keep each in a fresh process: a concurrent metadata-replacement case must not
+// invalidate another case's initial zero-RAM assertion.
+fn isolated_schema_case(name: &str) -> bool {
+    if std::env::var("SEDSNET_SCHEMA_CASE_CHILD").as_deref() == Ok(name) {
+        return false;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("SEDSNET_SCHEMA_CASE_CHILD", name)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated schema case {name} failed");
+    true
+}
+
 #[test]
 fn embedded_schema_encodes_directly_into_one_large_allocation() {
+    if isolated_schema_case("embedded_schema_encodes_directly_into_one_large_allocation") {
+        return;
+    }
     use sedsnet::discovery::{build_discovery_schema, decode_discovery_schema};
     // Exercise the actual no_std decoder, not hosted sender/schema caches.
     // Only the retained numeric sender alias and final endpoints need storage;
@@ -260,6 +279,9 @@ fn embedded_schema_encodes_directly_into_one_large_allocation() {
 
 #[test]
 fn embedded_named_id_lookup_uses_retained_schema_storage() {
+    if isolated_schema_case("embedded_named_id_lookup_uses_retained_schema_storage") {
+        return;
+    }
     // Exercise every compiled ID, including reserved endpoint IDs 200–202.
     // Generated endpoint IDs start at 100; they do not share the built-in
     // type-ID range. Unknown IDs must not alias a neighboring table entry.
@@ -316,6 +338,9 @@ fn embedded_named_id_lookup_uses_retained_schema_storage() {
 
 #[test]
 fn embedded_scheduling_metadata_follows_replaced_runtime_definitions() {
+    if isolated_schema_case("embedded_scheduling_metadata_follows_replaced_runtime_definitions") {
+        return;
+    }
     use sedsnet::config::{
         DataEndpoint, DataType, OwnedDataTypeDefinition, OwnedRuntimeSchemaSnapshot,
         merge_owned_schema_snapshot_with_budget,

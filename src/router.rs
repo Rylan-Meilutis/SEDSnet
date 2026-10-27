@@ -5455,18 +5455,15 @@ impl Router {
             matches.into_iter().map(|m| m.side).collect()
         };
 
-        /* Heartbeats represent network-wide liveness rather than a request for
-         * one interchangeable endpoint owner.  When discovery finds the
-         * heartbeat endpoint on multiple independent shortest-path sides,
-         * every segment must receive it. Other packets reaching this selector
-         * retain adaptive path selection; independent best-effort endpoint
-         * roles are planned separately before this fallback. */
+        // Replicated managed state follows its advertised owner contract.
+        // Ordinary application types use the same route selection regardless
+        // of their configured names.
         let has_distributed_variable_owners = selected.iter().any(|side| {
             st.discovery_routes
                 .get(side)
                 .is_some_and(|route| route.reachable_network_variables.contains(&ty))
         });
-        if DataType::try_named("HEARTBEAT") == Some(ty) || has_distributed_variable_owners {
+        if has_distributed_variable_owners {
             selected
         } else {
             self.apply_route_selection_locked(st, exclude, selected, discovered_origin)
@@ -5712,15 +5709,6 @@ impl Router {
         pending: &mut BTreeMap<u64, RouterSideId>,
         frozen: bool,
     ) {
-        // A heartbeat describes current liveness. Retrying an old heartbeat
-        // until every discovered endpoint acknowledges it turns temporary
-        // congestion into an ACK/retransmit storm and can starve fresh
-        // heartbeats. Per-link reliability still applies where configured;
-        // the next periodic heartbeat is the end-to-end freshness retry.
-        if DataType::try_named("HEARTBEAT") == Some(ty) {
-            pending.clear();
-            return;
-        }
         if frozen {
             return;
         }
@@ -6819,17 +6807,14 @@ impl Router {
                         Self::filter_timesync_matches_locked(&st, ty, self.clock.now_ms(), matches);
                 }
             }
-            /* Heartbeats and replicated network variables are network-segment
-             * state, so a nearer owner on one side must not hide a farther
-             * independent segment. Discovery's split horizon prevents the
-             * advertisement from being reflected back onto its ingress side.
-             * Ordinary application data retains shortest-path suppression. */
+            // Replicated managed variables retain independent owner segments.
+            // All ordinary application types retain shortest-path suppression.
             let has_distributed_variable_owners = matches.iter().any(|candidate| {
                 st.discovery_routes
                     .get(&candidate.side)
                     .is_some_and(|route| route.reachable_network_variables.contains(&ty))
             });
-            if DataType::try_named("HEARTBEAT") != Some(ty) && !has_distributed_variable_owners {
+            if !has_distributed_variable_owners {
                 // A single eligible physical side has no role/path ambiguity.
                 // Keep the allocation-bounded transit path instead of building
                 // per-role candidate vectors for the same sole destination.

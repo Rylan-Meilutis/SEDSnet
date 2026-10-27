@@ -1,0 +1,77 @@
+{
+  "result": "FOCUSED_PASS_FULL_MATRIX_PENDING",
+  "baseline_commit": "a54020b7832f324f15ce2c9bcda2a14a460b77a5",
+  "scope": "Local generic schema refactor; no version bump, push, tag, release or hardware qualification.",
+  "identity_contract": {
+    "reserved_types": "Exact SDK protocol names and IDs 0\u201318 only.",
+    "reserved_endpoints": "Exact SDK protocol names and IDs 200\u2013202 only.",
+    "application_default": "Namespace-specific stable name hash, independent of registration order and schema subset. Former application/test names have no special IDs.",
+    "explicit_id": "Optional JSON u32 in runtime streaming and snapshot loaders, embedded flash generation, legacy proc macro and editor validation. Explicit IDs must be consistent across participants.",
+    "collision_behavior": "Reject reserved spoofing and conflicting real identity claims before publication. Failed JSON loads and fallible merges retain previous definitions. Unclaimed ENDPOINT_<id> placeholders may learn real names.",
+    "protocol_metadata": "Remote schemas cannot override SDK protocol metadata. Legacy macro protocol names, IDs, priorities, reliability, elements and endpoints match runtime definitions.",
+    "generated_mirrors": "src/schema_identity.rs is authoritative. Explicit developer sync generates the standalone macro mirror and Python resolver. CI equality checks detect drift; ordinary builds never rewrite source files."
+  },
+  "generic_routing": {
+    "created_SDK_heartbeat": false,
+    "new_protocol_id": null,
+    "change": "Removed three application HEARTBEAT routing exceptions for fanout, ACK suppression and shortest paths. Equal metadata and routes now have equal behavior under arbitrary application names. Managed-variable owner routing remains.",
+    "side_names": "Production side labels do not select codecs, MTUs or routing priority. Actual transport profiles and configured capabilities remain legitimate protocol properties."
+  },
+  "focused_validation": {
+    "baseline_negative": "Old HEARTBEAT implicit ID 106 fails the uniform hash regression.",
+    "default_unit_tests": {
+      "passed": 625,
+      "existing_ignored": 3,
+      "environment": "Explicit legacy test schema paths, matching build.py."
+    },
+    "hosted_no_std": {
+      "passed_top_level": 6,
+      "cases": "One cached-transit, two identity and three schema-memory cases. Compiled explicit-ID flash catalog and runtime JSON agree; reserved-ID failure leaves state unchanged."
+    },
+    "integration": {
+      "passed": 4,
+      "cases": [
+        "Macro/runtime protocol and custom-ID parity",
+        "Exact application wire chunks under RADIO, SD_CARD, SOFTWARE_BUS, IMU, GPS and arbitrary side labels",
+        "Opaque application IDs 19/50/99 and endpoint IDs 0/100/101 roundtrip without protocol privilege",
+        "Placeholder learning followed by rejection of conflicting real claims"
+      ]
+    },
+    "macro_crate": {
+      "passed": 8,
+      "includes": "All protocol ID vectors and ordinary application-name hashes"
+    },
+    "python_editor": {
+      "passed": 9
+    },
+    "clippy": "All targets, -D warnings, passed; no lint allows added.",
+    "format": "Root and macro crate rustfmt plus generated-mirror equality passed."
+  },
+  "fixtures": "Historical application IDs are explicit JSON test configuration, never a core name table.",
+  "memory_test_isolation": "The existing hosted no_std zero-RAM case raced another case that retained 222 bytes of metadata. Each case now executes in a fresh child process with original assertions intact.",
+  "compatibility": "Default application IDs and old ordinal macro discriminants change. Applications must configure legacy IDs before pinning this candidate. The version/release decision remains with the parent and user.",
+  "remaining": [
+    "Full build.py test --all --full before any push, including the subsequent shared Router/Relay implementation",
+    "Matched all-seven TLSF+compact-ON builds and normal/mixed mode command, freshness and DAQ qualification",
+    "User owns crates.io/PyPI publication; release automation and version changes remain pending"
+  ],
+  "source_sha256": {
+    "src/schema_identity.rs": "a3455fd085fc96eda75da817587bb67bb7118acda3146d9b592366e601aadce5",
+    "src/config.rs": "a57c41045d01678cacb409c373fa13dd02d3a06d5e48189de2f31fe140d29117",
+    "src/router.rs": "aa43bf71f7af03362073e4a0247c88501f762a4f5b39f28b44baef0815d06aa6",
+    "build.rs": "cd770cb9008f67a5b5cf584a7b10a95a2690ef6ab9d7ab844c1e88e8fd7a2aa0",
+    "build.py": "9f6570e2ab31a4cb9274291c4c58a092eea60a17b8cdfd87ae75c17cc860cc02",
+    "sedsnet_macros/src/lib.rs": "ef010c563f067fcaafdd62c42cbad4001e54f48b87e007a52b4ce477bb3e4b81",
+    "sedsnet_macros/src/schema_identity.rs": "26b1cc75437ba4a9e465b4e156ca566a4105a534f70146cfbd1c8c0969378e39",
+    "schema_identity.py": "123e1d4a3fc813d732c1705df7964294106696e84a76bcf4506db3994500647b",
+    "scripts/sync-schema-identity.py": "73b215784b3c7ab8b61a294b2578ad6ab4ce947e584133031754823ffa60ea32"
+  },
+  "logs": {
+    "/tmp/sdk-schema-identity-before-20261027.log": "a3201f6371e02342847c983263f1977be7f9fc58e2b0137636e7203714302874",
+    "/tmp/sdk-generic-identity-unit-freeze-20261027.log": "5dd4aa42d51d29e38a702187e9ae9ec72dd6cf3bea508349e2dd9e52000c7bee",
+    "/tmp/sdk-generic-identity-nostd-freeze-20261027.log": "d101c481f7add8e5336ab520fc5b8d7f14a6a3f8852d29f1133d8430eaf2175e",
+    "/tmp/sdk-generic-identity-integration-freeze-20261027.log": "f5398b48844ca695883355394ad2c6049ed028afd36ff0018830f578494cf671",
+    "/tmp/sdk-generic-identity-macro-accepted-20261027.log": "481b1a517a7b07079bc29407504aeae104f9aca375840c4cff726834c1b028f0",
+    "/tmp/sdk-generic-identity-clippy-accepted-20261027.log": "161f92a329fdeea44bf9b4acd7ecb422c6de44c94077091f01dc138df62846c9"
+  }
+}

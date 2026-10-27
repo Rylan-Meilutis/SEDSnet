@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from schema_identity import resolve_id
 import os
 import re
 import sys
@@ -1172,6 +1173,21 @@ class TelemetryConfigEditor(tk.Tk if tk is not None else object):
         other_obj = self.config_objs[other_scope]
         if "endpoints" not in obj or "types" not in obj:
             raise RuntimeError("JSON must contain top-level keys: endpoints, types")
+
+        # Resolve the combined base/IPC namespaces before changing or saving
+        # any data. IDs are optional; only network protocol IDs are reserved.
+        for category, endpoint in [("endpoints", True), ("types", False)]:
+            by_id, by_name = {}, {}
+            for document in (obj, other_obj):
+                for entry in document.get(category, []):
+                    try:
+                        identity = resolve_id(entry.get("name"), entry.get("id"), endpoint=endpoint)
+                    except ValueError as error:
+                        raise RuntimeError(str(error)) from error
+                    name = entry.get("name")
+                    if identity in by_id or name in by_name:
+                        raise RuntimeError(f"{category} identity collision: {name!r}")
+                    by_id[identity], by_name[name] = name, identity
 
         other_endpoint_rust = {str(ep.get("rust", "")).strip() for ep in other_obj.get("endpoints", [])}
         other_endpoint_name = {str(ep.get("name", "")).strip() for ep in other_obj.get("endpoints", [])}

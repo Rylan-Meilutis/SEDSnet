@@ -1,3 +1,4 @@
+mod schema_identity;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -333,6 +334,8 @@ struct TelemetryConfig {
 
 #[derive(Debug, serde::Deserialize)]
 struct JsonEndpoint {
+    #[serde(default)]
+    id: Option<u32>,
     /// Rust enum variant, e.g. "Radio"
     rust: String,
     /// Schema string name, e.g. "RADIO" (MUST be all caps)
@@ -357,6 +360,8 @@ enum JsonReliability {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JsonType {
+    #[serde(default)]
+    id: Option<u32>,
     /// Rust enum variant, e.g. "GpsData"
     rust: String,
     /// Schema string name, e.g. "GPS_DATA" (MUST be all caps)
@@ -455,45 +460,40 @@ fn valid_ident_or_compile_error(s: &str) -> Result<syn::Ident, TokenStream> {
     })
 }
 
-fn quoted_variant_with_doc(id: &syn::Ident, doc: &str) -> proc_macro2::TokenStream {
-    if doc.is_empty() {
-        quote!(#id,)
-    } else {
-        quote!(
-            #[doc = #doc]
-            #id,
-        )
+fn validate_schema_ids(cfg: &TelemetryConfig) -> Result<(), String> {
+    let mut endpoints = std::collections::HashMap::new();
+    let mut endpoint_names = std::collections::HashMap::new();
+    let mut aliases = std::collections::HashMap::new();
+    let mut types = std::collections::HashMap::new();
+    let mut type_names = std::collections::HashMap::new();
+    for ep in &cfg.endpoints {
+        let id = schema_identity::resolve_endpoint(&ep.name, ep.id).map_err(str::to_owned)?;
+        if (200..=202).contains(&id) {
+            return Err("SDK protocol endpoints are built in".into());
+        }
+        if endpoints.insert(id, &ep.name).is_some() || endpoint_names.insert(&ep.name, id).is_some()
+        {
+            return Err("endpoint identity collision".into());
+        }
+        for alias in [&ep.name, &ep.rust] {
+            if aliases
+                .insert(alias, id)
+                .is_some_and(|previous| previous != id)
+            {
+                return Err("endpoint alias collision".into());
+            }
+        }
     }
-}
-
-fn is_timesync_endpoint(ep: &JsonEndpoint) -> bool {
-    ep.rust == "TimeSync" || ep.name == "TIME_SYNC"
-}
-
-fn is_discovery_endpoint(ep: &JsonEndpoint) -> bool {
-    ep.rust == "Discovery" || ep.name == "DISCOVERY"
-}
-
-fn is_timesync_type(ty: &JsonType) -> bool {
-    matches!(
-        (ty.rust.as_str(), ty.name.as_str()),
-        ("TimeSyncAnnounce", _)
-            | ("TimeSyncRequest", _)
-            | ("TimeSyncResponse", _)
-            | (_, "TIME_SYNC_ANNOUNCE")
-            | (_, "TIME_SYNC_REQUEST")
-            | (_, "TIME_SYNC_RESPONSE")
-    )
-}
-
-fn is_discovery_type(ty: &JsonType) -> bool {
-    matches!(
-        (ty.rust.as_str(), ty.name.as_str()),
-        ("DiscoveryAnnounce", _)
-            | (_, "DISCOVERY_ANNOUNCE")
-            | (_, "DISCOVERY_TIMESYNC_SOURCES")
-            | (_, "DISCOVERY_TOPOLOGY")
-    )
+    for ty in &cfg.types {
+        let id = schema_identity::resolve_type(&ty.name, ty.id).map_err(str::to_owned)?;
+        if id <= 18 {
+            return Err("SDK protocol types are built in".into());
+        }
+        if types.insert(id, &ty.name).is_some() || type_names.insert(&ty.name, id).is_some() {
+            return Err("type identity collision".into());
+        }
+    }
+    Ok(())
 }
 
 fn caller_manifest_dir() -> Result<std::path::PathBuf, String> {
@@ -690,59 +690,50 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
                 .into();
         }
     };
+    if let Err(error) = validate_schema_ids(&cfg) {
+        return syn::Error::new(Span::call_site(), error)
+            .to_compile_error()
+            .into();
+    }
     let timesync_enabled = timesync;
     let discovery_enabled = discovery;
 
+    // Rust aliases share the generated enum namespace, but do not assign
+    // wire semantics to an application's schema name.
     for ty in &cfg.types {
-        if ty.rust == "TelemetryError" || ty.name == "TELEMETRY_ERROR" {
+        let reserved_alias = matches!(
+            ty.rust.as_str(),
+            "TelemetryError" | "ReliableAck" | "ReliablePartialAck" | "ReliablePacketRequest"
+        ) || (timesync_enabled
+            && matches!(
+                ty.rust.as_str(),
+                "TimeSyncAnnounce" | "TimeSyncRequest" | "TimeSyncResponse"
+            ))
+            || (discovery_enabled
+                && matches!(
+                    ty.rust.as_str(),
+                    "DiscoveryAnnounce" | "DiscoveryTimeSyncSources" | "DiscoveryTopology"
+                ));
+        if reserved_alias {
             return syn::Error::new(
                 Span::call_site(),
-                "telemetry_config.json: TelemetryError is built-in and must not be defined in the schema",
+                "application Rust alias collides with a generated SDK variant",
             )
-                .to_compile_error()
-                .into();
-        }
-        if is_timesync_type(ty) {
-            return syn::Error::new(
-                Span::call_site(),
-                "telemetry_config.json: TimeSync types are built-in and must not be defined in the schema",
-            )
-                .to_compile_error()
-                .into();
-        }
-        if is_discovery_type(ty) {
-            return syn::Error::new(
-                Span::call_site(),
-                "telemetry_config.json: Discovery types are built-in and must not be defined in the schema",
-            )
-                .to_compile_error()
-                .into();
+            .to_compile_error()
+            .into();
         }
     }
     for ep in &cfg.endpoints {
-        if ep.rust == "TelemetryError" || ep.name == "TELEMETRY_ERROR" {
+        if ep.rust == "TelemetryError"
+            || (timesync_enabled && ep.rust == "TimeSync")
+            || (discovery_enabled && ep.rust == "Discovery")
+        {
             return syn::Error::new(
                 Span::call_site(),
-                "telemetry_config.json: TelemetryError endpoint is built-in and must not be defined in the schema",
+                "application Rust alias collides with a generated SDK variant",
             )
-                .to_compile_error()
-                .into();
-        }
-        if is_timesync_endpoint(ep) {
-            return syn::Error::new(
-                Span::call_site(),
-                "telemetry_config.json: TimeSync endpoint is built-in and must not be defined in the schema",
-            )
-                .to_compile_error()
-                .into();
-        }
-        if is_discovery_endpoint(ep) {
-            return syn::Error::new(
-                Span::call_site(),
-                "telemetry_config.json: Discovery endpoint is built-in and must not be defined in the schema",
-            )
-                .to_compile_error()
-                .into();
+            .to_compile_error()
+            .into();
         }
     }
 
@@ -775,13 +766,13 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
     if timesync_enabled {
         ep_idents.push(syn::Ident::new("TimeSync", Span::call_site()));
         ep_docs.push("Time sync routing endpoint (always forwarded).".to_string());
-        ep_names.push("TIME_SYNC".to_string());
+        ep_names.push("SEDSNET_TIME_SYNC".to_string());
         ep_link_local.push(false);
     }
     if discovery_enabled {
         ep_idents.push(syn::Ident::new("Discovery", Span::call_site()));
         ep_docs.push("Discovery control endpoint for internal route advertisements.".to_string());
-        ep_names.push("DISCOVERY".to_string());
+        ep_names.push("SEDSNET_DISCOVERY".to_string());
         ep_link_local.push(false);
     }
 
@@ -790,17 +781,30 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
         "Encoded telemetry error text (string payload) (CRITICAL FOR SYSTEM FUNCTIONALITY, DO NOT REMOVE)"
             .to_string(),
     );
-    ep_names.push("TELEMETRY_ERROR".to_string());
+    ep_names.push("SEDSNET_ERROR".to_string());
     ep_link_local.push(false);
 
-    let max_ep_value = cfg.endpoints.len() as u32
-        + if timesync_enabled { 1 } else { 0 }
-        + if discovery_enabled { 1 } else { 0 };
-
+    let ep_values = ep_idents
+        .iter()
+        .zip(&ep_names)
+        .map(|(rust, name)| {
+            let explicit = cfg
+                .endpoints
+                .iter()
+                .find(|ep| ep.rust == rust.to_string())
+                .and_then(|ep| ep.id);
+            schema_identity::resolve_endpoint(name, explicit).expect("validated endpoint identity")
+        })
+        .collect::<Vec<_>>();
+    let max_ep_value = ep_values.iter().copied().max().unwrap_or(0);
     let ep_variants = ep_idents
         .iter()
-        .zip(ep_docs.iter())
-        .map(|(id, doc)| quoted_variant_with_doc(id, doc));
+        .zip(&ep_docs)
+        .zip(&ep_values)
+        .map(|((id, doc), value)| {
+            // Emit an explicit discriminant; list order is never a wire identity.
+            quote!(#[doc = #doc] #id = #value,)
+        });
 
     // DataEndpoint::as_str() uses JSON "name" (RADIO, SD_CARD, ...)
     let ep_meta_arms = ep_idents
@@ -902,52 +906,70 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
         "Internal reliable-delivery retransmit request (type, seq).".to_string(),
     ));
 
-    let max_ty_value = cfg.types.len() as u32
-        + if timesync_enabled { 3 } else { 0 }
-        + if discovery_enabled { 3 } else { 0 }
-        + 3;
-
+    ty_entries.push((
+        syn::Ident::new("TelemetryError", Span::call_site()),
+        "SDK error text".to_string(),
+    ));
+    let ty_values = ty_entries
+        .iter()
+        .map(|(rust, _)| {
+            if let Some(ty) = cfg.types.iter().find(|ty| ty.rust == rust.to_string()) {
+                return schema_identity::resolve_type(&ty.name, ty.id)
+                    .expect("validated type identity");
+            }
+            let name = match rust.to_string().as_str() {
+                "TelemetryError" => "SEDSNET_ERROR",
+                "ReliableAck" => "SEDSNET_RELIABLE_ACK",
+                "ReliablePacketRequest" => "SEDSNET_RELIABLE_PACKET_REQUEST",
+                "ReliablePartialAck" => "SEDSNET_RELIABLE_PARTIAL_ACK",
+                "TimeSyncAnnounce" => "SEDSNET_TIME_SYNC_ANNOUNCE",
+                "TimeSyncRequest" => "SEDSNET_TIME_SYNC_REQUEST",
+                "TimeSyncResponse" => "SEDSNET_TIME_SYNC_RESPONSE",
+                "DiscoveryAnnounce" => "SEDSNET_DISCOVERY_ANNOUNCE",
+                "DiscoveryTimeSyncSources" => "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
+                "DiscoveryTopology" => "SEDSNET_DISCOVERY_TOPOLOGY",
+                _ => unreachable!("generated SDK protocol variant"),
+            };
+            schema_identity::type_id(name)
+        })
+        .collect::<Vec<_>>();
+    let max_ty_value = ty_values.iter().copied().max().unwrap_or(0);
     let ty_variants = ty_entries
         .iter()
-        .cloned()
-        .chain(std::iter::once((
-            syn::Ident::new("TelemetryError", Span::call_site()),
-            "Encoded telemetry error text (string payload) (CRITICAL FOR SYSTEM FUNCTIONALITY, DO NOT REMOVE)"
-                .to_string(),
-        )))
-        .map(|(id, doc)| quoted_variant_with_doc(&id, &doc));
+        .zip(&ty_values)
+        .map(|((id, doc), value)| quote!(#[doc = #doc] #id = #value,));
 
     let builtin_ty_meta = {
         let endpoints_tokens: Vec<proc_macro2::TokenStream> =
             vec![quote!(DataEndpoint::TelemetryError)];
         quote! {
             DataType::ReliableAck => MessageMeta {
-                name: "RELIABLE_ACK",
+                name: "SEDSNET_RELIABLE_ACK",
                 element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
                 endpoints: &[#(#endpoints_tokens),*],
                 reliable: crate::ReliableMode::None,
                 priority: 250,
             },
             DataType::ReliablePacketRequest => MessageMeta {
-                name: "RELIABLE_PACKET_REQUEST",
+                name: "SEDSNET_RELIABLE_PACKET_REQUEST",
                 element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
                 endpoints: &[#(#endpoints_tokens),*],
                 reliable: crate::ReliableMode::None,
                 priority: 250,
             },
             DataType::ReliablePartialAck => MessageMeta {
-                name: "RELIABLE_PARTIAL_ACK",
+                name: "SEDSNET_RELIABLE_PARTIAL_ACK",
                 element: MessageElement::Static(2, MessageDataType::UInt32, MessageClass::Data),
                 endpoints: &[#(#endpoints_tokens),*],
                 reliable: crate::ReliableMode::None,
                 priority: 250,
             },
             DataType::TelemetryError => MessageMeta {
-                name: "TELEMETRY_ERROR",
+                name: "SEDSNET_ERROR",
                 element: MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
                 endpoints: &[#(#endpoints_tokens),*],
-                reliable: crate::ReliableMode::Ordered,
-                priority: 200,
+                reliable: crate::ReliableMode::None,
+                priority: 255,
             },
         }
     };
@@ -994,25 +1016,25 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
     let timesync_ty_meta = if timesync_enabled {
         quote! {
             DataType::TimeSyncAnnounce => MessageMeta {
-                name: "TIME_SYNC_ANNOUNCE",
+                name: "SEDSNET_TIME_SYNC_ANNOUNCE",
                 element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
                 endpoints: &[DataEndpoint::TimeSync],
                 reliable: crate::ReliableMode::None,
-                priority: 255,
+                priority: 245,
             },
             DataType::TimeSyncRequest => MessageMeta {
-                name: "TIME_SYNC_REQUEST",
+                name: "SEDSNET_TIME_SYNC_REQUEST",
                 element: MessageElement::Static(2, MessageDataType::UInt64, MessageClass::Data),
                 endpoints: &[DataEndpoint::TimeSync],
                 reliable: crate::ReliableMode::None,
-                priority: 255,
+                priority: 245,
             },
             DataType::TimeSyncResponse => MessageMeta {
-                name: "TIME_SYNC_RESPONSE",
+                name: "SEDSNET_TIME_SYNC_RESPONSE",
                 element: MessageElement::Static(4, MessageDataType::UInt64, MessageClass::Data),
                 endpoints: &[DataEndpoint::TimeSync],
                 reliable: crate::ReliableMode::None,
-                priority: 255,
+                priority: 245,
             },
         }
     } else {
@@ -1022,24 +1044,24 @@ pub fn define_telemetry_schema(input: TokenStream) -> TokenStream {
     let discovery_ty_meta = if discovery_enabled {
         quote! {
             DataType::DiscoveryAnnounce => MessageMeta {
-                name: "DISCOVERY_ANNOUNCE",
+                name: "SEDSNET_DISCOVERY_ANNOUNCE",
                 element: MessageElement::Dynamic(MessageDataType::UInt32, MessageClass::Data),
                 endpoints: &[DataEndpoint::Discovery],
                 reliable: crate::ReliableMode::None,
                 priority: 240,
             },
             DataType::DiscoveryTimeSyncSources => MessageMeta {
-                name: "DISCOVERY_TIMESYNC_SOURCES",
+                name: "SEDSNET_DISCOVERY_TIMESYNC_SOURCES",
                 element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
                 endpoints: &[DataEndpoint::Discovery],
                 reliable: crate::ReliableMode::None,
                 priority: 240,
             },
             DataType::DiscoveryTopology => MessageMeta {
-                name: "DISCOVERY_TOPOLOGY",
+                name: "SEDSNET_DISCOVERY_TOPOLOGY",
                 element: MessageElement::Dynamic(MessageDataType::UInt8, MessageClass::Data),
                 endpoints: &[DataEndpoint::Discovery],
-                reliable: crate::ReliableMode::None,
+                reliable: crate::ReliableMode::Ordered,
                 priority: 240,
             },
         }
@@ -1100,6 +1122,7 @@ mod tests {
 
     fn endpoint(rust: &str, name: &str, link_local_only: bool) -> JsonEndpoint {
         JsonEndpoint {
+            id: None,
             rust: rust.to_string(),
             name: name.to_string(),
             doc: None,
@@ -1110,6 +1133,7 @@ mod tests {
 
     fn datatype(rust: &str, name: &str, endpoints: &[&str]) -> JsonType {
         JsonType {
+            id: None,
             rust: rust.to_string(),
             name: name.to_string(),
             doc: None,
@@ -1180,6 +1204,7 @@ mod tests {
     fn normalize_base_schema_upgrades_legacy_broadcast_mode_never() {
         let mut base = TelemetryConfig {
             endpoints: vec![JsonEndpoint {
+                id: None,
                 rust: "SoftwareBus".to_string(),
                 name: "SOFTWARE_BUS".to_string(),
                 doc: None,

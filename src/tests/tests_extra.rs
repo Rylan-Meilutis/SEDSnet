@@ -559,16 +559,15 @@ fn from_none_slice_builds_valid_packet() {
 
 #[cfg(feature = "discovery")]
 #[test]
-fn heartbeat_reaches_each_independently_discovered_network_side() {
+fn ordinary_application_names_share_the_same_routing_and_receipt_contract() {
     crate::tests::ensure_common_test_schema();
     use crate::config::register_data_type_with_description;
     use crate::discovery::{TopologyBoardNode, build_discovery_topology};
     use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode};
 
-    // Packed sides enable the destination contract used by the real
-    // GroundStation links. The contract names owners on both sides; route
-    // selection must not collapse that multi-segment delivery to one
-    // adaptive path.
+    // Merely naming an application type HEARTBEAT must not alter shortest
+    // paths or suppress destination receipt tracking. Compare equal payload,
+    // reliability, priority and endpoint contracts under arbitrary names.
     let seen_a: Arc<Mutex<Vec<Arc<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_b: Arc<Mutex<Vec<Arc<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_a_cb = seen_a.clone();
@@ -643,12 +642,37 @@ fn heartbeat_reaches_each_independently_discovered_network_side() {
         .tx(Packet::from_no_data(heartbeat, &[endpoint], 2).unwrap())
         .unwrap();
 
-    assert_eq!(seen_a.lock().unwrap().len(), 1);
-    assert_eq!(seen_b.lock().unwrap().len(), 1);
+    let heartbeat_delivery = (seen_a.lock().unwrap().len(), seen_b.lock().unwrap().len());
+    let heartbeat_receipts = router.debug_end_to_end_tracked_count();
     assert_eq!(
-        router.debug_end_to_end_tracked_count(),
-        0,
-        "periodic freshness packets must not create an end-to-end ACK storm",
+        heartbeat_delivery,
+        (1, 0),
+        "ordinary types obey shortest paths"
+    );
+    seen_a.lock().unwrap().clear();
+    seen_b.lock().unwrap().clear();
+    let metadata = crate::config::get_message_meta(heartbeat);
+    let ordinary = crate::config::register_data_type_with_description_and_e2e_encryption(
+        "ARBITRARY_APPLICATION_PULSE",
+        metadata.description.as_ref(),
+        metadata.element,
+        metadata.endpoints.as_ref(),
+        metadata.reliable,
+        metadata.priority,
+        metadata.e2e_encryption,
+    )
+    .unwrap();
+    router
+        .tx(Packet::from_no_data(ordinary, &[endpoint], 3).unwrap())
+        .unwrap();
+    assert_eq!(
+        (seen_a.lock().unwrap().len(), seen_b.lock().unwrap().len()),
+        heartbeat_delivery
+    );
+    assert_eq!(
+        router.debug_end_to_end_tracked_count() - heartbeat_receipts,
+        heartbeat_receipts,
+        "application names cannot disable the generic receipt contract"
     );
 }
 

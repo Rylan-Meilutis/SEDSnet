@@ -108,6 +108,7 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 criterion = "0.8.2"
+strum = { version = "0.28", features = ["derive"] }
 
 # Release profile for standard builds, performance optimized
 [profile.release]

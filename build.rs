@@ -12,6 +12,21 @@ fn required_str<'a>(value: &'a Value, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("schema field `{key}` must be a string"))
 }
 
+fn schema_id(value: &Value, endpoint: bool) -> u32 {
+    let name = required_str(value, "name");
+    let explicit = value.get("id").filter(|id| !id.is_null()).map(|id| {
+        id.as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .expect("schema id must be a u32 integer")
+    });
+    if endpoint {
+        schema_identity::resolve_endpoint(name, explicit)
+    } else {
+        schema_identity::resolve_type(name, explicit)
+    }
+    .unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
 fn rust_string(value: &str) -> String {
     format!("{value:?}")
 }
@@ -41,21 +56,31 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
     let mut endpoint_identity_names = HashMap::new();
     let mut type_identity_names = HashMap::new();
     let mut endpoints = endpoints.iter().collect::<Vec<_>>();
-    endpoints
-        .sort_unstable_by_key(|value| schema_identity::endpoint_id(required_str(value, "name")));
+    endpoints.sort_unstable_by_key(|value| schema_id(value, true));
     let mut types = types.iter().collect::<Vec<_>>();
-    types.sort_unstable_by_key(|value| schema_identity::type_id(required_str(value, "name")));
+    types.sort_unstable_by_key(|value| schema_id(value, false));
     generated.push_str("const EMBEDDED_SCHEMA_ENDPOINTS: &[EndpointDefinition] = &[\n");
     for endpoint in endpoints {
         let name = required_str(endpoint, "name");
-        let id = schema_identity::endpoint_id(name);
-        if let Some(previous) = endpoint_identity_names.insert(id, name) {
-            assert_eq!(previous, name, "endpoint identity collision");
-        }
+        let id = schema_id(endpoint, true);
+        assert!(
+            !endpoint_identity_names
+                .iter()
+                .any(|(known_id, known_name)| *known_name == name && *known_id != id),
+            "endpoint name collision"
+        );
+        assert!(
+            endpoint_identity_names.insert(id, name).is_none(),
+            "endpoint identity collision"
+        );
         let rust_name = endpoint["rust"].as_str().unwrap_or(name);
         let link_local = endpoint["link_local_only"].as_bool().unwrap_or(false)
             || endpoint["broadcast_mode"].as_str() == Some("Never");
-        endpoint_ids.insert(rust_name.to_owned(), id);
+        for alias in [rust_name, name] {
+            if let Some(previous) = endpoint_ids.insert(alias.to_owned(), id) {
+                assert_eq!(previous, id, "endpoint alias collision");
+            }
+        }
         writeln!(
             generated,
             "    EndpointDefinition {{ id: DataEndpoint({id}), name: {}, description: {}, link_local_only: {link_local} }},",
@@ -69,10 +94,17 @@ fn generate_embedded_schema(schema_path: &Path, output_path: &Path) {
     generated.push_str("const EMBEDDED_SCHEMA_TYPES: &[DataTypeDefinition] = &[\n");
     for ty in types {
         let name = required_str(ty, "name");
-        let id = schema_identity::type_id(name);
-        if let Some(previous) = type_identity_names.insert(id, name) {
-            assert_eq!(previous, name, "type identity collision");
-        }
+        let id = schema_id(ty, false);
+        assert!(
+            !type_identity_names
+                .iter()
+                .any(|(known_id, known_name)| *known_name == name && *known_id != id),
+            "type name collision"
+        );
+        assert!(
+            type_identity_names.insert(id, name).is_none(),
+            "type identity collision"
+        );
         let class = match required_str(ty, "class") {
             "Data" => "MessageClass::Data",
             "Error" => "MessageClass::Error",

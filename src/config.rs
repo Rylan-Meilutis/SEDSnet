@@ -808,8 +808,8 @@ impl Registry {
         let mut reg = Self {
             endpoints: Vec::new(),
             types: Vec::new(),
-            next_endpoint_id: 100,
-            next_type_id: 100,
+            next_endpoint_id: 0,
+            next_type_id: 0,
         };
         reg.register_endpoint_definition(EndpointDefinition {
             id: DataEndpoint::TelemetryError,
@@ -1071,6 +1071,8 @@ impl Registry {
     }
 
     fn register_owned_endpoint(&mut self, def: OwnedEndpointDefinition) -> TelemetryResult<()> {
+        schema_identity::resolve_endpoint(&def.name, Some(def.id.0))
+            .map_err(|_| TelemetryError::BadArg)?;
         if let Some((_, existing)) = self.endpoints.iter().find(|(id, _)| *id == def.id) {
             if existing.name.as_ref() == def.name
                 && existing.description.as_ref() == def.description
@@ -1114,6 +1116,8 @@ impl Registry {
     }
 
     fn register_owned_type(&mut self, def: OwnedDataTypeDefinition) -> TelemetryResult<()> {
+        schema_identity::resolve_type(&def.name, Some(def.id.0))
+            .map_err(|_| TelemetryError::BadArg)?;
         if let Some((_, existing)) = self.types.iter().find(|(id, _)| *id == def.id) {
             if existing.name.as_ref() == def.name
                 && existing.description.as_ref() == def.description
@@ -1614,6 +1618,7 @@ pub fn merge_owned_schema_snapshot_with_budget(
     mut snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
+    validate_schema_identities(&snapshot)?;
     sort_owned_schema(&mut snapshot);
     snapshot.endpoints.dedup_by_key(|def| def.id.0);
     snapshot.types.dedup_by_key(|def| def.id.0);
@@ -1631,6 +1636,18 @@ pub fn merge_owned_schema_snapshot_with_budget(
     drop(reg);
 
     let mut reg = registry().lock().expect("schema registry poisoned");
+    if snapshot.endpoints.iter().any(|def| {
+        reg.endpoints.iter().any(|(id, meta)| {
+            endpoint_identity_conflicts(*id, meta.name.as_ref(), def.id, &def.name)
+        })
+    }) || snapshot.types.iter().any(|def| {
+        reg.types.iter().any(|(id, meta)| {
+            (*id == def.id || meta.name.as_ref() == def.name)
+                && (*id != def.id || meta.name.as_ref() != def.name)
+        })
+    }) {
+        return Err(TelemetryError::BadArg);
+    }
     let mut preview = reg.clone();
     let report = merge_owned_schema_snapshot_locked(&mut preview, snapshot);
     if preview.schema_byte_cost() > max_schema_bytes {
@@ -2003,7 +2020,6 @@ pub fn data_type_definition_by_name(name: &str) -> Option<OwnedDataTypeDefinitio
         })
 }
 
-#[cfg(feature = "std")]
 fn is_internal_endpoint(ep: DataEndpoint) -> bool {
     matches!(
         ep,
@@ -2011,7 +2027,6 @@ fn is_internal_endpoint(ep: DataEndpoint) -> bool {
     )
 }
 
-#[cfg(feature = "std")]
 fn is_internal_data_type(ty: DataType) -> bool {
     matches!(
         ty,
@@ -2120,21 +2135,36 @@ fn type_winner(
 // Compatible partial catalogs contribute destinations rather than choosing
 // one node's incomplete list. Wire layouts/reliability remain a single
 // deterministic definition when incompatible declarations conflict.
+fn endpoint_placeholder(id: DataEndpoint, name: &str) -> bool {
+    name.strip_prefix("ENDPOINT_")
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        == Some(id.0)
+}
+fn endpoint_identity_conflicts(
+    a: DataEndpoint,
+    a_name: &str,
+    b: DataEndpoint,
+    b_name: &str,
+) -> bool {
+    if a == b {
+        a_name != b_name && !endpoint_placeholder(a, a_name) && !endpoint_placeholder(b, b_name)
+    } else {
+        a_name == b_name
+    }
+}
+
 fn merge_endpoint_metadata(
     a: &OwnedEndpointDefinition,
     b: &OwnedEndpointDefinition,
 ) -> OwnedEndpointDefinition {
+    if is_internal_endpoint(a.id) {
+        return a.clone();
+    }
     if a.id == b.id && a.name != b.name {
-        let placeholder = |def: &OwnedEndpointDefinition| {
-            def.name
-                .strip_prefix("ENDPOINT_")
-                .and_then(|suffix| suffix.parse::<u32>().ok())
-                == Some(def.id.0)
-        };
-        if placeholder(a) && !placeholder(b) {
+        if endpoint_placeholder(a.id, &a.name) && !endpoint_placeholder(b.id, &b.name) {
             return b.clone();
         }
-        if placeholder(b) && !placeholder(a) {
+        if endpoint_placeholder(b.id, &b.name) && !endpoint_placeholder(a.id, &a.name) {
             return a.clone();
         }
     }
@@ -2149,6 +2179,9 @@ fn merge_type_metadata(
     a: &OwnedDataTypeDefinition,
     b: &OwnedDataTypeDefinition,
 ) -> OwnedDataTypeDefinition {
+    if is_internal_data_type(a.id) {
+        return a.clone();
+    }
     if a.id != b.id
         || a.name != b.name
         || a.element != b.element
@@ -2372,6 +2405,7 @@ pub fn register_endpoint_id_with_description(
     description: &str,
     link_local_only: bool,
 ) -> TelemetryResult<DataEndpoint> {
+    schema_identity::resolve_endpoint(name, Some(id.0)).map_err(|_| TelemetryError::BadArg)?;
     let def = OwnedEndpointDefinition {
         id,
         name: name.into(),
@@ -2470,6 +2504,7 @@ pub fn register_data_type_id_with_description_and_e2e_encryption(
     priority: u8,
     e2e_encryption: E2eEncryptionPolicy,
 ) -> TelemetryResult<DataType> {
+    schema_identity::resolve_type(name, Some(id.0)).map_err(|_| TelemetryError::BadArg)?;
     let def = OwnedDataTypeDefinition {
         id,
         name: name.into(),
@@ -3209,8 +3244,24 @@ pub fn merge_owned_schema_snapshot_with_budget(
     snapshot: OwnedRuntimeSchemaSnapshot,
     max_schema_bytes: usize,
 ) -> TelemetryResult<SchemaMergeReport> {
+    validate_schema_identities(&snapshot)?;
     unsafe { telemetry_lock() };
     let result = (|| {
+        for def in &snapshot.endpoints {
+            if endpoint_definition(def.id).is_some_and(|known| {
+                endpoint_identity_conflicts(known.id, &known.name, def.id, &def.name)
+            }) || endpoint_definition_by_name(&def.name).is_some_and(|known| known.id != def.id)
+            {
+                return Err(TelemetryError::BadArg);
+            }
+        }
+        for def in &snapshot.types {
+            if data_type_definition(def.id).is_some_and(|known| known.name != def.name)
+                || data_type_definition_by_name(&def.name).is_some_and(|known| known.id != def.id)
+            {
+                return Err(TelemetryError::BadArg);
+            }
+        }
         let mut report = SchemaMergeReport {
             endpoints_added: 0,
             endpoints_replaced: 0,
@@ -3509,6 +3560,8 @@ struct JsonConfig {
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct JsonEndpoint {
+    #[serde(default)]
+    id: Option<u32>,
     rust: Option<String>,
     name: String,
     #[serde(default, alias = "doc")]
@@ -3523,6 +3576,8 @@ struct JsonEndpoint {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JsonType {
+    #[serde(default)]
+    id: Option<u32>,
     #[serde(rename = "rust")]
     _rust: Option<String>,
     name: String,
@@ -3560,6 +3615,30 @@ enum JsonElement {
     },
 }
 
+fn validate_schema_identities(snapshot: &OwnedRuntimeSchemaSnapshot) -> TelemetryResult<()> {
+    for (index, def) in snapshot.endpoints.iter().enumerate() {
+        schema_identity::resolve_endpoint(&def.name, Some(def.id.0))
+            .map_err(|_| TelemetryError::BadArg)?;
+        if snapshot.endpoints[..index]
+            .iter()
+            .any(|other| other.id == def.id || other.name == def.name)
+        {
+            return Err(TelemetryError::BadArg);
+        }
+    }
+    for (index, def) in snapshot.types.iter().enumerate() {
+        schema_identity::resolve_type(&def.name, Some(def.id.0))
+            .map_err(|_| TelemetryError::BadArg)?;
+        if snapshot.types[..index]
+            .iter()
+            .any(|other| other.id == def.id || other.name == def.name)
+        {
+            return Err(TelemetryError::BadArg);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "std")]
 fn schema_json_max_input_bytes(max_schema_bytes: usize) -> usize {
     max_schema_bytes
@@ -3574,6 +3653,7 @@ struct StreamingSchemaState<'a> {
     alias_bytes: usize,
     added_endpoints: Vec<DataEndpoint>,
     added_types: Vec<DataType>,
+    seen_types: Vec<DataType>,
     initial_next_endpoint_id: u32,
     initial_next_type_id: u32,
     link_local_overlay: bool,
@@ -3603,7 +3683,17 @@ impl StreamingSchemaState<'_> {
 
     fn add_endpoint(&mut self, ep: JsonEndpoint) -> TelemetryResult<()> {
         let rust_name = ep.rust.unwrap_or_else(|| ep.name.clone());
-        let id = DataEndpoint(schema_identity::endpoint_id(&ep.name));
+        if self
+            .aliases
+            .iter()
+            .any(|(alias, _)| alias == &rust_name || alias == &ep.name)
+        {
+            return Err(TelemetryError::BadArg);
+        }
+        let id = DataEndpoint(
+            schema_identity::resolve_endpoint(&ep.name, ep.id)
+                .map_err(|_| TelemetryError::BadArg)?,
+        );
         let existed = self.reg.endpoints.iter().any(|(known, _)| *known == id);
         let description = ep.description.unwrap_or_default();
         let retained = if existed {
@@ -3623,8 +3713,29 @@ impl StreamingSchemaState<'_> {
         if !existed {
             self.added_endpoints.push(id);
         }
-        self.alias_bytes = self.alias_bytes.saturating_add(rust_name.len());
-        self.aliases.push((rust_name, id));
+        let canonical_name = self
+            .reg
+            .endpoints
+            .iter()
+            .find(|(known, _)| *known == id)
+            .expect("registered endpoint")
+            .1
+            .name
+            .to_string();
+        for alias in [rust_name, canonical_name] {
+            if self
+                .aliases
+                .iter()
+                .any(|(known, known_id)| known == &alias && *known_id != id)
+            {
+                return Err(TelemetryError::BadArg);
+            }
+            if !self.aliases.iter().any(|(known, _)| known == &alias) {
+                self.ensure_budget(alias.len())?;
+                self.alias_bytes = self.alias_bytes.saturating_add(alias.len());
+                self.aliases.push((alias, id));
+            }
+        }
         Ok(())
     }
 
@@ -3647,7 +3758,15 @@ impl StreamingSchemaState<'_> {
                     .unwrap_or_else(|| DataEndpoint::identity(name))
             })
             .collect::<Vec<_>>();
-        let id = DataType(schema_identity::type_id(&ty.name));
+        let id = DataType(
+            schema_identity::resolve_type(&ty.name, ty.id).map_err(|_| TelemetryError::BadArg)?,
+        );
+        if self.seen_types.contains(&id) {
+            return Err(TelemetryError::BadArg);
+        }
+        self.ensure_budget(size_of::<DataType>())?;
+        self.alias_bytes = self.alias_bytes.saturating_add(size_of::<DataType>());
+        self.seen_types.push(id);
         let existed = self.reg.types.iter().any(|(known, _)| *known == id);
         let description = ty.description.unwrap_or_default();
         if !existed {
@@ -3835,6 +3954,7 @@ fn register_schema_json_reader_into<R: std::io::Read>(
         alias_bytes: 0,
         added_endpoints: Vec::new(),
         added_types: Vec::new(),
+        seen_types: Vec::new(),
         initial_next_endpoint_id,
         initial_next_type_id,
         link_local_overlay,
@@ -3887,8 +4007,6 @@ fn register_schema_json_file_into(
 fn json_config_to_snapshot(
     cfg: JsonConfig,
     link_local_overlay: bool,
-    mut next_endpoint_id: u32,
-    mut next_type_id: u32,
 ) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     let mut endpoint_ids: Vec<(String, DataEndpoint)> = Vec::new();
     let mut endpoints = Vec::with_capacity(cfg.endpoints.len());
@@ -3897,15 +4015,28 @@ fn json_config_to_snapshot(
         let link_local = link_local_overlay
             || ep.link_local_only.unwrap_or(false)
             || matches!(ep.broadcast_mode.as_deref(), Some("Never"));
-        let id = DataEndpoint(schema_identity::endpoint_id(&ep.name));
-        next_endpoint_id = next_endpoint_id.max(id.0.saturating_add(1));
+        let id = DataEndpoint(
+            schema_identity::resolve_endpoint(&ep.name, ep.id)
+                .map_err(|_| TelemetryError::BadArg)?,
+        );
         endpoints.push(OwnedEndpointDefinition {
             id,
             name: ep.name,
             description: ep.description.unwrap_or_default(),
             link_local_only: link_local,
         });
-        endpoint_ids.push((rust_name, id));
+        for alias in [
+            rust_name,
+            endpoints.last().expect("new endpoint").name.clone(),
+        ] {
+            if endpoint_ids
+                .iter()
+                .any(|(known, known_id)| known == &alias && *known_id != id)
+            {
+                return Err(TelemetryError::BadArg);
+            }
+            endpoint_ids.push((alias, id));
+        }
     }
 
     let mut types = Vec::with_capacity(cfg.types.len());
@@ -3921,8 +4052,9 @@ fn json_config_to_snapshot(
                     .unwrap_or_else(|| DataEndpoint::identity(name))
             })
             .collect::<Vec<_>>();
-        let id = DataType(schema_identity::type_id(&ty.name));
-        next_type_id = next_type_id.max(id.0.saturating_add(1));
+        let id = DataType(
+            schema_identity::resolve_type(&ty.name, ty.id).map_err(|_| TelemetryError::BadArg)?,
+        );
         let class = parse_message_class(&ty.class)?;
         let element = match ty.element {
             JsonElement::Static { data_type, count } => MessageElement::Static(
@@ -3946,14 +4078,16 @@ fn json_config_to_snapshot(
             e2e_encryption: parse_e2e_encryption_policy(ty.e2e_encryption.as_deref())?,
         });
     }
-    Ok(OwnedRuntimeSchemaSnapshot { endpoints, types })
+    let snapshot = OwnedRuntimeSchemaSnapshot { endpoints, types };
+    validate_schema_identities(&snapshot)?;
+    Ok(snapshot)
 }
 
 #[cfg(feature = "serde")]
 pub fn schema_snapshot_from_json_bytes(json: &[u8]) -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {
     let cfg: JsonConfig =
         serde_json::from_slice(json).map_err(|_| TelemetryError::Unpack("schema json"))?;
-    json_config_to_snapshot(cfg, false, 100, 100)
+    json_config_to_snapshot(cfg, false)
 }
 
 #[cfg(feature = "std")]
@@ -4158,5 +4292,127 @@ mod memory_regression_tests {
                 .any(|(_, meta)| meta.name.as_ref() == "SINGLE_BYTE_READER_TYPE")
         );
         assert!(reg.schema_byte_cost() > baseline_cost);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod generic_schema_identity_tests {
+    use super::*;
+    fn protocol_registry() -> Registry {
+        let mut registry = Registry::new();
+        registry
+            .endpoints
+            .retain(|(id, _)| is_internal_endpoint(*id));
+        registry.types.retain(|(id, _)| is_internal_data_type(*id));
+        registry
+    }
+
+    #[test]
+    fn macro_resolver_is_generated_from_the_same_authority() {
+        let expected = concat!(
+            "// Generated mirror of src/schema_identity.rs; run scripts/sync-schema-identity.py.\n",
+            include_str!("schema_identity.rs")
+        );
+        assert_eq!(
+            expected,
+            include_str!("../sedsnet_macros/src/schema_identity.rs")
+        );
+    }
+
+    #[test]
+    fn arbitrary_names_can_preserve_explicit_legacy_ids_in_all_json_loaders() {
+        let bytes = br#"{"endpoints":[{"rust":"Destination","name":"CUSTOM_DESTINATION","id":100}],"types":[{"name":"CUSTOM_SAMPLE","id":101,"class":"Data","element":{"kind":"Dynamic","data_type":"Binary"},"endpoints":["CUSTOM_DESTINATION"],"reliable":"Off"}]}"#;
+        let snapshot = schema_snapshot_from_json_bytes(bytes).unwrap();
+        assert_eq!(snapshot.endpoints[0].id, DataEndpoint(100));
+        assert_eq!(snapshot.types[0].id, DataType(101));
+        assert_eq!(snapshot.types[0].endpoints, [DataEndpoint(100)]);
+        let mut registry = protocol_registry();
+        register_schema_json_reader_into(&mut registry, &bytes[..], false, usize::MAX).unwrap();
+        assert_eq!(
+            registry
+                .types
+                .iter()
+                .find(|(id, _)| id.0 == 101)
+                .unwrap()
+                .1
+                .endpoints
+                .as_ref(),
+            &[DataEndpoint(100)]
+        );
+    }
+
+    #[test]
+    fn protocol_metadata_cannot_be_overridden_by_remote_schema() {
+        let registry = protocol_registry();
+        let (_, meta) = registry
+            .types
+            .iter()
+            .find(|(id, _)| *id == DataType::ReliableAck)
+            .unwrap();
+        let original = OwnedDataTypeDefinition {
+            id: DataType::ReliableAck,
+            name: meta.name.to_string(),
+            description: meta.description.to_string(),
+            element: meta.element,
+            endpoints: meta.endpoints.to_vec(),
+            reliable: meta.reliable,
+            priority: meta.priority,
+            e2e_encryption: meta.e2e_encryption,
+        };
+        let mut incoming = original.clone();
+        incoming.priority = 0;
+        incoming.reliable = ReliableMode::Ordered;
+        assert_eq!(merge_type_metadata(&original, &incoming), original);
+        let (_, meta) = registry
+            .endpoints
+            .iter()
+            .find(|(id, _)| *id == DataEndpoint::Discovery)
+            .unwrap();
+        let original = OwnedEndpointDefinition {
+            id: DataEndpoint::Discovery,
+            name: meta.name.to_string(),
+            description: meta.description.to_string(),
+            link_local_only: false,
+        };
+        let mut incoming = original.clone();
+        incoming.link_local_only = true;
+        assert_eq!(merge_endpoint_metadata(&original, &incoming), original);
+    }
+
+    #[test]
+    fn explicit_collision_and_reserved_id_fail_atomically() {
+        for id in ["0", "1", "18", "101"] {
+            let bytes = alloc::format!(
+                r#"{{"endpoints":[{{"name":"NEW_GENERIC_DESTINATION","id":100}}],"types":[{{"name":"FIRST_APPLICATION","id":101,"class":"Data","element":{{"kind":"Dynamic","data_type":"Binary"}},"endpoints":[],"reliable":"Off"}},{{"name":"SECOND_APPLICATION","id":{id},"class":"Data","element":{{"kind":"Dynamic","data_type":"Binary"}},"endpoints":[],"reliable":"Off"}}]}}"#
+            );
+            assert!(schema_snapshot_from_json_bytes(bytes.as_bytes()).is_err());
+            let mut registry = protocol_registry();
+            let before = (
+                registry.schema_byte_cost(),
+                registry.endpoints.len(),
+                registry.types.len(),
+                registry.next_endpoint_id,
+                registry.next_type_id,
+            );
+            assert!(
+                register_schema_json_reader_into(
+                    &mut registry,
+                    bytes.as_bytes(),
+                    false,
+                    usize::MAX
+                )
+                .is_err()
+            );
+            assert_eq!(
+                before,
+                (
+                    registry.schema_byte_cost(),
+                    registry.endpoints.len(),
+                    registry.types.len(),
+                    registry.next_endpoint_id,
+                    registry.next_type_id
+                )
+            );
+        }
     }
 }

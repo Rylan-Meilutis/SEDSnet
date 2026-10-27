@@ -11,47 +11,37 @@ use std::sync::{Arc, Mutex};
 type SeenType = Arc<Mutex<Option<(DataType, Vec<f32>)>>>;
 
 pub(crate) fn ensure_common_test_schema() {
-    use crate::config::{register_data_type_with_description, register_endpoint_with_description};
-    use crate::{MessageClass, MessageElement, ReliableMode};
     use std::sync::Once;
-
     static INIT: Once = Once::new();
-
     INIT.call_once(|| {
-        let radio = DataEndpoint::try_named("RADIO").unwrap_or_else(|| {
-            register_endpoint_with_description("RADIO", "test radio endpoint", false)
-                .expect("register RADIO")
-        });
-        let sd_card = DataEndpoint::try_named("SD_CARD").unwrap_or_else(|| {
-            register_endpoint_with_description("SD_CARD", "test sd endpoint", false)
-                .expect("register SD_CARD")
-        });
-        for (name, count, data_type, reliable) in [
-            (
-                "GPS_DATA",
-                3,
-                MessageDataType::Float32,
-                ReliableMode::Ordered,
-            ),
-            ("IMU_DATA", 6, MessageDataType::Float32, ReliableMode::None),
-            (
-                "BATTERY_STATUS",
-                2,
-                MessageDataType::Float32,
-                ReliableMode::None,
-            ),
-            ("HEARTBEAT", 0, MessageDataType::NoData, ReliableMode::None),
-        ] {
-            if DataType::try_named(name).is_none() {
-                register_data_type_with_description(
-                    name,
-                    "shared test fixture",
-                    MessageElement::Static(count, data_type, MessageClass::Data),
-                    &[radio, sd_card],
-                    reliable,
-                    1,
+        let fixture = crate::config::schema_snapshot_from_json_bytes(include_bytes!(
+            "../../tests/fixtures/legacy-test-schema.json"
+        ))
+        .unwrap();
+        for endpoint in fixture.endpoints {
+            if DataEndpoint::try_named(&endpoint.name).is_none() {
+                crate::config::register_endpoint_id_with_description(
+                    endpoint.id,
+                    &endpoint.name,
+                    &endpoint.description,
+                    endpoint.link_local_only,
                 )
-                .expect("register common test type");
+                .unwrap();
+            }
+        }
+        for ty in fixture.types {
+            if DataType::try_named(&ty.name).is_none() {
+                crate::config::register_data_type_id_with_description_and_e2e_encryption(
+                    ty.id,
+                    &ty.name,
+                    &ty.description,
+                    ty.element,
+                    &ty.endpoints,
+                    ty.reliable,
+                    ty.priority,
+                    ty.e2e_encryption,
+                )
+                .unwrap();
             }
         }
     });
