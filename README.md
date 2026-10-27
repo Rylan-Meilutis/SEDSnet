@@ -196,9 +196,24 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.0 highlights
+
+Candidate under qualification; package publication is pending.
+
+- Keep only network protocol identities reserved, with canonical `SEDSNET_`
+  message names. Application IDs belong to configuration, including IDs retained
+  for compatibility with existing firmware.
+- Use the shared routing engine and side configuration for Router and Relay,
+  with relay capabilities disabling local application origination and services.
+- Resolve schema identities consistently across hosted/embedded registration,
+  macro generation and Python tooling; reject conflicting definitions atomically.
+
+Read [the 4.3 migration guide](docs/migration-4.3.md) before upgrading a network.
+
 ### Version 4.2.7 highlights
 
-Qualification is in progress; this patch is not yet published.
+Version 4.2.7 is published on crates.io and PyPI. Its published artifacts remain
+unchanged; newer source changes are being qualified for 4.3.0.
 
 - Preserve every distinct destination role for best-effort multicast, including
   GPS sent to Flight Computer, SD logging and GroundStation across CAN and radio.

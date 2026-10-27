@@ -2,9 +2,31 @@
 
 ## Unreleased
 
+## 4.3.0
+
+Candidate under qualification; no 4.3.0 release or package upload yet.
+
+- Reserve schema identities only for network protocol messages and endpoints.
+  Application names such as GPS_DATA, IMU_DATA, HEARTBEAT, SD_CARD and RADIO now
+  use ordinary name-derived IDs, or explicit IDs supplied by configuration.
+  Preserve existing deployments by configuring their old application IDs before
+  upgrading. See [the migration guide](docs/migration-4.3.md).
+- Give every SDK-owned protocol message its canonical `SEDSNET_` name across
+  runtime registration, generated schemas and bindings. Application heartbeats
+  follow configured routing and reliability policies without name-based exceptions.
+- Share side configuration and the routing engine between Router and Relay.
+  Relay retains its compatibility API and disables local application origination
+  and services through its role capabilities.
+- Validate configured identities consistently in hosted and embedded schemas,
+  macro expansion and Python tooling. Accept repeated identical wire definitions
+  while rejecting conflicting identities without partially publishing a schema.
+- Update the SDK to 4.3.0 and its macro crate to 2.2.0. Package publication remains
+  a separate maintainer action after complete validation.
+
 ## 4.2.7
 
-Qualification is in progress; this patch has not been published.
+Version 4.2.7 is published on crates.io and PyPI. Published artifacts are immutable;
+subsequent source changes are being qualified for 4.3.0.
 
 - Route best-effort packets to every distinct destination endpoint role across
   independent sides. GPS addressed to Flight Computer, SD logging and GroundStation
