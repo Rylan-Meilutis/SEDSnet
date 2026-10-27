@@ -6,6 +6,10 @@
 
 Candidate under qualification; no release or package publication yet.
 
+- Retain completed proxy delivery in the bounded return-route cache. Delayed
+  publisher retries replay the aggregate receipt instead of reopening an ordered
+  child cohort, and late child receipts remain consumed by the proxy. Completion
+  still requires every frozen child owner; expiry cannot acknowledge delivery.
 - Keep reserved control capacity usable while a lower-priority transport
   partition refuses traffic. A refused lower-band opportunity permits another
   bounded control burst while retaining that band's reservation. Bound attempted

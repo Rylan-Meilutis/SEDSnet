@@ -889,9 +889,9 @@ struct ReliableRxState {
 #[derive(Debug, Clone)]
 struct ReliableReturnRouteState {
     side: RouterSideId,
-    // A final receipt can be lost after the application has acted. Ordinary
-    // RX traffic must not evict this delivery record before its return route.
-    locally_delivered: bool,
+    // A final receipt can be lost after local delivery or completion of every
+    // child owner. Retain that fact for the lifetime of this bounded route.
+    delivery_completed: bool,
     last_replay_ms: u64,
     // A legacy contract names this router, not its downstream owner.
     // Translate the child receipt back to the router identity and original
@@ -4968,7 +4968,7 @@ impl Router {
             || st
                 .reliable_return_routes
                 .get(&packet_id)
-                .is_some_and(|route| route.locally_delivered);
+                .is_some_and(|route| route.delivery_completed);
         let last_replay_ms = if duplicate {
             now.saturating_sub(retry_ms)
         } else {
@@ -5000,7 +5000,7 @@ impl Router {
             })
             .or_insert(ReliableReturnRouteState {
                 side,
-                locally_delivered: false,
+                delivery_completed: false,
                 last_replay_ms,
                 upstream_contract: None,
             });
@@ -5951,7 +5951,7 @@ impl Router {
             // bounded reliable return-route cache: best-effort telemetry can
             // churn recent_rx thousands of times while this receipt retries.
             if let Some(route) = st.reliable_return_routes.get_mut(&packet_id) {
-                route.locally_delivered = true;
+                route.delivery_completed = true;
             }
             Self::sender_hash(&Self::canonical_sender_locked(&st, original_sender))
         };
@@ -6581,6 +6581,24 @@ impl Router {
             }
         };
         let upstream_id = Self::get_hash(&data);
+        // A completed proxy still owns the aggregate receipt. A delayed parent
+        // retry must not recreate an ordered child cohort and block successors.
+        // Keep the alias too, so late child receipts remain consumed locally.
+        let completed_contract = {
+            let st = self.state.lock();
+            st.reliable_return_routes
+                .get(&upstream_id)
+                .filter(|route| route.delivery_completed)
+                .and_then(|route| route.upstream_contract)
+        };
+        if let Some((packet_id, publisher_hash)) = completed_contract {
+            self.queue_end_to_end_reliable_ack_for_sender_hash(
+                packet_id,
+                publisher_hash,
+                called_from_queue,
+            )?;
+            return Ok(None);
+        }
         #[cfg(feature = "discovery")]
         let destinations = {
             let st = self.state.lock();
@@ -14774,7 +14792,7 @@ impl Router {
             || st
                 .reliable_return_routes
                 .get(&id)
-                .is_some_and(|route| route.locally_delivered)
+                .is_some_and(|route| route.delivery_completed)
         {
             Ok(true)
         } else {
@@ -16032,9 +16050,9 @@ impl Router {
                             upstream_id,
                             ReliableReturnRouteState {
                                 side: alias.side,
-                                locally_delivered: false,
+                                delivery_completed: true,
                                 last_replay_ms: alias.last_replay_ms,
-                                upstream_contract: None,
+                                upstream_contract: Some((upstream_id, publisher_hash)),
                             },
                         );
                     }

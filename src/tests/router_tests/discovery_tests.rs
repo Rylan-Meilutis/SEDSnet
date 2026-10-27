@@ -8121,6 +8121,12 @@ fn non_owner_relay_translates_downstream_ack_to_original_contract() {
         relay.rx_packed_from_side(frame, relay_up).unwrap();
     }
     relay.process_all_queues().unwrap();
+    assert!(
+        !downstream.lock().unwrap().iter().any(|wire| {
+            wire_format::unpack_packet(wire).is_ok_and(|packet| packet.data_type() == ty)
+        }),
+        "a completed proxy must replay its own receipt without retransmitting to children"
+    );
     for frame in downstream.lock().unwrap().drain(..) {
         child.rx_packed_from_side(&frame, child_side).unwrap();
     }
@@ -8143,6 +8149,27 @@ fn non_owner_relay_translates_downstream_ack_to_original_contract() {
     assert!(
         relay.debug_reliable_return_route_count()
             <= crate::config::runtime_reliable_max_return_routes()
+    );
+    // A newer ordered value must proceed without waiting for another receipt
+    // for the already completed value. No child is pumped during this check.
+    downstream.lock().unwrap().clear();
+    source
+        .set_network_variable(
+            Packet::new(ty, &[ep], "GS", 1600, 2.0_f32.to_le_bytes().to_vec().into()).unwrap(),
+        )
+        .unwrap();
+    source.process_all_queues().unwrap();
+    for frame in forward.lock().unwrap().drain(..) {
+        relay.rx_packed_from_side(&frame, relay_up).unwrap();
+    }
+    relay.process_all_queues().unwrap();
+    assert!(
+        downstream.lock().unwrap().iter().any(|wire| {
+            wire_format::unpack_packet(wire).is_ok_and(|packet| {
+                packet.data_type() == ty && packet.data_as_f32().unwrap() == vec![2.0]
+            })
+        }),
+        "the next ordered value must not wait on a resurrected child cohort"
     );
 }
 
