@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from schema_identity import ENDPOINT_PROTOCOL, TYPE_PROTOCOL, resolve_id
 
 try:
     import sedsnet as seds
@@ -50,8 +51,18 @@ class PythonCurrentApiTests(unittest.TestCase):
         cls.state_ty = int(seds.data_type_info_by_name("PY_API_STATE_9203")["id"])
 
     def test_canonical_runtime_identities_before_registration(self) -> None:
-        self.assertEqual(seds.endpoint_identity("RADIO"), 101)
-        self.assertEqual(seds.data_type_identity("HEARTBEAT"), 106)
+        for name, legacy in [("SD_CARD", 100), ("RADIO", 101), ("SOFTWARE_BUS", 102)]:
+            self.assertEqual(seds.endpoint_identity(name), resolve_id(name, endpoint=True))
+            self.assertNotEqual(seds.endpoint_identity(name), legacy)
+        for name, legacy in [("GPS_DATA", 100), ("IMU_DATA", 101), ("BATTERY_STATUS", 102),
+                             ("SYSTEM_STATUS", 103), ("BAROMETER_DATA", 104), ("MESSAGE_DATA", 105),
+                             ("HEARTBEAT", 106), ("IPC_MESSAGE", 107)]:
+            self.assertEqual(seds.data_type_identity(name), resolve_id(name))
+            self.assertNotEqual(seds.data_type_identity(name), legacy)
+        for name, identity in ENDPOINT_PROTOCOL.items():
+            self.assertEqual(seds.endpoint_identity(name), identity)
+        for name, identity in TYPE_PROTOCOL.items():
+            self.assertEqual(seds.data_type_identity(name), identity)
         name = "PY_API_CANONICAL_UNDECLARED_ENDPOINT"
         type_name = "PY_API_CANONICAL_RUNTIME_FLOW"
         ep = seds.endpoint_identity(name)
