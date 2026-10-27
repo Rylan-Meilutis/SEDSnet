@@ -6,6 +6,9 @@
 
 Candidate under qualification; no release or package publication yet.
 
+- Accept Linux keyring chains by selecting the first supported OS credential
+  store in configured order. Login and later package publication no longer need
+  a backend override; plaintext and unsupported child stores remain excluded.
 - Pack dispatch completion flags into one byte so the existing stack-size
   assertion holds on i686 Python wheel builds as well as 64-bit hosts and ARM.
   Full qualification now checks i686 Python compilation in both profiles.
