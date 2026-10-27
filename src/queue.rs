@@ -455,10 +455,6 @@ impl<T: ByteCost> BoundedDeque<T> {
         if !owns && admitted && self.fair_owed_flags & PRIORITY_TURN_ACTIVE != 0 {
             self.fair_owed_flags |= PRIORITY_TURN_NESTED_ADMISSION;
         }
-        if !owns && priority == u8::MAX && !admitted && retained {
-            // Selection alone cannot spend the control admission allowance.
-            *priority_burst = priority_burst.saturating_sub(1);
-        }
         if !owns
             || self.fair_owed_flags & PRIORITY_TURN_ACTIVE == 0
             || self.fair_owed_priority != priority
@@ -475,6 +471,8 @@ impl<T: ByteCost> BoundedDeque<T> {
             // The owed band had its opportunity, but its transport capacity
             // can be independent of the control reserve. Keep its reservation
             // and permit another bounded control burst before retrying it.
+            // Bound attempts, including refused urgent work, so independent
+            // lower-band capacity also gets retried while controls are blocked.
             // A reentrant admission has already used that opportunity; do not
             // grant a second burst over its updated fairness accounting.
             if self.fair_owed_flags & PRIORITY_TURN_NESTED_ADMISSION == 0 {
@@ -893,6 +891,44 @@ impl<T: ByteCost> BoundedDeque<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_control_band_does_not_block_available_general_capacity() {
+        let capacity = 16 * core::mem::size_of::<Item>();
+        let mut queue = BoundedDeque::new(capacity, capacity, 1.0);
+        for priority in [255, 254] {
+            queue
+                .push_back_prioritized(
+                    Item {
+                        id: priority,
+                        cost: 1,
+                        priority,
+                    },
+                    |v| v.priority,
+                )
+                .unwrap();
+        }
+        let mut burst = 8;
+        let mut delivered = None;
+        for turn in 0..32 {
+            let (index, owns) = queue
+                .select_front_fair_deferred(&mut burst, 8, |v| v.priority, |_, _| true)
+                .unwrap();
+            let priority = queue.get(index).unwrap().priority;
+            // The urgent partition stays blocked throughout. The ordinary
+            // partition becomes usable independently at turn 12.
+            let admitted = priority == 254 && turn >= 12;
+            queue.finish_deferred_turn(priority, owns, admitted, !admitted, &mut burst);
+            if admitted {
+                delivered = Some(turn);
+                break;
+            }
+        }
+        assert!(
+            delivered.is_some_and(|turn| turn <= 20),
+            "refused urgent attempts starved ready general capacity: {delivered:?}"
+        );
+    }
 
     #[test]
     fn refused_general_band_does_not_block_available_control_reserve() {

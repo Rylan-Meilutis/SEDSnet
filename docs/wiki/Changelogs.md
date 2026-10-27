@@ -7,8 +7,9 @@
 Candidate under qualification; no release or package publication yet.
 
 - Keep receipt-reserved transport capacity usable during general backpressure.
-  Refused attempts do not spend the control admission allowance. Lower bands
-  retain bounded service opportunities, including across reentrant callbacks.
+  Retry refused lower-band service without blocking reserved receipt capacity.
+  Bound attempted control service so independently ready lower bands also make
+  progress, including across reentrant callbacks.
 - Preserve allocator and queue sizes, source rates, and wire identities.
 
 ## Version 4.3.0 highlights

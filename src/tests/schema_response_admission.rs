@@ -41,7 +41,27 @@ fn full_general_transport_does_not_hide_a_free_receipt_slot() {
         },
         options.clone(),
     );
-    let catalog = discovery::build_discovery_schema("RESERVE_RF", 0).unwrap();
+    // Use a fixed, valid catalog so other tests' process-wide registrations
+    // cannot change the fragment count or this transport-pressure fixture.
+    let catalog = discovery::build_discovery_schema_from_snapshot(
+        "RESERVE_RF",
+        0,
+        crate::config::RuntimeSchemaSnapshot {
+            endpoints: vec![crate::config::EndpointDefinition {
+                id: DataEndpoint(230),
+                name: "INDEPENDENT_SCHEMA",
+                description: concat!(
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                    "A bounded catalog tests fragmentation across a blocked general partition. ",
+                ),
+                link_local_only: false,
+            }],
+            types: vec![],
+        },
+    )
+    .unwrap();
     // Start a real SDT transfer and retain its accepted prefix across refusals.
     assert!(matches!(
         node.send_reliable_to_side(side, RouterItem::Packet(catalog.clone()), false),

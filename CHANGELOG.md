@@ -7,9 +7,10 @@
 Candidate under qualification; no release or package publication yet.
 
 - Keep reserved control capacity usable while a lower-priority transport
-  partition refuses traffic. Refused control attempts do not spend the admission
-  allowance, and a refused lower-band opportunity permits another bounded
-  control burst while retaining that band's reservation. Preserve admissions
+  partition refuses traffic. A refused lower-band opportunity permits another
+  bounded control burst while retaining that band's reservation. Bound attempted
+  control service so blocked urgent traffic cannot starve independently available
+  lower-band capacity. Preserve admissions
   made by reentrant callbacks rather than granting an additional burst over them.
 - Cover blocked general traffic, a newly available receipt slot, complete
   fragmented schema recovery, and bounded ordinary service without changing
