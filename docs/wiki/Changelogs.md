@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## Version 4.3.2 highlights
+
+Wire format and application identities remain compatible with 4.3.1.
+
+- Reduce contiguous reliable-tracking allocations on fragmented embedded heaps.
+- Keep accepted commands retryable when a reliable record allocation encounters
+  memory pressure, preserving ACK ownership and ordered delivery.
+- Retain existing queue limits and packet-store budgets.
+
 ## Version 4.3.1 highlights
 
 Wire format and application identities remain compatible with 4.3.0.
