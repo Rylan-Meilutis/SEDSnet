@@ -897,6 +897,26 @@ struct EndToEndReliableSent {
     queued: bool,
 }
 
+impl EndToEndReliableSent {
+    // Keeping the retained packet inline makes each B-tree leaf several KiB.
+    // Small independent records avoid that contiguous allocation on fragmented
+    // embedded heaps. A failed record allocation remains retryable pressure.
+    fn try_box(self) -> TelemetryResult<Box<Self>> {
+        let layout = core::alloc::Layout::new::<Self>();
+        // SAFETY: layout is nonzero and valid for Self. On failure self drops
+        // normally. On success initialize exactly once and transfer ownership
+        // to Box, which uses the same global allocator and layout on drop.
+        let ptr = unsafe { alloc::alloc::alloc(layout).cast::<Self>() };
+        if ptr.is_null() {
+            return Err(TelemetryError::Io("memory pressure"));
+        }
+        unsafe {
+            ptr.write(self);
+            Ok(Box::from_raw(ptr))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReliableRxState {
     expected_seq: u32,
@@ -2163,7 +2183,7 @@ struct RouterInner {
     reliable_return_routes: BTreeMap<u64, ReliableReturnRouteState>,
     reliable_return_route_order: VecDeque<u64>,
     forwarded_receipts: Option<Box<ForwardedReceiptCache>>,
-    end_to_end_reliable_tx: BTreeMap<u64, EndToEndReliableSent>,
+    end_to_end_reliable_tx: BTreeMap<u64, Box<EndToEndReliableSent>>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
     total_handler_retries: u64,
@@ -2430,7 +2450,7 @@ impl RouterInner {
     }
     fn set_replay_queued(
         hop: &mut BTreeMap<(RouterSideId, u32), ReliableTxState>,
-        end: &mut BTreeMap<u64, EndToEndReliableSent>,
+        end: &mut BTreeMap<u64, Box<EndToEndReliableSent>>,
         key: ReplayMarkerKey,
         queued: bool,
     ) {
@@ -5733,20 +5753,19 @@ impl Router {
         let mut retained = retained;
         #[cfg(feature = "compact-packet-store")]
         retained.park_for_queue()?;
+        let sent = EndToEndReliableSent {
+            ordered_type,
+            waiting_for_predecessor,
+            data: retained,
+            pending_destinations,
+            tracked_destinations,
+            last_send_ms: now_ms,
+            retries: 0,
+            queued: false,
+        }
+        .try_box()?;
         Self::remember_end_to_end_reliable_tx_locked(&mut st, packet_id);
-        st.end_to_end_reliable_tx.insert(
-            packet_id,
-            EndToEndReliableSent {
-                ordered_type,
-                waiting_for_predecessor,
-                data: retained,
-                pending_destinations,
-                tracked_destinations,
-                last_send_ms: now_ms,
-                retries: 0,
-                queued: false,
-            },
-        );
+        st.end_to_end_reliable_tx.insert(packet_id, sent);
         Ok(!waiting_for_predecessor)
     }
 
@@ -17199,7 +17218,9 @@ impl Router {
                                     if called_from_queue
                                         && matches!(
                                             error,
-                                            TelemetryError::Io("reliable window full")
+                                            TelemetryError::Io(
+                                                "reliable window full" | "memory pressure"
+                                            )
                                         )
                                     {
                                         // Acceptance transferred ownership to this queue. A full
@@ -18173,7 +18194,9 @@ mod queued_schema_identity_tests {
                     last_send_ms: 0,
                     retries: runtime_reliable_max_retries(),
                     queued: false,
-                },
+                }
+                .try_box()
+                .unwrap(),
             );
             let snapshot = router.export_reliable_pending_stats();
             assert_eq!(snapshot.len(), 1);
@@ -18237,7 +18260,9 @@ mod queued_schema_identity_tests {
                 last_send_ms: 0,
                 retries: 0,
                 queued: false,
-            },
+            }
+            .try_box()
+            .unwrap(),
         );
         router.rx_packed_queue_from_side(&bytes, side).unwrap();
         router.drain_queues_with_timeout(1).unwrap();

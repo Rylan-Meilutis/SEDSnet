@@ -674,7 +674,9 @@ fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
                 last_send_ms: 0,
                 retries: 1,
                 queued: false,
-            },
+            }
+            .try_box()
+            .unwrap(),
         );
         router.queue_end_to_end_reliable_retransmit(id).unwrap();
         // The original high-priority replay callback is refused. Repeat that
