@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 4.3.2
+
+Wire format and application identities remain compatible with 4.3.1.
+
+- Store retained reliable-delivery records separately from their tree index,
+  reducing large contiguous allocations on fragmented embedded heaps.
+- Return temporary memory pressure when a reliable record cannot be allocated,
+  and retain accepted commands for retry without changing ACK ownership.
+- Preserve ordered delivery, retry limits, and existing queue and packet-store
+  budgets.
+
 ## 4.3.1
 
 Wire format and application identities remain compatible with 4.3.0.
