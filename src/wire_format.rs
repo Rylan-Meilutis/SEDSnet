@@ -1596,7 +1596,10 @@ pub(crate) struct RoutingEnvelope<'a> {
     pub ty: DataType,
     bitmap: [u64; EP_BITMAP_BYTES / 8],
     endpoint_list: Option<&'a [u8]>,
-    schema_endpoints: Option<crate::MessageMeta>,
+    #[cfg(feature = "std")]
+    schema_endpoints: Option<Arc<[DataEndpoint]>>,
+    #[cfg(not(feature = "std"))]
+    schema_endpoints: Option<&'static [DataEndpoint]>,
     pub source_address: u32,
     pub timestamp_ms: u64,
     pub wire_shape: Option<MessageElement>,
@@ -1636,9 +1639,8 @@ impl Iterator for RoutingEndpointIter<'_> {
             self.list_offset = reader.off;
             return endpoint;
         }
-        if let Some(meta) = &self.envelope.schema_endpoints {
-            let next = meta
-                .endpoints_ref()
+        if let Some(endpoints) = &self.envelope.schema_endpoints {
+            let next = endpoints
                 .iter()
                 .copied()
                 .filter(|ep| self.previous.is_none_or(|previous| *ep > previous))
@@ -1704,8 +1706,6 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
     let source_address = u32::try_from(read_uleb128(r)?)
         .map_err(|_| TelemetryError::Unpack("source address too large"))?;
     let ty_u32 = data_type_id_from_wire(ty_v)?;
-    let metadata = crate::config::try_get_message_meta(DataType(ty_u32));
-    let known_ty = metadata.as_ref().map(|_| DataType(ty_u32));
     let is_reliable = flags & FLAG_RELIABLE_HEADER_PRESENT != 0;
     // Word-sized bitmaps avoid repeatedly scanning 32 individual bytes for
     // the usual one-destination telemetry frame on size-optimized MCUs.
@@ -1742,11 +1742,12 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
             }
         }
     } else {
-        let meta = metadata.ok_or(TelemetryError::InvalidType)?;
+        let meta = crate::config::try_get_message_meta(DataType(ty_u32))
+            .ok_or(TelemetryError::InvalidType)?;
         if unique_sorted_endpoints(meta.endpoints_ref()).count() != nep {
             return Err(TelemetryError::Unpack("endpoint count mismatch"));
         }
-        schema_endpoints = Some(meta);
+        schema_endpoints = Some(meta.endpoints);
     }
     let mut shape = None;
     let mut targets: &'a [u8] = &[];
@@ -1786,7 +1787,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
             return Err(TelemetryError::EmptyEndpoints);
         }
     }
-    let ty = known_ty.unwrap_or(DataType(ty_u32));
+    let ty = DataType(ty_u32);
     Ok(RoutingEnvelope {
         ty,
         bitmap,
