@@ -564,6 +564,11 @@ pub(crate) struct SideTxProgress {
     slots: [Option<SideTxCursor>; 4],
 }
 impl SideTxProgress {
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+
     pub(crate) fn begin(&mut self, key: u64, now: u64) -> TelemetryResult<usize> {
         for slot in &mut self.slots {
             // Match the receiver's assembly timeout. After a genuine pause,

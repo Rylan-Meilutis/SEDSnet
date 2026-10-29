@@ -27,8 +27,12 @@ class BuildCliTests(unittest.TestCase):
         self.assertIn('cryptography', profiles[0])
         self.assertIn('ingress-target-filter', profiles[0])
         self.assertNotIn('compact-packet-compression', profiles[0])
-        self.assertEqual(profiles[1] - profiles[0], {'compact-packet-compression', 'fair-admission'})
-        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 6)
+        self.assertEqual(profiles[1] - profiles[0], {'compact-packet-compression', 'fair-admission', 'latest-value-egress'})
+        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 8)
+        minimal = [c[c.index('--features') + 1] for c in commands
+                   if c[:2] == ['cargo', 'clippy'] and '--no-default-features' in c
+                   and c[c.index('--features') + 1] in {'std', 'std,latest-value-egress'}]
+        self.assertEqual(minimal, ['std', 'std,latest-value-egress'])
         self.assertEqual(sum('embedded_memory_behavior_test' in c for c in commands), 2)
         self.assertEqual(sum('packet_packing_memory' in c for c in commands), 1)
         self.assertEqual(sum(c[:2] == ['cargo', 'bench'] for c in commands), 1)
@@ -53,7 +57,16 @@ class BuildCliTests(unittest.TestCase):
     def test_matrix_selects_storage_profiles_and_keeps_common_features(self):
         profiles = build.qualification_profiles(['compact-packet-store', 'fair-admission', 'ingress-target-filter'])
         self.assertEqual(profiles, [['ingress-target-filter', 'cryptography'],
-            ['ingress-target-filter', 'cryptography', 'compact-packet-compression', 'fair-admission']])
+            ['ingress-target-filter', 'cryptography', 'compact-packet-compression', 'fair-admission', 'latest-value-egress']])
+
+    def test_latest_feature_is_off_in_reference_and_on_in_compact_profile(self):
+        profiles = build.qualification_profiles(['latest-value-egress'])
+        self.assertNotIn('latest-value-egress', profiles[0])
+        self.assertIn('latest-value-egress', profiles[1])
+        self.assertNotIn('compact-packet-compression', profiles[0])
+        self.assertIn('compact-packet-compression', profiles[1])
+        args = build.parse_args(['build', '--features', 'latest-value-egress'])
+        self.assertEqual(args.features, ['latest-value-egress'])
 
     def test_wheel_install_uses_selected_target_features_and_cargo_output(self):
         import tempfile

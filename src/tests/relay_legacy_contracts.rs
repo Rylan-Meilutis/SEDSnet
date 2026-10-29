@@ -94,7 +94,7 @@ mod compact_summary_tests {
         };
         Router::refresh_sender_topology_state(&mut sender);
         let mut route = DiscoverySideState::default();
-        route.announcers.insert("bridge".into(), sender);
+        route.announcers.insert("bridge".into(), Box::new(sender));
         Router::recompute_discovery_side_state(&mut route);
         let mut state = relay.state.lock();
         state.discovery_routes.insert(0, route);
@@ -373,10 +373,10 @@ mod queued_schema_identity_tests {
                 .announcers
                 .insert(
                     "SCHEMA_PEER".into(),
-                    DiscoverySenderState {
+                    Box::new(DiscoverySenderState {
                         advertised_address: Some(assigned),
                         ..DiscoverySenderState::default()
-                    },
+                    }),
                 );
         }
         relay.note_schema_received(side, "@addr:4660");
@@ -1060,7 +1060,7 @@ struct RelayTxItem {
 impl RelayTxItem {
     fn into_shared(self) -> TxQueued {
         TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item: RouterTxItem::ToSide {
                 src: self.src,
                 dst: self.dst,

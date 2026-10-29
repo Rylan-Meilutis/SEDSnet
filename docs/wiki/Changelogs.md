@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## Version 4.3.3 highlights
+
+Wire format and application identities remain compatible with 4.3.2.
+
+- Reduce contiguous peer-metadata allocations while preserving discovery and
+  clock identity handling and existing memory budgets.
+- Keep accepted reliable retries owned through side backpressure, including
+  partial child delivery and delayed receipts.
+- Add an optional hosted completion observer for retiring never-started
+  canonical retries after every frozen owner acknowledges, with explicit
+  transport-generation checks.
+- Add an explicit opt-in latest-value policy for one packed egress per router or
+  relay. Keep the newest pending best-effort sample for each source, type, and
+  endpoint flow before that egress encodes it, preserving its queue position.
+- Preserve local delivery and other egress traffic, reliable and managed data,
+  frozen contracts, protected control bands, and attempted or partial transport
+  owners. Keep existing queue budgets.
+- Defer fresh reports before encoding while that side has a refused or partial
+  owner, retaining attempted history under fair and priority queue pressure.
+- Gate the implementation and Rust/C setters behind the optional
+  `latest-value-egress` Cargo feature, omitted from default feature bundles;
+  CMake exports the matching C declaration macro when enabled.
+- Compile discovery-owned tracking helpers only with discovery, keeping minimal
+  `std` builds warning-free.
+
 ## Version 4.3.2 highlights
 
 Wire format and application identities remain compatible with 4.3.1.

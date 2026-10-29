@@ -236,7 +236,7 @@ impl Packet {
     /// - `Err(TelemetryError)` when the payload length or encoding does not
     ///   match the required shape.
     #[inline]
-    fn validate_payload_against_element(
+    pub(crate) fn validate_payload_against_element(
         element: MessageElement,
         payload: &[u8],
     ) -> TelemetryResult<()> {

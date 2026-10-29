@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "4.3.2"
+version = "4.3.3"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -27,6 +27,8 @@ discovery = []
 cryptography = []
 # Private handle-managed packet arena; leaves the application allocator unchanged.
 fair-admission = []
+# Opt-in canonical latest-value policy; omitted from all default bundles.
+latest-value-egress = []
 ingress-target-filter = []
 compact-packet-store = []
 compact-packet-compression = ["compact-packet-store", "compression", "zstd-safe/experimental"]

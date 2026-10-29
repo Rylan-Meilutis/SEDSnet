@@ -759,13 +759,24 @@ enum QueuedDelivery {
     ClaimedUnordered,
 }
 
+const TX_DISPOSABLE: u8 = 1;
+const TX_E2E_CHILD: u8 = 8;
+#[cfg(feature = "latest-value-egress")]
+const TX_LATEST_PENDING: u8 = 2;
+#[cfg(feature = "latest-value-egress")]
+const TX_HISTORY_OWNED: u8 = 4;
+#[cfg(feature = "latest-value-egress")]
+const TX_FRESH: u8 = TX_DISPOSABLE | TX_LATEST_PENDING;
+#[cfg(not(feature = "latest-value-egress"))]
+const TX_FRESH: u8 = TX_DISPOSABLE;
+
 /// Transmit queue item with flags.
 /// Holds a RouterTxItem and a flag to ignore local dispatch.
 /// Used internally by the Router transmit queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TxQueued {
     // Cached before queue parking; padding keeps the metadata footprint stable.
-    disposable: bool,
+    disposable: u8,
     item: RouterTxItem,
     ignore_local: bool,
     priority: u8,
@@ -779,7 +790,12 @@ struct TxQueued {
 struct TxClaim {
     token: u32,
     ordered: bool,
+    side_retry: bool,
 }
+const _: () = {
+    assert!(size_of::<TxClaim>() == size_of::<(u32, bool)>());
+    assert!(size_of::<Option<TxClaim>>() == size_of::<Option<(u32, bool)>>());
+};
 #[derive(Default)]
 struct DispatchContext {
     // Retain a denied queued replay's service band across side-owned retries.
@@ -803,6 +819,7 @@ impl DispatchContext {
     fn mark_terminal(&mut self) {
         self.completion_flags |= Self::TERMINAL;
     }
+    #[cfg(feature = "discovery")]
     fn mark_owner_transferred(&mut self) {
         self.completion_flags |= Self::OWNER_TRANSFERRED;
     }
@@ -887,6 +904,8 @@ struct ReliableSent {
 
 #[derive(Debug, Clone)]
 struct EndToEndReliableSent {
+    #[cfg(feature = "std")]
+    completion_epoch: u64,
     ordered_type: Option<u32>,
     waiting_for_predecessor: bool,
     data: RouterItem,
@@ -901,6 +920,7 @@ impl EndToEndReliableSent {
     // Keeping the retained packet inline makes each B-tree leaf several KiB.
     // Small independent records avoid that contiguous allocation on fragmented
     // embedded heaps. A failed record allocation remains retryable pressure.
+    #[cfg(feature = "discovery")]
     fn try_box(self) -> TelemetryResult<Box<Self>> {
         let layout = core::alloc::Layout::new::<Self>();
         // SAFETY: layout is nonzero and valid for Self. On failure self drops
@@ -962,7 +982,25 @@ struct DiscoverySideState {
     requested_network_variables: Vec<(DataType, u64)>,
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
-    announcers: BTreeMap<String, DiscoverySenderState>,
+    announcers: BTreeMap<String, Box<DiscoverySenderState>>,
+}
+
+#[cfg(feature = "discovery")]
+impl DiscoverySideState {
+    fn try_clone(&self) -> TelemetryResult<Self> {
+        // A refused new record leaves the authoritative route unchanged. Clone
+        // pointer values explicitly instead of adding infallible Box::clone
+        // allocations to the existing admitted snapshot path.
+        let announcers = crate::peer_record::try_clone_map(&self.announcers)?;
+        Ok(Self {
+            reachable: self.reachable.clone(),
+            reachable_network_variables: self.reachable_network_variables.clone(),
+            requested_network_variables: self.requested_network_variables.clone(),
+            reachable_timesync_sources: self.reachable_timesync_sources.clone(),
+            last_seen_ms: self.last_seen_ms,
+            announcers,
+        })
+    }
 }
 
 #[cfg(feature = "discovery")]
@@ -1587,6 +1625,12 @@ pub struct AddressBookEntry {
     pub last_seen_ms: u64,
 }
 
+#[cfg(feature = "discovery")]
+struct PreparedAddressRecords {
+    peer: Option<Box<AddressBookEntry>>,
+    local: Option<Box<AddressBookEntry>>,
+}
+
 pub struct P2pMessage<'a> {
     pub source_hostname: &'a str,
     pub source_address: NodeAddress,
@@ -2169,12 +2213,12 @@ struct RouterInner {
     side_transport: RouterMap<RouterSideId, Box<SideTransportState>>,
     local_services: Option<Box<LocalServicesState>>,
     local_address: AddressBookEntry,
-    address_book: BTreeMap<String, AddressBookEntry>,
+    address_book: BTreeMap<String, Box<AddressBookEntry>>,
     address_by_value: BTreeMap<NodeAddress, String>,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     tx_priority_burst: u8,
-    has_ordered_retry: bool,
+    tx_policy_flags: u8,
     ordered_claim_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
@@ -2415,13 +2459,15 @@ impl RouterInner {
             matches!(
                 item.delivery_state,
                 QueuedDelivery::ClaimedOrdered | QueuedDelivery::ClaimedUnordered
-            ) && item.deferred_since_ms == u64::from(token)
+            ) && if item.disposable & TX_E2E_CHILD != 0 {
+                matches!(&item.item, RouterTxItem::ToSide { src: Some(value), .. } if *value == token as usize)
+            } else { item.deferred_since_ms == u64::from(token) }
         })
     }
 
     #[inline(never)]
     fn refresh_retry_hint(&mut self) {
-        self.has_ordered_retry = self.transmit_queue.iter().any(|item| {
+        let pending = self.transmit_queue.iter().any(|item| {
             matches!(
                 item.delivery_state,
                 QueuedDelivery::ClaimedOrdered
@@ -2429,6 +2475,7 @@ impl RouterInner {
                     | QueuedDelivery::DeferredOrdered
             )
         });
+        self.tx_policy_flags = (self.tx_policy_flags & !1) | u8::from(pending);
     }
 
     fn cancel_accepted_type(&mut self, ty: u32) {
@@ -2479,6 +2526,13 @@ impl RouterInner {
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn tx_bulk_owner(item: &TxQueued) -> Option<u32> {
+        if item.disposable & TX_E2E_CHILD != 0 {
+            return None;
+        }
+        #[cfg(feature = "latest-value-egress")]
+        if item.disposable & TX_HISTORY_OWNED != 0 {
+            return None;
+        }
         match &item.item {
             RouterTxItem::Broadcast(data) | RouterTxItem::ToSide { data, .. } => {
                 Self::fair_bulk_owner(data, item.priority)
@@ -2630,7 +2684,7 @@ impl RouterInner {
                     .map(Self::topology_board_byte_cost)
                     .sum::<usize>(),
             )
-            .saturating_add(size_of::<DiscoverySenderState>())
+            .saturating_add(crate::peer_record::allocation_bytes::<DiscoverySenderState>())
     }
 
     #[cfg(feature = "discovery")]
@@ -2794,7 +2848,21 @@ impl RouterInner {
                 0usize
             }
         };
-        codec_bytes.saturating_add(
+        let completion_bytes = {
+            #[cfg(feature = "std")]
+            {
+                self.end_to_end_reliable_tx
+                    .values()
+                    .filter(|sent| sent.completion_epoch != 0)
+                    .count()
+                    * size_of::<u64>()
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                0usize
+            }
+        };
+        codec_bytes.saturating_add(completion_bytes).saturating_add(
             self.recent_rx
                 .max_bytes()
                 .saturating_add(self.reliable_rx_buffered_bytes())
@@ -2859,7 +2927,7 @@ impl RouterInner {
         queue
             .iter()
             .enumerate()
-            .filter(|(_, queued)| queued.disposable)
+            .filter(|(_, queued)| queued.disposable & TX_DISPOSABLE != 0)
             .min_by_key(|(index, queued)| (queued.priority, core::cmp::Reverse(*index)))
             .map(|(index, _)| index)
     }
@@ -2904,7 +2972,7 @@ impl RouterInner {
         let transmit = self
             .transmit_queue
             .iter()
-            .filter(|queued| queued.disposable)
+            .filter(|queued| queued.disposable & TX_DISPOSABLE != 0)
             .map(|queued| queued.priority)
             .min()
             .map(|priority| (RouterQueueKind::Transmit, priority));
@@ -3115,6 +3183,11 @@ impl RouterInner {
     }
 
     fn push_transmit(&mut self, mut item: TxQueued) -> TelemetryResult<()> {
+        let child = item.disposable & TX_E2E_CHILD != 0;
+        #[cfg(feature = "latest-value-egress")]
+        if item.disposable & TX_LATEST_PENDING != 0 && !self.latest_entry_eligible(&item) {
+            item.disposable &= !TX_LATEST_PENDING;
+        }
         #[cfg(feature = "compression")]
         match &mut item.item {
             RouterTxItem::Broadcast(data) => self.prepare_codec_queue_owner(None, data),
@@ -3156,11 +3229,35 @@ impl RouterInner {
             item.priority = priority;
             item.delivery_state = QueuedDelivery::OrderedTail;
         }
-        item.disposable = if item.delivery_state != QueuedDelivery::Untracked {
-            false
-        } else {
-            Self::classify_transmit_disposable(&item)
-        };
+        #[cfg(not(feature = "latest-value-egress"))]
+        {
+            item.disposable = if item.delivery_state != QueuedDelivery::Untracked {
+                0
+            } else {
+                u8::from(Self::classify_transmit_disposable(&item))
+            };
+        }
+        #[cfg(feature = "latest-value-egress")]
+        {
+            let history_owned = item.disposable & TX_HISTORY_OWNED != 0
+                || (item.retry_after_ms != 0
+                    && matches!(&item.item,
+                    RouterTxItem::ToSide { dst, .. } if self.latest_side() == Some(*dst)));
+            item.disposable = if history_owned {
+                TX_HISTORY_OWNED
+            } else if item.delivery_state != QueuedDelivery::Untracked {
+                0
+            } else {
+                u8::from(Self::classify_transmit_disposable(&item))
+                    | (item.disposable & TX_LATEST_PENDING)
+            };
+            if item.disposable & TX_LATEST_PENDING != 0 && self.replace_latest_pending(&mut item)? {
+                return Ok(());
+            }
+        }
+        if child {
+            item.disposable = (item.disposable & !TX_DISPOSABLE) | TX_E2E_CHILD;
+        }
         let ordered_retry = Self::ordered_original_type(&item).is_some()
             && item.delivery_state == QueuedDelivery::DeferredOrdered;
         let replay = item.item.replay_marker_key();
@@ -3277,7 +3374,7 @@ impl RouterInner {
             }
         };
         if result.is_ok() && ordered_retry {
-            self.has_ordered_retry = true;
+            self.tx_policy_flags |= 1;
         }
         if result.is_ok()
             && let Some(key) = replay
@@ -3426,6 +3523,8 @@ impl IsrRxQueue {
 /// Supports queuing, processing, and dispatching to local endpoint handlers.
 /// Thread-safe via internal locking.
 pub struct Router {
+    #[cfg(feature = "std")]
+    completion_observer: RouterMutex<Option<Arc<completion::ObserverRegistration>>>,
     sender: RouterMutex<Arc<str>>,
     cfg: ActiveRoutingConfig,
     state: RouterMutex<RouterInner>,
@@ -3473,7 +3572,7 @@ struct TimeSyncRuntime {
     tracker: Option<TimeSyncTracker>,
     clock: NetworkClock,
     disciplined_clock: SlewedNetworkClock,
-    remote_sources: BTreeMap<String, RemoteTimeSyncSource>,
+    remote_sources: BTreeMap<String, Box<RemoteTimeSyncSource>>,
     next_seq: u64,
     next_announce_mono_ms: u64,
     next_request_mono_ms: u64,
@@ -4400,13 +4499,15 @@ impl Router {
 
     #[cfg(feature = "discovery")]
     fn unique_hostname_locked(st: &RouterInner, base: &str, owner_hash: u64) -> String {
-        if !st.address_book.contains_key(base) {
+        if !st.address_book.contains_key(base) && st.local_address.hostname.as_ref() != base {
             return base.to_string();
         }
         let stem = if base.is_empty() { "node" } else { base };
         let mut candidate = format!("{stem}-{owner_hash:08x}");
         let mut suffix = 1u32;
-        while st.address_book.contains_key(&candidate) {
+        while st.address_book.contains_key(&candidate)
+            || st.local_address.hostname.as_ref() == candidate
+        {
             candidate = format!("{stem}-{owner_hash:08x}-{suffix}");
             suffix = suffix.saturating_add(1);
         }
@@ -4418,26 +4519,32 @@ impl Router {
         st: &mut RouterInner,
         mut local: AddressBookEntry,
         reason: AddressChangeReason,
-    ) -> AddressChange {
+        spare: Option<Box<AddressBookEntry>>,
+    ) -> TelemetryResult<AddressChange> {
         let old = st.local_address.clone();
-        st.address_book.remove(old.hostname.as_ref());
+        // Relays have no application identity record until explicitly configured
+        // or moved by a conflict. Reserve that storage before changing identity.
+        let mut record = match st.address_book.remove(old.hostname.as_ref()) {
+            Some(record) => record,
+            None => spare.ok_or(TelemetryError::Io("local identity changed"))?,
+        };
         st.address_by_value.remove(&old.address);
         local.last_seen_ms = self.clock.now_ms();
         st.address_by_value
             .insert(local.address, local.hostname.to_string());
-        st.address_book
-            .insert(local.hostname.to_string(), local.clone());
+        *record = local.clone();
+        st.address_book.insert(local.hostname.to_string(), record);
         st.local_address = local.clone();
         *self.sender.lock() = local.hostname.clone();
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(st, self.clock.now_ms());
-        AddressChange {
+        Ok(AddressChange {
             old_hostname: old.hostname,
             new_hostname: local.hostname,
             old_address: old.address,
             new_address: local.address,
             reason,
-        }
+        })
     }
 
     fn notify_address_change(&self, change: AddressChange) -> TelemetryResult<()> {
@@ -4473,12 +4580,12 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
-    fn ingest_address_advertisement(
-        &self,
-        ad: discovery::AddressAdvertisement,
-    ) -> TelemetryResult<bool> {
-        let now_ms = self.clock.now_ms();
-        let mut remote = AddressBookEntry {
+    fn prepare_address_record(
+        st: &RouterInner,
+        ad: &discovery::AddressAdvertisement,
+        now_ms: u64,
+    ) -> TelemetryResult<PreparedAddressRecords> {
+        let remote = AddressBookEntry {
             hostname: Arc::from(ad.hostname.as_str()),
             address: ad.address,
             requested_address: ad.requested_address,
@@ -4487,11 +4594,78 @@ impl Router {
             owner_hash: ad.owner_hash,
             last_seen_ms: now_ms,
         };
+        let peer = if st
+            .address_book
+            .get(ad.hostname.as_str())
+            .is_some_and(|entry| entry.owner_hash == ad.owner_hash)
+        {
+            None
+        } else {
+            Some(crate::peer_record::try_box(remote.clone())?)
+        };
+        let local = &st.local_address;
+        let moves_local = remote.owner_hash != local.owner_hash
+            && ((remote.hostname == local.hostname
+                && Self::identity_winner_pref(&remote) > Self::identity_winner_pref(local))
+                || (remote.address == local.address
+                    && Self::address_winner_pref(&remote) > Self::address_winner_pref(local)));
+        let spare = if moves_local && !st.address_book.contains_key(local.hostname.as_ref()) {
+            Some(crate::peer_record::try_box(local.clone())?)
+        } else {
+            None
+        };
+        Ok(PreparedAddressRecords { peer, local: spare })
+    }
+
+    #[cfg(all(feature = "discovery", test))]
+    fn ingest_address_advertisement(
+        &self,
+        ad: discovery::AddressAdvertisement,
+    ) -> TelemetryResult<bool> {
+        let prepared = Self::prepare_address_record(&self.state.lock(), &ad, self.clock.now_ms())?;
+        self.ingest_prepared_address(ad, prepared)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn ingest_prepared_address(
+        &self,
+        ad: discovery::AddressAdvertisement,
+        prepared: PreparedAddressRecords,
+    ) -> TelemetryResult<bool> {
+        let PreparedAddressRecords {
+            peer: mut fresh_peer,
+            local: mut local_spare,
+        } = prepared;
+        let now_ms = self.clock.now_ms();
+        let mut remote = match fresh_peer.as_ref() {
+            Some(record) => record.as_ref().clone(),
+            None => AddressBookEntry {
+                hostname: Arc::from(ad.hostname.as_str()),
+                address: ad.address,
+                requested_address: ad.requested_address,
+                mode: Self::address_mode_from_code(ad.mode, ad.requested_address),
+                birth_ms: ad.birth_ms,
+                owner_hash: ad.owner_hash,
+                last_seen_ms: now_ms,
+            },
+        };
+        remote.last_seen_ms = now_ms;
         let mut change = None;
         let mut changed = false;
         {
             let mut st = self.state.lock();
             let local = st.local_address.clone();
+            // Cold storage was reserved before publishing this packet's route.
+            // A concurrent identity change must retry instead of allocating
+            // after route commit or reusing another owner's identity record.
+            if fresh_peer.is_none()
+                && !st
+                    .address_book
+                    .get(remote.hostname.as_ref())
+                    .is_some_and(|entry| entry.owner_hash == remote.owner_hash)
+            {
+                return Err(TelemetryError::Io("peer identity changed"));
+            }
             let hostname_conflict =
                 remote.hostname == local.hostname && remote.owner_hash != local.owner_hash;
             let address_conflict =
@@ -4510,7 +4684,8 @@ impl Router {
                     &mut st,
                     next,
                     AddressChangeReason::HostnameConflict,
-                ));
+                    local_spare.take(),
+                )?);
                 changed = true;
             } else if address_conflict
                 && Self::address_winner_pref(&remote) > Self::address_winner_pref(&local)
@@ -4525,7 +4700,12 @@ impl Router {
                     AddressAssignmentMode::Requested(_) => AddressChangeReason::RequestedConflict,
                     AddressAssignmentMode::Dynamic => AddressChangeReason::DynamicConflict,
                 };
-                change = Some(self.update_local_identity_locked(&mut st, next, reason));
+                change = Some(self.update_local_identity_locked(
+                    &mut st,
+                    next,
+                    reason,
+                    local_spare.take(),
+                )?);
                 changed = true;
             } else if hostname_conflict {
                 remote.hostname = Arc::from(Self::unique_hostname_locked(
@@ -4544,12 +4724,16 @@ impl Router {
                 changed = true;
             }
 
-            st.address_book.remove(remote.hostname.as_ref());
+            let mut record = fresh_peer.take().unwrap_or_else(|| {
+                st.address_book
+                    .remove(ad.hostname.as_str())
+                    .expect("known peer remains present")
+            });
+            *record = remote.clone();
             st.address_by_value.remove(&remote.address);
             st.address_by_value
                 .insert(remote.address, remote.hostname.to_string());
-            st.address_book
-                .insert(remote.hostname.to_string(), remote.clone());
+            st.address_book.insert(remote.hostname.to_string(), record);
         }
         if let Some(change) = change {
             self.notify_address_change(change)?;
@@ -4842,19 +5026,19 @@ impl Router {
                     });
                     local_id
                 };
-                let dst =
-                    st.address_book
-                        .get(msg.source_hostname)
-                        .cloned()
-                        .unwrap_or(AddressBookEntry {
-                            hostname: peer_hostname,
-                            address: msg.source_address,
-                            requested_address: msg.source_address,
-                            mode: AddressAssignmentMode::Dynamic,
-                            birth_ms: self.clock.now_ms(),
-                            owner_hash: Self::sender_hash(msg.source_hostname),
-                            last_seen_ms: self.clock.now_ms(),
-                        });
+                let dst = st
+                    .address_book
+                    .get(msg.source_hostname)
+                    .map(|entry| entry.as_ref().clone())
+                    .unwrap_or(AddressBookEntry {
+                        hostname: peer_hostname,
+                        address: msg.source_address,
+                        requested_address: msg.source_address,
+                        mode: AddressAssignmentMode::Dynamic,
+                        birth_ms: self.clock.now_ms(),
+                        owner_hash: Self::sender_hash(msg.source_hostname),
+                        last_seen_ms: self.clock.now_ms(),
+                    });
                 let payload = Self::encode_p2p_stream_payload(
                     P2P_STREAM_SYN | P2P_STREAM_ACK,
                     local_id,
@@ -5682,6 +5866,12 @@ impl Router {
         destinations: Option<BTreeMap<u64, RouterSideId>>,
     ) -> TelemetryResult<bool> {
         let packet_id = Self::get_hash(data);
+        #[cfg(feature = "std")]
+        let completion_epoch = self
+            .completion_observer
+            .lock()
+            .as_ref()
+            .map_or(0, |observer| observer.epoch);
         let now_ms = self.clock.now_ms();
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
@@ -5721,6 +5911,15 @@ impl Router {
         if st.end_to_end_reliable_tx.len() >= runtime_reliable_max_end_to_end_pending().max(1) {
             return Err(TelemetryError::Io("reliable window full"));
         }
+        #[cfg(feature = "std")]
+        if completion_epoch != 0
+            && st
+                .shared_queue_bytes_used()
+                .saturating_add(size_of::<u64>())
+                > st.memory.max_queue_budget
+        {
+            return Err(TelemetryError::Io("memory pressure"));
+        }
         let ordered_type =
             matches!(reliable_mode(ty), crate::ReliableMode::Ordered).then_some(ty.as_u32());
         let waiting_for_predecessor = ordered_type.is_some()
@@ -5754,6 +5953,8 @@ impl Router {
         #[cfg(feature = "compact-packet-store")]
         retained.park_for_queue()?;
         let sent = EndToEndReliableSent {
+            #[cfg(feature = "std")]
+            completion_epoch,
             ordered_type,
             waiting_for_predecessor,
             data: retained,
@@ -6107,7 +6308,6 @@ impl Router {
                     sent.pending_destinations
                 );
             }
-            sent.queued = false;
             sent.last_send_ms = self.clock.now_ms();
             let data = sent.data.clone();
             let tracked_destinations = sent.tracked_destinations;
@@ -6246,7 +6446,7 @@ impl Router {
         let RemoteSidePlan::Target(sides) = plan;
         for idx in sides {
             st.push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_FRESH,
                 item: RouterTxItem::ToSide {
                     src: exclude,
                     dst: idx,
@@ -6279,6 +6479,10 @@ impl Router {
         };
         let RemoteSidePlan::Target(sides) = self.remote_side_plan(&data, src)?;
         for side in sides {
+            #[cfg(feature = "latest-value-egress")]
+            if self.queue_latest_egress(side, src, &data)? {
+                continue;
+            }
             self.tx_item_impl(
                 RouterTxItem::ToSide {
                     src,
@@ -7576,7 +7780,9 @@ impl Router {
         };
         Self::refresh_sender_topology_state(&mut sender);
         let mut route = DiscoverySideState::default();
-        route.announcers.insert("bridge".to_string(), sender);
+        route
+            .announcers
+            .insert("bridge".to_string(), Box::new(sender));
         Self::recompute_discovery_side_state(&mut route);
         self.state.lock().discovery_routes.insert(0, route);
     }
@@ -8521,7 +8727,7 @@ impl Router {
             return Err(TelemetryError::Io("schema prefix cancelled"));
         }
         st.push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item,
             ignore_local,
             priority,
@@ -8760,7 +8966,7 @@ impl Router {
             throttle.schema_response_packet_id = packet_id;
             throttle.schema_response_phase = SchemaResponsePhase::Owned;
             st.push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_DISPOSABLE,
                 item,
                 ignore_local: true,
                 priority,
@@ -9093,7 +9299,7 @@ impl Router {
                         shallow.buffer(value.reachable_network_variables.len().saturating_mul(4));
                     }
                     let entry = core::mem::size_of::<String>()
-                        + core::mem::size_of::<DiscoverySenderState>();
+                        + crate::peer_record::allocation_bytes::<DiscoverySenderState>();
                     shallow.bytes = shallow
                         .bytes
                         .saturating_add(route.announcers.len().saturating_mul(entry));
@@ -9218,13 +9424,20 @@ impl Router {
             if !side_link_local_enabled {
                 ad.reachable_endpoints.retain(|ep| !ep.is_link_local_only());
             }
-            let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+            let mut route = st
+                .discovery_routes
+                .get(&side)
+                .map(DiscoverySideState::try_clone)
+                .transpose()?
+                .unwrap_or_default();
             let previously_reachable_network_variables = route.reachable_network_variables.clone();
             if pkt.sender() != sender_id {
                 route.announcers.remove(pkt.sender());
             }
-            let mut sender_state =
-                core::mem::take(route.announcers.entry(sender_id.to_string()).or_default());
+            let mut sender_state = match route.announcers.remove(sender_id) {
+                Some(record) => record,
+                None => crate::peer_record::try_box(DiscoverySenderState::default())?,
+            };
             // DiscoveryAddress is a compact route summary. A multi-sided
             // router advertises endpoints reachable *through* it, so these
             // entries must not be attached to the announcer's topology node:
@@ -9260,6 +9473,7 @@ impl Router {
                 .copied()
                 .filter(|ty| !previously_reachable_network_variables.contains(ty))
                 .collect();
+            let prepared_address = Self::prepare_address_record(&st, &identity, now_ms)?;
             st.commit_discovery_route(side, route)?;
             self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
             if changed {
@@ -9282,7 +9496,7 @@ impl Router {
                 })
                 .collect();
             drop(st);
-            self.ingest_address_advertisement(identity)?;
+            self.ingest_prepared_address(identity, prepared_address)?;
             #[cfg(feature = "compression")]
             self.note_payload_codec_packet(side, pkt, true);
             for value in replay {
@@ -9362,7 +9576,12 @@ impl Router {
                 });
                 let newly_reachable = existing.is_none();
                 if newly_reachable {
-                    let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+                    let mut route = st
+                        .discovery_routes
+                        .get(&side)
+                        .map(DiscoverySideState::try_clone)
+                        .transpose()?
+                        .unwrap_or_default();
                     route.requested_network_variables.push((ty, now_ms));
                     Self::recompute_discovery_side_state(&mut route);
                     st.commit_discovery_route(side, route)?;
@@ -9440,7 +9659,11 @@ impl Router {
         let now_ms = self.clock.now_ms();
         if pkt.data_type() == DataType::DiscoveryLeave {
             let leaving = packet_sender.as_str();
-            let before = st.discovery_routes.clone();
+            let before = st
+                .discovery_routes
+                .iter()
+                .map(|(side, route)| Ok((*side, route.try_clone()?)))
+                .collect::<TelemetryResult<RouterMap<_, _>>>()?;
             for route in st.discovery_routes.values_mut() {
                 route.announcers.remove(leaving);
                 for sender_state in route.announcers.values_mut() {
@@ -9475,7 +9698,12 @@ impl Router {
                 }
             }
         }
-        let mut route = st.discovery_routes.get(&side).cloned().unwrap_or_default();
+        let mut route = st
+            .discovery_routes
+            .get(&side)
+            .map(DiscoverySideState::try_clone)
+            .transpose()?
+            .unwrap_or_default();
         let alias_state = if packet_sender != pkt.sender() {
             route.announcers.remove(pkt.sender())
         } else {
@@ -9487,12 +9715,10 @@ impl Router {
             .and_then(|entry| entry.as_ref())
             .map(|side_ref| side_ref.opts.link_local_enabled)
             .unwrap_or(false);
-        let mut sender_state = route
-            .announcers
-            .get_mut(&packet_sender)
-            .map(core::mem::take)
-            .or(alias_state)
-            .unwrap_or_default();
+        let mut sender_state = match route.announcers.remove(&packet_sender).or(alias_state) {
+            Some(record) => record,
+            None => crate::peer_record::try_box(DiscoverySenderState::default())?,
+        };
         let changed = match pkt.data_type() {
             DataType::DiscoveryAnnounce => {
                 let mut reachable = announce.take().expect("decoded above");
@@ -11864,8 +12090,19 @@ impl Router {
             }
             // Retain walks the bounded pending map in place. A queue pass
             // before any retry deadline must not allocate a list of keys.
-            st.end_to_end_reliable_tx.retain(|&packet_id, sent| {
-                if sent.waiting_for_predecessor
+            let RouterInner {
+                transmit_queue,
+                end_to_end_reliable_tx,
+                ..
+            } = &mut *st;
+            end_to_end_reliable_tx.retain(|&packet_id, sent| {
+                let covered = !sent.pending_destinations.is_empty()
+                    && sent
+                        .pending_destinations
+                        .values()
+                        .all(|side| Self::e2e_child_owned(transmit_queue, *side, packet_id));
+                if covered
+                    || sent.waiting_for_predecessor
                     || sent.queued
                     || now.wrapping_sub(sent.last_send_ms) < runtime_reliable_retransmit_ms()
                 {
@@ -11970,141 +12207,124 @@ impl Router {
             .as_ref()
             .expect("local time service enabled")
             .lock();
-        st.clock
-            .update_source(source, priority, time, now_ms, now_ns, ttl_ms);
+        if st
+            .clock
+            .try_update_source(source, priority, time, now_ms, now_ns, ttl_ms)
+            .is_err()
+        {
+            return;
+        }
         if let Some(unix_ms) = time.to_network_time().and_then(|t| t.as_unix_ms()) {
             st.disciplined_clock.steer_unix_ms(now_ns, unix_ms);
         }
     }
 
     #[cfg(feature = "timesync")]
-    fn set_network_time_source_impl(
-        &self,
-        source: &str,
-        priority: u64,
-        time: PartialNetworkTime,
-        ttl_ms: Option<u64>,
-    ) {
-        if self.timesync.is_none() {
-            return;
-        }
-
-        let observed_mono_ms = self.monotonic_now_ms();
-        let observed_mono_ns = self.monotonic_now_ns();
-        let mut st = self
-            .timesync
-            .as_ref()
-            .expect("local time service enabled")
-            .lock();
-        let commit_mono_ms = self.monotonic_now_ms();
-        let commit_mono_ns = self.monotonic_now_ns();
-        let adjusted = if let Some(base) = time.to_network_time() {
-            let elapsed_ns = commit_mono_ns.saturating_sub(observed_mono_ns);
-            advance_network_time(base, elapsed_ns)
-                .map(PartialNetworkTime::from)
-                .unwrap_or(time)
-        } else {
-            time
-        };
-        let adjusted_mono_ms =
-            observed_mono_ms.saturating_add(commit_mono_ms.saturating_sub(observed_mono_ms));
-        st.clock.update_source(
-            source,
-            priority,
-            adjusted,
-            commit_mono_ms.max(adjusted_mono_ms),
-            commit_mono_ns,
-            ttl_ms,
-        );
-        if let Some(unix_ms) = adjusted.to_network_time().and_then(|t| t.as_unix_ms()) {
-            st.disciplined_clock.steer_unix_ms(commit_mono_ns, unix_ms);
-        }
-    }
-
-    #[cfg(feature = "timesync")]
-    fn local_network_time_priority(&self) -> u64 {
-        if self.timesync.is_none() {
-            return 0;
-        }
-
-        let st = self
-            .timesync
-            .as_ref()
-            .expect("local time service enabled")
-            .lock();
-        st.cfg.map(|cfg| cfg.priority).unwrap_or(0)
-    }
-
-    #[cfg(feature = "timesync")]
-    /// Sets the local node's network time using any combination of date, time, and sub-second fields.
+    /// Sets local time, preserving the previous reading if storage is refused.
+    /// Use `try_set_local_network_time` when the caller needs refusal status.
     pub fn set_local_network_time(&self, time: PartialNetworkTime) {
-        if self.timesync.is_none() {
-            return;
-        }
+        let _ = self.try_set_local_network_time(time);
+    }
 
-        let priority = self.local_network_time_priority();
+    #[cfg(feature = "timesync")]
+    /// Transactionally sets any combination of local date/time fragments.
+    /// New record/key allocation failure preserves all prior clock sources.
+    pub fn try_set_local_network_time(&self, time: PartialNetworkTime) -> TelemetryResult<()> {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return Ok(());
+        };
+        let observed_ns = self.monotonic_now_ns();
+        let mut st = runtime.lock();
+        let now_ms = self.monotonic_now_ms();
+        let now_ns = self.monotonic_now_ns();
+        let priority = st.cfg.map(|cfg| cfg.priority).unwrap_or(0);
+        // A complete epoch sample can be advanced to the commit instant.
+        // Partial fields keep the observation anchor below so their eventual
+        // assembled reading also includes time spent waiting for this lock.
+        let time = time
+            .to_network_time()
+            .and_then(|base| advance_network_time(base, now_ns.saturating_sub(observed_ns)))
+            .map(PartialNetworkTime::from)
+            .unwrap_or(time);
         if time.is_complete_date() && time.is_complete_time() {
-            self.set_network_time_source_impl(LOCAL_TIMESYNC_FULL_SOURCE_ID, priority, time, None);
-            let mut st = self
-                .timesync
-                .as_ref()
-                .expect("local time service enabled")
-                .lock();
+            let adjusted = time;
+            let update = st.clock.prepare_source(
+                LOCAL_TIMESYNC_FULL_SOURCE_ID,
+                priority,
+                adjusted,
+                now_ms,
+                now_ns,
+                None,
+            )?;
+            st.clock.commit_source(update);
             st.clock.remove_source(LOCAL_TIMESYNC_DATE_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_TOD_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_SUBSEC_SOURCE_ID);
-            return;
-        }
-
-        {
-            let mut st = self
-                .timesync
-                .as_ref()
-                .expect("local time service enabled")
-                .lock();
+            if let Some(unix_ms) = adjusted
+                .to_network_time()
+                .and_then(|time| time.as_unix_ms())
+            {
+                st.disciplined_clock.steer_unix_ms(now_ns, unix_ms);
+            }
+        } else {
+            // Prepare every allocation first. In particular, do not erase an
+            // old full-date source before a replacement fragment can be saved.
+            let date = if time.year.is_some() || time.month.is_some() || time.day.is_some() {
+                Some(st.clock.prepare_source(
+                    LOCAL_TIMESYNC_DATE_SOURCE_ID,
+                    priority,
+                    PartialNetworkTime {
+                        year: time.year,
+                        month: time.month,
+                        day: time.day,
+                        ..Default::default()
+                    },
+                    now_ms,
+                    observed_ns,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            let tod = if time.hour.is_some() || time.minute.is_some() || time.second.is_some() {
+                Some(st.clock.prepare_source(
+                    LOCAL_TIMESYNC_TOD_SOURCE_ID,
+                    priority,
+                    PartialNetworkTime {
+                        hour: time.hour,
+                        minute: time.minute,
+                        second: time.second,
+                        nanosecond: time.nanosecond,
+                        ..Default::default()
+                    },
+                    now_ms,
+                    observed_ns,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            let subsec = if time.nanosecond.is_some() {
+                Some(st.clock.prepare_source(
+                    LOCAL_TIMESYNC_SUBSEC_SOURCE_ID,
+                    priority,
+                    PartialNetworkTime {
+                        nanosecond: time.nanosecond,
+                        ..Default::default()
+                    },
+                    now_ms,
+                    observed_ns,
+                    None,
+                )?)
+            } else {
+                None
+            };
             st.clock.remove_source(LOCAL_TIMESYNC_FULL_SOURCE_ID);
+            for update in [date, tod, subsec].into_iter().flatten() {
+                st.clock.commit_source(update);
+            }
         }
-
-        if time.year.is_some() || time.month.is_some() || time.day.is_some() {
-            self.set_network_time_source_impl(
-                LOCAL_TIMESYNC_DATE_SOURCE_ID,
-                priority,
-                PartialNetworkTime {
-                    year: time.year,
-                    month: time.month,
-                    day: time.day,
-                    ..Default::default()
-                },
-                None,
-            );
-        }
-
-        if time.hour.is_some() || time.minute.is_some() || time.second.is_some() {
-            self.set_network_time_source_impl(
-                LOCAL_TIMESYNC_TOD_SOURCE_ID,
-                priority,
-                PartialNetworkTime {
-                    hour: time.hour,
-                    minute: time.minute,
-                    second: time.second,
-                    nanosecond: time.nanosecond,
-                    ..Default::default()
-                },
-                None,
-            );
-        }
-
-        if time.nanosecond.is_some() {
-            self.set_network_time_source_impl(
-                LOCAL_TIMESYNC_SUBSEC_SOURCE_ID,
-                priority,
-                PartialNetworkTime {
-                    nanosecond: time.nanosecond,
-                    ..Default::default()
-                },
-                None,
-            );
-        }
+        Ok(())
     }
 
     #[cfg(feature = "timesync")]
@@ -12523,30 +12743,39 @@ impl Router {
             match pkt.data_type() {
                 DataType::TimeSyncAnnounce => {
                     let ann = decode_timesync_announce(pkt)?;
-                    let should_steer = {
-                        let tracker = st.tracker.as_mut().expect("tracker checked above");
-                        let _ = tracker.handle_announce(pkt, now_mono_ms)?;
-                        matches!(
-                            tracker.leader(now_mono_ms, has_usable_time),
-                            Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pkt.sender()
-                        )
-                    };
-                    st.remote_sources.insert(
-                        pkt.sender().to_owned(),
+                    // Stage all three new records/keys before changing leader,
+                    // sample cache or current time. A refused allocation drops
+                    // only this update, preserving every prior source.
+                    let tracker_update = st
+                        .tracker
+                        .as_ref()
+                        .expect("tracker checked above")
+                        .prepare_source(pkt.sender(), ann, now_mono_ms)?;
+                    let remote_update = crate::peer_record::prepare(
+                        &st.remote_sources,
+                        pkt.sender(),
                         RemoteTimeSyncSource {
                             priority: ann.priority,
                             last_sample_mono_ms: now_mono_ms,
                             sample_unix_ms: ann.time_ms,
                         },
-                    );
-                    st.clock.update_source(
+                    )?;
+                    let clock_update = st.clock.prepare_source(
                         pkt.sender(),
                         ann.priority,
                         PartialNetworkTime::from_unix_ms(ann.time_ms),
                         now_mono_ms,
                         now_mono_ns,
                         Some(cfg.source_timeout_ms),
-                    );
+                    )?;
+                    remote_update.commit(&mut st.remote_sources);
+                    st.clock.commit_source(clock_update);
+                    let should_steer = {
+                        let tracker = st.tracker.as_mut().expect("tracker checked above");
+                        tracker.commit_source(tracker_update);
+                        matches!(tracker.leader(now_mono_ms, has_usable_time),
+                            Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pkt.sender())
+                    };
                     if should_steer {
                         st.disciplined_clock.steer_unix_ms(now_mono_ns, ann.time_ms);
                     }
@@ -12594,22 +12823,25 @@ impl Router {
                             resp.t3_ms,
                             now_mono_ms,
                         );
-                        st.remote_sources.insert(
-                            pkt.sender().to_owned(),
+                        let remote_update = crate::peer_record::prepare(
+                            &st.remote_sources,
+                            pkt.sender(),
                             RemoteTimeSyncSource {
                                 priority: source_priority,
                                 last_sample_mono_ms: now_mono_ms,
                                 sample_unix_ms: estimate_ms,
                             },
-                        );
-                        st.clock.update_source(
+                        )?;
+                        let clock_update = st.clock.prepare_source(
                             pkt.sender(),
                             source_priority,
                             PartialNetworkTime::from_unix_ms(estimate_ms),
                             now_mono_ms,
                             now_mono_ns,
                             Some(cfg.source_timeout_ms),
-                        );
+                        )?;
+                        remote_update.commit(&mut st.remote_sources);
+                        st.clock.commit_source(clock_update);
                         st.disciplined_clock.steer_unix_ms(now_mono_ns, estimate_ms);
                         st.pending_request = None;
                     }
@@ -12667,13 +12899,15 @@ impl Router {
         };
         let mut address_book = BTreeMap::new();
         if local_services_enabled {
-            address_book.insert(hostname.to_string(), local_address.clone());
+            address_book.insert(hostname.to_string(), Box::new(local_address.clone()));
         }
         let mut address_by_value = BTreeMap::new();
         if local_services_enabled {
             address_by_value.insert(address, hostname.to_string());
         }
         Self {
+            #[cfg(feature = "std")]
+            completion_observer: RouterMutex::new(None),
             sender: RouterMutex::new(hostname),
             cfg: ActiveRoutingConfig::new(cfg),
             state: RouterMutex::new(RouterInner {
@@ -12716,7 +12950,7 @@ impl Router {
                     memory.queue_grow_step,
                 ),
                 tx_priority_burst: 0,
-                has_ordered_retry: false,
+                tx_policy_flags: 0,
                 ordered_claim_seq: 0,
                 rx_priority_burst: 0,
                 recent_rx: BoundedDeque::new(
@@ -12815,7 +13049,12 @@ impl Router {
     }
 
     pub fn address_book(&self) -> Vec<AddressBookEntry> {
-        self.state.lock().address_book.values().cloned().collect()
+        self.state
+            .lock()
+            .address_book
+            .values()
+            .map(|entry| entry.as_ref().clone())
+            .collect()
     }
 
     pub fn resolve_hostname(&self, hostname: &str) -> Option<AddressBookEntry> {
@@ -12827,7 +13066,7 @@ impl Router {
             Self::note_discovery_topology_change_locked(&mut st, now_ms);
         }
         if let Some(entry) = st.address_book.get(hostname) {
-            return Some(entry.clone());
+            return Some(entry.as_ref().clone());
         }
         // Address advertisements are link-local, but topology names cross
         // routers. Mirror resolve_address's topology-only identity support so
@@ -12855,14 +13094,14 @@ impl Router {
             .address_by_value
             .get(&address)
             .and_then(|hostname| st.address_book.get(hostname))
-            .cloned();
+            .map(|entry| entry.as_ref().clone());
         if direct.is_some() {
             return direct;
         }
 
         let hostname = Self::hostname_for_address_locked(&st, address)?;
         if let Some(entry) = st.address_book.get(&hostname) {
-            return Some(entry.clone());
+            return Some(entry.as_ref().clone());
         }
 
         // A topology-only remote has no DHCP-style address record on this
@@ -13091,7 +13330,7 @@ impl Router {
             let dst = st
                 .address_book
                 .get(peer_hostname.as_ref())
-                .cloned()
+                .map(|entry| entry.as_ref().clone())
                 .unwrap_or(AddressBookEntry {
                     hostname: peer_hostname.clone(),
                     address: peer_address,
@@ -13151,8 +13390,14 @@ impl Router {
             local.address = Self::fallback_address_for_hostname(hostname.as_ref());
             local.requested_address = 0;
         }
-        let change =
-            self.update_local_identity_locked(&mut st, local, AddressChangeReason::Configured);
+        let Ok(change) = self.update_local_identity_locked(
+            &mut st,
+            local,
+            AddressChangeReason::Configured,
+            None,
+        ) else {
+            return;
+        };
         drop(st);
         let _ = self.notify_address_change(change);
     }
@@ -13177,8 +13422,24 @@ impl Router {
                 }
             }
         };
-        let change =
-            self.update_local_identity_locked(&mut st, local, AddressChangeReason::Configured);
+        let spare = if st
+            .address_book
+            .contains_key(st.local_address.hostname.as_ref())
+        {
+            None
+        } else {
+            #[cfg(any(feature = "discovery", feature = "timesync"))]
+            let record = crate::peer_record::try_box(st.local_address.clone())?;
+            #[cfg(not(any(feature = "discovery", feature = "timesync")))]
+            let record = Box::new(st.local_address.clone());
+            Some(record)
+        };
+        let change = self.update_local_identity_locked(
+            &mut st,
+            local,
+            AddressChangeReason::Configured,
+            spare,
+        )?;
         drop(st);
         self.notify_address_change(change.clone())?;
         Ok(change)
@@ -13374,6 +13635,10 @@ impl Router {
                 return Err(TelemetryError::BadArg);
             }
             *slot = None;
+            #[cfg(feature = "latest-value-egress")]
+            if st.latest_side() == Some(side) {
+                st.tx_policy_flags &= 1;
+            }
             while st.sides.last().is_some_and(Option::is_none) {
                 st.sides.pop();
             }
@@ -13422,10 +13687,33 @@ impl Router {
         Ok(())
     }
 
+    /// Opt one packed egress into newest-pending best-effort reports (default disabled).
+    /// Local delivery and other sides are unchanged. Only never-attempted plaintext,
+    /// non-contract, non-managed, unreliable data below priority200 may be replaced.
+    /// One side per router, IDs0..126; None disables. Older source timestamps cannot
+    /// replace newer pending values. Already attempted/partial owners always finish.
+    #[cfg(feature = "latest-value-egress")]
+    pub fn set_latest_value_side(&self, side: Option<RouterSideId>) -> TelemetryResult<()> {
+        let mut st = self.state.lock();
+        let encoded = if let Some(side) = side {
+            if side >= 127 {
+                return Err(TelemetryError::BadArg);
+            }
+            let entry = Self::side_ref(&st, side).map_err(|_| TelemetryError::BadArg)?;
+            if matches!(entry.tx_handler, RouterTxHandlerFn::Packet(_)) {
+                return Err(TelemetryError::BadArg);
+            }
+            ((side as u8) + 1) << 1
+        } else {
+            0
+        };
+        st.tx_policy_flags = (st.tx_policy_flags & 1) | encoded;
+        Ok(())
+    }
+
     /// Enable or disable ingress processing for a registered side.
     ///
-    /// When `enabled` is `false`, packets tagged as arriving from `side` are rejected before local
-    /// delivery, discovery learning, or forwarding.
+    /// When disabled, ingress is rejected before local delivery, discovery learning, or forwarding.
     pub fn set_side_ingress_enabled(
         &self,
         side: RouterSideId,
@@ -14950,7 +15238,7 @@ impl Router {
                 response.schema_response_pending = true;
             }
         }
-        st.has_ordered_retry = false;
+        st.tx_policy_flags &= !1;
         st.received_queue.clear();
         st.rx_priority_burst = 0;
         drop(st);
@@ -14982,7 +15270,7 @@ impl Router {
             }
         }
         st.tx_priority_burst = 0;
-        st.has_ordered_retry = false;
+        st.tx_policy_flags &= !1;
     }
 
     #[inline(never)]
@@ -14991,13 +15279,15 @@ impl Router {
         now_ms: u64,
         control_only: bool,
     ) -> Option<TxWork> {
-        let slow = st.has_ordered_retry;
+        let slow = st.tx_policy_flags & 1 != 0;
         let mut next_token = st.ordered_claim_seq.wrapping_add(1).max(1);
         if slow {
             while st.claim_index(next_token).is_some() {
                 next_token = next_token.wrapping_add(1).max(1);
             }
         }
+        #[cfg(feature = "latest-value-egress")]
+        let latest_blocked = st.latest_blocked_side();
         let (selected, owed_turn) = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
@@ -15010,12 +15300,42 @@ impl Router {
                         | QueuedDelivery::OrderedTail
                 ) && item.retry_after_ms <= now_ms
                     && (!control_only || item.priority >= 200)
+                    && {
+                        #[cfg(feature = "latest-value-egress")]
+                        {
+                            !(item.disposable & TX_LATEST_PENDING != 0
+                                && matches!(&item.item,
+                            RouterTxItem::ToSide { dst, .. } if latest_blocked == Some(*dst)))
+                        }
+                        #[cfg(not(feature = "latest-value-egress"))]
+                        {
+                            true
+                        }
+                    }
             },
         )?;
         let current = st.transmit_queue.get(selected)?;
         let reliable = RouterInner::reliable_original_type(current).is_some();
         let ordered = reliable && RouterInner::ordered_original_type(current).is_some();
-        let (queued, claim) = if reliable {
+        let child = current.disposable & TX_E2E_CHILD != 0;
+        let (queued, claim) = if child {
+            let queued = current.clone();
+            st.transmit_queue.update_metadata(selected, |item| {
+                item.delivery_state = QueuedDelivery::ClaimedUnordered;
+                if let RouterTxItem::ToSide { src, .. } = &mut item.item {
+                    *src = Some(next_token as usize);
+                }
+            });
+            st.ordered_claim_seq = next_token;
+            (
+                queued,
+                Some(TxClaim {
+                    token: next_token,
+                    ordered: false,
+                    side_retry: true,
+                }),
+            )
+        } else if reliable {
             let queued = current.clone();
             st.transmit_queue.update_metadata(selected, |item| {
                 item.delivery_state = if ordered {
@@ -15031,16 +15351,27 @@ impl Router {
                 Some(TxClaim {
                     token: next_token,
                     ordered,
+                    side_retry: false,
                 }),
             )
         } else {
             (st.transmit_queue.remove_pos(selected)?, None)
         };
         if claim.is_some() {
-            st.has_ordered_retry = true;
+            st.tx_policy_flags |= 1;
         } else if slow {
             st.refresh_retry_hint();
         }
+        // Selecting work transfers it to encoding/transport ownership. Even a
+        // refused first callback may have advanced codec history. Never coalesce it.
+        #[cfg(feature = "latest-value-egress")]
+        let queued = {
+            let mut selected = queued;
+            if selected.disposable & TX_LATEST_PENDING != 0 {
+                selected.disposable = TX_HISTORY_OWNED;
+            }
+            selected
+        };
         Some(TxWork {
             queued,
             claim,
@@ -15302,7 +15633,7 @@ impl Router {
             reservation.release_locked(&mut state);
         }
         let result = state.push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item,
             ignore_local,
             priority,
@@ -15367,6 +15698,7 @@ impl Router {
     fn dispatch_queued_item(&self, work: TxWork) -> TelemetryResult<()> {
         let owed_turn = work.owed_turn;
         let queued = work.queued;
+        let parent = (queued.disposable & TX_E2E_CHILD != 0).then_some(queued.deferred_since_ms);
         let since = matches!(
             queued.delivery_state,
             QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
@@ -15380,14 +15712,38 @@ impl Router {
             refused: false,
             admitted: false,
         };
-        let schema = self.claim_schema_is_current(DataType(queued.accepted_type), work.claim);
+        let schema = if work.claim.is_some_and(|claim| claim.side_retry) {
+            Ok(true)
+        } else {
+            self.claim_schema_is_current(DataType(queued.accepted_type), work.claim)
+        };
         if !matches!(schema, Ok(true)) {
             self.finish_dispatch_turn(owed_turn, &context);
             return schema.map(|_| ());
         }
+        let mut child_unwind = work.claim.filter(|claim| claim.side_retry).map(|claim| {
+            e2e_backpressure::ChildUnwind {
+                router: self,
+                claim,
+                armed: true,
+            }
+        });
         let mut result =
             self.tx_item_impl_with_retry(queued.item, queued.ignore_local, true, &mut context);
         if let Some(claim) = work.claim {
+            if claim.side_retry {
+                self.finish_e2e_child_claim(
+                    claim,
+                    parent.expect("child parent"),
+                    &context,
+                    result.is_ok(),
+                )?;
+                if let Some(guard) = &mut child_unwind {
+                    guard.armed = false;
+                }
+                self.finish_dispatch_turn(owed_turn, &context);
+                return result;
+            }
             let mut st = self.state.lock();
             if result.is_err() && !context.is_terminal() && !context.owner_transferred() {
                 let Some(index) = st.claim_index(claim.token) else {
@@ -15505,7 +15861,7 @@ impl Router {
             item.deferred_since_ms = context.since.unwrap_or(now);
             item.retry_after_ms = retry_after_ms;
         });
-        st.has_ordered_retry = true;
+        st.tx_policy_flags |= 1;
         Ok(())
     }
 
@@ -15609,7 +15965,7 @@ impl Router {
     ) -> TelemetryResult<()> {
         let mut st = self.state.lock();
         st.push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item,
             ignore_local,
             priority,
@@ -16033,6 +16389,9 @@ impl Router {
         if Self::is_end_to_end_ack_packet(pkt)
             && let Ok(packet_id) = Self::decode_end_to_end_reliable_ack(pkt.payload())
         {
+            #[cfg(feature = "std")]
+            let explicit_completion_receipt = pkt.wire_target_senders().len() == 2
+                && pkt.wire_target_senders()[1] == Self::sender_hash(self.sender_arc().as_ref());
             let targets_local_sender = self.cfg.role.local_services()
                 && (pkt.wire_target_senders().is_empty()
                     || pkt
@@ -16122,11 +16481,42 @@ impl Router {
                             sent.pending_destinations
                         );
                     }
+                    #[cfg(feature = "std")]
+                    let completion = if _removed.is_some()
+                        && explicit_completion_receipt
+                        && targets_local_sender
+                        && sent.tracked_destinations
+                        && sent.pending_destinations.is_empty()
+                    {
+                        st.end_to_end_reliable_tx.remove(&packet_id)
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "std"))]
                     if sent.pending_destinations.is_empty() {
                         st.end_to_end_reliable_tx.remove(&packet_id);
                     }
+                    #[cfg(feature = "std")]
+                    if completion.is_none()
+                        && st
+                            .end_to_end_reliable_tx
+                            .get(&packet_id)
+                            .is_some_and(|sent| sent.pending_destinations.is_empty())
+                    {
+                        st.end_to_end_reliable_tx.remove(&packet_id);
+                    }
                     drop(st);
+                    #[cfg(feature = "std")]
+                    let release_result = self.release_ordered_successors();
+                    #[cfg(not(feature = "std"))]
                     self.release_ordered_successors()?;
+                    #[cfg(feature = "std")]
+                    {
+                        if let Some(completed) = completion {
+                            self.notify_delivery_completion(packet_id, &completed);
+                        }
+                        release_result?;
+                    }
                     return Ok(targets_local_sender);
                 }
                 st.end_to_end_reliable_tx.remove(&packet_id);
@@ -17246,7 +17636,13 @@ impl Router {
                 #[cfg(not(feature = "discovery"))]
                 let plan = self.remote_side_plan(&data, None)?;
                 let RemoteSidePlan::Target(sides) = plan;
+                let e2e_parent = context.owner_transferred().then(|| Self::get_hash(&data));
+                let _parent_lease = self.lease_e2e_send(e2e_parent);
                 for side in sides.iter().copied() {
+                    #[cfg(feature = "latest-value-egress")]
+                    if self.queue_latest_egress(side, None, &data)? {
+                        continue;
+                    }
                     #[cfg(feature = "compression")]
                     let mut side_data = data.clone();
                     #[cfg(feature = "compression")]
@@ -17266,25 +17662,42 @@ impl Router {
                     if let Err(e) = send_result {
                         if Self::is_transient_tx_error(&e) {
                             context.refused = true;
-                            #[cfg(feature = "compression")]
-                            self.retry_codec_owner(
-                                RouterTxItem::ToSide {
-                                    src: None,
-                                    dst: side,
-                                    data: side_data,
-                                },
-                                true,
-                                &mut reservation,
-                            )?;
-                            #[cfg(not(feature = "compression"))]
-                            self.tx_queue_item_for_retry(
-                                RouterTxItem::ToSide {
-                                    src: None,
-                                    dst: side,
-                                    data: data.clone(),
-                                },
-                                true,
-                            )?;
+                            if let Some(parent) = e2e_parent {
+                                self.enqueue_e2e_child(
+                                    RouterTxItem::ToSide {
+                                        src: None,
+                                        dst: side,
+                                        #[cfg(feature = "compression")]
+                                        data: side_data,
+                                        #[cfg(not(feature = "compression"))]
+                                        data: data.clone(),
+                                    },
+                                    Self::router_item_priority(&data)?,
+                                    parent,
+                                    #[cfg(feature = "compression")]
+                                    &mut reservation,
+                                )?;
+                            } else {
+                                #[cfg(feature = "compression")]
+                                self.retry_codec_owner(
+                                    RouterTxItem::ToSide {
+                                        src: None,
+                                        dst: side,
+                                        data: side_data,
+                                    },
+                                    true,
+                                    &mut reservation,
+                                )?;
+                                #[cfg(not(feature = "compression"))]
+                                self.tx_queue_item_for_retry(
+                                    RouterTxItem::ToSide {
+                                        src: None,
+                                        dst: side,
+                                        data: data.clone(),
+                                    },
+                                    true,
+                                )?;
+                            }
                             continue;
                         }
                         match &data {
@@ -17355,12 +17768,28 @@ impl Router {
                     return Ok(());
                 }
                 #[cfg(feature = "compression")]
-                let (send_result, mut reservation) = self.send_queued_to_side_with_progress(
-                    dst,
-                    &mut data,
-                    src.is_some(),
-                    &mut context.admitted,
-                );
+                let (send_result, mut reservation) =
+                    if let Some(claim) = context.claim.filter(|claim| claim.side_retry) {
+                        let prepared = self.prepare_e2e_child_for_send(claim, dst, &mut data);
+                        (
+                            prepared.and_then(|()| {
+                                self.send_reliable_to_side_with_progress(
+                                    dst,
+                                    data.clone(),
+                                    src.is_some(),
+                                    &mut context.admitted,
+                                )
+                            }),
+                            None,
+                        )
+                    } else {
+                        self.send_queued_to_side_with_progress(
+                            dst,
+                            &mut data,
+                            src.is_some(),
+                            &mut context.admitted,
+                        )
+                    };
                 #[cfg(not(feature = "compression"))]
                 let send_result = self.send_reliable_to_side_with_progress(
                     dst,
@@ -17371,6 +17800,10 @@ impl Router {
                 if let Err(e) = send_result {
                     if Self::is_transient_tx_error(&e) {
                         context.refused = true;
+                        if let Some(claim) = context.claim.filter(|claim| claim.side_retry) {
+                            self.restore_e2e_child_claim(claim)?;
+                            return Ok(());
+                        }
                         let retry_priority =
                             context.priority.max(self.item_service_priority(&data)?);
                         #[cfg(feature = "compression")]
@@ -17418,6 +17851,13 @@ impl Router {
                         self.remote_side_plan(&data, None)?;
                     sides = fallback_sides;
                 }
+                let _parent_lease = self.lease_e2e_send(Some(packet_id));
+                {
+                    let st = self.state.lock();
+                    sides.retain(|side| {
+                        !Self::e2e_child_owned(&st.transmit_queue, *side, packet_id)
+                    });
+                }
                 for side in sides.iter().copied() {
                     #[cfg(feature = "compression")]
                     let mut side_data = data.clone();
@@ -17440,26 +17880,19 @@ impl Router {
                             context.refused = true;
                             let retry_priority =
                                 Self::router_item_priority_bumped(DataType::ReliableAck);
-                            #[cfg(feature = "compression")]
-                            self.retry_codec_owner_at_priority(
+                            self.enqueue_e2e_child(
                                 RouterTxItem::ToSide {
                                     src: None,
                                     dst: side,
+                                    #[cfg(feature = "compression")]
                                     data: side_data,
-                                },
-                                true,
-                                &mut reservation,
-                                retry_priority,
-                            )?;
-                            #[cfg(not(feature = "compression"))]
-                            self.tx_queue_item_for_retry_at_priority(
-                                RouterTxItem::ToSide {
-                                    src: None,
-                                    dst: side,
+                                    #[cfg(not(feature = "compression"))]
                                     data: data.clone(),
                                 },
-                                true,
                                 retry_priority,
+                                packet_id,
+                                #[cfg(feature = "compression")]
+                                &mut reservation,
                             )?;
                             continue;
                         }
@@ -17897,7 +18330,7 @@ mod queued_schema_identity_tests {
         let mut st = router.state.lock();
         st.transmit_queue.clear();
         let queued = |dst, pkt| TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item: RouterTxItem::ToSide {
                 src: None,
                 dst,
@@ -17981,7 +18414,7 @@ mod queued_schema_identity_tests {
             node.state
                 .lock()
                 .push_transmit(TxQueued {
-                    disposable: true,
+                    disposable: TX_DISPOSABLE,
                     item: RouterTxItem::ToSide {
                         src: None,
                         dst: side,
@@ -18046,10 +18479,10 @@ mod queued_schema_identity_tests {
                 .announcers
                 .insert(
                     "SCHEMA_PEER".into(),
-                    DiscoverySenderState {
+                    Box::new(DiscoverySenderState {
                         advertised_address: Some(assigned),
                         ..DiscoverySenderState::default()
-                    },
+                    }),
                 );
         }
         router.note_schema_received(side, "@addr:4660");
@@ -18186,6 +18619,8 @@ mod queued_schema_identity_tests {
             router.state.lock().end_to_end_reliable_tx.insert(
                 id,
                 EndToEndReliableSent {
+                    #[cfg(feature = "std")]
+                    completion_epoch: 0,
                     ordered_type: Some(ty.as_u32()),
                     waiting_for_predecessor: false,
                     data: RouterItem::Packet(packet),
@@ -18252,6 +18687,8 @@ mod queued_schema_identity_tests {
         router.state.lock().end_to_end_reliable_tx.insert(
             id,
             EndToEndReliableSent {
+                #[cfg(feature = "std")]
+                completion_epoch: 0,
                 ordered_type: None,
                 waiting_for_predecessor: false,
                 data: RouterItem::Packet(data),
@@ -18445,7 +18882,7 @@ mod queued_schema_identity_tests {
         node.state
             .lock()
             .push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
                     src: None,
                     dst: side,
@@ -18508,7 +18945,7 @@ mod queued_schema_identity_tests {
         node.state
             .lock()
             .push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
                     src: None,
                     dst: side,
@@ -18641,7 +19078,7 @@ mod bounded_fair_queue_tests {
                     priority: 0,
                 };
                 let tx_item = |data| TxQueued {
-                    disposable: true,
+                    disposable: TX_DISPOSABLE,
                     item: RouterTxItem::Broadcast(data),
                     ignore_local: true,
                     priority: 0,
@@ -18743,7 +19180,7 @@ mod bounded_fair_queue_tests {
                         priority: 0,
                     };
                     let tx_item = |data| TxQueued {
-                        disposable: true,
+                        disposable: TX_DISPOSABLE,
                         item: RouterTxItem::Broadcast(data),
                         ignore_local: true,
                         priority: 0,
@@ -18851,7 +19288,7 @@ mod bounded_fair_queue_tests {
                             priority: 0,
                         };
                         let tx_item = |data| TxQueued {
-                            disposable: true,
+                            disposable: TX_DISPOSABLE,
                             item: RouterTxItem::Broadcast(data),
                             ignore_local: true,
                             priority: 0,
@@ -19075,3 +19512,23 @@ mod bounded_rx_priority_tests {
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/accepted_tx_ownership.rs"]
 mod accepted_tx_ownership;
+
+#[cfg(feature = "latest-value-egress")]
+#[path = "router_latest.rs"]
+mod latest;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/retry_backpressure_native.rs"]
+mod retry_backpressure_native;
+
+#[path = "router_e2e_backpressure.rs"]
+mod e2e_backpressure;
+#[cfg(all(test, feature = "std", feature = "discovery", feature = "timesync"))]
+#[path = "tests/peer_record_footprint.rs"]
+mod peer_record_footprint;
+
+#[cfg(feature = "std")]
+#[path = "router_completion.rs"]
+mod completion;
+#[cfg(feature = "std")]
+pub use completion::{DeliveryCompletion, DeliveryCompletionObserver, PendingCanonicalWrite};

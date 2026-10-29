@@ -334,7 +334,7 @@ fn continuously_refilled_bulk_cannot_block_catalog_priority_admission() {
             )
             .unwrap();
             let _ = router.state.lock().push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
                     src: None,
                     dst: side,
@@ -390,7 +390,7 @@ fn topology_and_catalog_recover_under_protected_refill_with_existing_eviction_po
             .state
             .lock()
             .push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
                     src: None,
                     dst: side,
@@ -414,6 +414,8 @@ fn topology_and_catalog_recover_under_protected_refill_with_existing_eviction_po
             .get(0)
             .unwrap()
             .disposable
+            & TX_DISPOSABLE
+            != 0
     );
     let _ = router.announce_discovery();
     for tick in (250..=5000).step_by(250) {

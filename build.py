@@ -27,13 +27,17 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression")
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress")
 
 def qualification_profiles(features: list[str]) -> list[list[str]]:
-    """Exercise both storage implementations, retaining common feature choices."""
-    storage = {"compact-packet-store", "compact-packet-compression", "fair-admission"}
+    """Exercise feature-OFF normal storage and feature-ON compact/fair storage.
+
+    The existing long codec soak runs once, in the compact enabled profile.
+    Shared minimal-std checks independently cover both feature states.
+    """
+    storage = {"compact-packet-store", "compact-packet-compression", "fair-admission", "latest-value-egress"}
     common = list(dict.fromkeys([*(f for f in features if f not in storage), "cryptography"]))
-    return [common, [*common, "compact-packet-compression", "fair-admission"]]
+    return [common, [*common, "compact-packet-compression", "fair-admission", "latest-value-egress"]]
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and validate SEDSnet with Cargo-style commands and flags.", allow_abbrev=False)
@@ -43,7 +47,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--target", default="", help="Rust target triple (host by default).")
     parser.add_argument("--device-id", default="", help="Compile-time DEVICE_IDENTIFIER.")
     parser.add_argument("--full", action="store_true", help="Include ignored long-duration tests with test.")
-    parser.add_argument("--all", action="store_true", help="With test, run the normal and compact/fair qualification matrix; not Cargo --all-features. Common --features apply to both profiles.")
+    parser.add_argument("--all", action="store_true", help="With test, run the feature-OFF normal and feature-ON compact/fair qualification matrix; not Cargo --all-features. Common --features apply to both profiles.")
     parser.add_argument("--static-schema-path", help="Runtime registry seed JSON path.")
     parser.add_argument("--static-ipc-schema-path", help="Runtime IPC overlay seed JSON path.")
     for flag, description in (("max-stack-payload", "Maximum stack payload bytes"), ("max-queue-budget", "Shared router/relay queue budget bytes"), ("max-recent-rx-ids", "Preallocated recent packet-ID entries")):
@@ -1031,6 +1035,15 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
             total_steps_override=total_steps,
         )
         _success("Clippy checks passed.")
+        if _shared_test_steps:
+            for minimal_features in ("std", "std,latest-value-egress"):
+                run_cmd(
+                    ["cargo", "clippy", *build_mode, "--no-default-features", "--features", minimal_features, "--lib", "--", "-D", "warnings"],
+                    env=env, repo_root=repo_root,
+                    title="Minimal std/discovery-OFF strict Clippy: " + minimal_features,
+                    release_build=release_build,
+                )
+            _success("Minimal std feature-OFF/ON checks passed.")
 
         runner_name, test_cmds = test_runner_cmds(
             env=env,

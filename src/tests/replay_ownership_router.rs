@@ -116,7 +116,7 @@ fn ring_slot_eviction_releases_end_to_end_replay_marker() {
     let mut state = node.state.lock();
     state
         .push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item: RouterTxItem::ToSide {
                 src: None,
                 dst: 0,

@@ -666,6 +666,8 @@ fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
         router.state.lock().end_to_end_reliable_tx.insert(
             id,
             EndToEndReliableSent {
+                #[cfg(feature = "std")]
+                completion_epoch: 0,
                 ordered_type: matches!(mode, crate::ReliableMode::Ordered).then_some(ty.as_u32()),
                 waiting_for_predecessor: false,
                 data: RouterItem::Packet(packet),

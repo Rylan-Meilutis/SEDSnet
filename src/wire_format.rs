@@ -1608,6 +1608,7 @@ pub(crate) struct RoutingEnvelope<'a> {
     targets: &'a [u8],
     has_reliable_header: bool,
 }
+#[derive(Clone)]
 pub(crate) struct RoutingEndpointIter<'a> {
     envelope: &'a RoutingEnvelope<'a>,
     word: usize,
@@ -1956,6 +1957,39 @@ pub(crate) fn peek_plain_discovery_payload(
         return Err(TelemetryError::Unpack("discovery payload length mismatch"));
     }
     Ok(Some((envelope.source_address, reader.read_bytes(size)?)))
+}
+
+/// Fully validate a replaceable plaintext sample without owning its payload.
+/// Contract/codec/reliable frames never enter freshness coalescing.
+#[cfg(feature = "latest-value-egress")]
+pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
+    if buf.first().is_none_or(|flags| flags & 0x17 != 0) {
+        return Err(TelemetryError::BadArg);
+    }
+    let data = verify_crc32(buf)?;
+    let mut reader = ByteReader::new(data);
+    let envelope = read_routing_envelope(&mut reader)?;
+    if envelope.has_reliable_header || envelope.endpoints().next().is_none() {
+        return Err(TelemetryError::BadArg);
+    }
+    let mut prelude = ByteReader::new(data);
+    prelude.read_bytes(2)?;
+    read_uleb128(&mut prelude)?;
+    let size = usize::try_from(read_uleb128(&mut prelude)?).map_err(|_| TelemetryError::BadArg)?;
+    if reader.remaining() != size {
+        return Err(TelemetryError::SizeMismatch {
+            expected: size,
+            got: reader.remaining(),
+        });
+    }
+    let meta =
+        crate::config::try_get_message_meta(envelope.ty).ok_or(TelemetryError::InvalidType)?;
+    Packet::validate_payload_against_element(meta.element, reader.read_bytes(size)?)?;
+    Ok(RoutingFrameInfo {
+        envelope,
+        reliable: None,
+        empty_payload: size == 0,
+    })
 }
 
 pub(crate) fn peek_routing_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {

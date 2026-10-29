@@ -7,8 +7,9 @@
 //! - Maintains partial or complete network time assembled from one or more sources.
 //! - Provides a slewed clock that converges toward sampled network time without hard jumps.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
@@ -396,10 +397,21 @@ struct NetworkTimeSourceState {
     time: PartialNetworkTime,
 }
 
+pub(crate) struct PreparedClockSource<'a>(crate::peer_record::Prepared<'a, NetworkTimeSourceState>);
+
+pub(crate) struct PreparedTrackerSource<'a> {
+    ignore: bool,
+    sender: &'a str,
+    priority: u64,
+    recv_ms: u64,
+    time_ms: u64,
+    insert: Option<crate::peer_record::Prepared<'a, TimeSyncSource>>,
+}
+
 /// Aggregates multiple partial or complete time sources into a current network-time reading.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkClock {
-    sources: BTreeMap<String, NetworkTimeSourceState>,
+    sources: BTreeMap<String, Box<NetworkTimeSourceState>>,
 }
 
 impl NetworkClock {
@@ -413,8 +425,52 @@ impl NetworkClock {
         anchor_mono_ns: u64,
         ttl_ms: Option<u64>,
     ) {
-        self.sources.insert(
-            source.to_string(),
+        // Keep the historical infallible signature. Failure preserves the
+        // previous reading instead of publishing a partially replaced source.
+        let _ = self.try_update_source(
+            source,
+            priority,
+            time,
+            updated_mono_ms,
+            anchor_mono_ns,
+            ttl_ms,
+        );
+    }
+
+    /// Fallible source update. Allocation refusal preserves the prior reading.
+    pub fn try_update_source(
+        &mut self,
+        source: &str,
+        priority: u64,
+        time: PartialNetworkTime,
+        updated_mono_ms: u64,
+        anchor_mono_ns: u64,
+        ttl_ms: Option<u64>,
+    ) -> TelemetryResult<()> {
+        let update = self.prepare_source(
+            source,
+            priority,
+            time,
+            updated_mono_ms,
+            anchor_mono_ns,
+            ttl_ms,
+        )?;
+        self.commit_source(update);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_source<'a>(
+        &self,
+        source: &'a str,
+        priority: u64,
+        time: PartialNetworkTime,
+        updated_mono_ms: u64,
+        anchor_mono_ns: u64,
+        ttl_ms: Option<u64>,
+    ) -> TelemetryResult<PreparedClockSource<'a>> {
+        crate::peer_record::prepare(
+            &self.sources,
+            source,
             NetworkTimeSourceState {
                 priority,
                 updated_mono_ms,
@@ -422,7 +478,12 @@ impl NetworkClock {
                 ttl_ms,
                 time,
             },
-        );
+        )
+        .map(PreparedClockSource)
+    }
+
+    pub(crate) fn commit_source(&mut self, update: PreparedClockSource<'_>) {
+        update.0.commit(&mut self.sources);
     }
 
     /// Removes a previously registered source by identifier.
@@ -444,7 +505,7 @@ impl NetworkClock {
         let sources: Vec<(&str, &NetworkTimeSourceState)> = self
             .sources
             .iter()
-            .map(|(name, src)| (name.as_str(), src))
+            .map(|(name, src)| (name.as_str(), src.as_ref()))
             .collect();
         if sources.is_empty() {
             return None;
@@ -575,7 +636,7 @@ fn civil_from_days(mut z: u64) -> Option<(i32, u32, u32)> {
 pub struct TimeSyncTracker {
     cfg: TimeSyncConfig,
     local_id: String,
-    sources: BTreeMap<String, TimeSyncSource>,
+    sources: BTreeMap<String, Box<TimeSyncSource>>,
     current_source: Option<String>,
 }
 
@@ -599,7 +660,7 @@ impl TimeSyncTracker {
     pub fn current_source(&self) -> Option<&TimeSyncSource> {
         self.current_source
             .as_ref()
-            .and_then(|sender| self.sources.get(sender))
+            .and_then(|sender| self.sources.get(sender).map(AsRef::as_ref))
     }
 
     /// Removes stale sources and re-runs source selection.
@@ -619,6 +680,7 @@ impl TimeSyncTracker {
                     .cmp(&b.priority)
                     .then_with(|| a.sender.cmp(&b.sender))
             })
+            .map(AsRef::as_ref)
     }
 
     /// Returns the effective local candidate priority if the node may lead at `now_ms`.
@@ -705,14 +767,58 @@ impl TimeSyncTracker {
             return Ok(TimeSyncUpdate::NoChange);
         }
 
-        let incoming = TimeSyncSource {
-            sender: pkt.sender().to_string(),
-            priority: ann.priority,
-            last_announce_ms: recv_ms,
-            last_time_ms: ann.time_ms,
+        let update = self.prepare_source(pkt.sender(), ann, recv_ms)?;
+        Ok(self.commit_source(update))
+    }
+
+    pub(crate) fn prepare_source<'a>(
+        &self,
+        sender: &'a str,
+        ann: TimeSyncAnnounceFields,
+        recv_ms: u64,
+    ) -> TelemetryResult<PreparedTrackerSource<'a>> {
+        let ignore = sender == self.local_id.as_str();
+        let insert = if ignore || self.sources.contains_key(sender) {
+            None
+        } else {
+            let incoming = TimeSyncSource {
+                sender: crate::peer_record::try_string(sender)?,
+                priority: ann.priority,
+                last_announce_ms: recv_ms,
+                last_time_ms: ann.time_ms,
+            };
+            Some(crate::peer_record::prepare(
+                &self.sources,
+                sender,
+                incoming,
+            )?)
         };
-        self.sources.insert(incoming.sender.clone(), incoming);
-        Ok(self.reselect_source(recv_ms))
+        Ok(PreparedTrackerSource {
+            ignore,
+            sender,
+            priority: ann.priority,
+            recv_ms,
+            time_ms: ann.time_ms,
+            insert,
+        })
+    }
+
+    pub(crate) fn commit_source(&mut self, update: PreparedTrackerSource<'_>) -> TimeSyncUpdate {
+        if update.ignore {
+            return TimeSyncUpdate::NoChange;
+        }
+        if let Some(insert) = update.insert {
+            insert.commit(&mut self.sources);
+        } else {
+            let source = self
+                .sources
+                .get_mut(update.sender)
+                .expect("prepared source remains present");
+            source.priority = update.priority;
+            source.last_announce_ms = update.recv_ms;
+            source.last_time_ms = update.time_ms;
+        }
+        self.reselect_source(update.recv_ms)
     }
 
     /// Returns `true` when the current remote source is still within the active timeout window.

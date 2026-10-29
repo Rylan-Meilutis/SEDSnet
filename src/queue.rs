@@ -546,7 +546,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     #[inline]
-    #[cfg(feature = "discovery")]
+    #[cfg(any(feature = "discovery", feature = "latest-value-egress"))]
     pub(crate) fn update_admitted<F>(
         &mut self,
         index: usize,

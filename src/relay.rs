@@ -181,6 +181,13 @@ impl Relay {
         self.core.set_side_ingress_enabled(side, enabled)
     }
 
+    /// Opt one packed egress into never-attempted newest-pending best-effort data.
+    /// See [`Router::set_latest_value_side`] for eligibility and timestamp semantics.
+    #[cfg(feature = "latest-value-egress")]
+    pub fn set_latest_value_side(&self, side: Option<RelaySideId>) -> TelemetryResult<()> {
+        self.core.set_latest_value_side(side)
+    }
+
     pub fn set_side_egress_enabled(&self, side: RelaySideId, enabled: bool) -> TelemetryResult<()> {
         self.core.set_side_egress_enabled(side, enabled)
     }

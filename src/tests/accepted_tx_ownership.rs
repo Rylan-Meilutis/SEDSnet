@@ -134,7 +134,7 @@ fn unrelated_typed_queue_does_not_block_and_packed_unknown_fails_closed() {
         .state
         .lock()
         .push_transmit(TxQueued {
-            disposable: false,
+            disposable: 0,
             item: RouterTxItem::ToSide {
                 src: None,
                 dst: 0,

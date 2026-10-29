@@ -2286,7 +2286,7 @@ pub extern "C" fn seds_router_set_local_network_time(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_time(PartialNetworkTime {
+    match router.try_set_local_network_time(PartialNetworkTime {
         year: has_year.then_some(year),
         month: has_month.then_some(month),
         day: has_day.then_some(day),
@@ -2294,8 +2294,10 @@ pub extern "C" fn seds_router_set_local_network_time(
         minute: has_minute.then_some(minute),
         second: has_second.then_some(second),
         nanosecond: has_nanosecond.then_some(nanosecond),
-    });
-    status_from_result_code(SedsResult::SedsOk)
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2310,8 +2312,15 @@ pub extern "C" fn seds_router_set_local_network_date(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_date(year, month, day);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        year: Some(year),
+        month: Some(month),
+        day: Some(day),
+        ..Default::default()
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2325,8 +2334,14 @@ pub extern "C" fn seds_router_set_local_network_time_hm(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_time_hm(hour, minute);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        hour: Some(hour),
+        minute: Some(minute),
+        ..Default::default()
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2341,8 +2356,15 @@ pub extern "C" fn seds_router_set_local_network_time_hms(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_time_hms(hour, minute, second);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+        ..Default::default()
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2358,8 +2380,16 @@ pub extern "C" fn seds_router_set_local_network_time_hms_millis(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_time_hms_millis(hour, minute, second, millisecond);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+        nanosecond: Some((millisecond as u32).saturating_mul(1_000_000)),
+        ..Default::default()
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2375,8 +2405,16 @@ pub extern "C" fn seds_router_set_local_network_time_hms_nanos(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_time_hms_nanos(hour, minute, second, nanosecond);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+        nanosecond: Some(nanosecond),
+        ..Default::default()
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2394,8 +2432,18 @@ pub extern "C" fn seds_router_set_local_network_datetime(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_datetime(year, month, day, hour, minute, second);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        year: Some(year),
+        month: Some(month),
+        day: Some(day),
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+        ..Default::default()
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2414,8 +2462,18 @@ pub extern "C" fn seds_router_set_local_network_datetime_millis(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_datetime_millis(year, month, day, hour, minute, second, millisecond);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        year: Some(year),
+        month: Some(month),
+        day: Some(day),
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+        nanosecond: Some((millisecond as u32).saturating_mul(1_000_000)),
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 #[cfg(feature = "timesync")]
@@ -2434,8 +2492,18 @@ pub extern "C" fn seds_router_set_local_network_datetime_nanos(
         return status_from_err(TelemetryError::BadArg);
     }
     let router = unsafe { &(*r).inner };
-    router.set_local_network_datetime_nanos(year, month, day, hour, minute, second, nanosecond);
-    status_from_result_code(SedsResult::SedsOk)
+    match router.try_set_local_network_time(PartialNetworkTime {
+        year: Some(year),
+        month: Some(month),
+        day: Some(day),
+        hour: Some(hour),
+        minute: Some(minute),
+        second: Some(second),
+        nanosecond: Some(nanosecond),
+    }) {
+        Ok(()) => status_from_result_code(SedsResult::SedsOk),
+        Err(error) => status_from_err(error),
+    }
 }
 
 // ============================================================================
@@ -5924,6 +5992,37 @@ mod tests {
     use std::ffi::CStr;
     use std::sync::Mutex;
 
+    #[cfg(feature = "latest-value-egress")]
+    #[test]
+    fn latest_value_setters_validate_handles_sides_and_disable() {
+        let bad = status_from_err(TelemetryError::BadArg);
+        assert_eq!(seds_router_set_latest_value_side(ptr::null_mut(), -1), bad);
+        assert_eq!(seds_relay_set_latest_value_side(ptr::null_mut(), 0), bad);
+        let router = Router::new_with_clock(RouterConfig::new([]), Box::new(|| 0));
+        let side = router.add_side_packed("radio", |_| Ok(()));
+        let mut handle = SedsRouter {
+            inner: Arc::new(router),
+        };
+        assert_eq!(seds_router_set_latest_value_side(&mut handle, -2), bad);
+        assert_eq!(seds_router_set_latest_value_side(&mut handle, 127), bad);
+        assert_eq!(seds_router_set_latest_value_side(&mut handle, 126), bad);
+        assert_eq!(
+            seds_router_set_latest_value_side(&mut handle, side as i32),
+            0
+        );
+        assert_eq!(seds_router_set_latest_value_side(&mut handle, -1), 0);
+        let relay = Relay::new(Box::new(|| 0));
+        let radio = relay.add_side_packed("radio", |_| Ok(()));
+        let mut relay_handle = SedsRelay {
+            inner: Arc::new(relay),
+        };
+        assert_eq!(
+            seds_relay_set_latest_value_side(&mut relay_handle, radio as i32),
+            0
+        );
+        assert_eq!(seds_relay_set_latest_value_side(&mut relay_handle, -1), 0);
+    }
+
     #[test]
     fn fixed_unsigned_bytes_preserve_all_bits_through_queue_and_wire() {
         crate::tests::ensure_common_test_schema();
@@ -8103,3 +8202,23 @@ mod pending_copy_contract_tests {
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/best_effort_endpoint_fanout.rs"]
 mod best_effort_endpoint_fanout;
+
+/// Opt one packed egress into latest pending reports. -1 disables; IDs0..126.
+#[cfg(feature = "latest-value-egress")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_latest_value_side(r: *mut SedsRouter, side: i32) -> i32 {
+    if r.is_null() || !(-1..127).contains(&side) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    ok_or_status(unsafe { &(*r).inner }.set_latest_value_side((side >= 0).then_some(side as usize)))
+}
+
+/// Opt one relay packed egress into latest pending reports. -1 disables; IDs0..126.
+#[cfg(feature = "latest-value-egress")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_relay_set_latest_value_side(r: *mut SedsRelay, side: i32) -> i32 {
+    if r.is_null() || !(-1..127).contains(&side) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    ok_or_status(unsafe { &(*r).inner }.set_latest_value_side((side >= 0).then_some(side as usize)))
+}

@@ -102,7 +102,7 @@ fn shared_bus_switches_to_canonical_frames_without_forgetting_rx_dictionary() {
                 .entry(side)
                 .or_default()
                 .announcers
-                .insert(peer.into(), DiscoverySenderState::default());
+                .insert(peer.into(), Box::new(DiscoverySenderState::default()));
         }
     }
     for _ in 0..64 {
