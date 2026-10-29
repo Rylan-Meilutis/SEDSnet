@@ -6,6 +6,13 @@
 
 Wire format and application identities remain compatible with 4.3.1.
 
+- Decode 32-bit embedded variable-length integers with constant shifts while
+  preserving wire values and malformed-input checks.
+- Cache a bounded set of immutable compiled-schema definitions while checking
+  runtime schema updates on every lookup.
+- Retain only endpoint metadata during routing inspection, reducing metadata
+  copies without changing packet validation or routing behavior.
+
 - Store retained reliable-delivery records separately from their tree index,
   reducing large contiguous allocations on fragmented embedded heaps.
 - Return temporary memory pressure when a reliable record cannot be allocated,

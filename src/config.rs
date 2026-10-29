@@ -3147,15 +3147,28 @@ const _: () = {
 #[cfg(not(feature = "std"))]
 #[inline(never)]
 fn compiled_type_definition(id: DataType) -> Option<&'static DataTypeDefinition> {
-    EMBEDDED_BUILTIN_TYPES
-        .get(id.0 as usize)
-        .or_else(|| {
-            EMBEDDED_SCHEMA_TYPES
-                .binary_search_by_key(&id.0, |def| def.id.0)
-                .ok()
-                .map(|index| &EMBEDDED_SCHEMA_TYPES[index])
-        })
-        .filter(|def| type_visible_at(def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
+    // Cache only immutable flash definitions. The ID lives in the pointed-to
+    // definition, so concurrent replacement of a slot cannot mismatch key/value.
+    // Every hit still checks the current overlay: schema updates and name/ID
+    // shadowing retain exactly the uncached behavior. No allocation is retained.
+    static CACHE: [AtomicPtr<DataTypeDefinition>; 4] =
+        [const { AtomicPtr::new(core::ptr::null_mut()) }; 4];
+    let slot = &CACHE[id.0 as usize & 3];
+    let cached = slot.load(Ordering::Acquire);
+    let definition = if !cached.is_null() && unsafe { (*cached).id == id } {
+        // SAFETY: only immutable 'static flash definitions are published below.
+        Some(unsafe { &*cached })
+    } else {
+        let found = EMBEDDED_BUILTIN_TYPES.get(id.0 as usize).or_else(|| {
+            EMBEDDED_SCHEMA_TYPES.binary_search_by_key(&id.0, |def| def.id.0)
+                .ok().map(|index| &EMBEDDED_SCHEMA_TYPES[index])
+        });
+        if let Some(definition) = found {
+            slot.store(core::ptr::from_ref(definition).cast_mut(), Ordering::Release);
+        }
+        found
+    };
+    definition.filter(|def| type_visible_at(def, EMBEDDED_TYPE_HEAD.load(Ordering::Acquire)))
 }
 #[cfg(not(feature = "std"))]
 #[inline(never)]

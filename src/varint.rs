@@ -50,32 +50,43 @@ fn read_u64_32(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
 #[cfg(any(test, target_pointer_width = "32"))]
 #[inline(never)]
 fn read_u64_32_slow(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
-    let (mut low, mut high) = (0u32, 0u32);
-    for index in 0..10u32 {
-        let Some(&byte) = buf.get(*off) else {
-            return Err(TelemetryError::Unpack("short read"));
-        };
-        *off += 1;
-        let part = u32::from(byte & 0x7f);
-        match index {
-            0..=3 => low |= part << (7 * index),
-            4 => {
-                low |= part << 28;
-                high = part >> 4;
+    // Native constant shifts avoid a variable shift/range dispatch per byte
+    // on Cortex-M. Keep offset advancement identical on every malformed input.
+    let mut low = 0u32;
+    let mut high = 0u32;
+    macro_rules! byte {
+        ($body:expr) => {{
+            let Some(&byte) = buf.get(*off) else {
+                return Err(TelemetryError::Unpack("short read"));
+            };
+            *off += 1;
+            $body(byte);
+            if byte & 0x80 == 0 {
+                return Ok((u64::from(high) << 32) | u64::from(low));
             }
-            5..=8 => high |= part << (7 * index - 32),
-            _ => {
-                if byte > 1 {
-                    return Err(TelemetryError::Unpack("uleb128 too long"));
-                }
-                high |= part << 31;
-            }
-        }
-        if byte & 0x80 == 0 {
-            return Ok((u64::from(high) << 32) | u64::from(low));
-        }
+        }};
     }
-    Err(TelemetryError::Unpack("uleb128 too long"))
+    byte!(|b: u8| low = u32::from(b & 0x7f));
+    byte!(|b: u8| low |= u32::from(b & 0x7f) << 7);
+    byte!(|b: u8| low |= u32::from(b & 0x7f) << 14);
+    byte!(|b: u8| low |= u32::from(b & 0x7f) << 21);
+    byte!(|b: u8| {
+        low |= u32::from(b & 0x7f) << 28;
+        high = u32::from(b & 0x7f) >> 4;
+    });
+    byte!(|b: u8| high |= u32::from(b & 0x7f) << 3);
+    byte!(|b: u8| high |= u32::from(b & 0x7f) << 10);
+    byte!(|b: u8| high |= u32::from(b & 0x7f) << 17);
+    byte!(|b: u8| high |= u32::from(b & 0x7f) << 24);
+    let Some(&last) = buf.get(*off) else {
+        return Err(TelemetryError::Unpack("short read"));
+    };
+    *off += 1;
+    if last > 1 {
+        return Err(TelemetryError::Unpack("uleb128 too long"));
+    }
+    high |= u32::from(last) << 31;
+    Ok((u64::from(high) << 32) | u64::from(low))
 }
 
 #[cfg(test)]
