@@ -196,6 +196,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.2 highlights
+
+- Reduce contiguous reliable-tracking allocations on fragmented embedded heaps.
+- Keep accepted commands retryable when record allocation encounters memory
+  pressure, while preserving delivery ownership and existing memory budgets.
+- Retain wire compatibility with 4.3.1.
+
 ### Version 4.3.1 highlights
 
 Wire format and application identities remain compatible with 4.3.0.
