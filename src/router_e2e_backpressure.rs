@@ -65,7 +65,20 @@ impl Router {
             reservation.release_locked(&mut st);
         }
         st.push_transmit(TxQueued {
-            disposable: TX_E2E_CHILD,
+            disposable: TX_E2E_CHILD | {
+                #[cfg(feature = "std")]
+                {
+                    if completion::is_retry_intent() {
+                        TX_E2E_RETRY
+                    } else {
+                        0
+                    }
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    0
+                }
+            },
             item,
             ignore_local: true,
             priority,

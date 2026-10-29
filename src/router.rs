@@ -761,6 +761,8 @@ enum QueuedDelivery {
 
 const TX_DISPOSABLE: u8 = 1;
 const TX_E2E_CHILD: u8 = 8;
+#[cfg(feature = "std")]
+const TX_E2E_RETRY: u8 = 16;
 #[cfg(feature = "latest-value-egress")]
 const TX_LATEST_PENDING: u8 = 2;
 #[cfg(feature = "latest-value-egress")]
@@ -3184,6 +3186,8 @@ impl RouterInner {
 
     fn push_transmit(&mut self, mut item: TxQueued) -> TelemetryResult<()> {
         let child = item.disposable & TX_E2E_CHILD != 0;
+        #[cfg(feature = "std")]
+        let retry_origin = item.disposable & TX_E2E_RETRY;
         #[cfg(feature = "latest-value-egress")]
         if item.disposable & TX_LATEST_PENDING != 0 && !self.latest_entry_eligible(&item) {
             item.disposable &= !TX_LATEST_PENDING;
@@ -3257,6 +3261,10 @@ impl RouterInner {
         }
         if child {
             item.disposable = (item.disposable & !TX_DISPOSABLE) | TX_E2E_CHILD;
+            #[cfg(feature = "std")]
+            {
+                item.disposable |= retry_origin;
+            }
         }
         let ordered_retry = Self::ordered_original_type(&item).is_some()
             && item.delivery_state == QueuedDelivery::DeferredOrdered;
@@ -3524,7 +3532,7 @@ impl IsrRxQueue {
 /// Thread-safe via internal locking.
 pub struct Router {
     #[cfg(feature = "std")]
-    completion_observer: RouterMutex<Option<Arc<completion::ObserverRegistration>>>,
+    retry_trackers: RouterMutex<Vec<std::sync::Weak<completion::TrackerInner>>>,
     sender: RouterMutex<Arc<str>>,
     cfg: ActiveRoutingConfig,
     state: RouterMutex<RouterInner>,
@@ -5867,11 +5875,7 @@ impl Router {
     ) -> TelemetryResult<bool> {
         let packet_id = Self::get_hash(data);
         #[cfg(feature = "std")]
-        let completion_epoch = self
-            .completion_observer
-            .lock()
-            .as_ref()
-            .map_or(0, |observer| observer.epoch);
+        let completion_epoch = self.retry_birth();
         let now_ms = self.clock.now_ms();
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
@@ -12907,7 +12911,7 @@ impl Router {
         }
         Self {
             #[cfg(feature = "std")]
-            completion_observer: RouterMutex::new(None),
+            retry_trackers: RouterMutex::new(Vec::new()),
             sender: RouterMutex::new(hostname),
             cfg: ActiveRoutingConfig::new(cfg),
             state: RouterMutex::new(RouterInner {
@@ -13634,6 +13638,8 @@ impl Router {
             if slot.is_none() {
                 return Err(TelemetryError::BadArg);
             }
+            #[cfg(feature = "std")]
+            self.invalidate_retry_side(side);
             *slot = None;
             #[cfg(feature = "latest-value-egress")]
             if st.latest_side() == Some(side) {
@@ -16505,6 +16511,8 @@ impl Router {
                     {
                         st.end_to_end_reliable_tx.remove(&packet_id);
                     }
+                    #[cfg(feature = "std")]
+                    let completion_cutoff = completion.as_ref().map_or(0, |_| completion::serial());
                     drop(st);
                     #[cfg(feature = "std")]
                     let release_result = self.release_ordered_successors();
@@ -16513,7 +16521,7 @@ impl Router {
                     #[cfg(feature = "std")]
                     {
                         if let Some(completed) = completion {
-                            self.notify_delivery_completion(packet_id, &completed);
+                            self.retire_completed_writes(packet_id, &completed, completion_cutoff);
                         }
                         release_result?;
                     }
@@ -17447,6 +17455,8 @@ impl Router {
         called_from_queue: bool,
         context: &mut DispatchContext,
     ) -> TelemetryResult<()> {
+        #[cfg(feature = "std")]
+        let _clear_retry_intent = self.retry_queued_intent(context.claim);
         match item {
             RouterTxItem::Broadcast(data) => {
                 let claim = context.claim;
@@ -17637,6 +17647,8 @@ impl Router {
                 let plan = self.remote_side_plan(&data, None)?;
                 let RemoteSidePlan::Target(sides) = plan;
                 let e2e_parent = context.owner_transferred().then(|| Self::get_hash(&data));
+                #[cfg(feature = "std")]
+                let _retry_intent = self.retry_intent(e2e_parent, false);
                 let _parent_lease = self.lease_e2e_send(e2e_parent);
                 for side in sides.iter().copied() {
                     #[cfg(feature = "latest-value-egress")]
@@ -17851,6 +17863,8 @@ impl Router {
                         self.remote_side_plan(&data, None)?;
                     sides = fallback_sides;
                 }
+                #[cfg(feature = "std")]
+                let _retry_intent = self.retry_intent(Some(packet_id), true);
                 let _parent_lease = self.lease_e2e_send(Some(packet_id));
                 {
                     let st = self.state.lock();
@@ -19531,4 +19545,4 @@ mod peer_record_footprint;
 #[path = "router_completion.rs"]
 mod completion;
 #[cfg(feature = "std")]
-pub use completion::{DeliveryCompletion, DeliveryCompletionObserver, PendingCanonicalWrite};
+pub use completion::{PackedWriteLease, RetryTracker, RetryTrackerLimits, WriteStart};

@@ -874,112 +874,168 @@ fn completion_actual_receipts(f: &Fixture, sender: &str, wire: &[u8]) -> Vec<Arc
     result
 }
 
+fn tracked_fixture(admit: bool) -> (Fixture, RetryTracker, Arc<Mutex<Vec<PackedWriteLease>>>) {
+    let f = setup("INTERNAL_TRACKER");
+    f.router.remove_side(f.side).unwrap();
+    let leases = Arc::new(Mutex::new(Vec::new()));
+    let out = leases.clone();
+    let frames = f.frames.clone();
+    let ty = f.ty;
+    let behavior = f.mode.clone();
+    let (side, tracker) = f
+        .router
+        .add_side_packed_leased_with_priority_and_options(
+            "radio",
+            move |lease, _| {
+                if wire_format::peek_envelope(lease.bytes()).is_ok_and(|env| env.ty == ty) {
+                    if behavior.load(Ordering::SeqCst) == 0 {
+                        return Err(TelemetryError::Io("side tx busy"));
+                    }
+                    if admit {
+                        lease.admit()?;
+                    }
+                    frames.lock().unwrap().push(Arc::from(lease.bytes()));
+                    out.lock().unwrap().push(lease);
+                }
+                Ok(())
+            },
+            RouterSideOptions {
+                reliable_enabled: false,
+                header_template_enabled: false,
+                ..Default::default()
+            },
+            RetryTrackerLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(side, f.side);
+    let topology = build_discovery_topology(
+        "FC",
+        0,
+        &[TopologyBoardNode {
+            sender_id: "FC".into(),
+            reachable_endpoints: vec![f.ep],
+            reachable_timesync_sources: vec![],
+            connections: vec!["GS".into()],
+        }],
+    )
+    .unwrap();
+    f.router.rx_from_side(&topology, side).unwrap();
+    f.router.clear_tx_queue();
+    (f, tracker, leases)
+}
+fn next_tracked_retry(f: &Fixture) {
+    f.now
+        .fetch_add(runtime_reliable_retransmit_ms(), Ordering::SeqCst);
+    f.router.process_end_to_end_reliable_timeouts().unwrap();
+    f.router.dispatch_tx_queue_with_timeout(0).unwrap();
+}
+fn finish_tracked(f: &Fixture, wire: &[u8]) {
+    for receipt in completion_actual_receipts(f, "FC", wire) {
+        f.router.rx_packed_from_side(&receipt, f.side).unwrap();
+    }
+}
 #[test]
-fn completion_event_final_receipt_matches_exact_unstarted_retry_outside_locks() {
-    let f = Arc::new(setup("COMPLETION_FINAL_AUDIT"));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let observed = calls.clone();
-    let weak = Arc::downgrade(&f);
-    f.router
-        .set_delivery_completion_observer(
-            7,
-            Some(Arc::new(move |proof| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                let f = weak.upgrade().unwrap();
-                // This acquires the SDK state lock: the completion observer must not hold it.
-                assert_eq!(
-                    f.router
-                        .export_runtime_stats()
-                        .reliable
-                        .end_to_end_pending_count,
-                    0
-                );
-                assert_eq!(proof.epoch(), 7);
-                let wire = f.frames.lock().unwrap()[0].clone();
-                let retry = PendingCanonicalWrite::NeverStartedRetry { epoch: 7 };
-                assert!(
-                    proof.can_cancel(&wire, retry, 7),
-                    "the actual admitted retry is covered by authoritative completion"
-                );
-                assert!(!proof.can_cancel(&wire, PendingCanonicalWrite::Unknown, 7));
-                assert!(!proof.can_cancel(&wire, PendingCanonicalWrite::NeverStartedFirst, 7));
-                assert!(!proof.can_cancel(&wire, PendingCanonicalWrite::Started, 7));
-                assert!(!proof.can_cancel(
-                    &wire,
-                    PendingCanonicalWrite::NeverStartedRetry { epoch: 8 },
-                    7
-                ));
-                assert!(!proof.can_cancel(&wire, retry, 8));
-                assert!(!proof.can_cancel(&wire[..wire.len() - 1], retry, 7));
-                let opaque =
-                    crate::side_transport::wrap_side_transport_frame_parts(3, &[&[0u8; 8], &wire]);
-                assert!(!proof.can_cancel(&opaque, retry, 7));
-                let mut bad_crc = wire.to_vec();
-                *bad_crc.last_mut().unwrap() ^= 1;
-                assert!(!proof.can_cancel(&bad_crc, retry, 7));
-                let sequenced = wire_format::rewrite_reliable_header_owned(&wire, 0, 1, 0)
-                    .unwrap()
-                    .unwrap();
-                assert!(!proof.can_cancel(&sequenced, retry, 7));
-                let original = wire_format::unpack_packet(&wire).unwrap();
-                let changed = Packet::new_with_wire_contract(
-                    original.data_type(),
-                    original.endpoints(),
-                    original.sender(),
-                    original.timestamp(),
-                    original.nonce(),
-                    Arc::from(original.payload()),
-                    original.wire_shape(),
-                    vec![Router::sender_hash("UNRELATED"), Router::sender_hash("FC")].into(),
-                )
-                .unwrap();
-                assert_eq!(changed.packet_id(), proof.packet_id());
-                let changed = wire_format::pack_packet(&changed);
-                assert!(
-                    !proof.can_cancel(&changed, retry, 7),
-                    "same ID cannot replace frozen owners"
-                );
-                let changed_shape = Packet::new_with_wire_contract(
-                    original.data_type(),
-                    original.endpoints(),
-                    original.sender(),
-                    original.timestamp(),
-                    original.nonce(),
-                    Arc::from(original.payload()),
-                    Some(MessageElement::Static(
-                        1,
-                        crate::MessageDataType::Int8,
-                        crate::MessageClass::Data,
-                    )),
-                    original.wire_target_senders().into(),
-                )
-                .unwrap();
-                assert_eq!(changed_shape.packet_id(), proof.packet_id());
-                assert!(!proof.can_cancel(&wire_format::pack_packet(&changed_shape), retry, 7));
-            })),
+fn tracker_final_owner_retires_only_sdk_retry_after_physical_drain() {
+    let (f, _tracker, leases) = tracked_fixture(true);
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    next_tracked_retry(&f);
+    let retry = leases.lock().unwrap().last().unwrap().clone();
+    finish_tracked(&f, first.bytes());
+    assert!(retry.discard_if_retired());
+    assert_eq!(retry.try_start(), WriteStart::Retired);
+    assert_eq!(first.try_start(), WriteStart::Ready);
+}
+#[test]
+fn tracker_first_unknown_and_started_retries_are_retained() {
+    for drained in [false, true] {
+        let (f, _t, leases) = tracked_fixture(true);
+        publish(&f);
+        let first = leases.lock().unwrap()[0].clone();
+        if drained {
+            assert_eq!(first.try_start(), WriteStart::Ready);
+            first.report_drained().unwrap();
+        }
+        next_tracked_retry(&f);
+        let retry = leases.lock().unwrap().last().unwrap().clone();
+        if drained {
+            assert_eq!(retry.try_start(), WriteStart::Ready);
+        }
+        finish_tracked(&f, first.bytes());
+        assert!(!retry.discard_if_retired());
+        assert_eq!(retry.try_start(), WriteStart::Ready);
+        assert!(!first.discard_if_retired());
+    }
+}
+#[test]
+fn tracker_late_admission_cannot_consume_prior_completion() {
+    let (f, _t, leases) = tracked_fixture(false);
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::PendingAdmission);
+    first.admit().unwrap();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    next_tracked_retry(&f);
+    let retry = leases.lock().unwrap().last().unwrap().clone();
+    finish_tracked(&f, first.bytes());
+    retry.admit().unwrap();
+    assert!(!retry.discard_if_retired());
+    assert_eq!(retry.try_start(), WriteStart::Ready);
+}
+#[test]
+fn tracker_reconnect_invalidates_unconsumed_retirement_but_not_consumed_discard() {
+    for discard in [false, true] {
+        let (f, t, leases) = tracked_fixture(true);
+        publish(&f);
+        let first = leases.lock().unwrap()[0].clone();
+        assert_eq!(first.try_start(), WriteStart::Ready);
+        first.report_drained().unwrap();
+        next_tracked_retry(&f);
+        let retry = leases.lock().unwrap().last().unwrap().clone();
+        finish_tracked(&f, first.bytes());
+        if discard {
+            assert!(retry.discard_if_retired());
+        }
+        t.invalidate_generation().unwrap();
+        assert_eq!(
+            retry.try_start(),
+            if discard {
+                WriteStart::Retired
+            } else {
+                WriteStart::Ready
+            }
+        );
+    }
+}
+#[test]
+fn tracker_unrelated_side_reset_does_not_invalidate_radio() {
+    let (f, _t, leases) = tracked_fixture(true);
+    let (_, other) = f
+        .router
+        .add_side_packed_leased_with_priority_and_options(
+            "other",
+            |_, _| Ok(()),
+            RouterSideOptions::default(),
+            RetryTrackerLimits::default(),
         )
         .unwrap();
     publish(&f);
-    let wire = f.frames.lock().unwrap()[0].clone();
-    let receipts = completion_actual_receipts(&f, "FC", &wire);
-    for receipt in &receipts {
-        f.router.rx_packed_from_side(receipt, f.side).unwrap();
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    for receipt in &receipts {
-        f.router.rx_packed_from_side(receipt, f.side).unwrap();
-    }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "late/duplicate unknown receipts create no proof"
-    );
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    next_tracked_retry(&f);
+    let retry = leases.lock().unwrap().last().unwrap().clone();
+    other.invalidate_generation().unwrap();
+    finish_tracked(&f, first.bytes());
+    assert!(retry.discard_if_retired());
 }
 
 #[test]
-fn completion_event_waits_for_every_frozen_owner() {
-    let f = setup("COMPLETION_TWO_OWNERS");
-    let wired = f.router.add_side_packed("wired", |_| Ok(()));
+fn tracker_waits_for_all_frozen_owners_and_rejects_unknown_receipts() {
+    let (f, _t, leases) = tracked_fixture(true);
     let topology = build_discovery_topology(
         "RF",
         0,
@@ -991,176 +1047,32 @@ fn completion_event_waits_for_every_frozen_owner() {
         }],
     )
     .unwrap();
-    f.router.rx_from_side(&topology, wired).unwrap();
+    f.router.rx_from_side(&topology, f.side).unwrap();
     f.router.clear_tx_queue();
-    let events = Arc::new(AtomicUsize::new(0));
-    let count = events.clone();
-    f.router
-        .set_delivery_completion_observer(
-            9,
-            Some(Arc::new(move |_| {
-                count.fetch_add(1, Ordering::SeqCst);
-            })),
-        )
-        .unwrap();
     publish(&f);
-    assert_eq!(
-        f.router
-            .state
-            .lock()
-            .end_to_end_reliable_tx
-            .values()
-            .next()
-            .unwrap()
-            .pending_destinations
-            .len(),
-        2
-    );
-    let wire = f.frames.lock().unwrap()[0].clone();
-    for receipt in completion_actual_receipts(&f, "FC", &wire) {
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    next_tracked_retry(&f);
+    let retry = leases.lock().unwrap().last().unwrap().clone();
+    finish_tracked(&f, first.bytes());
+    assert!(!retry.discard_if_retired());
+    for receipt in completion_actual_receipts(&f, "RF", first.bytes()) {
         f.router.rx_packed_from_side(&receipt, f.side).unwrap();
     }
-    assert_eq!(events.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        f.router
-            .state
-            .lock()
-            .end_to_end_reliable_tx
-            .values()
-            .next()
-            .unwrap()
-            .pending_destinations
-            .len(),
-        1
-    );
-    for receipt in completion_actual_receipts(&f, "RF", &wire) {
-        f.router.rx_packed_from_side(&receipt, wired).unwrap();
-    }
-    assert_eq!(events.load(Ordering::SeqCst), 1);
+    assert!(retry.discard_if_retired());
 }
-
 #[test]
-fn completion_event_never_infers_timeout_eviction_or_unknown_receipts() {
-    for evict in [false, true] {
-        let f = setup("COMPLETION_NO_ABSENCE_INFERENCE");
-        let events = Arc::new(AtomicUsize::new(0));
-        let count = events.clone();
-        f.router
-            .set_delivery_completion_observer(
-                10,
-                Some(Arc::new(move |_| {
-                    count.fetch_add(1, Ordering::SeqCst);
-                })),
-            )
-            .unwrap();
-        publish(&f);
-        let wire = f.frames.lock().unwrap()[0].clone();
-        let id = *f
-            .router
-            .state
-            .lock()
-            .end_to_end_reliable_tx
-            .keys()
-            .next()
-            .unwrap();
-        if evict {
-            f.router.state.lock().end_to_end_reliable_tx.remove(&id);
-        } else {
-            f.router
-                .state
-                .lock()
-                .end_to_end_reliable_tx
-                .get_mut(&id)
-                .unwrap()
-                .retries = runtime_reliable_max_retries();
-            f.now
-                .store(runtime_reliable_retransmit_ms(), Ordering::SeqCst);
-            let _ = f.router.process_end_to_end_reliable_timeouts();
-        }
-        for receipt in completion_actual_receipts(&f, "FC", &wire) {
-            f.router.rx_packed_from_side(&receipt, f.side).unwrap();
-        }
-        assert_eq!(events.load(Ordering::SeqCst), 0);
-    }
-}
-
-#[test]
-fn completion_event_epoch_change_disable_and_late_opt_in_cannot_authorize_old_parents() {
+fn tracker_wrong_owner_publisher_and_legacy_receipts_retain_work() {
     for mode in 0..3 {
-        let f = setup("COMPLETION_EPOCH_AUDIT");
-        let events = Arc::new(AtomicUsize::new(0));
-        let count = events.clone();
-        let observer: Arc<DeliveryCompletionObserver> = Arc::new(move |_| {
-            count.fetch_add(1, Ordering::SeqCst);
-        });
-        if mode != 2 {
-            f.router
-                .set_delivery_completion_observer(11, Some(observer.clone()))
-                .unwrap();
-        }
+        let (f, _t, leases) = tracked_fixture(true);
         publish(&f);
-        let wire = f.frames.lock().unwrap()[0].clone();
-        if mode == 1 {
-            f.router.set_delivery_completion_observer(0, None).unwrap();
-        } else {
-            f.router
-                .set_delivery_completion_observer(12, Some(observer))
-                .unwrap();
-        }
-        for receipt in completion_actual_receipts(&f, "FC", &wire) {
-            f.router.rx_packed_from_side(&receipt, f.side).unwrap();
-        }
-        assert_eq!(events.load(Ordering::SeqCst), 0);
-    }
-}
-
-#[test]
-fn completion_event_callback_can_rotate_epoch_without_deadlock_or_old_generation_pruning() {
-    let f = Arc::new(setup("COMPLETION_EPOCH_CALLBACK"));
-    let weak = Arc::downgrade(&f);
-    let events = Arc::new(AtomicUsize::new(0));
-    let count = events.clone();
-    f.router
-        .set_delivery_completion_observer(
-            13,
-            Some(Arc::new(move |proof| {
-                let f = weak.upgrade().unwrap();
-                f.router.set_delivery_completion_observer(14, None).unwrap();
-                let wire = f.frames.lock().unwrap()[0].clone();
-                assert!(!proof.can_cancel(
-                    &wire,
-                    PendingCanonicalWrite::NeverStartedRetry { epoch: 13 },
-                    14
-                ));
-                count.fetch_add(1, Ordering::SeqCst);
-            })),
-        )
-        .unwrap();
-    publish(&f);
-    let wire = f.frames.lock().unwrap()[0].clone();
-    for receipt in completion_actual_receipts(&f, "FC", &wire) {
-        f.router.rx_packed_from_side(&receipt, f.side).unwrap();
-    }
-    assert_eq!(events.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn completion_event_wrong_owner_publisher_and_legacy_receipts_do_not_emit_proof() {
-    for mode in 0..3 {
-        let f = setup("COMPLETION_BAD_RECEIPTS");
-        let events = Arc::new(AtomicUsize::new(0));
-        let count = events.clone();
-        f.router
-            .set_delivery_completion_observer(
-                15,
-                Some(Arc::new(move |_| {
-                    count.fetch_add(1, Ordering::SeqCst);
-                })),
-            )
-            .unwrap();
-        publish(&f);
-        let wire = f.frames.lock().unwrap()[0].clone();
-        let receipt = completion_actual_receipts(&f, "FC", &wire).remove(0);
+        let first = leases.lock().unwrap()[0].clone();
+        assert_eq!(first.try_start(), WriteStart::Ready);
+        first.report_drained().unwrap();
+        next_tracked_retry(&f);
+        let retry = leases.lock().unwrap().last().unwrap().clone();
+        let receipt = completion_actual_receipts(&f, "FC", first.bytes()).remove(0);
         let ack = wire_format::unpack_packet(&receipt).unwrap();
         let altered = if mode == 2 {
             Packet::new(
@@ -1172,14 +1084,6 @@ fn completion_event_wrong_owner_publisher_and_legacy_receipts_do_not_emit_proof(
             )
             .unwrap()
         } else {
-            let targets = if mode == 0 {
-                vec![Router::sender_hash("UNKNOWN"), Router::sender_hash("GS")]
-            } else {
-                vec![
-                    Router::sender_hash("FC"),
-                    Router::sender_hash("OTHER_PUBLISHER"),
-                ]
-            };
             Packet::new_with_wire_contract(
                 ack.data_type(),
                 ack.endpoints(),
@@ -1188,147 +1092,79 @@ fn completion_event_wrong_owner_publisher_and_legacy_receipts_do_not_emit_proof(
                 ack.nonce().wrapping_add(1),
                 Arc::from(ack.payload()),
                 ack.wire_shape(),
-                targets.into(),
+                if mode == 0 {
+                    vec![Router::sender_hash("UNKNOWN"), Router::sender_hash("GS")]
+                } else {
+                    vec![
+                        Router::sender_hash("FC"),
+                        Router::sender_hash("OTHER_PUBLISHER"),
+                    ]
+                }
+                .into(),
             )
             .unwrap()
         };
         f.router
             .rx_packed_from_side(&wire_format::pack_packet(&altered), f.side)
             .unwrap();
-        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert!(!retry.discard_if_retired());
         if mode == 0 {
             f.router.rx_packed_from_side(&receipt, f.side).unwrap();
-            assert_eq!(
-                events.load(Ordering::SeqCst),
-                1,
-                "unknown owner must not poison real completion"
-            );
+            assert!(retry.discard_if_retired());
         }
     }
 }
-
 #[test]
-fn completion_event_first_receipt_loss_keeps_parent_until_retry_receipt() {
-    let f = setup("COMPLETION_LOST_FIRST_ACK");
-    let events = Arc::new(AtomicUsize::new(0));
-    let count = events.clone();
-    f.router
-        .set_delivery_completion_observer(
-            16,
-            Some(Arc::new(move |_| {
-                count.fetch_add(1, Ordering::SeqCst);
-            })),
+fn tracker_timeout_and_side_reuse_never_authorize_old_proofs() {
+    let (f, t, leases) = tracked_fixture(true);
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    next_tracked_retry(&f);
+    let retry = leases.lock().unwrap().last().unwrap().clone();
+    f.router.remove_side(f.side).unwrap();
+    let (side, _new) = f
+        .router
+        .add_side_packed_leased_with_priority_and_options(
+            "replacement",
+            |_, _| Ok(()),
+            RouterSideOptions::default(),
+            RetryTrackerLimits::default(),
         )
         .unwrap();
-    publish(&f);
-    let wire = f.frames.lock().unwrap()[0].clone();
-    let receipts = completion_actual_receipts(&f, "FC", &wire); // Explicitly lose this actual receipt.
-    assert_eq!(events.load(Ordering::SeqCst), 0);
-    assert!(!f.router.state.lock().end_to_end_reliable_tx.is_empty());
-    f.now
-        .store(runtime_reliable_retransmit_ms(), Ordering::SeqCst);
-    f.router.process_end_to_end_reliable_timeouts().unwrap();
-    f.router.dispatch_tx_queue_with_timeout(0).unwrap();
-    assert!(
-        f.calls.load(Ordering::SeqCst) >= 2,
-        "first ACK loss retains genuine retry behavior"
-    );
-    for receipt in receipts {
-        f.router.rx_packed_from_side(&receipt, f.side).unwrap();
-    }
-    assert_eq!(events.load(Ordering::SeqCst), 1);
+    assert_eq!(side, f.side);
+    finish_tracked(&f, first.bytes());
+    assert!(!retry.discard_if_retired());
+    assert_eq!(retry.try_start(), WriteStart::Ready);
+    t.invalidate_generation().unwrap();
 }
 
 #[test]
-fn completion_event_epoch_bytes_are_admitted_and_released_with_bounded_parent() {
-    let f = setup("COMPLETION_EPOCH_BUDGET");
+fn tracker_retry_provenance_survives_child_queue_admission_and_refusal() {
+    let (f, _t, leases) = tracked_fixture(true);
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    f.mode.store(0, Ordering::SeqCst);
+    next_tracked_retry(&f);
     assert!(
         f.router
-            .set_delivery_completion_observer(0, Some(Arc::new(|_| {})))
-            .is_err()
+            .state
+            .lock()
+            .transmit_queue
+            .iter()
+            .any(|q| q.disposable & TX_E2E_CHILD != 0 && q.disposable & TX_E2E_RETRY != 0)
     );
-    f.router
-        .set_delivery_completion_observer(17, Some(Arc::new(|_| {})))
-        .unwrap();
-    let packet =
-        RouterItem::Packet(Packet::new(f.ty, &[f.ep], "GS", 123, Arc::from([1u8])).unwrap());
-    let budget = f.router.state.lock().memory.max_queue_budget;
-    let before = f.router.state.lock().shared_queue_bytes_used();
-    f.router.state.lock().memory.max_queue_budget = before + size_of::<u64>() - 1;
-    assert!(matches!(
-        f.router.register_end_to_end_reliable_tx(&packet, None),
-        Err(TelemetryError::Io("memory pressure"))
-    ));
-    assert!(f.router.state.lock().end_to_end_reliable_tx.is_empty());
-    f.router.state.lock().memory.max_queue_budget = budget;
-    f.router
-        .register_end_to_end_reliable_tx(&packet, None)
-        .unwrap();
-    assert_eq!(
-        f.router.state.lock().shared_queue_bytes_used(),
-        before + size_of::<u64>()
-    );
-    f.router.state.lock().end_to_end_reliable_tx.clear();
-    assert_eq!(f.router.state.lock().shared_queue_bytes_used(), before);
-}
-
-#[test]
-fn completion_event_reentrant_receipt_during_retry_handoff_waits_for_accepted_owner() {
-    let f = Arc::new(setup("COMPLETION_CALLBACK_HANDOFF_RACE"));
-    let pending = Arc::new(Mutex::new(Vec::<Arc<[u8]>>::new()));
-    let handed_off = Arc::new(AtomicUsize::new(0));
-    let observer_handoff = handed_off.clone();
-    let queue = pending.clone();
-    f.router
-        .set_delivery_completion_observer(
-            18,
-            Some(Arc::new(move |proof| {
-                assert_eq!(observer_handoff.load(Ordering::Acquire), 1);
-                let mut queue = queue.lock().unwrap();
-                queue.retain(|wire| {
-                    !proof.can_cancel(
-                        wire,
-                        PendingCanonicalWrite::NeverStartedRetry { epoch: 18 },
-                        18,
-                    )
-                });
-            })),
-        )
-        .unwrap();
-    let weak = Arc::downgrade(&f);
-    let queue = pending.clone();
-    let tx_handoff = handed_off.clone();
-    f.router.state.lock().sides[f.side]
-        .as_mut()
-        .unwrap()
-        .tx_handler = RouterTxHandlerFn::Packed(Arc::new(move |wire| {
-        let f = weak.upgrade().unwrap();
-        if !wire_format::peek_envelope(wire).is_ok_and(|env| env.ty == f.ty) {
-            return Ok(());
-        }
-        let call = f.calls.fetch_add(1, Ordering::SeqCst);
-        if call == 0 {
-            return Ok(());
-        } // first actual write loses its receipt
-        let receipts = completion_actual_receipts(&f, "FC", wire);
-        for receipt in receipts {
-            f.router.rx_packed_from_side(&receipt, f.side).unwrap();
-        }
-        // A receipt arrives while the callback is still transferring this retry.
-        // The SDK queues reentrant RX; it cannot notify before this owner appears.
-        assert!(!f.router.state.lock().end_to_end_reliable_tx.is_empty());
-        queue.lock().unwrap().push(Arc::from(wire));
-        tx_handoff.store(1, Ordering::Release);
-        Ok(())
-    }));
-    publish(&f);
-    f.now
-        .store(runtime_reliable_retransmit_ms(), Ordering::SeqCst);
-    f.router.process_end_to_end_reliable_timeouts().unwrap();
+    f.now.fetch_add(2, Ordering::SeqCst);
     f.router.dispatch_tx_queue_with_timeout(0).unwrap();
-    assert_eq!(handed_off.load(Ordering::Acquire), 1);
-    assert!(pending.lock().unwrap().is_empty());
-    f.router.process_all_queues().unwrap();
-    assert!(pending.lock().unwrap().is_empty());
-    assert!(f.router.state.lock().end_to_end_reliable_tx.is_empty());
+    assert_eq!(leases.lock().unwrap().len(), 1);
+    f.mode.store(1, Ordering::SeqCst);
+    f.now.fetch_add(2, Ordering::SeqCst);
+    f.router.dispatch_tx_queue_with_timeout(0).unwrap();
+    let retry = leases.lock().unwrap().last().unwrap().clone();
+    assert_ne!(retry.bytes().as_ptr(), first.bytes().as_ptr());
+    finish_tracked(&f, first.bytes());
+    assert!(retry.discard_if_retired());
 }

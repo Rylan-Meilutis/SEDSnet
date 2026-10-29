@@ -10,9 +10,9 @@ Wire format and application identities remain compatible with 4.3.2.
   clock identity handling and existing memory budgets.
 - Keep accepted reliable retries owned through side backpressure, including
   partial child delivery and delayed receipts.
-- Add an optional hosted completion observer for retiring never-started
-  canonical retries after every frozen owner acknowledges, with explicit
-  transport-generation checks.
+- Add optional side-scoped transport retry tracking. Retire never-started
+  canonical SDK retries internally after every frozen owner acknowledges,
+  preserving physical write progress and transport-generation boundaries.
 - Add an explicit opt-in latest-value policy for one packed egress per router or
   relay. Keep the newest pending best-effort sample for each source, type, and
   endpoint flow before that egress encodes it, preserving its queue position.
