@@ -251,3 +251,36 @@ the radio is in an RX window or otherwise unable to accept a frame. The router/r
 queued and retries during later queue processing. If the radio driver measures a bring-up probe or
 slot throughput, feed that sample into `note_side_link_probe_sample()` so adaptive routing learns
 that the radio has less headroom than Ethernet or other high-rate links.
+
+
+### Asynchronous packed transport retry ownership
+
+Hosted Rust drivers can opt into `Router::add_side_packed_leased_with_priority_and_options`.
+The callback receives `PackedWriteLease` instead of borrowed bytes and retains it
+through physical IO. Existing packed callbacks and the wire format are unchanged;
+embedded and `no_std` builds have no tracker API or tracker fields.
+
+Call `admit()` when the external queue accepts the write, before publishing it to a
+worker. Before capacity or pacing waits, `discard_if_retired()` can consume an
+SDK-authorized retirement. Immediately before the first actual write attempt, call
+`try_start()` and preserve the lease across errors and partial writes. Report
+`report_drained()` only after the complete frame has physically written and drained.
+Callback success and removing an item from an application queue do not establish
+physical drain. Clones refer to the same logical write; they cannot represent another
+queue owner or retransmission. `try_start_batch()` atomically validates and starts a
+same-side group; a retired member starts none of its previously unstarted peers.
+
+The SDK tracks its own retry intent and all frozen owner receipts. It does not expose
+receipt callbacks or completion IDs to the driver. Retirement requires a genuine SDK
+retry, matching canonical bytes and contract, a prior complete physical drain, current
+side generation, and external admission before the final matching receipt. First,
+started, partial, encoded, ordered-hop, unknown, and over-budget work remains live.
+Admission after that receipt is never cancelled retrospectively.
+
+Keep the returned `RetryTracker` with the physical transport. Invalidate its generation
+on a known reconnect, peer restart, or lost progress history. Each side registration
+has a distinct identity, including reuse of a numeric side ID. Resetting one side does
+not invalidate other sides. Limits bound pending bookkeeping and retained drain
+history separately; missing evidence or exhausted capacity disables pruning for that
+write. The application remains responsible for its bounded external queue, releasing
+reservations exactly once, and ordinary state synchronization after a peer restart.

@@ -302,18 +302,18 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     for name in ["AB", "VB"] {
         route.announcers.insert(
             name.into(),
-            DiscoverySenderState {
+            Box::new(DiscoverySenderState {
                 last_seen_ms: 1,
                 reachable: vec![endpoint],
                 advertised_reachable: vec![endpoint],
                 ..Default::default()
-            },
+            }),
         );
     }
     let mut st = router.state.lock();
     st.discovery_routes.insert(side, route.clone());
     st.push_transmit(TxQueued {
-        disposable: true,
+        disposable: TX_DISPOSABLE,
         item: RouterTxItem::ToSide {
             src: None,
             dst: side,
@@ -328,7 +328,7 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     })
     .unwrap();
     st.push_transmit(TxQueued {
-        disposable: true,
+        disposable: TX_DISPOSABLE,
         item: RouterTxItem::ToSide {
             src: None,
             dst: side,
@@ -742,7 +742,7 @@ fn schema_reclaims_queued_data_before_refusing_update() {
     {
         let mut st = node.state.lock();
         st.push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item: RouterTxItem::ToSide {
                 src: None,
                 dst: side,
@@ -848,7 +848,7 @@ fn discovery_snapshot_reclaims_telemetry_but_preserves_commands_and_acks() {
         node.state
             .lock()
             .push_transmit(TxQueued {
-                disposable: true,
+                disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
                     src: None,
                     dst: side,

@@ -86,3 +86,30 @@ file(WRITE "${CMAKE_BINARY_DIR}/link-protection.txt" "${protection}")
                 self.assertNotIn("-Wa,--noexecstack", by_kind[kind])
             self.assertIn("-Wa,--noexecstack", by_kind[".S"])
             self.assertIn("-Wl,-z,noexecstack", (build / "link-protection.txt").read_text())
+
+class LatestValueFeatureContractTests(unittest.TestCase):
+    def test_c_header_exposes_setters_only_for_matching_feature(self):
+        compiler = shutil.which('cc')
+        self.assertIsNotNone(compiler, 'C compiler required for SDK C header contract')
+        program = '#include "sedsnet.h"\nvoid check(SedsRouter *r, SedsRelay *l) { seds_router_set_latest_value_side(r, 0); seds_relay_set_latest_value_side(l, 0); }\n'
+        command = [compiler, '-std=c11', '-Werror=implicit-function-declaration', '-fsyntax-only', '-x', 'c', '-I', str(CMAKE_TEMPLATE.parent/'C-Headers')]
+        for flag in [[], ['-DSEDS_ENABLE_LATEST_VALUE_EGRESS=0']]:
+            result = subprocess.run([*command, *flag, '-'], input=program, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0, 'feature-OFF headers must not promise unavailable symbols')
+            self.assertIn('seds_router_set_latest_value_side', result.stderr)
+            self.assertIn('seds_relay_set_latest_value_side', result.stderr)
+        result = subprocess.run([*command, '-DSEDS_ENABLE_LATEST_VALUE_EGRESS=1', '-'], input=program, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cmake_option_exports_matching_header_macro_and_cargo_feature(self):
+        with tempfile.TemporaryDirectory(prefix='latest feature contract ') as temp:
+            root = Path(temp)
+            (root/'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 3.22)\nproject(latest_contract NONE)\nadd_subdirectory("'+str(CMAKE_TEMPLATE.parent)+'" sdk)\nget_target_property(definitions sedsnet INTERFACE_COMPILE_DEFINITIONS)\nfile(WRITE "${CMAKE_BINARY_DIR}/definitions.txt" "${definitions}")\n')
+            for state in ['OFF', 'ON']:
+                build = root/state
+                result = subprocess.run(['cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DSEDSNET_LATEST_VALUE_EGRESS='+state], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                definitions = (build/'definitions.txt').read_text()
+                ninja = (build/'build.ninja').read_text()
+                self.assertEqual('SEDS_ENABLE_LATEST_VALUE_EGRESS=1' in definitions, state=='ON')
+                self.assertEqual('--features latest-value-egress' in ninja, state=='ON')

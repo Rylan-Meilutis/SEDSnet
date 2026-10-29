@@ -69,7 +69,7 @@ fn check_window_credit(ordered: bool, packed: bool, route_churn: bool) {
         let route = st.discovery_routes.entry(side).or_default();
         route.announcers.insert(
             "sink".into(),
-            DiscoverySenderState {
+            Box::new(DiscoverySenderState {
                 last_seen_ms: 1000,
                 advertised_address: Some(sender_address_u32("sink")),
                 reachable: vec![remote],
@@ -83,7 +83,7 @@ fn check_window_credit(ordered: bool, packed: bool, route_churn: bool) {
                 has_full_topology: true,
                 has_schema: true,
                 ..Default::default()
-            },
+            }),
         );
         Router::recompute_discovery_side_state(route);
     }

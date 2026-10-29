@@ -495,11 +495,11 @@ fn malformed_discovery_preserves_retained_relay_routes() {
     let mut route = DiscoverySideState::default();
     route.announcers.insert(
         "VB".into(),
-        DiscoverySenderState {
+        Box::new(DiscoverySenderState {
             last_seen_ms: 1,
             advertised_reachable: vec![crate::DataEndpoint::named("RADIO")],
             ..Default::default()
-        },
+        }),
     );
     relay
         .state
@@ -535,12 +535,12 @@ fn discovery_growth_drops_telemetry_before_live_routes() {
     for name in ["AB", "VB"] {
         route.announcers.insert(
             name.into(),
-            DiscoverySenderState {
+            Box::new(DiscoverySenderState {
                 last_seen_ms: 1,
                 reachable: vec![endpoint],
                 advertised_reachable: vec![endpoint],
                 ..Default::default()
-            },
+            }),
         );
     }
     let mut st = relay.state.lock();
@@ -597,12 +597,12 @@ fn incoming_relay_packet_cannot_evict_the_only_live_route() {
     for name in ["AB", "VB"] {
         route.announcers.insert(
             name.into(),
-            DiscoverySenderState {
+            Box::new(DiscoverySenderState {
                 last_seen_ms: 1,
                 reachable: vec![endpoint],
                 advertised_reachable: vec![endpoint],
                 ..Default::default()
-            },
+            }),
         );
     }
     let mut st = relay.state.lock();

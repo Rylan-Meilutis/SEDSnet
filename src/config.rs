@@ -3160,11 +3160,16 @@ fn compiled_type_definition(id: DataType) -> Option<&'static DataTypeDefinition>
         Some(unsafe { &*cached })
     } else {
         let found = EMBEDDED_BUILTIN_TYPES.get(id.0 as usize).or_else(|| {
-            EMBEDDED_SCHEMA_TYPES.binary_search_by_key(&id.0, |def| def.id.0)
-                .ok().map(|index| &EMBEDDED_SCHEMA_TYPES[index])
+            EMBEDDED_SCHEMA_TYPES
+                .binary_search_by_key(&id.0, |def| def.id.0)
+                .ok()
+                .map(|index| &EMBEDDED_SCHEMA_TYPES[index])
         });
         if let Some(definition) = found {
-            slot.store(core::ptr::from_ref(definition).cast_mut(), Ordering::Release);
+            slot.store(
+                core::ptr::from_ref(definition).cast_mut(),
+                Ordering::Release,
+            );
         }
         found
     };

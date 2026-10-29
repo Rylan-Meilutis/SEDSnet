@@ -196,6 +196,14 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.3 highlights
+
+- Opt one packed egress into bounded newest-pending best-effort reports before
+  encoding, preserving other destinations and protected delivery owners.
+- Enable the optional `latest-value-egress` feature, then configure the
+  default-disabled policy through Rust or C; see
+  [latest-value egress](docs/latest-value-egress.md) for eligibility and limits.
+
 ### Version 4.3.2 highlights
 
 - Reduce contiguous reliable-tracking allocations on fragmented embedded heaps.

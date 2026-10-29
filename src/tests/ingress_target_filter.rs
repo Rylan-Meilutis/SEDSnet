@@ -22,11 +22,11 @@ fn route(node: &Router, side: usize, name: &str) {
     let entry = st.discovery_routes.entry(side).or_default();
     entry.announcers.insert(
         name.into(),
-        DiscoverySenderState {
+        Box::new(DiscoverySenderState {
             last_seen_ms: now,
             advertised_address: Some(sender_address_u32(name)),
             ..Default::default()
-        },
+        }),
     );
     Router::recompute_discovery_side_state(entry);
 }

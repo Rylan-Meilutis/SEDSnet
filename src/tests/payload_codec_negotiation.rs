@@ -268,7 +268,7 @@ fn required_downgrade_reserves_expanded_queue_credit_before_handler_dispatch() {
         let mut state = owner.state.lock();
         assert!(state.codec_reserved_bytes > 0);
         let queued = state.push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item: RouterTxItem::Broadcast(RouterItem::Packet(competing.clone())),
             ignore_local: true,
             priority: 10,

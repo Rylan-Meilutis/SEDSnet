@@ -31,12 +31,12 @@ fn missing(router: &Router, side: RouterSideId, name: &str, address: u32, now: u
         .announcers
         .insert(
             name.into(),
-            DiscoverySenderState {
+            Box::new(DiscoverySenderState {
                 advertised_address: Some(address),
                 has_full_topology: true,
                 last_seen_ms: now,
                 ..DiscoverySenderState::default()
-            },
+            }),
         );
     st.discovery_side_throttle
         .entry(side)
@@ -336,7 +336,7 @@ fn progressive_catalog_closed_loop_avoids_a_second_full_response() {
         .state
         .lock()
         .push_transmit(TxQueued {
-            disposable: true,
+            disposable: TX_DISPOSABLE,
             item: RouterTxItem::ToSide {
                 src: None,
                 dst: pside,

@@ -807,6 +807,13 @@ int32_t seds_router_copy_memory_counters(SedsRouter *r, uint32_t *words, size_t 
 /* Return1 if work remains,0 if idle, negative status for an invalid router.
  * Workers must bound consecutive active passes to preserve scheduler fairness. */
 int32_t seds_router_has_queued_work(SedsRouter *r);
+/* Opt one packed egress into latest pending reports; -1 disables, IDs 0..126.
+ * Only never-attempted plaintext best-effort data below priority 200 is eligible. */
+/* Defined by the CMake interface only when the matching Cargo feature is built. */
+#if defined(SEDS_ENABLE_LATEST_VALUE_EGRESS) && SEDS_ENABLE_LATEST_VALUE_EGRESS
+int32_t seds_router_set_latest_value_side(SedsRouter *r, int32_t side);
+int32_t seds_relay_set_latest_value_side(SedsRelay *r, int32_t side);
+#endif
 /* Allocation-free versioned queue accounting; required word count is16. */
 int32_t seds_router_copy_queue_counters(SedsRouter *r, uint32_t *words, size_t capacity);
 

@@ -1156,3 +1156,6 @@ pub fn try_enum_from_i32<E: ReprI32Enum>(x: i32) -> Option<E> {
     let e = unsafe { (&x as *const i32 as *const E).read() };
     Some(e)
 }
+
+#[cfg(any(feature = "discovery", feature = "timesync"))]
+mod peer_record;
