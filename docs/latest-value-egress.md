@@ -53,10 +53,19 @@ Existing fairness and admission rules still apply to distinct flows.
 Coalescing occurs on canonical samples before this egress encodes SDT templates,
 compression history or chunks. Selection for dispatch permanently removes the
 replaceable marker. Even a refused first callback may have advanced encoded
-history; refusal never grants permission to discard that owner. While a refused
-or partial owner remains on the selected side, fresh latest-value work waits
-before encoding. Its never-attempted pending values can still coalesce. Retry
-owners and protected controls keep their normal dispatch opportunities, and
+history; refusal never grants permission to discard that owner. Fresh latest-value
+work waits before encoding while a refused or partial owner's encoding history
+must remain serialized. Its never-attempted pending values can still coalesce.
+
+Starting with 4.3.4, an SDK-owned streamed canonical discovery catalog can resume
+alongside independent fresh reports. Its already-accepted prefix must match the
+same catalog identity and frame size, remain within the existing transfer timeout,
+and be known not to depend on the side's encoding dictionary. The catalog remains
+owned and cannot be evicted. First refusals, packed or unknown owners, and
+dictionary-dependent transfers keep the conservative history barrier. This does
+not change discovery cadence or allocate additional transport capacity.
+
+Retry owners and protected controls keep their normal dispatch opportunities, and
 other sides and local handlers continue. Attempted owners on the opted-in side
 are excluded from both fair and priority queue eviction; pressure can refuse new
 admission rather than discard those owners. No transport-ready timing or CTS

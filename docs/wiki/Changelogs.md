@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## Version 4.3.4 highlights
+
+Wire format and application identities remain compatible with 4.3.3.
+
+- Keep latest-value reports flowing while an accepted canonical discovery
+  catalog transfer resumes on the same packed side.
+- Match the active transfer identity and frame size before allowing independent
+  reports; preserve timeout checks and dictionary-dependent history barriers.
+- Retain catalog queue ownership, protected retries, and existing memory budgets.
+
 ## Version 4.3.3 highlights
 
 Wire format and application identities remain compatible with 4.3.2.

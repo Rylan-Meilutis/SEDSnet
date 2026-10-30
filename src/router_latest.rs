@@ -115,20 +115,62 @@ impl RouterInner {
         };
         self.latest_side() == Some(*dst) && self.latest_data_eligible(data, item.priority)
     }
+    // This must mirror the canonical Packet catalog streaming branch. The
+    // network-critical type alone is insufficient: require the exact active
+    // independent transfer key and an accepted prefix. Unknown representations
+    // and first refusals retain the conservative encoding-history barrier.
+    fn independently_streaming_catalog(&self, queued: &TxQueued, now_ms: u64) -> bool {
+        let RouterTxItem::ToSide {
+            dst,
+            data: RouterItem::Packet(packet),
+            ..
+        } = &queued.item
+        else {
+            return false;
+        };
+        if packet.data_type() != DataType::DiscoverySchema {
+            return false;
+        }
+        let Some(side) = self.sides.get(*dst).and_then(Option::as_ref) else {
+            return false;
+        };
+        if side.opts.max_frame_bytes == 0 || packet.payload().len() <= side.opts.max_frame_bytes {
+            return false;
+        }
+        let Some(progress) = self
+            .side_transport
+            .get(dst)
+            .and_then(|transport| transport.tx_chunk_progress.as_ref())
+        else {
+            return false;
+        };
+        // packet_id hashes the payload. Avoid that scan for idle, expired,
+        // stateful or never-accepted progress before deriving the exact key.
+        if !progress.has_live_independent_progress(now_ms) {
+            return false;
+        }
+        let key = crate::side_transport::canonical_packet_progress_key(
+            packet.packet_id(),
+            side.opts.max_frame_bytes,
+        );
+        progress.has_independent_progress(key, now_ms)
+    }
+
     // A refused/partial owner must finish before another fresh report can
     // advance this side's encoding history. Controls and other sides bypass it.
-    pub(super) fn latest_blocked_side(&self) -> Option<RouterSideId> {
+    pub(super) fn latest_blocked_side(&self, now_ms: u64) -> Option<RouterSideId> {
         let side = self.latest_side()?;
         let partial = self.side_transport.get(&side).is_some_and(|state| {
             state
                 .tx_chunk_progress
                 .as_ref()
-                .is_some_and(|progress| !progress.is_idle())
+                .is_some_and(|progress| progress.blocks_latest())
         });
         (partial
             || self.transmit_queue.iter().any(|queued| {
                 queued.disposable & TX_HISTORY_OWNED != 0
                     && matches!(&queued.item, RouterTxItem::ToSide { dst, .. } if *dst == side)
+                    && !self.independently_streaming_catalog(queued, now_ms)
             }))
         .then_some(side)
     }
@@ -401,7 +443,7 @@ mod tests {
             .tx_chunk_progress
             .as_mut()
             .unwrap();
-        progress.begin(123, 0).unwrap();
+        progress.begin(123, 0, true).unwrap();
         progress.finish(123, 1, 0, &Err::<(), _>(TelemetryError::Io("side tx busy")));
         st.push_transmit(queued(side, packet(ty, &[ep], "GS", 4, 1)))
             .unwrap();
@@ -698,6 +740,349 @@ mod tests {
             values
                 .iter()
                 .all(|(_, payload)| payload.as_slice() == expected.payload())
+        );
+    }
+    #[test]
+    #[cfg(feature = "discovery")]
+    fn canonical_catalog_chunks_do_not_block_independent_latest_reports() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        };
+        let (ty, ep) = schema("LATEST_CANONICAL_CATALOG", crate::ReliableMode::None, 0);
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("RF"),
+            Box::new(move || clock.load(Ordering::SeqCst)),
+        );
+        let allowance = Arc::new(AtomicUsize::new(1));
+        let credit = allowance.clone();
+        let captured = Arc::new(Mutex::new(Vec::<Arc<[u8]>>::new()));
+        let frames = captured.clone();
+        let options = RouterSideOptions::default().with_small_packet_transport(192);
+        let side = router.add_side_packed_with_options(
+            "radio",
+            move |raw| {
+                if raw.starts_with(crate::side_transport::SIDE_TRANSPORT_MAGIC)
+                    && raw.get(3) == Some(&SIDE_TRANSPORT_KIND_CHUNK)
+                    && credit
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_err()
+                {
+                    return Err(TelemetryError::Io("side tx busy"));
+                }
+                frames.lock().unwrap().push(Arc::from(raw));
+                Ok(())
+            },
+            options.clone(),
+        );
+        router.clear_tx_queue();
+        router.set_latest_value_side(Some(side)).unwrap();
+        let catalog = crate::discovery::build_discovery_schema("RF", 0).unwrap();
+        assert!(catalog.payload().len() > 192);
+        let expected_catalog = catalog.payload().to_vec();
+        router
+            .emit_internal_tx(
+                RouterTxItem::ToSide {
+                    src: None,
+                    dst: side,
+                    data: RouterItem::Packet(catalog),
+                },
+                true,
+                true,
+            )
+            .unwrap();
+        router.dispatch_tx_queue_with_timeout(0).unwrap();
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        assert!(
+            !router.state.lock().side_transport[&side]
+                .tx_chunk_progress
+                .as_ref()
+                .unwrap()
+                .is_idle()
+        );
+        now.store(2, Ordering::SeqCst);
+        router
+            .queue_latest_egress(side, None, &packet(ty, &[ep], "FC", 2, 1))
+            .unwrap();
+        for tick in 2..=10 {
+            now.store(tick, Ordering::SeqCst);
+            match router.dispatch_tx_queue_with_timeout(0) {
+                Ok(()) | Err(TelemetryError::HandlerError(_)) => {}
+                Err(error) => panic!("unexpected dispatch error: {error:?}"),
+            }
+        }
+        assert!(
+            captured.lock().unwrap().len() > 1,
+            "a canonical catalog owns no TX dictionary history; independent reports must pass before its remaining chunks"
+        );
+        // Complete the exact retained transfer, then prove both original owners
+        // decode in one real receiver despite report/chunk interleaving.
+        allowance.store(1000, Ordering::SeqCst);
+        now.store(12, Ordering::SeqCst);
+        // Busy retry retains and resumes the exact original canonical owner.
+        router.dispatch_tx_queue_with_timeout(0).unwrap();
+        assert_eq!(router.state.lock().transmit_queue.len(), 0);
+        let receiver =
+            Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), Box::new(|| 12));
+        let input = receiver.add_side_packed_with_options("radio", |_| Ok(()), options);
+        let mut catalogs = Vec::new();
+        let mut reports = Vec::new();
+        for frame in captured.lock().unwrap().iter() {
+            if let Some(canonical) = receiver.decode_side_transport_frame(input, frame).unwrap() {
+                let packet = wire_format::unpack_packet(&canonical).unwrap();
+                if packet.data_type() == DataType::DiscoverySchema {
+                    catalogs.push(packet.payload().to_vec());
+                }
+                if packet.data_type() == ty {
+                    reports.push((packet.timestamp(), packet.payload().to_vec()));
+                }
+            }
+        }
+        assert_eq!(catalogs, [expected_catalog]);
+        assert_eq!(reports, [(2, vec![2])]);
+    }
+    #[test]
+    #[cfg(feature = "discovery")]
+    fn schema_service_keeps_two_five_hz_flows_fresh_under_finite_capacity() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        };
+        let flows = [
+            schema("LATEST_CATALOG_FLOW_A", crate::ReliableMode::None, 0),
+            schema("LATEST_CATALOG_FLOW_B", crate::ReliableMode::None, 0),
+        ];
+        let now = Arc::new(AtomicU64::new(0));
+        let time = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("RF"),
+            Box::new(move || time.load(Ordering::SeqCst)),
+        );
+        // Finite synthetic transport: at most320B per200ms, no unused credit
+        // carried forward. This is an SDK service proof, not an RFD profile.
+        let allowance = Arc::new(AtomicUsize::new(320));
+        let credit = allowance.clone();
+        let accepted = Arc::new(Mutex::new(Vec::<Arc<[u8]>>::new()));
+        let output = accepted.clone();
+        let options = RouterSideOptions::default().with_small_packet_transport(192);
+        let side = router.add_side_packed_with_options(
+            "finite-radio",
+            move |raw| {
+                credit
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        n.checked_sub(raw.len())
+                    })
+                    .map_err(|_| TelemetryError::Io("side tx busy"))?;
+                output.lock().unwrap().push(Arc::from(raw));
+                Ok(())
+            },
+            options.clone(),
+        );
+        router.clear_tx_queue();
+        router.set_latest_value_side(Some(side)).unwrap();
+        let request = crate::discovery::build_discovery_schema_request("GS", 0).unwrap();
+        router
+            .learn_discovery_packet(&request, Some(side), true)
+            .unwrap();
+        // Freeze the real service's one admitted catalog snapshot. Never inject
+        // or replace its owner; production poll/dispatch must retain and finish it.
+        let expected = {
+            let st = router.state.lock();
+            st.transmit_queue
+                .iter()
+                .find_map(|q| match &q.item {
+                    RouterTxItem::ToSide {
+                        data: RouterItem::Packet(p),
+                        ..
+                    } if p.data_type() == DataType::DiscoverySchema => {
+                        Some((p.packet_id(), p.payload().to_vec()))
+                    }
+                    _ => None,
+                })
+                .expect("real schema request admitted a catalog")
+        };
+        assert!(expected.1.len() > 192);
+        let duration = ((expected.1.len().div_ceil(176) as u64) * 200 + 4000).max(8000);
+        assert!(
+            duration <= 120000,
+            "fixture catalog exceeds bounded native scene"
+        );
+        let time = now.clone();
+        let receiver = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || time.load(Ordering::SeqCst)),
+        );
+        let input = receiver.add_side_packed_with_options("radio", |_| Ok(()), options);
+        let mut reports = [Vec::<(u64, u64)>::new(), Vec::new()];
+        let mut catalogs = Vec::new();
+        for ms in 0..=duration {
+            now.store(ms, Ordering::SeqCst);
+            if ms % 200 == 0 {
+                allowance.store(320, Ordering::SeqCst);
+                for (index, &(ty, ep)) in flows.iter().enumerate() {
+                    router
+                        .queue_latest_egress(
+                            side,
+                            None,
+                            &packet(ty, &[ep], "FC", ms, [24, 12][index]),
+                        )
+                        .unwrap();
+                }
+            }
+            router.poll_schema_response_on_side(side).unwrap();
+            match router.dispatch_tx_queue_with_timeout(0) {
+                Ok(()) | Err(TelemetryError::HandlerError(_)) => {}
+                Err(error) => panic!("unexpected finite transport error: {error:?}"),
+            }
+            for raw in core::mem::take(&mut *accepted.lock().unwrap()) {
+                if let Some(canonical) = receiver.decode_side_transport_frame(input, &raw).unwrap()
+                {
+                    let p = wire_format::unpack_packet(&canonical).unwrap();
+                    if p.data_type() == DataType::DiscoverySchema {
+                        crate::discovery::decode_discovery_schema(&p).unwrap();
+                        catalogs.push((p.packet_id(), p.payload().to_vec()));
+                    }
+                    for (n, &(ty, _)) in flows.iter().enumerate() {
+                        if p.data_type() == ty {
+                            assert_eq!(p.payload(), vec![p.timestamp() as u8; [24, 12][n]]);
+                            assert!(
+                                ms - p.timestamp() <= 500,
+                                "fresh report waited{}ms",
+                                ms - p.timestamp()
+                            );
+                            reports[n].push((p.timestamp(), ms));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            catalogs,
+            [expected],
+            "the actual service must finish the single original catalog"
+        );
+        let state = router.state.lock();
+        let throttle = &state.discovery_side_throttle[&side];
+        assert!(!throttle.schema_response_active && !throttle.schema_response_pending);
+        for flow in reports {
+            assert!(
+                flow.first().expect("flow delivered a report").1 <= 400,
+                "startup schema suppressed the first five-Hz report until {:?}",
+                flow.first()
+            );
+            let steady = flow
+                .iter()
+                .filter(|(source, _)| *source >= 1000)
+                .collect::<Vec<_>>();
+            assert!(
+                steady.len() as u64 >= (duration - 1000) / 200 - 1,
+                "five-Hz report cadence lost during catalog"
+            );
+            assert!(
+                steady.windows(2).all(|w| w[1].1 - w[0].1 <= 400),
+                "unbounded report gap"
+            );
+        }
+    }
+    #[test]
+    #[cfg(feature = "discovery")]
+    fn canonical_owner_requires_exact_accepted_independent_progress() {
+        let (router, side) = setup();
+        router.set_latest_value_side(Some(side)).unwrap();
+        let catalog = crate::discovery::build_discovery_schema("RF", 0).unwrap();
+        assert!(catalog.payload().len() > 192);
+        let key = crate::side_transport::canonical_packet_progress_key(catalog.packet_id(), 192);
+        let mut owner = queued(side, RouterItem::Packet(catalog));
+        owner.disposable = TX_HISTORY_OWNED;
+        let mut state = router.state.lock();
+        state.sides[side].as_mut().unwrap().opts =
+            RouterSideOptions::default().with_small_packet_transport(192);
+        state.push_transmit(owner).unwrap();
+        let independent = |state: &RouterInner| {
+            state.independently_streaming_catalog(state.transmit_queue.get(0).unwrap(), 0)
+        };
+        assert!(!independent(&state));
+        assert_eq!(state.latest_blocked_side(0), Some(side));
+        state
+            .side_transport
+            .get_mut(&side)
+            .unwrap()
+            .tx_chunk_progress = Some(Box::default());
+        fn progress(
+            state: &mut RouterInner,
+            side: usize,
+        ) -> &mut crate::side_transport::SideTxProgress {
+            state
+                .side_transport
+                .get_mut(&side)
+                .unwrap()
+                .tx_chunk_progress
+                .as_mut()
+                .unwrap()
+        }
+        progress(&mut state, side).begin(key ^ 1, 0, false).unwrap();
+        progress(&mut state, side).finish(
+            key ^ 1,
+            1,
+            0,
+            &Err::<(), _>(TelemetryError::Io("side tx busy")),
+        );
+        assert!(
+            !independent(&state),
+            "a different owner cannot authorize bypass"
+        );
+        progress(&mut state, side).begin(key, 0, false).unwrap();
+        assert!(
+            !independent(&state),
+            "first refusal has no accepted prefix proof"
+        );
+        progress(&mut state, side).finish(
+            key,
+            1,
+            0,
+            &Err::<(), _>(TelemetryError::Io("side tx busy")),
+        );
+        assert!(independent(&state));
+        assert!(
+            !state.independently_streaming_catalog(state.transmit_queue.get(0).unwrap(), 2001),
+            "stale progress cannot authorize bypass before another begin call"
+        );
+        assert_eq!(state.latest_blocked_side(2001), Some(side));
+        assert_eq!(state.latest_blocked_side(0), None);
+        assert_eq!(
+            state.transmit_queue.get(0).unwrap().disposable,
+            TX_HISTORY_OWNED
+        );
+        assert!(RouterInner::transmit_eviction_candidate(&state.transmit_queue).is_none());
+        assert!(RouterInner::tx_bulk_owner(state.transmit_queue.get(0).unwrap()).is_none());
+        progress(&mut state, side).begin(key, 1, true).unwrap();
+        assert!(
+            !independent(&state),
+            "same-key stateful evidence must remain protected"
+        );
+        assert_eq!(state.latest_blocked_side(0), Some(side));
+        progress(&mut state, side).begin(key, 2, false).unwrap();
+        assert!(
+            !independent(&state),
+            "a weaker classification cannot erase history"
+        );
+        progress(&mut state, side)
+            .begin(key ^ 2, 2002, false)
+            .unwrap();
+        assert!(
+            !independent(&state),
+            "expired progress cannot authorize bypass"
+        );
+        state
+            .side_transport
+            .get_mut(&side)
+            .unwrap()
+            .tx_chunk_progress = None;
+        assert!(
+            !independent(&state),
+            "missing progress remains conservative"
         );
     }
     #[test]

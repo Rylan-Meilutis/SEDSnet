@@ -10427,6 +10427,7 @@ impl Router {
         &self,
         side: RouterSideId,
         key: u64,
+        history_dependent: bool,
         send: impl FnOnce(&mut usize) -> TelemetryResult<T>,
     ) -> TelemetryResult<T> {
         let mut next = {
@@ -10447,7 +10448,7 @@ impl Router {
                 .tx_chunk_progress
                 .as_mut()
                 .expect("initialized")
-                .begin(key, self.clock.now_ms())?
+                .begin(key, self.clock.now_ms(), history_dependent)?
         };
         let result = send(&mut next);
         if let Some(progress) = self
@@ -10473,7 +10474,10 @@ impl Router {
             frames.send_resuming(&mut 0, send)
         } else {
             let key = frames.progress_key();
-            self.run_side_chunk_transfer(side, key, |next| frames.send_resuming(next, &mut send))
+            let history_dependent = frames.history_dependent();
+            self.run_side_chunk_transfer(side, key, history_dependent, |next| {
+                frames.send_resuming(next, &mut send)
+            })
         };
         if result.is_err() && bootstraps_template {
             // Encoding has already inserted the TX template, but a busy or
@@ -11872,11 +11876,11 @@ impl Router {
                 {
                     let mut attempts_total = 0usize;
                     let mut sent_bytes = 0usize;
-                    let key = crate::packet::hash_bytes_u64(
+                    let key = crate::side_transport::canonical_packet_progress_key(
                         pkt.packet_id(),
-                        &opts.max_frame_bytes.to_le_bytes(),
+                        opts.max_frame_bytes,
                     );
-                    let result = self.run_side_chunk_transfer(side, key, |next| {
+                    let result = self.run_side_chunk_transfer(side, key, false, |next| {
                         crate::side_transport::send_packet_chunks(
                             pkt,
                             opts.max_frame_bytes,
@@ -15293,7 +15297,7 @@ impl Router {
             }
         }
         #[cfg(feature = "latest-value-egress")]
-        let latest_blocked = st.latest_blocked_side();
+        let latest_blocked = st.latest_blocked_side(now_ms);
         let (selected, owed_turn) = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
