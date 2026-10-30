@@ -196,6 +196,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.4 highlights
+
+- Keep fresh reports moving during SDK-owned canonical schema transfers without
+  discarding accepted catalogs or advancing protected encoding history.
+- Preserve the optional, default-disabled latest-value policy and compatibility
+  with 4.3.3; see [latest-value egress](docs/latest-value-egress.md).
+
 ### Version 4.3.3 highlights
 
 - Opt one packed egress into bounded newest-pending best-effort reports before

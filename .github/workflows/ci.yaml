@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_NEXTEST_CACHE_KEY: cargo-nextest-v1
+      SEDSNET_CODEC_SOAK_SECONDS: ${{ vars.SEDSNET_CODEC_SOAK_SECONDS || '600' }}
 
     steps:
       - name: 'Checkout code'

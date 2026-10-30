@@ -4,6 +4,7 @@ use crate::{DataType, TelemetryError, TelemetryResult, packet::hash_bytes_u64, w
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
 
+const SIDE_TX_PROGRESS_TIMEOUT_MS: u64 = 2000;
 pub(crate) const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
 pub(crate) const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
 pub(crate) const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
@@ -68,6 +69,11 @@ impl SideTransportFrames {
     pub(crate) fn bootstraps_template(&self) -> bool {
         self.frame.starts_with(SIDE_TRANSPORT_MAGIC)
             && self.frame.get(3) == Some(&SIDE_TRANSPORT_KIND_FULL)
+    }
+    // Canonical chunks do not mutate the side dictionary. Wrapped full or
+    // compact frames must retain their encoding-history serialization barrier.
+    pub(crate) fn history_dependent(&self) -> bool {
+        self.frame.starts_with(SIDE_TRANSPORT_MAGIC)
     }
     pub(crate) fn progress_key(&self) -> u64 {
         hash_bytes_u64(
@@ -553,8 +559,16 @@ pub(crate) fn reconstruct_side_compact_frame(
     ))
 }
 
+pub(crate) fn canonical_packet_progress_key(packet_id: u64, max_frame_bytes: usize) -> u64 {
+    hash_bytes_u64(packet_id, &max_frame_bytes.to_le_bytes())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SideTxCursor {
+    #[cfg(feature = "latest-value-egress")]
+    history_dependent: bool,
+    #[cfg(feature = "latest-value-egress")]
+    latest_owner: bool,
     key: u64,
     next: usize,
     last_progress_ms: u64,
@@ -563,21 +577,121 @@ struct SideTxCursor {
 pub(crate) struct SideTxProgress {
     slots: [Option<SideTxCursor>; 4],
 }
+// Keep this optional classification inside the old cursor allocation on every
+// target. Comparing actual structs avoids assumptions about tuple/niche layout.
+#[cfg(feature = "latest-value-egress")]
+const _: () = {
+    struct PreviousCursor {
+        key: u64,
+        next: usize,
+        last_progress_ms: u64,
+    }
+    let previous = PreviousCursor {
+        key: 0,
+        next: 0,
+        last_progress_ms: 0,
+    };
+    let _ = (previous.key, previous.next, previous.last_progress_ms);
+    assert!(
+        core::mem::size_of::<SideTxProgress>()
+            <= core::mem::size_of::<[Option<PreviousCursor>; 4]>()
+    );
+};
+
 impl SideTxProgress {
     #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn clear_latest_owner(&mut self) {
+        for cursor in self.slots.iter_mut().flatten() {
+            cursor.latest_owner = false;
+        }
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn has_live_latest_owner(&self, now: u64) -> bool {
+        self.slots.iter().flatten().any(|cursor| {
+            cursor.latest_owner
+                && now.saturating_sub(cursor.last_progress_ms) <= SIDE_TX_PROGRESS_TIMEOUT_MS
+        })
+    }
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn has_available_slot(&self, now: u64) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.is_none_or(|cursor| {
+                now.saturating_sub(cursor.last_progress_ms) > SIDE_TX_PROGRESS_TIMEOUT_MS
+            })
+        })
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn available_slots(&self, now: u64) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                slot.is_none_or(|cursor| {
+                    now.saturating_sub(cursor.last_progress_ms) > SIDE_TX_PROGRESS_TIMEOUT_MS
+                })
+            })
+            .count()
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn has_live_key(&self, key: u64, now: u64) -> bool {
+        self.slots.iter().flatten().any(|cursor| {
+            cursor.key == key
+                && now.saturating_sub(cursor.last_progress_ms) <= SIDE_TX_PROGRESS_TIMEOUT_MS
+        })
+    }
+
+    #[cfg(all(test, feature = "latest-value-egress"))]
     pub(crate) fn is_idle(&self) -> bool {
         self.slots.iter().all(Option::is_none)
     }
 
-    pub(crate) fn begin(&mut self, key: u64, now: u64) -> TelemetryResult<usize> {
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn blocks_latest(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|cursor| cursor.history_dependent)
+    }
+
+    #[cfg(any(test, not(feature = "latest-value-egress")))]
+    pub(crate) fn begin(
+        &mut self,
+        key: u64,
+        now: u64,
+        _history_dependent: bool,
+    ) -> TelemetryResult<usize> {
+        self.begin_classified(key, now, _history_dependent, false)
+    }
+
+    pub(crate) fn begin_classified(
+        &mut self,
+        key: u64,
+        now: u64,
+        _history_dependent: bool,
+        _latest_owner: bool,
+    ) -> TelemetryResult<usize> {
         for slot in &mut self.slots {
             // Match the receiver's assembly timeout. After a genuine pause,
             // the peer requires a fresh transfer, rather than a missing suffix.
-            if slot.is_some_and(|entry| now.saturating_sub(entry.last_progress_ms) > 2000) {
+            if slot.is_some_and(|entry| {
+                now.saturating_sub(entry.last_progress_ms) > SIDE_TX_PROGRESS_TIMEOUT_MS
+            }) {
                 *slot = None;
             }
         }
-        if let Some(entry) = self.slots.iter().flatten().find(|entry| entry.key == key) {
+        if let Some(entry) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.key == key)
+        {
+            #[cfg(feature = "latest-value-egress")]
+            {
+                entry.history_dependent |= _history_dependent;
+                entry.latest_owner |= _latest_owner;
+            }
             return Ok(entry.next);
         }
         let slot = self
@@ -586,6 +700,10 @@ impl SideTxProgress {
             .find(|slot| slot.is_none())
             .ok_or(TelemetryError::Io("side chunk progress saturated"))?;
         *slot = Some(SideTxCursor {
+            #[cfg(feature = "latest-value-egress")]
+            history_dependent: _history_dependent,
+            #[cfg(feature = "latest-value-egress")]
+            latest_owner: _latest_owner,
             key,
             next: 0,
             last_progress_ms: now,
@@ -675,6 +793,24 @@ pub(crate) fn send_packet_chunks(
 #[cfg(test)]
 mod streamed_chunk_tests {
     use super::*;
+    #[test]
+    #[cfg(feature = "latest-value-egress")]
+    fn cursor_history_classification_never_weakens_a_retained_owner() {
+        let mut progress = SideTxProgress::default();
+        assert_eq!(progress.begin(1, 0, false).unwrap(), 0);
+        progress.finish(1, 1, 0, &Err::<(), _>(TelemetryError::Io("busy")));
+        assert!(!progress.blocks_latest());
+        assert_eq!(progress.begin(1, 1, true).unwrap(), 1);
+        assert!(progress.blocks_latest());
+        assert_eq!(progress.begin(1, 2, false).unwrap(), 1);
+        assert!(
+            progress.blocks_latest(),
+            "matching keys cannot weaken history protection"
+        );
+        progress.finish(1, 2, 2, &Ok(()));
+        assert!(!progress.blocks_latest());
+    }
+
     #[test]
     fn lazy_chunks_recheck_fragmentation_and_resume_without_skipping() {
         use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

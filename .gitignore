@@ -25,3 +25,7 @@ python-files/sedsnet/sedsprintf_rs.pyi
 /inspection/
 
 telemetry_config.json
+
+# Generated qualification reports belong in external build artifacts.
+/docs/*-20??-??-??.json
+/docs/qualification/*.json

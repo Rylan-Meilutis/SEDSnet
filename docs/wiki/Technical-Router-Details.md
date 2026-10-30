@@ -253,6 +253,30 @@ slot throughput, feed that sample into `note_side_link_probe_sample()` so adapti
 that the radio has less headroom than Ethernet or other high-rate links.
 
 
+### Optional latest-value packed egress
+
+`latest-value-egress` remains opt-in for one selected packed side. Fresh,
+best-effort unordered reports may replace only never-attempted samples of the
+same flow. Commands, receipts, managed values and immutable attempted owners
+retain their delivery contracts.
+
+Independent canonical discovery catalogs and fresh reports share byte-counted
+service earned by actual callback admission. Controls retain their existing
+priority. Catalogs transmit in bulk when no fresh report is waiting. Wrapped
+frames with dictionary dependencies retain their serialization barriers.
+
+The side keeps four fragment cursors. New independent catalogs leave one
+available for late fragmented work; matching live cursors continue to drain.
+Known cursor-capacity refusal retains queued work instead of dropping it. An
+SDK-owned cursor classification keeps an admitted fragmented report ahead of
+new catalog turns, including after partial callback admission or a policy transition. Side
+reset or a genuinely new logical report cannot inherit stale classification.
+Transfer keys, assembly expiry and queue budgets remain unchanged. This bounds
+bookkeeping; it does not promise a universal latency for arbitrarily large or
+over-capacity traffic. Packet and queued-item sizes and the four-cursor allocation are unchanged. Fixed
+router metadata grows by eight bytes only with the feature enabled on the
+measured 32-bit and 64-bit targets.
+
 ### Asynchronous packed transport retry ownership
 
 Hosted Rust drivers can opt into `Router::add_side_packed_leased_with_priority_and_options`.
