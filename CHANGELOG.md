@@ -6,11 +6,15 @@
 
 Wire format and application identities remain compatible with 4.3.3.
 
-- Keep latest-value reports flowing while an accepted canonical discovery
-  catalog transfer resumes on the same packed side.
-- Match the active transfer identity and frame size before allowing independent
-  reports; preserve timeout checks and dictionary-dependent history barriers.
-- Retain catalog queue ownership, protected retries, and existing memory budgets.
+- Share byte-counted transmit service between overlapping canonical discovery
+  catalogs and fresh latest-value reports on the same packed side.
+- Reserve one existing fragment cursor for late fragmented reports or controls,
+  retaining accepted owners when bounded cursor capacity is temporarily busy.
+- Preserve admitted continuation, dictionary-dependent serialization, protected
+  control priority, reliable ownership, and existing transfer deadlines.
+- Keep bulk catalog transmission when no fresh report is waiting. Packet and queue
+  item sizes and the four-cursor allocation are unchanged; optional latest-value router metadata
+  adds eight bytes on the measured 32-bit and 64-bit targets.
 
 ## 4.3.3
 

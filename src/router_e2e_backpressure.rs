@@ -112,7 +112,7 @@ impl Router {
     ) -> TelemetryResult<()> {
         let mut st = self.state.lock();
         if let Some(index) = st.claim_index(claim.token) {
-            if ok && !context.refused {
+            if ok && !context.refused() {
                 st.transmit_queue.remove_pos(index);
                 if context.admitted
                     && let Some(owner) = st.end_to_end_reliable_tx.get_mut(&parent)

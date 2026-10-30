@@ -567,6 +567,8 @@ pub(crate) fn canonical_packet_progress_key(packet_id: u64, max_frame_bytes: usi
 struct SideTxCursor {
     #[cfg(feature = "latest-value-egress")]
     history_dependent: bool,
+    #[cfg(feature = "latest-value-egress")]
+    latest_owner: bool,
     key: u64,
     next: usize,
     last_progress_ms: u64,
@@ -597,6 +599,49 @@ const _: () = {
 };
 
 impl SideTxProgress {
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn clear_latest_owner(&mut self) {
+        for cursor in self.slots.iter_mut().flatten() {
+            cursor.latest_owner = false;
+        }
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn has_live_latest_owner(&self, now: u64) -> bool {
+        self.slots.iter().flatten().any(|cursor| {
+            cursor.latest_owner
+                && now.saturating_sub(cursor.last_progress_ms) <= SIDE_TX_PROGRESS_TIMEOUT_MS
+        })
+    }
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn has_available_slot(&self, now: u64) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.is_none_or(|cursor| {
+                now.saturating_sub(cursor.last_progress_ms) > SIDE_TX_PROGRESS_TIMEOUT_MS
+            })
+        })
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn available_slots(&self, now: u64) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                slot.is_none_or(|cursor| {
+                    now.saturating_sub(cursor.last_progress_ms) > SIDE_TX_PROGRESS_TIMEOUT_MS
+                })
+            })
+            .count()
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn has_live_key(&self, key: u64, now: u64) -> bool {
+        self.slots.iter().flatten().any(|cursor| {
+            cursor.key == key
+                && now.saturating_sub(cursor.last_progress_ms) <= SIDE_TX_PROGRESS_TIMEOUT_MS
+        })
+    }
+
     #[cfg(all(test, feature = "latest-value-egress"))]
     pub(crate) fn is_idle(&self) -> bool {
         self.slots.iter().all(Option::is_none)
@@ -610,30 +655,22 @@ impl SideTxProgress {
             .any(|cursor| cursor.history_dependent)
     }
 
-    #[cfg(feature = "latest-value-egress")]
-    pub(crate) fn has_live_independent_progress(&self, now_ms: u64) -> bool {
-        self.slots.iter().flatten().any(|cursor| {
-            cursor.next != 0
-                && !cursor.history_dependent
-                && now_ms.saturating_sub(cursor.last_progress_ms) <= SIDE_TX_PROGRESS_TIMEOUT_MS
-        })
-    }
-
-    #[cfg(feature = "latest-value-egress")]
-    pub(crate) fn has_independent_progress(&self, key: u64, now_ms: u64) -> bool {
-        self.slots.iter().flatten().any(|cursor| {
-            cursor.key == key
-                && cursor.next != 0
-                && !cursor.history_dependent
-                && now_ms.saturating_sub(cursor.last_progress_ms) <= SIDE_TX_PROGRESS_TIMEOUT_MS
-        })
-    }
-
+    #[cfg(any(test, not(feature = "latest-value-egress")))]
     pub(crate) fn begin(
         &mut self,
         key: u64,
         now: u64,
         _history_dependent: bool,
+    ) -> TelemetryResult<usize> {
+        self.begin_classified(key, now, _history_dependent, false)
+    }
+
+    pub(crate) fn begin_classified(
+        &mut self,
+        key: u64,
+        now: u64,
+        _history_dependent: bool,
+        _latest_owner: bool,
     ) -> TelemetryResult<usize> {
         for slot in &mut self.slots {
             // Match the receiver's assembly timeout. After a genuine pause,
@@ -653,6 +690,7 @@ impl SideTxProgress {
             #[cfg(feature = "latest-value-egress")]
             {
                 entry.history_dependent |= _history_dependent;
+                entry.latest_owner |= _latest_owner;
             }
             return Ok(entry.next);
         }
@@ -664,6 +702,8 @@ impl SideTxProgress {
         *slot = Some(SideTxCursor {
             #[cfg(feature = "latest-value-egress")]
             history_dependent: _history_dependent,
+            #[cfg(feature = "latest-value-egress")]
+            latest_owner: _latest_owner,
             key,
             next: 0,
             last_progress_ms: now,

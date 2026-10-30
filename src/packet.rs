@@ -481,6 +481,25 @@ impl Packet {
     /// so the Router/Relay can use it to drop duplicates.
     #[inline]
     pub fn packet_id(&self) -> u64 {
+        hash_bytes_u64(self.packet_id_header(), self.payload())
+    }
+
+    #[cfg(feature = "latest-value-egress")]
+    pub(crate) fn scoped_packet_id(&self) -> TelemetryResult<u64> {
+        let header = self.packet_id_header();
+        #[cfg(feature = "compact-packet-store")]
+        {
+            self.payload
+                .with_slice(|bytes| hash_bytes_u64(header, bytes))
+        }
+        #[cfg(not(feature = "compact-packet-store"))]
+        {
+            Ok(hash_bytes_u64(header, self.payload()))
+        }
+    }
+
+    #[inline]
+    fn packet_id_header(&self) -> u64 {
         // Seed with an arbitrary non-zero constant.
         let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -512,9 +531,6 @@ impl Packet {
         h = hash_bytes_u64(h, &self.timestamp.to_le_bytes());
         h = hash_bytes_u64(h, &self.nonce.to_le_bytes());
         h = hash_bytes_u64(h, &(self.data_size as u64).to_le_bytes());
-
-        // Payload bytes
-        h = hash_bytes_u64(h, self.payload());
 
         h
     }

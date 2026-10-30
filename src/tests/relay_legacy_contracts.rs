@@ -1137,6 +1137,8 @@ fn drain_originals_without_reliable_timeouts(relay: &Relay) -> TelemetryResult<(
             queued,
             claim: None,
             owed_turn: false,
+            #[cfg(feature = "latest-value-egress")]
+            service: EgressService::default(),
         })?;
     }
 }

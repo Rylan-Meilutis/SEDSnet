@@ -768,6 +768,14 @@ const TX_LATEST_PENDING: u8 = 2;
 #[cfg(feature = "latest-value-egress")]
 const TX_HISTORY_OWNED: u8 = 4;
 #[cfg(feature = "latest-value-egress")]
+const TX_CANONICAL_OWED: u8 = 32;
+#[cfg(feature = "latest-value-egress")]
+const TX_CANONICAL_SERVED: u8 = 64;
+#[cfg(feature = "latest-value-egress")]
+const TX_CANONICAL_TURN: u8 = TX_CANONICAL_OWED | TX_CANONICAL_SERVED;
+#[cfg(feature = "latest-value-egress")]
+const TX_LATEST_TURN: u8 = 128;
+#[cfg(feature = "latest-value-egress")]
 const TX_FRESH: u8 = TX_DISPOSABLE | TX_LATEST_PENDING;
 #[cfg(not(feature = "latest-value-egress"))]
 const TX_FRESH: u8 = TX_DISPOSABLE;
@@ -798,6 +806,15 @@ const _: () = {
     assert!(size_of::<TxClaim>() == size_of::<(u32, bool)>());
     assert!(size_of::<Option<TxClaim>>() == size_of::<Option<(u32, bool)>>());
 };
+#[derive(Clone, Copy, Default)]
+struct EgressService {
+    #[cfg(feature = "latest-value-egress")]
+    token: u32,
+    #[cfg(feature = "latest-value-egress")]
+    side: u8,
+    #[cfg(feature = "latest-value-egress")]
+    kind: u8,
+}
 #[derive(Default)]
 struct DispatchContext {
     // Retain a denied queued replay's service band across side-owned retries.
@@ -805,12 +822,58 @@ struct DispatchContext {
     claim: Option<TxClaim>,
     since: Option<u64>,
     completion_flags: u8,
-    refused: bool,
     admitted: bool,
+    #[cfg(feature = "latest-value-egress")]
+    latest_service: EgressService,
 }
 impl DispatchContext {
     const TERMINAL: u8 = 1;
     const OWNER_TRANSFERRED: u8 = 2;
+    const REFUSED: u8 = 4;
+    fn refused(&self) -> bool {
+        self.completion_flags & Self::REFUSED != 0
+    }
+    fn mark_refused(&mut self) {
+        self.completion_flags |= Self::REFUSED;
+    }
+
+    fn egress_service(&self) -> EgressService {
+        #[cfg(feature = "latest-value-egress")]
+        {
+            self.latest_service
+        }
+        #[cfg(not(feature = "latest-value-egress"))]
+        {
+            EgressService::default()
+        }
+    }
+    fn yielded_canonical_turn(&self) -> bool {
+        #[cfg(feature = "latest-value-egress")]
+        {
+            self.latest_service.side != 0
+                && self.completion_flags & TX_CANONICAL_OWED != 0
+                && self.admitted
+        }
+        #[cfg(not(feature = "latest-value-egress"))]
+        {
+            false
+        }
+    }
+    fn canonical_turn_flags(&self) -> u8 {
+        #[cfg(feature = "latest-value-egress")]
+        if self.completion_flags & TX_LATEST_TURN != 0 {
+            return TX_LATEST_TURN;
+        }
+        #[cfg(feature = "latest-value-egress")]
+        if self.completion_flags & TX_CANONICAL_OWED != 0 {
+            return if self.admitted {
+                TX_CANONICAL_SERVED
+            } else {
+                self.completion_flags & TX_CANONICAL_TURN
+            };
+        }
+        0
+    }
 
     fn is_terminal(&self) -> bool {
         self.completion_flags & Self::TERMINAL != 0
@@ -830,13 +893,16 @@ impl DispatchContext {
 // The dispatch-only priority uses existing stack padding; retained queue,
 // reliable maps and packet ownership metadata do not grow.
 const _: () = assert!(
-    size_of::<DispatchContext>() == size_of::<(Option<TxClaim>, Option<u64>, bool, bool)>()
+    size_of::<DispatchContext>()
+        <= size_of::<(Option<TxClaim>, Option<u64>, bool, bool)>() + size_of::<u64>()
 );
 
 struct TxWork {
     queued: TxQueued,
     claim: Option<TxClaim>,
     owed_turn: bool,
+    #[cfg(feature = "latest-value-egress")]
+    service: EgressService,
 }
 
 /// Do not allow a continuously replenished stream of control traffic to keep
@@ -2221,6 +2287,12 @@ struct RouterInner {
     transmit_queue: BoundedDeque<TxQueued>,
     tx_priority_burst: u8,
     tx_policy_flags: u8,
+    #[cfg(feature = "latest-value-egress")]
+    latest_turn_phase: u8,
+    #[cfg(feature = "latest-value-egress")]
+    latest_turn_credit: i32,
+    #[cfg(feature = "latest-value-egress")]
+    latest_service_seq: u32,
     ordered_claim_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
@@ -3186,6 +3258,21 @@ impl RouterInner {
 
     fn push_transmit(&mut self, mut item: TxQueued) -> TelemetryResult<()> {
         let child = item.disposable & TX_E2E_CHILD != 0;
+        #[cfg(feature = "latest-value-egress")]
+        let turn_flags = if !child
+            && item.delivery_state == QueuedDelivery::Untracked
+            && self.canonical_catalog_owner(&item)
+        {
+            item.disposable & TX_CANONICAL_TURN
+        } else if !child
+            && item.delivery_state == QueuedDelivery::Untracked
+            && matches!(&item.item, RouterTxItem::ToSide { dst, .. }
+                if self.latest_side() == Some(*dst))
+        {
+            item.disposable & TX_LATEST_TURN
+        } else {
+            0
+        };
         #[cfg(feature = "std")]
         let retry_origin = item.disposable & TX_E2E_RETRY;
         #[cfg(feature = "latest-value-egress")]
@@ -3255,6 +3342,7 @@ impl RouterInner {
                 u8::from(Self::classify_transmit_disposable(&item))
                     | (item.disposable & TX_LATEST_PENDING)
             };
+            item.disposable |= turn_flags;
             if item.disposable & TX_LATEST_PENDING != 0 && self.replace_latest_pending(&mut item)? {
                 return Ok(());
             }
@@ -10024,7 +10112,13 @@ impl Router {
                 let mut sent_bytes = 0usize;
                 self.send_side_frames_resumable(side, frames, |frame| {
                     match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                        Self::packed_handler_call(&packed, frame, priority)
+                        self.packed_handler_call(
+                            side,
+                            &packed,
+                            frame,
+                            priority,
+                            EgressService::default(),
+                        )
                     }) {
                         Ok((_, attempts)) => {
                             *admitted = true;
@@ -10092,12 +10186,32 @@ impl Router {
         TelemetryResult<()>,
         Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
     ) {
+        self.send_queued_to_side_with_service(
+            side,
+            data,
+            relayed,
+            admitted,
+            EgressService::default(),
+        )
+    }
+    #[cfg(feature = "compression")]
+    fn send_queued_to_side_with_service(
+        &self,
+        side: RouterSideId,
+        data: &mut RouterItem,
+        relayed: bool,
+        admitted: &mut bool,
+        service: EgressService,
+    ) -> (
+        TelemetryResult<()>,
+        Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
+    ) {
         let reservation = match self.prepare_queued_payload(side, data) {
             Ok(reservation) => reservation,
             Err(error) => return (Err(error), None),
         };
         (
-            self.send_reliable_to_side_with_progress(side, data.clone(), relayed, admitted),
+            self.send_reliable_to_side_with_service(side, data.clone(), relayed, admitted, service),
             reservation,
         )
     }
@@ -10112,12 +10226,29 @@ impl Router {
         self.send_reliable_to_side_with_progress(side, data, relayed, &mut false)
     }
 
+    #[cfg(any(test, not(feature = "compression")))]
     fn send_reliable_to_side_with_progress(
         &self,
         side: RouterSideId,
         data: RouterItem,
         relayed: bool,
         admitted: &mut bool,
+    ) -> TelemetryResult<()> {
+        self.send_reliable_to_side_with_service(
+            side,
+            data,
+            relayed,
+            admitted,
+            EgressService::default(),
+        )
+    }
+    fn send_reliable_to_side_with_service(
+        &self,
+        side: RouterSideId,
+        data: RouterItem,
+        relayed: bool,
+        admitted: &mut bool,
+        service: EgressService,
     ) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
         let schema_id = (Self::item_data_type(&data).ok() == Some(DataType::DiscoverySchema))
@@ -10145,7 +10276,7 @@ impl Router {
                 }
             }
         }
-        let result = self.send_reliable_to_side_impl(side, data, relayed, admitted);
+        let result = self.send_reliable_to_side_impl(side, data, relayed, admitted, service);
         #[cfg(feature = "discovery")]
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
@@ -10172,6 +10303,7 @@ impl Router {
         data: RouterItem,
         relayed: bool,
         admitted: &mut bool,
+        service: EgressService,
     ) -> TelemetryResult<()> {
         // Reliability needs only the type and frozen-owner presence; endpoint
         // normalization and an owned wire-owner array are unnecessary here.
@@ -10199,8 +10331,9 @@ impl Router {
             &handler,
             RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)
         ) {
-            return self
-                .call_side_tx_handler_with_progress(side, &handler, &data, relayed, admitted);
+            return self.call_side_tx_handler_with_service(
+                side, &handler, &data, relayed, admitted, service,
+            );
         }
 
         if !hop_reliable_enabled {
@@ -10214,8 +10347,8 @@ impl Router {
             if let Some(adjusted) =
                 self.adjust_reliable_for_side(adjusted_opts, data, preserve_end_to_end_ack)?
             {
-                return self.call_side_tx_handler_with_progress(
-                    side, &handler, &adjusted, relayed, admitted,
+                return self.call_side_tx_handler_with_service(
+                    side, &handler, &adjusted, relayed, admitted, service,
                 );
             }
             return Ok(());
@@ -10228,8 +10361,8 @@ impl Router {
 
         if !is_reliable_type(ty) {
             if let Some(adjusted) = self.adjust_reliable_for_side(opts, data, true)? {
-                self.call_side_tx_handler_with_progress(
-                    side, &handler, &adjusted, relayed, admitted,
+                self.call_side_tx_handler_with_service(
+                    side, &handler, &adjusted, relayed, admitted, service,
                 )?;
             }
             return Ok(());
@@ -10289,27 +10422,37 @@ impl Router {
                             self.encode_side_transport_frames(side, opts, bytes.clone())?;
                         let mut attempts_total = 0usize;
                         let mut sent_bytes = 0usize;
-                        self.send_side_frames_resumable(side, frames, |frame| {
-                            match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                                Self::packed_handler_call(&handler, frame, priority)
-                            }) {
-                                Ok((_, attempts)) => {
-                                    *admitted = true;
-                                    attempts_total = attempts_total.saturating_add(attempts);
-                                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                        self.send_side_frames_resumable_with_service(
+                            side,
+                            frames,
+                            service,
+                            |frame| {
+                                match self.retry_with_attempts(
+                                    runtime_max_handler_retries(),
+                                    || {
+                                        self.packed_handler_call(
+                                            side, &handler, frame, priority, service,
+                                        )
+                                    },
+                                ) {
+                                    Ok((_, attempts)) => {
+                                        *admitted = true;
+                                        attempts_total = attempts_total.saturating_add(attempts);
+                                        sent_bytes = sent_bytes.saturating_add(frame.len());
+                                    }
+                                    Err((err, attempts)) => {
+                                        self.note_side_tx_failure(
+                                            side,
+                                            ty,
+                                            attempts_total.saturating_add(attempts),
+                                        );
+                                        return Err(err);
+                                    }
                                 }
-                                Err((err, attempts)) => {
-                                    self.note_side_tx_failure(
-                                        side,
-                                        ty,
-                                        attempts_total.saturating_add(attempts),
-                                    );
-                                    return Err(err);
-                                }
-                            }
 
-                            Ok(())
-                        })?;
+                                Ok(())
+                            },
+                        )?;
                         self.record_side_tx_sample(
                             side,
                             sent_bytes,
@@ -10334,27 +10477,37 @@ impl Router {
                             self.encode_side_transport_frames(side, opts, bytes.clone())?;
                         let mut attempts_total = 0usize;
                         let mut sent_bytes = 0usize;
-                        self.send_side_frames_resumable(side, frames, |frame| {
-                            match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                                Self::packed_handler_call(&handler, frame, priority)
-                            }) {
-                                Ok((_, attempts)) => {
-                                    *admitted = true;
-                                    attempts_total = attempts_total.saturating_add(attempts);
-                                    sent_bytes = sent_bytes.saturating_add(frame.len());
+                        self.send_side_frames_resumable_with_service(
+                            side,
+                            frames,
+                            service,
+                            |frame| {
+                                match self.retry_with_attempts(
+                                    runtime_max_handler_retries(),
+                                    || {
+                                        self.packed_handler_call(
+                                            side, &handler, frame, priority, service,
+                                        )
+                                    },
+                                ) {
+                                    Ok((_, attempts)) => {
+                                        *admitted = true;
+                                        attempts_total = attempts_total.saturating_add(attempts);
+                                        sent_bytes = sent_bytes.saturating_add(frame.len());
+                                    }
+                                    Err((err, attempts)) => {
+                                        self.note_side_tx_failure(
+                                            side,
+                                            ty,
+                                            attempts_total.saturating_add(attempts),
+                                        );
+                                        return Err(err);
+                                    }
                                 }
-                                Err((err, attempts)) => {
-                                    self.note_side_tx_failure(
-                                        side,
-                                        ty,
-                                        attempts_total.saturating_add(attempts),
-                                    );
-                                    return Err(err);
-                                }
-                            }
 
-                            Ok(())
-                        })?;
+                                Ok(())
+                            },
+                        )?;
                         self.record_side_tx_sample(
                             side,
                             sent_bytes,
@@ -10379,9 +10532,9 @@ impl Router {
         let frames = self.encode_side_transport_frames(side, opts, bytes.clone())?;
         let mut attempts_total = 0usize;
         let mut sent_bytes = 0usize;
-        self.send_side_frames_resumable(side, frames, |frame| {
+        self.send_side_frames_resumable_with_service(side, frames, service, |frame| {
             match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                Self::packed_handler_call(&handler, frame, priority)
+                self.packed_handler_call(side, &handler, frame, priority, service)
             }) {
                 Ok((_, attempts)) => {
                     *admitted = true;
@@ -10428,10 +10581,21 @@ impl Router {
         side: RouterSideId,
         key: u64,
         history_dependent: bool,
+        service: EgressService,
         send: impl FnOnce(&mut usize) -> TelemetryResult<T>,
     ) -> TelemetryResult<T> {
         let mut next = {
             let mut st = self.state.lock();
+            #[cfg(feature = "latest-value-egress")]
+            let defer_capacity = st.latest_side() == Some(side);
+            #[cfg(feature = "latest-value-egress")]
+            let latest_owner = defer_capacity
+                && service.token != 0
+                && service.side != 0
+                && side == usize::from(service.side - 1)
+                && service.token == st.latest_service_seq
+                && service.kind == 2
+                && st.latest_turn_phase == 4;
             let transport = st
                 .side_transport
                 .get_mut(&side)
@@ -10444,11 +10608,30 @@ impl Router {
                 transport.tx_chunk_progress =
                     Some(Box::new(crate::side_transport::SideTxProgress::default()));
             }
-            transport
-                .tx_chunk_progress
-                .as_mut()
-                .expect("initialized")
-                .begin(key, self.clock.now_ms(), history_dependent)?
+            let progress = transport.tx_chunk_progress.as_mut().expect("initialized");
+            #[cfg(feature = "latest-value-egress")]
+            if defer_capacity
+                && !progress.has_available_slot(self.clock.now_ms())
+                && !progress.has_live_key(key, self.clock.now_ms())
+            {
+                // This is a known bounded admission refusal before any bytes
+                // are sent, not a reinterpretation of an arbitrary IO error.
+                return Err(TelemetryError::Io("side tx busy"));
+            }
+            #[cfg(feature = "latest-value-egress")]
+            {
+                progress.begin_classified(
+                    key,
+                    self.clock.now_ms(),
+                    history_dependent,
+                    latest_owner,
+                )?
+            }
+            #[cfg(not(feature = "latest-value-egress"))]
+            {
+                let _ = service;
+                progress.begin(key, self.clock.now_ms(), history_dependent)?
+            }
         };
         let result = send(&mut next);
         if let Some(progress) = self
@@ -10466,7 +10649,17 @@ impl Router {
     fn send_side_frames_resumable(
         &self,
         side: RouterSideId,
+        frames: SideTransportFrames,
+        send: impl FnMut(&[u8]) -> TelemetryResult<()>,
+    ) -> TelemetryResult<()> {
+        self.send_side_frames_resumable_with_service(side, frames, EgressService::default(), send)
+    }
+
+    fn send_side_frames_resumable_with_service(
+        &self,
+        side: RouterSideId,
         mut frames: SideTransportFrames,
+        service: EgressService,
         mut send: impl FnMut(&[u8]) -> TelemetryResult<()>,
     ) -> TelemetryResult<()> {
         let bootstraps_template = frames.bootstraps_template();
@@ -10475,7 +10668,7 @@ impl Router {
         } else {
             let key = frames.progress_key();
             let history_dependent = frames.history_dependent();
-            self.run_side_chunk_transfer(side, key, history_dependent, |next| {
+            self.run_side_chunk_transfer(side, key, history_dependent, service, |next| {
                 frames.send_resuming(next, &mut send)
             })
         };
@@ -11766,15 +11959,54 @@ impl Router {
     }
 
     fn packed_handler_call(
+        &self,
+        side: RouterSideId,
         handler: &RouterTxHandlerFn,
         bytes: &[u8],
         priority: u8,
+        _service: EgressService,
     ) -> TelemetryResult<()> {
-        match handler {
+        let result = match handler {
             RouterTxHandlerFn::Packed(handler) => handler(bytes),
             RouterTxHandlerFn::PackedWithPriority(handler) => handler(bytes, priority),
             RouterTxHandlerFn::Packet(_) => Err(TelemetryError::BadArg),
+        };
+        #[cfg(feature = "latest-value-egress")]
+        if result.is_ok() && _service.token != 0 && _service.side != 0 {
+            let mut st = self.state.lock();
+            if st.latest_service_seq == _service.token
+                && st.latest_side() == Some(side)
+                && side == usize::from(_service.side - 1)
+                && matches!((_service.kind, st.latest_turn_phase), (1, 3) | (2, 4))
+            {
+                let bytes = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+                match _service.kind {
+                    1 => {
+                        let cap = st
+                            .sides
+                            .get(side)
+                            .and_then(Option::as_ref)
+                            .map_or(0, |side| {
+                                side.opts
+                                    .max_frame_bytes
+                                    .saturating_mul(usize::from(MAX_PRIORITY_BURST))
+                                    .min(i32::MAX as usize) as i32
+                            });
+                        st.latest_turn_credit =
+                            st.latest_turn_credit.saturating_add(bytes).min(cap);
+                    }
+                    2 => {
+                        st.latest_turn_credit = st
+                            .latest_turn_credit
+                            .saturating_sub(bytes.saturating_mul(2))
+                    }
+                    _ => {}
+                }
+            }
         }
+        #[cfg(not(feature = "latest-value-egress"))]
+        let _ = side;
+        result
     }
 
     fn effective_transport_priority(&self, ty: DataType) -> u8 {
@@ -11796,6 +12028,15 @@ impl Router {
         self.call_side_tx_handler_with_progress(side, handler, data, relayed, &mut false)
     }
 
+    // This branch streams canonical plaintext parts directly; no payload/header
+    // dictionary, encryption origin, or side template is advanced by an offer.
+    fn canonical_catalog_stream(packet: &Packet, max_frame_bytes: usize) -> bool {
+        packet.data_type() == DataType::DiscoverySchema
+            && max_frame_bytes != 0
+            && packet.data_size() > max_frame_bytes
+    }
+
+    #[cfg(test)]
     fn call_side_tx_handler_with_progress(
         &self,
         side: RouterSideId,
@@ -11803,6 +12044,24 @@ impl Router {
         data: &RouterItem,
         relayed: bool,
         admitted: &mut bool,
+    ) -> TelemetryResult<()> {
+        self.call_side_tx_handler_with_service(
+            side,
+            handler,
+            data,
+            relayed,
+            admitted,
+            EgressService::default(),
+        )
+    }
+    fn call_side_tx_handler_with_service(
+        &self,
+        side: RouterSideId,
+        handler: &RouterTxHandlerFn,
+        data: &RouterItem,
+        relayed: bool,
+        admitted: &mut bool,
+        service: EgressService,
     ) -> TelemetryResult<()> {
         let opts = {
             let st = self.state.lock();
@@ -11835,9 +12094,9 @@ impl Router {
                 let frames = self.encode_side_transport_frames(side, opts, send_bytes)?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
-                self.send_side_frames_resumable(side, frames, |frame| {
+                self.send_side_frames_resumable_with_service(side, frames, service, |frame| {
                     match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                        Self::packed_handler_call(packed, frame, priority)
+                        self.packed_handler_call(side, packed, frame, priority, service)
                     }) {
                         Ok((_, attempts)) => {
                             *admitted = true;
@@ -11870,35 +12129,65 @@ impl Router {
                 // Internal schemas are plaintext and use self-describing frames.
                 // This path is reached after hop-reliable handling; no replay
                 // buffer is needed here. Stream fragments from the payload.
-                if ty == DataType::DiscoverySchema
-                    && opts.max_frame_bytes != 0
-                    && pkt.payload().len() > opts.max_frame_bytes
-                {
+                if Self::canonical_catalog_stream(pkt, opts.max_frame_bytes) {
                     let mut attempts_total = 0usize;
                     let mut sent_bytes = 0usize;
                     let key = crate::side_transport::canonical_packet_progress_key(
                         pkt.packet_id(),
                         opts.max_frame_bytes,
                     );
-                    let result = self.run_side_chunk_transfer(side, key, false, |next| {
+                    #[cfg(feature = "latest-value-egress")]
+                    let bounded_turn = {
+                        let st = self.state.lock();
+                        service.kind == 1
+                            && service.side != 0
+                            && usize::from(service.side - 1) == side
+                            && service.token == st.latest_service_seq
+                            && st.latest_side() == Some(side)
+                    };
+                    #[cfg(not(feature = "latest-value-egress"))]
+                    let bounded_turn = false;
+                    let mut admitted_chunks = 0usize;
+                    let mut yielded = false;
+                    let result = self.run_side_chunk_transfer(side, key, false, service, |next| {
                         crate::side_transport::send_packet_chunks(
                             pkt,
                             opts.max_frame_bytes,
                             self.sender_arc().as_bytes(),
                             next,
-                            |frame| match self
-                                .retry_with_attempts(runtime_max_handler_retries(), || {
-                                    Self::packed_handler_call(packed, frame, priority)
-                                }) {
-                                Ok((_, attempts)) => {
-                                    *admitted = true;
-                                    attempts_total += attempts;
-                                    sent_bytes += frame.len();
-                                    Ok(())
+                            |frame| {
+                                #[cfg(feature = "latest-value-egress")]
+                                let fresh_waiting = if bounded_turn && admitted_chunks != 0 {
+                                    let st = self.state.lock();
+                                    st.latest_side() == Some(side) && st.transmit_queue.iter().any(|queued|
+                                        queued.disposable & (TX_LATEST_PENDING | TX_LATEST_TURN) != 0
+                                            && matches!(&queued.item, RouterTxItem::ToSide { dst, .. } if *dst == side))
+                                } else { false };
+                                #[cfg(not(feature = "latest-value-egress"))]
+                                let fresh_waiting = bounded_turn && admitted_chunks != 0;
+                                if fresh_waiting {
+                                    yielded = true;
+                                    return Err(TelemetryError::Io("side tx busy"));
                                 }
-                                Err((err, attempts)) => {
-                                    attempts_total += attempts;
-                                    Err(err)
+                                match self.retry_with_attempts(
+                                    runtime_max_handler_retries(),
+                                    || {
+                                        self.packed_handler_call(
+                                            side, packed, frame, priority, service,
+                                        )
+                                    },
+                                ) {
+                                    Ok((_, attempts)) => {
+                                        *admitted = true;
+                                        attempts_total += attempts;
+                                        sent_bytes += frame.len();
+                                        admitted_chunks += 1;
+                                        Ok(())
+                                    }
+                                    Err((err, attempts)) => {
+                                        attempts_total += attempts;
+                                        Err(err)
+                                    }
                                 }
                             },
                         )
@@ -11906,7 +12195,9 @@ impl Router {
                     let (raw_len, wire_len, chunks) = match result {
                         Ok(stats) => stats,
                         Err(err) => {
-                            self.note_side_tx_failure(side, ty, attempts_total);
+                            if !yielded {
+                                self.note_side_tx_failure(side, ty, attempts_total);
+                            }
                             return Err(err);
                         }
                     };
@@ -11926,9 +12217,9 @@ impl Router {
                 let frames = self.encode_side_transport_frames(side, opts, owned)?;
                 let mut attempts_total = 0usize;
                 let mut sent_bytes = 0usize;
-                self.send_side_frames_resumable(side, frames, |frame| {
+                self.send_side_frames_resumable_with_service(side, frames, service, |frame| {
                     match self.retry_with_attempts(runtime_max_handler_retries(), || {
-                        Self::packed_handler_call(packed, frame, priority)
+                        self.packed_handler_call(side, packed, frame, priority, service)
                     }) {
                         Ok((_, attempts)) => {
                             *admitted = true;
@@ -12959,6 +13250,12 @@ impl Router {
                 ),
                 tx_priority_burst: 0,
                 tx_policy_flags: 0,
+                #[cfg(feature = "latest-value-egress")]
+                latest_turn_phase: 0,
+                #[cfg(feature = "latest-value-egress")]
+                latest_turn_credit: 0,
+                #[cfg(feature = "latest-value-egress")]
+                latest_service_seq: 0,
                 ordered_claim_seq: 0,
                 rx_priority_burst: 0,
                 recent_rx: BoundedDeque::new(
@@ -13647,6 +13944,8 @@ impl Router {
             *slot = None;
             #[cfg(feature = "latest-value-egress")]
             if st.latest_side() == Some(side) {
+                st.latest_turn_phase = 0;
+                st.latest_turn_credit = 0;
                 st.tx_policy_flags &= 1;
             }
             while st.sides.last().is_some_and(Option::is_none) {
@@ -13717,7 +14016,14 @@ impl Router {
         } else {
             0
         };
+        if encoded != 0 && st.latest_service_seq == u32::MAX {
+            return Err(TelemetryError::BadArg);
+        }
+        st.latest_service_seq = st.latest_service_seq.saturating_add(1);
         st.tx_policy_flags = (st.tx_policy_flags & 1) | encoded;
+        st.latest_turn_phase = 0;
+        st.latest_turn_credit = 0;
+        st.clear_canonical_turn_flags();
         Ok(())
     }
 
@@ -13759,7 +14065,20 @@ impl Router {
             .get_mut(side)
             .and_then(|side| side.as_mut())
             .ok_or(TelemetryError::BadArg)?;
+        #[cfg(feature = "latest-value-egress")]
+        let changed = side_ref.opts.egress_enabled != enabled;
         side_ref.opts.egress_enabled = enabled;
+        #[cfg(feature = "latest-value-egress")]
+        if changed && st.latest_side() == Some(side) {
+            if let Some(next) = st.latest_service_seq.checked_add(1) {
+                st.latest_service_seq = next;
+            } else {
+                st.tx_policy_flags &= 1;
+            }
+            st.latest_turn_phase = 0;
+            st.latest_turn_credit = 0;
+            st.clear_canonical_turn_flags();
+        }
         if !enabled {
             st.retain_transmit(
                 |queued| {
@@ -15240,6 +15559,11 @@ impl Router {
         let mut st = self.state.lock();
         st.retain_transmit(|_| false);
         st.transmit_queue.cancel_deferred_turn();
+        #[cfg(feature = "latest-value-egress")]
+        if st.latest_turn_phase < 3 {
+            st.latest_turn_phase = 0;
+            st.latest_turn_credit = 0;
+        }
         #[cfg(feature = "discovery")]
         for response in st.discovery_side_throttle.values_mut() {
             if response.schema_response_active {
@@ -15271,6 +15595,11 @@ impl Router {
         let mut st = self.state.lock();
         st.retain_transmit(|_| false);
         st.transmit_queue.cancel_deferred_turn();
+        #[cfg(feature = "latest-value-egress")]
+        if st.latest_turn_phase < 3 {
+            st.latest_turn_phase = 0;
+            st.latest_turn_credit = 0;
+        }
         #[cfg(feature = "discovery")]
         for response in st.discovery_side_throttle.values_mut() {
             if response.schema_response_active {
@@ -15298,6 +15627,14 @@ impl Router {
         }
         #[cfg(feature = "latest-value-egress")]
         let latest_blocked = st.latest_blocked_side(now_ms);
+        #[cfg(feature = "latest-value-egress")]
+        let latest_turn = st.latest_turn_selection(latest_blocked.is_none(), now_ms);
+        #[cfg(feature = "latest-value-egress")]
+        let latest_side = st.latest_side();
+        #[cfg(feature = "latest-value-egress")]
+        let latest_frame = latest_side
+            .and_then(|side| st.sides.get(side)?.as_ref())
+            .map_or(0, |side| side.opts.max_frame_bytes);
         let (selected, owed_turn) = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
@@ -15313,8 +15650,15 @@ impl Router {
                     && {
                         #[cfg(feature = "latest-value-egress")]
                         {
-                            !(item.disposable & TX_LATEST_PENDING != 0
-                                && matches!(&item.item,
+                            let turn_ready = latest_turn.is_none_or(|index| {
+                                !latest::managed_turn_item(item, latest_side, latest_frame)
+                                    || _queue
+                                        .get(index)
+                                        .is_some_and(|chosen| core::ptr::eq(chosen, item))
+                            });
+                            turn_ready
+                                && !(item.disposable & TX_LATEST_PENDING != 0
+                                    && matches!(&item.item,
                             RouterTxItem::ToSide { dst, .. } if latest_blocked == Some(*dst)))
                         }
                         #[cfg(not(feature = "latest-value-egress"))]
@@ -15324,6 +15668,39 @@ impl Router {
                     }
             },
         )?;
+        #[cfg(feature = "latest-value-egress")]
+        if latest_turn == Some(selected) {
+            if let Some(next) = st.latest_service_seq.checked_add(1) {
+                st.latest_service_seq = next;
+            } else {
+                st.tx_policy_flags &= 1;
+                st.latest_turn_phase = 0;
+                st.latest_turn_credit = 0;
+                st.clear_canonical_turn_flags();
+            }
+            if st.latest_side().is_some()
+                && st.canonical_catalog_owner(st.transmit_queue.get(selected)?)
+            {
+                st.latest_turn_phase = 3;
+            } else if let Some(side) = st.latest_side() {
+                if st
+                    .transmit_queue
+                    .get(selected)
+                    .is_some_and(|queued| queued.disposable & TX_LATEST_TURN == 0)
+                    && let Some(progress) = st
+                        .side_transport
+                        .get_mut(&side)
+                        .and_then(|side| side.tx_chunk_progress.as_mut())
+                {
+                    // A genuinely new logical report cannot inherit an old
+                    // cursor classification left by cancellation or rebind.
+                    progress.clear_latest_owner();
+                }
+                st.latest_turn_phase = 4;
+                st.transmit_queue
+                    .update_metadata(selected, |q| q.disposable |= TX_LATEST_TURN);
+            }
+        }
         let current = st.transmit_queue.get(selected)?;
         let reliable = RouterInner::reliable_original_type(current).is_some();
         let ordered = reliable && RouterInner::ordered_original_type(current).is_some();
@@ -15378,14 +15755,33 @@ impl Router {
         let queued = {
             let mut selected = queued;
             if selected.disposable & TX_LATEST_PENDING != 0 {
-                selected.disposable = TX_HISTORY_OWNED;
+                selected.disposable = TX_HISTORY_OWNED | (selected.disposable & TX_LATEST_TURN);
             }
             selected
+        };
+        #[cfg(feature = "latest-value-egress")]
+        let service = {
+            #[cfg(feature = "latest-value-egress")]
+            {
+                EgressService {
+                    token: st.latest_service_seq,
+                    side: st.latest_dispatch_tag(&queued),
+                    kind: if queued.disposable & TX_CANONICAL_OWED != 0 {
+                        1
+                    } else if queued.disposable & TX_LATEST_TURN != 0 {
+                        2
+                    } else {
+                        0
+                    },
+                }
+            }
         };
         Some(TxWork {
             queued,
             claim,
             owed_turn,
+            #[cfg(feature = "latest-value-egress")]
+            service,
         })
     }
 
@@ -15621,7 +16017,7 @@ impl Router {
         ignore_local: bool,
         reservation: &mut Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
     ) -> TelemetryResult<()> {
-        self.retry_codec_owner_at_priority(item, ignore_local, reservation, 0)
+        self.retry_codec_owner_at_priority(item, ignore_local, reservation, 0, 0, false)
     }
 
     #[cfg(feature = "compression")]
@@ -15631,6 +16027,8 @@ impl Router {
         ignore_local: bool,
         reservation: &mut Option<crate::payload_codec::QueueReservation<'_, RouterInner>>,
         priority_floor: u8,
+        _turn_flags: u8,
+        immediate: bool,
     ) -> TelemetryResult<()> {
         let priority = priority_floor.max(match &item {
             RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
@@ -15643,14 +16041,14 @@ impl Router {
             reservation.release_locked(&mut state);
         }
         let result = state.push_transmit(TxQueued {
-            disposable: TX_DISPOSABLE,
+            disposable: TX_DISPOSABLE | _turn_flags,
             item,
             ignore_local,
             priority,
             delivery_state: QueuedDelivery::Untracked,
             accepted_type: 0,
             deferred_since_ms: 0,
-            retry_after_ms: self.clock.now_ms().saturating_add(1),
+            retry_after_ms: self.clock.now_ms().saturating_add(u64::from(!immediate)),
         });
         #[cfg(feature = "discovery")]
         if result.is_err() {
@@ -15718,9 +16116,19 @@ impl Router {
             priority: queued.priority,
             claim: work.claim,
             since,
-            completion_flags: 0,
-            refused: false,
+            completion_flags: queued.disposable & {
+                #[cfg(feature = "latest-value-egress")]
+                {
+                    TX_CANONICAL_TURN | TX_LATEST_TURN
+                }
+                #[cfg(not(feature = "latest-value-egress"))]
+                {
+                    0
+                }
+            },
             admitted: false,
+            #[cfg(feature = "latest-value-egress")]
+            latest_service: work.service,
         };
         let schema = if work.claim.is_some_and(|claim| claim.side_retry) {
             Ok(true)
@@ -15812,14 +16220,60 @@ impl Router {
         result
     }
 
+    fn current_egress_requeue(&self, context: &DispatchContext) -> (u8, bool) {
+        #[cfg(feature = "latest-value-egress")]
+        {
+            let service = context.egress_service();
+            let st = self.state.lock();
+            if service.side == 0
+                || service.token != st.latest_service_seq
+                || st.latest_side() != Some(usize::from(service.side - 1))
+            {
+                return (0, false);
+            }
+        }
+        (
+            context.canonical_turn_flags(),
+            context.yielded_canonical_turn(),
+        )
+    }
+
     fn finish_dispatch_turn(&self, owed_turn: bool, context: &DispatchContext) {
         let mut guard = self.state.lock();
         let st = &mut *guard;
+        #[cfg(feature = "latest-value-egress")]
+        if context.latest_service.side != 0
+            && context.latest_service.token == st.latest_service_seq
+            && st.latest_side() == Some(usize::from(context.latest_service.side - 1))
+        {
+            let kind = if context.completion_flags & TX_CANONICAL_OWED != 0 {
+                1
+            } else if context.completion_flags & TX_LATEST_TURN != 0 {
+                2
+            } else {
+                0
+            };
+            st.latest_turn_phase = match kind {
+                1 if context.admitted => 2,
+                1 if context.refused() => 1,
+                1 => 0,
+                2 if context.admitted => {
+                    if st.latest_turn_credit > 0 {
+                        2
+                    } else {
+                        0
+                    }
+                }
+                2 if context.refused() => 2,
+                2 => 0,
+                _ => st.latest_turn_phase,
+            };
+        }
         st.transmit_queue.finish_deferred_turn(
             context.priority,
             owed_turn,
             context.admitted,
-            context.refused,
+            context.refused(),
             &mut st.tx_priority_burst,
         );
     }
@@ -15847,7 +16301,7 @@ impl Router {
     }
 
     fn defer_accepted_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
-        context.refused = true;
+        context.mark_refused();
         let Some(claim) = context.claim else {
             return Err(TelemetryError::Io("reliable owner unavailable"));
         };
@@ -15915,19 +16369,22 @@ impl Router {
     }
 
     #[cfg(not(feature = "compression"))]
-    fn tx_queue_item_for_retry_at_priority(
+    fn tx_queue_item_for_retry_at_priority_with_turn(
         &self,
         item: RouterTxItem,
         ignore_local: bool,
         priority: u8,
+        turn_flags: u8,
+        immediate: bool,
     ) -> TelemetryResult<()> {
         #[cfg(feature = "discovery")]
         let schema_owner = RouterInner::schema_response_owner(&item);
-        let result = self.tx_queue_item_with_priority_at(
+        let result = self.tx_queue_item_with_priority_and_turn_at(
             item,
             ignore_local,
             priority,
-            self.clock.now_ms().saturating_add(1),
+            self.clock.now_ms().saturating_add(u64::from(!immediate)),
+            turn_flags,
         );
         #[cfg(feature = "discovery")]
         if result.is_err() {
@@ -15973,9 +16430,25 @@ impl Router {
         priority: u8,
         retry_after_ms: u64,
     ) -> TelemetryResult<()> {
+        self.tx_queue_item_with_priority_and_turn_at(
+            item,
+            ignore_local,
+            priority,
+            retry_after_ms,
+            0,
+        )
+    }
+    fn tx_queue_item_with_priority_and_turn_at(
+        &self,
+        item: RouterTxItem,
+        ignore_local: bool,
+        priority: u8,
+        retry_after_ms: u64,
+        turn_flags: u8,
+    ) -> TelemetryResult<()> {
         let mut st = self.state.lock();
         st.push_transmit(TxQueued {
-            disposable: TX_DISPOSABLE,
+            disposable: TX_DISPOSABLE | turn_flags,
             item,
             ignore_local,
             priority,
@@ -17677,7 +18150,7 @@ impl Router {
                     );
                     if let Err(e) = send_result {
                         if Self::is_transient_tx_error(&e) {
-                            context.refused = true;
+                            context.mark_refused();
                             if let Some(parent) = e2e_parent {
                                 self.enqueue_e2e_child(
                                     RouterTxItem::ToSide {
@@ -17736,6 +18209,7 @@ impl Router {
                 }
             }
             RouterTxItem::ToSide { src, dst, data } => {
+                let egress_service = context.egress_service();
                 #[cfg(feature = "compression")]
                 let mut data = data;
                 let ty = Self::item_data_type(&data)?;
@@ -17789,51 +18263,59 @@ impl Router {
                         let prepared = self.prepare_e2e_child_for_send(claim, dst, &mut data);
                         (
                             prepared.and_then(|()| {
-                                self.send_reliable_to_side_with_progress(
+                                self.send_reliable_to_side_with_service(
                                     dst,
                                     data.clone(),
                                     src.is_some(),
                                     &mut context.admitted,
+                                    egress_service,
                                 )
                             }),
                             None,
                         )
                     } else {
-                        self.send_queued_to_side_with_progress(
+                        self.send_queued_to_side_with_service(
                             dst,
                             &mut data,
                             src.is_some(),
                             &mut context.admitted,
+                            egress_service,
                         )
                     };
                 #[cfg(not(feature = "compression"))]
-                let send_result = self.send_reliable_to_side_with_progress(
+                let send_result = self.send_reliable_to_side_with_service(
                     dst,
                     data.clone(),
                     src.is_some(),
                     &mut context.admitted,
+                    egress_service,
                 );
                 if let Err(e) = send_result {
                     if Self::is_transient_tx_error(&e) {
-                        context.refused = true;
+                        context.mark_refused();
                         if let Some(claim) = context.claim.filter(|claim| claim.side_retry) {
                             self.restore_e2e_child_claim(claim)?;
                             return Ok(());
                         }
                         let retry_priority =
                             context.priority.max(self.item_service_priority(&data)?);
+                        let (turn_flags, immediate) = self.current_egress_requeue(context);
                         #[cfg(feature = "compression")]
                         self.retry_codec_owner_at_priority(
                             RouterTxItem::ToSide { src, dst, data },
                             true,
                             &mut reservation,
                             retry_priority,
+                            turn_flags,
+                            immediate,
                         )?;
                         #[cfg(not(feature = "compression"))]
-                        self.tx_queue_item_for_retry_at_priority(
+                        self.tx_queue_item_for_retry_at_priority_with_turn(
                             RouterTxItem::ToSide { src, dst, data },
                             true,
                             retry_priority,
+                            turn_flags,
+                            immediate,
                         )?;
                         return Ok(());
                     }
@@ -17895,7 +18377,7 @@ impl Router {
                     );
                     if let Err(e) = send_result {
                         if Self::is_transient_tx_error(&e) {
-                            context.refused = true;
+                            context.mark_refused();
                             let retry_priority =
                                 Self::router_item_priority_bumped(DataType::ReliableAck);
                             self.enqueue_e2e_child(
@@ -17955,7 +18437,7 @@ impl Router {
                     self.send_reliable_raw_to_side(dst, bytes.clone(), false, &mut context.admitted)
                 {
                     if Self::is_transient_tx_error(&e) {
-                        context.refused = true;
+                        context.mark_refused();
                         self.tx_queue_item_for_retry(
                             RouterTxItem::ReliableReplay {
                                 dst,
@@ -19550,3 +20032,7 @@ mod peer_record_footprint;
 mod completion;
 #[cfg(feature = "std")]
 pub use completion::{PackedWriteLease, RetryTracker, RetryTrackerLimits, WriteStart};
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/actual_bootstrap_arbitration.rs"]
+mod actual_bootstrap_arbitration;
