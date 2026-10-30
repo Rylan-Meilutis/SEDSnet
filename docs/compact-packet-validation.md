@@ -3,9 +3,9 @@
 The optional arena and indexed codec shipped in 4.1.0 as experimental features.
 The development results below are not a hardware qualification.
 
-## Current qualification: 4.2.4 (2026-10-19)
+## Qualification record: 4.2.4 (2026-10-19)
 
-The latest cohort uses the compact packet store and TLSF on all seven firmware
+The 4.2.4 cohort uses the compact packet store and TLSF on all seven firmware
 nodes, with compression disabled. Three strict starts, the all-current
 120-second restart and 600-second ARM/Renode soak pass, along with both DAQ/FC
 CSV reconciliations. The hosted backend's resolved SDK
@@ -19,7 +19,7 @@ power-loss durability, lossless best-effort delivery or indefinite OOM immunity.
 The packet store remains opt-in; the indexed compression configuration requires
 its own MCU memory and throughput qualification.
 
-## Current native pressure checks (2026-10-19)
+## Native pressure checks: 4.2.4 (2026-10-19)
 
 The final 4.2.4 candidate repeats the explicit 600-second wall-clock codec/arena
 pressure soak: 14,558,397 rounds and 227,475 deliberate oversized
@@ -29,7 +29,7 @@ fixed at 126,879 bytes on this native host. A separate 2,400-tick mixed-network
 churn test passes recovery after injected loss and route outages. These native
 checks do not qualify compression on a memory-constrained MCU.
 
-[Exact results and source hashes](native-pressure-soaks-2026-10-19.json).
+Generated results and source hashes are retained with external qualification artifacts.
 
 ## Initial development validation (2026-10-05)
 
