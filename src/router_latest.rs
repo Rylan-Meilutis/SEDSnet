@@ -1123,7 +1123,7 @@ mod tests {
         );
         let state = router.state.lock();
         let throttle = &state.discovery_side_throttle[&side];
-        assert!(!throttle.schema_response_active && !throttle.schema_response_pending);
+        assert!(!throttle.schema_response_active() && !throttle.schema_response_pending());
         for flow in reports {
             assert!(
                 flow.first().expect("flow delivered a report").1 <= 400,

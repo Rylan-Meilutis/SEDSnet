@@ -70,7 +70,7 @@ fn two_slot_full_announce_and_schema_request_recover_without_repeating_prefix() 
                 .count(),
             1
         );
-        assert!(!router.state.lock().discovery_side_throttle[&side].schema_response_active);
+        assert!(!router.state.lock().discovery_side_throttle[&side].schema_response_active());
     }
 }
 #[test]
@@ -179,7 +179,7 @@ fn clear_racing_atomic_catalog_admission_cannot_leave_an_orphan() {
         router.clear_tx_queue();
         thread.join().unwrap().unwrap();
         let st = router.state.lock();
-        assert!(!st.discovery_side_throttle[&side].schema_response_active);
+        assert!(!st.discovery_side_throttle[&side].schema_response_active());
         assert!(
             !st.transmit_queue
                 .iter()
@@ -242,9 +242,9 @@ fn coalesced_explicit_announce_cannot_rearm_an_already_admitted_prefix() {
         Ok(())
     });
     router.announce_discovery().unwrap();
-    assert!(router.state.lock().discovery_side_throttle[&side].has_sent_full);
+    assert!(router.state.lock().discovery_side_throttle[&side].has_sent_full());
     router.announce_discovery().unwrap();
-    assert!(router.state.lock().discovery_side_throttle[&side].has_sent_full);
+    assert!(router.state.lock().discovery_side_throttle[&side].has_sent_full());
     router.drain_queues_with_timeout(0).unwrap();
     router.poll_schema_response_on_side(side).unwrap();
     router.announce_discovery().unwrap();
@@ -255,7 +255,7 @@ fn coalesced_explicit_announce_cannot_rearm_an_already_admitted_prefix() {
             .count(),
         1
     );
-    assert!(router.state.lock().discovery_side_throttle[&side].has_sent_full);
+    assert!(router.state.lock().discovery_side_throttle[&side].has_sent_full());
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn old_prefix_payload_cannot_enqueue_after_clear_and_new_generation() {
         st.schema_response_sequence += 1;
         let claim = st.schema_response_sequence;
         let phase = st.discovery_side_throttle.entry(side).or_default();
-        phase.schema_response_active = true;
+        phase.set_schema_response_active(true);
         phase.schema_response_phase = SchemaResponsePhase::PrefixBuilding;
         phase.schema_response_packet_id = claim;
         claim
@@ -463,8 +463,8 @@ fn genuine_prefix_build_refusal_preserves_intent_until_memory_recovers() {
     {
         let st = router.state.lock();
         let phase = &st.discovery_side_throttle[&side];
-        assert!(!phase.schema_response_active);
-        assert!(phase.schema_response_pending);
+        assert!(!phase.schema_response_active());
+        assert!(phase.schema_response_pending());
         assert_eq!(phase.schema_response_phase, SchemaResponsePhase::Idle);
     }
     for tick in (250..=1000).step_by(10) {

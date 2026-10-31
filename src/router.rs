@@ -8,6 +8,10 @@
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
 
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/scoped_schema_recovery_audit.rs"]
+mod scoped_schema_recovery_audit;
+
 #[cfg(test)]
 #[path = "tests/relay_legacy_contracts.rs"]
 mod relay_legacy_contracts;
@@ -1088,25 +1092,76 @@ enum SchemaResponsePhase {
 struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
     next_schema_request_ms: u64,
+    // Bounded per-side rotation; advance only after query admission.
+    schema_request_cursor: u32,
     // Request bursts share one active catalog and one fresh pending generation.
     // No payload is retained here: the existing TX queue owns partial transfers.
     next_schema_response_ms: u64,
     schema_response_packet_id: u64,
-    schema_response_active: bool,
     schema_response_phase: SchemaResponsePhase,
-    schema_response_started: bool,
-    schema_response_pending: bool,
+    flags: u8,
     next_ping_ms: u64,
     // Scheduled and accepted sends differ when a constrained link is backed up.
     last_liveness_tx_ms: u64,
-    pending_incremental: bool,
     incremental_retries_remaining: u8,
-    has_sent_full: bool,
     last_topology: Vec<TopologyBoardNode>,
 }
 
 #[cfg(feature = "discovery")]
 impl DiscoverySideThrottleState {
+    #[inline]
+    fn flag(&self, mask: u8) -> bool {
+        self.flags & mask != 0
+    }
+    #[inline]
+    fn set_flag(&mut self, mask: u8, value: bool) {
+        if value {
+            self.flags |= mask;
+        } else {
+            self.flags &= !mask;
+        }
+    }
+    #[inline]
+    fn schema_response_active(&self) -> bool {
+        self.flag(1 << 0)
+    }
+    #[inline]
+    fn set_schema_response_active(&mut self, value: bool) {
+        self.set_flag(1 << 0, value)
+    }
+    #[inline]
+    fn schema_response_started(&self) -> bool {
+        self.flag(1 << 1)
+    }
+    #[inline]
+    fn set_schema_response_started(&mut self, value: bool) {
+        self.set_flag(1 << 1, value)
+    }
+    #[inline]
+    fn schema_response_pending(&self) -> bool {
+        self.flag(1 << 2)
+    }
+    #[inline]
+    fn set_schema_response_pending(&mut self, value: bool) {
+        self.set_flag(1 << 2, value)
+    }
+    #[inline]
+    fn pending_incremental(&self) -> bool {
+        self.flag(1 << 3)
+    }
+    #[inline]
+    fn set_pending_incremental(&mut self, value: bool) {
+        self.set_flag(1 << 3, value)
+    }
+    #[inline]
+    fn has_sent_full(&self) -> bool {
+        self.flag(1 << 4)
+    }
+    #[inline]
+    fn set_has_sent_full(&mut self, value: bool) {
+        self.set_flag(1 << 4, value)
+    }
+
     fn liveness_due(&self, now_ms: u64) -> bool {
         now_ms >= self.next_ping_ms
             && now_ms.saturating_sub(self.last_liveness_tx_ms)
@@ -2497,7 +2552,7 @@ impl RouterInner {
     ) {
         if let Some((side, id)) = owner
             && let Some(response) = responses.get_mut(&side)
-            && response.schema_response_active
+            && response.schema_response_active()
             && response.schema_response_phase == SchemaResponsePhase::Owned
             && response.schema_response_packet_id == id
         {
@@ -2505,7 +2560,7 @@ impl RouterInner {
             // may restart its self-describing catalog without replaying that
             // prefix and preempting another side's queued catalog forever.
             response.schema_response_packet_id = 0;
-            response.schema_response_started = false;
+            response.set_schema_response_started(false);
             response.schema_response_phase = SchemaResponsePhase::CatalogWaiting;
         }
     }
@@ -7567,7 +7622,7 @@ impl Router {
             .filter_map(|(side_id, side)| side.as_ref().map(|_| side_id))
         {
             let throttle = st.discovery_side_throttle.entry(side_id).or_default();
-            throttle.pending_incremental = true;
+            throttle.set_pending_incremental(true);
             throttle.incremental_retries_remaining = DISCOVERY_INCREMENTAL_RETRY_COUNT;
         }
         // Make the first incremental control frame self-describing. This is a
@@ -8007,17 +8062,17 @@ impl Router {
         now_ms: u64,
     ) -> Option<DiscoveryAdvertiseLevel> {
         let throttle = st.discovery_side_throttle.entry(side_id).or_default();
-        if !throttle.has_sent_full {
-            throttle.has_sent_full = true;
-            throttle.pending_incremental = false;
+        if !throttle.has_sent_full() {
+            throttle.set_has_sent_full(true);
+            throttle.set_pending_incremental(false);
             throttle.incremental_retries_remaining = 0;
             throttle.next_ping_ms = now_ms.saturating_add(DISCOVERY_SLOW_LINK_PING_INTERVAL_MS);
             return Some(DiscoveryAdvertiseLevel::Full);
         }
-        if throttle.pending_incremental {
+        if throttle.pending_incremental() {
             throttle.incremental_retries_remaining =
                 throttle.incremental_retries_remaining.saturating_sub(1);
-            throttle.pending_incremental = throttle.incremental_retries_remaining > 0;
+            throttle.set_pending_incremental(throttle.incremental_retries_remaining > 0);
             return Some(DiscoveryAdvertiseLevel::Incremental);
         }
         // Stable links carry only a small liveness announcement. Route and
@@ -8537,7 +8592,7 @@ impl Router {
                         .discovery_side_throttle
                         .get(&side_id)
                         .is_some_and(|throttle| {
-                            throttle.schema_response_active
+                            throttle.schema_response_active()
                                 && throttle.schema_response_phase
                                     == SchemaResponsePhase::PrefixBuilding
                                 && throttle.schema_response_packet_id == claim
@@ -8811,7 +8866,7 @@ impl Router {
             .discovery_side_throttle
             .get(&side)
             .is_some_and(|throttle| {
-                throttle.schema_response_active
+                throttle.schema_response_active()
                     && throttle.schema_response_phase == SchemaResponsePhase::PrefixBuilding
                     && throttle.schema_response_packet_id == claim
             })
@@ -8855,6 +8910,76 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
+    fn missing_schema_request_targets(
+        st: &RouterInner,
+        side: RouterSideId,
+        now: u64,
+    ) -> ([u32; discovery::SCHEMA_REQUEST_MAX_TARGETS], usize, bool) {
+        let mut targets = [0u32; discovery::SCHEMA_REQUEST_MAX_TARGETS];
+        let mut count = 0;
+        let mut legacy_broadcast = false;
+        let cursor = st
+            .discovery_side_throttle
+            .get(&side)
+            .map_or(0, |v| v.schema_request_cursor);
+        let order = |address: u32| {
+            let delta = address.wrapping_sub(cursor);
+            if delta == 0 {
+                1u64 << 32
+            } else {
+                u64::from(delta)
+            }
+        };
+        if let Some(route) = st.discovery_routes.get(&side) {
+            for (name, peer) in &route.announcers {
+                if !peer.has_full_topology
+                    || peer.has_schema
+                    || now.saturating_sub(peer.last_seen_ms) >= DISCOVERY_ROUTE_TTL_MS
+                {
+                    continue;
+                }
+                if st.side_transport.get(&side).is_some_and(|transport| {
+                    transport.rx_chunks.values().any(|assembly| {
+                        assembly.schema_progress_for(sender_address_u32(name), now)
+                            || peer
+                                .advertised_address
+                                .is_some_and(|a| assembly.schema_progress_for(a, now))
+                    })
+                }) {
+                    continue;
+                }
+                let address = peer
+                    .advertised_address
+                    .filter(|a| *a != 0)
+                    .unwrap_or_else(|| sender_address_u32(name));
+                if address == 0 {
+                    // Numeric zero aliases have no safe scope. Preserve legacy
+                    // recovery for them without poisoning addressable peers.
+                    legacy_broadcast = true;
+                    continue;
+                }
+                if targets[..count].contains(&address) {
+                    continue;
+                }
+                let position = targets[..count]
+                    .iter()
+                    .position(|old| order(address) < order(*old))
+                    .unwrap_or(count);
+                if position >= targets.len() {
+                    continue;
+                }
+                let next = (count + 1).min(targets.len());
+                for i in ((position + 1)..next).rev() {
+                    targets[i] = targets[i - 1];
+                }
+                targets[position] = address;
+                count = next;
+            }
+        }
+        (targets, count, legacy_broadcast)
+    }
+
+    #[cfg(feature = "discovery")]
     fn note_schema_received(&self, side: RouterSideId, sender: &str) {
         let mut st = self.state.lock();
         // Schema snapshots can be forwarded. They must never introduce a new
@@ -8893,14 +9018,14 @@ impl Router {
         let claim = {
             let mut st = self.state.lock();
             let throttle = st.discovery_side_throttle.entry(side).or_default();
-            if throttle.schema_response_active {
+            if throttle.schema_response_active() {
                 if explicit {
-                    throttle.schema_response_pending = true;
+                    throttle.set_schema_response_pending(true);
                 }
                 return Ok(false);
             }
             if !explicit
-                && (!throttle.schema_response_pending || now < throttle.next_schema_response_ms)
+                && (!throttle.schema_response_pending() || now < throttle.next_schema_response_ms)
             {
                 return Ok(false);
             }
@@ -8913,14 +9038,14 @@ impl Router {
                 .discovery_side_throttle
                 .get_mut(&side)
                 .expect("schema throttle");
-            throttle.schema_response_pending = false;
-            throttle.schema_response_active = true;
+            throttle.set_schema_response_pending(false);
+            throttle.set_schema_response_active(true);
             throttle.schema_response_phase = SchemaResponsePhase::PrefixBuilding;
             throttle.schema_response_packet_id = claim;
-            throttle.schema_response_started = false;
+            throttle.set_schema_response_started(false);
             throttle.next_schema_response_ms =
                 now.saturating_add(discovery::DISCOVERY_FAST_INTERVAL_MS);
-            throttle.has_sent_full = false;
+            throttle.set_has_sent_full(false);
             throttle.last_topology = Vec::new();
             if let Some(transport) = st.side_transport.get_mut(&side) {
                 transport.refresh_transmit_header_templates();
@@ -8944,21 +9069,21 @@ impl Router {
                 .discovery_side_throttle
                 .get_mut(&side)
                 .ok_or(TelemetryError::BadArg)?;
-            if !throttle.schema_response_active
+            if !throttle.schema_response_active()
                 || throttle.schema_response_phase != SchemaResponsePhase::PrefixBuilding
                 || throttle.schema_response_packet_id != claim
             {
                 return Ok(false);
             }
             if let Err(error) = prefix {
-                throttle.schema_response_active = false;
+                throttle.set_schema_response_active(false);
                 throttle.schema_response_phase = SchemaResponsePhase::Idle;
-                throttle.schema_response_pending = true;
+                throttle.set_schema_response_pending(true);
                 return Err(error);
             }
-            if !throttle.has_sent_full {
+            if !throttle.has_sent_full() {
                 // Liveness-only links still do not acquire a schema owner.
-                throttle.schema_response_active = false;
+                throttle.set_schema_response_active(false);
                 throttle.schema_response_phase = SchemaResponsePhase::Idle;
                 return Ok(true);
             }
@@ -8988,7 +9113,7 @@ impl Router {
                 .discovery_side_throttle
                 .get(&side)
                 .ok_or(TelemetryError::BadArg)?;
-            if !throttle.schema_response_active
+            if !throttle.schema_response_active()
                 || throttle.schema_response_phase != SchemaResponsePhase::CatalogWaiting
             {
                 return Ok(false);
@@ -9038,7 +9163,7 @@ impl Router {
             .discovery_side_throttle
             .get(&side)
             .ok_or(TelemetryError::BadArg)?;
-        if !throttle.schema_response_active
+        if !throttle.schema_response_active()
             || throttle.schema_response_phase != SchemaResponsePhase::CatalogBuilding
             || throttle.schema_response_packet_id != claim
         {
@@ -9080,9 +9205,9 @@ impl Router {
                 Ok(false)
             }
             Err(error) => {
-                throttle.schema_response_active = false;
+                throttle.set_schema_response_active(false);
                 throttle.schema_response_phase = SchemaResponsePhase::Idle;
-                throttle.schema_response_pending = true;
+                throttle.set_schema_response_pending(true);
                 Err(error)
             }
         }
@@ -9095,13 +9220,13 @@ impl Router {
             let Some(throttle) = st.discovery_side_throttle.get(&side) else {
                 return Ok(false);
             };
-            if throttle.schema_response_active {
+            if throttle.schema_response_active() {
                 if throttle.schema_response_phase != SchemaResponsePhase::CatalogWaiting {
                     return Ok(false);
                 }
                 true
             } else {
-                if !throttle.schema_response_pending
+                if !throttle.schema_response_pending()
                     || self.clock.now_ms() < throttle.next_schema_response_ms
                 {
                     return Ok(false);
@@ -9182,26 +9307,20 @@ impl Router {
             let mut st = self.state.lock();
             let mut due = Vec::new();
             for side in 0..st.sides.len() {
-                let missing = st.discovery_routes.get(&side).is_some_and(|route| {
-                    route.announcers.iter().any(|(name, peer)| {
-                        peer.has_full_topology
-                            && !peer.has_schema
-                            && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
-                            // Receiving this peer's catalog is already recovery.
-                            // Preserve the normal retry deadline: after useful
-                            // progress expires, the same due request can run.
-                            && !st.side_transport.get(&side).is_some_and(|transport| {
-                                transport.rx_chunks.values().any(|assembly| {
-                                    // Match note_schema_received's assigned-address
-                                    // and legacy hashed-sender compatibility.
-                                    assembly.schema_progress_for(sender_address_u32(name), now_ms)
-                                        || peer.advertised_address.is_some_and(|address| {
-                                            assembly.schema_progress_for(address, now_ms)
-                                        })
-                                })
-                            })
+                // Eligibility cannot change a future grace/retry deadline. Avoid
+                // scanning/sorting all announcers on the embedded poll hot path.
+                if st
+                    .discovery_side_throttle
+                    .get(&side)
+                    .is_some_and(|throttle| {
+                        throttle.next_schema_request_ms != 0
+                            && now_ms < throttle.next_schema_request_ms
                     })
-                });
+                {
+                    continue;
+                }
+                let (_, count, legacy) = Self::missing_schema_request_targets(&st, side, now_ms);
+                let missing = count != 0 || legacy;
                 if !missing {
                     continue;
                 }
@@ -9219,8 +9338,22 @@ impl Router {
         };
         let recovering = recovering || !schema_recovery_sides.is_empty();
         for side in schema_recovery_sides {
-            let pkt =
-                discovery::build_discovery_schema_request(self.sender_arc().as_ref(), now_ms)?;
+            let (addresses, count, legacy) = {
+                let st = self.state.lock();
+                Self::missing_schema_request_targets(&st, side, now_ms)
+            };
+            if count == 0 && !legacy {
+                continue;
+            }
+            let pkt = if legacy {
+                discovery::build_discovery_schema_request(self.sender_arc().as_ref(), now_ms)?
+            } else {
+                discovery::build_scoped_discovery_schema_request(
+                    self.sender_arc().as_ref(),
+                    now_ms,
+                    &addresses[..count],
+                )?
+            };
             self.emit_internal_tx(
                 RouterTxItem::ToSide {
                     src: None,
@@ -9230,6 +9363,11 @@ impl Router {
                 true,
                 true,
             )?;
+            if !legacy
+                && let Some(throttle) = self.state.lock().discovery_side_throttle.get_mut(&side)
+            {
+                throttle.schema_request_cursor = addresses[count - 1];
+            }
         }
         let due = {
             let mut st = self.state.lock();
@@ -9256,7 +9394,8 @@ impl Router {
                 st.discovery_side_throttle
                     .get(&side_id)
                     .is_none_or(|throttle| {
-                        (!in_flight && (!throttle.has_sent_full || throttle.pending_incremental))
+                        (!in_flight
+                            && (!throttle.has_sent_full() || throttle.pending_incremental()))
                             || throttle.liveness_due(now_ms)
                     })
             });
@@ -9305,12 +9444,26 @@ impl Router {
             return Ok(true);
         }
         if pkt.data_type() == DataType::DiscoverySchemaRequest {
+            if let Some(targets) = discovery::schema_request_targets(pkt.payload()) {
+                let assigned = self.state.lock().local_address.address;
+                let legacy = sender_address_u32(self.sender_arc().as_ref());
+                if !(0..targets.len() / 4).any(|index| {
+                    let bytes = &targets[index * 4..index * 4 + 4];
+                    let address =
+                        u32::from_le_bytes(bytes.try_into().expect("validated address width"));
+                    address == assigned || address == legacy
+                }) {
+                    // Exclusion only affects THIS request; an accepted pending/inflight
+                    // generation and its retained owner are deliberately untouched.
+                    return Ok(true);
+                }
+            }
             self.state
                 .lock()
                 .discovery_side_throttle
                 .entry(side)
                 .or_default()
-                .schema_response_pending = true;
+                .set_schema_response_pending(true);
             self.poll_schema_response_on_side(side)?;
             return Ok(true);
         }
@@ -9342,7 +9495,7 @@ impl Router {
                     Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 }
                 let throttle = st.discovery_side_throttle.entry(side).or_default();
-                throttle.has_sent_full = false;
+                throttle.set_has_sent_full(false);
                 // A full reply cannot use the old incremental baseline. Drop
                 // that derived copy before admitting its replacement scratch;
                 // keep all learned routes, schemas and other links intact.
@@ -10257,12 +10410,12 @@ impl Router {
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
             if let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
-                && throttle.schema_response_active
+                && throttle.schema_response_active()
                 && throttle.schema_response_phase == SchemaResponsePhase::Owned
                 && throttle.schema_response_packet_id == id
-                && !throttle.schema_response_started
+                && !throttle.schema_response_started()
             {
-                throttle.schema_response_started = true;
+                throttle.set_schema_response_started(true);
                 throttle.next_schema_response_ms = self
                     .clock
                     .now_ms()
@@ -10281,16 +10434,18 @@ impl Router {
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
             if let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
-                && throttle.schema_response_active
+                && throttle.schema_response_active()
                 && throttle.schema_response_phase == SchemaResponsePhase::Owned
                 && throttle.schema_response_packet_id == id
             {
                 // Transient partial IO retains this exact owner in the outer
                 // queue path. It is not a new request for another catalog.
                 if !result.as_ref().is_err_and(Self::is_transient_tx_error) {
-                    throttle.schema_response_active = false;
+                    throttle.set_schema_response_active(false);
                     throttle.schema_response_phase = SchemaResponsePhase::Idle;
-                    throttle.schema_response_pending |= result.is_err();
+                    throttle.set_schema_response_pending(
+                        throttle.schema_response_pending() || result.is_err(),
+                    );
                 }
             }
         }
@@ -15566,10 +15721,10 @@ impl Router {
         }
         #[cfg(feature = "discovery")]
         for response in st.discovery_side_throttle.values_mut() {
-            if response.schema_response_active {
-                response.schema_response_active = false;
+            if response.schema_response_active() {
+                response.set_schema_response_active(false);
                 response.schema_response_phase = SchemaResponsePhase::Idle;
-                response.schema_response_pending = true;
+                response.set_schema_response_pending(true);
             }
         }
         st.tx_policy_flags &= !1;
@@ -15602,10 +15757,10 @@ impl Router {
         }
         #[cfg(feature = "discovery")]
         for response in st.discovery_side_throttle.values_mut() {
-            if response.schema_response_active {
-                response.schema_response_active = false;
+            if response.schema_response_active() {
+                response.set_schema_response_active(false);
                 response.schema_response_phase = SchemaResponsePhase::Idle;
-                response.schema_response_pending = true;
+                response.set_schema_response_pending(true);
             }
         }
         st.tx_priority_burst = 0;
