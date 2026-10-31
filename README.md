@@ -196,6 +196,13 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.5 highlights
+
+- Request missing peer catalogs with bounded network-address scopes, preserving
+  legacy broadcast requests and already-admitted response ownership.
+- Keep mixed-version discovery interoperable; see
+  [scoped recovery](docs/discovery-liveness.md#scoped-missing-catalog-recovery).
+
 ### Version 4.3.4 highlights
 
 - Keep fresh reports moving during SDK-owned canonical schema transfers without

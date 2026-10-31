@@ -656,7 +656,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
         peer.has_full_topology = true;
         peer.has_schema = true;
         let throttle = st.discovery_side_throttle.entry(side).or_default();
-        throttle.has_sent_full = true;
+        throttle.set_has_sent_full(true);
         throttle.next_ping_ms = 0;
     }
     extern "C" fn only_small_work(additional: usize, _: usize) -> bool {
@@ -680,7 +680,7 @@ fn known_discovery_survives_snapshot_memory_pressure() {
                 .discovery_side_throttle
                 .entry(side)
                 .or_default()
-                .has_sent_full = false;
+                .set_has_sent_full(false);
         }
         let repeated = discovery::build_discovery_address("AB", ms, &ad).unwrap();
         node.learn_discovery_item(side, &RouterItem::Packet(repeated))
@@ -1010,7 +1010,7 @@ fn keepalive_fits_reserved_control_headroom() {
         .discovery_side_throttle
         .entry(side)
         .or_default()
-        .has_sent_full = true;
+        .set_has_sent_full(true);
     extern "C" fn control_only(additional: usize, _: usize) -> bool {
         additional <= 512
     }

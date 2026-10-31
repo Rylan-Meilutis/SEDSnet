@@ -67,3 +67,39 @@ Regression tests drop a first packet's tail, deliver a different complete packet
 from that sender, and verify exact decoding. A repeated-loss test checks the
 assembly-count bound over 1,000 transfers. Update senders to correct IDs and
 receivers for bounded partial-transfer retention.
+
+## Scoped missing-catalog recovery
+
+Automatic schema recovery requests identify up to eight missing announcers by
+network address. Receiving a catalog from one peer does not satisfy another
+peer's missing schema. On a shared link, scoped requests let a peer whose catalog
+is already known omit a redundant response while the missing peer still replies.
+Useful unique fragments from that same peer continue to defer its recovery retry;
+normal grace, retry, assembly-inactivity and route leases are unchanged.
+
+The existing `DiscoverySchemaRequest` type retains its dynamic byte payload and
+reliability policy. Empty payloads request every peer's catalog, including requests
+made by the existing explicit `request_schema` API. The optional scoped payload is:
+
+| Bytes | Meaning |
+| --- | --- |
+| 0–3 | `53 52 51 01` (`SRQ`, version 1) |
+| 4 | Count, from 1 through 8 |
+| 5 onward | Exactly count distinct nonzero network addresses, each little-endian u32 |
+
+The largest scope is 37 payload bytes. A responder matches its current assigned
+network address or its legacy sender-derived address. These are SDK network
+identities, independent of modem identifiers. More than eight missing peers rotate
+through bounded scopes; refused queue admission does not advance that rotation.
+An unaddressable peer preserves broadcast recovery instead of blocking other peers.
+
+Only a valid scope excluding the responder suppresses that request's local catalog
+response. It does not cancel a previously admitted response, change routing or
+prevent forwarding to a downstream target. Unknown versions and malformed scopes
+retain broadcast behavior. This selection is not authorization: existing packet
+validation, ownership, ACK and transport checks remain in force.
+
+Older receivers ignore the optional body and still answer with a full catalog.
+Empty requests to new receivers also retain their original behavior. Mixed versions
+remain interoperable, but redundant-response reductions require updated responders.
+No application type IDs, side names or schema configuration changes are required.
