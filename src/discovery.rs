@@ -463,6 +463,52 @@ pub fn build_discovery_schema_request(sender: &str, timestamp_ms: u64) -> Teleme
     )
 }
 
+/// Versioned, bounded response scope for automatic missing-catalog recovery.
+/// An invalid/unknown body retains legacy broadcast semantics.
+pub(crate) const SCHEMA_REQUEST_MAX_TARGETS: usize = 8;
+pub(crate) fn schema_request_targets(payload: &[u8]) -> Option<&[u8]> {
+    if payload.len() < 5 || &payload[..4] != b"SRQ\x01" {
+        return None;
+    }
+    let count = usize::from(payload[4]);
+    if count == 0 || count > SCHEMA_REQUEST_MAX_TARGETS || payload.len() != 5 + count * 4 {
+        return None;
+    }
+    let targets = &payload[5..];
+    for i in 0..count {
+        let target = &targets[i * 4..i * 4 + 4];
+        if target == [0; 4] || (0..i).any(|old| &targets[old * 4..old * 4 + 4] == target) {
+            return None;
+        }
+    }
+    Some(targets)
+}
+pub(crate) fn build_scoped_discovery_schema_request(
+    sender: &str,
+    timestamp_ms: u64,
+    addresses: &[u32],
+) -> TelemetryResult<Packet> {
+    if addresses.is_empty() || addresses.len() > SCHEMA_REQUEST_MAX_TARGETS {
+        return Err(TelemetryError::BadArg);
+    }
+    let mut body = Vec::with_capacity(5 + addresses.len() * 4);
+    body.extend_from_slice(b"SRQ\x01");
+    body.push(addresses.len() as u8);
+    for address in addresses {
+        body.extend_from_slice(&address.to_le_bytes());
+    }
+    if schema_request_targets(&body).is_none() {
+        return Err(TelemetryError::BadArg);
+    }
+    Packet::new(
+        DataType::DiscoverySchemaRequest,
+        &[DataEndpoint::Discovery],
+        sender,
+        timestamp_ms,
+        body.into(),
+    )
+}
+
 pub fn build_discovery_leave(sender: &str, timestamp_ms: u64) -> TelemetryResult<Packet> {
     Packet::new(
         DataType::DiscoveryLeave,

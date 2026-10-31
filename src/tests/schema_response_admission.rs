@@ -229,7 +229,7 @@ fn schema_response_failures_retain_pending_without_growing_the_queue() {
             .unwrap();
         assert!(router.state.lock().transmit_queue.len() <= 1);
     }
-    assert!(router.state.lock().discovery_side_throttle[&side].schema_response_pending);
+    assert!(router.state.lock().discovery_side_throttle[&side].schema_response_pending());
     // The eventual generation is rebuilt from the current catalog, not a
     // retained clone made before this late schema registration.
     let ty = crate::config::register_data_type_with_description(
@@ -255,7 +255,7 @@ fn schema_response_failures_retain_pending_without_growing_the_queue() {
         "fresh schema {ty:?} missing"
     );
     drop(packets);
-    assert!(!router.state.lock().discovery_side_throttle[&side].schema_response_pending);
+    assert!(!router.state.lock().discovery_side_throttle[&side].schema_response_pending());
     // A peer restarting after the old response gets another full response.
     now.store(1500, Ordering::SeqCst);
     router
@@ -420,7 +420,7 @@ fn schema_response_queue_admission_failure_is_retried() {
             .learn_discovery_packet(&request, Some(side), true)
             .is_err()
     );
-    assert!(router.state.lock().discovery_side_throttle[&side].schema_response_pending);
+    assert!(router.state.lock().discovery_side_throttle[&side].schema_response_pending());
     router.state.lock().memory.max_queue_budget = original_budget;
     now.store(1250, Ordering::SeqCst);
     router.poll_discovery().unwrap();
@@ -1102,8 +1102,8 @@ fn one_partial_schema_request_completes_without_inventing_another_generation() {
             "retained partial IO is a continuation, not a fresh request (packed={packed})"
         );
         let state = node.state.lock();
-        assert!(!state.discovery_side_throttle[&side].schema_response_active);
-        assert!(!state.discovery_side_throttle[&side].schema_response_pending);
+        assert!(!state.discovery_side_throttle[&side].schema_response_active());
+        assert!(!state.discovery_side_throttle[&side].schema_response_pending());
         drop(state);
         let decoder = Router::new(RouterConfig::default());
         let rx = decoder.add_side_packed_with_options(
@@ -1126,7 +1126,7 @@ fn one_partial_schema_request_completes_without_inventing_another_generation() {
         node.learn_discovery_packet(&restart, Some(side), true)
             .unwrap();
         assert!(
-            node.state.lock().discovery_side_throttle[&side].schema_response_active,
+            node.state.lock().discovery_side_throttle[&side].schema_response_active(),
             "a genuine restart still gets a fresh generation"
         );
     }
@@ -1280,7 +1280,7 @@ fn lost_partial_schema_owner_can_recover_after_clear_eviction_or_readmission_fai
         }
         assert!(chunks.load(Ordering::Relaxed) > 0);
         let original = node.state.lock().discovery_side_throttle[&side].schema_response_packet_id;
-        assert!(node.state.lock().discovery_side_throttle[&side].schema_response_active);
+        assert!(node.state.lock().discovery_side_throttle[&side].schema_response_active());
         match loss {
             "clear" => node.clear_tx_queue(),
             "eviction" => assert!(
@@ -1308,13 +1308,13 @@ fn lost_partial_schema_owner_can_recover_after_clear_eviction_or_readmission_fai
             let st = node.state.lock();
             let state = &st.discovery_side_throttle[&side];
             if loss == "clear" {
-                assert!(!state.schema_response_active);
+                assert!(!state.schema_response_active());
                 assert!(
-                    state.schema_response_pending,
+                    state.schema_response_pending(),
                     "explicit clear requests a fresh prefix"
                 );
             } else {
-                assert!(state.schema_response_active);
+                assert!(state.schema_response_active());
                 assert_eq!(
                     state.schema_response_phase,
                     SchemaResponsePhase::CatalogWaiting,
@@ -1335,7 +1335,7 @@ fn lost_partial_schema_owner_can_recover_after_clear_eviction_or_readmission_fai
         );
         let st = node.state.lock();
         let state = &st.discovery_side_throttle[&side];
-        assert!(state.schema_response_active);
+        assert!(state.schema_response_active());
         assert_ne!(state.schema_response_packet_id, original);
     }
 }

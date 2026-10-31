@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 4.3.5
+
+Wire format and application identities remain compatible with 4.3.4.
+
+- Scope automatic missing-schema recovery requests to a bounded rotating set of
+  network announcers, so already-known peers can omit redundant catalog replies.
+- Preserve explicit empty broadcast requests, legacy receivers, pending catalog
+  owners, forwarding, retry cadence and existing reliability semantics.
+- Retain broadcast recovery for unknown request formats and unaddressable peers.
+
 ## 4.3.4
 
 Wire format and application identities remain compatible with 4.3.3.

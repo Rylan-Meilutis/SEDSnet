@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## Version 4.3.5 highlights
+
+- Scope automatic missing-catalog requests to bounded network-address sets while
+  retaining empty broadcast requests, legacy peers and admitted response owners.
+- Preserve routing, ACK ownership and recovery cadence.
+
 ## Version 4.3.4 highlights
 
 Wire format and application identities remain compatible with 4.3.3.
