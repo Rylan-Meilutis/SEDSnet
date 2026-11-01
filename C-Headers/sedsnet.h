@@ -494,6 +494,14 @@ SedsResult seds_router_current_address(SedsRouter * r, uint32_t * out_address);
 SedsResult seds_router_configure_address(SedsRouter * r,
                                          uint8_t address_mode,
                                          uint32_t requested_address);
+/** Match counted UTF-8 packet sender identity to an expected literal hostname.
+ * Numeric aliases require retained, unambiguous discovery/address metadata.
+ * Returns false for null, empty, invalid, unknown or ambiguous inputs.
+ * Preserves existing assigned-address precedence; does not authenticate packets.
+ * Does not allocate. Spans need not be NUL-terminated. */
+bool seds_router_sender_matches_hostname(const SedsRouter *r,
+                                          const char *sender, size_t sender_len,
+                                          const char *expected_hostname, size_t hostname_len);
 SedsResult seds_router_resolve_hostname_address(SedsRouter * r,
                                                 const char * hostname,
                                                 size_t hostname_len,

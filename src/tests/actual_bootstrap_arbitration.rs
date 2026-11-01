@@ -148,7 +148,7 @@ fn model_profile(period: u64, latest_enabled: bool, data_start: u64) -> serde_js
     let mut progress_events = Vec::new();
     let mut max_idle_credit = 0;
     let mut last_progress = String::new();
-    let mut last_codec_generation = u64::MAX;
+    let mut last_codec_generation = None;
     for ms in 0..=60_000u64 {
         now.store(ms, Ordering::SeqCst);
         if ms == 0 {
@@ -285,9 +285,12 @@ fn model_profile(period: u64, latest_enabled: bool, data_start: u64) -> serde_js
                 .get(&side)
                 .and_then(|t| t.tx_chunk_progress.as_ref())
         );
-        let generation = st.side_transport[&side].payload_codec.generation();
+        #[cfg(feature = "compression")]
+        let generation = Some(st.side_transport[&side].payload_codec.generation());
+        #[cfg(not(feature = "compression"))]
+        let generation = None::<u64>;
         if current != last_progress || generation != last_codec_generation {
-            progress_events.push(serde_json::json!({"at_ms":ms,"cursors":current,"codec_generation":st.side_transport[&side].payload_codec.generation(),"phase":diagnostic_turn_phase(&st)}));
+            progress_events.push(serde_json::json!({"at_ms":ms,"cursors":current,"codec_generation":generation,"phase":diagnostic_turn_phase(&st)}));
             last_progress = current;
             last_codec_generation = generation;
         }

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## Version 4.3.7 highlights
+
+- Preserve reliable ownership and required downstream receipts across routing
+  cycles and concurrent duplicate ingress.
+- Recover unchanged managed observations after an explicit GET with bounded
+  forwarding, preserving the original publisher, packet identity and source time.
+- Inspect known packed queued work and retained owners by cached type without
+  allocations or retained payload pins. Track known active queued work by type
+  with bounded std metadata; unknown work or tracking exhaustion stay conservative.
+- Match literal or discovered compact/assigned senders to hostnames from Rust,
+  C and Python, with collision-aware lookup and no authentication claim.
+- Support builds without time sync and charge new retained reliability metadata
+  to the existing shared budget without changing queue limits.
+- Tighten publication flag and credential guards, reuse package verification,
+  and align i686 toolchain and Windows wheel linker setup.
+- Keep wire format, application identities, schemas and packet layouts compatible
+  with 4.3.6; the macro crate remains at 2.2.0.
+
 ## Version 4.3.6 highlights
 
 - Invalidate rejected cached network-variable observations without changing

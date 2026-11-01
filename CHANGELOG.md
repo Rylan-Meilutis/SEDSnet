@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 4.3.7
+
+Wire format, application identities, schemas and packet layouts remain compatible
+with 4.3.6. The macro crate remains at 2.2.0.
+
+- Preserve reliable delivery across routing cycles and concurrent duplicate
+  ingress. Reserve local admission before committing receipts or child forwarding,
+  and retain the frozen downstream cohort until its required receipts arrive.
+- Let an explicit network-variable GET recover an unchanged cached observation
+  across intermediate routers through bounded refresh forwarding. Preserve the
+  original publisher, packet identity, source timestamp and payload; a refresh
+  does not turn an old observation into a newly sampled value.
+- Inspect retained reliable owners and known queued packed work by cached logical
+  type without allocating, materializing payloads or leaving packet-store pins.
+  Track known in-flight queued work by logical type with bounded std dispatch
+  metadata; unknown types or exhausted tracking slots remain conservative.
+- Add sender-to-hostname matching in Rust, C and Python. Compare literal names
+  exactly and resolve compact or assigned numeric aliases through retained
+  collision-aware discovery identity, preserving assigned-address precedence.
+  Unknown or malformed aliases fail closed; identity matching is not authentication.
+- Keep builds without the optional time-sync feature independent of time-sync
+  helpers while preserving the default and embedded feature bundles.
+- Charge eight additional logical bytes per retained reliable return-route record
+  and, in std builds, per retained end-to-end owner to shared-budget admission.
+  Existing completion-epoch charges remain additional. These charges do not cover
+  total allocator overhead or fixed router storage; queue limits remain unchanged.
+  The bounded 16-slot std active-dispatch table is additional fixed router storage.
+- Require fully spelled publisher flags, reuse package verification within the
+  same publication invocation, and make absent CI credentials an explicit upload
+  skip while preserving upload failures. Include the i686 C toolchain and select
+  the Windows wheel linker by target.
+
 ## 4.3.6
 
 Wire format, application identities and packet layouts remain compatible with 4.3.5.
