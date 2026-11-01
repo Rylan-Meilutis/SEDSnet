@@ -1257,6 +1257,11 @@ impl PyRouter {
         Ok(rtr.current_address())
     }
 
+    /// Compare a sender using retained, unambiguous routing identity metadata.
+    fn sender_matches_hostname(&self, sender: &str, expected_hostname: &str) -> bool {
+        self.inner.sender_matches_hostname(sender, expected_hostname)
+    }
+
     fn resolve_hostname(&self, py: Python<'_>, hostname: &str) -> PyResult<Option<Py<PyAny>>> {
         let rtr = self.inner.as_ref();
         let Some(entry) = rtr.resolve_hostname(hostname) else {

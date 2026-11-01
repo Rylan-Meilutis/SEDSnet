@@ -40,12 +40,15 @@ fn packet_row(bytes: &[u8], at_us: u64, offset: usize) -> TelemetryResult<Value>
     } else {
         None
     };
+    #[cfg(feature = "timesync")]
     let timesync = if packet.data_type() == DataType::TimeSyncAnnounce {
         let announce = crate::timesync::decode_timesync_announce(&packet)?;
         Some(json!({"priority":announce.priority,"time_ms":announce.time_ms}))
     } else {
         None
     };
+    #[cfg(not(feature = "timesync"))]
+    let timesync: Option<Value> = None;
     let name = format!("{:?}", info.envelope.ty);
     let managed_value = matches!(
         name.as_str(),
@@ -339,23 +342,28 @@ fn self_contained_trace_fixture() {
         })
         .unwrap();
     }
-    let utc_ms = 1_767_225_601_234;
-    let announce =
-        crate::timesync::build_timesync_announce_with_sender("CLOCK_SOURCE", 50, utc_ms).unwrap();
-    let frames = tx
-        .encode_side_transport_frames(
-            side,
-            options,
-            crate::shared_bytes::convert(wire_format::pack_packet(&announce)),
-        )
+    #[cfg(feature = "timesync")]
+    let (utc_ms, announce) = {
+        let utc_ms = 1_767_225_601_234;
+        let announce =
+            crate::timesync::build_timesync_announce_with_sender("CLOCK_SOURCE", 50, utc_ms)
+                .unwrap();
+        let frames = tx
+            .encode_side_transport_frames(
+                side,
+                options,
+                crate::shared_bytes::convert(wire_format::pack_packet(&announce)),
+            )
+            .unwrap();
+        tx.send_side_frames_resumable(side, frames, |frame| {
+            uart.extend_from_slice(&[0xa5, 0x5a]);
+            uart.extend_from_slice(&u16::try_from(frame.len()).unwrap().to_le_bytes());
+            uart.extend_from_slice(frame);
+            Ok(())
+        })
         .unwrap();
-    tx.send_side_frames_resumable(side, frames, |frame| {
-        uart.extend_from_slice(&[0xa5, 0x5a]);
-        uart.extend_from_slice(&u16::try_from(frame.len()).unwrap().to_le_bytes());
-        uart.extend_from_slice(frame);
-        Ok(())
-    })
-    .unwrap();
+        (utc_ms, announce)
+    };
     assert!(kinds.contains(&SIDE_TRANSPORT_KIND_CHUNK));
     // The400-byte compact follow-up is itself chunked at this64-byte cap;
     // outer UART frames therefore expose CHUNK rather than COMPACT kinds.
@@ -390,18 +398,24 @@ fn self_contained_trace_fixture() {
     let stream = &decoded["streams"][0];
     assert!(stream["errors"].as_array().unwrap().is_empty());
     let packets = stream["packets"].as_array().unwrap();
-    assert_eq!(packets.len(), 3);
+    assert_eq!(
+        packets.len(),
+        if cfg!(feature = "timesync") { 3 } else { 2 }
+    );
     assert!(
         packets[..2]
             .iter()
             .all(|row| row["packet_id"].as_u64() == Some(packet.packet_id())
                 && row["payload_len"] == 400)
     );
-    assert_eq!(
-        packets[2]["timesync_announce"],
-        json!({"priority":50,"time_ms":utc_ms})
-    );
-    assert_eq!(packets[2]["packet_id"].as_u64(), Some(announce.packet_id()));
+    #[cfg(feature = "timesync")]
+    {
+        assert_eq!(
+            packets[2]["timesync_announce"],
+            json!({"priority":50,"time_ms":utc_ms})
+        );
+        assert_eq!(packets[2]["packet_id"].as_u64(), Some(announce.packet_id()));
+    }
     assert_eq!(stream["trailing_bytes"], 0);
     println!("RADIO_TRACE_SELF_CONTAINED_FULL_CAMPAIGN_PASS");
 }
@@ -464,6 +478,7 @@ fn exact_side_codec_reconstructs_bootstrap_chunks_and_compact_followup() {
     assert_eq!(row["payload_len"], 400);
 }
 
+#[cfg(feature = "timesync")]
 #[test]
 fn timesync_metadata_uses_actual_packet_builder_and_payload_decoder() {
     crate::tests::ensure_common_test_schema();

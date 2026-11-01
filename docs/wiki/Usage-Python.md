@@ -321,6 +321,10 @@ client.send_p2p_to_address(0x10203040, 80, 49152, b"GET / HTTP/1.1\r\n\r\n")
 `router.current_address` returns the current compact address, and
 `router.resolve_hostname("name")` returns discovered address metadata when known.
 
+`router.sender_matches_hostname(sender, "controller-1")` compares literal names exactly
+and resolves numeric aliases only through retained, unambiguous discovery identity.
+Unknown/malformed aliases return `False`; this is identity attribution, not authentication. Existing explicitly assigned addresses retain precedence over compact-name fallback.
+
 For byte protocols that need a session lifecycle, bind a stream port and open a stream:
 
 ```python

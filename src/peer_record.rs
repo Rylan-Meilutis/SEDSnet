@@ -2,6 +2,7 @@
 //! types. Stage new allocations before changing authoritative peer state.
 use crate::{TelemetryError, TelemetryResult};
 use alloc::boxed::Box;
+#[cfg(any(feature = "discovery", feature = "timesync"))]
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 
@@ -44,11 +45,13 @@ pub(crate) fn try_box_with<T, F: FnOnce() -> T>(make: F) -> TelemetryResult<Box<
     Ok(unsafe { out.assume_init() })
 }
 
+#[cfg(feature = "timesync")]
 pub(crate) enum Prepared<'a, T> {
     Existing { key: &'a str, value: T },
     New { key: String, value: Box<T> },
 }
 
+#[cfg(feature = "timesync")]
 pub(crate) fn prepare<'a, T>(
     map: &BTreeMap<String, Box<T>>,
     key: &'a str,
@@ -62,6 +65,7 @@ pub(crate) fn prepare<'a, T>(
     Ok(Prepared::New { key, value })
 }
 
+#[cfg(feature = "timesync")]
 impl<T> Prepared<'_, T> {
     pub(crate) fn commit(self, map: &mut BTreeMap<String, Box<T>>) {
         match self {

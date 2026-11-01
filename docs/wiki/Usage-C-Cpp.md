@@ -638,6 +638,12 @@ See [Time-Sync](Time-Sync) for the time sync packet flow and roles.
 
 ## P2P Service Ports
 
+Use `seds_router_sender_matches_hostname(router, packet->sender, packet->sender_len,
+"controller-1", sizeof("controller-1") - 1)` when matching callback sender identities.
+It compares counted UTF-8 names without allocating; numeric aliases require retained,
+unambiguous discovery identity. Null, empty, malformed and unknown inputs return false.
+This attributes routing identity and does not authenticate the packet. Existing explicitly assigned addresses retain precedence over compact-name fallback.
+
 The C ABI exposes discovery-backed service ports for byte protocols that should run over SEDSnet
 instead of IP:
 

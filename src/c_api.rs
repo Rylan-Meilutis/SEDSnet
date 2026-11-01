@@ -1637,6 +1637,35 @@ pub extern "C" fn seds_router_configure_address(
     ok_or_status(router.set_address_assignment(mode).map(|_| ()))
 }
 
+/// Match a counted UTF-8 sender identity to a literal expected hostname.
+/// Returns false for null/empty/invalid inputs or unknown/ambiguous aliases.
+/// Input spans must be readable for their lengths; no output storage is needed.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_sender_matches_hostname(
+    r: *const SedsRouter,
+    sender: *const c_char,
+    sender_len: usize,
+    expected_hostname: *const c_char,
+    hostname_len: usize,
+) -> bool {
+    if r.is_null()
+        || sender.is_null()
+        || expected_hostname.is_null()
+        || sender_len == 0
+        || hostname_len == 0
+        || sender_len > isize::MAX as usize
+        || hostname_len > isize::MAX as usize
+    {
+        return false;
+    }
+    let sender = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+    let hostname = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(expected_hostname), hostname_len) };
+    let (Ok(sender), Ok(hostname)) = (from_utf8(sender), from_utf8(hostname)) else {
+        return false;
+    };
+    unsafe { &(*r).inner }.sender_matches_hostname(sender, hostname)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_resolve_hostname_address(
     r: *mut SedsRouter,
@@ -8259,3 +8288,7 @@ pub extern "C" fn seds_relay_set_latest_value_side(r: *mut SedsRelay, side: i32)
     }
     ok_or_status(unsafe { &(*r).inner }.set_latest_value_side((side >= 0).then_some(side as usize)))
 }
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/c_api_sender_identity_match.rs"]
+mod sender_identity_match_tests;

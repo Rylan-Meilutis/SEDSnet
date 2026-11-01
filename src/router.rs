@@ -212,12 +212,13 @@ use crate::diagnostics::{
     RouteModeStats, RouteOverrideStats, RoutePriorityStats, RouteWeightStats, RuntimeSideStats,
     RuntimeStatsSnapshot, RuntimeTypeStats, TypedRouteOverrideStats,
 };
+#[cfg(all(feature = "discovery", feature = "timesync"))]
+use crate::discovery::TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS;
 #[cfg(feature = "discovery")]
 use crate::discovery::{
     self, ClientStatsSnapshot, DISCOVERY_INCREMENTAL_RETRY_COUNT, DISCOVERY_ROUTE_TTL_MS,
-    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState,
-    TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS, TopologyAnnouncerRoute, TopologyBoardNode,
-    TopologySideRoute, TopologySnapshot,
+    DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState, TopologyAnnouncerRoute,
+    TopologyBoardNode, TopologySideRoute, TopologySnapshot,
 };
 use crate::packet::{hash_bytes_u64, sender_address_u32};
 use crate::queue::{BoundedDeque, ByteCost};
@@ -974,10 +975,19 @@ struct ReliableSent {
     partial_acked: bool,
 }
 
+// The std-only cached type grows the native boxed owner by up to one u64
+// alignment unit. Reserve/charge that bounded metadata, not just its u32 width.
+#[cfg(feature = "std")]
+const PENDING_TYPE_METADATA_BYTES: usize = size_of::<u64>();
+
 #[derive(Debug, Clone)]
 struct EndToEndReliableSent {
     #[cfg(feature = "std")]
     completion_epoch: u64,
+    // std-only ownership inspection must not materialize a retained Packed
+    // payload. Zero is unknown provenance and remains conservatively pending.
+    #[cfg(feature = "std")]
+    pending_type: u32,
     ordered_type: Option<u32>,
     waiting_for_predecessor: bool,
     data: RouterItem,
@@ -1015,17 +1025,98 @@ struct ReliableRxState {
     buffered: RouterMap<u32, crate::SharedBytes>,
 }
 
+// Logical incremental record growth relative to the prior return-route value.
+// This is not the full BTree allocation cost; allocator node deltas are measured
+// separately. The fixed RouterInner sequence is part of object footprint.
+const RELIABLE_RETURN_ROUTE_EXTRA_LOGICAL_BYTES: usize = size_of::<u64>();
+
 #[derive(Debug, Clone)]
 struct ReliableReturnRouteState {
     side: RouterSideId,
     // A final receipt can be lost after local delivery or completion of every
     // child owner. Retain that fact for the lifetime of this bounded route.
     delivery_completed: bool,
+    local_admission_completed: bool,
+    local_admission_token: u64,
+    admission_cancelled: bool,
+    admission_committing: bool,
     last_replay_ms: u64,
     // A legacy contract names this router, not its downstream owner.
     // Translate the child receipt back to the router identity and original
     // packet ID that the upstream publisher is awaiting.
     upstream_contract: Option<(u64, u64)>,
+}
+
+// Same-ID direct RX must not certify a cached observation while its required
+// callback is still deciding. This lease never holds state across callbacks.
+struct ReliableLocalAdmissionGuard<'a> {
+    router: &'a Router,
+    packet_id: u64,
+    token: u64,
+}
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    static LOCAL_ADMISSION_CHECKS: core::cell::Cell<usize> = const {core::cell::Cell::new(0)};
+}
+impl ReliableLocalAdmissionGuard<'_> {
+    fn check_locked(&self, state: &RouterInner) -> TelemetryResult<()> {
+        #[cfg(all(test, feature = "std"))]
+        LOCAL_ADMISSION_CHECKS.with(|count| count.set(count.get() + 1));
+        if state
+            .reliable_return_routes
+            .get(&self.packet_id)
+            .is_some_and(|route| {
+                route.local_admission_token == self.token && !route.admission_cancelled
+            })
+        {
+            Ok(())
+        } else {
+            Err(TelemetryError::Io("side changed during rx"))
+        }
+    }
+    fn check(&self) -> TelemetryResult<()> {
+        self.check_locked(&self.router.state.lock())
+    }
+    fn begin_commit(&self, local_accepted: bool) -> TelemetryResult<()> {
+        let mut state = self.router.state.lock();
+        self.check_locked(&state)?;
+        let route = state
+            .reliable_return_routes
+            .get_mut(&self.packet_id)
+            .expect("checked lease");
+        route.admission_committing = true;
+        route.local_admission_completed |= local_accepted;
+        Ok(())
+    }
+    fn end_commit(&self) {
+        let mut state = self.router.state.lock();
+        if let Some(route) = state.reliable_return_routes.get_mut(&self.packet_id)
+            && route.local_admission_token == self.token
+        {
+            route.admission_committing = false;
+        }
+    }
+}
+
+impl Drop for ReliableLocalAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.router.state.lock();
+        let cancelled = if let Some(route) = state.reliable_return_routes.get_mut(&self.packet_id)
+            && route.local_admission_token == self.token
+        {
+            route.local_admission_token = 0;
+            route.admission_committing = false;
+            route.admission_cancelled
+        } else {
+            false
+        };
+        if cancelled {
+            state.reliable_return_routes.remove(&self.packet_id);
+            state
+                .reliable_return_route_order
+                .retain(|id| *id != self.packet_id);
+        }
+    }
 }
 
 #[cfg(feature = "discovery")]
@@ -1046,12 +1137,49 @@ struct DiscoverySenderState {
     last_seen_ms: u64,
 }
 
+/// One bounded hop-send grant per requested variable and ingress segment.
+/// It does not create a new value or a new end-to-end reader cohort.
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedVariableSubscription {
+    last_seen_ms: u64,
+    next_refresh_ms: u64,
+    request_id: u64,
+    value_id: u64,
+    upstream: RouterSideId,
+    ty: DataType,
+    requester: u32,
+    writer: u32,
+    refresh_pending: bool,
+}
+
+#[cfg(feature = "discovery")]
+fn reserve_managed_subscriptions(
+    requests: &mut Vec<ManagedVariableSubscription>,
+    additional: usize,
+) -> TelemetryResult<()> {
+    let needed = requests
+        .len()
+        .checked_add(additional)
+        .ok_or(TelemetryError::Io("memory pressure"))?;
+    if needed <= requests.capacity() {
+        return Ok(());
+    }
+    let bytes = needed
+        .checked_mul(size_of::<ManagedVariableSubscription>())
+        .ok_or(TelemetryError::Io("memory pressure"))?;
+    crate::memory_admission::check(bytes, bytes)?;
+    requests
+        .try_reserve_exact(additional)
+        .map_err(|_| TelemetryError::Io("memory pressure"))
+}
+
 #[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySideState {
     reachable: Vec<DataEndpoint>,
     reachable_network_variables: Vec<DataType>,
-    requested_network_variables: Vec<(DataType, u64)>,
+    requested_network_variables: Vec<ManagedVariableSubscription>,
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
     announcers: BTreeMap<String, Box<DiscoverySenderState>>,
@@ -1064,10 +1192,13 @@ impl DiscoverySideState {
         // pointer values explicitly instead of adding infallible Box::clone
         // allocations to the existing admitted snapshot path.
         let announcers = crate::peer_record::try_clone_map(&self.announcers)?;
+        let mut requests = Vec::new();
+        reserve_managed_subscriptions(&mut requests, self.requested_network_variables.len())?;
+        requests.extend_from_slice(&self.requested_network_variables);
         Ok(Self {
             reachable: self.reachable.clone(),
             reachable_network_variables: self.reachable_network_variables.clone(),
-            requested_network_variables: self.requested_network_variables.clone(),
+            requested_network_variables: requests,
             reachable_timesync_sources: self.reachable_timesync_sources.clone(),
             last_seen_ms: self.last_seen_ms,
             announcers,
@@ -2340,6 +2471,8 @@ struct RouterInner {
     address_by_value: BTreeMap<NodeAddress, String>,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
+    #[cfg(feature = "std")]
+    active_queued_types: [(u32, u32); ACTIVE_QUEUED_TYPE_SLOTS],
     tx_priority_burst: u8,
     tx_policy_flags: u8,
     #[cfg(feature = "latest-value-egress")]
@@ -2354,6 +2487,7 @@ struct RouterInner {
     reliable_tx: BTreeMap<(RouterSideId, u32), ReliableTxState>,
     reliable_rx: BTreeMap<(RouterSideId, u32), ReliableRxState>,
     reliable_return_routes: BTreeMap<u64, ReliableReturnRouteState>,
+    local_admission_sequence: u64,
     reliable_return_route_order: VecDeque<u64>,
     forwarded_receipts: Option<Box<ForwardedReceiptCache>>,
     end_to_end_reliable_tx: BTreeMap<u64, Box<EndToEndReliableSent>>,
@@ -2379,6 +2513,11 @@ struct ManagedVariableCacheEntry {
     sender_address: u32,
     #[cfg(feature = "discovery")]
     cached_at_ms: u64,
+    // First actual ingress for this logical observation. Unlike the bounded
+    // ACK return cache, this remains with a quiet stable value. Zero is only
+    // the Option niche; a side index is represented by checked index + 1.
+    #[cfg(feature = "discovery")]
+    upstream: Option<core::num::NonZeroUsize>,
 }
 
 type NetworkVariableUpdateFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
@@ -2823,8 +2962,7 @@ impl RouterInner {
             .saturating_add(route.reachable.len() * size_of::<DataEndpoint>())
             .saturating_add(route.reachable_network_variables.len() * size_of::<DataType>())
             .saturating_add(
-                route.requested_network_variables.len()
-                    * (size_of::<DataType>() + size_of::<u64>()),
+                route.requested_network_variables.len() * size_of::<ManagedVariableSubscription>(),
             )
             .saturating_add(
                 route
@@ -2982,31 +3120,40 @@ impl RouterInner {
             {
                 self.end_to_end_reliable_tx
                     .values()
-                    .filter(|sent| sent.completion_epoch != 0)
-                    .count()
-                    * size_of::<u64>()
+                    .map(|sent| {
+                        PENDING_TYPE_METADATA_BYTES
+                            + usize::from(sent.completion_epoch != 0) * size_of::<u64>()
+                    })
+                    .sum::<usize>()
             }
             #[cfg(not(feature = "std"))]
             {
                 0usize
             }
         };
-        codec_bytes.saturating_add(completion_bytes).saturating_add(
-            self.recent_rx
-                .max_bytes()
-                .saturating_add(self.reliable_rx_buffered_bytes())
-                .saturating_add(crate::config::schema_bytes_used())
-                .saturating_add({
-                    #[cfg(feature = "discovery")]
-                    {
-                        self.discovery_bytes_used()
-                    }
-                    #[cfg(not(feature = "discovery"))]
-                    {
-                        0
-                    }
-                }),
-        )
+        let return_route_growth = self
+            .reliable_return_routes
+            .len()
+            .saturating_mul(RELIABLE_RETURN_ROUTE_EXTRA_LOGICAL_BYTES);
+        codec_bytes
+            .saturating_add(completion_bytes)
+            .saturating_add(return_route_growth)
+            .saturating_add(
+                self.recent_rx
+                    .max_bytes()
+                    .saturating_add(self.reliable_rx_buffered_bytes())
+                    .saturating_add(crate::config::schema_bytes_used())
+                    .saturating_add({
+                        #[cfg(feature = "discovery")]
+                        {
+                            self.discovery_bytes_used()
+                        }
+                        #[cfg(not(feature = "discovery"))]
+                        {
+                            0
+                        }
+                    }),
+            )
     }
     #[inline]
     fn shared_queue_bytes_used(&self) -> usize {
@@ -3209,6 +3356,27 @@ impl RouterInner {
     }
 
     #[cfg(feature = "discovery")]
+    fn cancel_managed_refresh_side(&mut self, side: RouterSideId) {
+        for (&ingress, route) in &mut self.discovery_routes {
+            for request in &mut route.requested_network_variables {
+                if ingress == side || request.upstream == side {
+                    request.refresh_pending = false;
+                }
+            }
+        }
+        if let Some(local) = self.local_services.as_mut() {
+            for entry in local.managed_variable_latest.values_mut() {
+                if entry
+                    .upstream
+                    .is_some_and(|upstream| upstream.get() - 1 == side)
+                {
+                    entry.upstream = None;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "discovery")]
     fn commit_discovery_route(
         &mut self,
         side: RouterSideId,
@@ -3342,7 +3510,15 @@ impl RouterInner {
             }
             _ => {}
         }
-        if let RouterTxItem::Broadcast(data) = &item.item {
+        let type_source = match &item.item {
+            RouterTxItem::Broadcast(data) => Some(data),
+            // This cache does not grant application acceptance: ToSide stays
+            // Untracked. Preserve explicit validated producer metadata (ACKs).
+            #[cfg(feature = "std")]
+            RouterTxItem::ToSide { data, .. } if item.accepted_type == 0 => Some(data),
+            _ => None,
+        };
+        if let Some(data) = type_source {
             item.accepted_type = match data {
                 RouterItem::Packet(packet) => packet.data_type().as_u32(),
                 RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
@@ -3692,11 +3868,38 @@ pub struct Router {
 }
 
 #[cfg(feature = "std")]
-struct QueuedTxActivityGuard<'a>(&'a core::sync::atomic::AtomicUsize);
+const ACTIVE_QUEUED_TYPE_SLOTS: usize = 16;
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+struct ActiveQueuedTypeKey {
+    slot: core::num::NonZeroU8,
+    kind: u32,
+}
+#[cfg(feature = "std")]
+struct QueuedTxActivityGuard<'a> {
+    router: &'a Router,
+    key: Option<ActiveQueuedTypeKey>,
+}
 #[cfg(feature = "std")]
 impl Drop for QueuedTxActivityGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, core::sync::atomic::Ordering::Release);
+        let mut state = self.router.state.lock();
+        if let Some(key) = self.key {
+            let slot = &mut state.active_queued_types[usize::from(key.slot.get() - 1)];
+            assert_eq!(slot.0, key.kind, "active queued type guard changed owner");
+            slot.1 = slot.1.checked_sub(1).expect("active queued type underflow");
+            if slot.1 == 0 {
+                slot.0 = 0;
+            }
+        }
+        let total = self
+            .router
+            .active_queued_tx
+            .load(core::sync::atomic::Ordering::Acquire);
+        self.router.active_queued_tx.store(
+            total.checked_sub(1).expect("active queued TX underflow"),
+            core::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -3969,7 +4172,10 @@ impl Router {
         &self,
         pkt: &Packet,
         notify_handlers: bool,
+        source_side: Option<RouterSideId>,
     ) -> TelemetryResult<()> {
+        #[cfg(not(feature = "discovery"))]
+        let _ = source_side;
         let sender_address = pkt
             .sender()
             .strip_prefix("@addr:")
@@ -3998,7 +4204,19 @@ impl Router {
             }) {
                 return Ok(());
             }
-            let changed = existing.is_none_or(|entry| entry.packet != *pkt);
+            // A proxy may change only the frozen transport recipients when
+            // returning this exact source observation. That is not a new
+            // application revision and must not replay update side effects.
+            let changed = existing.is_none_or(|entry| entry.packet.packet_id() != pkt.packet_id());
+            #[cfg(feature = "discovery")]
+            let upstream = existing
+                .filter(|_| !changed)
+                .and_then(|entry| entry.upstream)
+                .or_else(|| {
+                    source_side
+                        .and_then(|side| side.checked_add(1))
+                        .and_then(core::num::NonZeroUsize::new)
+                });
             // A B-tree leaf reserves eleven values, even for one variable.
             // Keep that sparse root small; reuse each box on later updates so
             // frequent state changes introduce no allocator churn.
@@ -4007,6 +4225,8 @@ impl Router {
                 sender_address,
                 #[cfg(feature = "discovery")]
                 cached_at_ms: self.clock.now_ms(),
+                #[cfg(feature = "discovery")]
+                upstream,
             };
             if let Some(entry) = st
                 .local_services
@@ -4042,7 +4262,7 @@ impl Router {
     }
 
     fn remember_managed_variable_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
-        self.cache_managed_variable_packet(pkt, true)
+        self.cache_managed_variable_packet(pkt, true, None)
     }
 
     fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
@@ -4768,7 +4988,7 @@ impl Router {
         Ok(PreparedAddressRecords { peer, local: spare })
     }
 
-    #[cfg(all(feature = "discovery", test))]
+    #[cfg(all(feature = "discovery", feature = "timesync", test))]
     fn ingest_address_advertisement(
         &self,
         ad: discovery::AddressAdvertisement,
@@ -5313,13 +5533,196 @@ impl Router {
         Ok(())
     }
 
+    // Close only a duplicate non-parent edge, never this router's aggregate
+    // receipt. The first ingress continues to own the full downstream subtree.
+    fn queue_duplicate_proxy_edge_receipt(
+        &self,
+        item: &RouterRxItem,
+        packet_id: u64,
+    ) -> TelemetryResult<()> {
+        let Some(src) = item.src else { return Ok(()) };
+        let eligible = |state: &RouterInner| {
+            state.end_to_end_reliable_tx.contains_key(&packet_id)
+                && state
+                    .reliable_return_routes
+                    .get(&packet_id)
+                    .is_some_and(|route| {
+                        route.side != src
+                            && route.local_admission_completed
+                            && !route.admission_cancelled
+                            && route.local_admission_token == 0
+                            && route.upstream_contract.is_some()
+                    })
+        };
+        if !eligible(&self.state.lock()) {
+            return Ok(());
+        }
+        let local_sender = self.sender_arc();
+        let local_hash = Self::sender_hash(local_sender.as_ref());
+        let source_address = match &item.data {
+            RouterItem::Packet(packet) => {
+                packet.validate()?;
+                if !packet.wire_target_senders().contains(&local_hash) {
+                    return Ok(());
+                }
+                sender_address_u32(packet.sender())
+            }
+            RouterItem::Packed(bytes) => {
+                let address = crate::shared_bytes::with_slice(bytes, |view| {
+                    let frame = wire_format::peek_routing_frame_info(view)?;
+                    Ok::<_, TelemetryError>(
+                        frame
+                            .envelope
+                            .target_senders()
+                            .any(|target| target == local_hash)
+                            .then_some(frame.envelope.source_address),
+                    )
+                })??;
+                let Some(address) = address else {
+                    return Ok(());
+                };
+                address
+            }
+        };
+        // Bind to the original retained observation, not a mutable discovery
+        // alias or a newly decompressed payload. Its logical ID and source
+        // address are unchanged across the proxy's frozen child contracts.
+        let publisher_hash = {
+            let state = self.state.lock();
+            if !eligible(&state) {
+                return Ok(());
+            }
+            let retained = &state
+                .end_to_end_reliable_tx
+                .get(&packet_id)
+                .expect("eligible owner")
+                .data;
+            let retained_address = match retained {
+                RouterItem::Packet(packet) => sender_address_u32(packet.sender()),
+                RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
+                    wire_format::peek_routing_envelope(view).map(|envelope| envelope.source_address)
+                })??,
+            };
+            if retained_address != source_address {
+                return Ok(());
+            }
+            let Some((original_id, publisher)) = state
+                .reliable_return_routes
+                .get(&packet_id)
+                .and_then(|route| route.upstream_contract)
+            else {
+                return Ok(());
+            };
+            if original_id != packet_id {
+                return Ok(());
+            };
+            publisher
+        };
+        let ack = Packet::new_local(
+            DataType::ReliableAck,
+            message_meta(DataType::ReliableAck).endpoints_owned(),
+            Arc::from(self.encode_end_to_end_ack_sender()),
+            self.packet_timestamp_ms(),
+            crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
+        )?;
+        let ack = self
+            .attach_wire_contract_to_item(RouterItem::Packet(ack), &[local_hash, publisher_hash])?;
+        let priority = self.item_service_priority(&ack)?;
+        let mut state = self.state.lock();
+        if !eligible(&state)
+            || !Self::side_ref(&state, src).is_ok_and(|side| side.opts.egress_enabled)
+            || state
+                .reliable_return_routes
+                .get(&packet_id)
+                .and_then(|route| route.upstream_contract)
+                != Some((packet_id, publisher_hash))
+        {
+            return Ok(());
+        }
+        let already_queued = state.transmit_queue.iter().any(|queued| {
+            let RouterTxItem::ToSide { dst, data, .. } = &queued.item else {
+                return false;
+            };
+            if *dst != src {
+                return false;
+            }
+            match data {
+                RouterItem::Packet(packet) => {
+                    packet.data_type() == DataType::ReliableAck
+                        && packet.payload() == packet_id.to_le_bytes()
+                }
+                RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
+                    wire_format::scheduling_type(view) == Some(DataType::ReliableAck)
+                        && wire_format::unpack_packet(view)
+                            .is_ok_and(|packet| packet.payload() == packet_id.to_le_bytes())
+                })
+                .unwrap_or(false),
+            }
+        });
+        if !already_queued {
+            state.push_transmit(TxQueued {
+                disposable: TX_DISPOSABLE,
+                item: RouterTxItem::ToSide {
+                    src: None,
+                    dst: src,
+                    data: ack,
+                },
+                ignore_local: true,
+                priority,
+                delivery_state: QueuedDelivery::Untracked,
+                accepted_type: DataType::ReliableAck.as_u32(),
+                deferred_since_ms: 0,
+                retry_after_ms: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    // Existing private route-fixture helper acquires and immediately retires
+    // the same admission lease; production retains it across actual RX work.
+    #[cfg(test)]
+    fn note_reliable_return_route(&self, side: RouterSideId, packet_id: u64) -> bool {
+        self.begin_reliable_local_admission(side, packet_id)
+            .is_ok_and(|guard| guard.is_some())
+    }
+
     /// Record the original live ingress for `packet_id`, preserving it across echoes.
     ///
     /// End-to-end reliable acknowledgements should return only toward the
     /// source-side that originated the data flow, not be flooded everywhere.
     /// This helper stores that learned return path in a bounded LRU-like cache.
-    fn note_reliable_return_route(&self, side: RouterSideId, packet_id: u64) -> bool {
+    fn begin_reliable_local_admission(
+        &self,
+        side: RouterSideId,
+        packet_id: u64,
+    ) -> TelemetryResult<Option<ReliableLocalAdmissionGuard<'_>>> {
+        self.begin_reliable_local_admission_with_parent(side, packet_id, None)
+    }
+
+    fn begin_reliable_local_admission_with_parent(
+        &self,
+        side: RouterSideId,
+        packet_id: u64,
+        parent: Option<&ReliableLocalAdmissionGuard<'_>>,
+    ) -> TelemetryResult<Option<ReliableLocalAdmissionGuard<'_>>> {
         let mut st = self.state.lock();
+        if let Some(parent) = parent {
+            parent.check_locked(&st)?;
+        }
+
+        if !Self::side_ref(&st, side)?.opts.ingress_enabled {
+            return Err(TelemetryError::HandlerError(
+                "router: ingress disabled for side id",
+            ));
+        }
+
+        if st
+            .reliable_return_routes
+            .get(&packet_id)
+            .is_some_and(|route| route.local_admission_token != 0)
+        {
+            return Err(TelemetryError::Io("rx packet busy"));
+        }
         // The retained proxy record owns retries until its child cohort
         // completes. Neither CAN reflections nor repeated upstream copies may
         // replace its return route or reapply the managed value meanwhile.
@@ -5329,7 +5732,7 @@ impl Router {
                 .get(&packet_id)
                 .is_some_and(|route| route.upstream_contract.is_some())
         {
-            return false;
+            return Ok(None);
         }
         // A retry can remain in RX dedupe after its smaller return-path cache
         // entry was evicted. Relearning that path must not restart the replay
@@ -5360,9 +5763,17 @@ impl Router {
                         || !Self::side_ref(&st, route.side)
                             .is_ok_and(|side| side.opts.egress_enabled)
                 });
-        if !Self::remember_reliable_return_route_locked(&mut st, packet_id) {
-            return true;
+        if !Self::can_admit_reliable_return_route_growth_locked(&st, packet_id) {
+            return Err(TelemetryError::Io("memory pressure"));
         }
+        let token = st
+            .local_admission_sequence
+            .checked_add(1)
+            .ok_or(TelemetryError::Io("local admission sequence exhausted"))?;
+        if !Self::remember_reliable_return_route_locked(&mut st, packet_id) {
+            return Err(TelemetryError::Io("reliable return route window full"));
+        }
+        st.local_admission_sequence = token;
         st.reliable_return_routes
             .entry(packet_id)
             .and_modify(|route| {
@@ -5373,10 +5784,22 @@ impl Router {
             .or_insert(ReliableReturnRouteState {
                 side,
                 delivery_completed: false,
+                local_admission_completed: false,
+                local_admission_token: 0,
+                admission_cancelled: false,
+                admission_committing: false,
                 last_replay_ms,
                 upstream_contract: None,
             });
-        true
+        st.reliable_return_routes
+            .get_mut(&packet_id)
+            .expect("reserved route")
+            .local_admission_token = token;
+        Ok(Some(ReliableLocalAdmissionGuard {
+            router: self,
+            packet_id,
+            token,
+        }))
     }
 
     /// Ensure `packet_id` is retained in the bounded reliable return-route cache.
@@ -5384,16 +5807,34 @@ impl Router {
     /// Existing entries are refreshed to the back of the order list. When the
     /// cache is full, evict the oldest route not pinned by active delivery.
     /// Refuse a new entry if every retained route is still active.
+    fn can_admit_reliable_return_route_growth_locked(st: &RouterInner, packet_id: u64) -> bool {
+        if st.reliable_return_routes.contains_key(&packet_id)
+            || st.reliable_return_routes.len() >= runtime_reliable_max_return_routes().max(1)
+        {
+            // Reusing a live row or evicting one bounded row adds no logical
+            // record charge. The eventual window/pin checks remain unchanged.
+            return true;
+        }
+        st.shared_queue_bytes_used()
+            .checked_add(RELIABLE_RETURN_ROUTE_EXTRA_LOGICAL_BYTES)
+            .is_some_and(|bytes| bytes <= st.memory.max_queue_budget)
+    }
+
     fn remember_reliable_return_route_locked(st: &mut RouterInner, packet_id: u64) -> bool {
+        if !Self::can_admit_reliable_return_route_growth_locked(st, packet_id) {
+            return false;
+        }
         let cap = runtime_reliable_max_return_routes().max(1);
         st.reliable_return_route_order
             .retain(|id| st.reliable_return_routes.contains_key(id) && *id != packet_id);
         while st.reliable_return_route_order.len() >= cap {
-            let Some(index) = st
-                .reliable_return_route_order
-                .iter()
-                .position(|id| !st.end_to_end_reliable_tx.contains_key(id))
-            else {
+            let Some(index) = st.reliable_return_route_order.iter().position(|id| {
+                !st.end_to_end_reliable_tx.contains_key(id)
+                    && !st
+                        .reliable_return_routes
+                        .get(id)
+                        .is_some_and(|route| route.local_admission_token != 0)
+            }) else {
                 return false;
             };
             if let Some(oldest) = st.reliable_return_route_order.remove(index) {
@@ -5429,6 +5870,36 @@ impl Router {
         resolve_proxy_segment: bool,
     ) -> TelemetryResult<BTreeMap<u64, RouterSideId>> {
         let (eps, ty) = self.item_route_info(data)?;
+        // A newly resolved proxy subtree must not wait for its original
+        // publisher: self-originated echoes are intentionally not delivered.
+        // Existing frozen cohorts are never rewritten. Ambiguous/unresolved
+        // compact senders remove no candidate; do not guess from a 32-bit hash.
+        let original_publisher = if resolve_proxy_segment {
+            match data {
+                RouterItem::Packet(packet) => {
+                    if let Some(address) = packet
+                        .sender()
+                        .strip_prefix("@addr:")
+                        .and_then(|value| value.parse::<u32>().ok())
+                    {
+                        Self::hostname_for_address_borrowed_locked(st, address)
+                            .map(Self::sender_hash)
+                    } else {
+                        Some(Self::sender_hash(packet.sender()))
+                    }
+                }
+                RouterItem::Packed(bytes) => {
+                    let address = crate::shared_bytes::with_slice(bytes, |view| {
+                        wire_format::peek_routing_envelope(view)
+                            .map(|envelope| envelope.source_address)
+                    })??;
+                    Self::hostname_for_address_borrowed_locked(st, address).map(Self::sender_hash)
+                }
+            }
+        } else {
+            None
+        };
+
         // A targeted proxy creates a separate downstream contract. All other
         // dispatch/retry planning must retain the existing frozen owner set.
         let frozen_targets = if resolve_proxy_segment {
@@ -5475,6 +5946,7 @@ impl Router {
                     if now_ms.saturating_sub(sender_state.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS
                         || !sender_state.reachable_network_variables.contains(&ty)
                         || !self.is_end_to_end_destination_sender(sender_id)
+                        || original_publisher == Some(Self::sender_hash(sender_id))
                     {
                         continue;
                     }
@@ -5517,7 +5989,9 @@ impl Router {
                     continue;
                 }
                 for board in sender_state.topology_boards.iter() {
-                    if !self.is_end_to_end_destination_sender(&board.sender_id) {
+                    if !self.is_end_to_end_destination_sender(&board.sender_id)
+                        || original_publisher == Some(Self::sender_hash(&board.sender_id))
+                    {
                         continue;
                     }
                     let owner = Self::sender_hash(&board.sender_id);
@@ -6059,11 +6533,11 @@ impl Router {
             return Err(TelemetryError::Io("reliable window full"));
         }
         #[cfg(feature = "std")]
-        if completion_epoch != 0
-            && st
-                .shared_queue_bytes_used()
-                .saturating_add(size_of::<u64>())
-                > st.memory.max_queue_budget
+        if st
+            .shared_queue_bytes_used()
+            .saturating_add(PENDING_TYPE_METADATA_BYTES)
+            .saturating_add(usize::from(completion_epoch != 0) * size_of::<u64>())
+            > st.memory.max_queue_budget
         {
             return Err(TelemetryError::Io("memory pressure"));
         }
@@ -6102,6 +6576,8 @@ impl Router {
         let sent = EndToEndReliableSent {
             #[cfg(feature = "std")]
             completion_epoch,
+            #[cfg(feature = "std")]
+            pending_type: ty.as_u32(),
             ordered_type,
             waiting_for_predecessor,
             data: retained,
@@ -6307,6 +6783,9 @@ impl Router {
         false
     }
 
+    // Preserve the existing private route-fixture helper; production guarded
+    // receives use the token-bound atomic handoff below.
+    #[cfg(test)]
     fn queue_end_to_end_reliable_ack(
         &self,
         pkt: &Packet,
@@ -6346,15 +6825,11 @@ impl Router {
         )
     }
 
-    fn queue_end_to_end_reliable_ack_for_sender_hash(
+    fn build_end_to_end_ack_data(
         &self,
         packet_id: u64,
         original_sender_hash: u64,
-        called_from_queue: bool,
-    ) -> TelemetryResult<()> {
-        if !self.cfg.reliable_enabled() {
-            return Ok(());
-        }
+    ) -> TelemetryResult<RouterItem> {
         let ack_sender = self.encode_end_to_end_ack_sender();
         let ack = Packet::new_local(
             DataType::ReliableAck,
@@ -6367,13 +6842,148 @@ impl Router {
         // Keep the acknowledging owner first for compatibility. The second
         // identity is the original publisher: it lets a busy relay recover the
         // ACK route from discovery after its bounded packet-id cache expires.
-        let ack = self.attach_wire_contract_to_item(
+        self.attach_wire_contract_to_item(
             RouterItem::Packet(ack),
             &[
                 Self::sender_hash(local_sender.as_ref()),
                 original_sender_hash,
             ],
-        )?;
+        )
+    }
+
+    fn queue_admitted_end_to_end_ack(
+        &self,
+        packet_id: u64,
+        original_sender: &str,
+        called_from_queue: bool,
+        admission: Option<&ReliableLocalAdmissionGuard<'_>>,
+    ) -> TelemetryResult<()> {
+        let Some(guard) = admission else {
+            return self.queue_end_to_end_reliable_ack_for_packet_id(
+                packet_id,
+                original_sender,
+                called_from_queue,
+            );
+        };
+        if !self.cfg.reliable_enabled() {
+            return Ok(());
+        }
+        if guard.packet_id != packet_id || !core::ptr::eq(guard.router, self) {
+            return Err(TelemetryError::BadArg);
+        }
+        let publisher_hash = {
+            let state = self.state.lock();
+            guard.check_locked(&state)?;
+            Self::sender_hash(&Self::canonical_sender_locked(&state, original_sender))
+        };
+        let data = self.build_end_to_end_ack_data(packet_id, publisher_hash)?;
+        let priority = self.item_service_priority(&data)?;
+        // Only this small newly built ACK is hashed for eager selection, never
+        // the original data or unrelated queued payloads.
+        let ack_id = Self::get_hash(&data);
+        let mut state = self.state.lock();
+        guard.check_locked(&state)?;
+        let dst = state
+            .reliable_return_routes
+            .get(&packet_id)
+            .expect("checked lease")
+            .side;
+        if !Self::side_ref(&state, dst)?.opts.egress_enabled {
+            return Err(TelemetryError::Io("side changed during rx"));
+        }
+        state.push_transmit(TxQueued {
+            disposable: TX_DISPOSABLE,
+            item: RouterTxItem::ToSide {
+                src: None,
+                dst,
+                data,
+            },
+            ignore_local: true,
+            priority,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: DataType::ReliableAck.as_u32(),
+            deferred_since_ms: 0,
+            retry_after_ms: 0,
+        })?;
+        // Admission and completion have one state-locked linearization point.
+        state
+            .reliable_return_routes
+            .get_mut(&packet_id)
+            .expect("checked lease")
+            .delivery_completed = true;
+        // Preserve the immediate-RX API's eager receipt without dispatching an
+        // unrelated application command. Admission/completion above stays
+        // atomic; claiming this one ACK uses normal queued-TX tracking/retry.
+        #[cfg(feature = "std")]
+        let can_claim = self
+            .active_queued_tx
+            .load(core::sync::atomic::Ordering::Acquire)
+            != usize::MAX;
+        #[cfg(not(feature = "std"))]
+        let can_claim = true;
+        let work = if !called_from_queue && can_claim {
+            let index = state.transmit_queue.iter().position(|queued| {
+                if queued.accepted_type != DataType::ReliableAck.as_u32() {
+                    return false;
+                }
+                let RouterTxItem::ToSide {
+                    dst: side, data, ..
+                } = &queued.item
+                else {
+                    return false;
+                };
+                if *side != dst {
+                    return false;
+                }
+                match data {
+                    RouterItem::Packet(packet) => packet.packet_id() == ack_id,
+                    RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
+                        wire_format::packet_id_from_wire(view).is_ok_and(|id| id == ack_id)
+                    })
+                    .unwrap_or(false),
+                }
+            });
+            index
+                .and_then(|index| state.transmit_queue.remove_pos(index))
+                .map(|queued| {
+                    #[cfg(feature = "latest-value-egress")]
+                    let service = EgressService {
+                        token: state.latest_service_seq,
+                        side: state.latest_dispatch_tag(&queued),
+                        kind: 0,
+                    };
+                    TxWork {
+                        queued,
+                        claim: None,
+                        owed_turn: false,
+                        #[cfg(feature = "latest-value-egress")]
+                        service,
+                    }
+                })
+        } else {
+            None
+        };
+        #[cfg(feature = "std")]
+        let work = self.track_queued_tx(&mut state, work);
+        drop(state);
+        if let Some(work) = work {
+            #[cfg(feature = "std")]
+            let (work, _activity) = work;
+            self.dispatch_queued_item(work)?;
+        }
+        Ok(())
+    }
+
+    fn queue_end_to_end_reliable_ack_for_sender_hash(
+        &self,
+        packet_id: u64,
+        original_sender_hash: u64,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
+        if !self.cfg.reliable_enabled() {
+            return Ok(());
+        }
+        let ack = self.build_end_to_end_ack_data(packet_id, original_sender_hash)?;
         // Freeze a known return side in the queued receipt itself. Its bounded
         // packet-id cache can churn before dispatch; an echoed data frame must
         // not redirect an ACK which already has a valid destination.
@@ -7352,19 +7962,14 @@ impl Router {
                 && routing_target_senders.is_empty()
                 && preferred_packet_id.is_none();
             if st.discovery_routes.is_empty() {
-                let mut fallback =
+                let fallback =
                     self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
                 #[cfg(feature = "timesync")]
-                {
-                    if select_routes {
-                        fallback = Self::filter_timesync_sides_locked(
-                            &st,
-                            ty,
-                            self.clock.now_ms(),
-                            fallback,
-                        );
-                    }
-                }
+                let fallback = if select_routes {
+                    Self::filter_timesync_sides_locked(&st, ty, self.clock.now_ms(), fallback)
+                } else {
+                    fallback
+                };
                 return Ok(RemoteSidePlan::Target(if fallback.len() == 1 {
                     fallback
                 } else {
@@ -7469,19 +8074,14 @@ impl Router {
                 Ok(RemoteSidePlan::Target(Vec::new()))
             } else {
                 if Self::has_explicit_route_policy_locked(&st, exclude, ty) {
-                    let mut sides =
+                    let sides =
                         self.eligible_side_ids_locked(&st, exclude, Some(ty), restrict_link_local);
                     #[cfg(feature = "timesync")]
-                    {
-                        if select_routes {
-                            sides = Self::filter_timesync_sides_locked(
-                                &st,
-                                ty,
-                                self.clock.now_ms(),
-                                sides,
-                            );
-                        }
-                    }
+                    let sides = if select_routes {
+                        Self::filter_timesync_sides_locked(&st, ty, self.clock.now_ms(), sides)
+                    } else {
+                        sides
+                    };
                     Ok(RemoteSidePlan::Target(select_sides(
                         &mut st,
                         sides,
@@ -7543,7 +8143,12 @@ impl Router {
         eps
     }
 
-    #[cfg(feature = "discovery")]
+    #[cfg(all(feature = "discovery", not(feature = "timesync")))]
+    fn local_discovery_timesync_sources(&self, _now_ms: u64) -> Vec<String> {
+        Vec::new()
+    }
+
+    #[cfg(all(feature = "discovery", feature = "timesync"))]
     fn local_discovery_timesync_sources(&self, now_ms: u64) -> Vec<String> {
         #[cfg(feature = "timesync")]
         if self.timesync.is_none() {
@@ -7685,13 +8290,17 @@ impl Router {
             reachable_timesync_sources.extend(sender.reachable_timesync_sources.iter().cloned());
             last_seen_ms = last_seen_ms.max(sender.last_seen_ms);
         }
-        reachable_network_variables
-            .extend(route.requested_network_variables.iter().map(|(ty, _)| *ty));
+        reachable_network_variables.extend(
+            route
+                .requested_network_variables
+                .iter()
+                .map(|request| request.ty),
+        );
         last_seen_ms = last_seen_ms.max(
             route
                 .requested_network_variables
                 .iter()
-                .map(|(_, last_seen_ms)| *last_seen_ms)
+                .map(|request| request.last_seen_ms)
                 .max()
                 .unwrap_or(0),
         );
@@ -7807,11 +8416,10 @@ impl Router {
             route.announcers.retain(|_, sender| {
                 now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
             });
-            route
-                .requested_network_variables
-                .retain(|(_, last_seen_ms)| {
-                    now_ms.saturating_sub(*last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
-                });
+            route.requested_network_variables.retain(|request| {
+                now_ms >= request.last_seen_ms
+                    && now_ms - request.last_seen_ms <= DISCOVERY_ROUTE_TTL_MS
+            });
             if before_peers != route.announcers.len()
                 || before_requests != route.requested_network_variables.len()
             {
@@ -9532,7 +10140,7 @@ impl Router {
                         route
                             .requested_network_variables
                             .len()
-                            .saturating_mul(core::mem::size_of::<(DataType, u64)>()),
+                            .saturating_mul(core::mem::size_of::<ManagedVariableSubscription>()),
                     );
                     shallow.strings(&route.reachable_timesync_sources);
                     for (name, value) in &route.announcers {
@@ -9598,7 +10206,7 @@ impl Router {
                     route
                         .requested_network_variables
                         .iter()
-                        .any(|(id, _)| *id == ty)
+                        .any(|request| request.ty == ty)
                 });
             if existing {
                 (1024, 256)
@@ -9807,27 +10415,75 @@ impl Router {
             {
                 let now_ms = self.clock.now_ms();
                 let mut st = self.state.lock();
-                // Refreshing an existing subscription changes only its lease.
-                // Do not clone the complete learned topology or rebuild route
-                // summaries on every retry from a slow/disconnected subscriber.
+                // Read-only replicas still forward GET toward a writer. The
+                // grant names only the existing cached observation and its
+                // actual upstream; it cannot manufacture a cached response.
+                let grant = st.local_services.as_ref().and_then(|local| {
+                    if Self::managed_variable_permissions_locked(&st, ty).write {
+                        return None;
+                    }
+                    let entry = local.managed_variable_latest.get(&ty.as_u32())?;
+                    let value_id = entry.packet.packet_id();
+                    let upstream = entry.upstream?.get() - 1;
+                    (upstream != side
+                        && Self::side_ref(&st, upstream)
+                            .is_ok_and(|link| link.opts.ingress_enabled))
+                    .then_some((value_id, upstream, entry.sender_address))
+                });
+                let mut request = ManagedVariableSubscription {
+                    last_seen_ms: now_ms,
+                    next_refresh_ms: 0,
+                    request_id: pkt.packet_id(),
+                    value_id: 0,
+                    upstream: side,
+                    ty,
+                    requester: sender_address_u32(pkt.sender()),
+                    writer: 0,
+                    refresh_pending: false,
+                };
+                if let Some((value_id, upstream, writer)) = grant {
+                    request.value_id = value_id;
+                    request.upstream = upstream;
+                    request.writer = writer;
+                    request.refresh_pending = true;
+                }
                 let existing = st.discovery_routes.get_mut(&side).and_then(|route| {
-                    let (_, last_seen_ms) = route
+                    let previous = route
                         .requested_network_variables
                         .iter_mut()
-                        .find(|(requested, _)| *requested == ty)?;
-                    *last_seen_ms = now_ms;
+                        .find(|previous| previous.ty == ty)?;
+                    let repeated = previous.request_id == request.request_id
+                        && previous.requester == request.requester;
+                    let backstep = now_ms < previous.last_seen_ms;
+                    let cooling =
+                        previous.next_refresh_ms == u64::MAX || now_ms < previous.next_refresh_ms;
+                    if backstep {
+                        previous.refresh_pending = false;
+                    } else if !repeated && !cooling && !previous.refresh_pending {
+                        request.next_refresh_ms = previous.next_refresh_ms;
+                        *previous = request;
+                    } else {
+                        // Same GET stays consumed even after recent-ID churn.
+                        // New GETs cannot flood hop work during the independent
+                        // cooldown; their lease renewals never slide it.
+                        previous.last_seen_ms = now_ms;
+                    }
                     route.last_seen_ms = route.last_seen_ms.max(now_ms);
                     Some(())
                 });
                 let newly_reachable = existing.is_none();
                 if newly_reachable {
+                    // Refuse before allocating the expanded row. Existing-row
+                    // renewals above neither clone nor grow this vector.
+                    st.make_shared_queue_room(size_of::<ManagedVariableSubscription>(), 255, None)?;
                     let mut route = st
                         .discovery_routes
                         .get(&side)
                         .map(DiscoverySideState::try_clone)
                         .transpose()?
                         .unwrap_or_default();
-                    route.requested_network_variables.push((ty, now_ms));
+                    reserve_managed_subscriptions(&mut route.requested_network_variables, 1)?;
+                    route.requested_network_variables.push(request);
                     Self::recompute_discovery_side_state(&mut route);
                     st.commit_discovery_route(side, route)?;
                 }
@@ -13403,6 +14059,8 @@ impl Router {
                     memory.starting_queue_size,
                     memory.queue_grow_step,
                 ),
+                #[cfg(feature = "std")]
+                active_queued_types: [(0, 0); ACTIVE_QUEUED_TYPE_SLOTS],
                 tx_priority_burst: 0,
                 tx_policy_flags: 0,
                 #[cfg(feature = "latest-value-egress")]
@@ -13421,6 +14079,7 @@ impl Router {
                 reliable_tx: Default::default(),
                 reliable_rx: Default::default(),
                 reliable_return_routes: Default::default(),
+                local_admission_sequence: 0,
                 reliable_return_route_order: VecDeque::new(),
                 forwarded_receipts: None,
                 end_to_end_reliable_tx: Default::default(),
@@ -13506,6 +14165,37 @@ impl Router {
         }
         #[cfg(not(feature = "discovery"))]
         None
+    }
+
+    /// Match a packet sender to an expected literal hostname without allocating.
+    ///
+    /// Literal names compare exactly. Numeric `@addr:<u32>` aliases must resolve
+    /// through retained assigned-address or collision-aware compact identity
+    /// metadata; unknown or ambiguous aliases never match by hash alone.
+    /// Existing explicit assigned-address precedence is preserved; this does
+    /// not add stronger cross-namespace ambiguity or authenticity guarantees.
+    /// Empty names, malformed aliases and embedded NULs fail closed. This is
+    /// routing identity attribution, not packet authentication.
+    pub fn sender_matches_hostname(&self, sender: &str, expected_hostname: &str) -> bool {
+        if sender.is_empty()
+            || expected_hostname.is_empty()
+            || sender.contains('\0')
+            || expected_hostname.contains('\0')
+            || expected_hostname.starts_with("@addr:")
+        {
+            return false;
+        }
+        let Some(value) = sender.strip_prefix("@addr:") else {
+            return sender == expected_hostname;
+        };
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(address) = value.parse::<u32>() else {
+            return false;
+        };
+        let state = self.state.lock();
+        Self::hostname_for_address_borrowed_locked(&state, address) == Some(expected_hostname)
     }
 
     pub fn address_book(&self) -> Vec<AddressBookEntry> {
@@ -14082,6 +14772,12 @@ impl Router {
         let now_ms = self.clock.now_ms();
         {
             let mut st = self.state.lock();
+            if st.reliable_return_routes.values().any(|route| {
+                route.side == side && route.local_admission_token != 0 && route.admission_committing
+            }) {
+                return Err(TelemetryError::Io("side rx commit busy"));
+            }
+
             #[cfg(feature = "std")]
             if st
                 .side_transport
@@ -14127,8 +14823,16 @@ impl Router {
             st.timesync_side_throttle.remove(&side);
             st.side_runtime_stats.remove(&side);
             st.side_transport.remove(&side);
-            st.reliable_return_routes
-                .retain(|_, route| route.side != side);
+            st.reliable_return_routes.retain(|_, route| {
+                if route.side != side {
+                    return true;
+                }
+                if route.local_admission_token != 0 {
+                    route.admission_cancelled = true;
+                    return true;
+                }
+                false
+            });
             st.retain_transmit(
                 |queued| {
                     !matches!(&queued.item, RouterTxItem::ToSide { dst, .. } if *dst == side)
@@ -14140,6 +14844,7 @@ impl Router {
             st.reliable_rx.retain(|(side_id, _), _| *side_id != side);
             #[cfg(feature = "discovery")]
             {
+                st.cancel_managed_refresh_side(side);
                 st.discovery_routes.remove(&side);
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
             }
@@ -14193,12 +14898,31 @@ impl Router {
         #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
+        if !enabled
+            && st.reliable_return_routes.values().any(|route| {
+                route.side == side && route.local_admission_token != 0 && route.admission_committing
+            })
+        {
+            return Err(TelemetryError::Io("side rx commit busy"));
+        }
+
         let side_ref = st
             .sides
             .get_mut(side)
             .and_then(|side| side.as_mut())
             .ok_or(TelemetryError::BadArg)?;
         side_ref.opts.ingress_enabled = enabled;
+        if !enabled {
+            for route in st.reliable_return_routes.values_mut() {
+                if route.side == side && route.local_admission_token != 0 {
+                    route.admission_cancelled = true;
+                }
+            }
+        }
+        #[cfg(feature = "discovery")]
+        if !enabled {
+            st.cancel_managed_refresh_side(side);
+        }
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
@@ -14215,6 +14939,14 @@ impl Router {
         #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
+        if !enabled
+            && st.reliable_return_routes.values().any(|route| {
+                route.side == side && route.local_admission_token != 0 && route.admission_committing
+            })
+        {
+            return Err(TelemetryError::Io("side rx commit busy"));
+        }
+
         let side_ref = st
             .sides
             .get_mut(side)
@@ -14223,6 +14955,15 @@ impl Router {
         #[cfg(feature = "latest-value-egress")]
         let changed = side_ref.opts.egress_enabled != enabled;
         side_ref.opts.egress_enabled = enabled;
+        if !enabled {
+            #[cfg(feature = "discovery")]
+            st.cancel_managed_refresh_side(side);
+            for route in st.reliable_return_routes.values_mut() {
+                if route.side == side && route.local_admission_token != 0 {
+                    route.admission_cancelled = true;
+                }
+            }
+        }
         #[cfg(feature = "latest-value-egress")]
         if changed && st.latest_side() == Some(side) {
             if let Some(next) = st.latest_service_seq.checked_add(1) {
@@ -14684,7 +15425,7 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
         }
-        self.cache_managed_variable_packet(&pkt, false)
+        self.cache_managed_variable_packet(&pkt, false, None)
     }
 
     pub fn cached_managed_variable(&self, ty: DataType) -> Option<Packet> {
@@ -14714,7 +15455,7 @@ impl Router {
                 return Err(TelemetryError::PermissionDenied);
             }
         }
-        self.cache_managed_variable_packet(&pkt, false)?;
+        self.cache_managed_variable_packet(&pkt, false, None)?;
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
@@ -14734,6 +15475,10 @@ impl Router {
     /// managed-variable request and returns `Ok(None)`. If the value is stale, this queues a refresh
     /// request and returns the stale cached value so callers can continue operating while the network
     /// catches up.
+    ///
+    /// Cache age is local observation age. A refresh reply preserves the
+    /// original source timestamp and packet identity; it is not proof of a new
+    /// source measurement or a request-correlated application readback.
     #[cfg(feature = "discovery")]
     pub fn get_network_variable(
         &self,
@@ -14973,7 +15718,9 @@ impl Router {
 
     /// Snapshot outstanding reliable deliveries for diagnostics. Allocates
     /// metadata bounded by the existing pending window; never clones payloads
-    /// or changes retry timing. Not needed in the normal dispatch hot path.
+    /// or changes retry timing. Known std owner types use cached metadata;
+    /// unknown types and non-std builds retain payload decoding as a fallback.
+    /// Not needed in the normal dispatch hot path.
     pub fn export_reliable_pending_stats(&self) -> Vec<crate::diagnostics::ReliablePendingStats> {
         let st = self.state.lock();
         st.end_to_end_reliable_tx
@@ -14981,7 +15728,20 @@ impl Router {
             .filter_map(|(&packet_id, sent)| {
                 Some(crate::diagnostics::ReliablePendingStats {
                     packet_id,
-                    data_type: Self::item_data_type(&sent.data).ok()?,
+                    data_type: {
+                        #[cfg(feature = "std")]
+                        {
+                            if sent.pending_type != 0 {
+                                DataType(sent.pending_type)
+                            } else {
+                                Self::item_data_type(&sent.data).ok()?
+                            }
+                        }
+                        #[cfg(not(feature = "std"))]
+                        {
+                            Self::item_data_type(&sent.data).ok()?
+                        }
+                    },
                     pending_destinations: sent.pending_destinations.keys().copied().collect(),
                     retries: sent.retries,
                     queued: sent.queued,
@@ -15236,24 +15996,46 @@ impl Router {
     /// Whether SDK delivery ownership remains for a reliable type submitted
     /// through `tx_queue`/`tx_packed_queue`. Includes original/claimed work,
     /// transport retries and reliable owners. A concurrent queued TX dispatch
-    /// conservatively returns true even for an unrelated type. This allocates
-    /// nothing and changes no queues. Packed work without a cached type is
-    /// conservatively pending, without materializing or pinning its payload.
+    /// is exact while its known logical types fit the bounded inline claim table.
+    /// Unknown or unrepresented active work stays conservatively pending.
+    /// This allocates nothing and changes no queues. Retained end-to-end owners and their
+    /// replay markers use the logical type validated when ownership was created,
+    /// independent of Packed payload representation. Packed queue work without
+    /// a cached type, or an owner with unknown type metadata, is conservatively
+    /// pending, without materializing or pinning its payload.
     /// It is NOT an RX-originated ownership or
     /// external transport/modem-drain guarantee.
     #[cfg(feature = "std")]
     pub fn has_pending_reliable_tx_type(&self, ty: DataType) -> bool {
         let st = self.state.lock();
-        if self
+        let total = self
             .active_queued_tx
-            .load(core::sync::atomic::Ordering::Acquire)
-            != 0
+            .load(core::sync::atomic::Ordering::Acquire) as u64;
+        let known = st
+            .active_queued_types
+            .iter()
+            .try_fold(0u64, |sum, &(kind, count)| {
+                if kind == 0 && count != 0 {
+                    return None;
+                }
+                sum.checked_add(u64::from(count))
+            });
+        // Unknown provenance, exhausted slots, overflow or inconsistent counts
+        // remain conservative. No payload is parsed or pinned by inspection.
+        if known != Some(total)
+            || st
+                .active_queued_types
+                .iter()
+                .any(|&(kind, count)| count != 0 && kind == ty.as_u32())
         {
             return true;
         }
         let matches_data = |data: &RouterItem| match data {
             RouterItem::Packet(packet) => packet.data_type() == ty,
             RouterItem::Packed(_) => true,
+        };
+        let matches_owner = |owner: &EndToEndReliableSent| {
+            owner.pending_type == 0 || owner.pending_type == ty.as_u32()
         };
         st.transmit_queue.iter().any(|queued| {
             if queued.accepted_type != 0 {
@@ -15267,12 +16049,12 @@ impl Router {
                 RouterTxItem::EndToEndReplay { packet_id } => st
                     .end_to_end_reliable_tx
                     .get(packet_id)
-                    .is_some_and(|owner| matches_data(&owner.data)),
+                    .is_some_and(|owner| matches_owner(owner)),
             }
         }) || st
             .end_to_end_reliable_tx
             .values()
-            .any(|owner| matches_data(&owner.data))
+            .any(|owner| matches_owner(owner))
             || st
                 .reliable_tx
                 .iter()
@@ -15282,11 +16064,58 @@ impl Router {
     // Called only while the same state lock that pops the work is still held.
     // Thus inspection cannot observe a popped retry before this count exists.
     #[cfg(feature = "std")]
-    fn track_queued_tx(&self, work: Option<TxWork>) -> Option<(TxWork, QueuedTxActivityGuard<'_>)> {
+    fn track_queued_tx<'a>(
+        &'a self,
+        state: &mut RouterInner,
+        work: Option<TxWork>,
+    ) -> Option<(TxWork, QueuedTxActivityGuard<'a>)> {
         work.map(|work| {
+            let total = self
+                .active_queued_tx
+                .load(core::sync::atomic::Ordering::Acquire);
+            // All three callers check before removing queue ownership. Both
+            // registration and release hold state, so this cannot race Drop.
+            let next = total.checked_add(1).expect("active queued TX overflow");
+            let kind = if work.queued.accepted_type != 0 {
+                Some(work.queued.accepted_type)
+            } else {
+                match &work.queued.item {
+                    RouterTxItem::Broadcast(RouterItem::Packet(packet))
+                    | RouterTxItem::ToSide {
+                        data: RouterItem::Packet(packet),
+                        ..
+                    } => Some(packet.data_type().as_u32()),
+                    RouterTxItem::ReliableReplay { ty, .. } => Some(ty.as_u32()),
+                    RouterTxItem::EndToEndReplay { packet_id } => state
+                        .end_to_end_reliable_tx
+                        .get(packet_id)
+                        .map(|owner| owner.pending_type),
+                    _ => None,
+                }
+            }
+            .filter(|kind| *kind != 0);
+            let key = kind.and_then(|kind| {
+                let index = state
+                    .active_queued_types
+                    .iter()
+                    .position(|slot| slot.0 == kind)
+                    .or_else(|| {
+                        state
+                            .active_queued_types
+                            .iter()
+                            .position(|slot| slot.1 == 0)
+                    })?;
+                let slot = &mut state.active_queued_types[index];
+                let count = slot.1.checked_add(1)?;
+                *slot = (kind, count);
+                Some(ActiveQueuedTypeKey {
+                    slot: core::num::NonZeroU8::new((index + 1) as u8).expect("inline type slot"),
+                    kind,
+                })
+            });
             self.active_queued_tx
-                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-            (work, QueuedTxActivityGuard(&self.active_queued_tx))
+                .store(next, core::sync::atomic::Ordering::Release);
+            (work, QueuedTxActivityGuard { router: self, key })
         })
     }
 
@@ -15627,7 +16456,10 @@ impl Router {
     /// Compute a de-dupe ID for a RouterItem and record it.
     /// Returns true if this item was seen recently (and should be skipped).
     fn is_duplicate_pkt(&self, item: &RouterItem) -> TelemetryResult<bool> {
-        let id = Self::get_hash(item);
+        self.is_duplicate_packet_id(Self::get_hash(item))
+    }
+
+    fn is_duplicate_packet_id(&self, id: u64) -> TelemetryResult<bool> {
         let mut st = self.state.lock();
         if st.recent_rx.contains(&id)
             || st
@@ -15994,9 +16826,20 @@ impl Router {
 
             let pkt_opt = {
                 let mut st = self.state.lock();
+                #[cfg(feature = "std")]
+                let work = if self
+                    .active_queued_tx
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    == usize::MAX
+                {
+                    None // Leave ownership queued; never wrap the active total.
+                } else {
+                    Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false)
+                };
+                #[cfg(not(feature = "std"))]
                 let work = Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false);
                 #[cfg(feature = "std")]
-                let work = self.track_queued_tx(work);
+                let work = self.track_queued_tx(&mut st, work);
                 work
             };
             let Some(pkt) = pkt_opt else { break };
@@ -16113,9 +16956,20 @@ impl Router {
                 let now = self.clock.now_ms();
                 // Complete one fair TX even after RX uses the deadline.
                 // Priority burst limits still prefer and protect queued ACKs.
+                #[cfg(feature = "std")]
+                let work = if self
+                    .active_queued_tx
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    == usize::MAX
+                {
+                    None // Leave ownership queued; never wrap the active total.
+                } else {
+                    Self::pop_transmit_queue_locked(&mut st, now, false)
+                };
+                #[cfg(not(feature = "std"))]
                 let work = Self::pop_transmit_queue_locked(&mut st, now, false);
                 #[cfg(feature = "std")]
-                let work = self.track_queued_tx(work);
+                let work = self.track_queued_tx(&mut st, work);
                 work
             } {
                 #[cfg(feature = "std")]
@@ -17111,15 +17965,22 @@ impl Router {
                 if completed {
                     let mut st = self.state.lock();
                     if Self::remember_reliable_return_route_locked(&mut st, upstream_id) {
-                        st.reliable_return_routes.insert(
-                            upstream_id,
-                            ReliableReturnRouteState {
+                        st.reliable_return_routes
+                            .entry(upstream_id)
+                            .and_modify(|route| {
+                                route.delivery_completed = true;
+                                route.upstream_contract = Some((upstream_id, publisher_hash));
+                            })
+                            .or_insert(ReliableReturnRouteState {
                                 side: alias.side,
                                 delivery_completed: true,
+                                local_admission_completed: true,
+                                local_admission_token: 0,
+                                admission_cancelled: false,
+                                admission_committing: false,
                                 last_replay_ms: alias.last_replay_ms,
                                 upstream_contract: Some((upstream_id, publisher_hash)),
-                            },
-                        );
+                            });
                     }
                 }
                 self.queue_end_to_end_reliable_ack_for_sender_hash(
@@ -17226,6 +18087,119 @@ impl Router {
         }
     }
 
+    /// Explicit GET permits one unchanged observation to cross a completed
+    /// proxy again. Queue admission owns only this hop, independently of old
+    /// end-to-end ACKs. Source time and identity never change; this is not proof
+    /// of a post-request writer revision. A lost response needs another GET.
+    #[cfg(feature = "discovery")]
+    fn forward_requested_managed_observation(
+        &self,
+        item: &RouterRxItem,
+        duplicate: bool,
+        ty: DataType,
+    ) -> TelemetryResult<()> {
+        let Some(src) = item.src else {
+            return Ok(());
+        };
+        if !self.is_managed_variable_type(ty) || is_internal_control_type(ty) {
+            return Ok(());
+        }
+        let id = Self::get_hash(&item.data);
+        let untargeted = self.item_target_senders(&item.data)?.is_empty();
+        let now = self.clock.now_ms();
+        let priority = self.item_service_priority(&item.data)?;
+        let mut state = self.state.lock();
+        let current = state
+            .local_services
+            .as_ref()
+            .and_then(|local| local.managed_variable_latest.get(&ty.as_u32()))
+            .map(|entry| (entry.packet.packet_id(), entry.sender_address));
+        // A different revision cancels the grant, not completes a response.
+        // Normal routing owns fresh updates; a backstep cannot extend a grant.
+        for route in state.discovery_routes.values_mut() {
+            for request in &mut route.requested_network_variables {
+                if request.ty == ty
+                    && request.refresh_pending
+                    && (now < request.last_seen_ms
+                        || now - request.last_seen_ms > DISCOVERY_ROUTE_TTL_MS
+                        || current != Some((request.value_id, request.writer)))
+                {
+                    request.refresh_pending = false;
+                }
+            }
+        }
+        if !duplicate || !untargeted {
+            return Ok(());
+        }
+        loop {
+            let candidate = state.discovery_routes.iter().find_map(|(&side, route)| {
+                if side == src
+                    || !Self::side_ref(&state, side).is_ok_and(|link| link.opts.egress_enabled)
+                {
+                    return None;
+                }
+                route
+                    .requested_network_variables
+                    .iter()
+                    .find(|request| {
+                        request.ty == ty
+                            && request.refresh_pending
+                            && request.upstream == src
+                            && request.value_id == id
+                    })
+                    .map(|request| (side, *request))
+            });
+            let Some((side, owner)) = candidate else {
+                break;
+            };
+            // Reuse an already admitted untracked hop for this exact source
+            // observation. It cannot be retired by an old reader ACK. Never
+            // alias a frozen child/replay owner or rewrite an active payload.
+            let owned = state.transmit_queue.iter().any(|queued| {
+                queued.ignore_local
+                    && queued.delivery_state == QueuedDelivery::Untracked
+                    && queued.disposable & TX_E2E_CHILD == 0
+                    && matches!(&queued.item,
+                        RouterTxItem::ToSide { src: queued_src, dst, data }
+                        if *queued_src == Some(src) && *dst == side
+                            && Self::get_hash(data) == id)
+            });
+            if !owned {
+                // Ordinary ToSide work, not a new end-to-end reader cohort.
+                // Refusal leaves the grant pending; admission and grant
+                // consumption share this lock. No new priority or credit.
+                state.push_transmit(TxQueued {
+                    disposable: TX_FRESH,
+                    item: RouterTxItem::ToSide {
+                        src: Some(src),
+                        dst: side,
+                        data: item.data.clone(),
+                    },
+                    ignore_local: true,
+                    priority,
+                    delivery_state: QueuedDelivery::Untracked,
+                    accepted_type: 0,
+                    deferred_since_ms: 0,
+                    retry_after_ms: 0,
+                })?;
+            }
+            if let Some(request) = state.discovery_routes.get_mut(&side).and_then(|route| {
+                route
+                    .requested_network_variables
+                    .iter_mut()
+                    .find(|request| {
+                        request.ty == ty
+                            && request.request_id == owner.request_id
+                            && request.requester == owner.requester
+                    })
+            }) {
+                request.refresh_pending = false;
+                request.next_refresh_ms = now.saturating_add(runtime_reliable_retransmit_ms());
+            }
+        }
+        Ok(())
+    }
+
     /// Core receive function handling both Packet and Packed items.
     ///
     /// Relay mode: if a destination endpoint has no matching local handler and the packet has
@@ -17235,6 +18209,7 @@ impl Router {
         // Reuse this CRC-validated borrowed envelope for accounting and
         // role/return-route checks in this invocation. Dispatch still rechecks
         // current routing metadata; no validation result survives queueing.
+        let mut _local_admission_guard = None;
         let packed_frame = match &item.data {
             RouterItem::Packed(bytes) => Some(wire_format::peek_routing_frame_info(bytes.as_ref())),
             RouterItem::Packet(_) => None,
@@ -17269,9 +18244,14 @@ impl Router {
                 RouterItem::Packet(pkt) => {
                     if (is_reliable_type(pkt.data_type()) || !pkt.wire_target_senders().is_empty())
                         && !is_internal_control_type(pkt.data_type())
-                        && !self.note_reliable_return_route(src, pkt.packet_id())
                     {
-                        return Ok(());
+                        match self.begin_reliable_local_admission(src, pkt.packet_id())? {
+                            Some(guard) => _local_admission_guard = Some(guard),
+                            None => {
+                                self.queue_duplicate_proxy_edge_receipt(item, pkt.packet_id())?;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 RouterItem::Packed(bytes) => {
@@ -17279,9 +18259,14 @@ impl Router {
                         && (is_reliable_type(env.ty) || env.target_senders().len() != 0)
                         && !is_internal_control_type(env.ty)
                         && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
-                        && !self.note_reliable_return_route(src, packet_id)
                     {
-                        return Ok(());
+                        match self.begin_reliable_local_admission(src, packet_id)? {
+                            Some(guard) => _local_admission_guard = Some(guard),
+                            None => {
+                                self.queue_duplicate_proxy_edge_receipt(item, packet_id)?;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -17289,7 +18274,7 @@ impl Router {
         match &item.data {
             RouterItem::Packet(pkt) => {
                 if !is_internal_control_type(pkt.data_type()) {
-                    self.remember_managed_variable_packet(pkt)?;
+                    self.cache_managed_variable_packet(pkt, true, item.src)?;
                 }
             }
             RouterItem::Packed(bytes) => {
@@ -17299,9 +18284,12 @@ impl Router {
                 {
                     let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
-                    self.remember_managed_variable_packet(&pkt)?;
+                    self.cache_managed_variable_packet(&pkt, true, item.src)?;
                 }
             }
+        }
+        if let Some(guard) = _local_admission_guard.as_ref() {
+            guard.check()?;
         }
         let mut released_buffered: Vec<crate::SharedBytes> = Vec::new();
         if let (Some(src), RouterItem::Packed(bytes)) = (item.src, &item.data) {
@@ -17482,7 +18470,29 @@ impl Router {
             }
         }
 
-        if self.is_duplicate_pkt(&item.data)? {
+        let duplicate = self.is_duplicate_pkt(&item.data)?;
+        if duplicate
+            && let Some(guard) = _local_admission_guard.as_ref()
+        {
+            guard.begin_commit(true)?;
+        }
+        #[cfg(feature = "discovery")]
+        {
+            // Reuse the already CRC-validated header. Ordinary telemetry must
+            // not pay another full-frame CRC pass for the managed GET path.
+            let ty = match &item.data {
+                RouterItem::Packet(packet) => packet.data_type(),
+                RouterItem::Packed(_) => packed_frame
+                    .as_ref()
+                    .expect("packed frame")
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .envelope
+                    .ty,
+            };
+            self.forward_requested_managed_observation(item, duplicate, ty)?;
+        }
+        if duplicate {
             #[cfg(feature = "discovery")]
             let shared_pending = if item.src.is_some()
                 // SDK protocols use reliable transport too, but their echoed
@@ -17551,7 +18561,12 @@ impl Router {
                                     pkt.endpoints(),
                                 )?) =>
                     {
-                        self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
+                        self.queue_admitted_end_to_end_ack(
+                            pkt.packet_id(),
+                            pkt.sender(),
+                            called_from_queue,
+                            _local_admission_guard.as_ref(),
+                        )?;
                     }
                     RouterItem::Packed(bytes) => {
                         if let Ok(pkt) = self.unpack_packet_for_role(bytes.as_ref())
@@ -17566,12 +18581,18 @@ impl Router {
                                     pkt.endpoints(),
                                 )?)
                         {
-                            let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
-                                .unwrap_or_else(|_| pkt.packet_id());
-                            self.queue_end_to_end_reliable_ack_for_packet_id(
+                            let packet_id = _local_admission_guard
+                                .as_ref()
+                                .map(|guard| guard.packet_id)
+                                .unwrap_or_else(|| {
+                                    wire_format::packet_id_from_wire(bytes.as_ref())
+                                        .unwrap_or_else(|_| pkt.packet_id())
+                                });
+                            self.queue_admitted_end_to_end_ack(
                                 packet_id,
                                 pkt.sender(),
                                 called_from_queue,
+                                _local_admission_guard.as_ref(),
                             )?;
                         }
                     }
@@ -17581,11 +18602,31 @@ impl Router {
             return Ok(());
         }
 
-        self.dispatch_rx_data(item, called_from_queue)?;
+        self.dispatch_rx_data(item, called_from_queue, _local_admission_guard.as_ref())?;
+        if let Some(guard) = _local_admission_guard.as_ref() {
+            guard.end_commit();
+        }
 
         for release_bytes in released_buffered {
             let release_data = RouterItem::Packed(release_bytes.clone());
-            if self.is_duplicate_pkt(&release_data)? {
+            if let Some(guard) = _local_admission_guard.as_ref() {
+                guard.check()?;
+            }
+            let release_id = Self::get_hash(&release_data);
+            let release_type = wire_format::scheduling_type(release_bytes.as_ref())
+                .ok_or(TelemetryError::InvalidType)?;
+            let release_guard = if !is_internal_control_type(release_type)
+                && let Some(src) = item.src
+            {
+                self.begin_reliable_local_admission_with_parent(
+                    src,
+                    release_id,
+                    _local_admission_guard.as_ref(),
+                )?
+            } else {
+                None
+            };
+            if self.is_duplicate_packet_id(release_id)? {
                 continue;
             }
             let release_item = RouterRxItem {
@@ -17593,7 +18634,7 @@ impl Router {
                 priority: Self::router_item_priority(&release_data)?,
                 data: release_data,
             };
-            self.dispatch_rx_data(&release_item, called_from_queue)?;
+            self.dispatch_rx_data(&release_item, called_from_queue, release_guard.as_ref())?;
         }
 
         Ok(())
@@ -17603,6 +18644,7 @@ impl Router {
         &self,
         item: &RouterRxItem,
         called_from_queue: bool,
+        admission: Option<&ReliableLocalAdmissionGuard<'_>>,
     ) -> TelemetryResult<()> {
         match &item.data {
             RouterItem::Packet(pkt) => {
@@ -17620,7 +18662,12 @@ impl Router {
                     if self.item_targets_local_sender(&item.data)? {
                         self.dispatch_p2p_packet(pkt)?;
                         if item.src.is_some() {
-                            self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
+                            self.queue_admitted_end_to_end_ack(
+                                pkt.packet_id(),
+                                pkt.sender(),
+                                called_from_queue,
+                                admission,
+                            )?;
                         }
                     }
                     if self.should_route_remote(&item.data, item.src)? {
@@ -17734,6 +18781,10 @@ impl Router {
                     }
                 }
 
+                if let Some(guard) = admission {
+                    guard.begin_commit(local_delivery_error.is_none())?;
+                }
+
                 if let Some(src) = item.src
                     && had_local_delivery
                     && local_delivery_error.is_none()
@@ -17751,9 +18802,17 @@ impl Router {
                         && self
                             .item_targets_router_as_intermediate_hop(&item.data, pkt.endpoints())?)
                 {
-                    self.queue_end_to_end_reliable_ack(pkt, called_from_queue)?;
+                    self.queue_admitted_end_to_end_ack(
+                        pkt.packet_id(),
+                        pkt.sender(),
+                        called_from_queue,
+                        admission,
+                    )?;
                 }
 
+                if let Some(guard) = admission {
+                    guard.check()?;
+                }
                 if has_remote {
                     let relay_item = RouterItem::Packet(pkt.to_owned());
                     self.relay_send(relay_item, item.src, called_from_queue)?;
@@ -17921,6 +18980,10 @@ impl Router {
                     }
                 }
 
+                if let Some(guard) = admission {
+                    guard.begin_commit(local_delivery_error.is_none())?;
+                }
+
                 if item.src.is_some()
                     && had_local_delivery
                     && local_delivery_error.is_none()
@@ -17930,20 +18993,27 @@ impl Router {
                         && self
                             .item_targets_router_as_intermediate_hop(&item.data, &env.endpoints)?)
                 {
-                    let packet_id =
+                    let packet_id = if let Some(guard) = admission {
+                        guard.packet_id
+                    } else {
                         wire_format::packet_id_from_wire(bytes.as_ref()).or_else(|_| {
                             pkt_opt
                                 .as_ref()
                                 .map(Packet::packet_id)
                                 .ok_or(TelemetryError::Unpack("missing packet id"))
-                        })?;
-                    self.queue_end_to_end_reliable_ack_for_packet_id(
+                        })?
+                    };
+                    self.queue_admitted_end_to_end_ack(
                         packet_id,
                         &env.sender,
                         called_from_queue,
+                        admission,
                     )?;
                 }
 
+                if let Some(guard) = admission {
+                    guard.check()?;
+                }
                 if has_remote {
                     let relay_item = match pkt_opt {
                         Some(ref p) => RouterItem::Packet(p.clone()),
@@ -19309,6 +20379,8 @@ mod queued_schema_identity_tests {
                 EndToEndReliableSent {
                     #[cfg(feature = "std")]
                     completion_epoch: 0,
+                    #[cfg(feature = "std")]
+                    pending_type: ty.as_u32(),
                     ordered_type: Some(ty.as_u32()),
                     waiting_for_predecessor: false,
                     data: RouterItem::Packet(packet),
@@ -19377,6 +20449,8 @@ mod queued_schema_identity_tests {
             EndToEndReliableSent {
                 #[cfg(feature = "std")]
                 completion_epoch: 0,
+                #[cfg(feature = "std")]
+                pending_type: data.data_type().as_u32(),
                 ordered_type: None,
                 waiting_for_predecessor: false,
                 data: RouterItem::Packet(data),
@@ -20224,3 +21298,26 @@ pub use completion::{PackedWriteLease, RetryTracker, RetryTrackerLimits, WriteSt
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/actual_bootstrap_arbitration.rs"]
 mod actual_bootstrap_arbitration;
+
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/router_managed_refresh.rs"]
+mod managed_refresh_tests;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/pending_type_metadata.rs"]
+mod pending_type_metadata;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/sender_identity_match.rs"]
+mod sender_identity_match;
+
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/router_cold_cycle_trace.rs"]
+mod router_cold_cycle_trace;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/toside_inspection_metadata.rs"]
+mod toside_inspection_metadata;
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/active_queued_types.rs"]
+mod active_queued_types;

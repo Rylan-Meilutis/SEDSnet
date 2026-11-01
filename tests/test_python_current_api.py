@@ -94,6 +94,30 @@ class PythonCurrentApiTests(unittest.TestCase):
         router.set_network_variable(packet)
         self.assertIsNotNone(router.cached_network_variable(self.state_ty))
 
+    def test_sender_matches_hostname_uses_retained_identity(self) -> None:
+        name = "py-identity-source"
+        address = 0x10203155
+        alias = f"@addr:{address}"
+        receiver = seds.Router(hostname="py-identity-receiver")
+        self.assertTrue(receiver.sender_matches_hostname(name, name))
+        for sender in ("PY-IDENTITY-SOURCE", "", "@addr:", "@addr:+1", "@addr:4294967296", alias):
+            self.assertFalse(receiver.sender_matches_hostname(sender, name))
+        self.assertFalse(receiver.sender_matches_hostname(name, ""))
+
+        packets = []
+        peer = seds.Router(hostname=name, address_mode=2, requested_address=address)
+        peer.add_side_packet("identity-wire", packets.append)
+        peer.announce_discovery()
+        peer.process_all_queues()
+        self.assertTrue(packets)
+        side = receiver.add_side_packet("identity-source", lambda _packet: None)
+        for packet in packets:
+            receiver.receive_packet_queue_from_side(side, packet)
+        receiver.process_all_queues()
+        self.assertEqual(receiver.resolve_hostname(name)["address"], address)
+        self.assertTrue(receiver.sender_matches_hostname(alias, name))
+        self.assertFalse(receiver.sender_matches_hostname(alias, "wrong-identity"))
+
     def test_runtime_config_memory_and_network_variable_api(self) -> None:
         seds.set_runtime_device_identifier("PY_API_DEFAULT")
         self.assertEqual(seds.runtime_device_identifier(), "PY_API_DEFAULT")

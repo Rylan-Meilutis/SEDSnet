@@ -541,6 +541,12 @@ The lookup accepts dynamically assigned addresses, deterministic compact wire ad
 identities retained from multi-hop topology summaries. A compact application packet can therefore
 be attributed even when the remote board's link-local address advertisement did not cross a router.
 
+`router.sender_matches_hostname(packet.sender(), "controller-1")` compares a sender without
+allocating an address-book snapshot. Literal names compare exactly; numeric `@addr:<u32>`
+aliases must resolve unambiguously through retained assigned-address or compact discovery
+identity. Unknown/malformed aliases fail closed; a matching hash alone is insufficient.
+This attributes routing identity and does not authenticate the packet. Existing explicitly assigned addresses retain precedence over compact-name fallback.
+
 P2P service traffic is separate from endpoint broadcast telemetry. A service binds a port and
 receives opaque bytes:
 
