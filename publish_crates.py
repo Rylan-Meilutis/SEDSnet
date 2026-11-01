@@ -351,16 +351,25 @@ def docker_maturin_windows_build(
             "ln -sf $(command -v clang) /usr/local/bin/clang-cl; "
             "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal >/tmp/rustup.log; "
             "source /usr/local/cargo/env; "
+            # Match Rust's COFF export syntax, including 32-bit EXPORTAS aliases.
+            "sedsnet_rust_host=$(rustc -vV | sed -n 's/^host: //p'); "
+            'sedsnet_rust_lld="$(rustc --print sysroot)/lib/rustlib/${sedsnet_rust_host}/bin/rust-lld"; '
+            'test -x "${sedsnet_rust_lld}"; '
+            'ln -sf "${sedsnet_rust_lld}" /usr/local/bin/lld-link; '
+            "/usr/local/bin/lld-link --version; "
             "python3 -m pip install --break-system-packages maturin >/dev/null; "
             f"cd /io; rustup target add {shlex.quote(target)}; "
             + " ".join(shlex.quote(part) for part in maturin_cmd)
         )
+        environment_args = docker_cargo_env_args()
+        if target == "i686-pc-windows-msvc":
+            environment_args.extend(["-e", "XWIN_ARCH=x86"])
         run(
             [
                 "docker",
                 "run",
                 "--rm",
-                *docker_cargo_env_args(),
+                *environment_args,
                 "-v",
                 f"{REPO_ROOT}:/io",
                 image,
