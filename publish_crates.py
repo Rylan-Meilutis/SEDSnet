@@ -220,6 +220,7 @@ def cargo_publish(
     token: str | None,
     ignore_errors: bool,
     timeout_s: int,
+    package_verified: bool = False,
 ) -> str:
     crate_name, crate_version = manifest_package(manifest)
     if publish and crate_version_exists(crate_name, crate_version):
@@ -229,6 +230,10 @@ def cargo_publish(
     cmd = ["cargo", "publish", "--manifest-path", str(manifest)]
     if not publish:
         cmd.append("--dry-run")
+    if package_verified:
+        # Only the caller's successful cargo_package in this invocation supplies
+        # this proof. --skip-package must retain cargo publish's verification.
+        cmd.append("--no-verify")
     if allow_dirty:
         cmd.append("--allow-dirty")
     env = cargo_env()
@@ -244,7 +249,7 @@ def cargo_publish(
     print(redact_output(result.stdout, env), end="")
     if result.returncode == 0:
         return PUBLISH_PUBLISHED
-    if is_already_published_output(result.stdout):
+    if is_crate_already_published_output(result.stdout, crate_version):
         print(f"\n{crate_name} v{crate_version} was already published; continuing.")
         return PUBLISH_ALREADY_EXISTS
     if ignore_errors:
@@ -351,16 +356,25 @@ def docker_maturin_windows_build(
             "ln -sf $(command -v clang) /usr/local/bin/clang-cl; "
             "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal >/tmp/rustup.log; "
             "source /usr/local/cargo/env; "
+            # Match Rust's COFF export syntax, including 32-bit EXPORTAS aliases.
+            "sedsnet_rust_host=$(rustc -vV | sed -n 's/^host: //p'); "
+            'sedsnet_rust_lld="$(rustc --print sysroot)/lib/rustlib/${sedsnet_rust_host}/bin/rust-lld"; '
+            'test -x "${sedsnet_rust_lld}"; '
+            'ln -sf "${sedsnet_rust_lld}" /usr/local/bin/lld-link; '
+            "/usr/local/bin/lld-link --version; "
             "python3 -m pip install --break-system-packages maturin >/dev/null; "
             f"cd /io; rustup target add {shlex.quote(target)}; "
             + " ".join(shlex.quote(part) for part in maturin_cmd)
         )
+        environment_args = docker_cargo_env_args()
+        if target == "i686-pc-windows-msvc":
+            environment_args.extend(["-e", "XWIN_ARCH=x86"])
         run(
             [
                 "docker",
                 "run",
                 "--rm",
-                *docker_cargo_env_args(),
+                *environment_args,
                 "-v",
                 f"{REPO_ROOT}:/io",
                 image,
@@ -524,9 +538,8 @@ def twine_upload(
     print(redact_output(result.stdout, env), end="")
     if result.returncode == 0:
         return
-    if skip_existing and is_already_published_output(result.stdout):
-        print("\nPyPI artifacts already exist; continuing.")
-        return
+    # Twine's --skip-existing handles supported registry duplicate responses and
+    # exits successfully. Any remaining nonzero status is a genuine failure.
     raise subprocess.CalledProcessError(result.returncode, safe_command(cmd, env), output=redact_output(result.stdout, env))
 
 
@@ -554,23 +567,28 @@ def cargo_search(crate_name: str) -> bool:
 
 
 def crate_version_exists(crate_name: str, version: str) -> bool:
-    try:
-        out = cargo_search_output(crate_name)
-    except subprocess.CalledProcessError:
-        return False
+    # An unavailable registry is not evidence that a version is absent.
+    out = cargo_search_output(crate_name)
     pattern = re.compile(rf"^{re.escape(crate_name)}\s*=\s*\"{re.escape(version)}\"")
     return any(pattern.match(line) for line in out.splitlines())
 
 
-def is_already_published_output(output: str) -> bool:
-    lowered = output.lower()
-    return (
-        "already uploaded" in lowered
-        or "already exists" in lowered
-        or "crate version" in lowered and "is already uploaded" in lowered
-        or "file already exists" in lowered
-        or "400 bad request" in lowered and "already" in lowered
+def is_crate_already_published_output(output: str, version: str) -> bool:
+    # Cargo can log earlier warnings before an unrelated fatal error. Accept
+    # only a terminal registry duplicate diagnostic for this exact version.
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return False
+    quoted_version = rf"(?:`{re.escape(version)}`|'{re.escape(version)}'|\"{re.escape(version)}\"|{re.escape(version)})"
+    registry_response = (
+        r"(?:(?:the remote server|the registry) responded with an error "
+        r"\(status (?:400 Bad Request|409 Conflict)\):\s*)?"
     )
+    diagnostic = (
+        rf"(?:error:\s*)?{registry_response}crate version\s+{quoted_version}"
+        r"\s+is already uploaded\.?"
+    )
+    return re.fullmatch(diagnostic, lines[-1], re.IGNORECASE) is not None
 
 
 def wait_for_index(crate_name: str, version: str, timeout_s: int, interval_s: int) -> bool:
@@ -723,7 +741,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-package",
         action="store_true",
-        help="Skip cargo package checks before publish/dry-run.",
+        help="Skip separate cargo package checks; publish/dry-run still verifies the crate.",
     )
     parser.add_argument(
         "--allow-dirty",
@@ -830,8 +848,10 @@ def main() -> int:
         run(test_cmd)
 
     if not args.skip_crates:
+        macro_package_verified = False
         if not args.skip_package:
             cargo_package(MACROS_MANIFEST, allow_dirty=args.allow_dirty)
+            macro_package_verified = True
 
         macro_publish_status = cargo_publish(
             MACROS_MANIFEST,
@@ -840,6 +860,7 @@ def main() -> int:
             token=token,
             ignore_errors=args.ignore_publish_errors,
             timeout_s=args.publish_timeout,
+            package_verified=macro_package_verified,
         )
 
         if args.publish and macro_publish_status == PUBLISH_PUBLISHED:
@@ -881,8 +902,10 @@ def main() -> int:
                 )
 
         if args.publish or crate_version_exists(macro_name, macro_version):
+            main_package_verified = False
             if not args.skip_package:
                 cargo_package(MAIN_MANIFEST, allow_dirty=args.allow_dirty)
+                main_package_verified = True
 
             main_publish_status = cargo_publish(
                 MAIN_MANIFEST,
@@ -891,6 +914,7 @@ def main() -> int:
                 token=token,
                 ignore_errors=args.ignore_publish_errors,
                 timeout_s=args.publish_timeout,
+                package_verified=main_package_verified,
             )
 
             if args.publish:
