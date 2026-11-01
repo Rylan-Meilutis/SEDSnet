@@ -6874,6 +6874,16 @@ impl Router {
         let publisher_hash = {
             let state = self.state.lock();
             guard.check_locked(&state)?;
+            let dst = state
+                .reliable_return_routes
+                .get(&packet_id)
+                .expect("checked lease")
+                .side;
+            // Receive-only observers accept local state without originating a
+            // receipt. A real mid-RX revocation still fails the lease check.
+            if !Self::side_ref(&state, dst)?.opts.egress_enabled {
+                return Ok(());
+            }
             Self::sender_hash(&Self::canonical_sender_locked(&state, original_sender))
         };
         let data = self.build_end_to_end_ack_data(packet_id, publisher_hash)?;
@@ -6889,7 +6899,7 @@ impl Router {
             .expect("checked lease")
             .side;
         if !Self::side_ref(&state, dst)?.opts.egress_enabled {
-            return Err(TelemetryError::Io("side changed during rx"));
+            return Ok(());
         }
         state.push_transmit(TxQueued {
             disposable: TX_DISPOSABLE,
@@ -14939,7 +14949,16 @@ impl Router {
         #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
+        let changed = st
+            .sides
+            .get(side)
+            .and_then(|side| side.as_ref())
+            .ok_or(TelemetryError::BadArg)?
+            .opts
+            .egress_enabled
+            != enabled;
         if !enabled
+            && changed
             && st.reliable_return_routes.values().any(|route| {
                 route.side == side && route.local_admission_token != 0 && route.admission_committing
             })
@@ -14952,15 +14971,17 @@ impl Router {
             .get_mut(side)
             .and_then(|side| side.as_mut())
             .ok_or(TelemetryError::BadArg)?;
-        #[cfg(feature = "latest-value-egress")]
-        let changed = side_ref.opts.egress_enabled != enabled;
         side_ref.opts.egress_enabled = enabled;
         if !enabled {
             #[cfg(feature = "discovery")]
             st.cancel_managed_refresh_side(side);
-            for route in st.reliable_return_routes.values_mut() {
-                if route.side == side && route.local_admission_token != 0 {
-                    route.admission_cancelled = true;
+            // Reasserting an unchanged receive-only policy is not a side
+            // lifecycle event. Preserve revocation for an actual transition.
+            if changed {
+                for route in st.reliable_return_routes.values_mut() {
+                    if route.side == side && route.local_admission_token != 0 {
+                        route.admission_cancelled = true;
+                    }
                 }
             }
         }

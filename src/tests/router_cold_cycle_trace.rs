@@ -2099,3 +2099,311 @@ fn cycle_commit_reservation_releases_after_ack_budget_refusal() {
     node.set_side_egress_enabled(side, false).unwrap();
     node.remove_side(side).unwrap();
 }
+
+fn observer_pre_disabled_rx(packed: bool) {
+    let ep = sedsnet::config::register_endpoint("GENERIC_SILENT_OBSERVER_EP", false).unwrap();
+    let ty = sedsnet::config::register_data_type_with_description(
+        "GENERIC_SILENT_OBSERVER_VALUE",
+        "",
+        MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+        &[ep],
+        ReliableMode::Ordered,
+        16,
+    )
+    .unwrap();
+    let node = Router::new_with_clock(
+        RouterConfig::default().with_sender("silent-observer"),
+        Box::new(|| 99),
+    );
+    node.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+        .unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let counter = calls.clone();
+    node.on_network_variable_update(ty, move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
+    .unwrap();
+    let sent: Wire = Arc::default();
+    let output = sent.clone();
+    let side = node.add_side_packed("parent", move |bytes| {
+        output.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    });
+    node.set_side_egress_enabled(side, false).unwrap();
+    let packet =
+        sedsnet::packet::Packet::new(ty, &[ep], "observer-writer", 99, Arc::<[u8]>::from([7]))
+            .unwrap()
+            .with_nonce(101);
+    let id = packet.packet_id();
+    let wire = sedsnet::wire_format::pack_packet(&packet);
+    for attempt in 0..2 {
+        let result = if packed {
+            node.rx_packed_from_side(wire.as_ref(), side)
+        } else {
+            node.rx_from_side(&packet, side)
+        };
+        eprintln!(
+            "OBSERVER_PRE_DISABLED packed={packed} attempt={attempt} result={result:?} calls={}",
+            calls.load(Ordering::Relaxed)
+        );
+        assert!(
+            result.is_ok(),
+            "preconfigured receive-only policy is not RX cancellation"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(node.cached_managed_variable(ty).unwrap().packet_id(), id);
+        node.process_all_queues_with_timeout(0).unwrap();
+        let state = node.state.lock();
+        assert!(state.transmit_queue.is_empty());
+        assert!(
+            state.end_to_end_reliable_tx.is_empty(),
+            "observer must not republish"
+        );
+        let route = state.reliable_return_routes.get(&id).unwrap();
+        assert!(
+            !route.delivery_completed,
+            "silent observation is not aggregate receipt completion"
+        );
+        assert_eq!(route.local_admission_token, 0);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "observer must not transmit ACK or payload"
+        );
+    }
+}
+#[test]
+fn observer_pre_disabled_packet_accepts_once_without_receipt() {
+    observer_pre_disabled_rx(false);
+}
+#[test]
+fn observer_pre_disabled_packed_accepts_once_without_receipt() {
+    observer_pre_disabled_rx(true);
+}
+
+#[test]
+fn observer_pre_disabled_frozen_publisher_keeps_owed_owner() {
+    let mut f = cycle_fixture(&[(0, 1)]);
+    let side = f
+        .links
+        .iter()
+        .find(|l| l.from == 1 && l.to == 0)
+        .unwrap()
+        .side;
+    f.routers[1].set_side_egress_enabled(side, false).unwrap();
+    for link in &f.links {
+        link.wire.lock().unwrap().clear();
+    }
+    f.publish(102, 7);
+    let id = owner_id(&f);
+    f.pump(100, 400);
+    assert_eq!(f.errors, 0);
+    assert_eq!(f.callbacks.load(Ordering::Relaxed), 1);
+    assert!(f.routers[1].cached_managed_variable(f.ty).is_some());
+    let state = f.routers[0].state.lock();
+    let owner = state
+        .end_to_end_reliable_tx
+        .get(&id)
+        .expect("no receipt: publisher still owes observer");
+    assert_eq!(owner.pending_destinations.len(), 1);
+    drop(state);
+    assert_eq!(ack_count(&f, 1, id), 0);
+    assert!(!f.frames.iter().any(|(from, _, bytes)| *from == 1
+        && sedsnet::wire_format::unpack_packet(bytes).is_ok_and(|p| p.data_type()
+            == DataType::ReliableAck
+            && p.payload() == id.to_le_bytes())));
+    let route = f.routers[1].state.lock();
+    assert!(
+        !route
+            .reliable_return_routes
+            .get(&id)
+            .unwrap()
+            .delivery_completed
+    );
+}
+
+fn observer_held_egress_policy(action: u8) {
+    let ep = sedsnet::config::register_endpoint("GENERIC_OBSERVER_HELD_EP", false).unwrap();
+    let ty = sedsnet::config::register_data_type_with_description(
+        "GENERIC_OBSERVER_HELD_VALUE",
+        "",
+        MessageElement::Static(1, MessageDataType::UInt8, MessageClass::Data),
+        &[ep],
+        ReliableMode::Ordered,
+        16,
+    )
+    .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let calls = Arc::new(AtomicU64::new(0));
+    let count = calls.clone();
+    let node = Arc::new(Router::new_with_clock(
+        RouterConfig::new([super::EndpointHandler::new_packet_handler(ep, move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(())
+        })])
+        .with_sender("held-observer"),
+        Box::new(|| 99),
+    ));
+    let sent: Wire = Arc::default();
+    let output = sent.clone();
+    let side = node.add_side_packed("parent", move |bytes| {
+        output.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    });
+    if action != 1 {
+        node.set_side_egress_enabled(side, false).unwrap();
+    }
+    let packet =
+        sedsnet::packet::Packet::new(ty, &[ep], "observer-writer", 99, Arc::<[u8]>::from([7]))
+            .unwrap()
+            .with_nonce(103);
+    let id = packet.packet_id();
+    let data = node
+        .attach_wire_contract_to_item(
+            super::RouterItem::Packet(packet),
+            &[Router::sender_hash(node.sender().as_ref())],
+        )
+        .unwrap();
+    let wire = match data {
+        super::RouterItem::Packed(b) => b.to_vec(),
+        super::RouterItem::Packet(p) => sedsnet::wire_format::pack_packet(&p).to_vec(),
+    };
+    let worker = node.clone();
+    let join = std::thread::spawn(move || worker.rx_packed_from_side(&wire, side));
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    match action {
+        0 => {
+            node.set_side_egress_enabled(side, false).unwrap();
+            node.set_side_egress_enabled(side, false).unwrap();
+        }
+        1 => {
+            node.set_side_egress_enabled(side, false).unwrap();
+            node.set_side_egress_enabled(side, false).unwrap();
+            assert!(
+                node.state
+                    .lock()
+                    .reliable_return_routes
+                    .get(&id)
+                    .unwrap()
+                    .admission_cancelled
+            );
+        }
+        2 => node.set_side_egress_enabled(side, true).unwrap(),
+        _ => unreachable!(),
+    }
+    release_tx.send(()).unwrap();
+    let result = join.join().unwrap();
+    if action == 1 {
+        assert!(result.is_err());
+        node.set_side_egress_enabled(side, true).unwrap();
+    } else {
+        assert!(
+            result.is_ok(),
+            "unchanged false is not revocation; enable authorizes current egress: {result:?}"
+        );
+    }
+    // Draining after re-enable catches deferred stale receipts too.
+    node.dispatch_tx_queue_with_timeout(0).unwrap();
+    node.process_rx_queue().unwrap();
+    node.dispatch_tx_queue_with_timeout(0).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let receipts = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| {
+            sedsnet::wire_format::unpack_packet(b).is_ok_and(|p| {
+                p.data_type() == DataType::ReliableAck && p.payload() == id.to_le_bytes()
+            })
+        })
+        .count();
+    assert_eq!(receipts, usize::from(action == 2));
+    let state = node.state.lock();
+    if action == 1 {
+        assert!(!state.reliable_return_routes.contains_key(&id));
+    } else {
+        assert_eq!(
+            state
+                .reliable_return_routes
+                .get(&id)
+                .unwrap()
+                .delivery_completed,
+            action == 2
+        );
+    }
+    assert!(state.transmit_queue.is_empty());
+}
+#[test]
+fn observer_repeated_false_during_callback_is_not_cancellation() {
+    observer_held_egress_policy(0);
+}
+#[test]
+fn observer_true_to_false_still_cancels_and_never_acks_after_drain() {
+    observer_held_egress_policy(1);
+}
+#[test]
+fn observer_false_to_true_during_callback_can_emit_legitimate_receipt() {
+    observer_held_egress_policy(2);
+}
+#[test]
+fn observer_repeated_false_is_not_busy_for_unchanged_commit_policy() {
+    let node = Router::new_with_clock(
+        RouterConfig::default().with_sender("observer-commit"),
+        Box::new(|| 99),
+    );
+    let side = node.add_side_packed("parent", |_| Ok(()));
+    node.set_side_egress_enabled(side, false).unwrap();
+    let guard = node
+        .begin_reliable_local_admission(side, 104)
+        .unwrap()
+        .unwrap();
+    guard.begin_commit(true).unwrap();
+    assert!(node.set_side_egress_enabled(side, false).is_ok());
+    guard.check().unwrap();
+    assert!(
+        !node
+            .state
+            .lock()
+            .reliable_return_routes
+            .get(&104)
+            .unwrap()
+            .delivery_completed
+    );
+}
+
+#[test]
+fn observer_egress_badarg_invalid_side_preserves_public_error() {
+    let node = Router::new_with_clock(
+        RouterConfig::default().with_sender("invalid-side-control"),
+        Box::new(|| 99),
+    );
+    for enabled in [false, true] {
+        let result = node.set_side_egress_enabled(usize::MAX, enabled);
+        assert!(
+            matches!(&result, Err(sedsnet::TelemetryError::BadArg)),
+            "invalid side enabled={enabled} result={result:?}"
+        );
+    }
+}
+#[test]
+fn observer_egress_badarg_removed_side_preserves_public_error() {
+    let node = Router::new_with_clock(
+        RouterConfig::default().with_sender("removed-side-control"),
+        Box::new(|| 99),
+    );
+    let side = node.add_side_packed("removed", |_| Ok(()));
+    node.remove_side(side).unwrap();
+    for enabled in [false, true] {
+        let result = node.set_side_egress_enabled(side, enabled);
+        assert!(
+            matches!(&result, Err(sedsnet::TelemetryError::BadArg)),
+            "removed side enabled={enabled} result={result:?}"
+        );
+    }
+}
