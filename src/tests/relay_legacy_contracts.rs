@@ -1,6 +1,8 @@
 //! Existing Relay contracts, exercised against the shared routing engine.
 use super::*;
-use crate::relay::{Relay, RelayConfig, RelaySideId, RelaySideOptions};
+#[cfg(feature = "discovery")]
+use crate::relay::RelayConfig;
+use crate::relay::{Relay, RelaySideId, RelaySideOptions};
 
 #[cfg(all(test, feature = "std"))]
 #[path = "independent_side_tx_relay.rs"]
@@ -1089,6 +1091,7 @@ impl RouterInner {
     }
 }
 impl Relay {
+    #[cfg(feature = "discovery")]
     fn learn_discovery_item(&self, side: usize, data: &RouterItem) -> TelemetryResult<()> {
         match data {
             RouterItem::Packet(packet) => {
@@ -1112,6 +1115,7 @@ fn queued_data(queued: &TxQueued) -> &RouterItem {
         _ => panic!("expected original publication, found replay marker"),
     }
 }
+#[cfg(feature = "discovery")]
 fn queued_destination(queued: &TxQueued) -> usize {
     match &queued.item {
         RouterTxItem::ToSide { dst, .. } => *dst,
@@ -1120,6 +1124,7 @@ fn queued_destination(queued: &TxQueued) -> usize {
 }
 /// Keep the baseline ACK outstanding: dispatch actual queued originals but do
 /// not generate retries or consume shared replay markers in this cadence test.
+#[cfg(feature = "discovery")]
 fn drain_originals_without_reliable_timeouts(relay: &Relay) -> TelemetryResult<()> {
     loop {
         let queued = {

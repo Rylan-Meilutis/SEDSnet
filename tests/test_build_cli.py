@@ -128,6 +128,58 @@ class BuildCliTests(unittest.TestCase):
         self.assertIn("--profile",command)
         self.assertIn("release-embedded",command)
 
+    def test_cmake_staticlib_selector_is_opt_in_and_validated(self):
+        import subprocess, tempfile
+        for value in [None, "staticlib", "cdylib"]:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                command = ["cmake", "-S", str(Path(__file__).parents[1]), "-B", directory]
+                if value is not None:
+                    command.append("-DSEDSNET_CRATE_TYPE=" + value)
+                result = subprocess.run(command, text=True, capture_output=True)
+                output = result.stdout + result.stderr
+                if value == "cdylib":
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("SEDSNET_CRATE_TYPE must be empty or staticlib", output)
+                else:
+                    self.assertEqual(result.returncode, 0, output)
+                    args_line = next(line for line in output.splitlines() if "sedsnet build args:" in line)
+                    if value is None:
+                        self.assertNotIn("--crate-type", args_line)
+                    else:
+                        self.assertIn("--crate-type staticlib", args_line)
+
+    def test_staticlib_output_is_explicit_and_defaults_are_unchanged(self):
+        for shared, expected in [(False, "rlib,staticlib"), (True, "rlib,staticlib,cdylib")]:
+            command = build.cargo_lib_build_cmd(build_mode=[], build_args=[], build_shared=shared)
+            self.assertEqual(command[command.index("--crate-type") + 1], expected)
+            selected = build.cargo_lib_build_cmd(build_mode=[], build_args=[], build_shared=shared,
+                                                crate_type="staticlib")
+            self.assertEqual(selected[selected.index("--crate-type") + 1], "staticlib")
+            self.assertNotIn("-Clto=fat", selected)
+        self.assertIsNone(build.parse_args(["build"]).crate_type)
+        for arguments in [["check", "--crate-type", "staticlib"],
+                          ["test", "--crate-type", "staticlib"],
+                          ["maturin-build", "--crate-type", "staticlib"],
+                          ["build", "--features", "python", "--crate-type", "staticlib"],
+                          ["build", "--crate-type", "cdylib"]]:
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                build.parse_args(arguments)
+
+    def test_staticlib_selector_reaches_host_and_embedded_cargo_invocations(self):
+        for features in [[], ["--features", "embedded", "--target", "thumbv7em-none-eabihf"]]:
+            with self.subTest(features=features), \
+                 mock.patch.object(build, "ensure_rust_target_installed"), \
+                 mock.patch.object(build, "has_embedded_c_toolchain", return_value=True), \
+                 mock.patch.object(build, "collect_artifact_sizes", return_value={}), \
+                 mock.patch.object(build, "print_artifact_sizes"), \
+                 mock.patch.object(build, "run_cmd") as run, contextlib.redirect_stdout(io.StringIO()):
+                build.main(["build", "--release", "--crate-type", "staticlib", *features])
+            command = run.call_args.args[0]
+            self.assertEqual(command[:3], ["cargo", "rustc", "--lib"])
+            self.assertEqual(command[command.index("--crate-type") + 1], "staticlib")
+            if features:
+                self.assertEqual(command[command.index("--profile") + 1], "release-embedded")
+
     def test_default_build(self):
         self.assertEqual(build.parse_args([]).command, "build")
         self.assertTrue(build.parse_args(["--release"]).release)

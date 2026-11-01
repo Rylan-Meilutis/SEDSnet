@@ -482,7 +482,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std", feature = "discovery"))]
     pub(crate) fn priority_fair_cursor(&self) -> u8 {
         self.fair_priority_cursor
     }

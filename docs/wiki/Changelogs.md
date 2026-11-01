@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## Version 4.3.6 highlights
+
+- Invalidate rejected cached network-variable observations without changing
+  permissions, callbacks or service advertisements, with Rust, C and Python APIs.
+- Select static-library-only output for C clients through build.py or CMake,
+  retaining the default artifact set and the selected profile's LTO policy.
+- Keep wire format, application identities and packet layouts compatible with 4.3.5.
+
 ## Version 4.3.5 highlights
 
 - Scope automatic missing-catalog requests to bounded network-address sets while

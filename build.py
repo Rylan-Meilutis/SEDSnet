@@ -45,6 +45,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--release", action="store_true", help="Use the release profile (release-embedded on embedded targets).")
     parser.add_argument("--features", action="append", default=[], metavar="FEATURES", help="Comma/space-separated features; repeatable: " + ", ".join(FEATURE_OPTIONS))
     parser.add_argument("--target", default="", help="Rust target triple (host by default).")
+    parser.add_argument("--crate-type", choices=("staticlib",), help="With build, emit only the C static library; default also emits rlib and host cdylib.")
     parser.add_argument("--device-id", default="", help="Compile-time DEVICE_IDENTIFIER.")
     parser.add_argument("--full", action="store_true", help="Include ignored long-duration tests with test.")
     parser.add_argument("--all", action="store_true", help="With test, run the feature-OFF normal and feature-ON compact/fair qualification matrix; not Cargo --all-features. Common --features apply to both profiles.")
@@ -58,6 +59,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     unknown = set(args.features) - set(FEATURE_OPTIONS)
     if unknown: parser.error("unsupported features: " + ", ".join(sorted(unknown)))
     if "embedded" in args.features and "python" in args.features: parser.error("build embedded and python targets separately")
+    if args.crate_type and (args.command != "build" or "python" in args.features):
+        parser.error("--crate-type requires a non-Python build command")
     if args.full and args.command != "test": parser.error("--full requires test")
     if args.all and args.command != "test": parser.error("--all requires test")
     args.env_overrides = {}
@@ -336,10 +339,11 @@ def cargo_lib_build_cmd(
         build_mode: list[str],
         build_args: list[str],
         build_shared: bool,
+        crate_type: str | None = None,
 ) -> list[str]:
     cmd = ["cargo", "rustc", "--lib", *build_mode, *build_args]
-    crate_types = ["rlib", "staticlib"]
-    if build_shared:
+    crate_types = [crate_type] if crate_type else ["rlib", "staticlib"]
+    if build_shared and crate_type is None:
         crate_types.append("cdylib")
     cmd.extend(["--crate-type", ",".join(crate_types)])
     return cmd
@@ -1239,7 +1243,7 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
         before_sizes = collect_artifact_sizes(repo_root, target=target, profile=profile_name, env=env)
 
         run_cmd(
-            cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=False),
+            cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=False, crate_type=args.crate_type),
             env=env,
             repo_root=repo_root,
             title="cargo build (embedded)",
@@ -1300,7 +1304,7 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
         build_args.extend(["--features", ",".join(feature_parts)])
 
     run_cmd(
-        cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=build_shared),
+        cargo_lib_build_cmd(build_mode=build_mode, build_args=build_args, build_shared=build_shared, crate_type=args.crate_type),
         env=env,
         repo_root=repo_root,
         title="cargo build",

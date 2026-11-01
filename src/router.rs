@@ -12172,7 +12172,7 @@ impl Router {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std", feature = "discovery"))]
     fn call_side_tx_handler(
         &self,
         side: RouterSideId,
@@ -12191,7 +12191,7 @@ impl Router {
             && packet.data_size() > max_frame_bytes
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std", feature = "discovery"))]
     fn call_side_tx_handler_with_progress(
         &self,
         side: RouterSideId,
@@ -14624,6 +14624,39 @@ impl Router {
         if was_advertised {
             Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         }
+    }
+
+    /// Forget the cached observation of one network variable.
+    ///
+    /// This retains its permissions, update callbacks and service advertisement.
+    /// It neither publishes a replacement value nor disables the variable. A
+    /// callback that rejects an inbound value may use this before returning an
+    /// error so that the same value can be considered again on a later update.
+    /// Returns whether a cached packet was removed. Routers without local
+    /// services return `false` without creating local state.
+    pub fn invalidate_network_variable_cache(&self, ty: DataType) -> bool {
+        self.state
+            .lock()
+            .local_services
+            .as_mut()
+            .is_some_and(|local| local.managed_variable_latest.remove(&ty.as_u32()).is_some())
+    }
+
+    /// Forget all cached network-variable observations, retaining registrations.
+    ///
+    /// All cached types are affected, including types unrelated to the caller's
+    /// current operation. Permissions, callbacks and advertised variable types
+    /// are unchanged. No replacement values or refresh requests are sent.
+    /// Returns the number of cached packets removed. Routers without local
+    /// services return zero without allocating local state.
+    pub fn clear_network_variable_caches(&self) -> usize {
+        let mut state = self.state.lock();
+        let Some(local) = state.local_services.as_mut() else {
+            return 0;
+        };
+        let count = local.managed_variable_latest.len();
+        local.managed_variable_latest.clear();
+        count
     }
 
     pub fn seed_managed_variable(&self, pkt: Packet) -> TelemetryResult<()> {

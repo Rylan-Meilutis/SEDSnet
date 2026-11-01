@@ -196,6 +196,14 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.6 highlights
+
+- Invalidate rejected cached network-variable observations without changing
+  permissions, callbacks or service advertisements, with Rust, C and Python APIs.
+- Select static-library-only output for C clients through build.py or CMake,
+  retaining the default artifact set and the selected profile's LTO policy.
+- Keep wire format, application identities and packet layouts compatible with 4.3.5.
+
 ### Version 4.3.5 highlights
 
 - Request missing peer catalogs with bounded network-address scopes, preserving
@@ -601,8 +609,17 @@ Full release history: [CHANGELOG.md](./CHANGELOG.md).
 
 To build the library in a C project, just include the library as a submodule or subtree and link it in your
 cmakelists.txt as shown below.
-For other build systems, `build.py build` can produce the Rust `rlib` and static library, plus a host
-`cdylib` when Python bindings are enabled. Link the artifact appropriate for your project.
+For other build systems, `build.py build` produces the Rust `rlib` and static library, plus a host
+`cdylib` for a normal native build. Link the artifact appropriate for your project.
+
+C-only clients can select `build.py build --crate-type staticlib`, including with `--features embedded`.
+This emits only the static library and lets Cargo apply the selected profile's LTO without combining
+Rust and C library outputs. It does not force an LTO setting or change the default output set. Use a
+separate output directory when comparing configurations so an older `rlib` or shared library is not
+mistaken for a newly emitted artifact. The selector is rejected for Python, check, test and wheel
+commands; Python packaging retains its existing build path. CMake consumers can opt in with
+`-DSEDSNET_CRATE_TYPE=staticlib`; its empty default preserves the normal output set. Other values
+are rejected during configuration.
 
 Building with python bindings can be done with the build script on posix systems:
 
@@ -647,6 +664,7 @@ Options:
   maturin-develop         Run maturin develop.
   maturin-install         Build wheel and install it with uv pip install.
   --target <triple>         Set Rust compilation target (e.g. --target thumbv7em-none-eabihf).
+  --crate-type staticlib   Emit only the C static library (build only; excludes Python).
   --device-id <id>          Set the packaged DEVICE_IDENTIFIER default for the build.
   --static-schema-path <path>      Set SEDSNET_STATIC_SCHEMA_PATH for runtime registry seeding.
   --static-ipc-schema-path <path>  Set SEDSNET_STATIC_IPC_SCHEMA_PATH for a runtime IPC/link-local seed.
@@ -663,6 +681,8 @@ Examples:
 ./build.py check
 ./build.py check --release
 ./build.py build --release --target thumbv7em-none-eabihf --device-id=FC --features embedded
+# C-only embedded client: allow the release profile to use static-library LTO
+./build.py build --release --target thumbv7em-none-eabihf --features embedded --crate-type staticlib
 ./build.py build --features python
 ./build.py test --release
 ./build.py maturin-install --max-recent-rx-ids=256 --env MAX_STACK_PAYLOAD=128
@@ -1060,6 +1080,21 @@ Updates from one writer use its sender-local timestamp to reject older packets. 
 writer, including an authoritative value replacing a restored local seed, remain valid; nonce and
 packet ID are deduplication identities, not revisions. Register `on_network_variable_update(...)` when code needs
 a callback whenever an inbound network update changes a variable cache.
+
+A callback that rejects an inbound observation because application validation or persistence failed
+can call `invalidate_network_variable_cache(ty)` before returning an error. Inbound observations
+enter the cache before the callback runs, so returning an error alone leaves the rejected value
+cached and may suppress a later retry of the same observation. Selective invalidation removes only
+that type's cached packet; it keeps read/write permissions, callbacks, and service advertisements.
+It sends no replacement value or refresh request and does not allocate or enable local services.
+Its boolean result reports whether a cached packet existed.
+
+`clear_network_variable_caches()` returns the number of cached packets removed and has the same
+registration-preserving behavior, but affects **every** cached type, including unrelated variables.
+Use selective invalidation when rejecting one update. These operations also have C ABI and Python
+bindings with the same names (the C functions have the `seds_router_` prefix and optional output
+pointers). C callers receive `SEDS_BAD_ARG` for a null router; Python's network-variable methods are
+available with the `discovery` feature, matching the other Python network-variable methods.
 
 Data types can also choose an E2E payload cryptography policy:
 

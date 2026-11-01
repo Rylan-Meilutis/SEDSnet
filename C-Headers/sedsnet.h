@@ -644,6 +644,31 @@ SedsResult seds_router_on_network_variable_update(
 void seds_router_disable_managed_variable(SedsRouter * r, SedsDataType ty);
 
 /**
+ * @brief Forget one cached observation without changing variable registration.
+ *
+ * Permissions, callbacks and service advertisements are retained. No replacement
+ * value or refresh request is sent. out_invalidated is optional and reports
+ * whether a cached packet was removed. Routers without local services are a no-op.
+ * A null router returns SEDS_BAD_ARG and leaves the output untouched.
+ */
+SedsResult seds_router_invalidate_network_variable_cache(
+    SedsRouter * r,
+    SedsDataType ty,
+    bool * out_invalidated
+);
+
+/**
+ * @brief Forget every cached network-variable observation, retaining registration.
+ *
+ * This affects all cached types, including unrelated variables. Permissions,
+ * callbacks and service advertisements are retained. No replacement values or
+ * refresh requests are sent. out_count is optional. Routers without local
+ * services return zero removed observations without creating local services.
+ * A null router returns SEDS_BAD_ARG and leaves the output untouched.
+ */
+SedsResult seds_router_clear_network_variable_caches(SedsRouter * r, size_t * out_count);
+
+/**
  * @brief Ask the network to replay the latest cached value for a managed variable data type.
  *
  * Responders send the original value packet, so normal endpoint handlers are invoked exactly as if

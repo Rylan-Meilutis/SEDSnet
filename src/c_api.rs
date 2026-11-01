@@ -11,6 +11,10 @@
 //! Router sides are registered explicitly (like the Relay), and RX can specify
 //! an ingress side for relay-style behavior.
 
+#[cfg(all(test, feature = "std"))]
+#[path = "tests/c_api_cache_invalidation.rs"]
+mod cache_invalidation_tests;
+
 use crate::binding_options::{relay_side_options_for_profile, router_side_options_for_profile};
 #[cfg(feature = "discovery")]
 use crate::config::known_endpoints;
@@ -2088,6 +2092,39 @@ pub extern "C" fn seds_router_disable_managed_variable(r: *mut SedsRouter, ty: D
     }
     let router = unsafe { &(*r).inner };
     router.disable_managed_variable(ty);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_invalidate_network_variable_cache(
+    r: *mut SedsRouter,
+    ty: DataType,
+    out_invalidated: *mut bool,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let invalidated = router.invalidate_network_variable_cache(ty);
+    if !out_invalidated.is_null() {
+        unsafe { *out_invalidated = invalidated };
+    }
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_clear_network_variable_caches(
+    r: *mut SedsRouter,
+    out_count: *mut usize,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let count = router.clear_network_variable_caches();
+    if !out_count.is_null() {
+        unsafe { *out_count = count };
+    }
+    status_from_result_code(SedsResult::SedsOk)
 }
 
 #[cfg(feature = "discovery")]

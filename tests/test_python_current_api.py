@@ -79,6 +79,21 @@ class PythonCurrentApiTests(unittest.TestCase):
         self.assertEqual(info["reliable"], 2)
         self.assertNotIn("reliable_mode", info)
 
+    def test_network_variable_cache_invalidation_preserves_registration(self) -> None:
+        router = seds.Router(hostname="py-cache-owner")
+        router.enable_network_variable(self.state_ty, True, True)
+        packet = seds.make_packet(self.state_ty, router.sender_id, [self.radio], 1, bytes([1]))
+        router.set_network_variable(packet)
+        self.assertTrue(router.invalidate_network_variable_cache(self.state_ty))
+        self.assertIsNone(router.cached_network_variable(self.state_ty))
+        self.assertFalse(router.invalidate_network_variable_cache(self.state_ty))
+        # A second set still succeeds: invalidation retains write permission.
+        router.set_network_variable(packet)
+        self.assertEqual(router.clear_network_variable_caches(), 1)
+        self.assertEqual(router.clear_network_variable_caches(), 0)
+        router.set_network_variable(packet)
+        self.assertIsNotNone(router.cached_network_variable(self.state_ty))
+
     def test_runtime_config_memory_and_network_variable_api(self) -> None:
         seds.set_runtime_device_identifier("PY_API_DEFAULT")
         self.assertEqual(seds.runtime_device_identifier(), "PY_API_DEFAULT")
