@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 4.3.6
+
+Wire format, application identities and packet layouts remain compatible with 4.3.5.
+
+- Add an opt-in static-library-only build output for C clients, allowing Cargo
+  to honor the existing release LTO profile while keeping default outputs unchanged.
+- Add selective cached network-variable invalidation without changing registered
+  permissions, callbacks or service advertisements, so rejected observations can
+  be retried without unregistering the variable.
+- Add explicit all-variable cache clearing with the same registration-preserving
+  behavior, available alongside selective invalidation in Rust, C and Python.
+
 ## 4.3.5
 
 Wire format and application identities remain compatible with 4.3.4.

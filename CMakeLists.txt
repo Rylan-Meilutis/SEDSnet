@@ -13,6 +13,14 @@ get_filename_component(RUST_DIR "${SEDSNET_DIR}" REALPATH)
 # Config overrides forwarded into the Rust build (via build.py)
 # ============================================================
 
+# Optional C-only output; leave empty to preserve the normal artifact set.
+set(SEDSNET_CRATE_TYPE "" CACHE STRING
+    "Rust library output selector (empty = normal outputs; staticlib = C archive only)")
+set_property(CACHE SEDSNET_CRATE_TYPE PROPERTY STRINGS "" "staticlib")
+if (NOT SEDSNET_CRATE_TYPE STREQUAL "" AND NOT SEDSNET_CRATE_TYPE STREQUAL "staticlib")
+    message(FATAL_ERROR "SEDSNET_CRATE_TYPE must be empty or staticlib")
+endif ()
+
 # Device identifier override for Rust (passed to build.py)
 set(SEDSNET_DEVICE_IDENTIFIER "" CACHE STRING
     "Override DEVICE_IDENTIFIER passed to build.py (empty = use default)")
@@ -151,6 +159,9 @@ endif ()
 # Configure-time args passed to build.py (list form)
 # ============================================================
 set(RS_ARGS_BOOTSTRAP "build")
+if (NOT SEDSNET_CRATE_TYPE STREQUAL "")
+    list(APPEND RS_ARGS_BOOTSTRAP "--crate-type" "${SEDSNET_CRATE_TYPE}")
+endif ()
 
 if (SEDSNET_EMBEDDED_BUILD)
     list(APPEND RS_ARGS_BOOTSTRAP "--features" "embedded")

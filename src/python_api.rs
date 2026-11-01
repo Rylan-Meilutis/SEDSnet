@@ -2081,6 +2081,24 @@ impl PyRouter {
             .map_err(py_err_from)
     }
 
+    /// Forget one cached observation without changing its registration.
+    ///
+    /// Returns whether a cached value was removed. No refresh request is sent.
+    #[cfg(feature = "discovery")]
+    fn invalidate_network_variable_cache(&self, ty: u32) -> PyResult<bool> {
+        Ok(self.inner.invalidate_network_variable_cache(
+            DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
+        ))
+    }
+
+    /// Forget every cached observation, including unrelated variable types.
+    ///
+    /// Permissions, callbacks and advertised services remain registered.
+    #[cfg(feature = "discovery")]
+    fn clear_network_variable_caches(&self) -> usize {
+        self.inner.clear_network_variable_caches()
+    }
+
     #[cfg(feature = "discovery")]
     fn request_managed_variable(&self, ty: u32) -> PyResult<()> {
         let rtr = self.inner.as_ref();

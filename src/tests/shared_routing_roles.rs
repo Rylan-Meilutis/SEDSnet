@@ -7,6 +7,9 @@ fn relay_role_allocates_no_local_services_and_cannot_originate_application_data(
     let node = Router::new_with_clock(RouterConfig::relay(), Box::new(|| 0));
     assert_eq!(node.cfg.role, RoutingRole::Relay);
     assert!(node.state.lock().local_services.is_none());
+    assert!(!node.invalidate_network_variable_cache(DataType::named("GPS_DATA")));
+    assert_eq!(node.clear_network_variable_caches(), 0);
+    assert!(node.state.lock().local_services.is_none());
     assert!(node.isr_rx_queue.is_none());
     assert!(node.cfg.local.is_none());
     #[cfg(feature = "timesync")]
