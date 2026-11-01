@@ -3037,6 +3037,27 @@ impl RouterInner {
             None => false,
         }
     }
+    // Incomplete ingress must share headroom with inline queue admission,
+    // including forwarded work. Otherwise it can fill the shared budget for
+    // its progress timeout while an empty egress queue refuses ordinary work.
+    // Reuse the initial queue allowance without changing memory or priorities.
+    // This does not grant application-origin permission to a forwarding role.
+    fn side_chunk_admission_budget(&self, protected: usize) -> usize {
+        let inline_credit = size_of::<TxQueued>()
+            .saturating_add(crate::config::STACK_PAYLOAD_SIZE)
+            .saturating_add(self.local_address.hostname.len())
+            .saturating_add(size_of::<DataEndpoint>());
+        // Do not reserve most of an already metadata-constrained budget:
+        // an active assembly must retain its existing bounded progress path.
+        let spendable = self.memory.max_queue_budget.saturating_sub(protected);
+        let local_credit = if inline_credit <= spendable / 2 {
+            inline_credit.min(self.memory.starting_queue_size)
+        } else {
+            0
+        };
+        self.memory.max_queue_budget.saturating_sub(local_credit)
+    }
+
     fn make_side_chunk_room(
         &mut self,
         side: RouterSideId,
@@ -3045,10 +3066,9 @@ impl RouterInner {
         total: u16,
         payload_len: usize,
     ) -> TelemetryResult<()> {
-        let budget = self
-            .memory
-            .max_queue_budget
-            .saturating_sub(self.protected_metadata_bytes_used());
+        let protected = self.protected_metadata_bytes_used();
+        let admission_budget = self.side_chunk_admission_budget(protected);
+        let budget = admission_budget.saturating_sub(protected);
         let state = self
             .side_transport
             .get_mut(&side)
@@ -3083,7 +3103,7 @@ impl RouterInner {
         {
             state.take_chunk(oldest, true);
         }
-        while self.shared_queue_bytes_used().saturating_add(cost) > self.memory.max_queue_budget {
+        while self.shared_queue_bytes_used().saturating_add(cost) > admission_budget {
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             if let Some(owner) = self.bulk_loads(199).queue_victim(None)
                 && self.reclaim_bulk_from(owner, 199, None)

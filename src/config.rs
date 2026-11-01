@@ -362,6 +362,16 @@ pub fn runtime_reliable_max_end_to_end_ack_cache() -> usize {
 /// Compile-time environment values remain the defaults for embedded builds, but applications using
 /// prebuilt binaries can now choose per-instance budgets at construction time.
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Memory limits shared by receive, transmit, and incomplete side transfers.
+///
+/// Reassembly leaves a bounded inline enqueue allowance within the existing
+/// `max_queue_budget`, capped by `starting_queue_size`. The allowance applies
+/// when the budget left after protected metadata can fit two full inline queue
+/// items; tighter configurations retain their active-transfer progress path.
+///
+/// This supports bounded inline/one-endpoint queue admission, including transit.
+/// It does not increase allocator capacity, guarantee arbitrary payload/fanout
+/// admission, or grant application-origin permission to forwarding-only roles.
 pub struct RuntimeMemoryConfig {
     pub max_queue_budget: usize,
     pub max_recent_rx_ids: usize,
