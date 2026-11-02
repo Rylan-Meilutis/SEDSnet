@@ -30,6 +30,7 @@ fn relay_role_allocates_no_local_services_and_cannot_originate_application_data(
     let wire = wire_format::pack_packet(&packet);
     for result in [
         node.tx(packet.clone()),
+        node.try_tx_queue(packet.clone()),
         node.tx_queue(packet),
         node.tx_packed(wire.clone()),
         node.tx_packed_queue(wire.clone()),

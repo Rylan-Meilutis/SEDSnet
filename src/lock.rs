@@ -142,6 +142,16 @@ impl<T> RouterMutex<T> {
     pub fn lock(&self) -> std::sync::MutexGuard<'_, T> {
         self.0.lock().expect("RouterMutex poisoned")
     }
+
+    /// Attempt the std mutex without waiting; poisoning remains a fatal error.
+    #[inline]
+    pub(crate) fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, T>> {
+        match self.0.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("RouterMutex poisoned"),
+        }
+    }
 }
 
 // ============================================================================
