@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 4.3.8
+
+Wire format, application identities, schemas and packet layouts remain compatible
+with 4.3.7. The macro crate remains at 2.2.0.
+
+- Add std-only `Router::try_tx_queue` for decoded packets. Attempt admission
+  without waiting for the router-core mutex, preserving role checks, managed
+  priority and shared queue limits. A busy core returns an error without admitting
+  a queue owner; callers retain a packet copy when they need to retry. Validation
+  and allocation still apply, and a poisoned core remains fatal.
+- Reserve bounded inline enqueue headroom inside the existing shared budget
+  while incomplete side transfers are retained. Apply the allowance to local and
+  forwarded work without increasing queue limits, changing priorities or granting
+  application-origin permission to forwarding-only roles.
+
 ## 4.3.7
 
 Wire format, application identities, schemas and packet layouts remain compatible

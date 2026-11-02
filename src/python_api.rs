@@ -1259,7 +1259,8 @@ impl PyRouter {
 
     /// Compare a sender using retained, unambiguous routing identity metadata.
     fn sender_matches_hostname(&self, sender: &str, expected_hostname: &str) -> bool {
-        self.inner.sender_matches_hostname(sender, expected_hostname)
+        self.inner
+            .sender_matches_hostname(sender, expected_hostname)
     }
 
     fn resolve_hostname(&self, py: Python<'_>, hostname: &str) -> PyResult<Option<Py<PyAny>>> {

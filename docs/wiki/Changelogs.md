@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## Version 4.3.8 highlights
+
+- Attempt decoded-packet admission with std-only `Router::try_tx_queue` without
+  waiting for the router-core mutex. A busy core admits no owner; retain a packet
+  copy for retry. Validation, allocation, role checks and queue budgets still apply.
+- Preserve bounded inline enqueue headroom while incomplete side transfers occupy
+  the existing shared budget, including forwarded work, without changing limits
+  or scheduling priorities.
+- Keep wire format, application identities, schemas and packet layouts compatible
+  with 4.3.7; the macro crate remains at 2.2.0.
+
 ## Version 4.3.7 highlights
 
 - Preserve reliable ownership and required downstream receipts across routing

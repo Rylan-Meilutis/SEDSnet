@@ -3037,6 +3037,27 @@ impl RouterInner {
             None => false,
         }
     }
+    // Incomplete ingress must share headroom with inline queue admission,
+    // including forwarded work. Otherwise it can fill the shared budget for
+    // its progress timeout while an empty egress queue refuses ordinary work.
+    // Reuse the initial queue allowance without changing memory or priorities.
+    // This does not grant application-origin permission to a forwarding role.
+    fn side_chunk_admission_budget(&self, protected: usize) -> usize {
+        let inline_credit = size_of::<TxQueued>()
+            .saturating_add(crate::config::STACK_PAYLOAD_SIZE)
+            .saturating_add(self.local_address.hostname.len())
+            .saturating_add(size_of::<DataEndpoint>());
+        // Do not reserve most of an already metadata-constrained budget:
+        // an active assembly must retain its existing bounded progress path.
+        let spendable = self.memory.max_queue_budget.saturating_sub(protected);
+        let local_credit = if inline_credit <= spendable / 2 {
+            inline_credit.min(self.memory.starting_queue_size)
+        } else {
+            0
+        };
+        self.memory.max_queue_budget.saturating_sub(local_credit)
+    }
+
     fn make_side_chunk_room(
         &mut self,
         side: RouterSideId,
@@ -3045,10 +3066,9 @@ impl RouterInner {
         total: u16,
         payload_len: usize,
     ) -> TelemetryResult<()> {
-        let budget = self
-            .memory
-            .max_queue_budget
-            .saturating_sub(self.protected_metadata_bytes_used());
+        let protected = self.protected_metadata_bytes_used();
+        let admission_budget = self.side_chunk_admission_budget(protected);
+        let budget = admission_budget.saturating_sub(protected);
         let state = self
             .side_transport
             .get_mut(&side)
@@ -3083,7 +3103,7 @@ impl RouterInner {
         {
             state.take_chunk(oldest, true);
         }
-        while self.shared_queue_bytes_used().saturating_add(cost) > self.memory.max_queue_budget {
+        while self.shared_queue_bytes_used().saturating_add(cost) > admission_budget {
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             if let Some(owner) = self.bulk_loads(199).queue_victim(None)
                 && self.reclaim_bulk_from(owner, 199, None)
@@ -18492,9 +18512,7 @@ impl Router {
         }
 
         let duplicate = self.is_duplicate_pkt(&item.data)?;
-        if duplicate
-            && let Some(guard) = _local_admission_guard.as_ref()
-        {
+        if duplicate && let Some(guard) = _local_admission_guard.as_ref() {
             guard.begin_commit(true)?;
         }
         #[cfg(feature = "discovery")]
@@ -18503,13 +18521,15 @@ impl Router {
             // not pay another full-frame CRC pass for the managed GET path.
             let ty = match &item.data {
                 RouterItem::Packet(packet) => packet.data_type(),
-                RouterItem::Packed(_) => packed_frame
-                    .as_ref()
-                    .expect("packed frame")
-                    .as_ref()
-                    .map_err(Clone::clone)?
-                    .envelope
-                    .ty,
+                RouterItem::Packed(_) => {
+                    packed_frame
+                        .as_ref()
+                        .expect("packed frame")
+                        .as_ref()
+                        .map_err(Clone::clone)?
+                        .envelope
+                        .ty
+                }
             };
             self.forward_requested_managed_observation(item, duplicate, ty)?;
         }
@@ -19899,6 +19919,39 @@ impl Router {
     pub fn tx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    /// Attempt to queue a decoded packet without waiting for the router-core mutex.
+    ///
+    /// Returns `Io("router core busy")` without admitting the packet to an SDK
+    /// queue when another thread holds that mutex. Validation, allocation and queue-budget
+    /// checks still apply; this is not a general lock-free or real-time API.
+    /// Local handlers and transport callbacks run later on a queue worker.
+    /// A caller that needs to retry must retain its own packet copy.
+    #[cfg(feature = "std")]
+    pub fn try_tx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
+        self.ensure_application_origin_allowed()?;
+        let data = RouterItem::Packet(pkt);
+        let (ty, priority) = Self::item_type_priority(&data)?;
+        let mut state = self
+            .state
+            .try_lock()
+            .ok_or(TelemetryError::Io("router core busy"))?;
+        let priority = if state.is_managed_variable(ty.as_u32()) {
+            crate::transport_priority(DataType::ManagedVariableValue)
+        } else {
+            priority
+        };
+        state.push_transmit(TxQueued {
+            disposable: TX_DISPOSABLE,
+            item: RouterTxItem::Broadcast(data),
+            ignore_local: false,
+            priority,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: 0,
+            deferred_since_ms: 0,
+            retry_after_ms: 0,
+        })
     }
 
     /// Queue packed bytes for later transmission.
@@ -21342,3 +21395,38 @@ mod toside_inspection_metadata;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/active_queued_types.rs"]
 mod active_queued_types;
+
+#[cfg(all(test, feature = "std"))]
+mod try_tx_queue_role_tests {
+    use super::*;
+
+    #[test]
+    fn relay_role_refuses_application_origin_before_core_admission() {
+        let endpoint = crate::config::register_endpoint("TRY_TX_ROLE", false).unwrap();
+        let ty = crate::config::register_data_type(
+            "TRY_TX_ROLE",
+            crate::MessageElement::Static(
+                1,
+                crate::MessageDataType::UInt8,
+                crate::MessageClass::Data,
+            ),
+            &[endpoint],
+            crate::ReliableMode::Unordered,
+            128,
+        )
+        .unwrap();
+        let packet = Packet::new(ty, &[endpoint], "producer", 10, Arc::from([1])).unwrap();
+        let relay = Router::new(RouterConfig::relay());
+        let held = relay.state.lock();
+        assert!(matches!(
+            relay.try_tx_queue(packet.clone()),
+            Err(TelemetryError::PermissionDenied)
+        ));
+        assert!(matches!(
+            relay.tx_queue(packet),
+            Err(TelemetryError::PermissionDenied)
+        ));
+        drop(held);
+        assert!(!relay.has_queued_work());
+    }
+}

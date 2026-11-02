@@ -21,7 +21,9 @@ fn work(ty: DataType, ep: DataEndpoint, unknown: bool) -> TxWork {
         Packet::new_with_nonce(ty, &[ep], "active-test", 1, 11, Arc::from([7u8].as_slice()))
             .unwrap();
     let item = if unknown {
-        RouterItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(&packet)))
+        RouterItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(
+            &packet,
+        )))
     } else {
         RouterItem::Packet(packet)
     };

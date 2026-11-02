@@ -2487,6 +2487,59 @@ fn discovery_topology_counts_against_shared_queue_budget() {
 
 #[test]
 fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
+    // Other unit tests register process-global schemas. Their unrelated catalog
+    // can already exceed this fixture's 24 KiB before its workload starts.
+    // Keep the exact workload/bounds in a fresh process of this feature binary.
+    const CHILD: &str = "SEDSNET_TEST_MULTI_NODE_MEMORY_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let qualified = concat!(
+            module_path!(),
+            "::multi_node_memory_exhaustion_keeps_runtime_pools_bounded"
+        );
+        let name = qualified.split_once("::").unwrap().1;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn isolated memory fixture");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("reap failed memory fixture");
+                    panic!(
+                        "isolated memory fixture timed out or wait failed: {result:?}; {output:?}"
+                    );
+                }
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .expect("collect isolated memory fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated memory fixture failed: {stdout} {stderr}"
+        );
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+            "isolated memory fixture did not execute exactly one test: {stdout} {stderr}"
+        );
+        println!(
+            "ISOLATED_MEMORY_WORKLOAD: exact child passed; six nodes, 180 rounds, 24576-byte bound unchanged"
+        );
+        return;
+    }
     ensure_topology_test_schema();
     let budget = 24 * 1024usize;
     let memory = RuntimeMemoryConfig::new(budget, 16, 512, 1.5).unwrap();

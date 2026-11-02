@@ -1659,7 +1659,8 @@ pub extern "C" fn seds_router_sender_matches_hostname(
         return false;
     }
     let sender = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
-    let hostname = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(expected_hostname), hostname_len) };
+    let hostname =
+        unsafe { slice::from_raw_parts(c_char_ptr_as_u8(expected_hostname), hostname_len) };
     let (Ok(sender), Ok(hostname)) = (from_utf8(sender), from_utf8(hostname)) else {
         return false;
     };
