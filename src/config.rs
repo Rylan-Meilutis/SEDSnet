@@ -1347,6 +1347,32 @@ pub fn owned_schema_byte_cost(snapshot: &OwnedRuntimeSchemaSnapshot) -> usize {
 #[cfg(feature = "std")]
 static REGISTRY: OnceLock<std::sync::Mutex<Registry>> = OnceLock::new();
 
+/// Private prepared-publication validation. Never initializes or waits for
+/// the global registry, and retains its guard through the caller's commit.
+#[cfg(feature = "std")]
+pub(crate) struct PreparedSchemaGuard(std::sync::MutexGuard<'static, Registry>);
+#[cfg(feature = "std")]
+impl PreparedSchemaGuard {
+    pub(crate) fn bytes_used_saturated(&self) -> usize {
+        self.0.endpoints.iter().map(|(_, meta)| endpoint_schema_byte_cost(meta.name.len(), meta.description.len()))
+            .chain(self.0.types.iter().map(|(_, meta)| type_schema_byte_cost(meta.name.len(), meta.description.len(), meta.endpoints.len())))
+            .fold(0usize, usize::saturating_add)
+    }
+
+
+    pub(crate) fn matches(&self, ty: DataType, expected: &MessageMeta) -> bool {
+        self.0.types.iter().find(|(id, _)| *id == ty).is_some_and(|(_, meta)| meta == expected)
+    }
+}
+#[cfg(feature = "std")]
+pub(crate) fn try_prepared_schema_guard() -> Option<PreparedSchemaGuard> {
+    match REGISTRY.get()?.try_lock() {
+        Ok(guard) => Some(PreparedSchemaGuard(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(_)) => panic!("schema registry poisoned"),
+    }
+}
+
 #[cfg(feature = "std")]
 fn registry() -> &'static std::sync::Mutex<Registry> {
     REGISTRY.get_or_init(|| std::sync::Mutex::new(Registry::new()))

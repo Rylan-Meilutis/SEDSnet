@@ -140,6 +140,15 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         }
     }
 
+    #[cfg(all(feature="std", feature="compact-packet-store"))]
+    pub(crate) fn byte_cost_saturated(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len as usize,
+            Self::Heap(a) => a.len().saturating_add(size_of::<Arc<[u8]>>()),
+            #[cfg(feature="compact-packet-store")]
+            Self::Managed(a) => a.len(),
+        }
+    }
     /// Byte cost of the payload (for use in byte-limited queues).
     #[inline]
     fn byte_cost(&self) -> usize {

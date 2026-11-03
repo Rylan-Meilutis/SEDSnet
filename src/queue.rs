@@ -714,6 +714,25 @@ impl<T: ByteCost> BoundedDeque<T> {
         true
     }
 
+    /// Pure, conservative reservation check: no growth, parking or eviction.
+    /// The caller must keep exclusive queue ownership through commit.
+    #[cfg(feature = "std")]
+    pub(crate) fn fits_prepared_batch(&self, costs: &[usize]) -> bool {
+        let Some(len) = self.q.len().checked_add(costs.len()) else { return false; };
+        let Some(bytes) = costs.iter().try_fold(self.cur_bytes, |n, cost| n.checked_add(*cost)) else { return false; };
+        len <= self.max_elems && len <= self.q.capacity() && bytes <= self.max_bytes
+    }
+
+    /// Infallible only after fits_prepared_batch under the same exclusive owner.
+    /// Cached cost/priority were obtained before publication. No trait callbacks
+    /// or allocator growth are introduced at this commit boundary.
+    #[cfg(feature = "std")]
+    pub(crate) fn push_prepared_batch_item<F>(&mut self, value: T, cost: usize, priority: u8, priority_of: F)
+    where F: FnMut(&T) -> u8 {
+        assert!(self.fits_prepared_batch(&[cost]));
+        self.insert_prioritized_prepared(value, cost, priority, priority_of);
+    }
+
     /// Push to back, evicting from front as needed to stay within byte budget.
     ///
     /// Guarantees:

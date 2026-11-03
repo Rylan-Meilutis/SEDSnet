@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+
+## 4.3.9
+
+Wire format, application message identities and C event layouts remain compatible
+with 4.3.8. The macro crate remains at 2.2.0.
+
+- Add std-only caller-owned decoded-packet preparation, atomic queued admission
+  with a pending-reliable-type fence, and nonwaiting conservative inspection.
+  Preserve unadmitted packets on refusal and admit without evicting prior work.
+- Add std-only prepared queued P2P stream operations with checked session revisions
+  and all-or-nothing refresh-SYN/data admission. Keep callbacks on queue workers.
+- Validate incoming stream sender attribution and bound peer tuples. Distinguish
+  topology-only compact routing identities from assigned source addresses so
+  handshake binding preserves multi-hop routing and legitimate early data.
+
+
 ## 4.3.8
 
 Wire format, application identities, schemas and packet layouts remain compatible

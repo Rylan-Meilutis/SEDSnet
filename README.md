@@ -196,6 +196,15 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.9 highlights
+
+- Add std-only caller-owned decoded-packet preparation and atomic queued admission with a pending-reliable-type fence, plus a nonwaiting conservative ownership inspector.
+- Add std-only prepared queued P2P stream operations. A refresh SYN and DATA are admitted together; refusal retains the unadmitted plan and its original bytes/timestamp.
+- Validate stream sender attribution and bound hostname, ports, stream IDs and assigned address. Preserve topology-only routing by distinguishing compact routing identity from assigned-address binding during the handshake.
+- Keep the wire format, C event ABI, application message identities and macro crate 2.2.0 unchanged.
+
+See [queued admission](docs/queued-admission.md) for ownership, scheduling and retry semantics.
+
 ### Version 4.3.8 highlights
 
 - Attempt decoded-packet admission with std-only `Router::try_tx_queue` without

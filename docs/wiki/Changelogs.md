@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## Version 4.3.9 highlights
+
+- Add hosted prepared decoded-packet admission with an atomic pending-reliable-type fence and nonwaiting conservative inspection.
+- Add hosted prepared queued P2P stream operations with all-or-nothing refresh-SYN/data admission and retained unadmitted buffers.
+- Validate stream sender/peer tuples while preserving topology-only address binding and legitimate early data.
+- Keep wire format, C event ABI, application message identities and macro crate 2.2.0 unchanged.
+
 ## Version 4.3.8 highlights
 
 - Attempt decoded-packet admission with std-only `Router::try_tx_queue` without

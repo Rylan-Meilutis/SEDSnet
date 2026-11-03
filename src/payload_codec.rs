@@ -53,6 +53,10 @@ impl Ledger {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+    #[cfg(feature="std")]
+    pub(crate) fn heap_bytes_saturated(&self) -> usize {
+        self.peers.capacity().saturating_mul(core::mem::size_of::<Peer>()).saturating_add(self.names_bytes)
+    }
     pub(crate) fn heap_bytes(&self) -> usize {
         self.peers.capacity() * core::mem::size_of::<Peer>() + self.names_bytes
     }
