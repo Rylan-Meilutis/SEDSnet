@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 fn local(inside: &Arc<AtomicBool>) -> Router {
+    // Nextest starts each test with a fresh process. Establish the ordinary
+    // P2P schema before budget baselines or try-only registry inspection.
+    let _ = crate::message_meta(DataType::P2pMessage);
     let observed = inside.clone();
     let router = Router::new_with_clock(
         RouterConfig::new([])
@@ -978,4 +981,64 @@ fn prepared_p2p_nested_budget_overflow_refuses_open_data_fin_rst_without_any_tra
             .unwrap();
         assert_nested_overflow_preserves_plan(&r, sides, &mut control);
     }
+}
+
+#[test]
+fn prepared_p2p_direct_router_prepares_and_admits_without_fixture_schema_initialization() {
+    // This intentionally bypasses local(). Preparation may initialize schema
+    // metadata; protocol, queues and session ownership must remain inert.
+    let r = Router::new_with_clock(
+        RouterConfig::new([])
+            .with_sender("COLD_DIRECT")
+            .with_static_address(11),
+        Box::new(|| 10000),
+    );
+    r.clear_queues();
+    let protocol = || {
+        let state = r.state.lock();
+        let services = state.local_services.as_ref().unwrap();
+        (
+            state.p2p_revision,
+            services.next_p2p_stream_id,
+            services.p2p_stream_sessions.len(),
+            state.transmit_queue.len(),
+            state.transmit_queue.bytes_used(),
+            state.received_queue.len(),
+            state.received_queue.bytes_used(),
+        )
+    };
+    let before = protocol();
+    let mut plan = r
+        .prepare_p2p_stream_open(P2pTarget::Hostname("COLD_DIRECT"), 90, 91, Some(0))
+        .unwrap();
+    assert_eq!(protocol(), before);
+    assert!(!plan.admitted);
+    let frozen = bytes(&plan);
+    assert_eq!(
+        wire_format::unpack_packet(&frozen[0]).unwrap().timestamp(),
+        0
+    );
+    let receipt = r.try_queue_prepared_p2p(&mut plan).unwrap();
+    assert_eq!(receipt.frames_queued, 1);
+    assert_eq!(receipt.sequence, 0);
+    assert!(plan.admitted);
+    assert!(plan.frames.iter().all(Option::is_none));
+    let owned = protocol();
+    assert_eq!(owned.0, before.0 + 1);
+    assert_eq!(owned.1, receipt.stream_id.wrapping_add(1).max(1));
+    assert_eq!(owned.2, before.2 + 1);
+    assert_eq!(owned.3, before.3);
+    assert_eq!(owned.4, before.4);
+    assert_eq!(owned.5, before.5 + 1);
+    assert!(owned.6 > before.6);
+    {
+        let state = r.state.lock();
+        let session =
+            &state.local_services.as_ref().unwrap().p2p_stream_sessions[&receipt.stream_id];
+        assert_eq!(session.next_sequence, 1);
+        assert_eq!(session.peer_stream_id, 0);
+        assert!(!session.connected);
+    }
+    drop(plan);
+    assert_eq!(protocol(), owned);
 }
