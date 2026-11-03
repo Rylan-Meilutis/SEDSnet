@@ -8,7 +8,14 @@ use std::sync::{
 
 #[test]
 fn stream_data_and_response_cross_gateway_without_leaf_address_advertisement() {
-    use sedsnet::router::P2pStreamEventKind;
+    run_topology_stream_roundtrip(false);
+}
+#[test]
+fn prepared_stream_data_and_response_cross_gateway_without_leaf_address_advertisement() {
+    run_topology_stream_roundtrip(true);
+}
+fn run_topology_stream_roundtrip(prepared: bool) {
+    use sedsnet::router::{P2pStreamEventKind, P2pStreamOperation, P2pTarget};
     use std::{collections::VecDeque, sync::Mutex};
     let gs = Arc::new(Router::new_with_clock(
         RouterConfig::new([]).with_sender("GS"),
@@ -108,7 +115,14 @@ fn stream_data_and_response_cross_gateway_without_leaf_address_advertisement() {
         Ok(())
     })
     .unwrap();
-    let stream = gs.open_p2p_stream_to_hostname("AB", 4510, 49152).unwrap();
+    let stream = if prepared {
+        let mut plan = gs
+            .prepare_p2p_stream_open(P2pTarget::Hostname("AB"), 4510, 49152, Some(0))
+            .unwrap();
+        gs.try_queue_prepared_p2p(&mut plan).unwrap().stream_id
+    } else {
+        gs.open_p2p_stream_to_hostname("AB", 4510, 49152).unwrap()
+    };
     pump();
     assert!(
         replies
@@ -117,7 +131,14 @@ fn stream_data_and_response_cross_gateway_without_leaf_address_advertisement() {
             .iter()
             .any(|(kind, _)| *kind == P2pStreamEventKind::Connected)
     );
-    gs.send_p2p_stream(stream, b"ota-chunk").unwrap();
+    if prepared {
+        let mut plan = gs
+            .prepare_p2p_stream_control(stream, P2pStreamOperation::Data(b"ota-chunk"), Some(0))
+            .unwrap();
+        gs.try_queue_prepared_p2p(&mut plan).unwrap();
+    } else {
+        gs.send_p2p_stream(stream, b"ota-chunk").unwrap();
+    }
     pump();
     assert_eq!(*received.lock().unwrap(), vec![b"ota-chunk".to_vec()]);
     assert!(

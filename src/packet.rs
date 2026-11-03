@@ -38,7 +38,7 @@ const DEFAULT_STRING_CAPACITY: usize = 96;
 static PACKET_NONCE_COUNTER: AtomicU32 = AtomicU32::new(0xA5C3_1F27);
 
 #[inline]
-fn next_packet_nonce() -> u16 {
+pub(crate) fn next_packet_nonce() -> u16 {
     let mut x = PACKET_NONCE_COUNTER.fetch_add(0x9E37_79B9, Ordering::Relaxed);
     x ^= x << 13;
     x ^= x >> 17;
@@ -1217,6 +1217,23 @@ impl core::fmt::Display for Packet {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.write_str(&Packet::as_string(self))
+    }
+}
+
+#[cfg(feature="std")]
+impl Packet {
+    pub(crate) fn queue_byte_cost_saturated(&self) -> usize {
+        #[cfg(feature="compact-packet-store")]
+        let payload = self.payload.byte_cost_saturated();
+        #[cfg(not(feature="compact-packet-store"))]
+        let payload = match &self.payload {
+            StandardSmallPayload::Heap(a) => size_of::<StandardSmallPayload>().saturating_add(a.len()),
+            // Generated inline variants contain bounded u8-sized payloads.
+            _ => self.payload.byte_cost(),
+        };
+        size_of::<Self>().saturating_add(self.sender.len())
+            .saturating_add(self.endpoints.len().saturating_mul(size_of::<DataEndpoint>()))
+            .saturating_add(payload)
     }
 }
 

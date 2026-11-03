@@ -1979,7 +1979,22 @@ struct P2pStreamSession {
     peer_stream_id: P2pStreamId,
     next_sequence: u32,
     connected: bool,
+    // A topology compact routing identity is not an assigned source address.
+    peer_address_bound: bool,
 }
+
+// Compile this no-growth private-layout witness on hosted and embedded
+// targets. Both schemas are private Rust layouts, never serialized or FFI.
+const _: () = {
+    #[allow(dead_code)]
+    struct PriorSessionLayout {
+        peer_hostname: Arc<str>, peer_address: NodeAddress,
+        local_port: P2pPort, peer_port: P2pPort,
+        peer_stream_id: P2pStreamId, next_sequence: u32, connected: bool,
+    }
+    assert!(core::mem::size_of::<P2pStreamSession>() == core::mem::size_of::<PriorSessionLayout>());
+    assert!(core::mem::align_of::<P2pStreamSession>() == core::mem::align_of::<PriorSessionLayout>());
+};
 
 #[derive(Debug, Clone)]
 struct PendingP2pStreamEvent {
@@ -2450,6 +2465,9 @@ struct ForwardedReceiptCache {
 }
 
 struct RouterInner {
+    #[cfg(feature = "std")]
+    p2p_revision: u64,
+
     #[cfg(feature = "compression")]
     codec_reserved_bytes: usize,
     memory: RuntimeMemoryConfig,
@@ -3122,6 +3140,10 @@ impl RouterInner {
 
     #[inline(never)]
     fn protected_metadata_bytes_used(&self) -> usize {
+        #[cfg(feature="std")]
+        { self.protected_metadata_bytes_with_schema(crate::config::schema_bytes_used) }
+        #[cfg(not(feature="std"))]
+        {
         let codec_bytes = {
             #[cfg(all(feature = "compression", feature = "discovery"))]
             {
@@ -3174,7 +3196,63 @@ impl RouterInner {
                         }
                     }),
             )
+            }
     }
+    #[cfg(feature="std")]
+    fn protected_metadata_bytes_with_schema(&self, schema_bytes: impl FnOnce() -> usize) -> usize {
+        let codec_bytes = {
+            #[cfg(all(feature = "compression", feature = "discovery"))]
+            {
+                self.side_transport
+                    .values()
+                    .map(|side| side.payload_codec.heap_bytes())
+                    .sum::<usize>()
+            }
+            #[cfg(not(all(feature = "compression", feature = "discovery")))]
+            {
+                0usize
+            }
+        };
+        let completion_bytes = {
+            #[cfg(feature = "std")]
+            {
+                self.end_to_end_reliable_tx
+                    .values()
+                    .map(|sent| {
+                        PENDING_TYPE_METADATA_BYTES
+                            + usize::from(sent.completion_epoch != 0) * size_of::<u64>()
+                    })
+                    .sum::<usize>()
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                0usize
+            }
+        };
+        let return_route_growth = self
+            .reliable_return_routes
+            .len()
+            .saturating_mul(RELIABLE_RETURN_ROUTE_EXTRA_LOGICAL_BYTES);
+        codec_bytes
+            .saturating_add(completion_bytes)
+            .saturating_add(return_route_growth)
+            .saturating_add(
+                self.recent_rx
+                    .max_bytes()
+                    .saturating_add(self.reliable_rx_buffered_bytes())
+                    .saturating_add(schema_bytes())
+                    .saturating_add({
+                        #[cfg(feature = "discovery")]
+                        {
+                            self.discovery_bytes_used()
+                        }
+                        #[cfg(not(feature = "discovery"))]
+                        {
+                            0
+                        }
+                    }),
+            )
+        }
     #[inline]
     fn shared_queue_bytes_used(&self) -> usize {
         self.received_queue
@@ -4912,6 +4990,8 @@ impl Router {
         reason: AddressChangeReason,
         spare: Option<Box<AddressBookEntry>>,
     ) -> TelemetryResult<AddressChange> {
+        #[cfg(feature = "std")]
+        st.invalidate_prepared_p2p();
         let old = st.local_address.clone();
         // Relays have no application identity record until explicitly configured
         // or moved by a conflict. Reserve that storage before changing identity.
@@ -5045,6 +5125,8 @@ impl Router {
         let mut changed = false;
         {
             let mut st = self.state.lock();
+            #[cfg(feature = "std")]
+            st.invalidate_prepared_p2p();
             let local = st.local_address.clone();
             // Cold storage was reserved before publishing this packet's route.
             // A concurrent identity change must retry instead of allocating
@@ -5289,6 +5371,8 @@ impl Router {
     }
 
     fn allocate_p2p_stream_id_locked(st: &mut RouterInner) -> P2pStreamId {
+        #[cfg(feature = "std")]
+        st.invalidate_prepared_p2p();
         for _ in 0..u32::MAX {
             let id = st
                 .local_services
@@ -5325,6 +5409,11 @@ impl Router {
         }
         let decoded = Self::decode_p2p_payload(pkt.payload())?;
         if let Some(stream) = Self::decode_p2p_stream_payload(decoded.payload)? {
+            // Routing attribution consistency only, never authentication. A
+            // compact alias must resolve through the existing unique matcher.
+            if !self.sender_matches_hostname(pkt.sender(), decoded.source_hostname) {
+                return Ok(());
+            }
             return self.dispatch_p2p_stream_frame(&decoded, &stream);
         }
         let handlers = {
@@ -5347,6 +5436,33 @@ impl Router {
             })?;
         }
         Ok(())
+    }
+
+    // Caller owns core. Missing assigned-address metadata is provisional only
+    // when the retained, collision-aware topology positively identifies it.
+    fn p2p_target_address_bound_locked(st: &RouterInner, peer: &AddressBookEntry) -> Option<bool> {
+        if let Some(current) = st.address_book.get(peer.hostname.as_ref()) {
+            return (current.as_ref() == peer).then_some(true);
+        }
+        let compact = sender_address_u32(peer.hostname.as_ref());
+        (peer.address == compact
+            && Self::hostname_for_address_borrowed_locked(st, compact) == Some(peer.hostname.as_ref()))
+            .then_some(false)
+    }
+
+    fn p2p_session_tuple_matches(st: &RouterInner, session: &P2pStreamSession, message: &P2pDecoded<'_>) -> bool {
+        let address_matches = if session.peer_address_bound {
+            session.peer_address == message.source_address
+        } else {
+            // A newly learned assigned address constrains even the first
+            // handshake. Address zero remains an ordinary declared address.
+            st.address_book.get(session.peer_hostname.as_ref())
+                .is_none_or(|known| known.address == message.source_address)
+        };
+        session.peer_hostname.as_ref() == message.source_hostname
+            && address_matches
+            && session.peer_port == message.source_port
+            && session.local_port == message.destination_port
     }
 
     fn dispatch_p2p_stream_frame(
@@ -5395,6 +5511,7 @@ impl Router {
                                 peer_stream_id: frame.source_stream_id,
                                 next_sequence: 1,
                                 connected: true,
+                                peer_address_bound: true,
                             },
                         );
                     let handlers = st
@@ -5439,6 +5556,15 @@ impl Router {
                 )?;
                 reply = Some((dst, msg.source_port, msg.destination_port, payload));
             } else if frame.flags & P2P_STREAM_SYN != 0 && frame.flags & P2P_STREAM_ACK != 0 {
+                let bound = frame.source_stream_id != 0 && st.local_services.as_ref()
+                    .expect("local services enabled").p2p_stream_sessions
+                    .get(&frame.destination_stream_id).is_some_and(|session|
+                        Self::p2p_session_tuple_matches(&st, session, msg)
+                        && (session.peer_stream_id == 0 || session.peer_stream_id == frame.source_stream_id));
+                if !bound { return Ok(()); }
+                #[cfg(feature = "std")]
+                st.invalidate_prepared_p2p();
+
                 if let Some(session) = st
                     .local_services
                     .as_mut()
@@ -5446,6 +5572,8 @@ impl Router {
                     .p2p_stream_sessions
                     .get_mut(&frame.destination_stream_id)
                 {
+                    session.peer_address = msg.source_address;
+                    session.peer_address_bound = true;
                     session.peer_stream_id = frame.source_stream_id;
                     session.connected = true;
                     let peer_hostname = session.peer_hostname.clone();
@@ -5496,14 +5624,18 @@ impl Router {
                                 .then_some(*id)
                         })
                 };
-                if let Some(session_id) = session_id
-                    && let Some(session) = st
-                        .local_services
-                        .as_ref()
-                        .expect("local services enabled")
-                        .p2p_stream_sessions
-                        .get(&session_id)
-                {
+                if let Some(session_id) = session_id {
+                    let bound = st.local_services.as_ref().expect("local services enabled")
+                        .p2p_stream_sessions.get(&session_id).is_some_and(|session|
+                            Self::p2p_session_tuple_matches(&st, session, msg)
+                            && (session.peer_stream_id == 0 || session.peer_stream_id == frame.source_stream_id));
+                    if !bound { return Ok(()); }
+                    // A peer-ID0 session may receive legitimate early DATA or
+                    // control from its bound tuple; never learn/rebind from it.
+                    #[cfg(feature = "std")]
+                    st.invalidate_prepared_p2p();
+                    let session = st.local_services.as_ref().expect("local services enabled")
+                        .p2p_stream_sessions.get(&session_id).expect("validated session");
                     let handlers = st
                         .local_services
                         .as_ref()
@@ -5518,7 +5650,7 @@ impl Router {
                         stream_id: session_id,
                         peer_stream_id: frame.source_stream_id,
                         peer_hostname: session.peer_hostname.clone(),
-                        peer_address: session.peer_address,
+                        peer_address: if session.peer_address_bound { session.peer_address } else { msg.source_address },
                         local_port: session.local_port,
                         peer_port: session.peer_port,
                     });
@@ -6805,7 +6937,7 @@ impl Router {
 
     // Preserve the existing private route-fixture helper; production guarded
     // receives use the token-bound atomic handoff below.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "discovery"))]
     fn queue_end_to_end_reliable_ack(
         &self,
         pkt: &Packet,
@@ -8245,6 +8377,8 @@ impl Router {
 
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RouterInner, now_ms: u64) {
+        #[cfg(feature = "std")]
+        st.invalidate_prepared_p2p();
         st.discovery_cadence.on_topology_change(now_ms);
         // Propagate route changes immediately without restarting discovery or
         // resending the complete topology graph. DiscoveryAddress replaces the
@@ -14051,6 +14185,8 @@ impl Router {
             sender: RouterMutex::new(hostname),
             cfg: ActiveRoutingConfig::new(cfg),
             state: RouterMutex::new(RouterInner {
+                #[cfg(feature = "std")]
+                p2p_revision: 1,
                 #[cfg(feature = "compression")]
                 codec_reserved_bytes: 0,
                 memory,
@@ -14431,6 +14567,8 @@ impl Router {
         }
         let stream_id = {
             let mut st = self.state.lock();
+            let peer_address_bound = Self::p2p_target_address_bound_locked(&st, &dst)
+                .ok_or(TelemetryError::Io("p2p target identity changed"))?;
             let stream_id = Self::allocate_p2p_stream_id_locked(&mut st);
             if stream_id == 0 {
                 return Err(TelemetryError::Io("p2p stream id exhausted"));
@@ -14449,6 +14587,7 @@ impl Router {
                         peer_stream_id: 0,
                         next_sequence: 1,
                         connected: false,
+                        peer_address_bound,
                     },
                 );
             stream_id
@@ -14490,6 +14629,8 @@ impl Router {
     ) -> TelemetryResult<()> {
         let (dst, dst_port, src_port, peer_stream_id, seq, refresh_syn) = {
             let mut st = self.state.lock();
+            #[cfg(feature = "std")]
+            st.invalidate_prepared_p2p();
             let Some(session) = st
                 .local_services
                 .as_mut()
@@ -14531,13 +14672,11 @@ impl Router {
             Self::encode_p2p_stream_payload(flags, stream_id, peer_stream_id, seq, payload)?;
         self.send_p2p_to_entry(dst, dst_port, src_port, &stream_payload)?;
         if flags & (P2P_STREAM_FIN | P2P_STREAM_RST) != 0 {
-            self.state
-                .lock()
-                .local_services
-                .as_mut()
-                .expect("local services enabled")
-                .p2p_stream_sessions
-                .remove(&stream_id);
+            let mut state = self.state.lock();
+            #[cfg(feature = "std")]
+            state.invalidate_prepared_p2p();
+            state.local_services.as_mut().expect("local services enabled")
+                .p2p_stream_sessions.remove(&stream_id);
         }
         Ok(())
     }
@@ -16049,6 +16188,11 @@ impl Router {
     #[cfg(feature = "std")]
     pub fn has_pending_reliable_tx_type(&self, ty: DataType) -> bool {
         let st = self.state.lock();
+        self.pending_reliable_tx_type_locked(&st, ty)
+    }
+
+    #[cfg(feature = "std")]
+    fn pending_reliable_tx_type_locked(&self, st: &RouterInner, ty: DataType) -> bool {
         let total = self
             .active_queued_tx
             .load(core::sync::atomic::Ordering::Acquire) as u64;
@@ -21430,3 +21574,23 @@ mod try_tx_queue_role_tests {
         assert!(!relay.has_queued_work());
     }
 }
+
+#[cfg(feature = "std")]
+#[path = "router_prepared_p2p.rs"]
+mod prepared_p2p;
+#[cfg(feature = "std")]
+pub use prepared_p2p::{P2pAdmission, P2pStreamOperation, P2pTarget, PreparedP2p, TryP2pError};
+
+#[cfg(all(test,feature="std",feature="discovery"))]
+#[path="published_p2p_tuple_causal.rs"]
+mod published_p2p_tuple_causal;
+
+#[cfg(feature = "std")]
+#[path = "router_prepared_queue.rs"]
+mod prepared_queue;
+#[cfg(feature = "std")]
+pub use prepared_queue::{PrepareQueuedPacketFailure, PreparedQueuedPacket, TryPendingTypeError, TryQueuedPacketError};
+
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "router_topology_binding_tests.rs"]
+mod topology_binding_tests;
