@@ -140,7 +140,7 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
         }
     }
 
-    #[cfg(all(feature="std", feature="compact-packet-store"))]
+    #[cfg_attr(not(feature = "std"), inline(never))]
     pub(crate) fn byte_cost_saturated(&self) -> usize {
         match self {
             Self::Inline { len, .. } => *len as usize,
@@ -152,12 +152,7 @@ impl<const INLINE: usize> SmallPayload<INLINE> {
     /// Byte cost of the payload (for use in byte-limited queues).
     #[inline]
     fn byte_cost(&self) -> usize {
-        match self {
-            SmallPayload::Inline { len, .. } => *len as usize,
-            SmallPayload::Heap(a) => a.len() + size_of::<Arc<[u8]>>(),
-            #[cfg(feature = "compact-packet-store")]
-            SmallPayload::Managed(a) => a.len(),
-        }
+        self.byte_cost_saturated()
     }
 
     /// Return the payload as a borrowed byte slice.
@@ -437,5 +432,22 @@ mod queue_parking_tests {
                 assert_eq!(&*held.pin().unwrap(), &[9; 128]);
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod accounting_cost_equivalence {
+    use super::*;
+    #[test]
+    fn canonical_small_payload_cost_preserves_inline_and_heap_boundaries() {
+        fn check<const N:usize>() {
+            for len in [0,1,N,N+1,257] {
+                let bytes=alloc::vec![0x7c;len];let payload=SmallPayload::<N>::new(&bytes);
+                let expected=if payload.is_inline() {len} else {len+size_of::<Arc<[u8]>>()};
+                assert_eq!(payload.byte_cost_saturated(),expected);assert_eq!(ByteCost::byte_cost(&payload),expected);
+                assert_eq!(payload.as_slice(),bytes.as_slice());
+            }
+        }
+        check::<0>();check::<1>();check::<8>();check::<128>();
     }
 }

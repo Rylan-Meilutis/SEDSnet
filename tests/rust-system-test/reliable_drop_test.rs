@@ -91,9 +91,31 @@ mod reliable_drop_tests {
         });
     }
 
+    // One unchanged ORIGINAL global-round drain quantum. The bounded profile
+    // refuses before accept; it does not evict accepted frames or accelerate a link.
+    fn original_link_quantum(link:usize)->usize {
+        match link {0|1=>12,2|3=>3,4..=7=>6,_=>4}
+    }
+    #[derive(Default)]
+    struct CallbackAdmissionFacts {
+        accepted:[AtomicU64;14], refused:[AtomicU64;14], max_queued:[AtomicU64;14],
+    }
+    fn accept_callback_frame(q:&Arc<Mutex<VecDeque<Vec<u8>>>>,facts:&CallbackAdmissionFacts,link:usize,bounded:bool,bytes:&[u8])->TelemetryResult<()> {
+        let mut queue=q.lock().unwrap();
+        if bounded && queue.len()>=original_link_quantum(link) {
+            facts.refused[link].fetch_add(1,Ordering::Relaxed);
+            return Err(sedsnet::TelemetryError::Io("side tx busy"));
+        }
+        queue.push_back(bytes.to_vec());
+        facts.accepted[link].fetch_add(1,Ordering::Relaxed);
+        facts.max_queued[link].fetch_max(queue.len()as u64,Ordering::Relaxed);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     struct RocketTopology {
         now: Arc<AtomicU64>,
+        callback_admission:Arc<CallbackAdmissionFacts>,
         gs: Router,
         gw: Relay,
         rf: Relay,
@@ -135,8 +157,10 @@ mod reliable_drop_tests {
 
     #[allow(dead_code)]
     impl RocketTopology {
-        fn new() -> Self {
+        fn new() -> Self {Self::with_callback_backpressure(false)}
+        fn with_callback_backpressure(bounded:bool) -> Self {
             ensure_common_test_schema();
+            let callback_admission=Arc::new(CallbackAdmissionFacts::default());
             let now = Arc::new(AtomicU64::new(0));
             let gs = Router::new_with_clock(
                 RouterConfig::default()
@@ -244,9 +268,9 @@ mod reliable_drop_tests {
                 "gw",
                 {
                     let q = gs_gw_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,0,bounded,bytes)
                     }
                 },
                 side_opts.clone(),
@@ -255,9 +279,9 @@ mod reliable_drop_tests {
                 "rf",
                 {
                     let q = gs_rf_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,2,bounded,bytes)
                     }
                 },
                 topology_side_opts,
@@ -267,9 +291,9 @@ mod reliable_drop_tests {
                 "gs",
                 {
                     let q = gw_gs_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,1,bounded,bytes)
                     }
                 },
                 relay_side_opts.clone(),
@@ -278,9 +302,9 @@ mod reliable_drop_tests {
                 "ab",
                 {
                     let q = gw_ab_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,4,bounded,bytes)
                     }
                 },
                 relay_side_opts,
@@ -289,9 +313,9 @@ mod reliable_drop_tests {
                 "vb",
                 {
                     let q = gw_vb_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,6,bounded,bytes)
                     }
                 },
                 leaf_relay_side_opts.clone(),
@@ -300,9 +324,9 @@ mod reliable_drop_tests {
                 "daq",
                 {
                     let q = gw_daq_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,8,bounded,bytes)
                     }
                 },
                 leaf_relay_side_opts.clone(),
@@ -312,9 +336,9 @@ mod reliable_drop_tests {
                 "gs",
                 {
                     let q = rf_gs_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,3,bounded,bytes)
                     }
                 },
                 topology_relay_side_opts,
@@ -323,9 +347,9 @@ mod reliable_drop_tests {
                 "pb",
                 {
                     let q = rf_pb_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,10,bounded,bytes)
                     }
                 },
                 leaf_relay_side_opts.clone(),
@@ -334,9 +358,9 @@ mod reliable_drop_tests {
                 "fc",
                 {
                     let q = rf_fc_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,12,bounded,bytes)
                     }
                 },
                 leaf_relay_side_opts,
@@ -346,9 +370,9 @@ mod reliable_drop_tests {
                 "gw",
                 {
                     let q = ab_gw_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,5,bounded,bytes)
                     }
                 },
                 side_opts,
@@ -357,9 +381,9 @@ mod reliable_drop_tests {
                 "gw",
                 {
                     let q = vb_gw_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,7,bounded,bytes)
                     }
                 },
                 leaf_side_opts.clone(),
@@ -368,9 +392,9 @@ mod reliable_drop_tests {
                 "gw",
                 {
                     let q = daq_gw_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,9,bounded,bytes)
                     }
                 },
                 leaf_side_opts.clone(),
@@ -379,9 +403,9 @@ mod reliable_drop_tests {
                 "rf",
                 {
                     let q = pb_rf_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,11,bounded,bytes)
                     }
                 },
                 leaf_side_opts.clone(),
@@ -390,9 +414,9 @@ mod reliable_drop_tests {
                 "rf",
                 {
                     let q = fc_rf_tx.clone();
+                    let facts=callback_admission.clone();
                     move |bytes: &[u8]| -> TelemetryResult<()> {
-                        q.lock().unwrap().push_back(bytes.to_vec());
-                        Ok(())
+                        accept_callback_frame(&q,&facts,13,bounded,bytes)
                     }
                 },
                 leaf_side_opts,
@@ -400,6 +424,7 @@ mod reliable_drop_tests {
 
             Self {
                 now,
+                callback_admission,
                 gs,
                 gw,
                 rf,
@@ -3231,12 +3256,7 @@ mod reliable_drop_tests {
         }
 
         fn budget(&self, link: usize) -> usize {
-            match link {
-                0 | 1 => 12, // fast ground-station trunk
-                2 | 3 => 3,  // slow RF backup
-                4..=7 => 6,  // medium local buses
-                _ => 4,
-            }
+            original_link_quantum(link)
         }
 
         fn maybe_churn(&mut self, tick: usize) {
@@ -3580,7 +3600,9 @@ mod reliable_drop_tests {
             arena
         };
         ensure_common_test_schema();
-        let topology = RocketTopology::new();
+        // Explicit finite downstream admission model. Original unbounded
+        // callback/FIFO failure is retained as a separate negative witness.
+        let topology = RocketTopology::with_callback_backpressure(true);
         let tick_count = std::env::var("SEDSNET_SOAK_TICKS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -4067,6 +4089,13 @@ mod reliable_drop_tests {
         assert!(gs_rx_packets > 0);
         assert!(gs_stats.discovery.route_count > 0 || gs_stats.discovery.announcer_count > 0);
         let gw_stats = topology.gw.export_runtime_stats();
+        let accepted=topology.callback_admission.accepted.each_ref().map(|n|n.load(Ordering::Relaxed));
+        let refused=topology.callback_admission.refused.each_ref().map(|n|n.load(Ordering::Relaxed));
+        let max_queued=topology.callback_admission.max_queued.each_ref().map(|n|n.load(Ordering::Relaxed));
+        assert!(refused.iter().any(|n|*n!=0),"finite callback backpressure must actually be exercised");
+        for(link,maximum)in max_queued.iter().enumerate(){assert!(*maximum<=original_link_quantum(link)as u64,"hidden accepted backlog exceeded declared model capacity");}
+        println!("SOAK_CALLBACK_ADMISSION accepted={accepted:?} refused={refused:?} max_queued={max_queued:?}");
+
         let gw_tx_packets: u64 = gw_stats.sides.iter().map(|side| side.tx_packets).sum();
         let gw_rx_packets: u64 = gw_stats.sides.iter().map(|side| side.rx_packets).sum();
         assert!(gw_tx_packets > 0);

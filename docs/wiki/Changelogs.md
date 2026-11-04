@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## Version 4.3.10 highlights
+
+- Retain ordered frames and their sequence across transport backpressure, and bind inline acknowledgements to the exact active offer.
+- Bind schema and managed-request receipts to the original publisher, side and packet.
+- Distinguish physical-hop neighbors from relayed addresses, including compact numeric aliases.
+- Add std-only prepared managed-variable batches with atomic cache and queue admission.
+- Reduce embedded routing and accounting overhead without reducing precision or configured limits.
+- Keep wire encoding, C event ABI, application message identities and macro crate 2.2.0 unchanged.
+
+Use matching 4.3.10 peers for publisher-bound schema and managed-request receipt exchanges. Legacy 4.3.9 control receipts do not satisfy those new bound exchanges.
+
 ## Version 4.3.9 highlights
 
 - Add hosted prepared decoded-packet admission with an atomic pending-reliable-type fence and nonwaiting conservative inspection.

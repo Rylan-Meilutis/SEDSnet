@@ -25,6 +25,7 @@ fn fixture() -> (Relay, usize, usize) {
     (node, a, b)
 }
 fn fixture_with_clock() -> (Relay, usize, usize, Arc<core::sync::atomic::AtomicU64>) {
+    let _ = crate::config::try_get_message_meta(DataType::TelemetryError);
     #[cfg(feature = "compact-packet-store")]
     crate::packet_store::set_default_store(Some(
         crate::packet_store::PacketStore::new(32768, 512, 512).unwrap(),
@@ -323,7 +324,15 @@ fn shared_chunk_budget_sheds_fast_bulk_before_slow_report_and_control() {
     );
     for index in 0..16 {
         node.decode_side_transport_frame(a, &fragment(99, index, 28, &[7; 112]))
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "shared chunk admission failed: fragment_index={index}/16 total_fragments=28 payload_bytes=112 error={error:?}; layout={}; queue_lengths_rx_tx_recent={:?}; remaining_e2e_owners={}; retained_packet_rows={:?}",
+                    node.export_memory_layout_json(),
+                    node.debug_queue_lengths(),
+                    node.debug_end_to_end_tracked_count(),
+                    packet_rows(&node),
+                )
+            });
     }
     let after = packet_rows(&node);
     assert!(

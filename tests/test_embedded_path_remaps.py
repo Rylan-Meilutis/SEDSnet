@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -44,8 +46,10 @@ class EmbeddedPathRemapTests(unittest.TestCase):
 
     def test_missing_toolchain_retains_original_flags(self):
         env={"RUSTFLAGS":"-Copt-level=z"};before=env.copy()
-        with mock.patch.object(build.subprocess,"check_output",side_effect=OSError):
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stdout(diagnostic), mock.patch.object(build.subprocess,"check_output",side_effect=OSError):
             build.apply_embedded_path_remaps("thumbv7em-none-eabihf",env)
+        self.assertEqual(diagnostic.getvalue(), "warning: could not query Rust sysroot; keeping original source paths.\n")
         self.assertEqual(env,before)
 
     def test_virtual_toolchain_sources_preserve_user_overrides(self):

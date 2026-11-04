@@ -3,6 +3,29 @@
 ## Unreleased
 
 
+## 4.3.10
+
+Packet framing, application message identities and C event layouts retain their
+4.3.9 representations. The macro crate remains at 2.2.0.
+
+Publisher-bound schema (`DiscoverySchema`, network type 10) and managed-request
+(`ManagedVariableRequest`, network type 13) receipt exchanges require matching
+4.3.10 peers. Legacy 4.3.9 control receipts do not complete these exchanges;
+wire-layout compatibility does not imply mixed-version delivery parity.
+
+- Add std-only caller-owned managed-value batch preparation and atomic cache/queue
+  admission, preserving packet identities and source timestamps. Observation age
+  is preserved through preparation, rebase and commit; later dispatch retains
+  the existing local-observation age refresh behavior.
+- Preserve accepted Ordered owners across transport backpressure and reject
+  retired continuations before they can publish stale work.
+- Report failure for exhausted hop-ordered channels rather than silently accepting
+  traffic stranded behind an unrecoverable sequence gap.
+- Bootstrap shared-side announcer metadata without coupling independent senders
+  to a single hop sequence. Keep application and schema sequencing unchanged.
+
+
+
 ## 4.3.9
 
 Wire format, application message identities and C event layouts remain compatible

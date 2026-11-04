@@ -428,6 +428,12 @@ pub struct ParkedPayload {
     view: RouterMutex<Option<PinnedBytes>>,
 }
 impl ParkedPayload {
+    #[cfg(all(feature = "discovery", feature = "compact-packet-store"))]
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.handle.store,&other.handle.store)
+            && self.handle.slot.is_some() && self.handle.slot == other.handle.slot
+            && self.handle.len == other.handle.len
+    }
     pub(crate) fn new(handle: StoredBytes) -> Self {
         assert!(!handle.is_compressed());
         Self {

@@ -1,5 +1,6 @@
 use crate::{TelemetryError, TelemetryResult};
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 /// Items stored in the queue must report (approximately) how much memory they
 /// account for.
@@ -546,7 +547,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     #[inline]
-    #[cfg(any(feature = "discovery", feature = "latest-value-egress"))]
+    #[cfg(any(feature = "compression", feature = "discovery", feature = "latest-value-egress"))]
     pub(crate) fn update_admitted<F>(
         &mut self,
         index: usize,
@@ -731,6 +732,40 @@ impl<T: ByteCost> BoundedDeque<T> {
     where F: FnMut(&T) -> u8 {
         assert!(self.fits_prepared_batch(&[cost]));
         self.insert_prioritized_prepared(value, cost, priority, priority_of);
+    }
+
+    /// Replace one retained owner with a fully charged group under one owner.
+    /// No allocation, growth, parking or eviction; costs are queue metadata.
+    pub(crate) fn fits_replacement_group(&self, index: usize, costs: &[usize]) -> bool {
+        let Some(old) = self.q.get(index) else { return false; };
+        let Some(extra) = costs.len().checked_sub(1) else { return false; };
+        let Some(len) = self.q.len().checked_add(extra) else { return false; };
+        let Some(bytes) = self.cur_bytes.checked_sub(old.byte_cost())
+            .and_then(|used| costs.iter().try_fold(used, |used, cost| used.checked_add(*cost)))
+        else { return false; };
+        len <= self.max_elems && len <= self.q.capacity() && bytes <= self.max_bytes
+    }
+
+    /// Caller already checked the single replacement under the same owner.
+    pub(crate) fn replace_prepared_item(&mut self, index: usize, item: T, cost: usize) {
+        let old = self.q.get(index).expect("checked retained owner").byte_cost();
+        self.cur_bytes = self.cur_bytes.checked_sub(old).unwrap().checked_add(cost).unwrap();
+        self.q[index] = item;
+    }
+
+    /// Caller keeps the same exclusive owner between preflight and replacement.
+    pub(crate) fn replace_prepared_group<F>(
+        &mut self, index: usize, values: Vec<(T, usize)>, mut priority_of: F,
+    ) where F: FnMut(&T) -> u8 {
+        // Costs and values were checked as one transaction by the caller.
+        assert!(!values.is_empty());
+        let mut values = values.into_iter();
+        let (first, cost) = values.next().expect("checked nonempty group");
+        self.replace_prepared_item(index, first, cost);
+        for (item, cost) in values {
+            let priority = priority_of(&item);
+            self.insert_prioritized_prepared(item, cost, priority, &mut priority_of);
+        }
     }
 
     /// Push to back, evicting from front as needed to stay within byte budget.

@@ -67,7 +67,7 @@ fn incomplete_side_transfers_stay_bounded_under_repeated_loss() {
 }
 
 #[test]
-fn unacknowledged_topology_does_not_silence_discovery_liveness() {
+fn unacknowledged_schema_does_not_silence_discovery_liveness() {
     crate::tests::ensure_common_test_schema();
     let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
@@ -90,16 +90,19 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
     );
     rf.announce_discovery().unwrap();
     rf.process_tx_queue().unwrap();
-    // Deliberately withhold the hop ACK for a transmitted topology baseline.
+    let held_schema=rf.test_hold_schema_owner(side,0).unwrap();
+    // Deliberately withhold the hop ACK for a transmitted schema baseline.
     assert!(
         rf.state
             .lock()
             .reliable_tx
             .iter()
             .any(|((s, ty), tx)| *s == side
-                && *ty == DataType::DiscoveryTopology.as_u32()
+                && *ty == DataType::DiscoverySchema.as_u32()
                 && !tx.sent.is_empty())
     );
+    assert!(rf.state.lock().reliable_tx.get(&(side,DataType::DiscoverySchema.as_u32()))
+        .and_then(|stream|stream.sent.get(&held_schema.0)).is_some_and(|sent|sent.bytes.as_ref()==held_schema.1.as_ref()));
     emitted.lock().unwrap().clear();
     let fc_clock = now.clone();
     let fc = Router::new_with_clock(
@@ -190,6 +193,8 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
             "FC must actually transmit each sensor packet, not just return success at {ms} ms"
         );
     }
+    assert!(rf.state.lock().reliable_tx.get(&(side,DataType::DiscoverySchema.as_u32()))
+        .and_then(|stream|stream.sent.get(&held_schema.0)).is_some_and(|sent|sent.bytes.as_ref()==held_schema.1.as_ref()));
     let frames = emitted.lock().unwrap();
     let types: Vec<_> = frames
         .iter()
@@ -201,7 +206,7 @@ fn unacknowledged_topology_does_not_silence_discovery_liveness() {
         .collect();
     assert!(
         pings.len() >= 3,
-        "a lost topology ACK must not suppress bounded keepalives for an entire route TTL"
+        "a lost schema ACK must not suppress bounded keepalives for an entire route TTL"
     );
     assert!(
         pings.len() <= 5,
