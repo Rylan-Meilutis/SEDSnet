@@ -30,7 +30,11 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi gcc-multilib gnuplot python3-tk
+          sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi gcc-multilib gnuplot python3-tk
+          command -v cmake
+          command -v ninja
+          cmake --version
+          ninja --version
 
       - name: Cache cargo-nextest
         id: cache-cargo-nextest
