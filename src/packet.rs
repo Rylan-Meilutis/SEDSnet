@@ -1220,8 +1220,8 @@ impl core::fmt::Display for Packet {
     }
 }
 
-#[cfg(feature="std")]
 impl Packet {
+    #[cfg_attr(not(feature = "std"), inline(never))]
     pub(crate) fn queue_byte_cost_saturated(&self) -> usize {
         #[cfg(feature="compact-packet-store")]
         let payload = self.payload.byte_cost_saturated();
@@ -1244,10 +1244,7 @@ impl ByteCost for Packet {
     }
     #[inline]
     fn byte_cost(&self) -> usize {
-        size_of::<Self>()
-            + self.sender.len()
-            + self.endpoints.len() * size_of::<DataEndpoint>()
-            + self.payload.byte_cost()
+        self.queue_byte_cost_saturated()
     }
 }
 
@@ -1340,5 +1337,45 @@ impl Packet {
             header: self,
             payload,
         })
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod accounting_cost_equivalence {
+    use super::*;
+    fn packet(bytes: &[u8]) -> Packet {
+        Packet::new_with_wire_contract(DataType(900001), &[DataEndpoint(900002)], "cost-source", 12345, 71,
+            Arc::<[u8]>::from(bytes), Some(MessageElement::Static(bytes.len(), MessageDataType::UInt8, MessageClass::Data)),
+            Arc::<[u64]>::from([])).unwrap()
+    }
+    #[test]
+    fn canonical_packet_cost_preserves_actual_inline_heap_formula_and_wire() {
+        let mut lengths=vec![0,1,crate::config::STACK_PAYLOAD_SIZE,crate::config::STACK_PAYLOAD_SIZE+1,1024];
+        lengths.sort_unstable();lengths.dedup();
+        for len in lengths {
+            let bytes=vec![0x5a;len];let p=packet(&bytes);
+            let identity=(p.packet_id(),p.timestamp());
+            let wire=crate::wire_format::pack_packet(&p);
+            let payload_cost=if p.payload.is_inline() {len} else {
+                #[cfg(feature="compact-packet-store")] {len+size_of::<Arc<[u8]>>()}
+                #[cfg(not(feature="compact-packet-store"))] {len+size_of::<StandardSmallPayload>()}
+            };
+            let expected=size_of::<Packet>()+p.sender.len()+p.endpoints.len()*size_of::<DataEndpoint>()+payload_cost;
+            assert_eq!(p.queue_byte_cost_saturated(),expected);assert_eq!(p.byte_cost(),expected);
+            assert_eq!((p.packet_id(),p.timestamp()),identity);assert_eq!(p.payload(),bytes.as_slice());
+            assert_eq!(crate::wire_format::pack_packet(&p),wire);
+        }
+    }
+    #[cfg(feature="compact-packet-store")]
+    #[test]
+    fn canonical_managed_cost_reads_metadata_without_pin_or_arena_change() {
+        let bytes=vec![0x6b;257];let mut p=packet(&bytes);let identity=(p.packet_id(),p.timestamp());let wire=crate::wire_format::pack_packet(&p);
+        let store=crate::packet_store::PacketStore::new(4096,16,16).unwrap();
+        p.payload=StandardSmallPayload::Managed(crate::packet_store::ParkedPayload::new(store.store(&bytes).unwrap()));
+        let before=store.stats();assert_eq!(before.pinned_bytes,0);
+        let expected=size_of::<Packet>()+p.sender.len()+p.endpoints.len()*size_of::<DataEndpoint>()+bytes.len();
+        assert_eq!(p.queue_byte_cost_saturated(),expected);assert_eq!(p.byte_cost(),expected);
+        assert_eq!(store.stats(),before,"cost must not pin/decode/allocate payload views");
+        assert_eq!((p.packet_id(),p.timestamp()),identity);assert_eq!(crate::wire_format::pack_packet(&p),wire);
     }
 }

@@ -1,5 +1,34 @@
 use super::*;
 
+// This fixture is included by both Router and the legacy Relay facade. Exercise
+// each public receive API with the same owned, original announcement.
+trait UntemplatedPhysicalReceive {
+    fn receive_physical_announcement(
+        &self,
+        announcement: Packet,
+        side: crate::router::RouterSideId,
+    ) -> TelemetryResult<()>;
+}
+impl UntemplatedPhysicalReceive for crate::router::Router {
+    fn receive_physical_announcement(
+        &self,
+        announcement: Packet,
+        side: crate::router::RouterSideId,
+    ) -> TelemetryResult<()> {
+        self.rx_from_side(&announcement, side)
+    }
+}
+impl UntemplatedPhysicalReceive for crate::relay::Relay {
+    fn receive_physical_announcement(
+        &self,
+        announcement: Packet,
+        side: crate::relay::RelaySideId,
+    ) -> TelemetryResult<()> {
+        self.rx_from_side(side, announcement)?;
+        self.process_rx_queue()
+    }
+}
+
 fn canonical_frame() -> crate::SharedBytes {
     // Use a dedicated best-effort type: the compiled qualification schema
     // configures GPS_DATA as reliable, unlike the fallback unit-test schema.
@@ -97,13 +126,12 @@ fn shared_bus_switches_to_canonical_frames_without_forgetting_rx_dictionary() {
             .get_mut(&side)
             .unwrap()
             .insert_rx_template(123, template, 8);
-        for peer in ["PEER_A", "PEER_B"] {
-            st.discovery_routes
-                .entry(side)
-                .or_default()
-                .announcers
-                .insert(peer.into(), Box::new(DiscoverySenderState::default()));
-        }
+    }
+    // A shared physical bus requires actual hop-local advertisements. Logical
+    // Address17 publishers alone must not change point-to-point framing.
+    for peer in ["PEER_A", "PEER_B"] {
+        let announcement = crate::discovery::build_discovery_announce(peer, 0, &[]).unwrap();
+        node.receive_physical_announcement(announcement, side).unwrap();
     }
     for _ in 0..64 {
         let mut frames = node

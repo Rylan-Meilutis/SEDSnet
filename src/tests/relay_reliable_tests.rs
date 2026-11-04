@@ -4,7 +4,6 @@ use crate::discovery::build_discovery_announce;
 use crate::relay::{Relay, RelaySideOptions};
 use crate::router::Clock;
 use crate::tests::packed_frame_type;
-use crate::tests::timeout_tests::StepClock;
 use crate::{TelemetryResult, packet::Packet, wire_format};
 
 use std::sync::{Arc, Mutex};
@@ -120,11 +119,13 @@ fn relay_reliable_retransmit_across_chain_preserves_order() {
             .expect("register RELAY_CHAIN_RELIABLE_DATA")
         })
     };
-    let relay1 = Arc::new(Relay::new(StepClock::new_box(
-        0,
-        RELIABLE_RETRANSMIT_MS + 1,
-    )));
-    let relay2 = Arc::new(Relay::new(zero_clock()));
+    // A clock read is observation, not elapsed time. Advance only after both
+    // routers have had their global-round turn, preserving the 201ms step.
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock1 = now.clone();
+    let clock2 = now.clone();
+    let relay1 = Arc::new(Relay::new(Box::new(move || clock1.load(std::sync::atomic::Ordering::SeqCst))));
+    let relay2 = Arc::new(Relay::new(Box::new(move || clock2.load(std::sync::atomic::Ordering::SeqCst))));
 
     relay1.add_side_packed_with_options(
         "SRC",
@@ -180,6 +181,10 @@ fn relay_reliable_retransmit_across_chain_preserves_order() {
     // Destination capture on relay2
     let delivered: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let delivered_c = delivered.clone();
+    let originals = Arc::new(Mutex::new(Vec::new()));
+    let originals_c = originals.clone();
+    let acknowledged = Arc::new(Mutex::new(Vec::new()));
+    let acknowledged_c = acknowledged.clone();
     let relay2_for_ack = relay2.clone();
     let relay1_for_ack = relay1.clone();
     let relay2_dst_id: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
@@ -189,8 +194,10 @@ fn relay_reliable_retransmit_across_chain_preserves_order() {
         move |bytes: &[u8]| -> TelemetryResult<()> {
             let frame = wire_format::peek_frame_info(bytes)?;
             if let Some(hdr) = frame.reliable
-                && (hdr.flags & wire_format::RELIABLE_FLAG_ACK_ONLY) == 0
+                && (hdr.flags & (wire_format::RELIABLE_FLAG_ACK_ONLY | wire_format::RELIABLE_FLAG_UNSEQUENCED)) == 0
+                && frame.envelope.ty == reliable_ty
             {
+                originals_c.lock().unwrap().push((wire_format::packet_id_from_wire(bytes)?, wire_format::unpack_packet(bytes)?.payload().to_vec()));
                 delivered_c.lock().unwrap().push(hdr.seq);
                 let ack_bytes =
                     wire_format::pack_reliable_ack("DST", frame.envelope.ty, 0, hdr.seq);
@@ -198,6 +205,7 @@ fn relay_reliable_retransmit_across_chain_preserves_order() {
                     relay2_for_ack.rx_packed_from_side(dst_id, ack_bytes.as_ref())?;
                 }
                 relay1_for_ack.rx_packed_from_side(relay1_mid, ack_bytes.as_ref())?;
+                acknowledged_c.lock().unwrap().push(hdr.seq);
             }
             Ok(())
         },
@@ -224,16 +232,29 @@ fn relay_reliable_retransmit_across_chain_preserves_order() {
     )
     .unwrap();
 
+    let expected = [(pkt1.packet_id(), pkt1.payload().to_vec()), (pkt2.packet_id(), pkt2.payload().to_vec())];
     relay1.rx_from_side(0, pkt1).unwrap();
     relay1.rx_from_side(0, pkt2).unwrap();
 
     for _ in 0..10 {
         relay1.process_all_queues_with_timeout(0).unwrap();
         relay2.process_all_queues_with_timeout(0).unwrap();
-        if delivered.lock().unwrap().len() >= 2 {
+        let retired = relay1.core.test_hop_history_retired(relay1_mid, reliable_ty)
+            && relay2.core.test_hop_history_retired(relay2_dst, reliable_ty);
+        if delivered.lock().unwrap().len() >= 2 && retired {
             break;
         }
+        now.fetch_add(RELIABLE_RETRANSMIT_MS + 1, std::sync::atomic::Ordering::SeqCst);
     }
+    assert!(now.load(std::sync::atomic::Ordering::SeqCst) < 10 * (RELIABLE_RETRANSMIT_MS + 1), "both deliveries and real ACK retirement must finish before the original round cap");
+    assert!(relay1.core.test_hop_history_retired(relay1_mid, reliable_ty));
+    assert!(relay2.core.test_hop_history_retired(relay2_dst, reliable_ty));
+    let actual = originals.lock().unwrap();
+    let mut unique = Vec::new();
+    for row in actual.iter() { if !unique.contains(row) { unique.push(row.clone()); } }
+    assert_eq!(unique.as_slice(), expected.as_slice(), "original packet IDs and values must survive relay/retry unchanged");
+    let acknowledged = acknowledged.lock().unwrap();
+    assert!(acknowledged.contains(&1) && acknowledged.contains(&2), "both actual app sequences need destination ACKs");
 
     let delivered = delivered.lock().unwrap().clone();
     let mut first_seen = Vec::new();

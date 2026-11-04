@@ -1360,6 +1360,10 @@ impl PreparedSchemaGuard {
     }
 
 
+    pub(crate) fn matches_managed_endpoint(&self, expected: &OwnedEndpointDefinition) -> bool {
+        self.0.endpoints.iter().any(|(id, meta)| *id==expected.id && meta.name.as_ref()==expected.name.as_str() && meta.description.as_ref()==expected.description.as_str() && meta.link_local_only==expected.link_local_only)
+    }
+
     pub(crate) fn matches(&self, ty: DataType, expected: &MessageMeta) -> bool {
         self.0.types.iter().find(|(id, _)| *id == ty).is_some_and(|(_, meta)| meta == expected)
     }
@@ -1371,6 +1375,14 @@ pub(crate) fn try_prepared_schema_guard() -> Option<PreparedSchemaGuard> {
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(_)) => panic!("schema registry poisoned"),
     }
+}
+
+/// Ordinary FIFO dispatch preserves the legacy blocking Core-to-schema order.
+/// Never use this accessor in prepared/try APIs: those must retain no-wait
+/// publication and honest SchemaBusy. Unknown registry is not initialized here.
+#[cfg(feature = "std")]
+pub(crate) fn ordinary_schema_guard() -> Option<PreparedSchemaGuard> {
+    Some(PreparedSchemaGuard(REGISTRY.get()?.lock().expect("schema registry poisoned")))
 }
 
 #[cfg(feature = "std")]

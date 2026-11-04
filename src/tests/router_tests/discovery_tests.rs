@@ -2616,10 +2616,16 @@ fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
 
         for (idx, (label, router, side)) in nodes.iter().enumerate() {
             let learned = router.rx_from_side(&topology_pkt, *side);
-            assert!(matches!(
-                learned,
-                Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
-            ));
+            assert!(
+                matches!(
+                    learned,
+                    Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
+                ),
+                "{label}: topology admission failed at round {round}: result={learned:?}; queued_inputs={queued_inputs}; layout={}; queue_lengths_rx_tx_recent={:?}; remaining_e2e_owners={}",
+                router.export_memory_layout_json(),
+                router.debug_queue_lengths(),
+                router.debug_end_to_end_tracked_count(),
+            );
             max_discovery_seen[idx] = max_discovery_seen[idx].max(discovery_bytes(router));
             let queued = router.log_queue_ts(
                 DataType::named("GPS_DATA"),
@@ -2633,8 +2639,10 @@ fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
                     queued,
                     Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
                 ),
-                "{label}: unexpected telemetry admission failure at round {round}: {queued:?}; layout={}",
-                router.export_memory_layout_json()
+                "{label}: unexpected telemetry admission failure at round {round}: {queued:?}; queued_inputs={queued_inputs}; layout={}; queue_lengths_rx_tx_recent={:?}; remaining_e2e_owners={}",
+                router.export_memory_layout_json(),
+                router.debug_queue_lengths(),
+                router.debug_end_to_end_tracked_count(),
             );
             let pkt = Packet::from_f32_slice(
                 DataType::named("GPS_DATA"),
@@ -2644,10 +2652,16 @@ fn multi_node_memory_exhaustion_keeps_runtime_pools_bounded() {
             )
             .unwrap();
             let received = router.rx_queue(pkt);
-            assert!(matches!(
-                received,
-                Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
-            ));
+            assert!(
+                matches!(
+                    received,
+                    Ok(()) | Err(TelemetryError::Io("shared priority queue saturated"))
+                ),
+                "{label}: RX admission failed at round {round}: result={received:?}; queued_inputs={queued_inputs}; layout={}; queue_lengths_rx_tx_recent={:?}; remaining_e2e_owners={}",
+                router.export_memory_layout_json(),
+                router.debug_queue_lengths(),
+                router.debug_end_to_end_tracked_count(),
+            );
             queued_inputs += u64::from(queued.is_ok()) + u64::from(received.is_ok());
 
             if round % 15 == 0 {
@@ -3350,7 +3364,7 @@ fn router_does_not_stack_periodic_discovery_behind_an_unacked_snapshot() {
 }
 
 #[test]
-fn router_unacked_discovery_blocks_only_the_affected_side() {
+fn router_unacked_schema_blocks_only_the_affected_side() {
     ensure_topology_test_schema();
     let now_ms = Arc::new(AtomicU64::new(0));
     let reliable_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3363,7 +3377,7 @@ fn router_unacked_discovery_blocks_only_the_affected_side() {
             now_ms: now_ms.clone(),
         }),
     );
-    router.add_side_packed_with_options(
+    let held_side=router.add_side_packed_with_options(
         "reliable_radio",
         move |bytes| {
             reliable_seen_c.lock().unwrap().push(bytes.to_vec());
@@ -3385,7 +3399,12 @@ fn router_unacked_discovery_blocks_only_the_affected_side() {
 
     assert!(router.poll_discovery().unwrap());
     router.process_all_queues().unwrap();
-    let reliable_first = reliable_seen.lock().unwrap().len();
+    let held_schema=router.test_hold_schema_owner(held_side,0).unwrap();
+    let blocked_count=|frames:&Vec<Vec<u8>>|frames.iter().filter(|bytes|{
+        let info=crate::wire_format::peek_frame_info(bytes).unwrap();
+        info.reliable.is_some_and(|h|h.flags & crate::wire_format::RELIABLE_FLAG_UNSEQUENCED==0)
+    }).count();
+    let reliable_first = blocked_count(&reliable_seen.lock().unwrap());
     let best_effort_first = best_effort_seen.lock().unwrap().len();
     assert!(reliable_first > 0);
     assert!(best_effort_first > 0);
@@ -3398,7 +3417,8 @@ fn router_unacked_discovery_blocks_only_the_affected_side() {
     // assertion into a reliable-retransmit timing test.
     now_ms.store(0, Ordering::SeqCst);
     router.process_tx_queue().unwrap();
-    assert_eq!(reliable_seen.lock().unwrap().len(), reliable_first);
+    assert_eq!(blocked_count(&reliable_seen.lock().unwrap()), reliable_first);
+    assert!(router.test_schema_owner_current(held_side,&held_schema));
     assert!(best_effort_seen.lock().unwrap().len() > best_effort_first);
 }
 
@@ -3432,7 +3452,7 @@ fn relay_does_not_stack_periodic_discovery_behind_an_unacked_snapshot() {
 }
 
 #[test]
-fn relay_unacked_discovery_blocks_only_the_affected_side() {
+fn relay_unacked_schema_blocks_only_the_affected_side() {
     let now_ms = Arc::new(AtomicU64::new(0));
     let reliable_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let best_effort_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3441,7 +3461,7 @@ fn relay_unacked_discovery_blocks_only_the_affected_side() {
     let relay = Relay::new(Box::new(SharedClock {
         now_ms: now_ms.clone(),
     }));
-    relay.add_side_packed_with_options(
+    let held_side=relay.add_side_packed_with_options(
         "reliable_radio",
         move |bytes| {
             reliable_seen_c.lock().unwrap().push(bytes.to_vec());
@@ -3463,7 +3483,12 @@ fn relay_unacked_discovery_blocks_only_the_affected_side() {
 
     assert!(relay.poll_discovery().unwrap());
     relay.process_all_queues().unwrap();
-    let reliable_first = reliable_seen.lock().unwrap().len();
+    let held_schema=relay.test_hold_schema_owner(held_side,0).unwrap();
+    let blocked_count=|frames:&Vec<Vec<u8>>|frames.iter().filter(|bytes|{
+        let info=crate::wire_format::peek_frame_info(bytes).unwrap();
+        info.reliable.is_some_and(|h|h.flags & crate::wire_format::RELIABLE_FLAG_UNSEQUENCED==0)
+    }).count();
+    let reliable_first = blocked_count(&reliable_seen.lock().unwrap());
     let best_effort_first = best_effort_seen.lock().unwrap().len();
     assert!(reliable_first > 0);
     assert!(best_effort_first > 0);
@@ -3474,7 +3499,8 @@ fn relay_unacked_discovery_blocks_only_the_affected_side() {
     assert!(relay.poll_discovery().unwrap());
     now_ms.store(0, Ordering::SeqCst);
     relay.process_tx_queue().unwrap();
-    assert_eq!(reliable_seen.lock().unwrap().len(), reliable_first);
+    assert_eq!(blocked_count(&reliable_seen.lock().unwrap()), reliable_first);
+    assert!(relay.test_schema_owner_current(held_side,&held_schema));
     assert!(best_effort_seen.lock().unwrap().len() > best_effort_first);
 }
 
@@ -7276,7 +7302,22 @@ fn router_and_relay_memory_layout_exports_queue_breakdown() {
 
 #[test]
 fn router_runtime_memory_budget_caps_queued_state() {
+    let _ = crate::config::try_get_message_meta(DataType::TelemetryError);
     crate::tests::ensure_common_test_schema();
+    // This best-effort fixture is declared in the test schema, but is not a
+    // built-in protocol type or part of the smaller common fixture. Register
+    // only its declared runtime metadata when running this test in isolation.
+    if DataType::try_named("BAROMETER_DATA").is_none() {
+        let fixture = crate::config::schema_snapshot_from_json_bytes(include_bytes!(
+            "../../../telemetry_config.test.json"
+        )).unwrap();
+        let barometer = fixture.types.into_iter()
+            .find(|ty| ty.name == "BAROMETER_DATA").unwrap();
+        register_data_type_with_description(
+            &barometer.name, &barometer.description, barometer.element,
+            &barometer.endpoints, barometer.reliable, barometer.priority,
+        ).unwrap();
+    }
     let ep = DataEndpoint::named("RADIO");
     // Leave room for the initial discovery snapshot, then verify that
     // sustained user traffic remains within the shared pool.

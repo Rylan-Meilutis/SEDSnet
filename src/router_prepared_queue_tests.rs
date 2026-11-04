@@ -298,7 +298,8 @@ fn atomic_queue_pending_active_unknown_packed_replay_and_owner_matrix() {
         1,
         ReliableSent {
             bytes: crate::shared_bytes::convert(Arc::<[u8]>::from(&b"retry"[..])),
-            last_send_ms: 0,
+            offer_stamp: 0,
+            first_offer: FirstHopOffer::Complete,
             retries: 0,
             queued: false,
             partial_acked: false,

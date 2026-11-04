@@ -228,6 +228,21 @@ pub const fn is_discovery_endpoint(ep: DataEndpoint) -> bool {
     matches!(ep, DataEndpoint::Discovery)
 }
 
+/// Announcer-producing metadata must bootstrap before a shared side knows its peers.
+/// Keep schema, requests, managed values and application reliability unchanged.
+#[inline]
+pub(crate) const fn is_announcer_bootstrap_type(ty: DataType) -> bool {
+    matches!(ty, DataType::DiscoveryAddress | DataType::DiscoveryAnnounce
+        | DataType::DiscoveryTimeSyncSources | DataType::DiscoveryTopology)
+}
+
+/// Baseline repair reissues these idempotent network queries. This transport
+/// policy does not cover managed GET, values, commands or application data.
+#[inline]
+pub(crate) const fn is_periodic_discovery_request_type(ty: DataType) -> bool {
+    matches!(ty,DataType::DiscoveryTopologyRequest|DataType::DiscoverySchemaRequest)
+}
+
 /// Returns `true` when the data type is a discovery control packet type.
 #[inline]
 pub const fn is_discovery_type(ty: DataType) -> bool {
@@ -260,7 +275,7 @@ pub const fn is_discovery_request_type(ty: DataType) -> bool {
 }
 
 fn sort_dedup_strings(items: &mut Vec<String>) {
-    items.sort_unstable();
+    crate::small_sort::sort(items);
     items.dedup();
 }
 
@@ -889,7 +904,7 @@ pub fn decode_discovery_timesync_sources_payload(payload: &[u8]) -> TelemetryRes
         return Err(TelemetryError::Unpack("discovery timesync trailing bytes"));
     }
 
-    out.sort_unstable();
+    crate::small_sort::sort(&mut out);
     out.dedup();
     Ok(out)
 }
@@ -982,6 +997,86 @@ pub(crate) fn topology_snapshot_scratch<'a>(
     )
 }
 
+#[derive(Clone, Copy)]
+struct TopologyScratchView<'a> {
+    name: &'a str,
+    endpoints: &'a [DataEndpoint],
+    sources: &'a [String],
+    connections: &'a [String],
+    backlink: bool,
+}
+
+// Borrowed lazy flattening: cloning never re-fetches the current peer. Like
+// FlatMap's fused outer iterator, the first missing peer ends this cursor.
+#[derive(Clone)]
+struct TopologyScratchViews<'a, 'f> {
+    peer_at: &'f dyn Fn(usize) -> Option<TopologyScratchPeer<'a>>,
+    next_peer: usize,
+    current: Option<TopologyScratchPeer<'a>>,
+    next_board: usize,
+    finished: bool,
+}
+impl<'a, 'f> TopologyScratchViews<'a, 'f> {
+    fn new(peer_at: &'f dyn Fn(usize) -> Option<TopologyScratchPeer<'a>>) -> Self {
+        Self { peer_at, next_peer: 0, current: None, next_board: 0, finished: false }
+    }
+}
+impl<'a> Iterator for TopologyScratchViews<'a, '_> {
+    type Item = TopologyScratchView<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished { return None; }
+        loop {
+            if let Some((name, endpoints, sources, boards)) = self.current {
+                if boards.is_empty() {
+                    self.current = None;
+                    return Some(TopologyScratchView { name, endpoints, sources, connections: &[], backlink: true });
+                }
+                if let Some(board) = boards.get(self.next_board) {
+                    self.next_board += 1;
+                    return Some(TopologyScratchView {
+                        name: &board.sender_id, endpoints: &board.reachable_endpoints,
+                        sources: &board.reachable_timesync_sources, connections: &board.connections,
+                        backlink: board.sender_id == name,
+                    });
+                }
+                self.current = None;
+            }
+            let peer = (self.peer_at)(self.next_peer);
+            self.next_peer = self.next_peer.saturating_add(1);
+            match peer {
+                Some(peer) => { self.current = Some(peer); self.next_board = 0; }
+                None => { self.finished = true; return None; }
+            }
+        }
+    }
+}
+
+enum ScratchPriorQuery<'a> {
+    Any,
+    Endpoint(&'a DataEndpoint),
+    Source(&'a String),
+    Connection(&'a String, &'a str),
+    Backlink(&'a str),
+}
+#[cfg_attr(not(feature = "std"), inline(never))]
+fn prior_scratch_view_matches(views: TopologyScratchViews<'_, '_>, limit: usize,
+    name: &str, query: ScratchPriorQuery<'_>) -> bool {
+    for old in views.take(limit) {
+        if old.name != name { continue; }
+        let matches = match query {
+            ScratchPriorQuery::Any => true,
+            ScratchPriorQuery::Endpoint(endpoint) => old.endpoints.contains(endpoint),
+            ScratchPriorQuery::Source(source) => old.sources.contains(source),
+            ScratchPriorQuery::Connection(connection, sender) =>
+                old.connections.contains(connection) || (old.backlink && connection == sender),
+            ScratchPriorQuery::Backlink(sender) =>
+                old.backlink || old.connections.iter().any(|value| value == sender),
+        };
+        if matches { return true; }
+    }
+    false
+}
+
 #[inline(never)]
 fn topology_snapshot_scratch_impl<'a>(
     sender: &str,
@@ -1001,14 +1096,6 @@ fn topology_snapshot_scratch_impl<'a>(
             peer
         }
     });
-    #[derive(Clone, Copy)]
-    struct View<'a> {
-        name: &'a str,
-        endpoints: &'a [DataEndpoint],
-        sources: &'a [String],
-        connections: &'a [String],
-        backlink: bool,
-    }
     let node_size = core::mem::size_of::<TopologyBoardNode>();
     let string_size = core::mem::size_of::<String>();
     let mut nodes = 1usize;
@@ -1027,31 +1114,9 @@ fn topology_snapshot_scratch_impl<'a>(
     }
     // Mirror the union used by merge_topology_boards without creating owned
     // scratch. Overlapping peer catalogs retain each node and field only once.
-    let views = peers.flat_map(|(name, endpoints, sources, boards)| {
-        core::iter::once(View {
-            name,
-            endpoints,
-            sources,
-            connections: &[],
-            backlink: true,
-        })
-        .filter(move |_| boards.is_empty())
-        .chain(boards.iter().map(move |board| View {
-            name: &board.sender_id,
-            endpoints: &board.reachable_endpoints,
-            sources: &board.reachable_timesync_sources,
-            connections: &board.connections,
-            backlink: board.sender_id == name,
-        }))
-    });
+    let views = TopologyScratchViews::new(peer_at);
     for (index, node) in views.clone().enumerate() {
-        let prior = || {
-            views
-                .clone()
-                .take(index)
-                .filter(|old| old.name == node.name)
-        };
-        if node.name != sender && prior().next().is_none() {
+        if node.name != sender && !prior_scratch_view_matches(views.clone(), index, node.name, ScratchPriorQuery::Any) {
             nodes = nodes.saturating_add(1);
             graph = graph
                 .saturating_add(node_size)
@@ -1059,13 +1124,13 @@ fn topology_snapshot_scratch_impl<'a>(
             wire = wire.saturating_add(20).saturating_add(node.name.len());
         }
         for endpoint in node.endpoints {
-            if !prior().any(|old| old.endpoints.contains(endpoint)) {
+            if !prior_scratch_view_matches(views.clone(), index, node.name, ScratchPriorQuery::Endpoint(endpoint)) {
                 graph = graph.saturating_add(4);
                 wire = wire.saturating_add(4);
             }
         }
         for source in node.sources {
-            if !prior().any(|old| old.sources.contains(source)) {
+            if !prior_scratch_view_matches(views.clone(), index, node.name, ScratchPriorQuery::Source(source)) {
                 graph = graph
                     .saturating_add(string_size)
                     .saturating_add(source.len());
@@ -1074,9 +1139,8 @@ fn topology_snapshot_scratch_impl<'a>(
         }
         for connection in node.connections {
             if connection != node.name
-                && !prior().any(|old| {
-                    old.connections.contains(connection) || (old.backlink && connection == sender)
-                })
+                && !prior_scratch_view_matches(views.clone(), index, node.name,
+                    ScratchPriorQuery::Connection(connection, sender))
             {
                 graph = graph
                     .saturating_add(string_size)
@@ -1087,8 +1151,8 @@ fn topology_snapshot_scratch_impl<'a>(
         if node.backlink
             && node.name != sender
             && !node.connections.iter().any(|value| value == sender)
-            && !prior()
-                .any(|old| old.backlink || old.connections.iter().any(|value| value == sender))
+            && !prior_scratch_view_matches(views.clone(), index, node.name,
+                ScratchPriorQuery::Backlink(sender))
         {
             graph = graph
                 .saturating_add(string_size)
@@ -1472,7 +1536,7 @@ pub fn decode_discovery_topology_update(pkt: &Packet) -> TelemetryResult<Discove
         return Err(TelemetryError::Unpack("discovery topology trailing bytes"));
     }
     normalize_topology_boards(&mut boards);
-    removed.sort_unstable();
+    crate::small_sort::sort(&mut removed);
     removed.dedup();
     Ok(DiscoveryTopologyUpdate {
         incremental: true,
@@ -1886,7 +1950,7 @@ pub fn elect_discovery_master(local_sender: &str, boards: &[TopologyBoardNode]) 
     }
     nodes.entry(local_sender).or_default();
     for peers in nodes.values_mut() {
-        peers.sort_unstable();
+        crate::small_sort::sort(peers);
         peers.dedup();
     }
 
@@ -2537,3 +2601,7 @@ mod bounded_decode_tests {
         }
     }
 }
+
+#[cfg(all(test,feature="std"))]
+#[path="tests/topology_scratch_sharing_equivalence.rs"]
+mod topology_scratch_sharing_equivalence;

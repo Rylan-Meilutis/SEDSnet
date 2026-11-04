@@ -196,6 +196,17 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.10 highlights
+
+- Retain ordered frames and their sequence across transport backpressure, and bind inline acknowledgements to the exact active offer.
+- Bind schema and managed-request receipts to the original publisher, side and packet.
+- Distinguish physical-hop neighbors from relayed addresses, including compact numeric aliases.
+- Add std-only prepared managed-variable batches with atomic cache and queue admission.
+- Reduce embedded routing and accounting overhead without reducing precision or configured limits.
+- Keep wire encoding, C event ABI, application message identities and macro crate 2.2.0 unchanged.
+
+Use matching 4.3.10 peers for publisher-bound schema and managed-request receipt exchanges. Legacy 4.3.9 control receipts do not satisfy those new bound exchanges.
+
 ### Version 4.3.9 highlights
 
 - Add std-only caller-owned decoded-packet preparation and atomic queued admission with a pending-reliable-type fence, plus a nonwaiting conservative ownership inspector.

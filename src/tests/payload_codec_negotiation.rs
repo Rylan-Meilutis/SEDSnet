@@ -17,6 +17,7 @@ fn data_packet() -> Packet {
     Packet::new(ty, &[endpoint], "HOST", 123, Arc::from(vec![b'A'; 4096])).unwrap()
 }
 fn fixture(peers: &[(&str, Option<bool>)]) -> (Router, RouterSideId, Arc<Mutex<Vec<Vec<u8>>>>) {
+    crate::tests::ensure_common_test_schema();
     let output = Arc::new(Mutex::new(Vec::new()));
     let capture = output.clone();
     let node = Router::new_with_clock(RouterConfig::new([]).with_sender("HOST"), Box::new(|| 100));

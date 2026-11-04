@@ -55,3 +55,46 @@ mod scoped_inspection_tests {
         assert_eq!(consumer, &[7; 32]);
     }
 }
+
+/// Immutable storage-owner identity, without decoding/pinning bytes under Core.
+pub(crate) fn same_owner(left: &SharedBytes, right: &SharedBytes) -> bool {
+    #[cfg(not(feature = "compact-packet-store"))]
+    { alloc::sync::Arc::ptr_eq(left,right) }
+    #[cfg(feature = "compact-packet-store")]
+    {
+        match (left,right) {
+            (crate::small_payload::SmallPayload::Heap(a),crate::small_payload::SmallPayload::Heap(b)) => alloc::sync::Arc::ptr_eq(a,b),
+            (crate::small_payload::SmallPayload::Managed(a),crate::small_payload::SmallPayload::Managed(b)) => a.same_owner(b),
+            _ => false,
+        }
+    }
+}
+
+/// Bounded sequential field reads avoid nested arena locks and persistent pins.
+/// A hash match is never authority for merging two retained commands.
+pub(crate) fn equal_bytes(left: &SharedBytes,right: &SharedBytes) -> crate::TelemetryResult<bool> {
+    if same_owner(left,right) {return Ok(true)}
+    if left.len() != right.len() {return Ok(false)}
+    let mut offset = 0;
+    let mut a = [0u8;32];
+    let mut b = [0u8;32];
+    while offset < left.len() {
+        let count = (left.len()-offset).min(a.len());
+        read_range(left,offset,&mut a[..count])?;
+        read_range(right,offset,&mut b[..count])?;
+        if a[..count] != b[..count] {return Ok(false)}
+        offset += count;
+    }
+    Ok(true)
+}
+fn read_range(bytes: &SharedBytes,offset: usize,out: &mut [u8]) -> crate::TelemetryResult<()> {
+    #[cfg(feature="compact-packet-store")]
+    { bytes.read_range(offset,out) }
+    #[cfg(not(feature="compact-packet-store"))]
+    {
+        let end = offset.checked_add(out.len()).filter(|end| *end <= bytes.len())
+            .ok_or(crate::TelemetryError::Unpack("payload range out of bounds"))?;
+        out.copy_from_slice(&bytes[offset..end]);
+        Ok(())
+    }
+}

@@ -25,6 +25,7 @@ fn fixture() -> (Router, usize, usize) {
     (node, a, b)
 }
 fn fixture_with_clock() -> (Router, usize, usize, Arc<core::sync::atomic::AtomicU64>) {
+    let _ = crate::config::try_get_message_meta(DataType::TelemetryError);
     #[cfg(feature = "compact-packet-store")]
     crate::packet_store::set_default_store(Some(
         crate::packet_store::PacketStore::new(32768, 512, 512).unwrap(),
@@ -325,7 +326,15 @@ fn shared_chunk_budget_sheds_fast_bulk_before_slow_report_and_control() {
     );
     for index in 0..16 {
         node.decode_side_transport_frame(a, &fragment(99, index, 28, &[7; 112]))
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "shared chunk admission failed: fragment_index={index}/16 total_fragments=28 payload_bytes=112 error={error:?}; layout={}; queue_lengths_rx_tx_recent={:?}; remaining_e2e_owners={}; retained_packet_rows={:?}",
+                    node.export_memory_layout_json(),
+                    node.debug_queue_lengths(),
+                    node.debug_end_to_end_tracked_count(),
+                    packet_rows(&node),
+                )
+            });
     }
     let after = packet_rows(&node);
     assert!(
@@ -484,4 +493,70 @@ fn shared_chunk_budget_busy_preserves_already_received_fragments() {
         &raw[..],
         "same-fragment retry must complete the exact packet"
     );
+}
+
+#[cfg(feature = "discovery")]
+fn admitted_probe(name: &str, priority: u8) -> Packet {
+    let endpoint = crate::config::register_endpoint_with_description(&format!("{name}_ENDPOINT"),"caller-owned endpoint",false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        name,"caller-owned data",crate::MessageElement::Static(1,crate::MessageDataType::UInt8,crate::MessageClass::Data),
+        &[endpoint],crate::ReliableMode::None,priority,
+    ).unwrap();
+    Packet::new(ty,&[endpoint],"APP",0,Arc::<[u8]>::from([1])).unwrap()
+}
+
+#[test]
+#[cfg(feature = "discovery")]
+fn metadata_prefers_unknown_partial_and_preserves_known_peer_catalog() {
+    let _store_reset = StoreReset;
+    let (node, unknown, known) = fixture();
+    let announced = discovery::build_discovery_announce("KNOWN_SCHEMA_PEER",0,&[]).unwrap();
+    node.rx_from_side(&announced,known).unwrap();
+    let probe = admitted_probe("LOW_PRIORITY_TRANSIT_PROTECTION",0);
+    node.rx_queue_from_side(probe,unknown).unwrap();
+    let catalog = discovery::build_discovery_schema("KNOWN_SCHEMA_PEER",0).unwrap();
+    let raw = wire_format::pack_packet(&catalog);
+    assert!(raw.len()>32);
+    for (side,id) in [(unknown,50),(known,60)] {
+        node.decode_side_transport_frame(side,&fragment(id,0,3,&raw[..32])).unwrap();
+    }
+    let mut state=node.state.lock();
+    let reliable_before=state.reliable_tx.len();
+    let schema_before=state.discovery_side_throttle.len();
+    state.memory.max_queue_budget=state.shared_queue_bytes_used();
+    state.make_shared_queue_room(1,241,Some(&RouterItem::Packet(catalog))).unwrap();
+    assert!(!state.side_transport[&unknown].rx_chunks.contains_key(&50));
+    assert!(state.side_transport[&known].rx_chunks.contains_key(&60));
+    assert_eq!(state.received_queue.len(),1,"admitted transit must survive network metadata growth");
+    assert!(!state.reclaim_unannounced_incomplete_chunk(),"known peer catalog must remain protected");
+    assert_eq!(state.reliable_tx.len(),reliable_before);
+    assert_eq!(state.discovery_side_throttle.len(),schema_before);
+}
+
+#[test]
+#[cfg(feature = "discovery")]
+fn ordinary_admission_does_not_gain_control_partial_reclamation() {
+    let _store_reset=StoreReset;
+    let (node,unknown,_)=fixture();
+    node.decode_side_transport_frame(unknown,&fragment(70,0,3,&[7;32])).unwrap();
+    let mut state=node.state.lock();
+    state.memory.max_queue_budget=state.shared_queue_bytes_used();
+    assert!(state.make_shared_queue_room(1,0,None).is_err());
+    assert!(state.side_transport[&unknown].rx_chunks.contains_key(&70));
+}
+
+#[test]
+#[cfg(feature = "discovery")]
+fn high_priority_application_data_keeps_existing_queue_victim_policy() {
+    let _store_reset=StoreReset;
+    let (node,unknown,_)=fixture();
+    let probe=admitted_probe("LOW_PRIORITY_TRANSIT_APP_CONTROL",0);
+    let incoming=admitted_probe("HIGH_PRIORITY_APP_RECLAIM_CONTROL",250);
+    node.rx_queue_from_side(probe,unknown).unwrap();
+    node.decode_side_transport_frame(unknown,&fragment(80,0,3,&[7;32])).unwrap();
+    let mut state=node.state.lock();
+    state.memory.max_queue_budget=state.shared_queue_bytes_used();
+    state.make_shared_queue_room(1,250,Some(&RouterItem::Packet(incoming))).unwrap();
+    assert!(state.side_transport[&unknown].rx_chunks.contains_key(&80));
+    assert_eq!(state.received_queue.len(),0,"application traffic must retain existing queue-victim fallback");
 }

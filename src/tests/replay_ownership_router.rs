@@ -250,6 +250,7 @@ fn accepted_original_contract_survives_control_eviction_before_first_dispatch() 
 
 #[test]
 fn control_admission_reclaims_best_effort_before_an_accepted_reliable_original() {
+    let _ = crate::config::try_get_message_meta(DataType::TelemetryError);
     crate::tests::ensure_common_test_schema();
     for packed in [false, true] {
         let node = Router::new_with_clock(RouterConfig::new([]), Box::new(|| 1000));

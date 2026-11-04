@@ -51,7 +51,7 @@ fn relay_chunk_identity_and_loss_are_bounded() {
 }
 
 #[test]
-fn unacknowledged_topology_does_not_silence_relay_liveness() {
+fn unacknowledged_schema_does_not_silence_relay_liveness() {
     use std::sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -75,6 +75,7 @@ fn unacknowledged_topology_does_not_silence_relay_liveness() {
     );
     relay.announce_discovery().unwrap();
     relay.process_tx_queue().unwrap();
+    let held_schema=relay.test_hold_schema_owner(side,0).unwrap();
     assert!(
         relay
             .state
@@ -82,16 +83,20 @@ fn unacknowledged_topology_does_not_silence_relay_liveness() {
             .reliable_tx
             .iter()
             .any(|((s, ty), tx)| *s == side
-                && *ty == crate::DataType::DiscoveryTopology.as_u32()
+                && *ty == crate::DataType::DiscoverySchema.as_u32()
                 && !tx.sent.is_empty())
     );
+    assert!(relay.state.lock().reliable_tx.get(&(side,crate::DataType::DiscoverySchema.as_u32()))
+        .and_then(|stream|stream.sent.get(&held_schema.0)).is_some_and(|sent|sent.bytes.as_ref()==held_schema.1.as_ref()));
     emitted.lock().unwrap().clear();
     for ms in (1_000..=60_000).step_by(1_000) {
         now.store(ms, Ordering::Relaxed);
         relay.poll_discovery().unwrap();
-        // Hold the baseline ACK outstanding; drain only new advertisements.
+        // Hold the schema ACK outstanding; drain only new advertisements.
         drain_originals_without_reliable_timeouts(&relay).unwrap();
     }
+    assert!(relay.state.lock().reliable_tx.get(&(side,crate::DataType::DiscoverySchema.as_u32()))
+        .and_then(|stream|stream.sent.get(&held_schema.0)).is_some_and(|sent|sent.bytes.as_ref()==held_schema.1.as_ref()));
     let frames = emitted.lock().unwrap();
     let types: Vec<_> = frames
         .iter()
@@ -103,7 +108,7 @@ fn unacknowledged_topology_does_not_silence_relay_liveness() {
         .count();
     assert!(
         (3..=5).contains(&pings),
-        "keepalives must continue at a bounded rate despite a lost topology ACK; got {pings}"
+        "keepalives must continue at a bounded rate despite a lost schema ACK; got {pings}"
     );
     assert!(
         types
@@ -1196,7 +1201,8 @@ fn relay_tx_service_consumes_queued_receipt_before_retry() {
         1,
         ReliableSent {
             bytes: crate::shared_bytes::convert(wire_format::pack_packet(&packet)),
-            last_send_ms: 0,
+            offer_stamp: 0,
+            first_offer: FirstHopOffer::Complete,
             retries: 0,
             queued: false,
             partial_acked: false,

@@ -980,7 +980,10 @@ fn pack_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]
 /// # Returns
 /// - `Ok(Arc<[u8]>)` containing the packed frame bytes.
 /// - `Err(TelemetryError)` if contract encoding fails.
-#[cfg(any(test, not(feature = "compression")))]
+#[cfg(any(
+    not(feature = "compression"),
+    all(test, any(feature = "discovery", feature = "latest-value-egress"))
+))]
 pub(crate) fn pack_packet_with_wire_contract(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,

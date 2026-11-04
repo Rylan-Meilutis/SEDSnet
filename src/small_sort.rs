@@ -72,3 +72,36 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod string_heap_equivalence {
+    use super::heap_sort;
+    use alloc::{string::String,vec::Vec};
+    fn samples(length:usize)->Vec<String> {
+        let words=["", "a", "aa", "A", "é", "λ", "a\0b", "z", "same"];
+        (0..length).map(|index|{
+            let word=words[(index*7+length)%words.len()];
+            let mut value=String::with_capacity(word.len()+if index%2==0{4096}else{0});value.push_str(word);value
+        }).collect()
+    }
+    #[test]
+    fn string_heap_sort_large_ties_empty_unicode_and_capacities_match_values() {
+        for length in [0,1,2,3,7,8,16,64,255,1024] {
+            let mut values=samples(length);let mut expected=values.clone();expected.sort_unstable();
+            let mut allocations=values.iter().map(|s|(s.as_ptr()as usize,s.len(),s.capacity())).collect::<Vec<_>>();allocations.sort_unstable();
+            heap_sort(&mut values);assert_eq!(values,expected);
+            let mut after=values.iter().map(|s|(s.as_ptr()as usize,s.len(),s.capacity())).collect::<Vec<_>>();after.sort_unstable();
+            assert_eq!(after,allocations,"sort moves owners without duplicating/dropping allocations");
+            values.dedup();expected.dedup();assert_eq!(values,expected);
+            // Equal-value allocation choice is intentionally not asserted.
+        }
+    }
+    #[test]
+    fn borrowed_string_heap_sort_matches_lexical_dedup_values() {
+        for length in [0,1,2,7,16,255,1024] {
+            let owners=samples(length);let mut values=owners.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut expected=values.clone();expected.sort_unstable();heap_sort(&mut values);assert_eq!(values,expected);
+            values.dedup();expected.dedup();assert_eq!(values,expected);
+        }
+    }
+}
