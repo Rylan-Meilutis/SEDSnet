@@ -33,13 +33,18 @@ class CiReleaseContracts(unittest.TestCase):
         )
         self.assertIn("python3 publish_crates.py", workflow)
 
-    def test_full_qualification_installs_i686_c_toolchain(self) -> None:
+    def test_full_qualification_installs_and_checks_cmake_ninja_and_i686_toolchain(self) -> None:
         for path in (".github/workflows/ci.yaml", ".github/workflows/release.yml", ".gitlab-ci.yml"):
             with self.subTest(workflow=path):
                 workflow = (REPO_ROOT / path).read_text()
                 install = next(line for line in workflow.splitlines()
                                if 'apt-get install' in line and 'gcc-arm-none-eabi' in line)
-                self.assertIn('gcc-multilib', install)
+                for package in ('gcc-multilib', 'cmake', 'ninja-build'):
+                    self.assertIn(package, install.split())
+                before_full_gate = workflow.split('python3 publish_crates.py', 1)[0]
+                for preflight in ('command -v cmake', 'command -v ninja', 'cmake --version', 'ninja --version'):
+                    self.assertIn(preflight, before_full_gate)
+
 
     def test_release_gate_checks_experimental_storage(self) -> None:
         for quick in (False, True):

@@ -27,7 +27,11 @@ rust-tests:
     CARGO_PROFILE_TEST_DEBUG: "0"
   before_script:
     - apt-get update
-    - apt-get install -y cmake gcc-arm-none-eabi gcc-multilib gnuplot python3-tk
+    - apt-get install -y cmake ninja-build gcc-arm-none-eabi gcc-multilib gnuplot python3-tk
+    - command -v cmake
+    - command -v ninja
+    - cmake --version
+    - ninja --version
     - rustup component add clippy rustfmt
     - cargo install cargo-nextest --locked
   script:
