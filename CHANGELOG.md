@@ -3,6 +3,20 @@
 ## Unreleased
 
 
+## 4.3.11
+
+Wire framing, application message identities and C event layouts retain their
+4.3.10 representations. The macro crate remains at 2.2.0.
+
+- Recover network clocks that are more than five seconds behind using a fresh,
+  matched response from the currently elected time source. Ordinary announcements
+  and source updates retain the configured slew policy.
+- Retry expired time requests and reject consumed, stale, malformed or retired-source
+  responses before applying a forward correction.
+- Preserve normal slew for backward corrections and forward corrections of five
+  seconds or less, including the configured no-slew behavior.
+
+
 ## 4.3.10
 
 Packet framing, application message identities and C event layouts retain their
