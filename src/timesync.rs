@@ -367,6 +367,25 @@ impl SlewedNetworkClock {
         u64::try_from(unix_ns / 1_000_000).ok()
     }
 
+    /// Corrects a gross forward error only after the caller validates a fresh
+    /// request/response exchange with its currently elected source. Announce
+    /// traffic and ordinary source updates must continue using `steer_unix_ms`.
+    /// Backward and <=5-second corrections retain the configured slew policy.
+    pub(crate) fn steer_verified_response_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
+        let target_ns = (target_unix_ms as i128) * 1_000_000;
+        if self.max_slew_ppm != 0
+            && self.read_unix_ns(now_mono_ns).is_some_and(|current| {
+                target_ns.saturating_sub(current) > 5_000_000_000
+            })
+        {
+            self.anchor_mono_ns = now_mono_ns;
+            self.anchor_unix_ns = target_ns;
+            self.pending_adjust_ns = 0;
+            return;
+        }
+        self.steer_unix_ms(now_mono_ns, target_unix_ms);
+    }
+
     /// Steers the clock toward a target Unix millisecond reading at the configured slew rate.
     pub fn steer_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
         let target_unix_ns = (target_unix_ms as i128) * 1_000_000;
@@ -1149,5 +1168,181 @@ mod slew_absolute_target_tests {
                 Some((15_000 + offset_ms) as u64)
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod verified_forward_response_tests {
+    use super::*;
+    use crate::router::{Router, RouterConfig};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    const EPOCH: u64 = 1_783_000_000_000;
+    type Requests = Arc<Mutex<Vec<(u64, u64)>>>;
+    fn fixture() -> (Router, Arc<AtomicU64>, Requests) {
+        let now = Arc::new(AtomicU64::new(0));
+        let read = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::default().with_timesync(TimeSyncConfig {
+                role: TimeSyncRole::Consumer,
+                source_timeout_ms: 5000,
+                consumer_promotion_enabled: false,
+                ..Default::default()
+            }),
+            Box::new(move || read.load(Ordering::SeqCst)),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let capture = requests.clone();
+        router.add_side_packet("capture", move |packet| {
+            if packet.data_type() == DataType::TimeSyncRequest {
+                let words = packet.data_as_u64()?;
+                capture.lock().unwrap().push((words[0], words[1]));
+            }
+            Ok(())
+        });
+        router
+            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH - 466_000).unwrap())
+            .unwrap();
+        router.process_tx_queue().unwrap();
+        assert!(!requests.lock().unwrap().is_empty());
+        (router, now, requests)
+    }
+    fn response(sender: &'static str, seq: u64, t1: u64, t2: u64, t3: u64) -> Packet {
+        let packet = build_timesync_response(seq, t1, t2, t3).unwrap();
+        Packet::new(
+            DataType::TimeSyncResponse,
+            &[DataEndpoint::TimeSync],
+            sender,
+            packet.timestamp(),
+            packet.payload().into(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn verified_forward_threshold_and_backward_slew_are_monotonic() {
+        for (offset, expected) in [(5000, 10_000), (5001, 15_001)] {
+            let mut clock = SlewedNetworkClock::new(50_000);
+            clock.steer_unix_ms(0, 10_000);
+            clock.steer_verified_response_ms(0, 10_000 + offset);
+            assert_eq!(clock.read_unix_ms(0), Some(expected));
+        }
+        let mut clock = SlewedNetworkClock::new(50_000);
+        clock.steer_unix_ms(0, EPOCH);
+        clock.steer_verified_response_ms(0, EPOCH - 466_000);
+        assert_eq!(clock.read_unix_ms(0), Some(EPOCH));
+        assert_eq!(clock.read_unix_ms(1_000_000_000), Some(EPOCH + 950));
+        let mut disabled = SlewedNetworkClock::new(0);
+        disabled.steer_unix_ms(0, EPOCH);
+        disabled.steer_verified_response_ms(0, EPOCH + 466_000);
+        assert_eq!(disabled.read_unix_ms(0), Some(EPOCH));
+    }
+    #[test]
+    fn fresh_elected_response_recovers_minutes_in_one_exchange_and_is_consumed() {
+        let (router, now, requests) = fixture();
+        let (seq, t1) = requests.lock().unwrap()[0];
+        now.store(200, Ordering::SeqCst);
+        // Announce alone cannot hard-correct an already initialized clock.
+        router
+            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH + 200).unwrap())
+            .unwrap();
+        assert!(router.network_time_ms().unwrap() < EPOCH);
+        router
+            .rx(&response("GS", seq, t1, EPOCH + 100, EPOCH + 100))
+            .unwrap();
+        assert_eq!(router.network_time_ms(), Some(EPOCH + 200));
+        now.store(250, Ordering::SeqCst);
+        router
+            .rx(&response(
+                "GS",
+                seq,
+                t1,
+                EPOCH + 1_000_000,
+                EPOCH + 1_000_000,
+            ))
+            .unwrap();
+        assert_eq!(
+            router.network_time_ms(),
+            Some(EPOCH + 250),
+            "consumed challenge cannot be replayed with fresh packet metadata"
+        );
+    }
+    #[test]
+    fn malformed_wrong_source_or_expired_responses_cannot_rebase() {
+        for case in 0..7 {
+            let (router, now, requests) = fixture();
+            let (seq, t1) = requests.lock().unwrap()[0];
+            let elapsed = if case == 4 { 5001 } else { 200 };
+            now.store(elapsed, Ordering::SeqCst);
+            let before = router.network_time_ms().unwrap();
+            let packet = match case {
+                0 => response("other", seq, t1, EPOCH, EPOCH),
+                1 => response("GS", seq + 1, t1, EPOCH, EPOCH),
+                2 => response("GS", seq, t1 + 1, EPOCH, EPOCH),
+                3 => response("GS", seq, t1, EPOCH + 1, EPOCH),
+                5 => response("GS", seq, t1, EPOCH, EPOCH + 201),
+                6 => response("GS", seq, 201, EPOCH, EPOCH),
+                _ => response("GS", seq, t1, EPOCH, EPOCH),
+            };
+            router.rx(&packet).unwrap();
+            assert_eq!(
+                router.network_time_ms(),
+                Some(before),
+                "invalid response case {case}"
+            );
+        }
+    }
+    #[test]
+    fn lost_challenge_expires_and_new_exchange_recovers_without_changing_leader() {
+        let (router, now, requests) = fixture();
+        let old = requests.lock().unwrap()[0];
+        now.store(5001, Ordering::SeqCst);
+        router
+            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH + 5001).unwrap())
+            .unwrap();
+        router.process_tx_queue().unwrap();
+        let fresh = *requests.lock().unwrap().last().unwrap();
+        assert_ne!(
+            fresh.0, old.0,
+            "lost challenge must not block subsequent requests forever"
+        );
+        let before = router.network_time_ms().unwrap();
+        router
+            .rx(&response(
+                "GS",
+                old.0,
+                old.1,
+                EPOCH + 50_000,
+                EPOCH + 50_000,
+            ))
+            .unwrap();
+        assert_eq!(
+            router.network_time_ms(),
+            Some(before),
+            "expired challenge cannot be reused after retry"
+        );
+        now.store(5101, Ordering::SeqCst);
+        router
+            .rx(&response(
+                "GS",
+                fresh.0,
+                fresh.1,
+                EPOCH + 5051,
+                EPOCH + 5051,
+            ))
+            .unwrap();
+        assert_eq!(router.network_time_ms(), Some(EPOCH + 5101));
+    }
+    #[test]
+    fn response_from_retired_leader_cannot_correct_clock() {
+        let (router, now, requests) = fixture();
+        let (seq, t1) = requests.lock().unwrap()[0];
+        now.store(100, Ordering::SeqCst);
+        router
+            .rx(&build_timesync_announce_with_sender("replacement", 0, EPOCH - 465_900).unwrap())
+            .unwrap();
+        let before = router.network_time_ms().unwrap();
+        router.rx(&response("GS", seq, t1, EPOCH, EPOCH)).unwrap();
+        assert_eq!(router.network_time_ms(), Some(before));
     }
 }
