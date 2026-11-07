@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## Version 4.3.12 highlights
+
+- Expose `packet::sender_address_u32` for existing 32-bit compact source identities without packet packing or wire-name cache changes.
+- Add `Router::prepare_targeted_packet` to prepare an owned application packet for an explicit frozen logical recipient cohort without enqueueing or sending.
+- Keep 64-bit wire-target symbols, 32-bit compact source identities and assigned node addresses distinct. Recipient metadata is not authentication, freshness or physical-incarnation evidence.
+- Return the original packet for unknown, ambiguous, duplicate, empty or conflicting recipients; preserve an identical existing wire cohort without rewriting it.
+- Keep supported build and publisher entrypoints while moving internal release helpers under `scripts`; wire framing, schemas, default features and macro crate 2.2.0 remain unchanged.
+
 ## Version 4.3.11 highlights
 
 - Recover a network clock more than five seconds behind from a fresh, matched response by the elected time source.

@@ -14,6 +14,22 @@ Or from git:
 sedsnet = { git = "https://github.com/Rylan-Meilutis/sedsnet.git", branch = "main" }
 ```
 
+## Compact sender identity
+
+From 4.3.12, compare the compact wire-source identity of an exact sender string
+without constructing or packing a packet:
+
+```rust
+let source = sedsnet::packet::sender_address_u32("sensor-example");
+assert_eq!(sedsnet::packet::sender_address_u32(&format!("@addr:{source}")), source);
+```
+
+This pure helper does not learn names or modify router state. A valid `@addr:`
+`u32` alias retains its numeric identity, including zero; malformed aliases keep
+the existing ordinary-name hashing behavior. Compact identities can collide and
+are neither assigned/discovered node addresses nor authentication or route proof.
+Use the original router for its assigned node address.
+
 ## Minimal router example
 
 ```rust
@@ -647,3 +663,28 @@ For ordinary loops, prefer `periodic(timeout_ms)` so time sync, discovery, and q
 together.
 
 See [Time-Sync](Time-Sync) for the protocol details.
+
+### Preparing a frozen logical recipient cohort
+
+`Router::prepare_targeted_packet(packet, &["sensor-a", "sensor-b"])` prepares
+an owned packet using the existing wire-target contract. It does not enqueue or
+send. Preparation may wait and allocate, so perform it outside admission and IO
+guards. Unknown, duplicate, ambiguous, empty, oversized, or conflicting frozen
+cohorts return the original packet with a typed error. Numeric `@addr:` aliases
+are not canonical recipient names.
+
+The returned `FrozenTargetPacket` exposes its packet and immutable
+`FrozenRecipient` snapshots. The 64-bit `wire_target_symbol` is distinct from the
+32-bit compact source address and assigned node address. Address/birth/owner
+metadata is optional: topology-only names do not acquire invented identity.
+Retained discovery is not freshness, authentication, physical incarnation, or
+receiver readiness. A replacement device using the same hostname cannot be
+distinguished by this logical wire contract. Applications needing original
+physical ownership must retain and validate that context separately.
+
+An identical existing frozen set is accepted without rewriting its wire order or
+shape. A different set is refused; later discovery cannot expand that packet's
+recipient list. `into_packet()` or `into_parts()` recovers caller ownership for
+the existing admission APIs. Preparation itself grants no Router or Session
+authority and does not read a clock, prune routes, learn names, pack/encrypt,
+invoke providers, allocate reliable sequence numbers, or perform network IO.

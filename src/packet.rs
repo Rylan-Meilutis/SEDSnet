@@ -133,13 +133,25 @@ pub fn hash_bytes_u64(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Stable compact source address derived from a logical sender name.
+/// Return the deterministic compact-wire source identity for a sender string.
 ///
-/// Network-master address assignment can override the discovery mapping at the
-/// routing layer, but standalone packets need a deterministic address so the
-/// canonical wire header never has to carry the sender string.
+/// This is the numeric source used by the canonical packet header and packet
+/// receipt identity. It is **not** a router's assigned/discovered node address:
+/// address assignment is a separate namespace and requires the original router.
+/// Pass the exact logical sender text whose wire identity is being compared.
+///
+/// A sender beginning with `@addr:` whose suffix parses as a `u32` preserves
+/// that numeric identity, including zero. Other strings (including malformed
+/// aliases) use the existing name hash, with a zero hash mapped to one. Distinct
+/// names can collide: this non-cryptographic 32-bit identity is neither sender
+/// authentication nor proof that a name, route, node or peer is known.
+///
+/// This function only reads its argument. It allocates nothing and changes no
+/// wire-name cache, router/address table, nonce, clock, provider or IO state.
+/// Packing a packet is different: hosted packing may remember its sender name.
+/// No name lookup, collision resolution or assigned-address substitution occurs.
 #[inline]
-pub(crate) fn sender_address_u32(sender: &str) -> u32 {
+pub fn sender_address_u32(sender: &str) -> u32 {
     // Unresolved wire senders retain their numeric identity through repacking
     // and receipts. Hashing the alias text would invent a different sender.
     if let Some(address) = sender
@@ -659,6 +671,39 @@ impl Packet {
     #[inline]
     pub(crate) fn wire_shape(&self) -> Option<MessageElement> {
         self.wire_shape
+    }
+
+    // Preparation reads payload storage without packing or learning sender names.
+    // Check multiplication before the existing shape validator can evaluate it.
+    pub(crate) fn validate_target_contract_shape(
+        &self,
+        shape: MessageElement,
+    ) -> TelemetryResult<()> {
+        if self.endpoints.is_empty() || self.payload.len() != self.data_size {
+            return Err(TelemetryError::BadArg);
+        }
+        if let MessageElement::Static(count, kind, _) = shape {
+            count.checked_mul(data_type_size(kind)).ok_or(TelemetryError::BadArg)?;
+        }
+        #[cfg(feature = "compact-packet-store")]
+        {
+            self.payload.with_slice(|bytes| Self::validate_payload_against_element(shape, bytes))?
+        }
+        #[cfg(not(feature = "compact-packet-store"))]
+        {
+            Self::validate_payload_against_element(shape, &self.payload)
+        }
+    }
+
+    // Caller has validated shape and conflicting cohorts before this infallible
+    // mutation. Every header/payload field remains untouched.
+    pub(crate) fn set_prepared_target_contract(
+        &mut self,
+        shape: MessageElement,
+        targets: Arc<[u64]>,
+    ) {
+        self.wire_shape = Some(shape);
+        self.wire_target_senders = Some(targets);
     }
 
     /// Return the frozen destination-holder hashes preserved from the wire contract.
