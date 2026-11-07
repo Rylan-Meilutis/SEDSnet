@@ -7516,7 +7516,12 @@ impl Router {
         let should_clear = st
             .pending_request
             .as_ref()
-            .is_some_and(|pending| Some(pending.source.as_str()) != active_remote);
+            .is_some_and(|pending| {
+                Some(pending.source.as_str()) != active_remote
+                    || now_ms < pending.t1_mono_ms
+                    || now_ms.saturating_sub(pending.t1_mono_ms)
+                        > st.cfg.map(|cfg| cfg.source_timeout_ms).unwrap_or(0)
+            });
         if should_clear {
             st.pending_request = None;
             st.next_request_mono_ms = now_ms;
@@ -14376,6 +14381,13 @@ impl Router {
                     if let Some(pending) = pending
                         && pending.seq == resp.seq
                         && pending.source == pkt.sender()
+                        && pending.t1_mono_ms == resp.t1_ms
+                        && now_mono_ms >= pending.t1_mono_ms
+                        && now_mono_ms - pending.t1_mono_ms <= cfg.source_timeout_ms
+                        && resp.t3_ms >= resp.t2_ms
+                        && resp.t3_ms - resp.t2_ms <= now_mono_ms - pending.t1_mono_ms
+                        && matches!(st.tracker.as_ref().and_then(|tracker|tracker.leader(now_mono_ms, has_usable_time)),
+                            Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pending.source)
                     {
                         let source_priority = {
                             let tracker = st.tracker.as_ref().expect("tracker checked above");
@@ -14410,7 +14422,7 @@ impl Router {
                         )?;
                         remote_update.commit(&mut st.remote_sources);
                         st.clock.commit_source(clock_update);
-                        st.disciplined_clock.steer_unix_ms(now_mono_ns, estimate_ms);
+                        st.disciplined_clock.steer_verified_response_ms(now_mono_ns, estimate_ms);
                         st.pending_request = None;
                     }
                 }

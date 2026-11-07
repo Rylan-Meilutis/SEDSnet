@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## Version 4.3.11 highlights
+
+- Recover a network clock more than five seconds behind from a fresh, matched response by the elected time source.
+- Reject consumed, stale, malformed and retired-source responses; retry expired time requests.
+- Preserve configured slew behavior for backward and smaller forward corrections, with 4.3.10 wire representations and macro crate 2.2.0 unchanged.
+
 ## Version 4.3.10 highlights
 
 - Retain ordered frames and their sequence across transport backpressure, and bind inline acknowledgements to the exact active offer.
