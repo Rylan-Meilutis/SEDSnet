@@ -22400,3 +22400,10 @@ mod cold_control_codegen_equivalence;
 #[cfg(all(test,feature="std"))]
 #[path="tests/unit_retry_sharing_equivalence.rs"]
 mod unit_retry_sharing_equivalence;
+
+#[path = "router_targeted_packet.rs"]
+mod targeted_packet;
+pub use targeted_packet::{
+    FrozenRecipient, FrozenTargetPacket, PrepareTargetedPacketError,
+    PrepareTargetedPacketErrorKind, MAX_PREPARED_TARGET_RECIPIENTS,
+};

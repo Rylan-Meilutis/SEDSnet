@@ -20,8 +20,8 @@ from base64 import b64encode
 from getpass import getpass
 from pathlib import Path
 from cargo_paths import cargo_target_directory
-import release_credentials
-from release_logging import redact_output, safe_command
+from scripts import release_credentials
+from scripts.release_logging import redact_output, safe_command
 
 RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
