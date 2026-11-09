@@ -3,6 +3,37 @@
 ## Unreleased
 
 
+## 4.3.13
+
+Wire framing, message schemas, configuration fields and C event layouts retain their
+4.3.12 representations. The macro crate remains at 2.2.0.
+
+- Carry time quality in the announce priority word: bit 63 marks a qualified
+  announce, bit 62 marks unanchored (non-UTC) time, bits 36..62 hold the reference
+  priority, bits 32..36 the stratum and bits 0..32 the tag of the announcer's own
+  source. Numeric order still ranks UTC before unanchored time, then priority, then
+  stratum.
+- Elect anchored UTC ahead of uptime or other unanchored time regardless of
+  configured priority or arrival order. Times before 2020-01-01T00:00:00Z are never
+  anchored. Legacy two-word announces with a plain priority are anchored only when
+  their time is plausible, at stratum 8.
+- Step an unanchored network clock onto UTC from the first anchored announce,
+  verified response or local reference; anchored clocks keep the existing slew and
+  verified-forward-step policy, and plausible UTC is never steered toward uptime.
+- Synchronize hop by hop: routers consume time sync traffic instead of relaying it.
+  A node following a remote re-serves it at the next stratum on its other sides only,
+  requests time on the side its source announces from, and names that source in the
+  upper 32 bits of the request sequence so other servers on a shared segment stay
+  silent. Leaf boards do not announce, and upstream links carry one announce,
+  request and response per interval.
+- Never select a source that names this node as its own source, and stop following
+  at stratum 15, so relays fall back to unanchored time when the reference disappears.
+- Mixed fleets: 4.3.12 and older nodes read qualified priority words as very large
+  plain priorities, so they rank qualified sources behind legacy ones but still follow
+  them when no legacy source exists. Legacy priorities at or above 2^63 decode as the
+  worst qualified rank.
+
+
 ## 4.3.12
 
 Wire framing, application message identities and C event layouts retain their
