@@ -103,7 +103,7 @@ fn check_window_credit(ordered: bool, packed: bool, route_churn: bool) {
         predecessors.push(packet.packet_id());
         node.register_end_to_end_reliable_tx(
             &RouterItem::Packet(packet),
-            Some(BTreeMap::from([(owner, side)])),
+            Some(OrdMap::from([(owner, side)])),
         )
         .unwrap();
     }

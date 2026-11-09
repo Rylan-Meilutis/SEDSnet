@@ -123,7 +123,7 @@ fn cached_type_native_record_growth_is_fully_charged() {
         ordered_type: Option<u32>,
         waiting_for_predecessor: bool,
         data: RouterItem,
-        pending_destinations: BTreeMap<u64, RouterSideId>,
+        pending_destinations: OrdMap<u64, RouterSideId>,
         tracked_destinations: bool,
         last_send_ms: u64,
         retries: u32,

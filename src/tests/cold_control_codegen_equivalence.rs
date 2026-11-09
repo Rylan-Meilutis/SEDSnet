@@ -14,7 +14,7 @@ fn byte_fold_matches_original_empty_mixed_keys_and_phases() {
     let mut state=node.state.lock();
     assert_eq!(state.first_offer_bytes_used(),0);
     for side in [9,2] {
-        let mut sent=BTreeMap::new();
+        let mut sent=OrdMap::new();
         for (seq,phase,len) in [(u32::MAX,FirstHopOffer::AckedActive,31),(1,FirstHopOffer::Complete,5),
             (17,FirstHopOffer::Pending,0),(8,FirstHopOffer::Active,11)] {
             sent.insert(seq,owner(phase,&vec![7;len]));
@@ -49,7 +49,7 @@ fn actual_receipt_scan_matches_ordered_cursor_max_and_exact_phase_owner() {
     let other=discovery::build_discovery_schema("CODEGEN_OTHER",1001).unwrap();
     let otherwire=wire_format::pack_packet_with_reliable(&other,wire_format::ReliableHeader{flags:0,seq:2,ack:0});
     let retained=crate::SharedBytes::from(wire.as_ref());
-    let mut sent=BTreeMap::new();
+    let mut sent=OrdMap::new();
     for (seq,phase,bytes) in [(u32::MAX,FirstHopOffer::Complete,retained.clone()),
         (8,FirstHopOffer::Complete,crate::SharedBytes::from(otherwire.as_ref())),
         (1,FirstHopOffer::Pending,retained.clone())] {

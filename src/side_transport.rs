@@ -1,7 +1,8 @@
 //! Shared wire codec for router and relay side transports.
 
 use crate::{DataType, TelemetryError, TelemetryResult, packet::hash_bytes_u64, wire_format};
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use crate::OrdMap;
+use alloc::{sync::Arc, vec::Vec};
 use crc32fast::Hasher as Crc32Hasher;
 
 const SIDE_TX_PROGRESS_TIMEOUT_MS: u64 = 2000;
@@ -929,7 +930,7 @@ impl SideChunkAssembly {
     // descriptor vector. The former 64-byte estimate included B-tree entries.
     const FRAGMENT_OVERHEAD: usize = 48;
     #[inline(never)]
-    pub(crate) fn oldest(chunks: &BTreeMap<u32, Self>, keep: Option<u32>) -> Option<(u32, u64)> {
+    pub(crate) fn oldest(chunks: &OrdMap<u32, Self>, keep: Option<u32>) -> Option<(u32, u64)> {
         let mut victim = None;
         let mut time = u64::MAX;
         // B-tree iteration already breaks equal-time ties by transfer ID.
@@ -1014,7 +1015,7 @@ impl SideChunkAssembly {
     }
     #[inline(never)]
     pub(crate) fn remove(
-        chunks: &mut BTreeMap<u32, Self>,
+        chunks: &mut OrdMap<u32, Self>,
         buffered: &mut usize,
         id: u32,
     ) -> Option<Self> {
@@ -1023,7 +1024,7 @@ impl SideChunkAssembly {
         Some(value)
     }
     #[inline(never)]
-    pub(crate) fn expire(chunks: &mut BTreeMap<u32, Self>, buffered: &mut usize, now: u64) -> u32 {
+    pub(crate) fn expire(chunks: &mut OrdMap<u32, Self>, buffered: &mut usize, now: u64) -> u32 {
         let mut reclaimed = 0u32;
         // Each link admits at most four assemblies. Reuse ordinary removal
         // rather than linking a second B-tree deletion/retention iterator.
@@ -1036,7 +1037,7 @@ impl SideChunkAssembly {
         reclaimed
     }
     pub(crate) fn make_room(
-        chunks: &mut BTreeMap<u32, Self>,
+        chunks: &mut OrdMap<u32, Self>,
         buffered: &mut usize,
         transfer_id: u32,
         index: u16,
@@ -1272,8 +1273,8 @@ mod incremental_chunk_cache_tests {
 mod expiry_chunk_cache_tests {
     use super::*;
 
-    fn fixture(entries: &[(u32, u64, usize)]) -> (BTreeMap<u32, SideChunkAssembly>, usize) {
-        let mut chunks = BTreeMap::new();
+    fn fixture(entries: &[(u32, u64, usize)]) -> (OrdMap<u32, SideChunkAssembly>, usize) {
+        let mut chunks = OrdMap::new();
         let mut buffered = 0usize;
         for &(id, last_seen_ms, length) in entries {
             let mut assembly = SideChunkAssembly {
@@ -1428,7 +1429,7 @@ mod chunk_slot_tests {
                 .is_err()
         );
         assert_eq!(assembly.last_seen_ms, 100);
-        let mut chunks = BTreeMap::from([(1, assembly)]);
+        let mut chunks = OrdMap::from([(1, assembly)]);
         let mut buffered = chunks[&1].byte_cost();
         // A repeated fragment cannot extend the original two-second expiry.
         SideChunkAssembly::expire(&mut chunks, &mut buffered, 2101);

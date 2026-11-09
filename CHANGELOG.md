@@ -3,6 +3,33 @@
 ## Unreleased
 
 
+## 4.3.14
+
+Wire framing, message schemas, configuration fields, C/Python APIs and desktop
+behavior retain their 4.3.13 representations. The macro crate remains at 2.2.0.
+This release reduces embedded flash so the full `embedded` feature set fits
+STM32G491-class boards (measured on a 463.5 KiB application region: from
+233,084 bytes over to 6,140 bytes free on stable Rust).
+
+- Build zstd for embedded targets with only the level-1 `fast` block compressor
+  and its size-oriented decoder variants (`ZSTD_EXCLUDE_*_BLOCK_COMPRESSOR`,
+  `HUF_FORCE_DECOMPRESS_X1`, `ZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT`,
+  `ZSTD_NO_INLINE`, `ZSTD_STRIP_ERROR_STRINGS`, `DYNAMIC_BMI2=0`). Payloads remain
+  standard zstd frames and every valid frame still decodes. Opt out with
+  `SEDSNET_EMBEDDED_CFLAGS_AUTO=0`.
+- Store every crate-internal ordered table in one sorted-`Vec` map/set on
+  embedded no_std builds instead of monomorphizing B-tree code per key/value
+  pair. Ordering, iteration and entry semantics are unchanged; inserts and
+  removals shift entries, which is cheap at embedded table sizes. Desktop/std
+  builds keep `BTreeMap`/`BTreeSet`.
+- Sort topology boards and links with the existing constant-scratch heapsort on
+  embedded builds.
+- Add an opt-in nightly route, `SEDSNET_EMBEDDED_BUILD_STD=1` (CMake
+  `SEDSNET_EMBEDDED_BUILD_STD=ON`), that rebuilds `core`/`alloc` for size and
+  aborts on panic without formatting; it saved a further 36,264 bytes on the
+  same board. It is off by default and stable builds are unchanged.
+
+
 ## 4.3.13
 
 Wire framing, message schemas, configuration fields and C event layouts retain their

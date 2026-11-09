@@ -767,6 +767,23 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
         "-fno-asynchronous-unwind-tables",
         "-DZSTD_DISABLE_ASM=1",
         "-DZSTD_LEGACY_SUPPORT=0",
+        # SEDSnet compresses payloads only at level 1 (the `fast` strategy), so
+        # the other block compressors are unreachable. Excluded strategies fall
+        # back to a lower one inside zstd; frames stay standard and decodable.
+        "-DZSTD_EXCLUDE_DFAST_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR",
+        # Size-over-speed decoder variants (zstd's "thin" configuration); they
+        # decode every valid frame, using the smaller single-symbol/short paths.
+        "-DHUF_FORCE_DECOMPRESS_X1=1",
+        "-DZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT=1",
+        "-DZSTD_NO_INLINE=1",
+        "-DZSTD_STRIP_ERROR_STRINGS=1",
+        "-DDYNAMIC_BMI2=0",
     ]
 
     keys = [
@@ -786,6 +803,33 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
         "info: applied embedded CFLAGS defaults for size (override with --env CFLAGS=... "
         "or disable via --env SEDSNET_EMBEDDED_CFLAGS_AUTO=0)."
     )
+
+
+def embedded_build_std_args(target: str, profile_name: str, env: dict[str, str]) -> list[str]:
+    """Opt-in nightly size route for bare-metal release builds.
+
+    Off by default; stable builds are unchanged. With
+    SEDSNET_EMBEDDED_BUILD_STD=1 the core/alloc libraries are rebuilt with
+    `optimize_for_size` and panics abort immediately without formatting,
+    removing panic messages/locations and most core::fmt code. Requires a
+    nightly toolchain with rust-src (SEDSNET_EMBEDDED_BUILD_STD_TOOLCHAIN,
+    default `nightly`, selected through RUSTUP_TOOLCHAIN).
+    """
+    if env.get("SEDSNET_EMBEDDED_BUILD_STD", "0").lower() not in ("1", "true", "on", "yes"):
+        return []
+    if "-none-" not in target or profile_name != "release-embedded":
+        print("info: SEDSNET_EMBEDDED_BUILD_STD applies only to bare-metal --release builds; ignoring.")
+        return []
+    env.setdefault("RUSTUP_TOOLCHAIN", env.get("SEDSNET_EMBEDDED_BUILD_STD_TOOLCHAIN", "nightly"))
+    print(f"info: rebuilding core/alloc for size with toolchain `{env['RUSTUP_TOOLCHAIN']}` "
+          "(SEDSNET_EMBEDDED_BUILD_STD).")
+    return [
+        "-Zbuild-std=core,alloc",
+        "-Zbuild-std-features=optimize_for_size",
+        "-Zpanic-immediate-abort",
+        "--config",
+        f'profile.{profile_name}.panic="immediate-abort"',
+    ]
 
 
 def install_wheel_file(build_mode: list[str], *, env: dict[str, str], repo_root: Path, target: str = "", feature_parts: list[str] | None = None) -> None:
@@ -1232,6 +1276,9 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
         if not target:
             print("info: no target specified using thumbv7em-none-eabihf")
             target = "thumbv7em-none-eabihf"
+        # Select an opt-in nightly toolchain before path remapping queries rustc.
+        build_std_args = embedded_build_std_args(
+            target, "release-embedded" if release_build else "debug", env)
         apply_embedded_cflags_defaults(target, env)
         if not has_embedded_c_toolchain(target, env):
             expected = ", ".join(preferred_cross_compilers(target)) or "CC_<target>/TARGET_CC"
@@ -1246,6 +1293,7 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
                     file=sys.stderr,
                 )
         build_args = [
+            *build_std_args,
             "--no-default-features",
             "--target",
             target,

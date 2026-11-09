@@ -1,4 +1,4 @@
-use alloc::collections::BTreeMap;
+use crate::OrdMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -291,7 +291,7 @@ pub fn normalize_topology_boards(boards: &mut Vec<TopologyBoardNode>) {
         board.connections.retain(|peer| peer != &board.sender_id);
         sort_dedup_strings(&mut board.connections);
     }
-    boards.sort_unstable_by(|a, b| a.sender_id.cmp(&b.sender_id));
+    crate::small_sort::sort_by(boards, |a, b| a.sender_id.cmp(&b.sender_id));
     boards.dedup_by(|a, b| a.sender_id == b.sender_id);
 }
 
@@ -310,7 +310,9 @@ pub fn topology_links_from_boards(boards: &[TopologyBoardNode]) -> Vec<TopologyL
             links.push(TopologyLink { source, target });
         }
     }
-    links.sort_unstable_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    crate::small_sort::sort_by(&mut links, |a, b| {
+        (&a.source, &a.target).cmp(&(&b.source, &b.target))
+    });
     links.dedup_by(|a, b| a.source == b.source && a.target == b.target);
     links
 }
@@ -1934,7 +1936,7 @@ pub fn build_discovery_schema(sender: &str, timestamp_ms: u64) -> TelemetryResul
 /// 3. Lowest total hop distance across all reachable boards.
 /// 4. Lexicographically smallest sender ID.
 pub fn elect_discovery_master(local_sender: &str, boards: &[TopologyBoardNode]) -> String {
-    let mut nodes: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut nodes: OrdMap<&str, Vec<&str>> = OrdMap::new();
     for board in boards {
         nodes.entry(board.sender_id.as_str()).or_default();
         for peer in board.connections.iter() {

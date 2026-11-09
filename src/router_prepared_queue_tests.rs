@@ -280,7 +280,7 @@ fn atomic_queue_pending_active_unknown_packed_replay_and_owner_matrix() {
             ordered_type: None,
             waiting_for_predecessor: false,
             data: RouterItem::Packet(packet(candidate, ep)),
-            pending_destinations: BTreeMap::new(),
+            pending_destinations: OrdMap::new(),
             tracked_destinations: false,
             last_send_ms: 0,
             retries: 0,
@@ -293,7 +293,7 @@ fn atomic_queue_pending_active_unknown_packed_replay_and_owner_matrix() {
         assert_pending(&r, signal, pending_type != candidate.as_u32());
         r.state.lock().end_to_end_reliable_tx.clear();
     }
-    let mut sent = BTreeMap::new();
+    let mut sent = OrdMap::new();
     sent.insert(
         1,
         ReliableSent {

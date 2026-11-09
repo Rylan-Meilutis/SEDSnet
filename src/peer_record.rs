@@ -1,9 +1,9 @@
-//! Pointer-sized peer index values keep B-tree rotations shared across metadata
-//! types. Stage new allocations before changing authoritative peer state.
+//! Pointer-sized peer index values keep ordered-table moves cheap and shared
+//! across metadata types. Stage new allocations before changing authoritative peer state.
 use crate::{TelemetryError, TelemetryResult};
 use alloc::boxed::Box;
 #[cfg(any(feature = "discovery", feature = "timesync"))]
-use alloc::collections::BTreeMap;
+use crate::OrdMap;
 use alloc::string::String;
 
 // Pointer storage plus conservative allocator slack is charged separately from
@@ -53,7 +53,7 @@ pub(crate) enum Prepared<'a, T> {
 
 #[cfg(feature = "timesync")]
 pub(crate) fn prepare<'a, T>(
-    map: &BTreeMap<String, Box<T>>,
+    map: &OrdMap<String, Box<T>>,
     key: &'a str,
     value: T,
 ) -> TelemetryResult<Prepared<'a, T>> {
@@ -67,7 +67,7 @@ pub(crate) fn prepare<'a, T>(
 
 #[cfg(feature = "timesync")]
 impl<T> Prepared<'_, T> {
-    pub(crate) fn commit(self, map: &mut BTreeMap<String, Box<T>>) {
+    pub(crate) fn commit(self, map: &mut OrdMap<String, Box<T>>) {
         match self {
             Self::Existing { key, value } => {
                 // Preparation/commit stay inside the same caller-owned lock.
@@ -82,9 +82,9 @@ impl<T> Prepared<'_, T> {
 
 #[cfg(feature = "discovery")]
 pub(crate) fn try_clone_map<T: Clone>(
-    map: &BTreeMap<String, Box<T>>,
-) -> TelemetryResult<BTreeMap<String, Box<T>>> {
-    let mut out = BTreeMap::new();
+    map: &OrdMap<String, Box<T>>,
+) -> TelemetryResult<OrdMap<String, Box<T>>> {
+    let mut out = OrdMap::new();
     for (name, value) in map {
         let record = try_box_with(|| value.as_ref().clone())?;
         out.insert(try_string(name)?, record);

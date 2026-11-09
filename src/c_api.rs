@@ -50,7 +50,9 @@ use crate::{
 use crate::{MessageDataType::NoData, get_data_type};
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 #[cfg(feature = "discovery")]
-use alloc::{collections::BTreeMap, format};
+use crate::OrdMap;
+#[cfg(feature = "discovery")]
+use alloc::format;
 use core::{ffi::c_char, ffi::c_void, mem::size_of, ptr, slice, str::from_utf8};
 
 #[cfg(feature = "cryptography")]
@@ -539,7 +541,7 @@ fn json_push_escaped(out: &mut String, s: &str) {
 fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> String {
     fn push_endpoint_name<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, S>,
+        names: &OrdMap<DataEndpoint, S>,
         ep: DataEndpoint,
     ) {
         if let Some(name) = names.get(&ep) {
@@ -562,7 +564,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
 
     fn push_endpoint_names_array<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, S>,
+        names: &OrdMap<DataEndpoint, S>,
         vals: &[DataEndpoint],
     ) {
         out.push('[');
@@ -592,7 +594,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
 
     fn push_board<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, S>,
+        names: &OrdMap<DataEndpoint, S>,
         board: &crate::discovery::TopologyBoardNode,
     ) {
         out.push('{');
@@ -612,7 +614,7 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
     let endpoint_names = known_endpoints()
         .into_iter()
         .map(|def| (def.id, def.name))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<OrdMap<_, _>>();
     let mut out = String::new();
     out.push('{');
     out.push_str("\"advertised_endpoints\":");
@@ -770,7 +772,7 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
 
     fn push_endpoint_names_array<S: AsRef<str>>(
         out: &mut String,
-        names: &BTreeMap<DataEndpoint, S>,
+        names: &OrdMap<DataEndpoint, S>,
         vals: &[DataEndpoint],
     ) {
         out.push('[');
@@ -789,7 +791,7 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
     let endpoint_names = known_endpoints()
         .into_iter()
         .map(|def| (def.id, def.name))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<OrdMap<_, _>>();
     let mut out = String::new();
     out.push('{');
     out.push_str("\"sender_id\":");
