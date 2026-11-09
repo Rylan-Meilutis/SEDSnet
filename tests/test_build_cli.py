@@ -10,6 +10,7 @@ spec.loader.exec_module(build)
 class BuildCliTests(unittest.TestCase):
     def test_all_runs_distinct_profiles_but_shared_checks_once(self):
         with mock.patch.object(build, 'has_embedded_c_toolchain', return_value=True), \
+             mock.patch.object(build, '_can_compile_c_for_i686_linux', return_value=True), \
              mock.patch.object(build, 'ensure_rust_target_installed'), \
              mock.patch.object(build, 'apply_embedded_cflags_defaults'), \
              mock.patch.object(build, 'collect_artifact_sizes', return_value={}), \
@@ -53,6 +54,29 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(call.kwargs['env']['PYO3_CROSS_PYTHON_VERSION'], '3.9')
             self.assertEqual(call.kwargs['env']['PYO3_CROSS'], '1')
             self.assertEqual(call.kwargs['env']['PYO3_NO_PYTHON'], '1')
+
+    def test_full_skips_i686_check_without_a_cross_c_compiler(self):
+        with mock.patch.object(build, 'has_embedded_c_toolchain', return_value=True), \
+             mock.patch.object(build, '_can_compile_c_for_i686_linux', return_value=False), \
+             mock.patch.object(build, 'ensure_rust_target_installed'), \
+             mock.patch.object(build, 'apply_embedded_cflags_defaults'), \
+             mock.patch.object(build, 'collect_artifact_sizes', return_value={}), \
+             mock.patch.object(build, 'print_artifact_sizes'), \
+             mock.patch.object(build, 'cargo_target_directory', return_value=Path('/tmp/fixture-target')), \
+             mock.patch.object(build, 'cargo_nextest_available', return_value=False), \
+             mock.patch.object(build, 'python_test_environment', side_effect=lambda *a: contextlib.nullcontext({})), \
+             mock.patch.object(build, 'run_cmd') as run, contextlib.redirect_stdout(io.StringIO()) as out:
+            build.main(['test', '--all', '--full'])
+        self.assertFalse(any(call.args[0][:2] == ['cargo', 'check'] for call in run.call_args_list))
+        self.assertIn('i686 Python release compile check', out.getvalue())
+
+    def test_i686_c_compiler_detection(self):
+        with mock.patch.object(build.sys, 'platform', 'linux'):
+            self.assertTrue(build._can_compile_c_for_i686_linux({}))
+        with mock.patch.object(build.sys, 'platform', 'darwin'), \
+             mock.patch.object(build.shutil, 'which', return_value=None):
+            self.assertFalse(build._can_compile_c_for_i686_linux({}))
+            self.assertTrue(build._can_compile_c_for_i686_linux({'CC_i686_unknown_linux_gnu': 'zig cc'}))
 
     def test_matrix_selects_storage_profiles_and_keeps_common_features(self):
         profiles = build.qualification_profiles(['compact-packet-store', 'fair-admission', 'ingress-target-filter'])
