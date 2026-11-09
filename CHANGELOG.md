@@ -3,6 +3,26 @@
 ## Unreleased
 
 
+## 4.3.12
+
+Wire framing, application message identities and C event layouts retain their
+4.3.11 representations. The macro crate remains at 2.2.0.
+
+- Expose `sedsnet::packet::sender_address_u32` to compare a sender's existing
+  compact wire identity without packing a packet or learning a sender name.
+- Document numeric aliases and the distinction between compact wire identity,
+  assigned node addresses and authentication. Existing identity values and
+  alias handling remain unchanged.
+- Add `Router::prepare_targeted_packet` for an explicit frozen logical-hostname
+  cohort without enqueueing or sending; return the original packet on refusal.
+- Distinguish 64-bit wire-target symbols from 32-bit compact source identities
+  and assigned node addresses. Immutable recipient metadata is not authentication,
+  freshness or physical-incarnation evidence. Existing wire framing, schemas and
+  default features remain unchanged.
+- Move internal release helpers under `scripts` while preserving the supported
+  build and publisher entrypoints.
+
+
 ## 4.3.11
 
 Wire framing, application message identities and C event layouts retain their

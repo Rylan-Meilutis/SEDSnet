@@ -13,7 +13,7 @@ from unittest import mock
 
 import build
 import publish_crates as publisher
-import release_credentials as credentials
+from scripts import release_credentials as credentials
 
 
 class MemoryStore:

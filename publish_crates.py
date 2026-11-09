@@ -27,8 +27,8 @@ MACROS_MANIFEST = REPO_ROOT / "sedsnet_macros" / "Cargo.toml"
 MAIN_MANIFEST = REPO_ROOT / "Cargo.toml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 RELEASE_CONFIG = REPO_ROOT / ".sedsnet-release.toml"
-import release_credentials
-from release_logging import redact_output, safe_command
+from scripts import release_credentials
+from scripts.release_logging import redact_output, safe_command
 
 DEFAULT_LINUX_DOCKER_TARGETS = [
     "x86_64-unknown-linux-gnu",
