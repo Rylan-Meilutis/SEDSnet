@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## Version 4.3.14 highlights
+
+- Fit the full `embedded` feature set (compression, cryptography, time sync, discovery, JSON schemas) on 512 KiB STM32G4 boards: zstd keeps only its level-1 compressor and small decoders, and embedded tables share one sorted-`Vec` map instead of per-type B-trees.
+- Add opt-in `SEDSNET_EMBEDDED_BUILD_STD` nightly builds that rebuild `core`/`alloc` for size with immediate-abort panics.
+- Wire framing, schemas, C/Python APIs, desktop behavior and macro crate 2.2.0 are unchanged.
+
 ## Version 4.3.13 highlights
 
 - Elect UTC ahead of uptime regardless of priority or arrival order, and step unanchored clocks onto UTC.

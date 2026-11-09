@@ -387,6 +387,19 @@ Bare-metal builds expect the following symbols to be provided by the host enviro
 
 See [Usage-C-Cpp](Usage-C-Cpp) for an example stub implementation.
 
+### Embedded flash size
+
+Embedded builds through `build.py` (and therefore CMake) compile zstd with only the
+level-1 `fast` compressor and its smaller decoder variants; set
+`SEDSNET_EMBEDDED_CFLAGS_AUTO=0` to supply your own `CFLAGS` instead. Crate-internal
+ordered tables use one sorted-`Vec` map/set on embedded no_std builds.
+
+For extra headroom, `SEDSNET_EMBEDDED_BUILD_STD=1` (or CMake
+`SEDSNET_EMBEDDED_BUILD_STD=ON`) rebuilds `core`/`alloc` with `optimize_for_size` and
+`panic = "immediate-abort"` for bare-metal `--release` builds. It needs a nightly
+toolchain with `rust-src` (`SEDSNET_EMBEDDED_BUILD_STD_TOOLCHAIN`, default `nightly`)
+and is off by default. Panics then trap without calling `telemetry_panic_hook`.
+
 ### Fair admission under pressure
 
 Hosted builds use bounded stack-only arbitration when an application memory probe
