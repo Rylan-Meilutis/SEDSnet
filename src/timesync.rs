@@ -8,7 +8,7 @@
 //! - Provides a slewed clock that converges toward sampled network time without hard jumps.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use crate::OrdMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -523,7 +523,7 @@ pub(crate) struct PreparedTrackerSource<'a> {
 /// Aggregates multiple partial or complete time sources into a current network-time reading.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkClock {
-    sources: BTreeMap<String, Box<NetworkTimeSourceState>>,
+    sources: OrdMap<String, Box<NetworkTimeSourceState>>,
 }
 
 impl NetworkClock {
@@ -758,7 +758,7 @@ fn civil_from_days(mut z: u64) -> Option<(i32, u32, u32)> {
 pub struct TimeSyncTracker {
     cfg: TimeSyncConfig,
     local_id: String,
-    sources: BTreeMap<String, Box<TimeSyncSource>>,
+    sources: OrdMap<String, Box<TimeSyncSource>>,
     current_source: Option<String>,
     local_anchored: bool,
     local_tag: u32,
@@ -772,7 +772,7 @@ impl TimeSyncTracker {
             cfg,
             local_tag: timesync_sender_tag(&local_id),
             local_id,
-            sources: BTreeMap::new(),
+            sources: OrdMap::new(),
             current_source: None,
             local_anchored: false,
         }

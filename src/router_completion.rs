@@ -586,7 +586,7 @@ mod tests {
         router
             .register_end_to_end_reliable_tx(
                 &item,
-                Some(BTreeMap::from([(Router::sender_hash("FC"), 0)])),
+                Some(OrdMap::from([(Router::sender_hash("FC"), 0)])),
             )
             .unwrap();
         (router, tracker, item, id)

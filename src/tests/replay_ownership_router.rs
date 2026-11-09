@@ -78,7 +78,7 @@ fn end_to_end_node() -> (Router, u64) {
     let id = packet.packet_id();
     node.register_end_to_end_reliable_tx(
         &RouterItem::Packet(packet),
-        Some(BTreeMap::from([(1, 0)])),
+        Some(OrdMap::from([(1, 0)])),
     )
     .unwrap();
     (node, id)

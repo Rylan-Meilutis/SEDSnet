@@ -47,7 +47,7 @@ fn completed_proxy_retry_replays_receipt_without_reopening_child_cohort() {
         node.note_reliable_return_route(ingress, id);
         node.register_end_to_end_reliable_tx(
             &item,
-            Some(BTreeMap::from([
+            Some(OrdMap::from([
                 (owners[0], downstream),
                 (owners[1], downstream),
             ])),

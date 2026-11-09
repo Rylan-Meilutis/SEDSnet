@@ -673,7 +673,7 @@ fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
                 ordered_type: matches!(mode, crate::ReliableMode::Ordered).then_some(ty.as_u32()),
                 waiting_for_predecessor: false,
                 data: RouterItem::Packet(packet),
-                pending_destinations: BTreeMap::from([(Router::sender_hash("RF"), side)]),
+                pending_destinations: OrdMap::from([(Router::sender_hash("RF"), side)]),
                 tracked_destinations: true,
                 last_send_ms: 0,
                 retries: 1,
