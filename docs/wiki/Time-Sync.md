@@ -35,6 +35,25 @@ All payload fields are `u64` values in little-endian order. Timestamps are in mi
 - `TimeSyncRequest`: `[seq, t1_ms]`
 - `TimeSyncResponse`: `[seq, t1_ms, t2_ms, t3_ms]`
 
+Since 4.3.13 the announce `priority` word also carries time quality (`TimeSyncQuality`):
+
+| Bits | Meaning |
+| --- | --- |
+| 63 | 1 for a qualified announce |
+| 62 | 1 when the time is unanchored (uptime or otherwise not traceable to UTC) |
+| 36..62 | priority of the reference, saturated to 26 bits |
+| 32..36 | stratum: 0 for a reference, plus one per re-serving hop |
+| 0..32 | `timesync_sender_tag` of the announcer's own source, 0 for a reference |
+
+Times before `TIMESYNC_UTC_FLOOR_MS` (2020-01-01T00:00:00Z) are never anchored. A legacy announce
+(bit 63 clear) is anchored only when its time is plausible, and is then treated as stratum
+`TIMESYNC_LEGACY_STRATUM` (8). Older decoders compare the whole word, so they still rank anchored before
+unanchored, then priority, then stratum, but rank every qualified source behind legacy sources.
+Use `encode_timesync_priority` / `decode_timesync_quality` or `TimeSyncSource::quality()`.
+
+A request sent to a source learned on a known side carries that source's tag in the upper 32 bits of
+`seq`. Servers answer only untargeted requests or requests naming them; legacy servers echo the word.
+
 With the `discovery` feature enabled, discovery also adds a built-in
 `SEDSNET_DISCOVERY_TIMESYNC_SOURCES` control packet that advertises concrete time source sender IDs.
 The richer `SEDSNET_DISCOVERY_TOPOLOGY` packet then attributes those source IDs to specific remote routers
@@ -48,6 +67,10 @@ The router handles the built-in time sync packet types internally:
 
 - `TimeSyncAnnounce` updates per-remote-source state; the router does not collapse all remotes into
   one shared slot.
+- Time sync is hop by hop: a router with time sync configured consumes announces, requests and
+  responses instead of relaying them. While following a remote it re-serves that remote at the next
+  stratum on every side except the one the remote announces from, so a board with a single side never
+  announces. Requests go to the side the elected source announces from.
 - `TimeSyncRequest` may cause the router to queue an internal response when it is acting as a
   source.
 - `TimeSyncResponse` updates the leader's remote sample and steers the local network clock using
@@ -75,7 +98,17 @@ Applications can read the resulting network time through:
 - `Auto`: acts like an opportunistic producer. It only enters the election when no active producer
   is present and it has usable network time.
 
-Sources are chosen by priority (lower is better). Ties are broken by sender ID (lexicographic).
+Sources are chosen by quality first: anchored UTC always outranks unanchored time, whatever the
+configured priority or arrival order. Among sources of equal quality the lower priority wins, then the
+lower stratum (the nearest hop to the same reference), then the sender ID (lexicographic). A source
+whose announce names this node as its own source, or whose stratum exceeds `TIMESYNC_MAX_STRATUM` (15),
+is never selected, so two relays cannot keep each other alive after their reference disappears: they
+fall back to unanchored time (or consumer promotion) after `source_timeout_ms`.
+
+A router's local candidate is anchored when a local time source (the local setters or
+`update_network_time_source`) reads plausible UTC. An `Auto` node, or a promotable consumer, with
+anchored local time also takes over from an unanchored remote. Standalone `TimeSyncTracker` users
+declare local quality with `set_local_time_anchored`.
 When several producers have the same configured priority, the elected leader advertises a boosted
 priority for as long as it remains leader so the tie resolves consistently without changing the
 standby producers' configured priorities. If no announce is seen within `source_timeout_ms`, a
@@ -88,8 +121,10 @@ source only when no better source is active and it already has usable time.
 Discovery-master preference is independent from these roles. For example, a vehicle can prefer
 GroundStation (`GS`) as discovery master while configuring RF as time source priority `1`,
 GroundStation as source priority `50`, and other boards as promotable consumers. RF then wins while
-present, GroundStation takes over after RF's source timeout, and ordinary consumer promotion remains
-the final fallback when neither configured source is available.
+present with time of the same quality, GroundStation takes over after RF's source timeout, and ordinary
+consumer promotion remains the final fallback when neither configured source is available. An RF
+board without a GPS fix announces unanchored uptime, so it follows a GroundStation that has UTC and
+re-serves that time to the vehicle.
 
 Runtime configuration entry points:
 
@@ -105,8 +140,12 @@ Runtime configuration entry points:
 Failover uses holdover plus slew:
 
 - the network clock keeps running monotonically during producer loss or producer change
-- a new leader does not step the clock backward or forward immediately
+- a new leader does not step an anchored clock backward or forward immediately
 - instead, the router slews toward the new leader at the configured `max_slew_ppm` rate
+- a fresh, matched response from the elected source may step an anchored clock forward by more than
+  five seconds
+- a clock holding unanchored time steps onto UTC from the first anchored announce, verified response
+  or local reference, and a clock reading plausible UTC is never steered toward unanchored time
 
 The internal clock also supports merging partial absolute sources:
 

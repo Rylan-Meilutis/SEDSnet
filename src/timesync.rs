@@ -35,6 +35,21 @@ pub const LOCAL_TIMESYNC_DATE_SOURCE_ID: &str = "__timesync_local_date__";
 pub const LOCAL_TIMESYNC_TOD_SOURCE_ID: &str = "__timesync_local_tod__";
 /// Synthetic source identifier used for a locally supplied sub-second source.
 pub const LOCAL_TIMESYNC_SUBSEC_SOURCE_ID: &str = "__timesync_local_subsec__";
+/// Earliest Unix millisecond (2020-01-01T00:00:00Z) accepted as real UTC.
+/// Earlier readings are uptime or otherwise unanchored time.
+pub const TIMESYNC_UTC_FLOOR_MS: u64 = 1_577_836_800_000;
+/// Largest stratum that may be followed. A node re-serves at its source's stratum plus one.
+pub const TIMESYNC_MAX_STRATUM: u8 = 15;
+/// Stratum assumed for a legacy (unqualified) announce carrying plausible UTC.
+pub const TIMESYNC_LEGACY_STRATUM: u8 = 8;
+/// Forward error, in milliseconds, above which a verified exchange steps an anchored
+/// clock; unanchored clocks step onto UTC whenever their error exceeds it.
+pub(crate) const TIMESYNC_STEP_THRESHOLD_MS: u64 = 5_000;
+const QUALITY_MARKER: u64 = 1 << 63;
+const QUALITY_UNANCHORED: u64 = 1 << 62;
+const QUALITY_PRIORITY_SHIFT: u32 = 36;
+const QUALITY_PRIORITY_MAX: u64 = (1 << 26) - 1;
+const QUALITY_STRATUM_SHIFT: u32 = 32;
 
 /// Declares how a node participates in time synchronization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,12 +109,81 @@ pub enum TimeSyncLeader {
 pub struct TimeSyncSource {
     /// Sender identifier for the remote source.
     pub sender: String,
-    /// Advertised source priority. Lower is better.
+    /// Advertised announce priority word. Lower is better. Qualified announces
+    /// also carry time quality; see [`TimeSyncSource::quality`].
     pub priority: u64,
     /// Monotonic receive time, in milliseconds, of the last announce.
     pub last_announce_ms: u64,
     /// Network time value carried by the last announce, in Unix milliseconds.
     pub last_time_ms: u64,
+}
+
+impl TimeSyncSource {
+    /// Decodes the time quality carried by the last announce.
+    pub fn quality(&self) -> TimeSyncQuality {
+        decode_timesync_quality(self.priority, self.last_time_ms)
+    }
+}
+
+/// Time quality carried in the announce priority word.
+///
+/// Qualified announces set bit 63, set bit 62 for unanchored (non-UTC) time,
+/// and carry a 26-bit priority in bits 36..62, the stratum in bits 32..36 and
+/// the sender tag of the announcer's own source in bits 0..32 (0 for a
+/// reference). Numeric order therefore still ranks anchored before unanchored,
+/// then priority, then stratum, for decoders that only compare the word.
+/// Legacy announces carry a plain priority and are anchored only when their
+/// time is at or after [`TIMESYNC_UTC_FLOOR_MS`], at [`TIMESYNC_LEGACY_STRATUM`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSyncQuality {
+    /// Time is traceable to a real UTC reference.
+    pub anchored: bool,
+    /// Hops from the reference. A reference announces stratum 0.
+    pub stratum: u8,
+    /// Configured priority of the reference. Lower is better.
+    pub priority: u64,
+    /// [`timesync_sender_tag`] of the source the announcer follows, or 0.
+    pub upstream: u32,
+}
+
+impl TimeSyncQuality {
+    fn rank(&self) -> (bool, u64, u8) {
+        (!self.anchored, self.priority, self.stratum)
+    }
+}
+
+/// Encodes a qualified announce priority word.
+pub fn encode_timesync_priority(quality: TimeSyncQuality) -> u64 {
+    QUALITY_MARKER
+        | if quality.anchored { 0 } else { QUALITY_UNANCHORED }
+        | (quality.priority.min(QUALITY_PRIORITY_MAX) << QUALITY_PRIORITY_SHIFT)
+        | (u64::from(quality.stratum.min(TIMESYNC_MAX_STRATUM)) << QUALITY_STRATUM_SHIFT)
+        | u64::from(quality.upstream)
+}
+
+/// Decodes the time quality of an announce priority word and its time.
+/// Times before [`TIMESYNC_UTC_FLOOR_MS`] are never anchored.
+pub fn decode_timesync_quality(priority: u64, time_ms: u64) -> TimeSyncQuality {
+    let plausible = time_ms >= TIMESYNC_UTC_FLOOR_MS;
+    if priority & QUALITY_MARKER == 0 {
+        return TimeSyncQuality {
+            anchored: plausible,
+            stratum: if plausible { TIMESYNC_LEGACY_STRATUM } else { 0 },
+            priority,
+            upstream: 0,
+        };
+    }
+    TimeSyncQuality {
+        anchored: plausible && priority & QUALITY_UNANCHORED == 0,
+        stratum: ((priority >> QUALITY_STRATUM_SHIFT) & 0xF) as u8,
+        priority: (priority >> QUALITY_PRIORITY_SHIFT) & QUALITY_PRIORITY_MAX,
+        upstream: priority as u32,
+    }
+}
+
+/// Stable nonzero tag identifying a sender in qualified announces and targeted requests.
+pub fn timesync_sender_tag(sender: &str) -> u32 {
+    crate::packet::sender_address_u32(sender)
 }
 
 /// Reports whether tracker state changed after processing or pruning sources.
@@ -375,7 +459,7 @@ impl SlewedNetworkClock {
         let target_ns = (target_unix_ms as i128) * 1_000_000;
         if self.max_slew_ppm != 0
             && self.read_unix_ns(now_mono_ns).is_some_and(|current| {
-                target_ns.saturating_sub(current) > 5_000_000_000
+                target_ns.saturating_sub(current) > TIMESYNC_STEP_THRESHOLD_MS as i128 * 1_000_000
             })
         {
             self.anchor_mono_ns = now_mono_ns;
@@ -384,6 +468,15 @@ impl SlewedNetworkClock {
             return;
         }
         self.steer_unix_ms(now_mono_ns, target_unix_ms);
+    }
+
+    /// Re-anchors the clock at a target reading in either direction. Callers use
+    /// this only when replacing unanchored time with time traceable to UTC.
+    pub(crate) fn step_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
+        self.anchor_mono_ns = now_mono_ns;
+        self.anchor_unix_ns = (target_unix_ms as i128) * 1_000_000;
+        self.pending_adjust_ns = 0;
+        self.initialized = true;
     }
 
     /// Steers the clock toward a target Unix millisecond reading at the configured slew rate.
@@ -521,9 +614,19 @@ impl NetworkClock {
 
     /// Returns the best current reading by preferring complete sources, then merging partial ones.
     pub fn current_time(&self, now_mono_ns: u64) -> Option<NetworkTimeReading> {
+        self.current_time_filtered(now_mono_ns, |_| true)
+    }
+
+    /// Like [`Self::current_time`], using only sources whose identifier passes `keep`.
+    pub(crate) fn current_time_filtered(
+        &self,
+        now_mono_ns: u64,
+        keep: impl Fn(&str) -> bool,
+    ) -> Option<NetworkTimeReading> {
         let sources: Vec<(&str, &NetworkTimeSourceState)> = self
             .sources
             .iter()
+            .filter(|(name, _)| keep(name.as_str()))
             .map(|(name, src)| (name.as_str(), src.as_ref()))
             .collect();
         if sources.is_empty() {
@@ -657,17 +760,33 @@ pub struct TimeSyncTracker {
     local_id: String,
     sources: BTreeMap<String, Box<TimeSyncSource>>,
     current_source: Option<String>,
+    local_anchored: bool,
+    local_tag: u32,
 }
 
 impl TimeSyncTracker {
     /// Creates a tracker with the supplied time sync configuration.
     pub fn new(cfg: TimeSyncConfig) -> Self {
+        let local_id = runtime_device_identifier();
         Self {
             cfg,
-            local_id: runtime_device_identifier(),
+            local_tag: timesync_sender_tag(&local_id),
+            local_id,
             sources: BTreeMap::new(),
             current_source: None,
+            local_anchored: false,
         }
+    }
+
+    /// Declares whether local candidate time is traceable to UTC. Defaults to
+    /// `false`; anchored remote sources then outrank the local candidate.
+    pub fn set_local_time_anchored(&mut self, anchored: bool) {
+        self.local_anchored = anchored;
+    }
+
+    /// Sets the sender name downstream announces use to name this node as their source.
+    pub(crate) fn set_local_sender(&mut self, sender: &str) {
+        self.local_tag = timesync_sender_tag(sender);
     }
 
     /// Returns the tracker's active configuration.
@@ -689,17 +808,33 @@ impl TimeSyncTracker {
         self.reselect_source(now_ms)
     }
 
-    /// Returns the best currently active remote source according to priority and sender ID.
+    /// Returns the best currently active remote source: anchored time first, then
+    /// priority, stratum and sender ID. Sources that follow this node, or exceed
+    /// [`TIMESYNC_MAX_STRATUM`], are never selected.
     pub fn best_active_source(&self, now_ms: u64) -> Option<&TimeSyncSource> {
         self.sources
             .values()
-            .filter(|src| Self::source_is_active(src, now_ms, self.cfg.source_timeout_ms))
+            .filter(|src| self.is_candidate(src, now_ms))
             .min_by(|a, b| {
-                a.priority
-                    .cmp(&b.priority)
+                a.quality()
+                    .rank()
+                    .cmp(&b.quality().rank())
                     .then_with(|| a.sender.cmp(&b.sender))
             })
             .map(AsRef::as_ref)
+    }
+
+    fn is_candidate(&self, src: &TimeSyncSource, now_ms: u64) -> bool {
+        let quality = src.quality();
+        Self::source_is_active(src, now_ms, self.cfg.source_timeout_ms)
+            && quality.upstream != self.local_tag
+            && quality.stratum <= TIMESYNC_MAX_STRATUM
+    }
+
+    fn remote_may_lead(&self, now_ms: u64) -> bool {
+        // Local UTC also outranks an unanchored remote for opportunistic roles.
+        self.best_active_source(now_ms)
+            .is_some_and(|src| !self.local_anchored || src.quality().anchored)
     }
 
     /// Returns the effective local candidate priority if the node may lead at `now_ms`.
@@ -708,7 +843,7 @@ impl TimeSyncTracker {
             TimeSyncRole::Consumer => {
                 if has_usable_time
                     && self.cfg.consumer_promotion_enabled
-                    && self.best_active_source(now_ms).is_none()
+                    && !self.remote_may_lead(now_ms)
                 {
                     Some(self.cfg.priority)
                 } else {
@@ -717,7 +852,7 @@ impl TimeSyncTracker {
             }
             TimeSyncRole::Source => Some(self.cfg.priority),
             TimeSyncRole::Auto => {
-                if has_usable_time && self.best_active_source(now_ms).is_none() {
+                if has_usable_time && !self.remote_may_lead(now_ms) {
                     Some(self.cfg.priority)
                 } else {
                     None
@@ -732,9 +867,10 @@ impl TimeSyncTracker {
         let remote = self.best_active_source(now_ms).cloned();
         match (local_priority, remote) {
             (Some(priority), Some(remote)) => {
-                if priority < remote.priority
-                    || (priority == remote.priority
-                        && self.local_id.as_str() < remote.sender.as_str())
+                let local = (!self.local_anchored, priority, 0);
+                let remote_rank = remote.quality().rank();
+                if local < remote_rank
+                    || (local == remote_rank && self.local_id.as_str() < remote.sender.as_str())
                 {
                     Some(TimeSyncLeader::Local { priority })
                 } else {
@@ -755,8 +891,9 @@ impl TimeSyncTracker {
         let tie_exists = self
             .sources
             .values()
-            .filter(|src| Self::source_is_active(src, now_ms, self.cfg.source_timeout_ms))
-            .any(|src| src.priority == priority);
+            .filter(|src| self.is_candidate(src, now_ms))
+            .map(|src| src.quality())
+            .any(|q| q.priority == priority && q.stratum == 0 && q.anchored == self.local_anchored);
         Some(if tie_exists {
             priority.saturating_sub(1)
         } else {

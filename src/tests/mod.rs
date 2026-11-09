@@ -463,3 +463,6 @@ fn scheduler_reserves_discovery_and_shared_state_priority_bands() {
 
 #[cfg(feature = "discovery")]
 mod borrowed_election;
+
+#[cfg(all(feature = "timesync", feature = "compression"))]
+mod timesync_hierarchy;
