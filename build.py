@@ -767,6 +767,23 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
         "-fno-asynchronous-unwind-tables",
         "-DZSTD_DISABLE_ASM=1",
         "-DZSTD_LEGACY_SUPPORT=0",
+        # SEDSnet compresses payloads only at level 1 (the `fast` strategy), so
+        # the other block compressors are unreachable. Excluded strategies fall
+        # back to a lower one inside zstd; frames stay standard and decodable.
+        "-DZSTD_EXCLUDE_DFAST_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR",
+        "-DZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR",
+        # Size-over-speed decoder variants (zstd's "thin" configuration); they
+        # decode every valid frame, using the smaller single-symbol/short paths.
+        "-DHUF_FORCE_DECOMPRESS_X1=1",
+        "-DZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT=1",
+        "-DZSTD_NO_INLINE=1",
+        "-DZSTD_STRIP_ERROR_STRINGS=1",
+        "-DDYNAMIC_BMI2=0",
     ]
 
     keys = [
