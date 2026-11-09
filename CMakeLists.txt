@@ -70,6 +70,9 @@ option(SEDSNET_COMPACT_PACKET_COMPRESSION "Enable indexed Zstd arena buffers" OF
 option(SEDSNET_ENABLE_CRYPTOGRAPHY
     "Enable cryptography provider APIs and define SEDS_ENABLE_CRYPTOGRAPHY for C/C++ users"
     ON)
+option(SEDSNET_EMBEDDED_BUILD_STD
+    "Opt-in: rebuild core/alloc for size with nightly + rust-src on embedded release builds"
+    OFF)
 
 # Auto-detect embedded if user hasn't forced it
 if (NOT SEDSNET_EMBEDDED_BUILD)
@@ -210,6 +213,9 @@ if (SEDSNET_FAIR_ADMISSION)
 endif ()
 if (SEDSNET_ENABLE_CRYPTOGRAPHY)
     list(APPEND RS_ARGS_BOOTSTRAP "--features" "cryptography")
+endif ()
+if (SEDSNET_EMBEDDED_BUILD_STD)
+    list(APPEND RS_ARGS_BOOTSTRAP "--env" "SEDSNET_EMBEDDED_BUILD_STD=1")
 endif ()
 
 # New: forward arbitrary option_env config vars: SEDSNET_ENV_<KEY> => --env KEY=VALUE
