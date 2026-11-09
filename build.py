@@ -117,6 +117,21 @@ def _fail(msg: str) -> None:
     print(f"{prefix} {msg}", file=sys.stderr)
 
 
+def _skip(msg: str) -> None:
+    prefix = "⏭️" if _EMOJI_OK else "SKIP"
+    print(f"{prefix} {msg}")
+
+
+def _can_compile_c_for_i686_linux(env: dict[str, str]) -> bool:
+    # zstd-sys builds C even under cargo check, so the host needs a C compiler
+    # for the target. Linux hosts have one; others need an explicit cross CC.
+    if sys.platform.startswith("linux"):
+        return True
+    if env.get("CC_i686_unknown_linux_gnu") or env.get("TARGET_CC"):
+        return True
+    return shutil.which("i686-linux-gnu-gcc") is not None
+
+
 def _fmt_bytes(n: int) -> str:
     units = ["B", "KiB", "MiB", "GiB"]
     x = float(n)
@@ -1128,7 +1143,11 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
         _success("Python unittest checks finished against the newly built host extension.")
         next_step += 1
 
-        if test_full:
+        if test_full and not _can_compile_c_for_i686_linux(env):
+            _skip(f"{next_step}/{total_steps} i686 Python release compile check: this host has no "
+                  "i686 Linux C compiler (set CC_i686_unknown_linux_gnu to enable). CI runs it on Linux.")
+            next_step += 1
+        elif test_full:
             # Rust field layout differs between 32-bit x86 and ARM. Check the
             # Python release target even when the host extension is 64-bit;
             # cargo check needs no cross linker or target Python interpreter.
