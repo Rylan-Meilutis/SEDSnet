@@ -252,17 +252,12 @@ use crate::{
 };
 use alloc::string::{String, ToString};
 
-#[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
-use crate::small_map::SmallMap as RouterMap;
-#[cfg(not(any(test, all(feature = "embedded", not(feature = "std")))))]
-use alloc::collections::BTreeMap as RouterMap;
-
-use alloc::collections::BTreeMap;
+use crate::{OrdMap, OrdMap as RouterMap, OrdSet};
 
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     format,
     sync::Arc,
     vec,
@@ -478,13 +473,13 @@ struct SideTransportState {
     #[cfg(all(feature = "compression", feature = "discovery"))]
     payload_codec_choice: u64,
     tx_template_ids: RouterMap<u64, u32>,
-    tx_templates: BTreeMap<u64, SideHeaderTemplate>,
+    tx_templates: OrdMap<u64, SideHeaderTemplate>,
     tx_last_timestamps: RouterMap<u32, u64>,
     tx_compact_uses: RouterMap<u32, u8>,
     rx_templates: RouterMap<u64, u32>,
-    rx_templates_by_id: BTreeMap<u32, SideHeaderTemplate>,
+    rx_templates_by_id: OrdMap<u32, SideHeaderTemplate>,
     rx_last_timestamps: RouterMap<u32, u64>,
-    rx_chunks: BTreeMap<u32, SideChunkAssembly>,
+    rx_chunks: OrdMap<u32, SideChunkAssembly>,
     rx_chunk_reclaims: u32,
     rx_chunk_bytes: usize,
 }
@@ -1003,7 +998,7 @@ struct ReliableTxState {
     // Zero is a sticky exhausted Ordered hop. Never serialized on the wire.
     next_seq: u32,
     sent_order: VecDeque<u32>,
-    sent: BTreeMap<u32, ReliableSent>,
+    sent: OrdMap<u32, ReliableSent>,
 }
 
 /// A tentative ACK has authority only for this exact currently active offer;
@@ -1044,7 +1039,7 @@ struct EndToEndReliableSent {
     ordered_type: Option<u32>,
     waiting_for_predecessor: bool,
     data: RouterItem,
-    pending_destinations: BTreeMap<u64, RouterSideId>,
+    pending_destinations: OrdMap<u64, RouterSideId>,
     tracked_destinations: bool,
     last_send_ms: u64,
     retries: u32,
@@ -1261,7 +1256,7 @@ struct DiscoverySideState {
     requested_network_variables: Vec<ManagedVariableSubscription>,
     reachable_timesync_sources: Vec<String>,
     last_seen_ms: u64,
-    announcers: BTreeMap<String, Box<DiscoverySenderState>>,
+    announcers: OrdMap<String, Box<DiscoverySenderState>>,
 }
 
 #[cfg(feature = "discovery")]
@@ -1508,7 +1503,7 @@ struct SideRuntimeStatsInner {
     side_transport_max_compact_overhead_bytes: Option<usize>,
     side_transport_compact_target_misses: u64,
     side_transport_template_evictions: u64,
-    data_types: BTreeMap<u32, TypeRuntimeStatsInner>,
+    data_types: OrdMap<u32, TypeRuntimeStatsInner>,
 }
 
 impl SideRuntimeStatsInner {
@@ -2533,13 +2528,13 @@ struct LocalServicesState {
     managed_cache_epoch: u64,
     #[cfg(all(feature="std",feature="discovery"))]
     managed_registration_dirty: bool,
-    managed_variable_types: BTreeSet<u32>,
-    managed_variable_permissions: BTreeMap<u32, NetworkVariablePermissions>,
-    managed_variable_latest: BTreeMap<u32, Box<ManagedVariableCacheEntry>>,
-    network_variable_update_handlers: BTreeMap<u32, Vec<NetworkVariableUpdateHandler>>,
-    p2p_port_handlers: BTreeMap<P2pPort, Vec<P2pPortHandler>>,
-    p2p_stream_handlers: BTreeMap<P2pPort, Vec<P2pStreamHandler>>,
-    p2p_stream_sessions: BTreeMap<P2pStreamId, P2pStreamSession>,
+    managed_variable_types: OrdSet<u32>,
+    managed_variable_permissions: OrdMap<u32, NetworkVariablePermissions>,
+    managed_variable_latest: OrdMap<u32, Box<ManagedVariableCacheEntry>>,
+    network_variable_update_handlers: OrdMap<u32, Vec<NetworkVariableUpdateHandler>>,
+    p2p_port_handlers: OrdMap<P2pPort, Vec<P2pPortHandler>>,
+    p2p_stream_handlers: OrdMap<P2pPort, Vec<P2pStreamHandler>>,
+    p2p_stream_sessions: OrdMap<P2pStreamId, P2pStreamSession>,
     next_p2p_stream_id: P2pStreamId,
 }
 
@@ -2556,7 +2551,7 @@ impl LocalServicesState {
 
 #[derive(Default)]
 struct ForwardedReceiptCache {
-    destinations: BTreeMap<u64, BTreeSet<u64>>,
+    destinations: OrdMap<u64, OrdSet<u64>>,
     order: VecDeque<u64>,
 }
 
@@ -2590,8 +2585,8 @@ struct RouterInner {
     side_transport: RouterMap<RouterSideId, Box<SideTransportState>>,
     local_services: Option<Box<LocalServicesState>>,
     local_address: AddressBookEntry,
-    address_book: BTreeMap<String, Box<AddressBookEntry>>,
-    address_by_value: BTreeMap<NodeAddress, String>,
+    address_book: OrdMap<String, Box<AddressBookEntry>>,
+    address_by_value: OrdMap<NodeAddress, String>,
     received_queue: BoundedDeque<RouterRxItem>,
     transmit_queue: BoundedDeque<TxQueued>,
     #[cfg(feature = "std")]
@@ -2607,13 +2602,13 @@ struct RouterInner {
     ordered_claim_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
-    reliable_tx: BTreeMap<(RouterSideId, u32), ReliableTxState>,
-    reliable_rx: BTreeMap<(RouterSideId, u32), ReliableRxState>,
-    reliable_return_routes: BTreeMap<u64, ReliableReturnRouteState>,
+    reliable_tx: OrdMap<(RouterSideId, u32), ReliableTxState>,
+    reliable_rx: OrdMap<(RouterSideId, u32), ReliableRxState>,
+    reliable_return_routes: OrdMap<u64, ReliableReturnRouteState>,
     local_admission_sequence: u64,
     reliable_return_route_order: VecDeque<u64>,
     forwarded_receipts: Option<Box<ForwardedReceiptCache>>,
-    end_to_end_reliable_tx: BTreeMap<u64, Box<EndToEndReliableSent>>,
+    end_to_end_reliable_tx: OrdMap<u64, Box<EndToEndReliableSent>>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
     total_handler_retries: u64,
@@ -2893,8 +2888,8 @@ impl RouterInner {
         }
     }
     fn set_replay_queued(
-        hop: &mut BTreeMap<(RouterSideId, u32), ReliableTxState>,
-        end: &mut BTreeMap<u64, Box<EndToEndReliableSent>>,
+        hop: &mut OrdMap<(RouterSideId, u32), ReliableTxState>,
+        end: &mut OrdMap<u64, Box<EndToEndReliableSent>>,
         key: ReplayMarkerKey,
         queued: bool,
     ) {
@@ -4203,7 +4198,7 @@ struct TimeSyncRuntime {
     tracker: Option<TimeSyncTracker>,
     clock: NetworkClock,
     disciplined_clock: SlewedNetworkClock,
-    remote_sources: BTreeMap<String, Box<RemoteTimeSyncSource>>,
+    remote_sources: OrdMap<String, Box<RemoteTimeSyncSource>>,
     next_seq: u64,
     next_announce_mono_ms: u64,
     next_request_mono_ms: u64,
@@ -6207,7 +6202,7 @@ impl Router {
         exclude: Option<RouterSideId>,
         managed: bool,
         resolve_proxy_segment: bool,
-    ) -> TelemetryResult<BTreeMap<u64, RouterSideId>> {
+    ) -> TelemetryResult<OrdMap<u64, RouterSideId>> {
         let (eps, ty) = self.item_route_info(data)?;
         // A newly resolved proxy subtree must not wait for its original
         // publisher: self-originated echoes are intentionally not delivered.
@@ -6264,7 +6259,7 @@ impl Router {
          * its announcer is the segment router that can ACK and replicate the
          * value to the owners behind it. */
         if managed || st.is_managed_variable(ty.as_u32()) {
-            let mut out = BTreeMap::new();
+            let mut out = OrdMap::new();
             for (&side, route) in st.discovery_routes.iter() {
                 if Some(side) == exclude {
                     continue;
@@ -6306,7 +6301,7 @@ impl Router {
         let scoring_eps = self.preferred_scoring_endpoints(&eps, prefer_best_overlap);
         let mut best_overlap = 0usize;
         let limit = runtime_reliable_max_end_to_end_pending().max(1);
-        let mut out = BTreeMap::new();
+        let mut out = OrdMap::new();
         for (&side, route) in st.discovery_routes.iter() {
             if Some(side) == exclude {
                 continue;
@@ -6516,7 +6511,7 @@ impl Router {
                         };
                     }
 
-                    let mut visited: BTreeSet<&str> = BTreeSet::new();
+                    let mut visited: OrdSet<&str> = OrdSet::new();
                     let mut pending = VecDeque::from([(announcer.as_str(), 0usize)]);
                     while let Some((sender, distance)) = pending.pop_front() {
                         if !visited.insert(sender) {
@@ -6548,7 +6543,7 @@ impl Router {
             .iter()
             .map(Some)
             .chain(core::iter::once(None).filter(|_| target_senders.is_empty()));
-        let mut selected = BTreeSet::new();
+        let mut selected = OrdSet::new();
         for target in route_targets {
             let distances: Vec<(RouterSideId, usize)> = matches
                 .iter()
@@ -6803,7 +6798,7 @@ impl Router {
         if st.forwarded_receipts.is_none() {
             return;
         }
-        let mut active_senders = BTreeSet::new();
+        let mut active_senders = OrdSet::new();
         for route in st.discovery_routes.values() {
             for sender_state in route.announcers.values() {
                 for board in sender_state.topology_boards.iter() {
@@ -6827,7 +6822,7 @@ impl Router {
     fn register_end_to_end_reliable_tx(
         &self,
         data: &RouterItem,
-        destinations: Option<BTreeMap<u64, RouterSideId>>,
+        destinations: Option<OrdMap<u64, RouterSideId>>,
     ) -> TelemetryResult<bool> {
         let packet_id = Self::get_hash(data);
         #[cfg(feature = "std")]
@@ -7030,9 +7025,9 @@ impl Router {
     fn active_end_to_end_destinations_locked(
         &self,
         st: &RouterInner,
-    ) -> BTreeMap<u64, RouterSideId> {
+    ) -> OrdMap<u64, RouterSideId> {
         let now_ms = self.clock.now_ms();
-        let mut out = BTreeMap::new();
+        let mut out = OrdMap::new();
         for (&side, route) in st.discovery_routes.iter() {
             if now_ms.saturating_sub(route.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
                 continue;
@@ -7074,7 +7069,7 @@ impl Router {
         &self,
         st: &RouterInner,
         ty: DataType,
-        pending: &mut BTreeMap<u64, RouterSideId>,
+        pending: &mut OrdMap<u64, RouterSideId>,
         frozen: bool,
     ) {
         if frozen {
@@ -13753,7 +13748,7 @@ impl Router {
     fn process_end_to_end_reliable_timeouts(&self) -> TelemetryResult<()> {
         let now = self.clock.now_ms();
         let mut requeue = Vec::new();
-        let mut failed_ordered_types = BTreeSet::new();
+        let mut failed_ordered_types = OrdSet::new();
 
         {
             let mut st = self.state.lock();
@@ -14699,11 +14694,11 @@ impl Router {
             owner_hash,
             last_seen_ms: clock.now_ms(),
         };
-        let mut address_book = BTreeMap::new();
+        let mut address_book = OrdMap::new();
         if local_services_enabled {
             address_book.insert(hostname.to_string(), Box::new(local_address.clone()));
         }
-        let mut address_by_value = BTreeMap::new();
+        let mut address_by_value = OrdMap::new();
         if local_services_enabled {
             address_by_value.insert(address, hostname.to_string());
         }
@@ -14736,7 +14731,7 @@ impl Router {
                         managed_cache_epoch:0,
                         #[cfg(all(feature="std",feature="discovery"))]
                         managed_registration_dirty:false,
-                        managed_variable_types: BTreeSet::new(),
+                        managed_variable_types: OrdSet::new(),
                         managed_variable_permissions: Default::default(),
                         managed_variable_latest: Default::default(),
                         network_variable_update_handlers: Default::default(),
@@ -20705,7 +20700,7 @@ impl Router {
             .as_ref()?
             .destinations
             .get(&id)
-            .map(BTreeSet::len)
+            .map(OrdSet::len)
     }
     #[cfg(all(test, feature = "discovery"))]
     pub(crate) fn debug_end_to_end_acked_packet_count(&self) -> usize {
@@ -21288,7 +21283,7 @@ mod queued_schema_identity_tests {
             let packet = Packet::new(ty, &[ep], "FC", 1, Arc::<[u8]>::from([42u8])).unwrap();
             let id = packet.packet_id();
             let owner = Router::sender_hash("GS");
-            let mut destinations = BTreeMap::new();
+            let mut destinations = OrdMap::new();
             destinations.insert(owner, side);
             router.state.lock().end_to_end_reliable_tx.insert(
                 id,
@@ -21370,7 +21365,7 @@ mod queued_schema_identity_tests {
                 ordered_type: None,
                 waiting_for_predecessor: false,
                 data: RouterItem::Packet(data),
-                pending_destinations: BTreeMap::from([(owner, side)]),
+                pending_destinations: OrdMap::from([(owner, side)]),
                 tracked_destinations: true,
                 last_send_ms: 0,
                 retries: 0,

@@ -1196,7 +1196,7 @@ fn relay_tx_service_consumes_queued_receipt_before_retry() {
         },
     );
     let packet = Packet::new(ty, &[ep], "PEER", 1, Arc::<[u8]>::from([42u8])).unwrap();
-    let mut sent = BTreeMap::new();
+    let mut sent = OrdMap::new();
     sent.insert(
         1,
         ReliableSent {

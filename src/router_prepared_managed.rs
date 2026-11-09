@@ -64,8 +64,8 @@ pub struct PreparedManagedBatch<'a> {
     registration_epoch: u64,
     cache_epoch: u64,
     // After success these hold OLD live maps, never dropped during commit.
-    replacement_types: BTreeSet<u32>,
-    replacement_latest: BTreeMap<u32, Box<ManagedVariableCacheEntry>>,
+    replacement_types: OrdSet<u32>,
+    replacement_latest: OrdMap<u32, Box<ManagedVariableCacheEntry>>,
     adds_registration: bool,
     admitted: bool,
 }
@@ -183,8 +183,8 @@ impl Router {
             age_anchor_ms,
             registration_epoch: 0,
             cache_epoch: 0,
-            replacement_types: BTreeSet::new(),
-            replacement_latest: BTreeMap::new(),
+            replacement_types: OrdSet::new(),
+            replacement_latest: OrdMap::new(),
             adds_registration: false,
             admitted: false,
         };

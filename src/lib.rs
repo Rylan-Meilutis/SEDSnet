@@ -190,6 +190,14 @@ pub mod routing_config;
 mod side_transport;
 #[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
 mod small_map;
+// Crate-internal ordered tables. Embedded no_std builds use one sorted-`Vec`
+// implementation instead of monomorphizing B-tree code per key/value pair (a
+// large flash cost); desktop/std production builds keep `BTreeMap`/`BTreeSet`.
+// Tests use the embedded variant so its behavior is exercised on the host.
+#[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
+pub(crate) use small_map::{SmallMap as OrdMap, SmallSet as OrdSet};
+#[cfg(not(any(test, all(feature = "embedded", not(feature = "std")))))]
+pub(crate) use alloc::collections::{BTreeMap as OrdMap, BTreeSet as OrdSet};
 mod small_payload;
 mod small_sort;
 #[cfg(feature = "timesync")]

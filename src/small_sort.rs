@@ -11,15 +11,36 @@ pub(crate) fn sort<T: Ord>(values: &mut [T]) {
     heap_sort(values);
 }
 
+/// Unstable sort by comparator; embedded builds use the same constant-scratch
+/// heapsort instead of instantiating the standard pattern-defeating quicksort.
+#[cfg(feature = "discovery")]
+pub(crate) fn sort_by<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(values: &mut [T], compare: F) {
+    #[cfg(not(feature = "embedded"))]
+    values.sort_unstable_by(compare);
+    #[cfg(feature = "embedded")]
+    heap_sort_by(values, compare);
+}
+
 #[cfg(any(feature = "embedded", test))]
 fn heap_sort<T: Ord>(values: &mut [T]) {
-    fn sift<T: Ord>(values: &mut [T], mut root: usize, end: usize) {
+    heap_sort_by(values, T::cmp);
+}
+
+#[cfg(any(feature = "embedded", test))]
+fn heap_sort_by<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(values: &mut [T], mut compare: F) {
+    use core::cmp::Ordering::Less;
+    fn sift<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(
+        values: &mut [T],
+        mut root: usize,
+        end: usize,
+        compare: &mut F,
+    ) {
         while root < end / 2 {
             let mut child = root * 2 + 1;
-            if child + 1 < end && values[child] < values[child + 1] {
+            if child + 1 < end && compare(&values[child], &values[child + 1]) == Less {
                 child += 1;
             }
-            if values[root] >= values[child] {
+            if compare(&values[root], &values[child]) != Less {
                 break;
             }
             values.swap(root, child);
@@ -28,17 +49,33 @@ fn heap_sort<T: Ord>(values: &mut [T]) {
     }
     let len = values.len();
     for root in (0..len / 2).rev() {
-        sift(values, root, len);
+        sift(values, root, len, &mut compare);
     }
     for end in (1..len).rev() {
         values.swap(0, end);
-        sift(values, 0, end);
+        sift(values, 0, end, &mut compare);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::heap_sort;
+    #[test]
+    fn comparator_sort_matches_standard_ordering() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut values: alloc::vec::Vec<(u8, u16)> = (0..300u16)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed % 9) as u8, i)
+            })
+            .collect();
+        let mut expected = values.clone();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        super::heap_sort_by(&mut values, |a, b| b.cmp(a));
+        assert_eq!(values, expected);
+    }
     #[test]
     fn embedded_sort_matches_standard_for_routing_lists() {
         for length in [0, 1, 2, 3, 7, 8, 13, 16, 31, 32, 255, 256, 1024] {

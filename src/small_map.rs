@@ -1,10 +1,17 @@
-//! Compact ordered index for small embedded router tables.
+//! Compact ordered map/set for embedded router tables.
 //!
-//! Binary search preserves B-tree key order and logarithmic lookups. Insertions
-//! shift entries, so this is reserved for small side/transport/replay indexes;
-//! unbounded schemas, peer addresses and per-type metadata keep B-trees. Empty
-//! tables release their allocation rather than retaining a historical peak.
-//! There is no entry cap and no unsafe code. Desktop production uses B-trees.
+//! Binary search preserves B-tree key order and logarithmic lookups. Embedded
+//! no_std builds (and tests) use these for every crate-internal ordered table
+//! through `crate::OrdMap`/`crate::OrdSet`: one sorted `Vec` implementation
+//! costs far less flash than B-tree code monomorphized per key/value pair.
+//! Insertions and removals shift later entries (a `memmove` of O(n) entries).
+//! Embedded tables are bounded by the fleet and schema: per-side/route state
+//! by the board's sides, peer/address/time-source tables by the visible fleet,
+//! per-type tables by the schema and reliable windows by `RELIABLE_MAX_*`.
+//! Peer-keyed tables box their values, so shifts move pointer-sized payloads.
+//! Each table is one contiguous allocation that grows by doubling; empty tables
+//! release it rather than retaining a historical peak. There is no entry cap
+//! and no unsafe code. Desktop/std production uses B-trees.
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 
@@ -129,7 +136,6 @@ pub(crate) struct Entry<'a, K, V> {
     position: Result<usize, usize>,
 }
 impl<'a, K: Ord, V> Entry<'a, K, V> {
-    #[cfg(test)]
     pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Self {
         if let Ok(i) = self.position {
             f(&mut self.map.entries[i].1);
@@ -232,6 +238,104 @@ impl<K: Ord + Borrow<Q>, V, Q: Ord + ?Sized> core::ops::Index<&Q> for SmallMap<K
     type Output = V;
     fn index(&self, key: &Q) -> &V {
         self.get(key).expect("no entry found for key")
+    }
+}
+
+/// Sorted-`Vec` counterpart of `BTreeSet`, with the same ordering and
+/// iteration semantics as [`SmallMap`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SmallSet<T> {
+    items: Vec<T>,
+}
+impl<T> Default for SmallSet<T> {
+    fn default() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+impl<T: Ord> SmallSet<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn position<Q: Ord + ?Sized>(&self, value: &Q) -> Result<usize, usize>
+    where
+        T: Borrow<Q>,
+    {
+        self.items.binary_search_by(|v| v.borrow().cmp(value))
+    }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.items = Vec::new();
+    }
+    pub fn contains<Q: Ord + ?Sized>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+    {
+        self.position(value).is_ok()
+    }
+    pub fn insert(&mut self, value: T) -> bool {
+        match self.position(&value) {
+            Ok(_) => false,
+            Err(i) => {
+                self.items.insert(i, value);
+                true
+            }
+        }
+    }
+    pub fn remove<Q: Ord + ?Sized>(&mut self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+    {
+        let Ok(i) = self.position(value) else {
+            return false;
+        };
+        self.items.remove(i);
+        if self.items.is_empty() {
+            self.items = Vec::new();
+        }
+        true
+    }
+    pub fn retain<F: FnMut(&T) -> bool>(&mut self, f: F) {
+        self.items.retain(f);
+        if self.items.is_empty() {
+            self.items = Vec::new();
+        }
+    }
+    pub fn iter(&self) -> core::slice::Iter<'_, T> {
+        self.items.iter()
+    }
+}
+impl<T: Ord> Extend<T> for SmallSet<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, it: I) {
+        for value in it {
+            self.insert(value);
+        }
+    }
+}
+impl<T: Ord> FromIterator<T> for SmallSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(it: I) -> Self {
+        let mut set = Self::new();
+        set.extend(it);
+        set
+    }
+}
+impl<T> IntoIterator for SmallSet<T> {
+    type Item = T;
+    type IntoIter = alloc::vec::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+impl<'a, T: Ord> IntoIterator for &'a SmallSet<T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
