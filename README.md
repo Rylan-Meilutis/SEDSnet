@@ -196,6 +196,12 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 4.3.13 highlights
+
+- Elect UTC ahead of uptime regardless of priority or arrival order, and step unanchored clocks onto UTC.
+- Synchronize hop by hop through any number of relays: each node re-serves its source at the next stratum on its downstream sides and exchanges only with its nearest upstream neighbor.
+- Prevent source loops between relays; quality travels in the existing announce priority word, with 4.3.12 schemas and macro crate 2.2.0 unchanged.
+
 ### Version 4.3.12 highlights
 
 - Expose `packet::sender_address_u32` for existing 32-bit compact source identities without packet packing or wire-name cache changes.
