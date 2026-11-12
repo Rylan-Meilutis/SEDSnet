@@ -334,7 +334,6 @@ use alloc::{
     borrow::ToOwned,
     boxed::Box,
     collections::VecDeque,
-    format,
     sync::Arc,
     vec,
     vec::Vec,
@@ -5243,12 +5242,17 @@ impl Router {
             return base.to_string();
         }
         let stem = if base.is_empty() { "node" } else { base };
-        let mut candidate = format!("{stem}-{owner_hash:08x}");
+        let mut candidate = String::from(stem);
+        candidate.push('-');
+        crate::diag_text::push_hex(&mut candidate, owner_hash, 8);
+        let base_len = candidate.len();
         let mut suffix = 1u32;
         while st.address_book.contains_key(&candidate)
             || st.local_address.hostname.as_ref() == candidate
         {
-            candidate = format!("{stem}-{owner_hash:08x}-{suffix}");
+            candidate.truncate(base_len);
+            candidate.push('-');
+            crate::diag_text::push_dec(&mut candidate, u64::from(suffix));
             suffix = suffix.saturating_add(1);
         }
         candidate
@@ -5522,7 +5526,7 @@ impl Router {
 
     fn encode_end_to_end_ack_sender(&self) -> String {
         let sender = self.sender_arc();
-        format!("{}{}", Self::END_TO_END_ACK_PREFIX, sender)
+        crate::diag_text::concat(&[Self::END_TO_END_ACK_PREFIX, &sender])
     }
 
     #[cfg(feature = "discovery")]
@@ -17623,11 +17627,10 @@ impl Router {
 
         let device = self.sender_arc();
         let error_msg = match dest {
-            Some(failed_local) => format!(
-                "Handler for endpoint {:?} failed on device {:?}: {:?}",
-                failed_local, device, e
-            ),
-            None => format!("TX Handler failed on device {:?}: {:?}", device, e),
+            Some(failed_local) => {
+                crate::diag_text::handler_failed(Some(failed_local), false, &device, &e)
+            }
+            None => crate::diag_text::tx_handler_failed(&device, &e),
         };
 
         let mut recipients: Vec<DataEndpoint> = pkt
@@ -19071,10 +19074,7 @@ impl Router {
         }
 
         let device = self.sender_arc();
-        let error_msg = format!(
-            "Handler for endpoint {:?} failed on device {:?}: {:?}",
-            dest, device, e
-        );
+        let error_msg = crate::diag_text::handler_failed(dest, true, &device, &e);
 
         if recipients.is_empty() && dest.is_none() {
             fallback_stdout(&error_msg);

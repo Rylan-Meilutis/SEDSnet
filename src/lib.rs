@@ -171,6 +171,7 @@ pub mod config;
 #[cfg(feature = "cryptography")]
 pub mod crypto;
 pub mod diagnostics;
+mod diag_text;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 mod lock;

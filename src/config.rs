@@ -513,22 +513,29 @@ impl DataEndpoint {
     }
 }
 
+impl DataEndpoint {
+    /// Calls `f` with the name `Debug` prints, or `None` when it prints
+    /// `DataEndpoint(<id>)`.
+    pub(crate) fn with_debug_name<R>(self, f: impl FnOnce(Option<&str>) -> R) -> R {
+        match self {
+            Self::TelemetryError => f(Some("SEDSNET_ERROR")),
+            Self::TimeSync => f(Some("SEDSNET_TIME_SYNC")),
+            Self::Discovery => f(Some("SEDSNET_DISCOVERY")),
+            _ => {
+                let meta = get_endpoint_meta(self);
+                let meta_name = meta.name_ref();
+                f((meta_name != "UNKNOWN_ENDPOINT").then_some(meta_name))
+            }
+        }
+    }
+}
+
 impl core::fmt::Debug for DataEndpoint {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let name = match *self {
-            Self::TelemetryError => "SEDSNET_ERROR",
-            Self::TimeSync => "SEDSNET_TIME_SYNC",
-            Self::Discovery => "SEDSNET_DISCOVERY",
-            _ => {
-                let meta = get_endpoint_meta(*self);
-                let meta_name = meta.name_ref();
-                if meta_name != "UNKNOWN_ENDPOINT" {
-                    return f.write_str(meta_name);
-                }
-                return write!(f, "DataEndpoint({})", self.0);
-            }
-        };
-        f.write_str(name)
+        self.with_debug_name(|name| match name {
+            Some(name) => f.write_str(name),
+            None => write!(f, "DataEndpoint({})", self.0),
+        })
     }
 }
 
