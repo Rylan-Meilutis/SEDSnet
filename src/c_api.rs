@@ -8557,15 +8557,12 @@ pub extern "C" fn seds_compact_bundle_pack(
     }
     let offsets = unsafe { slice::from_raw_parts(offsets, count) };
     let lengths = unsafe { slice::from_raw_parts(lengths, count) };
-    let mut frames: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(count);
-    for (&off, &len) in offsets.iter().zip(lengths) {
-        frames.push(unsafe { slice::from_raw_parts(base.add(usize::from(off)), usize::from(len)) });
-    }
-    let bundle = match crate::wire_bundle::pack_bundle(&frames) {
-        Ok(bundle) => bundle,
-        Err(_) => return status_from_err(TelemetryError::BadArg),
+    let frame = |i: usize| unsafe {
+        slice::from_raw_parts(base.add(usize::from(offsets[i])), usize::from(lengths[i]))
     };
-    drop(frames);
+    let Ok(bundle) = crate::wire_bundle::pack_bundle_with(count, &frame) else {
+        return status_from_err(TelemetryError::BadArg);
+    };
     if bundle.len() > cap || bundle.len() > i32::MAX as usize {
         return status_from_err(TelemetryError::SizeMismatch { expected: cap, got: bundle.len() });
     }

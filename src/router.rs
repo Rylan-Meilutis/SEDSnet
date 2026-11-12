@@ -15838,17 +15838,17 @@ impl Router {
         };
         // Same liveness rule as the template dictionary: every sender heard
         // on this side recently, direct or forwarded, must accept bundles.
-        let mut live = route
-            .announcers
-            .values()
-            .filter(|sender| now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS)
-            .peekable();
-        live.peek().is_some()
-            && live.all(|sender| {
-                sender.link_capabilities.is_some_and(|caps| {
-                    caps.flags & discovery::LINK_CAPABILITY_COMPACT_BUNDLE != 0
-                })
-            })
+        let mut live = false;
+        for sender in route.announcers.values() {
+            if now_ms.saturating_sub(sender.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
+                continue;
+            }
+            match sender.link_capabilities {
+                Some(caps) if caps.flags & discovery::LINK_CAPABILITY_COMPACT_BUNDLE != 0 => live = true,
+                _ => return false,
+            }
+        }
+        live
     }
 
     /// Enable or disable egress toward a registered side.

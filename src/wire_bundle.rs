@@ -100,26 +100,26 @@ struct Reader<'a> {
 }
 impl<'a> Reader<'a> {
     #[inline(never)]
-    fn take(&mut self, n: usize) -> TelemetryResult<&'a [u8]> {
-        let end = self.off.checked_add(n).filter(|end| *end <= self.buf.len()).ok_or(BAD)?;
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.off.checked_add(n).filter(|end| *end <= self.buf.len())?;
         let out = &self.buf[self.off..end];
         self.off = end;
-        Ok(out)
+        Some(out)
     }
-    fn byte(&mut self) -> TelemetryResult<u8> {
-        Ok(self.take(1)?[0])
+    fn byte(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
     }
     #[inline(never)]
-    fn uleb(&mut self) -> TelemetryResult<u64> {
-        read_uleb128_local(self.buf, &mut self.off).map_err(|_| BAD)
+    fn uleb(&mut self) -> Option<u64> {
+        read_uleb128_local(self.buf, &mut self.off).ok()
     }
     /// A ULEB128 field that must fit 32 bits (type, size, source, lengths).
     #[inline(never)]
-    fn u32(&mut self) -> TelemetryResult<u32> {
-        u32::try_from(self.uleb()?).map_err(|_| BAD)
+    fn u32(&mut self) -> Option<u32> {
+        u32::try_from(self.uleb()?).ok()
     }
-    fn len(&mut self) -> TelemetryResult<usize> {
-        Ok(self.u32()? as usize)
+    fn len(&mut self) -> Option<usize> {
+        Some(self.u32()? as usize)
     }
     fn rest(&mut self) -> &'a [u8] {
         let out = &self.buf[self.off..];
@@ -127,7 +127,7 @@ impl<'a> Reader<'a> {
         out
     }
     /// Endpoint bytes as the canonical flags describe them.
-    fn endpoints(&mut self, flags: u8, nep: u8) -> TelemetryResult<&'a [u8]> {
+    fn endpoints(&mut self, flags: u8, nep: u8) -> Option<&'a [u8]> {
         let start = self.off;
         if flags & F_EP_LIST != 0 {
             for _ in 0..nep {
@@ -136,10 +136,10 @@ impl<'a> Reader<'a> {
         } else if flags & F_EP_BITMAP != 0 {
             self.take(EP_BITMAP_BYTES)?;
         }
-        Ok(&self.buf[start..self.off])
+        Some(&self.buf[start..self.off])
     }
     /// Reliable header bytes as the canonical flags describe them.
-    fn reliable(&mut self, flags: u8) -> TelemetryResult<&'a [u8]> {
+    fn reliable(&mut self, flags: u8) -> Option<&'a [u8]> {
         let start = self.off;
         if flags & F_RELIABLE != 0 {
             if flags & F_COMPACT_RELIABLE != 0 {
@@ -154,92 +154,97 @@ impl<'a> Reader<'a> {
                 self.take(9)?;
             }
         }
-        Ok(&self.buf[start..self.off])
+        Some(&self.buf[start..self.off])
     }
 }
 
 /// Split `bytes` into data and its trailing CRC32-LE, checking it.
-fn checked(bytes: &[u8]) -> TelemetryResult<&[u8]> {
-    let n = bytes.len().checked_sub(4).ok_or(BAD)?;
+fn checked(bytes: &[u8]) -> Option<&[u8]> {
+    let n = bytes.len().checked_sub(4)?;
     let (data, crc) = bytes.split_at(n);
     if crc32_bytes(data).to_le_bytes() != crc {
-        return Err(BAD);
+        return None;
     }
-    Ok(data)
+    Some(data)
 }
 
-fn usable_flags(flags: u8) -> TelemetryResult<u8> {
+fn usable_flags(flags: u8) -> Option<u8> {
     if flags & F_E2E != 0 || flags & F_EPS == F_EPS {
-        return Err(BAD);
+        return None;
     }
-    Ok(flags)
+    Some(flags)
 }
 
-/// Read one frame's fields: the canonical form (`prev` None, `rec` false) or
-/// a bundle record relative to the previous record.
-fn read_fields<'a>(buf: &'a [u8], rec: bool, p: Option<&Fields<'a>>, prev_ts: u64) -> TelemetryResult<Fields<'a>> {
+/// Read one frame's fields into `p`: the canonical form (`rec` false), or a
+/// bundle record relative to the previous record already in `p` (`first`
+/// when there is none; `p.ts` is then the bundle's base timestamp).
+fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, p: &mut Fields<'a>) -> Option<()> {
     let mut r = Reader { buf, off: 0 };
     let flags = usable_flags(r.byte()?)?;
     let elide = if rec { r.byte()? } else { 0 };
-    let has_prev = p.is_some();
-    let p = p.copied().unwrap_or_default();
     // Elision needs a previous record and the field it refers to.
     if elide & !E_KNOWN != 0
-        || (!has_prev && elide != 0)
+        || (first && elide != 0)
         || (elide & E_NONCE_DELTA != 0 && (elide & E_SOURCE == 0 || flags & p.flags & F_NONCE == 0))
         || (elide & E_CONTRACT != 0 && flags & p.flags & F_CONTRACT == 0)
         || (elide & E_ENDPOINTS != 0
             && (elide & E_NEP == 0 || flags & F_EPS == 0 || p.flags & F_EPS != flags & F_EPS))
     {
-        return Err(BAD);
+        return None;
     }
-    let nep = if elide & E_NEP != 0 { p.nep } else { r.byte()? };
-    let ty = if elide & E_TYPE != 0 { p.ty } else { r.u32()? };
+    if elide & E_NEP == 0 {
+        p.nep = r.byte()?;
+    }
+    if elide & E_TYPE == 0 {
+        p.ty = r.u32()?;
+    }
     let size = if !rec || flags & F_COMPRESSED != 0 { Some(r.u32()?) } else { None };
-    let ts = if rec { prev_ts.wrapping_add(unzigzag(r.uleb()?)) } else { r.uleb()? };
-    let nonce = if flags & F_NONCE != 0 {
+    let ts = r.uleb()?;
+    p.ts = if rec { p.ts.wrapping_add(unzigzag(ts)) } else { ts };
+    if flags & F_NONCE != 0 {
         let v = r.u32()?;
-        let n = if elide & E_NONCE_DELTA != 0 {
-            u32::from(p.nonce).wrapping_add(unzigzag32(v))
-        } else {
-            v
-        };
-        u16::try_from(n).map_err(|_| BAD)?
+        let n = if elide & E_NONCE_DELTA != 0 { u32::from(p.nonce).wrapping_add(unzigzag32(v)) } else { v };
+        p.nonce = u16::try_from(n).ok()?;
     } else {
-        0
-    };
-    let src = if elide & E_SOURCE != 0 { p.src } else { r.u32()? };
-    let eps = if elide & E_ENDPOINTS != 0 { p.eps } else { r.endpoints(flags, nep)? };
-    let contract = if flags & F_CONTRACT == 0 {
-        &[][..]
-    } else if elide & E_CONTRACT != 0 {
-        p.contract
-    } else {
-        let n = r.len()?;
-        r.take(n)?
-    };
-    let rel = r.reliable(flags)?;
-    let payload = r.rest();
-    let plen = u32::try_from(payload.len()).map_err(|_| BAD)?;
-    let size = size.unwrap_or(plen);
-    if flags & F_COMPRESSED == 0 && size != plen {
-        return Err(BAD);
+        p.nonce = 0;
     }
-    Ok(Fields { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
+    if elide & E_SOURCE == 0 {
+        p.src = r.u32()?;
+    }
+    if elide & E_ENDPOINTS == 0 {
+        p.eps = r.endpoints(flags, p.nep)?;
+    }
+    if flags & F_CONTRACT == 0 {
+        p.contract = &[];
+    } else if elide & E_CONTRACT == 0 {
+        let n = r.len()?;
+        p.contract = r.take(n)?;
+    }
+    p.rel = r.reliable(flags)?;
+    p.payload = r.rest();
+    let plen = u32::try_from(p.payload.len()).ok()?;
+    p.size = size.unwrap_or(plen);
+    if flags & F_COMPRESSED == 0 && p.size != plen {
+        return None;
+    }
+    p.flags = flags;
+    Some(())
 }
 
-fn parse_canonical(frame: &[u8]) -> TelemetryResult<Fields<'_>> {
+fn parse_canonical(frame: &[u8]) -> Option<Fields<'_>> {
     if frame.starts_with(b"SDT") {
-        return Err(BAD);
+        return None;
     }
-    read_fields(checked(frame)?, false, None, 0)
+    let mut f = Fields::default();
+    read_fields(checked(frame)?, false, true, &mut f)?;
+    Some(f)
 }
 
 /// Whether `frame` can travel inside a bundle: a canonical (not side-wrapped),
 /// CRC-valid, unsealed frame. Urgency is the writer's decision: it keeps
 /// urgent frames out before asking.
 pub fn frame_bundleable(frame: &[u8]) -> bool {
-    parse_canonical(frame).is_ok()
+    parse_canonical(frame).is_some()
 }
 
 #[inline]
@@ -336,16 +341,20 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
 /// holds a frame that is not a valid canonical frame; the writer then sends
 /// such a frame on its own.
 pub fn pack_bundle(frames: &[&[u8]]) -> TelemetryResult<Vec<u8>> {
-    if frames.is_empty() || frames.len() > MAX_BUNDLE_RECORDS {
+    pack_bundle_with(frames.len(), &|i| frames[i])
+}
+
+/// [`pack_bundle`] over `count` frames that `frame(i)` returns.
+pub fn pack_bundle_with<'a>(count: usize, frame: &dyn Fn(usize) -> &'a [u8]) -> TelemetryResult<Vec<u8>> {
+    if count == 0 || count > MAX_BUNDLE_RECORDS {
         return Err(BAD);
     }
-    let total: usize = frames.iter().map(|f| f.len()).sum();
-    let mut out = Vec::with_capacity(total + 16);
-    let mut record = Vec::with_capacity(64);
+    let mut out = Vec::new();
+    let mut record = Vec::new();
     let mut prev: Option<Fields<'_>> = None;
     put(&mut out, &[BUNDLE_MARKER]);
-    for frame in frames {
-        let c = parse_canonical(frame)?;
+    for i in 0..count {
+        let c = parse_canonical(frame(i)).ok_or(BAD)?;
         if prev.is_none() {
             put_uleb(&mut out, c.ts);
         }
@@ -359,29 +368,19 @@ pub fn pack_bundle(frames: &[&[u8]]) -> TelemetryResult<Vec<u8>> {
     Ok(out)
 }
 
-/// Walk every record; with `each`, hand over each rebuilt canonical frame.
-fn walk(bytes: &[u8], mut each: Option<&mut dyn FnMut(&[u8]) -> TelemetryResult<()>>) -> TelemetryResult<usize> {
-    if !is_bundle(bytes) {
-        return Err(BAD);
-    }
-    let mut r = Reader { buf: checked(bytes)?, off: 1 };
-    let mut prev_ts = r.uleb()?;
-    let mut prev: Option<Fields<'_>> = None;
+/// Walk every record, handing each rebuilt canonical frame to `each`.
+fn walk(bytes: &[u8], each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>) -> TelemetryResult<usize> {
+    let mut r = Reader { buf: checked(bytes).filter(|_| is_bundle(bytes)).ok_or(BAD)?, off: 1 };
+    let mut cur = Fields { ts: r.uleb().ok_or(BAD)?, ..Fields::default() };
     let mut count = 0usize;
     let mut canonical = Vec::new();
     while r.off < r.buf.len() {
-        if count == MAX_BUNDLE_RECORDS {
+        let rec = r.len().and_then(|n| r.take(n)).ok_or(BAD)?;
+        if count == MAX_BUNDLE_RECORDS || read_fields(rec, true, count == 0, &mut cur).is_none() {
             return Err(BAD);
         }
-        let n = r.len()?;
-        let rec = r.take(n)?;
-        let c = read_fields(rec, true, prev.as_ref(), prev_ts)?;
-        if let Some(each) = each.as_mut() {
-            write_fields(&c, false, None, &mut canonical);
-            each(&canonical)?;
-        }
-        prev_ts = c.ts;
-        prev = Some(c);
+        write_fields(&cur, false, None, &mut canonical);
+        each(&canonical)?;
         count += 1;
     }
     if count == 0 {
@@ -397,8 +396,8 @@ pub fn unpack_bundle(
     bytes: &[u8],
     each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>,
 ) -> TelemetryResult<usize> {
-    walk(bytes, None)?;
-    walk(bytes, Some(each))
+    walk(bytes, &mut |_| Ok(()))?;
+    walk(bytes, each)
 }
 
 /// Verify a bundle and return its rebuilt canonical frames.
