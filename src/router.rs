@@ -6752,6 +6752,7 @@ impl Router {
             .is_empty()
     }
 
+    #[cfg(feature = "discovery")]
     fn filter_end_to_end_satisfied_sides_locked(
         &self,
         st: &RouterInner,
