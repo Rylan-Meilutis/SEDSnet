@@ -602,6 +602,9 @@ typedef struct SedsTimeSyncStatus {
  */
 void seds_set_clock_us(uint64_t (*now_us)(void));
 
+/** @brief Current network time in Unix microseconds. */
+SedsResult seds_router_get_network_time_us(SedsRouter * r, uint64_t * out_us);
+
 /** @brief Read this node's time sync quality. */
 SedsResult seds_router_get_timesync_status(SedsRouter * r, SedsTimeSyncStatus * out);
 

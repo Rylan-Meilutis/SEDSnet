@@ -2045,6 +2045,23 @@ pub extern "C" fn seds_router_configure_timesync(
     status_from_result_code(SedsResult::SedsOk)
 }
 
+/// Current network time in Unix microseconds (time sync builds).
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_network_time_us(r: *mut SedsRouter, out_us: *mut u64) -> i32 {
+    if r.is_null() || out_us.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    match router.network_time_ns() {
+        Some(ns) if ns >= 0 => {
+            unsafe { *out_us = (ns / 1_000) as u64 };
+            status_from_result_code(SedsResult::SedsOk)
+        }
+        _ => status_from_err(TelemetryError::Io("network time unavailable")),
+    }
+}
+
 /// Time sync quality for C callers. See `seds_router_get_timesync_status`.
 #[cfg(feature = "timesync")]
 #[repr(C)]
