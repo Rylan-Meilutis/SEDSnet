@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+**Breaking wire change.** A side opened with `SideOptions::compact_bundle`
+carries compact bundles, and nodes on such a link must all run a
+bundle-capable build. There is no negotiation and no fallback, so the whole
+network (ground station, relay station and every board) must be updated
+together. Sides without the option keep the 4.3.14 framing.
+
+- Add `wire_bundle` (feature `compact-bundle`: on by default for std builds,
+  opt-in for `embedded`; CMake `SEDSNET_COMPACT_BUNDLE`). A bundle carries
+  several canonical frames in one side frame with one CRC32. Each record
+  drops header fields equal to the previous record's and carries its
+  timestamp and nonce as deltas. Records name sources and frozen target
+  hashes by their 1-byte position in a node table that every build shares
+  (`set_node_table`, `seds_set_node_table`). A bundle that uses the table
+  carries a check byte of the table, and a receiver with a different table,
+  or none, drops the bundle rather than guess. The receiver rebuilds every
+  canonical frame byte for byte, so packet ids, routing, hop and end-to-end
+  reliability and forwarding are unchanged.
+- A compact-bundle side hands its writer canonical frames: no header
+  templates. Writers pack the frames they already hold, in their own
+  priority order, with `pack_bundle` / `seds_compact_bundle_pack`, and keep
+  urgent frames (ABORT) standalone. ABORT decodes with no prior state.
+- Router receive (`rx_packed_from_side`, `rx_packed_queue_from_side`)
+  verifies a whole bundle before it delivers any of its frames.
+
 
 ## 5.0.0
 
