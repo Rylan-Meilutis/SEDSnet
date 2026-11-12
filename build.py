@@ -27,7 +27,7 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-FEATURE_OPTIONS = ("embedded", "embedded-core", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress")
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress")
 
 def qualification_profiles(features: list[str]) -> list[list[str]]:
     """Exercise feature-OFF normal storage and feature-ON compact/fair storage.
@@ -58,7 +58,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args.features = list(dict.fromkeys(f for value in args.features for f in re.split(r"[,\s]+", value) if f))
     unknown = set(args.features) - set(FEATURE_OPTIONS)
     if unknown: parser.error("unsupported features: " + ", ".join(sorted(unknown)))
-    if {"embedded", "embedded-core"} & set(args.features) and "python" in args.features: parser.error("build embedded and python targets separately")
+    if "embedded" in args.features and "python" in args.features: parser.error("build embedded and python targets separately")
     if args.crate_type and (args.command != "build" or "python" in args.features):
         parser.error("--crate-type requires a non-Python build command")
     if args.full and args.command != "test": parser.error("--full requires test")
@@ -1014,13 +1014,11 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
     checks = args.command == "check"
     tests = args.command == "test"
     test_full = args.full
-    build_embedded = "embedded" in args.features or "embedded-core" in args.features
-    # embedded-core: the embedded bundle without zstd payload compression.
-    embedded_feature = "embedded" if "embedded" in args.features else "embedded-core"
+    build_embedded = "embedded" in args.features
     build_python = "python" in args.features
     build_timesync = "timesync" in args.features
     build_cryptography = "cryptography" in args.features
-    extra_features = [f for f in args.features if f not in ("embedded", "embedded-core", "python", "timesync", "cryptography")]
+    extra_features = [f for f in args.features if f not in ("embedded", "python", "timesync", "cryptography")]
     build_wheel = args.command == "maturin-build"
     develop_wheel = args.command == "maturin-develop"
     release_build = args.release
@@ -1300,7 +1298,7 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
             "--target",
             target,
             "--features",
-            f"{embedded_feature}{feature_suffix}",
+            f"embedded{feature_suffix}",
         ]
         if release_build:
             build_mode = ["--profile", "release-embedded"]

@@ -19,11 +19,7 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = ["std", "compression", "timesync", "discovery", "cryptography"]
 std = ["serde", "serde/std", "serde_json", "serde_json/std"]
-embedded = ["embedded-core", "compression"]
-# The embedded bundle without payload compression (zstd, about 48 KB of flash).
-# SEDSnet negotiates payload codecs per link, so such a node's links carry
-# plain payloads while compressing nodes keep compressing elsewhere.
-embedded-core = ["timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
+embedded = ["compression", "timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
 python = ["std", "pyo3/extension-module", "pyo3/abi3-py39", "compression", "timesync", "discovery", "cryptography"]
 compression = ["zstd-safe"]
 timesync = []
