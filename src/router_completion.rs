@@ -65,9 +65,14 @@ struct Ledger {
     fence: u64,
     pending: Vec<Weak<Write>>,
     history: Vec<History>,
+    /// End-to-end parents whose tracked write physically drained since the
+    /// router last looked, with the router-clock drain instant (ms).
+    drained: Vec<(u64, u64)>,
 }
 pub(super) struct TrackerInner {
     router: u64,
+    /// The owning router's clock (drain instants share its timebase).
+    clock: Option<Arc<dyn Clock + Send + Sync>>,
     side: AtomicU64,
     limits: RetryTrackerLimits,
     ledger: RouterMutex<Ledger>,
@@ -280,6 +285,12 @@ impl PackedWriteLease {
             return Ok(());
         }
         self.write.flags.fetch_or(DRAINED, Ordering::AcqRel);
+        if self.write.parent != 0
+            && l.drained.len() < 32
+            && let Some(clock) = &t.clock
+        {
+            l.drained.push((self.write.parent, clock.now_ms()));
+        }
         if self.write.birth == 0
             || l.fence == 0
             || l.fence != self.write.fence
@@ -368,9 +379,11 @@ impl Router {
         let fence = serial();
         let tracker = RetryTracker(Arc::new(TrackerInner {
             router,
+            clock: Some(self.clock.clone()),
             side: AtomicU64::new(u64::MAX),
             limits,
             ledger: RouterMutex::new(Ledger {
+                drained: Vec::new(),
                 fence,
                 pending: Vec::new(),
                 history: Vec::new(),
@@ -402,6 +415,24 @@ impl Router {
         } else {
             0
         }
+    }
+    /// Parents whose tracked write drained since the last call, and parents
+    /// with a tracked write handed to the transport but not yet drained,
+    /// discarded or retired (a held write counts as covering its packet).
+    pub(super) fn retry_write_progress(&self) -> (Vec<(u64, u64)>, Vec<u64>) {
+        let mut drained = Vec::new();
+        let mut held = Vec::new();
+        for t in self.retry_trackers.lock().iter().filter_map(Weak::upgrade) {
+            let mut l = t.ledger.lock();
+            drained.append(&mut l.drained);
+            for w in l.pending.iter().filter_map(Weak::upgrade) {
+                let f = w.flags.load(Ordering::Acquire);
+                if w.parent != 0 && f & (DRAINED | DISCARDED | RETIRED) == 0 {
+                    held.push(w.parent);
+                }
+            }
+        }
+        (drained, held)
     }
     pub(super) fn retry_queued_intent(&self, claim: Option<TxClaim>) -> IntentGuard {
         let queued = claim.filter(|c| c.side_retry).and_then(|c| {
@@ -495,9 +526,11 @@ mod tests {
     fn tracker(limits: RetryTrackerLimits) -> RetryTracker {
         RetryTracker(Arc::new(TrackerInner {
             router: 1,
+            clock: None,
             side: AtomicU64::new(0),
             limits,
             ledger: RouterMutex::new(Ledger {
+                drained: Vec::new(),
                 fence: 1,
                 pending: Vec::new(),
                 history: Vec::new(),

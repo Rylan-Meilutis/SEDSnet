@@ -1168,3 +1168,33 @@ fn tracker_retry_provenance_survives_child_queue_admission_and_refusal() {
     finish_tracked(&f, first.bytes());
     assert!(retry.discard_if_retired());
 }
+#[test]
+fn retry_clock_starts_when_the_write_drains_not_at_handoff() {
+    // A transport that holds its write most of a retry interval (GS turn
+    // writer behind an RF burst) must not see a replay queued right behind
+    // the first copy: the retry interval counts from the physical drain.
+    let (f, _t, leases) = tracked_fixture(true);
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    let interval = runtime_reliable_retransmit_ms();
+    let step = || {
+        f.now.fetch_add(10, Ordering::SeqCst);
+        f.router.process_end_to_end_reliable_timeouts().unwrap();
+        f.router.dispatch_tx_queue_with_timeout(0).unwrap();
+    };
+    let hold = interval * 7 / 8;
+    for _ in 0..hold / 10 {
+        step();
+    }
+    assert_eq!(leases.lock().unwrap().len(), 1, "no replay while the first copy is held");
+    first.report_drained().unwrap();
+    for _ in 0..interval / 10 - 2 {
+        step();
+        assert_eq!(leases.lock().unwrap().len(), 1, "replay before drain + retry interval");
+    }
+    for _ in 0..4 {
+        step();
+    }
+    assert_eq!(leases.lock().unwrap().len(), 2, "one replay after drain + retry interval");
+}

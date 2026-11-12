@@ -4133,7 +4133,7 @@ pub struct Router {
     side_tx_activity: crate::lock::SideTxActivity,
     #[cfg(feature = "std")]
     active_queued_tx: core::sync::atomic::AtomicUsize,
-    clock: Box<dyn Clock + Send + Sync>,
+    clock: Arc<dyn Clock + Send + Sync>,
     #[cfg(feature = "timesync")]
     timesync: Option<Box<RouterMutex<TimeSyncRuntime>>>,
     /// Side and transmit-mark slot of a time sync frame being handed to a
@@ -13798,9 +13798,21 @@ impl Router {
         let now = self.clock.now_ms();
         let mut requeue = Vec::new();
         let mut failed_ordered_types = OrdSet::new();
+        // Leased transports report physical drain: a copy's retry interval
+        // starts when it actually left, and a copy still held by the writer
+        // covers its packet for up to two intervals (a writer that never
+        // drains or discards cannot stall the retries forever).
+        #[cfg(feature = "std")]
+        let (drained, held) = self.retry_write_progress();
 
         {
             let mut st = self.state.lock();
+            #[cfg(feature = "std")]
+            for (id, at) in drained {
+                if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&id) {
+                    sent.last_send_ms = sent.last_send_ms.max(at);
+                }
+            }
             #[cfg(feature = "discovery")]
             {
                 if Self::prune_discovery_routes_locked(&mut st, now) {
@@ -13825,6 +13837,11 @@ impl Router {
                         .pending_destinations
                         .values()
                         .all(|side| Self::e2e_child_owned(transmit_queue, *side, packet_id));
+                #[cfg(feature = "std")]
+                let covered = covered
+                    || (held.contains(&packet_id)
+                        && now.wrapping_sub(sent.last_send_ms)
+                            < runtime_reliable_retransmit_ms().saturating_mul(2));
                 if covered
                     || sent.waiting_for_predecessor
                     || sent.queued
@@ -14870,7 +14887,7 @@ impl Router {
             side_tx_activity: crate::lock::SideTxActivity::default(),
             #[cfg(feature = "std")]
             active_queued_tx: core::sync::atomic::AtomicUsize::new(0),
-            clock,
+            clock: Arc::from(clock),
             #[cfg(feature = "timesync")]
             timesync: local_services_enabled
                 .then(|| Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)))),
