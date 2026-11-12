@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+**Breaking wire change (time sync).** SEDSnet 4.x and 5.x nodes do not keep
+time with each other: the GS, RRLS and every board update together. Frames
+do not grow; time sync uses the same words differently. Other wire framing and
+message schemas keep their 4.3.14 representations.
+
+- Time sync uses NTP interleaved mode in the existing request/response words.
+  The response carries the microsecond receive stamp of this request (with the
+  responder's sync flag and error-bound code) and the true transmit time of the
+  responder's previous response to the same requester. Responder queueing
+  becomes turnaround instead of path delay: a 7 s radio queue no longer biases
+  the clock. The millisecond 4.x answer and the verified-forward-step path are
+  removed.
+- Stamps are local bookkeeping: the router stamps time sync frames at handoff
+  to the side and at receipt; transports can report the real transmit
+  completion (`note_frame_sent`, `seds_router_note_frame_sent`) and receive
+  instant (`rx_packed_from_side_at`, `rx_packed_queue_from_side_at`,
+  `seds_router_receive_packed_from_side_at`).
+- Followers keep 8 samples, reject delay outliers, fit phase and oscillator
+  frequency by weighted least squares and slew (they step only before first
+  lock or onto a re-anchored source). A 1% HSI is learned and held over.
+  Locked followers exchange 4x less often (time sync air at or below 4.3.14).
+- `timesync_status` / `seds_router_get_timesync_status`: state (unsynced,
+  acquiring, locked, holdover), error bound, pending offset, learned rate,
+  stratum, and a one-byte health summary for BOARD_HEALTH spare bits
+  (`decode_health_byte`).
+- `set_side_timesync_path` / `seds_router_set_side_timesync_path`: per-byte and
+  fixed path asymmetry of slow links.
+- UTC reference reports: a follower with GPS reports reference UTC minus
+  network time in its request (`set_utc_reference_offset`); the source reads
+  them (`take_utc_reference_reports`, std). An offset that does not fit is not
+  sent.
+- `step_local_network_time_ns`: a leading station coarse-sets its UTC once.
+- A node following a better source keeps its own host time as a candidate
+  only; a node disciplined from an anchored source may lead as anchored during
+  holdover while its bound is within the lock threshold (RRLS/RF bridging).
+- Scheduling classes: `set_type_scheduling_class` / `seds_dtype_set_scheduling_class`
+  place application types (ABORT, operator commands) above SEDSnet network
+  control; time sync, schema and managed variables are 254; acks and route
+  discovery stay 255; data is below.
+- Reliability: the end-to-end retry interval starts when a leased write
+  reports drained, and a held write covers its packet for up to two intervals;
+  `complete_reliable` / `seds_router_complete_reliable` completes one pending
+  send on other proof of delivery (never ABORT or urgent types);
+  `relayed_frame_satisfied` / `seds_router_relayed_frame_satisfied` lets a
+  driver drop a queued relayed copy every owner already acknowledged.
+
 
 ## 4.3.14
 
