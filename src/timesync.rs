@@ -595,8 +595,48 @@ impl SlewedNetworkClock {
 pub const TIMESYNC_V2_REQUEST: u64 = 1 << 31;
 /// Response seq flag marking an interleaved microsecond answer.
 pub const TIMESYNC_V2_RESPONSE: u64 = 1 << 30;
+/// Request seq flag: the t1 word carries an absolute-time (UTC) report.
+pub const TIMESYNC_UTC_REPORT: u64 = 1 << 29;
 /// Request counter bits of the seq word.
-pub const TIMESYNC_SEQ_COUNTER_MASK: u64 = (1 << 30) - 1;
+pub const TIMESYNC_SEQ_COUNTER_MASK: u64 = (1 << 29) - 1;
+const UTC_REPORT_OFFSET_BITS: u32 = 41;
+
+/// Packs a UTC report into a request's t1 word: bits 0..41 signed offset in
+/// microseconds (reference UTC minus the requester's network time, +-12 days),
+/// bits 41..48 error code, bits 48..64 a cookie that keeps the word unique.
+/// Returns `None` when the offset does not fit (the report is then not sent;
+/// it is never wrapped).
+pub fn encode_utc_report_word(offset_us: i64, error_code: u8, cookie: u16) -> Option<u64> {
+    let limit = 1i64 << (UTC_REPORT_OFFSET_BITS - 1);
+    if offset_us <= -limit || offset_us >= limit {
+        return None;
+    }
+    let offset = (offset_us as u64) & ((1 << UTC_REPORT_OFFSET_BITS) - 1);
+    Some(offset | (u64::from(error_code & 0x7F) << UTC_REPORT_OFFSET_BITS) | (u64::from(cookie) << 48))
+}
+
+/// Unpacks [`encode_utc_report_word`]: (offset microseconds, error code).
+pub fn decode_utc_report_word(word: u64) -> (i64, u8) {
+    let raw = word & ((1 << UTC_REPORT_OFFSET_BITS) - 1);
+    let shift = 64 - UTC_REPORT_OFFSET_BITS;
+    (((raw << shift) as i64) >> shift, ((word >> UTC_REPORT_OFFSET_BITS) & 0x7F) as u8)
+}
+
+/// An absolute-time report a follower sent with its request: the follower's
+/// own UTC reference (e.g. GPS) minus network time, as the follower measured
+/// it. Followers are synced to this node, so it measures this node's
+/// network-time error against that reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtcReferenceReport {
+    /// [`timesync_sender_tag`] of the reporting follower.
+    pub sender_tag: u32,
+    /// Reference UTC minus network time, ns.
+    pub offset_ns: i64,
+    /// Error bound of the report (reference error plus the follower's sync error), ns.
+    pub error_ns: u64,
+    /// Local monotonic receive instant, ns.
+    pub received_mono_ns: u64,
+}
 const V2_TIME_MASK: u64 = (1 << 56) - 1;
 
 /// Packs a v2 response t2 word.

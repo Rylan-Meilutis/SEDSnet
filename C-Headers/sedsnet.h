@@ -618,6 +618,13 @@ SedsResult seds_router_receive_packed_from_side_at(SedsRouter * r, uint32_t side
  */
 SedsResult seds_router_set_side_timesync_path(SedsRouter * r, uint32_t side_id, uint32_t byte_ns, int32_t fixed_asymmetry_ns);
 
+/**
+ * @brief Report this node's absolute-time reference (e.g. GPS UTC minus network
+ * time, microseconds, measured at the fix) to its time source. Sent in the
+ * existing request words while fresh (5 s); `valid = false` stops it.
+ */
+SedsResult seds_router_set_utc_reference_offset(SedsRouter * r, bool valid, int64_t offset_us, uint32_t error_us);
+
 /** @brief Decode a 7-bit time sync error code to microseconds (UINT32_MAX = unknown). */
 uint32_t seds_timesync_error_code_us(uint8_t code);
 

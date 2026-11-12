@@ -401,42 +401,38 @@ impl ClockDiscipline {
     }
 }
 
-/// Encodes an error bound into 7 bits: values below 64 are microseconds,
-/// then a 3-bit mantissa / 4-bit exponent float up to about 6.5 s. Larger
-/// values and "unknown" map to 127.
+/// Encodes an error bound into 7 bits, rounding up: codes 0..16 are
+/// microseconds, then four codes per octave (1, 1.25, 1.5, 1.75 x 2^e us) up
+/// to about 70 minutes. 127 means unknown or larger.
 pub fn encode_error_code(bound_ns: u64) -> u8 {
     let us = bound_ns.div_ceil(1_000);
-    if us < 64 {
+    if us < 16 {
         return us as u8;
     }
-    // us >= 64: find e such that (us >> e) in 8..16, mantissa 3 bits.
-    let mut e = 0u32;
-    let mut m = us;
-    while m >= 16 {
-        m = m.div_ceil(2);
+    let mut e = 63 - us.leading_zeros(); // us in [2^e, 2^(e+1)), e >= 4
+    let step = 1u64 << (e - 2);
+    let mut q = us.div_ceil(step); // 4..=8
+    if q == 8 {
+        q = 4;
         e += 1;
     }
-    // m in 8..=16 after rounding up.
-    if m == 16 {
-        m = 8;
-        e += 1;
-    }
-    let code = 64 + (e.saturating_sub(3)) * 8 + (m as u32 - 8);
+    let code = 16 + u64::from(e - 4) * 4 + (q - 4);
     code.min(127) as u8
 }
 
-/// Decodes [`encode_error_code`] to an upper bound in nanoseconds.
+/// Decodes [`encode_error_code`] to an upper bound in nanoseconds
+/// (`u64::MAX` for 127).
 pub fn decode_error_code(code: u8) -> u64 {
     let code = u64::from(code.min(127));
     if code == 127 {
         return u64::MAX;
     }
-    if code < 64 {
+    if code < 16 {
         return code * 1_000;
     }
-    let e = (code - 64) / 8 + 3;
-    let m = (code - 64) % 8 + 8;
-    (m << e) * 1_000
+    let e = (code - 16) / 4 + 4;
+    let q = (code - 16) % 4 + 4;
+    (q << (e - 2)) * 1_000
 }
 
 #[cfg(test)]
@@ -584,13 +580,12 @@ mod tests {
 
     #[test]
     fn error_codes_round_up_and_saturate() {
-        for &ns in &[0u64, 999, 1_000, 63_000, 64_000, 65_000, 1_000_000, 12_345_678, 6_000_000_000] {
+        for &ns in &[0u64, 999, 1_000, 15_000, 16_000, 17_000, 1_000_000, 12_345_678, 23_600_000, 6_000_000_000, 1_000_000_000_000] {
             let code = encode_error_code(ns);
-            assert!(decode_error_code(code) >= ns, "{ns} -> {code} -> {}", decode_error_code(code));
-            // At most 12.5% (one mantissa step) above above the microsecond range.
-            if ns >= 64_000 && code < 127 {
-                assert!(decode_error_code(code) <= ns + ns / 8 + 1_000, "{ns} coarse");
-            }
+            assert!(code < 127, "{ns} saturated");
+            let back = decode_error_code(code);
+            assert!(back >= ns, "{ns} -> {code} -> {back}");
+            assert!(back <= ns + ns / 4 + 1_000, "{ns} -> {back} too coarse");
         }
         assert_eq!(decode_error_code(encode_error_code(u64::MAX)), u64::MAX);
         assert_eq!(encode_error_code(u64::MAX), 127);

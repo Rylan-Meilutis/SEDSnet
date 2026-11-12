@@ -324,3 +324,28 @@ fn urgent_types_outrank_network_control_which_outranks_data() {
     assert!(crate::set_type_scheduling_class(abort, 1));
     assert!(!crate::type_is_urgent(abort));
 }
+
+#[test]
+fn utc_reports_ride_in_the_request_cookie_and_never_wrap() {
+    let mut p = pair(2_000);
+    for _ in 0..30_000 {
+        p.step(25_000_000, 0);
+    }
+    // RF's GPS says the network is 12.345 ms behind UTC, +-20 ms.
+    p.rf.set_utc_reference_offset(Some((12_345_000, 20_000_000)));
+    let _ = p.gs.take_utc_reference_reports();
+    for _ in 0..12_000 {
+        p.step(25_000_000, 0);
+    }
+    let reports = p.gs.take_utc_reference_reports();
+    assert!(!reports.is_empty(), "no report reached the GS");
+    let r = reports.last().unwrap();
+    assert_eq!(r.offset_ns, 12_345_000);
+    assert!(r.error_ns >= 20_000_000 && r.error_ns < 30_000_000, "{r:?}");
+    assert_eq!(r.sender_tag, timesync_sender_tag("RF"));
+    // Sync keeps working with report cookies.
+    assert!(p.rf_error_ns().abs() < 3_000_000);
+    // An offset that does not fit 41 bits is not sent at all.
+    assert!(encode_utc_report_word(1 << 41, 1, 0).is_none());
+    assert_eq!(decode_utc_report_word(encode_utc_report_word(-5, 3, 9).unwrap()), (-5, 3));
+}

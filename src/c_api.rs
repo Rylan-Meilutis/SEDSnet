@@ -2124,6 +2124,27 @@ pub extern "C" fn seds_router_set_side_timesync_path(
     status_from_result_code(SedsResult::SedsOk)
 }
 
+/// Reports this node's absolute-time reference to its time source (e.g. RF
+/// GPS UTC minus network time, measured at the fix), carried in the next
+/// requests while fresh (5 s). `valid == false` stops reporting.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_utc_reference_offset(
+    r: *mut SedsRouter,
+    valid: bool,
+    offset_us: i64,
+    error_us: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_utc_reference_offset(valid.then(|| {
+        (offset_us.saturating_mul(1_000), u64::from(error_us).saturating_mul(1_000))
+    }));
+    status_from_result_code(SedsResult::SedsOk)
+}
+
 /// Decodes a 7-bit time sync error code (health byte bits 0..7) to an upper
 /// bound in microseconds; UINT32_MAX for 127 (unknown).
 #[cfg(feature = "timesync")]

@@ -7510,6 +7510,15 @@ impl Router {
     }
 
     #[cfg(feature = "timesync")]
+    fn timesync_following_remote_locked(st: &TimeSyncRuntime, now_ms: u64, now_ns: u64) -> bool {
+        let usable = Self::timesync_has_usable_time_locked(st, now_ns);
+        matches!(
+            st.tracker.as_ref().and_then(|t| t.leader(now_ms, usable)),
+            Some(TimeSyncLeader::Remote(_))
+        )
+    }
+
+    #[cfg(feature = "timesync")]
     fn reconcile_pending_timesync_request_locked(
         st: &mut TimeSyncRuntime,
         leader: &Option<TimeSyncLeader>,
@@ -13940,6 +13949,7 @@ impl Router {
             .to_network_time()
             .and_then(|t| t.as_unix_ns())
             .filter(|ns| *ns >= 0)
+            && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
         {
             st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
         }
@@ -13990,7 +14000,11 @@ impl Router {
                 .to_network_time()
                 .and_then(|time| time.as_unix_ns())
                 .filter(|ns| *ns >= 0)
+                && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
             {
+                // A node that follows a better remote source (an RRLS while the
+                // GS leads) keeps its host time as a candidate only; steering
+                // the clock to it would fight the exchange discipline.
                 st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
             }
         } else {
@@ -14473,13 +14487,15 @@ impl Router {
                     cfg.request_interval_ms
                 };
                 st.next_request_mono_ms = now_ms.saturating_add(interval);
-                Self::timesync_record_request_locked(&mut st, seq, now_ms, now_ns);
+                // A fresh absolute-time report rides in the t1 cookie word.
+                let (seq, cookie) = Self::timesync_request_cookie_locked(&st, seq, now_ms, now_ns);
+                Self::timesync_record_request_locked(&mut st, seq, cookie, now_ns);
                 st.pending_request = Some(PendingTimeSyncRequest {
                     seq,
-                    t1_mono_ms: now_ms,
+                    t1_mono_ms: cookie,
                     source: remote.sender,
                 });
-                request = Some((seq, now_ms, side));
+                request = Some((seq, cookie, side));
             }
         }
 
@@ -14633,6 +14649,13 @@ impl Router {
                             .and_then(|tracker| tracker.leader(now_mono_ms, has_usable_time));
                         let status =
                             Self::timesync_status_locked(&mut st, leader.as_ref(), now_mono_ns);
+                        Self::timesync_note_utc_report_locked(
+                            &mut st,
+                            pkt.sender(),
+                            req.seq,
+                            req.t1_ms,
+                            now_mono_ns,
+                        );
                         let (seq, t1, t2, t3) = Self::timesync_build_response_locked(
                             &mut st,
                             pkt.sender(),

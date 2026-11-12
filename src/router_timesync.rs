@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::timesync::{
+    TIMESYNC_UTC_REPORT, UtcReferenceReport, decode_utc_report_word, encode_utc_report_word,
     TIMESYNC_SEQ_COUNTER_MASK, TIMESYNC_V2_REQUEST, TIMESYNC_V2_RESPONSE, TimeSyncStatus,
     decode_v2_receive_word, decode_v2_transmit_word, encode_v2_receive_word,
     encode_v2_transmit_word,
@@ -104,6 +105,11 @@ pub(super) struct TimeSyncV2 {
     locked: bool,
     stratum: u8,
     rx_override: u64,
+    /// Local UTC reference report to send: (offset ns, error ns, set at mono ns).
+    utc_report: Option<(i64, u64, u64)>,
+    /// Reports received from followers (newest last, at most 4).
+    utc_reports: [Option<UtcReferenceReport>; 4],
+    utc_reports_head: u8,
 }
 
 impl TimeSyncV2 {
@@ -382,6 +388,83 @@ impl Router {
             v2.asymmetry[len] = (side, byte_ns, fixed_asymmetry_ns);
             v2.asymmetry_len += 1;
         }
+    }
+
+    /// Chooses the request's t1 cookie: the monotonic ms as before, or a UTC
+    /// report (flag bit in seq) while one is fresh (5 s).
+    pub(super) fn timesync_request_cookie_locked(
+        st: &TimeSyncRuntime,
+        seq: u64,
+        now_ms: u64,
+        now_ns: u64,
+    ) -> (u64, u64) {
+        if let Some((offset_ns, error_ns, at)) = st.v2.utc_report
+            && now_ns.saturating_sub(at) <= 5_000_000_000
+        {
+            // The follower's own sync error adds to the reference's.
+            let own = st.v2.discipline.error_bound_ns(now_ns).unwrap_or(u64::MAX);
+            let error = error_ns.saturating_add(own);
+            let code = if error == u64::MAX { 127 } else { encode_error_code(error) };
+            if code != 127
+                && let Some(word) =
+                    encode_utc_report_word(offset_ns / 1_000, code, (seq & 0xFFFF) as u16)
+            {
+                return (seq | TIMESYNC_UTC_REPORT, word);
+            }
+        }
+        (seq, now_ms)
+    }
+
+    /// Stores a follower's UTC report carried by a request.
+    pub(super) fn timesync_note_utc_report_locked(
+        st: &mut TimeSyncRuntime,
+        sender: &str,
+        seq: u64,
+        t1: u64,
+        now_ns: u64,
+    ) {
+        if seq & TIMESYNC_V2_REQUEST == 0 || seq & TIMESYNC_UTC_REPORT == 0 {
+            return;
+        }
+        let (offset_us, code) = decode_utc_report_word(t1);
+        if code == 127 {
+            return;
+        }
+        let head = usize::from(st.v2.utc_reports_head);
+        st.v2.utc_reports[head] = Some(UtcReferenceReport {
+            sender_tag: timesync_sender_tag(sender),
+            offset_ns: offset_us.saturating_mul(1_000),
+            error_ns: decode_error_code(code),
+            received_mono_ns: now_ns,
+        });
+        st.v2.utc_reports_head = ((head + 1) % 4) as u8;
+    }
+
+    /// Sets this node's absolute-time reference measurement (e.g. GPS UTC
+    /// minus network time, measured at the GPS fix), sent to its source in
+    /// the next requests while fresh (5 s). `None` stops reporting.
+    pub fn set_utc_reference_offset(&self, report: Option<(i64, u64)>) {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return;
+        };
+        let now_ns = self.monotonic_now_ns();
+        runtime.lock().v2.utc_report = report.map(|(offset_ns, error_ns)| (offset_ns, error_ns, now_ns));
+    }
+
+    /// Takes the UTC reports followers sent since the last call (oldest first).
+    pub fn take_utc_reference_reports(&self) -> Vec<UtcReferenceReport> {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return Vec::new();
+        };
+        let mut st = runtime.lock();
+        let head = usize::from(st.v2.utc_reports_head);
+        let mut out = Vec::new();
+        for i in 0..4 {
+            if let Some(r) = st.v2.utc_reports[(head + i) % 4].take() {
+                out.push(r);
+            }
+        }
+        out
     }
 
     /// Records an outgoing v2 request so its answers can be matched.
@@ -663,6 +746,12 @@ impl Router {
         let has_usable_time = Self::timesync_has_usable_time_locked(&st, now_ns);
         let leader = st.tracker.as_ref().and_then(|t| t.leader(now_ms, has_usable_time));
         Some(Self::timesync_status_locked(&mut st, leader.as_ref(), now_ns))
+    }
+
+    /// The router's monotonic clock, ns: the timebase of transport stamps
+    /// passed to [`Router::note_frame_sent`] and the `_at` receive calls.
+    pub fn clock_now_ns(&self) -> u64 {
+        self.monotonic_now_ns()
     }
 
     /// Current network time with nanosecond resolution, when available.
