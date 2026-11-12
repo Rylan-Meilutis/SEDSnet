@@ -1176,12 +1176,52 @@ struct FfiClock {
     user_addr: usize,
 }
 
+/// Optional microsecond clock for C routers (`seds_set_clock_us`): same
+/// epoch as the router's millisecond callback, for sub-millisecond time sync
+/// stamps. 0 when unset.
+static CLOCK_US: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+type CNowUs = extern "C" fn() -> u64;
+
+fn clock_us() -> Option<u64> {
+    match CLOCK_US.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        f => {
+            // SAFETY: only `seds_set_clock_us` stores, and only a `CNowUs`.
+            let f: CNowUs = unsafe { core::mem::transmute::<usize, CNowUs>(f) };
+            Some(f())
+        }
+    }
+}
+
+/// Installs a microsecond clock for every C-created router, in the same epoch
+/// as the millisecond callback each router was created with (e.g. board
+/// microseconds since the router's start). Time sync then stamps and
+/// disciplines at microsecond resolution. Pass NULL to remove it.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_clock_us(now_us: Option<CNowUs>) {
+    CLOCK_US.store(
+        now_us.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 impl Clock for FfiClock {
     fn now_ms(&self) -> u64 {
+        if let Some(us) = clock_us() {
+            return us / 1_000;
+        }
         if let Some(f) = self.cb {
             f(self.user_addr as *mut c_void)
         } else {
             0
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        match clock_us() {
+            Some(us) => us.saturating_mul(1_000),
+            None => self.now_ms().saturating_mul(1_000_000),
         }
     }
 }

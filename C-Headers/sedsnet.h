@@ -592,6 +592,16 @@ typedef struct SedsTimeSyncStatus {
     uint32_t last_sample_age_ms; /**< age of newest exchange sample; UINT32_MAX when none */
 } SedsTimeSyncStatus;
 
+/**
+ * @brief Install a microsecond clock for all C-created routers (SEDSnet 5).
+ *
+ * Must use the same epoch as each router's millisecond now callback (e.g.
+ * board microseconds since the router started) and be callable from any
+ * context. Time sync stamps (`*_at`, `note_frame_sent`) are then taken at
+ * microsecond resolution. NULL removes it.
+ */
+void seds_set_clock_us(uint64_t (*now_us)(void));
+
 /** @brief Read this node's time sync quality. */
 SedsResult seds_router_get_timesync_status(SedsRouter * r, SedsTimeSyncStatus * out);
 

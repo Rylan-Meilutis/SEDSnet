@@ -55,6 +55,8 @@ that option, keep their 4.3.14 representations.
   network time in its request (`set_utc_reference_offset`); the source reads
   them (`take_utc_reference_reports`, std). An offset that does not fit is not
   sent.
+- `seds_set_clock_us`: an optional microsecond clock for C routers (same epoch
+  as the millisecond callback); time sync then stamps at microsecond resolution.
 - `step_local_network_time_ns`: a leading station coarse-sets its UTC once.
 - A node following a better source keeps its own host time as a candidate
   only; a node disciplined from an anchored source may lead as anchored during
