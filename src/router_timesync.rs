@@ -7,7 +7,7 @@
 use super::*;
 use crate::timesync::{
     TIMESYNC_UTC_REPORT, encode_utc_report_word,
-    TIMESYNC_SEQ_COUNTER_MASK, TIMESYNC_V2_REQUEST, TIMESYNC_V2_RESPONSE, TimeSyncStatus,
+    TIMESYNC_SEQ_COUNTER_MASK, TimeSyncStatus,
     decode_v2_receive_word, decode_v2_transmit_word, encode_v2_receive_word,
     encode_v2_transmit_word,
 };
@@ -472,7 +472,7 @@ impl Router {
         t1: u64,
         now_ns: u64,
     ) {
-        if seq & TIMESYNC_V2_REQUEST == 0 || seq & TIMESYNC_UTC_REPORT == 0 {
+        if seq & TIMESYNC_UTC_REPORT == 0 {
             return;
         }
         let (offset_us, code) = decode_utc_report_word(t1);
@@ -549,7 +549,6 @@ impl Router {
         seq: u64,
         t1: u64,
         now_mono_ns: u64,
-        now_mono_ms: u64,
         status: &TimeSyncStatus,
     ) -> (u64, u64, u64, u64) {
         let tag = timesync_sender_tag(requester);
@@ -563,31 +562,20 @@ impl Router {
             })
         };
         let t2_ns = net_at(st, rx_ns).unwrap_or(rx_ns as i64).max(0);
-        let words = if seq & TIMESYNC_V2_REQUEST != 0 {
-            let w2 = encode_v2_receive_word(
-                (t2_ns / 1_000) as u64,
-                status.state.is_synced(),
-                if status.error_bound_ns == u64::MAX {
-                    127
-                } else {
-                    encode_error_code(status.error_bound_ns)
-                },
-            );
-            let w3 = st
-                .v2
-                .served_for(tag)
-                .map_or(0, |s| encode_v2_transmit_word(u64::from(s.counter), s.t3_net_us));
-            (seq | TIMESYNC_V2_RESPONSE, t1, w2, w3)
-        } else {
-            // Legacy answer: t2 is now the real receive instant; t3 is the
-            // build instant (the legacy requester only needs t3 >= t2).
-            let t2_ms = (t2_ns / 1_000_000) as u64;
-            let t3_ms = net_at(st, now_mono_ns)
-                .map(|ns| (ns.max(0) / 1_000_000) as u64)
-                .unwrap_or(now_mono_ms)
-                .max(t2_ms);
-            (seq, t1, t2_ms, t3_ms)
-        };
+        let w2 = encode_v2_receive_word(
+            (t2_ns / 1_000) as u64,
+            status.state.is_synced(),
+            if status.error_bound_ns == u64::MAX {
+                127
+            } else {
+                encode_error_code(status.error_bound_ns)
+            },
+        );
+        let w3 = st
+            .v2
+            .served_for(tag)
+            .map_or(0, |s| encode_v2_transmit_word(u64::from(s.counter), s.t3_net_us));
+        let words = (seq, t1, w2, w3);
         st.v2.push_tx_mark(TxMark {
             state: MarkState::Queued,
             response: true,
@@ -629,49 +617,34 @@ impl Router {
             return false;
         };
         let rate = st.disciplined_clock.rate_ppb();
-        let sample = if seq & TIMESYNC_V2_RESPONSE != 0 {
-            let (t2_us, _synced, code) = decode_v2_receive_word(t2);
-            let source_error_ns = decode_error_code(code).min(UNKNOWN_SOURCE_ERROR_NS);
-            {
-                let ex = &mut st.v2.exchanges[idx];
-                ex.answered = true;
-                ex.t4_ns = t4_ns;
-                ex.t2_net_us = t2_us;
-                ex.source_error_ns = source_error_ns;
-                ex.response_len = response_len;
-            }
-            decode_v2_transmit_word(t3).and_then(|(prev, t3_us)| {
-                let prev_idx = st.v2.exchanges.iter().position(|e| {
-                    e.used && e.answered && (e.counter & 0xFF) as u8 == prev && e.t1_ns != 0
-                })?;
-                let ex = st.v2.exchanges[prev_idx];
-                st.v2.exchanges[prev_idx].used = false;
-                let asymmetry = st.v2.asymmetry_ns(side, &ex);
-                exchange_sample(
-                    ex.t1_ns,
-                    (ex.t2_net_us as i64).saturating_mul(1_000),
-                    (t3_us as i64).saturating_mul(1_000),
-                    ex.t4_ns,
-                    ex.source_error_ns,
-                    asymmetry,
-                    rate,
-                )
-            })
-        } else {
-            // Legacy responder: millisecond stamps of its processing instant.
-            let mut ex = st.v2.exchanges[idx];
+        let sample = {
+        let (t2_us, _synced, code) = decode_v2_receive_word(t2);
+        let source_error_ns = decode_error_code(code).min(UNKNOWN_SOURCE_ERROR_NS);
+        {
+            let ex = &mut st.v2.exchanges[idx];
+            ex.answered = true;
+            ex.t4_ns = t4_ns;
+            ex.t2_net_us = t2_us;
+            ex.source_error_ns = source_error_ns;
             ex.response_len = response_len;
-            st.v2.exchanges[idx].used = false;
+        }
+        decode_v2_transmit_word(t3).and_then(|(prev, t3_us)| {
+            let prev_idx = st.v2.exchanges.iter().position(|e| {
+                e.used && e.answered && (e.counter & 0xFF) as u8 == prev && e.t1_ns != 0
+            })?;
+            let ex = st.v2.exchanges[prev_idx];
+            st.v2.exchanges[prev_idx].used = false;
             let asymmetry = st.v2.asymmetry_ns(side, &ex);
             exchange_sample(
                 ex.t1_ns,
-                (t2 as i64).saturating_mul(1_000_000),
-                (t3 as i64).saturating_mul(1_000_000),
-                t4_ns,
-                1_000_000,
+                (ex.t2_net_us as i64).saturating_mul(1_000),
+                (t3_us as i64).saturating_mul(1_000),
+                ex.t4_ns,
+                ex.source_error_ns,
                 asymmetry,
                 rate,
             )
+        })
         };
         let Some(sample) = sample else {
             return false;

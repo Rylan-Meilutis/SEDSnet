@@ -7604,7 +7604,6 @@ impl Router {
         now_mono_ns: u64,
         target_ms: u64,
         anchored: bool,
-        verified: bool,
     ) {
         let anchored = anchored && target_ms >= TIMESYNC_UTC_FLOOR_MS;
         let clock = &mut st.disciplined_clock;
@@ -7622,11 +7621,7 @@ impl Router {
             || target_ms >= TIMESYNC_UTC_FLOOR_MS
             || current.is_none_or(|current| current < TIMESYNC_UTC_FLOOR_MS)
         {
-            if verified {
-                clock.steer_verified_response_ms(now_mono_ns, target_ms);
-            } else {
-                clock.steer_unix_ms(now_mono_ns, target_ms);
-            }
+            clock.steer_unix_ms(now_mono_ns, target_ms);
             st.clock_anchored = anchored;
         }
     }
@@ -13927,7 +13922,7 @@ impl Router {
         });
         if let Some(target_ms) = target_ms {
             let anchored = remote.quality().anchored;
-            Self::timesync_steer_remote_locked(st, now_mono_ns, target_ms, anchored, false);
+            Self::timesync_steer_remote_locked(st, now_mono_ns, target_ms, anchored);
         }
     }
 
@@ -14484,9 +14479,6 @@ impl Router {
             {
                 let seq = st.next_seq & crate::timesync::TIMESYNC_SEQ_COUNTER_MASK;
                 st.next_seq = ((seq + 1) & crate::timesync::TIMESYNC_SEQ_COUNTER_MASK).max(1);
-                // Bit 31 asks a v2 responder for an interleaved microsecond
-                // answer; a legacy responder echoes it and answers as before.
-                let seq = seq | crate::timesync::TIMESYNC_V2_REQUEST;
                 // A request on a known side names its target so other servers on
                 // a shared segment stay silent. Legacy servers echo the word.
                 let side = st.remote_sources.get(&remote.sender).and_then(|src| src.side);
@@ -14640,7 +14632,6 @@ impl Router {
                             now_mono_ns,
                             ann.time_ms,
                             quality.anchored,
-                            false,
                         );
                     }
                     poll_after = true;
@@ -14677,7 +14668,6 @@ impl Router {
                             req.seq,
                             req.t1_ms,
                             now_mono_ns,
-                            now_mono_ms,
                             &status,
                         );
                         response = Some((seq, t1, t2, t3, src));
@@ -14695,7 +14685,7 @@ impl Router {
                     });
                     if let Some(quality) = source_quality {
                         let answered = st.pending_request.as_ref().is_some_and(|pending| {
-                            pending.seq == resp.seq & !crate::timesync::TIMESYNC_V2_RESPONSE
+                            pending.seq == resp.seq
                                 && pending.t1_mono_ms == resp.t1_ms
                                 && pending.source == pkt.sender()
                         });

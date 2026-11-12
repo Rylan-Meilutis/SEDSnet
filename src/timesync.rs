@@ -538,25 +538,6 @@ impl SlewedNetworkClock {
         }
     }
 
-    /// Corrects a gross forward error only after the caller validates a fresh
-    /// request/response exchange with its currently elected source. Announce
-    /// traffic and ordinary source updates must continue using `steer_unix_ms`.
-    /// Backward and <=5-second corrections retain the configured slew policy.
-    pub(crate) fn steer_verified_response_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
-        let target_ns = clamp_unix_ns(i128::from(target_unix_ms) * 1_000_000);
-        if self.max_slew_ppm != 0
-            && self.read_ns(now_mono_ns).is_some_and(|current| {
-                target_ns.saturating_sub(current) > TIMESYNC_STEP_THRESHOLD_MS as i64 * 1_000_000
-            })
-        {
-            self.anchor_mono_ns = now_mono_ns;
-            self.anchor_unix_ns = target_ns;
-            self.pending_adjust_ns = 0;
-            return;
-        }
-        self.steer_unix_ms(now_mono_ns, target_unix_ms);
-    }
-
     /// Re-anchors the clock at a target reading in either direction. Callers use
     /// this only when replacing unanchored time with time traceable to UTC.
     pub(crate) fn step_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
@@ -573,13 +554,13 @@ impl SlewedNetworkClock {
 }
 
 // ---------------------------------------------------------------------------
-// Interleaved (v2) exchange carried in the existing request/response words.
+// Time sync exchange (SEDSnet 5 wire format; 4.x nodes do not interoperate).
 //
-// Request  [seq, t1]: seq bit 31 asks for a v2 answer. The low 30 bits are the
-//          counter, bits 32..64 the target tag as before. t1 stays the
+// Request  [seq, t1]: seq bits 0..29 are the counter, bit 29 flags a UTC
+//          report in t1, bits 32..64 the target tag. Otherwise t1 is the
 //          requester's monotonic millisecond cookie; the precise transmit
 //          instant is kept locally.
-// Response [seq | bit 30, t1, t2, t3] when the request asked for v2:
+// Response [seq, t1, t2, t3] (NTP interleaved mode):
 //          t2 = bits 0..56 responder network time in microseconds when the
 //               request was received; bit 63 = responder synced; bits 56..63
 //               = responder error bound code (timesync_discipline).
@@ -587,15 +568,9 @@ impl SlewedNetworkClock {
 //               PREVIOUS response to this requester actually left; bits
 //               56..64 = low byte of that previous request's counter. 0 when
 //               no earlier response is known.
-// A legacy responder echoes seq unchanged and answers in milliseconds, so the
-// requester sees bit 30 clear and uses the legacy meaning. A legacy requester
-// never sets bit 31 and gets a legacy answer. No frame grows.
+// Responder queueing becomes turnaround, not path delay. No frame grew.
 // ---------------------------------------------------------------------------
 
-/// Request seq flag asking for an interleaved microsecond answer.
-pub const TIMESYNC_V2_REQUEST: u64 = 1 << 31;
-/// Response seq flag marking an interleaved microsecond answer.
-pub const TIMESYNC_V2_RESPONSE: u64 = 1 << 30;
 /// Request seq flag: the t1 word carries an absolute-time (UTC) report.
 pub const TIMESYNC_UTC_REPORT: u64 = 1 << 29;
 /// Request counter bits of the seq word.
@@ -1522,178 +1497,3 @@ mod slew_absolute_target_tests {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
-mod verified_forward_response_tests {
-    use super::*;
-    use crate::router::{Router, RouterConfig};
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
-    const EPOCH: u64 = 1_783_000_000_000;
-    type Requests = Arc<Mutex<Vec<(u64, u64)>>>;
-    fn fixture() -> (Router, Arc<AtomicU64>, Requests) {
-        let now = Arc::new(AtomicU64::new(0));
-        let read = now.clone();
-        let router = Router::new_with_clock(
-            RouterConfig::default().with_timesync(TimeSyncConfig {
-                role: TimeSyncRole::Consumer,
-                source_timeout_ms: 5000,
-                consumer_promotion_enabled: false,
-                ..Default::default()
-            }),
-            Box::new(move || read.load(Ordering::SeqCst)),
-        );
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let capture = requests.clone();
-        router.add_side_packet("capture", move |packet| {
-            if packet.data_type() == DataType::TimeSyncRequest {
-                let words = packet.data_as_u64()?;
-                capture.lock().unwrap().push((words[0], words[1]));
-            }
-            Ok(())
-        });
-        router
-            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH - 466_000).unwrap())
-            .unwrap();
-        router.process_tx_queue().unwrap();
-        assert!(!requests.lock().unwrap().is_empty());
-        (router, now, requests)
-    }
-    fn response(sender: &'static str, seq: u64, t1: u64, t2: u64, t3: u64) -> Packet {
-        let packet = build_timesync_response(seq, t1, t2, t3).unwrap();
-        Packet::new(
-            DataType::TimeSyncResponse,
-            &[DataEndpoint::TimeSync],
-            sender,
-            packet.timestamp(),
-            packet.payload().into(),
-        )
-        .unwrap()
-    }
-    #[test]
-    fn verified_forward_threshold_and_backward_slew_are_monotonic() {
-        for (offset, expected) in [(5000, 10_000), (5001, 15_001)] {
-            let mut clock = SlewedNetworkClock::new(50_000);
-            clock.steer_unix_ms(0, 10_000);
-            clock.steer_verified_response_ms(0, 10_000 + offset);
-            assert_eq!(clock.read_unix_ms(0), Some(expected));
-        }
-        let mut clock = SlewedNetworkClock::new(50_000);
-        clock.steer_unix_ms(0, EPOCH);
-        clock.steer_verified_response_ms(0, EPOCH - 466_000);
-        assert_eq!(clock.read_unix_ms(0), Some(EPOCH));
-        assert_eq!(clock.read_unix_ms(1_000_000_000), Some(EPOCH + 950));
-        let mut disabled = SlewedNetworkClock::new(0);
-        disabled.steer_unix_ms(0, EPOCH);
-        disabled.steer_verified_response_ms(0, EPOCH + 466_000);
-        assert_eq!(disabled.read_unix_ms(0), Some(EPOCH));
-    }
-    #[test]
-    fn fresh_elected_response_recovers_minutes_in_one_exchange_and_is_consumed() {
-        let (router, now, requests) = fixture();
-        let (seq, t1) = requests.lock().unwrap()[0];
-        now.store(200, Ordering::SeqCst);
-        // Announce alone cannot hard-correct an already initialized clock.
-        router
-            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH + 200).unwrap())
-            .unwrap();
-        assert!(router.network_time_ms().unwrap() < EPOCH);
-        router
-            .rx(&response("GS", seq, t1, EPOCH + 100, EPOCH + 100))
-            .unwrap();
-        assert_eq!(router.network_time_ms(), Some(EPOCH + 200));
-        now.store(250, Ordering::SeqCst);
-        router
-            .rx(&response(
-                "GS",
-                seq,
-                t1,
-                EPOCH + 1_000_000,
-                EPOCH + 1_000_000,
-            ))
-            .unwrap();
-        assert_eq!(
-            router.network_time_ms(),
-            Some(EPOCH + 250),
-            "consumed challenge cannot be replayed with fresh packet metadata"
-        );
-    }
-    #[test]
-    fn malformed_wrong_source_or_expired_responses_cannot_rebase() {
-        for case in 0..7 {
-            let (router, now, requests) = fixture();
-            let (seq, t1) = requests.lock().unwrap()[0];
-            let elapsed = if case == 4 { 5001 } else { 200 };
-            now.store(elapsed, Ordering::SeqCst);
-            let before = router.network_time_ms().unwrap();
-            let packet = match case {
-                0 => response("other", seq, t1, EPOCH, EPOCH),
-                1 => response("GS", seq + 1, t1, EPOCH, EPOCH),
-                2 => response("GS", seq, t1 + 1, EPOCH, EPOCH),
-                3 => response("GS", seq, t1, EPOCH + 1, EPOCH),
-                5 => response("GS", seq, t1, EPOCH, EPOCH + 201),
-                6 => response("GS", seq, 201, EPOCH, EPOCH),
-                _ => response("GS", seq, t1, EPOCH, EPOCH),
-            };
-            router.rx(&packet).unwrap();
-            assert_eq!(
-                router.network_time_ms(),
-                Some(before),
-                "invalid response case {case}"
-            );
-        }
-    }
-    #[test]
-    fn lost_challenge_expires_and_new_exchange_recovers_without_changing_leader() {
-        let (router, now, requests) = fixture();
-        let old = requests.lock().unwrap()[0];
-        now.store(5001, Ordering::SeqCst);
-        router
-            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH + 5001).unwrap())
-            .unwrap();
-        router.process_tx_queue().unwrap();
-        let fresh = *requests.lock().unwrap().last().unwrap();
-        assert_ne!(
-            fresh.0, old.0,
-            "lost challenge must not block subsequent requests forever"
-        );
-        let before = router.network_time_ms().unwrap();
-        router
-            .rx(&response(
-                "GS",
-                old.0,
-                old.1,
-                EPOCH + 50_000,
-                EPOCH + 50_000,
-            ))
-            .unwrap();
-        assert_eq!(
-            router.network_time_ms(),
-            Some(before),
-            "expired challenge cannot be reused after retry"
-        );
-        now.store(5101, Ordering::SeqCst);
-        router
-            .rx(&response(
-                "GS",
-                fresh.0,
-                fresh.1,
-                EPOCH + 5051,
-                EPOCH + 5051,
-            ))
-            .unwrap();
-        assert_eq!(router.network_time_ms(), Some(EPOCH + 5101));
-    }
-    #[test]
-    fn response_from_retired_leader_cannot_correct_clock() {
-        let (router, now, requests) = fixture();
-        let (seq, t1) = requests.lock().unwrap()[0];
-        now.store(100, Ordering::SeqCst);
-        router
-            .rx(&build_timesync_announce_with_sender("replacement", 0, EPOCH - 465_900).unwrap())
-            .unwrap();
-        let before = router.network_time_ms().unwrap();
-        router.rx(&response("GS", seq, t1, EPOCH, EPOCH)).unwrap();
-        assert_eq!(router.network_time_ms(), Some(before));
-    }
-}

@@ -1,9 +1,7 @@
-//! Interleaved (v2) time sync over the unchanged request/response frames:
-//! transport stamps, legacy peers on both ends, quality reporting and the
-//! scheduling bands. Mixed builds against the real 4.3.14 router are covered
-//! by the out-of-tree compat harness (workspace `compat-test`).
-use crate::config::{DataEndpoint, DataType};
-use crate::packet::Packet;
+//! Interleaved time sync over the request/response frames (word counts
+//! unchanged): transport stamps, responder queueing, quality reporting, UTC
+//! reports and the scheduling bands, with real routers on both ends.
+use crate::config::DataType;
 use crate::router::{Clock, Router, RouterConfig, RouterSideId};
 use crate::timesync::*;
 use crate::timesync_discipline::SyncState;
@@ -173,8 +171,8 @@ fn interleaved_exchange_ignores_a_seven_second_responder_queue() {
 #[test]
 fn frames_keep_their_word_counts_and_flags() {
     let mut p = pair(0);
-    let mut seen_v2_request = false;
-    let mut seen_v2_response = false;
+    let mut seen_request = false;
+    let mut seen_interleaved_response = false;
     for _ in 0..6_000 {
         let gs_frames = p.gs_out.lock().unwrap().clone();
         let rf_frames = p.rf_out.lock().unwrap().clone();
@@ -184,11 +182,11 @@ fn frames_keep_their_word_counts_and_flags() {
             match pkt.data_type() {
                 DataType::TimeSyncRequest => {
                     assert_eq!(words.len(), TIMESYNC_REQUEST_WORDS);
-                    seen_v2_request |= words[0] & TIMESYNC_V2_REQUEST != 0;
+                    seen_request = true;
                 }
                 DataType::TimeSyncResponse => {
                     assert_eq!(words.len(), TIMESYNC_RESPONSE_WORDS);
-                    seen_v2_response |= words[0] & TIMESYNC_V2_RESPONSE != 0;
+                    seen_interleaved_response |= words[3] != 0;
                 }
                 DataType::TimeSyncAnnounce => assert_eq!(words.len(), TIMESYNC_ANNOUNCE_WORDS),
                 _ => {}
@@ -196,98 +194,11 @@ fn frames_keep_their_word_counts_and_flags() {
         }
         p.step(25_000_000, 0);
     }
-    assert!(seen_v2_request && seen_v2_response);
+    assert!(seen_request && seen_interleaved_response);
 }
 
-fn legacy_request(seq: u64, t1: u64) -> Packet {
-    Packet::new(
-        DataType::TimeSyncRequest,
-        &[DataEndpoint::TimeSync],
-        "OLD",
-        t1,
-        crate::router::encode_slice_le(&[seq, t1]),
-    )
-    .unwrap()
-}
 
-#[test]
-fn legacy_requester_gets_a_millisecond_answer_with_real_receive_stamp() {
-    let p = pair(0);
-    for _ in 0..3 {
-        p.set_gs_utc();
-        let _ = p.gs.periodic(0);
-    }
-    p.gs_out.lock().unwrap().clear();
-    p.gs.rx_from_side(&legacy_request(7, 1234), p.gs_side).unwrap();
-    let _ = p.gs.drain_queues_with_timeout(0);
-    let frames = p.gs_out.lock().unwrap().clone();
-    let resp = frames
-        .iter()
-        .map(|b| crate::wire_format::unpack_packet(b).unwrap())
-        .find(|pkt| pkt.data_type() == DataType::TimeSyncResponse)
-        .expect("legacy request answered");
-    let w = resp.data_as_u64().unwrap();
-    assert_eq!(w[0], 7, "legacy seq echoed without v2 flags");
-    assert_eq!(w[1], 1234);
-    let utc_ms = ((UTC_NS + p.true_ns() as i128) / 1_000_000) as u64;
-    assert!(w[2].abs_diff(utc_ms) <= 1, "t2 is UTC milliseconds: {} vs {utc_ms}", w[2]);
-    assert!(w[3] >= w[2]);
-}
 
-#[test]
-fn legacy_responder_still_disciplines_a_new_requester() {
-    // RF (new) follows a GS that answers like 4.3.14: echo seq, t2 = t3 =
-    // its processing time in ms, regardless of the v2 flag.
-    let now = Arc::new(AtomicU64::new(5_000_000_000));
-    RF_SKEW.with(|s| s.set(5_000));
-    let rf = Router::new_with_clock(
-        RouterConfig::default().with_sender("RF").with_timesync(cfg(false)),
-        Box::new(Osc { now_ns: now.clone(), skew_ppm: 5_000 }),
-    );
-    let out: Arc<Mutex<Vec<Packet>>> = Arc::default();
-    let tx = out.clone();
-    let side = rf.add_side_packet("radio", move |p: &Packet| {
-        tx.lock().unwrap().push(p.clone());
-        Ok(())
-    });
-    let mut pending: Vec<(u64, Packet)> = Vec::new();
-    for ms in 0..60_000u64 {
-        let t = now.load(Ordering::SeqCst);
-        let utc_ms = ((UTC_NS + t as i128) / 1_000_000) as u64;
-        if ms % 1_000 == 0 {
-            let ann = build_timesync_announce_with_sender("OLDGS", 50, utc_ms).unwrap();
-            pending.push((t + 25_000_000, ann));
-        }
-        let _ = rf.periodic(0);
-        for pkt in std::mem::take(&mut *out.lock().unwrap()) {
-            if pkt.data_type() == DataType::TimeSyncRequest {
-                let w = pkt.data_as_u64().unwrap();
-                // Legacy server: answers on arrival + 25 ms.
-                let at = t + 25_000_000;
-                let ms_then = ((UTC_NS + at as i128) / 1_000_000) as u64;
-                let resp = Packet::new(
-                    DataType::TimeSyncResponse,
-                    &[DataEndpoint::TimeSync],
-                    "OLDGS",
-                    ms_then,
-                    crate::router::encode_slice_le(&[w[0], w[1], ms_then, ms_then]),
-                )
-                .unwrap();
-                pending.push((at + 25_000_000, resp));
-            }
-        }
-        let due: Vec<_> = pending.iter().filter(|(a, _)| *a <= t).cloned().collect();
-        pending.retain(|(a, _)| *a > t);
-        for (_, pkt) in due {
-            let _ = rf.rx_from_side(&pkt, side);
-            let _ = rf.drain_queues_with_timeout(0);
-        }
-        now.fetch_add(1_000_000, Ordering::SeqCst);
-    }
-    let err = rf.network_time_ns().unwrap() - (UTC_NS + now.load(Ordering::SeqCst) as i128);
-    assert!(err.abs() < 3_000_000, "error {err} ns against a legacy responder");
-    assert_eq!(rf.timesync_status().unwrap().stratum, TIMESYNC_LEGACY_STRATUM + 1);
-}
 
 #[test]
 fn quality_moves_from_unsynced_to_locked_and_holds_over() {
