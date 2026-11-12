@@ -26,6 +26,17 @@
 //! standalone in the legacy format). End-to-end sealed frames are not bundled.
 
 use crate::side_transport::{crc32_bytes, read_uleb128_local, write_uleb128_local};
+
+// Out-of-line writers: inlined Vec growth at every field cost the RF image
+// about a kilobyte.
+#[inline(never)]
+fn put_uleb(out: &mut Vec<u8>, v: u64) {
+    write_uleb128_local(v, out);
+}
+#[inline(never)]
+fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(bytes);
+}
 use crate::{TelemetryError, TelemetryResult};
 use alloc::vec::Vec;
 
@@ -221,35 +232,35 @@ fn encode_record(c: &Fields<'_>, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
             }
         }
     }
-    out.push(c.flags);
-    out.push(elide);
+    put(out, &[c.flags]);
+    put(out, &[elide]);
     if elide & E_NEP == 0 {
-        out.push(c.nep);
+        put(out, &[c.nep]);
     }
     if elide & E_TYPE == 0 {
-        write_uleb128_local(c.ty, out);
+        put_uleb(out, c.ty);
     }
     if elide & E_SOURCE == 0 {
-        out.extend_from_slice(&c.src.to_le_bytes());
+        put(out, &c.src.to_le_bytes());
     }
-    write_uleb128_local(zigzag(c.ts.wrapping_sub(prev_ts)), out);
+    put_uleb(out, zigzag(c.ts.wrapping_sub(prev_ts)));
     if c.flags & F_NONCE != 0 {
         let base = if elide & E_NONCE_DELTA != 0 { p.map_or(0, |p| p.nonce) } else { 0 };
         let v = c.nonce.wrapping_sub(base);
-        write_uleb128_local(if elide & E_NONCE_DELTA != 0 { zigzag(v) } else { v }, out);
+        put_uleb(out, if elide & E_NONCE_DELTA != 0 { zigzag(v) } else { v });
     }
     if elide & E_ENDPOINTS == 0 {
-        out.extend_from_slice(c.eps);
+        put(out, c.eps);
     }
     if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
-        write_uleb128_local(c.contract.len() as u64, out);
-        out.extend_from_slice(c.contract);
+        put_uleb(out, c.contract.len() as u64);
+        put(out, c.contract);
     }
-    out.extend_from_slice(c.rel);
+    put(out, c.rel);
     if c.flags & F_COMPRESSED != 0 {
-        write_uleb128_local(c.size, out);
+        put_uleb(out, c.size);
     }
-    out.extend_from_slice(c.payload);
+    put(out, c.payload);
 }
 
 /// Pack canonical frames, in the given order, into one bundle.
@@ -265,20 +276,20 @@ pub fn pack_bundle(frames: &[&[u8]]) -> TelemetryResult<Vec<u8>> {
     let mut out = Vec::with_capacity(total + 16);
     let mut record = Vec::with_capacity(64);
     let mut prev: Option<Fields<'_>> = None;
-    out.push(BUNDLE_MARKER);
+    put(&mut out, &[BUNDLE_MARKER]);
     for frame in frames {
         let c = parse_canonical(frame)?;
         if prev.is_none() {
-            write_uleb128_local(c.ts, &mut out);
+            put_uleb(&mut out, c.ts);
         }
         record.clear();
         encode_record(&c, prev.as_ref(), &mut record);
-        write_uleb128_local(record.len() as u64, &mut out);
-        out.extend_from_slice(&record);
+        put_uleb(&mut out, record.len() as u64);
+        put(&mut out, &record);
         prev = Some(c);
     }
     let crc = crc32_bytes(&out);
-    out.extend_from_slice(&crc.to_le_bytes());
+    put(&mut out, &crc.to_le_bytes());
     Ok(out)
 }
 
@@ -334,24 +345,24 @@ fn decode_record<'a>(rec: &'a [u8], p: Option<&Fields<'a>>, prev_ts: u64) -> Tel
 
 fn write_canonical(c: &Fields<'_>, out: &mut Vec<u8>) {
     out.clear();
-    out.push(c.flags);
-    out.push(c.nep);
-    write_uleb128_local(c.ty, out);
-    write_uleb128_local(c.size, out);
-    write_uleb128_local(c.ts, out);
+    put(out, &[c.flags]);
+    put(out, &[c.nep]);
+    put_uleb(out, c.ty);
+    put_uleb(out, c.size);
+    put_uleb(out, c.ts);
     if c.flags & F_NONCE != 0 {
-        write_uleb128_local(c.nonce, out);
+        put_uleb(out, c.nonce);
     }
-    write_uleb128_local(u64::from(c.src), out);
-    out.extend_from_slice(c.eps);
+    put_uleb(out, u64::from(c.src));
+    put(out, c.eps);
     if c.flags & F_CONTRACT != 0 {
-        write_uleb128_local(c.contract.len() as u64, out);
-        out.extend_from_slice(c.contract);
+        put_uleb(out, c.contract.len() as u64);
+        put(out, c.contract);
     }
-    out.extend_from_slice(c.rel);
-    out.extend_from_slice(c.payload);
+    put(out, c.rel);
+    put(out, c.payload);
     let crc = crc32_bytes(out);
-    out.extend_from_slice(&crc.to_le_bytes());
+    put(out, &crc.to_le_bytes());
 }
 
 /// Walk every record; with `each`, hand over each rebuilt canonical frame.
