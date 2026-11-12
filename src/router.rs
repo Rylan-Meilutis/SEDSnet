@@ -6721,6 +6721,37 @@ impl Router {
     }
 
     #[cfg(feature = "discovery")]
+    /// For a transport that queues frames itself (a radio or CAN driver
+    /// queue): `true` when `frame`, a reliable end-to-end copy this router
+    /// handed to `side`, no longer needs sending because every destination
+    /// owner behind that side has acknowledged it meanwhile. Call just before
+    /// the physical write and drop the frame when `true`. Frames that are not
+    /// reliable end-to-end copies, or cannot be parsed, return `false`.
+    #[cfg(feature = "discovery")]
+    pub fn relayed_frame_satisfied(&self, side: RouterSideId, frame: &[u8]) -> bool {
+        let Ok(Some(decoded)) = self.decode_side_transport_frame(side, frame) else {
+            return false;
+        };
+        let data = RouterItem::Packed(decoded);
+        let Ok(ty) = Self::item_data_type(&data) else {
+            return false;
+        };
+        is_reliable_type(ty) && self.relayed_copy_satisfied(side, &data, ty)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn relayed_copy_satisfied(&self, side: RouterSideId, data: &RouterItem, ty: DataType) -> bool {
+        let Ok((eps, _)) = self.item_route_info(data) else {
+            return false;
+        };
+        let st = self.state.lock();
+        if st.forwarded_receipts.is_none() {
+            return false;
+        }
+        self.filter_end_to_end_satisfied_sides_locked(&st, data, alloc::vec![side], &eps, ty)
+            .is_empty()
+    }
+
     fn filter_end_to_end_satisfied_sides_locked(
         &self,
         st: &RouterInner,
@@ -6934,6 +6965,37 @@ impl Router {
 
     // Select at most one in-flight packet per ordered type. Waiting messages
     // share the existing bounded pending window, not an unbounded extra queue.
+    /// Completes one pending end-to-end reliable send this router originated
+    /// when the application holds other proof of delivery (a board's
+    /// BOARD_STATE_STATUS reply to a BOARD_RECOVERY_REQUEST). Its retries stop
+    /// and ordered successors are released; copies already handed to a
+    /// transport still go out. Urgent types (ABORT, see
+    /// [`crate::set_type_scheduling_class`]) and any type named `ABORT` are
+    /// never completed this way: `Err(PermissionDenied)`, nothing changes.
+    /// `Ok(false)` when nothing was pending under that id.
+    pub fn complete_reliable(&self, packet_id: u64) -> TelemetryResult<bool> {
+        let ty = {
+            let st = self.state.lock();
+            match st.end_to_end_reliable_tx.get(&packet_id) {
+                None => return Ok(false),
+                Some(sent) => Self::item_data_type(&sent.data)?,
+            }
+        };
+        if crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT" {
+            return Err(TelemetryError::PermissionDenied);
+        }
+        let removed = self
+            .state
+            .lock()
+            .end_to_end_reliable_tx
+            .remove(&packet_id)
+            .is_some();
+        if removed {
+            self.release_ordered_successors()?;
+        }
+        Ok(removed)
+    }
+
     fn release_ordered_successors(&self) -> TelemetryResult<()> {
         let ready = {
             let mut st = self.state.lock();

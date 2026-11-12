@@ -2145,6 +2145,42 @@ pub extern "C" fn seds_router_set_utc_reference_offset(
     status_from_result_code(SedsResult::SedsOk)
 }
 
+/// Completes one pending end-to-end reliable send by packet id when the
+/// application holds other proof of delivery. Returns SEDS_OK when it was
+/// pending and is now complete, a not-found status when nothing was pending,
+/// and a permission-denied status for urgent types (ABORT is never completed).
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_complete_reliable(r: *mut SedsRouter, packet_id: u64) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    match router.complete_reliable(packet_id) {
+        Ok(true) => status_from_result_code(SedsResult::SedsOk),
+        Ok(false) => status_from_err(TelemetryError::Io("reliable send not pending")),
+        Err(e) => status_from_err(e),
+    }
+}
+
+/// For a driver that queues frames itself: true when `bytes` (a frame this
+/// router handed to `side_id`) is a relayed reliable copy every destination
+/// owner has already acknowledged. Drop it instead of writing it.
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_relayed_frame_satisfied(
+    r: *mut SedsRouter,
+    side_id: u32,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if r.is_null() || bytes.is_null() || len == 0 {
+        return false;
+    }
+    let router = unsafe { &(*r).inner };
+    let slice = unsafe { slice::from_raw_parts(bytes, len) };
+    router.relayed_frame_satisfied(side_id as usize, slice)
+}
+
 /// Decodes a 7-bit time sync error code (health byte bits 0..7) to an upper
 /// bound in microseconds; UINT32_MAX for 127 (unknown).
 #[cfg(feature = "timesync")]

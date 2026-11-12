@@ -8586,3 +8586,72 @@ fn failed_clock_handoff_does_not_spend_its_slow_link_allowance() {
         "failed handoff must not block its retry for30seconds"
     );
 }
+
+#[test]
+fn relayed_copy_held_by_a_driver_queue_is_known_satisfied_once_every_owner_acked() {
+    // RF's radio or CAN driver queue still holds a relayed copy when the
+    // only destination's receipt passes back through RF: the driver asks
+    // before the physical write and drops it.
+    crate::tests::ensure_common_test_schema();
+    type Wire = Arc<Mutex<Vec<Vec<u8>>>>;
+    let to_dest: Wire = Arc::default();
+    let to_relay: Wire = Arc::default();
+    let relay = Router::new_with_clock(RouterConfig::default().with_sender("RELAY"), zero_clock());
+    let dest = Router::new_with_clock(
+        RouterConfig::new([EndpointHandler::new_packet_handler(DataEndpoint::named("RADIO"), |_| Ok(()))])
+            .with_sender("DEST_A"),
+        zero_clock(),
+    );
+    let ingress = relay.add_side_packet("INGRESS", |_pkt: &Packet| -> TelemetryResult<()> { Ok(()) });
+    let w = to_dest.clone();
+    let link = relay.add_side_packed("LINK", move |b: &[u8]| -> TelemetryResult<()> {
+        w.lock().unwrap().push(b.to_vec());
+        Ok(())
+    });
+    let w = to_relay.clone();
+    let up = dest.add_side_packed("UP", move |b: &[u8]| -> TelemetryResult<()> {
+        w.lock().unwrap().push(b.to_vec());
+        Ok(())
+    });
+    let exchange = |hold: bool| -> Vec<Vec<u8>> {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            for b in std::mem::take(&mut *to_dest.lock().unwrap()) {
+                if hold && wire_format::packet_id_from_wire(&b).is_ok_and(|_| {
+                    wire_format::unpack_packet(&b).is_ok_and(|p| p.data_type() == DataType::named("GPS_DATA"))
+                }) {
+                    held.push(b);
+                    continue;
+                }
+                let _ = dest.rx_packed_from_side(&b, up);
+            }
+            for b in std::mem::take(&mut *to_relay.lock().unwrap()) {
+                let _ = relay.rx_packed_from_side(&b, link);
+            }
+            let _ = dest.process_all_queues();
+            let _ = relay.process_all_queues();
+        }
+        held
+    };
+    dest.announce_discovery().unwrap();
+    relay.announce_discovery().unwrap();
+    exchange(false);
+    let pkt = Packet::from_f32_slice(
+        DataType::named("GPS_DATA"),
+        &[7.0, 0.0, 0.0],
+        &[DataEndpoint::named("RADIO")],
+        7,
+    )
+    .unwrap();
+    // Two copies leave the relay (a first copy and, after the destination
+    // receipt is delayed, a retry held in the driver). Deliver the first,
+    // keep the second in the "driver queue".
+    relay.rx_from_side(&pkt, ingress).unwrap();
+    let mut held = exchange(true);
+    assert!(!held.is_empty(), "relayed copy handed to the driver");
+    let copy = held.remove(0);
+    assert!(!relay.relayed_frame_satisfied(link, &copy), "owner has not acknowledged yet");
+    let _ = dest.rx_packed_from_side(&copy, up);
+    exchange(false);
+    assert!(relay.relayed_frame_satisfied(link, &copy), "every owner acknowledged");
+}

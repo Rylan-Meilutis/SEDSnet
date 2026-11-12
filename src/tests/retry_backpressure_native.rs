@@ -1198,3 +1198,25 @@ fn retry_clock_starts_when_the_write_drains_not_at_handoff() {
     }
     assert_eq!(leases.lock().unwrap().len(), 2, "one replay after drain + retry interval");
 }
+#[test]
+fn application_can_complete_a_pending_send_but_never_an_urgent_one() {
+    let (f, _t, leases) = tracked_fixture(true);
+    publish(&f);
+    let id = *f.router.state.lock().end_to_end_reliable_tx.keys().next().unwrap();
+    // Urgent (ABORT-class) sends are never completed by the application.
+    assert!(crate::set_type_scheduling_class(f.ty, -1));
+    assert_eq!(f.router.complete_reliable(id), Err(TelemetryError::PermissionDenied));
+    assert!(f.router.state.lock().end_to_end_reliable_tx.contains_key(&id));
+    assert!(crate::set_type_scheduling_class(f.ty, 1));
+    // Proof of delivery from elsewhere: retries stop.
+    assert_eq!(f.router.complete_reliable(id), Ok(true));
+    assert!(!f.router.state.lock().end_to_end_reliable_tx.contains_key(&id));
+    assert_eq!(f.router.complete_reliable(id), Ok(false));
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    let before = leases.lock().unwrap().len();
+    next_tracked_retry(&f);
+    next_tracked_retry(&f);
+    assert_eq!(leases.lock().unwrap().len(), before, "a completed send is not replayed");
+}

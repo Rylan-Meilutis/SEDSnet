@@ -625,6 +625,18 @@ SedsResult seds_router_set_side_timesync_path(SedsRouter * r, uint32_t side_id, 
  */
 SedsResult seds_router_set_utc_reference_offset(SedsRouter * r, bool valid, int64_t offset_us, uint32_t error_us);
 
+/**
+ * @brief Complete one pending end-to-end reliable send by packet id (other proof
+ * of delivery, e.g. a board's state reply). ABORT/urgent types are refused.
+ */
+SedsResult seds_router_complete_reliable(SedsRouter * r, uint64_t packet_id);
+
+/**
+ * @brief True when a frame a driver still holds is a relayed reliable copy that
+ * every destination owner already acknowledged: drop it instead of writing.
+ */
+bool seds_router_relayed_frame_satisfied(SedsRouter * r, uint32_t side_id, const uint8_t * bytes, size_t len);
+
 /** @brief Decode a 7-bit time sync error code to microseconds (UINT32_MAX = unknown). */
 uint32_t seds_timesync_error_code_us(uint8_t code);
 
