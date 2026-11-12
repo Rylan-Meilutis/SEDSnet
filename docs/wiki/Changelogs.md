@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## Version 5.0.0 highlights
+
+- Breaking time sync wire change (4.x and 5.x nodes do not keep time together; update the whole stack): NTP interleaved exchange in the existing request/response words, transport transmit/receive stamps, and a least-squares phase/frequency discipline with holdover. No frame grows.
+- Per-node sync quality (state, error bound, offset, learned rate) with a one-byte BOARD_HEALTH summary; UTC reference reports from GPS followers; coarse UTC set for RTC-less stations.
+- Application scheduling classes put ABORT and operator commands above SEDSnet network control.
+- Reliability: retries count from the physical drain; `complete_reliable` (never ABORT); drivers can drop relayed copies every owner acknowledged.
+
 ## Version 4.3.14 highlights
 
 - Fit the full `embedded` feature set (compression, cryptography, time sync, discovery, JSON schemas) on 512 KiB STM32G4 boards: zstd keeps only its level-1 compressor and small decoders, and embedded tables share one sorted-`Vec` map instead of per-type B-trees.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## 5.0.0
+
 **Breaking wire change (time sync).** SEDSnet 4.x and 5.x nodes do not keep
 time with each other: the GS, RRLS and every board update together. Frames
 do not grow; time sync uses the same words differently. Other wire framing and
