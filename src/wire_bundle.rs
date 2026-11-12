@@ -1,19 +1,31 @@
 //! Compact bundle (CB1): several canonical frames in one side frame.
 //!
-//! A bundle is negotiated per link (see
-//! [`crate::discovery::LINK_CAPABILITY_COMPACT_BUNDLE`]) and is stateless: every
-//! record decodes from the bundle alone, so no dictionary can be lost or go
-//! stale. The receiver rebuilds each canonical frame byte for byte (CRC
-//! included), so packet ids, routing, hop and end-to-end reliability and
-//! forwarding are unchanged.
+//! A side uses bundles when it is opened with
+//! [`crate::routing_config::SideOptions::compact_bundle`]; every node on such a
+//! link runs a bundle-capable build (no negotiation, no legacy fallback). A
+//! bundle needs no dictionary that could be lost or go stale: every record
+//! decodes from the bundle plus the static node table below. The receiver
+//! rebuilds each canonical frame byte for byte (CRC included), so packet ids,
+//! routing, hop and end-to-end reliability and forwarding are unchanged.
+//!
+//! Node table: every node is built with the same ordered list of node names
+//! ([`set_node_table`]). A record then names a source address, or a frozen
+//! target hash, by its 1-byte position in that list instead of 4-5 or 8 bytes.
+//! A bundle that uses the table carries a check byte of the table; a receiver
+//! whose table differs (or that has none) drops the whole bundle rather than
+//! guess. Urgent frames (ABORT) never travel in a bundle: they stay
+//! self-contained canonical frames that decode with no prior state.
 //!
 //! ```text
-//! bundle = MARKER | base_ts ULEB128 | record+ | CRC32-LE(MARKER .. last record)
+//! bundle = MARKER | [table check, MARKER_TABLE only] | base_ts ULEB128 | record+
+//!          | CRC32-LE(MARKER .. last record)
 //! record = len ULEB128 | flags | elide | [nep] | [type ULEB128]
 //!        | [logical size ULEB128, only when the payload is compressed]
 //!        | ts zigzag ULEB128 (delta from the previous record, the first from base_ts)
 //!        | [nonce: ULEB128, or zigzag delta from the previous record's nonce]
-//!        | [source ULEB128] | [endpoints] | [contract: ULEB128 len | bytes]
+//!        | [source: ULEB128, or 1-byte node index] | [endpoints]
+//!        | [contract: ULEB128 len | bytes, targets as 1-byte node indices
+//!           when elide bit E_TARGET_INDEX is set]
 //!        | [reliable header] | payload
 //! ```
 //! Fields are in canonical order, so one reader and one writer serve both
@@ -41,11 +53,16 @@ fn put_uleb(out: &mut Vec<u8>, v: u64) {
 fn put(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
+use crate::packet::hash_bytes_u64;
 use crate::{TelemetryError, TelemetryResult};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// First byte of a compact bundle.
+/// First byte of a compact bundle without node-table references.
 pub const BUNDLE_MARKER: u8 = 0xA1;
+/// First byte of a compact bundle whose records may use the node table; a
+/// table check byte follows.
+pub const BUNDLE_MARKER_TABLE: u8 = 0xA3;
 /// Upper bound on records accepted from one bundle.
 pub const MAX_BUNDLE_RECORDS: usize = 64;
 
@@ -66,7 +83,10 @@ const E_CONTRACT: u8 = 0x04;
 const E_NONCE_DELTA: u8 = 0x08;
 const E_NEP: u8 = 0x10;
 const E_ENDPOINTS: u8 = 0x20;
-const E_KNOWN: u8 = 0x3F;
+const E_SOURCE_INDEX: u8 = 0x40;
+const E_TARGET_INDEX: u8 = 0x80;
+const CONTRACT_TARGETS: u8 = 0x01;
+const CONTRACT_SHAPE: u8 = 0x02;
 
 // One error for every malformed bundle or unbundleable frame keeps the
 // embedded image small; the cause is never acted on differently.
@@ -75,7 +95,63 @@ const BAD: TelemetryError = TelemetryError::Unpack("bad compact bundle");
 /// Is `bytes` a compact bundle (by its first byte)?
 #[inline]
 pub fn is_bundle(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&BUNDLE_MARKER)
+    matches!(bytes.first(), Some(&(BUNDLE_MARKER | BUNDLE_MARKER_TABLE)))
+}
+
+// ---------------------------------------------------------------- node table
+
+static NODE_PTR: AtomicUsize = AtomicUsize::new(0);
+static NODE_LEN: AtomicUsize = AtomicUsize::new(0);
+const ACK_PREFIX: &[u8] = b"E2EACK:";
+
+/// Set the ordered node-name table every node on bundle links shares (at
+/// most 64 names). Position `i` names `names[i]`'s source address and frozen
+/// target hash; `64 + i` names the source address of its end-to-end ACKs.
+/// Set it once at start-up, before any bundle is packed or received.
+pub fn set_node_table(names: &'static [&'static str]) {
+    let names = &names[..names.len().min(64)];
+    NODE_LEN.store(0, Ordering::Release);
+    NODE_PTR.store(names.as_ptr() as usize, Ordering::Release);
+    NODE_LEN.store(names.len(), Ordering::Release);
+}
+
+fn nodes() -> &'static [&'static str] {
+    let len = NODE_LEN.load(Ordering::Acquire);
+    if len == 0 {
+        return &[];
+    }
+    // SAFETY: set_node_table stored a 'static slice of exactly `len` names.
+    unsafe { core::slice::from_raw_parts(NODE_PTR.load(Ordering::Acquire) as *const &'static str, len) }
+}
+
+fn source_of(i: usize) -> Option<u32> {
+    let names = nodes();
+    let name = names.get(i % 64)?.as_bytes();
+    if i >= 64 {
+        let h = hash_bytes_u64(hash_bytes_u64(0xA6D3_8C21_4B7F_19E5, ACK_PREFIX), name) as u32;
+        return Some(h.max(1));
+    }
+    Some(crate::packet::sender_address_u32(names[i]))
+}
+
+fn target_of(i: usize) -> Option<u64> {
+    Some(hash_bytes_u64(0x517C_C1B7_2722_0A95, nodes().get(i)?.as_bytes()))
+}
+
+#[inline(never)]
+fn source_index(src: u32) -> Option<u8> {
+    (0..nodes().len()).chain(64..64 + nodes().len()).find(|&i| source_of(i) == Some(src)).map(|i| i as u8)
+}
+
+#[inline(never)]
+fn target_index(hash: u64) -> Option<u8> {
+    (0..nodes().len()).find(|&i| target_of(i) == Some(hash)).map(|i| i as u8)
+}
+
+/// Check byte of the node table carried by MARKER_TABLE bundles.
+fn table_check() -> u8 {
+    let h = nodes().iter().fold(0x6B1D_3C4F_u64, |h, name| hash_bytes_u64(h ^ 0xFF, name.as_bytes()));
+    (h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24)) as u8
 }
 
 /// Header fields of one frame, shared by the canonical and record forms.
@@ -90,6 +166,8 @@ struct Fields<'a> {
     src: u32,
     eps: &'a [u8],
     contract: &'a [u8],
+    /// `contract` holds 1-byte node indices for its targets (record form).
+    targets_indexed: bool,
     rel: &'a [u8],
     payload: &'a [u8],
 }
@@ -138,6 +216,14 @@ impl<'a> Reader<'a> {
         }
         Some(&self.buf[start..self.off])
     }
+    /// The contract's flags and shape bytes, and its target count.
+    fn contract_head(&mut self) -> Option<usize> {
+        let flags = self.byte()?;
+        if flags & CONTRACT_SHAPE != 0 && self.byte()? & 0x40 != 0 {
+            self.uleb()?;
+        }
+        if flags & CONTRACT_TARGETS != 0 { self.len() } else { Some(0) }
+    }
     /// Reliable header bytes as the canonical flags describe them.
     fn reliable(&mut self, flags: u8) -> Option<&'a [u8]> {
         let start = self.off;
@@ -178,13 +264,16 @@ fn usable_flags(flags: u8) -> Option<u8> {
 /// Read one frame's fields into `p`: the canonical form (`rec` false), or a
 /// bundle record relative to the previous record already in `p` (`first`
 /// when there is none; `p.ts` is then the bundle's base timestamp).
-fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, p: &mut Fields<'a>) -> Option<()> {
+fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, table: bool, p: &mut Fields<'a>) -> Option<()> {
     let mut r = Reader { buf, off: 0 };
     let flags = usable_flags(r.byte()?)?;
     let elide = if rec { r.byte()? } else { 0 };
-    // Elision needs a previous record and the field it refers to.
-    if elide & !E_KNOWN != 0
-        || (first && elide != 0)
+    // Elision needs a previous record and the field it refers to; node
+    // indices need a bundle that carried a matching table check.
+    if (first && elide & !(E_SOURCE_INDEX | E_TARGET_INDEX) != 0)
+        || (!table && elide & (E_SOURCE_INDEX | E_TARGET_INDEX) != 0)
+        || (elide & E_SOURCE != 0 && elide & E_SOURCE_INDEX != 0)
+        || (elide & E_TARGET_INDEX != 0 && (flags & F_CONTRACT == 0 || elide & E_CONTRACT != 0))
         || (elide & E_NONCE_DELTA != 0 && (elide & E_SOURCE == 0 || flags & p.flags & F_NONCE == 0))
         || (elide & E_CONTRACT != 0 && flags & p.flags & F_CONTRACT == 0)
         || (elide & E_ENDPOINTS != 0
@@ -208,7 +297,9 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, p: &mut Fields<'a>) ->
     } else {
         p.nonce = 0;
     }
-    if elide & E_SOURCE == 0 {
+    if elide & E_SOURCE_INDEX != 0 {
+        p.src = source_of(usize::from(r.byte()?))?;
+    } else if elide & E_SOURCE == 0 {
         p.src = r.u32()?;
     }
     if elide & E_ENDPOINTS == 0 {
@@ -216,9 +307,20 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, p: &mut Fields<'a>) ->
     }
     if flags & F_CONTRACT == 0 {
         p.contract = &[];
+        p.targets_indexed = false;
     } else if elide & E_CONTRACT == 0 {
         let n = r.len()?;
         p.contract = r.take(n)?;
+        p.targets_indexed = elide & E_TARGET_INDEX != 0;
+        // The contract must describe exactly its own bytes, and every index
+        // must name a node in this table.
+        let mut c = Reader { buf: p.contract, off: 0 };
+        let targets = c.contract_head()?;
+        let each = if p.targets_indexed { 1 } else { 8 };
+        let list = c.take(targets.checked_mul(each)?)?;
+        if c.off != p.contract.len() || (p.targets_indexed && list.iter().any(|&i| target_of(usize::from(i)).is_none())) {
+            return None;
+        }
     }
     p.rel = r.reliable(flags)?;
     p.payload = r.rest();
@@ -236,7 +338,7 @@ fn parse_canonical(frame: &[u8]) -> Option<Fields<'_>> {
         return None;
     }
     let mut f = Fields::default();
-    read_fields(checked(frame)?, false, true, &mut f)?;
+    read_fields(checked(frame)?, false, true, false, &mut f)?;
     Some(f)
 }
 
@@ -271,6 +373,31 @@ fn unzigzag32(v: u32) -> u32 {
 
 /// Write one frame's fields: a bundle record relative to `p` (`rec`), or
 /// the canonical frame with its CRC32.
+/// Contract bytes with each 8-byte target swapped for its node index (or the
+/// reverse), length-prefixed; `None` when a target is not in the table.
+fn put_contract(out: &mut Vec<u8>, contract: &[u8], from_index: bool, to_index: bool) -> Option<()> {
+    let mut r = Reader { buf: contract, off: 0 };
+    let targets = r.contract_head()?;
+    let head = &contract[..r.off];
+    let width = if from_index { 1 } else { 8 };
+    let list = r.take(targets.checked_mul(width)?)?;
+    put_uleb(out, (head.len() + targets * if to_index { 1 } else { 8 }) as u64);
+    put(out, head);
+    for target in list.chunks_exact(width) {
+        let hash = if from_index {
+            target_of(usize::from(target[0]))?
+        } else {
+            u64::from_le_bytes(target.try_into().ok()?)
+        };
+        if to_index {
+            put(out, &[target_index(hash)?]);
+        } else {
+            put(out, &hash.to_le_bytes());
+        }
+    }
+    Some(())
+}
+
 fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
     let mut elide = 0u8;
     let prev_ts = p.map_or(c.ts, |p| p.ts);
@@ -292,6 +419,21 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
             if c.flags & F_EPS != 0 && p.flags & F_EPS == c.flags & F_EPS && p.eps == c.eps {
                 elide |= E_ENDPOINTS;
             }
+        }
+    }
+    // Node indices, when this node has a table (records only).
+    let source = if rec && elide & E_SOURCE == 0 { source_index(c.src) } else { None };
+    if source.is_some() {
+        elide |= E_SOURCE_INDEX;
+    }
+    let mut contract = Vec::new();
+    if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
+        let indexed = rec && !nodes().is_empty() && put_contract(&mut contract, c.contract, c.targets_indexed, true).is_some();
+        if indexed {
+            elide |= E_TARGET_INDEX;
+        } else {
+            contract.clear();
+            let _ = put_contract(&mut contract, c.contract, c.targets_indexed, false);
         }
     }
     out.clear();
@@ -317,16 +459,15 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
         };
         put_uleb(out, u64::from(v));
     }
-    if elide & E_SOURCE == 0 {
+    if let Some(index) = source {
+        put(out, &[index]);
+    } else if elide & E_SOURCE == 0 {
         put_uleb(out, u64::from(c.src));
     }
     if elide & E_ENDPOINTS == 0 {
         put(out, c.eps);
     }
-    if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
-        put_uleb(out, c.contract.len() as u64);
-        put(out, c.contract);
-    }
+    put(out, &contract);
     put(out, c.rel);
     put(out, c.payload);
     if !rec {
@@ -352,7 +493,11 @@ pub fn pack_bundle_with<'a>(count: usize, frame: &dyn Fn(usize) -> &'a [u8]) -> 
     let mut out = Vec::new();
     let mut record = Vec::new();
     let mut prev: Option<Fields<'_>> = None;
-    put(&mut out, &[BUNDLE_MARKER]);
+    if nodes().is_empty() {
+        put(&mut out, &[BUNDLE_MARKER]);
+    } else {
+        put(&mut out, &[BUNDLE_MARKER_TABLE, table_check()]);
+    }
     for i in 0..count {
         let c = parse_canonical(frame(i)).ok_or(BAD)?;
         if prev.is_none() {
@@ -371,12 +516,17 @@ pub fn pack_bundle_with<'a>(count: usize, frame: &dyn Fn(usize) -> &'a [u8]) -> 
 /// Walk every record, handing each rebuilt canonical frame to `each`.
 fn walk(bytes: &[u8], each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>) -> TelemetryResult<usize> {
     let mut r = Reader { buf: checked(bytes).filter(|_| is_bundle(bytes)).ok_or(BAD)?, off: 1 };
+    // A table bundle decodes only against the same node table, never a guess.
+    let table = bytes[0] == BUNDLE_MARKER_TABLE;
+    if table && (nodes().is_empty() || r.byte() != Some(table_check())) {
+        return Err(BAD);
+    }
     let mut cur = Fields { ts: r.uleb().ok_or(BAD)?, ..Fields::default() };
     let mut count = 0usize;
     let mut canonical = Vec::new();
     while r.off < r.buf.len() {
         let rec = r.len().and_then(|n| r.take(n)).ok_or(BAD)?;
-        if count == MAX_BUNDLE_RECORDS || read_fields(rec, true, count == 0, &mut cur).is_none() {
+        if count == MAX_BUNDLE_RECORDS || read_fields(rec, true, count == 0, table, &mut cur).is_none() {
             return Err(BAD);
         }
         write_fields(&cur, false, None, &mut canonical);

@@ -298,6 +298,16 @@ fn decode_capture_files(input: &Path, output: &Path) {
             }
         }
     }
+    #[cfg(feature = "compact-bundle")]
+    {
+        // Bundles that use the node table decode only against the same table.
+        let names: Vec<String> = manifest["node_table"].as_array().map_or_else(
+            || ["GS", "RRLS", "RF", "FC", "PB", "AB", "VB", "GB", "DAQ"].map(String::from).to_vec(),
+            |names| names.iter().map(|n| n.as_str().unwrap().to_owned()).collect(),
+        );
+        let names: Vec<&'static str> = names.into_iter().map(|n| &*Box::leak(n.into_boxed_str())).collect();
+        crate::wire_bundle::set_node_table(Box::leak(names.into_boxed_slice()));
+    }
     let streams = manifest["streams"].as_array().unwrap();
     assert!(!streams.is_empty() && streams.len() <= 32);
     let rows: Vec<_> = streams

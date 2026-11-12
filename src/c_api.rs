@@ -8493,7 +8493,7 @@ mod sender_identity_match_tests;
 //  FFI: compact bundles (feature `compact-bundle`)
 // ============================================================================
 
-/// Offer (1) or withdraw (0) compact bundles on a side.
+/// Switch a side to (1) or from (0) compact bundles.
 #[cfg(feature = "compact-bundle")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_set_side_compact_bundle(
@@ -8507,8 +8507,8 @@ pub extern "C" fn seds_router_set_side_compact_bundle(
     ok_or_status(unsafe { &(*r).inner }.set_side_compact_bundle(side_id as usize, enabled))
 }
 
-/// 1 when the side's writer may send compact bundles now, 0 when it must use
-/// the legacy format, negative status for a bad router.
+/// 1 when the side uses compact bundles, 0 when not, negative status for a
+/// bad router.
 #[cfg(feature = "compact-bundle")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_side_compact_bundle_active(r: *mut SedsRouter, side_id: u32) -> i32 {
@@ -8569,4 +8569,29 @@ pub extern "C" fn seds_compact_bundle_pack(
     // The input is no longer read: `out` may alias it.
     unsafe { core::ptr::copy(bundle.as_ptr(), out, bundle.len()) };
     bundle.len() as i32
+}
+
+/// Set the shared ordered node-name table for compact bundles (see
+/// `wire_bundle::set_node_table`). `names` and every string must stay valid
+/// for the program's lifetime (string literals). Call once at start-up.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_node_table(names: *const *const core::ffi::c_char, count: usize) -> i32 {
+    if names.is_null() || count == 0 || count > 64 {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let mut table: Vec<&'static str> = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = unsafe { *names.add(i) };
+        if name.is_null() {
+            return status_from_err(TelemetryError::BadArg);
+        }
+        // SAFETY: the caller passes NUL-terminated strings that live forever.
+        let Ok(name) = unsafe { core::ffi::CStr::from_ptr(name) }.to_str() else {
+            return status_from_err(TelemetryError::BadArg);
+        };
+        table.push(name);
+    }
+    crate::wire_bundle::set_node_table(alloc::boxed::Box::leak(table.into_boxed_slice()));
+    0
 }

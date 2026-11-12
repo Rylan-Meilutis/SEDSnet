@@ -1,6 +1,7 @@
 //! Compact bundles: round trip, negotiation, mixed old/new routers, fuzzing.
 use super::*;
 use crate::wire_bundle::{BUNDLE_MARKER, frame_bundleable, pack_bundle, unpack_bundle_frames};
+use crate::router::{RouterItem, RouterSideId};
 use crate::wire_format::{self, ReliableHeader};
 use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode, discovery};
 use std::sync::Mutex;
@@ -105,7 +106,7 @@ fn round_trip_rebuilds_every_canonical_frame_byte_for_byte() {
     for n in 1..=frames.len() {
         let refs: Vec<&[u8]> = frames[..n].iter().map(Vec::as_slice).collect();
         let bundle = pack_bundle(&refs).unwrap();
-        assert_eq!(bundle[0], BUNDLE_MARKER);
+        assert!(crate::wire_bundle::is_bundle(&bundle));
         assert_eq!(unpack_bundle_frames(&bundle).unwrap(), frames[..n].to_vec());
     }
     for f in &frames {
@@ -240,6 +241,77 @@ fn fuzz_decoder_behind_a_valid_crc() {
     assert!(accepted > 0, "fuzz never reached the record parser's accept path");
 }
 
+// ---------------------------------------------------------------- node table
+
+/// The node table every SEDS build shares (order matters).
+static NODES: [&str; 9] = ["GS", "RRLS", "RF", "FC", "PB", "AB", "VB", "GB", "DAQ"];
+
+fn with_table() {
+    crate::wire_bundle::set_node_table(&NODES);
+}
+
+fn ack_and_battery_frames() -> Vec<Vec<u8>> {
+    let ts0 = 1_767_225_607_518u64;
+    let gs = Router::sender_hash("GS");
+    let pb = Router::sender_hash("PB");
+    let mut out = Vec::new();
+    for i in 0..3u64 {
+        let ack = Packet::new(
+            DataType::ReliableAck,
+            &[DataEndpoint::named("RADIO")],
+            "E2EACK:GS",
+            ts0 + i,
+            Arc::<[u8]>::from((1000 + i).to_le_bytes().to_vec()),
+        )
+        .unwrap();
+        out.push(
+            wire_format::pack_packet_with_wire_contract(&ack, None, None, &[gs, if i == 1 { 0x55AA } else { pb }])
+                .unwrap()
+                .to_vec(),
+        );
+    }
+    out.push(wire_format::pack_packet(&packet(imu(), "PB", ts0 + 9, vec![3; 24])).to_vec());
+    out
+}
+
+/// With the shared table, sources and frozen targets travel as 1-byte node
+/// indices, unknown ones in full, and every frame rebuilds byte for byte.
+#[test]
+fn node_table_indices_round_trip_and_shrink_acks() {
+    with_table();
+    let frames = ack_and_battery_frames();
+    let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+    let bundle = pack_bundle(&refs).unwrap();
+    assert_eq!(bundle[0], crate::wire_bundle::BUNDLE_MARKER_TABLE);
+    assert_eq!(unpack_bundle_frames(&bundle).unwrap(), frames);
+    // Each indexed ACK record: no 16-byte target list, no 5-byte source.
+    let one = pack_bundle(&refs[..1]).unwrap().len();
+    let legacy = frames[0].len() + 4;
+    assert!(one + 16 <= legacy, "indexed ACK bundle {one} B vs {legacy} B");
+}
+
+/// A receiver whose node table differs drops the bundle; it never guesses.
+#[test]
+fn a_different_node_table_drops_the_bundle() {
+    with_table();
+    let frames = ack_and_battery_frames();
+    let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+    let mut bundle = pack_bundle(&refs).unwrap();
+    bundle[1] ^= 0x5A; // as packed by a node with another table
+    let n = bundle.len() - 4;
+    let crc = crc32fast::hash(&bundle[..n]).to_le_bytes();
+    bundle[n..].copy_from_slice(&crc);
+    assert!(unpack_bundle_frames(&bundle).is_err());
+    // Index bits inside a bundle that carries no table check are refused too.
+    let mut plain = pack_bundle(&refs).unwrap();
+    plain.remove(1);
+    plain[0] = BUNDLE_MARKER;
+    let n = plain.len() - 4;
+    let crc = crc32fast::hash(&plain[..n]).to_le_bytes();
+    plain[n..].copy_from_slice(&crc);
+    assert!(unpack_bundle_frames(&plain).is_err());
+}
+
 // ---------------------------------------------------------------- routers
 
 type Frames = Arc<Mutex<Vec<Vec<u8>>>>;
@@ -248,26 +320,6 @@ fn opts(bundle: bool) -> RouterSideOptions {
     let mut o = RouterSideOptions::default().with_small_packet_transport(1024);
     o.compact_bundle = bundle;
     o
-}
-
-/// Tell `node` that peer `name` on `side` advertises `peer_opts`' real link
-/// capabilities, through the same discovery path a radio peer uses.
-fn hear_peer(node: &Router, side: RouterSideId, name: &str, peer_opts: &RouterSideOptions) {
-    let ad = discovery::AddressAdvertisement {
-        hostname: name.into(),
-        address: crate::packet::sender_address_u32(name),
-        requested_address: 0,
-        mode: discovery::ADDRESS_MODE_STATIC,
-        state: discovery::ADDRESS_STATE_APPROVED,
-        birth_ms: 1,
-        owner_hash: crate::packet::sender_address_u32(name) as u64,
-        reachable_endpoints: vec![DataEndpoint::named("RADIO")],
-        reachable_network_variables: vec![],
-        reachable_timesync_sources: vec![],
-        link_capabilities: peer_opts.link_capabilities(),
-    };
-    let pkt = discovery::build_discovery_address(name, 100, &ad).unwrap();
-    node.rx_from_side(&pkt, side).unwrap();
 }
 
 fn sender_node(side_bundle: bool) -> (Router, RouterSideId, Frames) {
@@ -286,7 +338,7 @@ fn sender_node(side_bundle: bool) -> (Router, RouterSideId, Frames) {
     (node, side, out)
 }
 
-fn receiver_node(side_bundle: bool) -> (Router, RouterSideId, Arc<Mutex<Vec<(DataType, Vec<u8>)>>>) {
+fn receiver_node() -> (Router, RouterSideId, Arc<Mutex<Vec<(DataType, Vec<u8>)>>>) {
     crate::tests::ensure_common_test_schema();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
@@ -299,7 +351,7 @@ fn receiver_node(side_bundle: bool) -> (Router, RouterSideId, Arc<Mutex<Vec<(Dat
     )])
     .with_sender("GS");
     let node = Router::new_with_clock(cfg, Box::new(|| 100));
-    let side = node.add_side_packed_with_options("radio", |_| Ok(()), opts(side_bundle));
+    let side = node.add_side_packed_with_options("radio", |_| Ok(()), opts(true));
     (node, side, seen)
 }
 
@@ -308,12 +360,8 @@ fn emit(node: &Router, side: RouterSideId, item: &RouterItem) {
     node.call_side_tx_handler(side, &handler, item, false).unwrap();
 }
 
-/// The writer the boards and GS run: bundle consecutive bundleable frames
-/// when the side is active, otherwise write each frame as it is.
-fn writer(active: bool, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    if !active {
-        return frames.to_vec();
-    }
+/// The writer the boards and GS run: bundle consecutive bundleable frames.
+fn writer(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut run: Vec<&[u8]> = Vec::new();
     for f in frames {
@@ -334,134 +382,81 @@ fn writer(active: bool, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn negotiation_needs_every_live_peer_and_the_local_offer() {
-    let new_peer = opts(true);
-    let old_peer = opts(false);
-    for (local, peers, expect) in [
-        (true, vec![], false),
-        (true, vec![("GS", &new_peer)], true),
-        (false, vec![("GS", &new_peer)], false),
-        (true, vec![("GS", &new_peer), ("RRLS", &old_peer)], false),
-        (true, vec![("GS", &new_peer), ("RRLS", &new_peer)], true),
-    ] {
-        let (node, side, _) = sender_node(local);
-        for (name, o) in &peers {
-            hear_peer(&node, side, name, o);
-        }
-        assert_eq!(node.side_compact_bundle_active(side), expect, "local={local} peers={}", peers.len());
-    }
-    assert_eq!(new_peer.link_capabilities().flags & discovery::LINK_CAPABILITY_COMPACT_BUNDLE, discovery::LINK_CAPABILITY_COMPACT_BUNDLE);
-    assert_eq!(old_peer.link_capabilities().flags & discovery::LINK_CAPABILITY_COMPACT_BUNDLE, 0);
-}
-
-#[test]
-fn a_late_old_peer_or_withdrawn_offer_turns_bundles_off() {
-    let (node, side, _) = sender_node(true);
-    hear_peer(&node, side, "GS", &opts(true));
-    assert!(node.side_compact_bundle_active(side));
-    hear_peer(&node, side, "RRLS", &opts(false));
-    assert!(!node.side_compact_bundle_active(side));
-    let (node, side, _) = sender_node(true);
-    hear_peer(&node, side, "GS", &opts(true));
-    node.set_side_compact_bundle(side, false).unwrap();
-    assert!(!node.side_compact_bundle_active(side));
-    node.set_side_compact_bundle(side, true).unwrap();
-    assert!(node.side_compact_bundle_active(side));
-}
-
-/// Mixed old/new interop with real routers: the same telemetry stream from a
-/// bundling RF router reaches (a) a new receiver as bundles, (b) an old-style
-/// receiver (no offer) as legacy templated frames, and (c) a new receiver
-/// across a mid-stream switch, with identical delivered packets every time.
-#[test]
-fn mixed_old_and_new_routers_deliver_identical_packets() {
-    let stream: Vec<Packet> = (0..12u64)
-        .map(|i| match i % 3 {
-            0 => packet(imu(), "RF", 1_000 + i * 20, vec![i as u8; 24]),
-            1 => packet(blob(), "RF", 1_000 + i * 20, vec![i as u8; 7]),
-            _ => packet(imu(), "RF", 1_000 + i * 20 - 50, vec![0xEE; 24]),
-        })
-        .collect();
-    let expected: Vec<(DataType, Vec<u8>)> =
-        stream.iter().map(|p| (p.data_type(), p.payload().to_vec())).collect();
-
-    for (receiver_offers, switch_at) in [(true, None), (false, None), (true, Some(5usize))] {
-        let (tx, tx_side, out) = sender_node(true);
-        let (rx, rx_side, seen) = receiver_node(receiver_offers);
-        let rx_opts = opts(receiver_offers);
-        let mut wire_frames = Vec::new();
-        let mut bundles = 0;
-        for (i, p) in stream.iter().enumerate() {
-            if i == switch_at.unwrap_or(0) {
-                hear_peer(&tx, tx_side, "GS", &rx_opts);
-            }
-            emit(&tx, tx_side, &RouterItem::Packet(p.clone()));
-            // Deliver in writes of 3 frames, like a turn's burst.
-            if i % 3 == 2 {
-                let frames: Vec<Vec<u8>> = out.lock().unwrap().drain(..).collect();
-                let active = tx.side_compact_bundle_active(tx_side);
-                for w in writer(active, &frames) {
-                    bundles += usize::from(w[0] == BUNDLE_MARKER);
-                    wire_frames.push(w);
-                }
-            }
-        }
-        for w in &wire_frames {
-            rx.rx_packed_from_side(w, rx_side).unwrap();
-        }
-        rx.process_all_queues().unwrap();
-        let mut got = seen.lock().unwrap().clone();
-        let mut want = expected.clone();
-        got.sort();
-        want.sort();
-        assert_eq!(got, want, "receiver_offers={receiver_offers} switch={switch_at:?}");
-        match (receiver_offers, switch_at) {
-            (true, None) => assert_eq!(bundles, 4),
-            (false, _) => assert_eq!(bundles, 0),
-            (true, Some(_)) => assert!(bundles >= 2 && wire_frames.len() > bundles),
-        }
-    }
-}
-
-/// A queued receive (the GS path) and a reliable stream through bundles.
-#[test]
-fn queued_receive_and_reliable_frames_survive_bundling() {
-    let (rx, rx_side, seen) = receiver_node(true);
-    let frames: Vec<Vec<u8>> = (0..4u32)
-        .map(|i| {
-            wire_format::pack_packet_with_reliable(
-                &packet(battery(), "PB", 2_000 + u64::from(i), vec![i as u8; 4]),
-                ReliableHeader { flags: wire_format::RELIABLE_FLAG_UNSEQUENCED, seq: 0, ack: 0 },
-            )
-            .to_vec()
-        })
-        .collect();
-    let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
-    let bundle = pack_bundle(&refs).unwrap();
-    rx.rx_packed_queue_from_side(&bundle, rx_side).unwrap();
-    rx.process_all_queues().unwrap();
-    let got: Vec<Vec<u8>> = seen.lock().unwrap().iter().map(|(_, p)| p.clone()).collect();
-    assert_eq!(got.len(), 4);
-    let mut bad = bundle.clone();
-    let last = bad.len() - 6;
-    bad[last] ^= 1;
-    assert!(rx.rx_packed_from_side(&bad, rx_side).is_err());
-}
-
-/// With bundles active the router hands its writer canonical frames (no
-/// template wrapper); without, the existing templated format is unchanged.
-#[test]
-fn active_side_emits_canonical_frames_for_the_writer() {
-    for active in [false, true] {
-        let (tx, side, out) = sender_node(true);
-        hear_peer(&tx, side, "GS", &opts(active));
+fn a_bundle_side_hands_its_writer_canonical_frames() {
+    for bundle in [false, true] {
+        let (tx, side, out) = sender_node(bundle);
+        assert_eq!(tx.side_compact_bundle_active(side), bundle);
         out.lock().unwrap().clear();
         for i in 0..4u64 {
             emit(&tx, side, &RouterItem::Packet(packet(imu(), "RF", 100 + i, vec![1; 24])));
         }
         let frames = out.lock().unwrap().clone();
         assert_eq!(frames.len(), 4);
-        assert_eq!(frames.iter().all(|f| frame_bundleable(f)), active);
-        assert_eq!(frames.iter().any(|f| f.starts_with(b"SDT")), !active);
+        assert_eq!(frames.iter().all(|f| frame_bundleable(f)), bundle);
+        assert_eq!(frames.iter().any(|f| f.starts_with(b"SDT")), !bundle);
     }
+    let (tx, side, _) = sender_node(false);
+    tx.set_side_compact_bundle(side, true).unwrap();
+    assert!(tx.side_compact_bundle_active(side));
+}
+
+/// Whole new stack: a bundle-side RF router's stream reaches a bundle-side GS
+/// router through bundles (direct and queued receive) with every packet.
+#[test]
+fn routers_deliver_every_packet_through_bundles() {
+    with_table();
+    let stream: Vec<Packet> = (0..12u64)
+        .map(|i| match i % 3 {
+            0 => packet(imu(), "RF", 1_000 + i * 20, vec![i as u8; 24]),
+            1 => packet(blob(), "FC", 1_000 + i * 20, vec![i as u8; 7]),
+            _ => packet(imu(), "PB", 1_000 + i * 20 - 50, vec![0xEE; 24]),
+        })
+        .collect();
+    let mut want: Vec<(DataType, Vec<u8>)> = stream.iter().map(|p| (p.data_type(), p.payload().to_vec())).collect();
+    want.sort();
+    for queued in [false, true] {
+        let (tx, tx_side, out) = sender_node(true);
+        let (rx, rx_side, seen) = receiver_node();
+        let mut wire_frames = Vec::new();
+        for (i, p) in stream.iter().enumerate() {
+            emit(&tx, tx_side, &RouterItem::Packet(p.clone()));
+            if i % 3 == 2 {
+                let frames: Vec<Vec<u8>> = out.lock().unwrap().drain(..).collect();
+                wire_frames.extend(writer(&frames));
+            }
+        }
+        assert_eq!(wire_frames.len(), 4);
+        assert!(wire_frames.iter().all(|w| crate::wire_bundle::is_bundle(w)));
+        for w in &wire_frames {
+            if queued {
+                rx.rx_packed_queue_from_side(w, rx_side).unwrap();
+            } else {
+                rx.rx_packed_from_side(w, rx_side).unwrap();
+            }
+        }
+        rx.process_all_queues().unwrap();
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, want, "queued={queued}");
+        let mut bad = wire_frames[0].clone();
+        let last = bad.len() - 6;
+        bad[last] ^= 1;
+        assert!(rx.rx_packed_from_side(&bad, rx_side).is_err());
+    }
+}
+
+/// An ABORT is never bundled by the writers; as a canonical frame it decodes
+/// on a node that has never seen any bundle or node table.
+#[test]
+fn a_canonical_abort_decodes_with_no_prior_state() {
+    let abort = ty(
+        "CB_TEST_ABORT",
+        MessageElement::Dynamic(MessageDataType::String, MessageClass::Error),
+        ReliableMode::None,
+    );
+    let frame = wire_format::pack_packet(&packet(abort, "GS", 5, b"ABORT".to_vec())).to_vec();
+    let (rx, rx_side, seen) = receiver_node();
+    rx.rx_packed_from_side(&frame, rx_side).unwrap();
+    rx.process_all_queues().unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }

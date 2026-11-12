@@ -909,14 +909,19 @@ int32_t seds_router_has_queued_work(SedsRouter *r);
 int32_t seds_router_set_latest_value_side(SedsRouter *r, int32_t side);
 int32_t seds_relay_set_latest_value_side(SedsRelay *r, int32_t side);
 #endif
-/* Compact bundles (stateless, negotiated per side by discovery). The writer
- * packs canonical frames it already holds, in its priority order, and keeps
- * urgent frames (Abort, turn-bypass traffic) standalone. */
+/* Compact bundles. Every node on a bundle side runs a bundle-capable build
+ * (no negotiation). The writer packs canonical frames it already holds, in
+ * its priority order, and keeps urgent frames (Abort, turn-bypass traffic)
+ * standalone; those decode with no prior state. */
 #if defined(SEDS_ENABLE_COMPACT_BUNDLE) && SEDS_ENABLE_COMPACT_BUNDLE
-/* Offer (true) or withdraw compact bundles on a side. */
+/* Switch a side to (true) or from compact bundles. */
 int32_t seds_router_set_side_compact_bundle(SedsRouter *r, uint32_t side_id, bool enabled);
-/* 1 when every live peer on the side accepts bundles (send them), 0 legacy. */
+/* 1 when the side uses compact bundles, else 0. */
 int32_t seds_router_side_compact_bundle_active(SedsRouter *r, uint32_t side_id);
+/* The ordered node-name table every node shares (same list and order on
+ * every build; string literals). Lets bundle records name sources and frozen
+ * targets in 1 byte; a node with a different table drops such bundles. */
+int32_t seds_set_node_table(const char *const *names, size_t count);
 /* 1 when the frame may join a bundle (canonical, CRC-valid, unsealed). */
 int32_t seds_compact_bundle_frame_ok(const uint8_t *frame, size_t len);
 /* Pack frames base+offsets[i] (lengths[i] bytes) in order into out (may

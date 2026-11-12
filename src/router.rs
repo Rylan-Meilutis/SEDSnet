@@ -15797,58 +15797,31 @@ impl Router {
         Ok(())
     }
 
-    /// Offer or withdraw compact bundles on a registered side.
-    ///
-    /// See [`crate::routing_config::SideOptions::compact_bundle`]. The next
-    /// discovery advertisement carries the change to the side's peers.
+    /// Switch a registered side to (or from) compact bundles.
     #[cfg(feature = "compact-bundle")]
     pub fn set_side_compact_bundle(&self, side: RouterSideId, enabled: bool) -> TelemetryResult<()> {
-        let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let side_ref = st
             .sides
             .get_mut(side)
             .and_then(|side| side.as_mut())
             .ok_or(TelemetryError::BadArg)?;
-        if side_ref.opts.compact_bundle != enabled {
-            side_ref.opts.compact_bundle = enabled;
-            Self::note_discovery_topology_change_locked(&mut st, now_ms);
-        }
+        side_ref.opts.compact_bundle = enabled;
         Ok(())
     }
 
-    /// Whether the writer for `side` may send compact bundles now: the side
-    /// offers them and every peer heard live on it advertises
-    /// [`discovery::LINK_CAPABILITY_COMPACT_BUNDLE`]. With no live peer, or
-    /// any peer that does not advertise it, frames stay in the legacy format.
+    /// Whether the writer for `side` sends compact bundles: the side was
+    /// opened (or switched) with [`crate::routing_config::SideOptions::compact_bundle`].
+    /// Every node on such a link runs a bundle-capable build, so there is no
+    /// negotiation and no legacy fallback on it.
     #[cfg(feature = "compact-bundle")]
     pub fn side_compact_bundle_active(&self, side: RouterSideId) -> bool {
-        let now_ms = self.clock.now_ms();
-        let st = self.state.lock();
-        let offered = st
+        self.state
+            .lock()
             .sides
             .get(side)
             .and_then(|side| side.as_ref())
-            .is_some_and(|side| side.opts.compact_bundle);
-        if !offered {
-            return false;
-        }
-        let Some(route) = st.discovery_routes.get(&side) else {
-            return false;
-        };
-        // Same liveness rule as the template dictionary: every sender heard
-        // on this side recently, direct or forwarded, must accept bundles.
-        let mut live = false;
-        for sender in route.announcers.values() {
-            if now_ms.saturating_sub(sender.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS {
-                continue;
-            }
-            match sender.link_capabilities {
-                Some(caps) if caps.flags & discovery::LINK_CAPABILITY_COMPACT_BUNDLE != 0 => live = true,
-                _ => return false,
-            }
-        }
-        live
+            .is_some_and(|side| side.opts.compact_bundle)
     }
 
     /// Enable or disable egress toward a registered side.
