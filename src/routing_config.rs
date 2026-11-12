@@ -67,6 +67,15 @@ pub struct SideOptions {
     pub ingress_enabled: bool,
     /// Allows the router to transmit packets toward this side.
     pub egress_enabled: bool,
+    /// Offers compact bundles on this side (feature `compact-bundle`).
+    ///
+    /// The side then advertises [`discovery::LINK_CAPABILITY_COMPACT_BUNDLE`]
+    /// and accepts bundles. Once every live peer on the side advertises it
+    /// too ([`crate::router::Router::side_compact_bundle_active`]), the
+    /// router stops wrapping this side's frames in header templates, so the
+    /// writer gets canonical frames it can pack with
+    /// [`crate::wire_bundle::pack_bundle`].
+    pub compact_bundle: bool,
 }
 
 impl Default for SideOptions {
@@ -83,6 +92,7 @@ impl Default for SideOptions {
             side_transport_profile: SideTransportProfile::Canonical,
             ingress_enabled: true,
             egress_enabled: true,
+            compact_bundle: false,
         }
     }
 }
@@ -115,6 +125,13 @@ impl SideOptions {
         self.header_template_enabled = true;
         self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
         self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    /// Offer compact bundles on this side.
+    #[inline]
+    pub fn with_compact_bundle(mut self) -> Self {
+        self.compact_bundle = true;
         self
     }
 
@@ -175,6 +192,10 @@ impl SideOptions {
         #[cfg(feature = "compression")]
         {
             flags |= discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
+        }
+        #[cfg(feature = "compact-bundle")]
+        if self.compact_bundle {
+            flags |= discovery::LINK_CAPABILITY_COMPACT_BUNDLE;
         }
         discovery::LinkCapabilities {
             version: 1,

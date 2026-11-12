@@ -207,6 +207,8 @@ pub mod timesync_discipline;
 mod type_stats;
 mod varint;
 pub mod wire_format;
+#[cfg(feature = "compact-bundle")]
+pub mod wire_bundle;
 // ============================================================================
 //  Schema-derived global constants
 // ============================================================================

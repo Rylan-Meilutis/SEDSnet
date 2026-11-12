@@ -8488,3 +8488,88 @@ pub extern "C" fn seds_relay_set_latest_value_side(r: *mut SedsRelay, side: i32)
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/c_api_sender_identity_match.rs"]
 mod sender_identity_match_tests;
+
+// ============================================================================
+//  FFI: compact bundles (feature `compact-bundle`)
+// ============================================================================
+
+/// Offer (1) or withdraw (0) compact bundles on a side.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_compact_bundle(
+    r: *mut SedsRouter,
+    side_id: u32,
+    enabled: bool,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    ok_or_status(unsafe { &(*r).inner }.set_side_compact_bundle(side_id as usize, enabled))
+}
+
+/// 1 when the side's writer may send compact bundles now, 0 when it must use
+/// the legacy format, negative status for a bad router.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_side_compact_bundle_active(r: *mut SedsRouter, side_id: u32) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    i32::from(unsafe { &(*r).inner }.side_compact_bundle_active(side_id as usize))
+}
+
+/// 1 when `frame` may join a bundle (canonical, CRC-valid, unsealed), else 0.
+/// The caller keeps urgent frames out before asking.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_compact_bundle_frame_ok(frame: *const u8, len: usize) -> i32 {
+    if frame.is_null() || len == 0 {
+        return 0;
+    }
+    i32::from(crate::wire_bundle::frame_bundleable(unsafe {
+        slice::from_raw_parts(frame, len)
+    }))
+}
+
+/// Pack `count` frames (frame i at `base + offsets[i]`, `lengths[i]` bytes),
+/// in order, into one bundle written to `out` (capacity `cap`). `out` may
+/// overlap the input. Returns the bundle length, or a negative status:
+/// SEDS_BAD_ARG for bad arguments or a frame that cannot join a bundle,
+/// SEDS_SIZE_MISMATCH when the bundle does not fit `cap`.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_compact_bundle_pack(
+    base: *const u8,
+    offsets: *const u16,
+    lengths: *const u16,
+    count: usize,
+    out: *mut u8,
+    cap: usize,
+) -> i32 {
+    if base.is_null()
+        || offsets.is_null()
+        || lengths.is_null()
+        || out.is_null()
+        || count == 0
+        || count > crate::wire_bundle::MAX_BUNDLE_RECORDS
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let offsets = unsafe { slice::from_raw_parts(offsets, count) };
+    let lengths = unsafe { slice::from_raw_parts(lengths, count) };
+    let mut frames: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(count);
+    for (&off, &len) in offsets.iter().zip(lengths) {
+        frames.push(unsafe { slice::from_raw_parts(base.add(usize::from(off)), usize::from(len)) });
+    }
+    let bundle = match crate::wire_bundle::pack_bundle(&frames) {
+        Ok(bundle) => bundle,
+        Err(_) => return status_from_err(TelemetryError::BadArg),
+    };
+    drop(frames);
+    if bundle.len() > cap || bundle.len() > i32::MAX as usize {
+        return status_from_err(TelemetryError::SizeMismatch { expected: cap, got: bundle.len() });
+    }
+    // The input is no longer read: `out` may alias it.
+    unsafe { core::ptr::copy(bundle.as_ptr(), out, bundle.len()) };
+    bundle.len() as i32
+}

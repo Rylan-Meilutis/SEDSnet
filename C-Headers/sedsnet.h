@@ -909,6 +909,22 @@ int32_t seds_router_has_queued_work(SedsRouter *r);
 int32_t seds_router_set_latest_value_side(SedsRouter *r, int32_t side);
 int32_t seds_relay_set_latest_value_side(SedsRelay *r, int32_t side);
 #endif
+/* Compact bundles (stateless, negotiated per side by discovery). The writer
+ * packs canonical frames it already holds, in its priority order, and keeps
+ * urgent frames (Abort, turn-bypass traffic) standalone. */
+#if defined(SEDS_ENABLE_COMPACT_BUNDLE) && SEDS_ENABLE_COMPACT_BUNDLE
+/* Offer (true) or withdraw compact bundles on a side. */
+int32_t seds_router_set_side_compact_bundle(SedsRouter *r, uint32_t side_id, bool enabled);
+/* 1 when every live peer on the side accepts bundles (send them), 0 legacy. */
+int32_t seds_router_side_compact_bundle_active(SedsRouter *r, uint32_t side_id);
+/* 1 when the frame may join a bundle (canonical, CRC-valid, unsealed). */
+int32_t seds_compact_bundle_frame_ok(const uint8_t *frame, size_t len);
+/* Pack frames base+offsets[i] (lengths[i] bytes) in order into out (may
+ * overlap the input). Returns bundle length or negative status. */
+int32_t seds_compact_bundle_pack(const uint8_t *base, const uint16_t *offsets,
+                                 const uint16_t *lengths, size_t count,
+                                 uint8_t *out, size_t cap);
+#endif
 /* Allocation-free versioned queue accounting; required word count is16. */
 int32_t seds_router_copy_queue_counters(SedsRouter *r, uint32_t *words, size_t capacity);
 

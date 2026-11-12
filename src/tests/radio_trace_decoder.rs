@@ -167,6 +167,41 @@ fn decode_stream(path: &Path, max_clock_backstep_us: u64) -> Value {
             continue;
         }
         let body = if data_relay { relay.unwrap().1 } else { body };
+        #[cfg(feature = "compact-bundle")]
+        if crate::wire_bundle::is_bundle(body) {
+            let Ok(records) = crate::wire_bundle::unpack_bundle_frames(body) else {
+                offset += 1;
+                continue;
+            };
+            let at = times[end - 1];
+            let codec_ms = advance_codec_clock(&now, at);
+            let first = packets.len();
+            for record in &records {
+                // Records are canonical frames: run them through the same side
+                // codec so discovery/side state matches a production receiver.
+                match router.decode_side_transport_frame(side, record) {
+                    Ok(Some(canonical)) => match packet_row(canonical.as_ref(), at, offset) {
+                        Ok(mut row) => {
+                            row["relay_kind"] = relay_kind.into();
+                            row["outer_uart_frame_accepted_us"] = at.into();
+                            row["bundle_record_len"] = record.len().into();
+                            packets.push(row);
+                        }
+                        Err(error) => errors.push(json!({"at_us":at,"uart_offset":offset,"stage":"canonical","error":format!("{error:?}")})),
+                    },
+                    Ok(None) => {}
+                    Err(error) => errors.push(json!({"at_us":at,"uart_offset":offset,"stage":"bundle_record","error":format!("{error:?}")})),
+                }
+            }
+            frames.push(json!({"at_us":at,"uart_offset":offset,"length":length,"kind":kind,
+                "relay_kind":relay_kind,"relay_crc_verified":relay.is_some(),"inner_length":body.len(),
+                "side_kind":"bundle","bundle_records":records.len(),"packet_index":first,
+                "packet_indices":(first..packets.len()).collect::<Vec<_>>(),
+                "preceding_gap_bytes":offset-last_end,"codec_clock_ms":codec_ms}));
+            offset = end;
+            last_end = end;
+            continue;
+        }
         let wrapper = match parse_side_transport_wrapper(body) {
             Ok(wrapper) => wrapper,
             Err(_) => {

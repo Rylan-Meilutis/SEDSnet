@@ -174,6 +174,8 @@ pub const LINK_CAPABILITY_END_TO_END_RELIABILITY: u32 = 0x0000_0010;
 pub const LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS: u32 = 0x0000_0020;
 /// Can decode optional canonical payload compression. Absence means raw payloads.
 pub const LINK_CAPABILITY_PAYLOAD_COMPRESSION: u32 = 0x0000_0040;
+/// The side accepts compact bundles ([`crate::wire_bundle`]) from its peers.
+pub const LINK_CAPABILITY_COMPACT_BUNDLE: u32 = 0x0000_0080;
 
 pub const LINK_PROFILE_CANONICAL: u8 = 0;
 pub const LINK_PROFILE_TEMPLATE: u8 = 1;

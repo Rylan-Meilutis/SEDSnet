@@ -51,6 +51,9 @@ mod ingress_target_filter_tests;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
 #[path = "tests/payload_codec_negotiation.rs"]
 mod payload_codec_negotiation;
+#[cfg(all(test, feature = "std", feature = "compact-bundle"))]
+#[path = "tests/compact_bundle.rs"]
+mod compact_bundle_tests;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/reliable_tx_window_backpressure.rs"]
 mod reliable_tx_window_backpressure_tests;
@@ -12342,6 +12345,17 @@ impl Router {
             stats.note_side_transport_chunks(frames.len());
             return Ok(frames);
         }
+        // A bundling writer packs canonical frames itself; templates or a
+        // side wrapper would only hide them from it.
+        #[cfg(feature = "compact-bundle")]
+        if self.side_compact_bundle_active(side) {
+            let mut st = self.state.lock();
+            st.side_runtime_stats
+                .entry(side)
+                .or_default()
+                .note_side_transport_full(raw_len, raw_len);
+            return Ok(SideTransportFrames::single(raw));
+        }
 
         if opts.header_template_enabled {
             // Shared buses cannot retain one coherent dictionary across
@@ -15783,6 +15797,60 @@ impl Router {
         Ok(())
     }
 
+    /// Offer or withdraw compact bundles on a registered side.
+    ///
+    /// See [`crate::routing_config::SideOptions::compact_bundle`]. The next
+    /// discovery advertisement carries the change to the side's peers.
+    #[cfg(feature = "compact-bundle")]
+    pub fn set_side_compact_bundle(&self, side: RouterSideId, enabled: bool) -> TelemetryResult<()> {
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        let side_ref = st
+            .sides
+            .get_mut(side)
+            .and_then(|side| side.as_mut())
+            .ok_or(TelemetryError::BadArg)?;
+        if side_ref.opts.compact_bundle != enabled {
+            side_ref.opts.compact_bundle = enabled;
+            Self::note_discovery_topology_change_locked(&mut st, now_ms);
+        }
+        Ok(())
+    }
+
+    /// Whether the writer for `side` may send compact bundles now: the side
+    /// offers them and every peer heard live on it advertises
+    /// [`discovery::LINK_CAPABILITY_COMPACT_BUNDLE`]. With no live peer, or
+    /// any peer that does not advertise it, frames stay in the legacy format.
+    #[cfg(feature = "compact-bundle")]
+    pub fn side_compact_bundle_active(&self, side: RouterSideId) -> bool {
+        let now_ms = self.clock.now_ms();
+        let st = self.state.lock();
+        let offered = st
+            .sides
+            .get(side)
+            .and_then(|side| side.as_ref())
+            .is_some_and(|side| side.opts.compact_bundle);
+        if !offered {
+            return false;
+        }
+        let Some(route) = st.discovery_routes.get(&side) else {
+            return false;
+        };
+        // Same liveness rule as the template dictionary: every sender heard
+        // on this side recently, direct or forwarded, must accept bundles.
+        let mut live = route
+            .announcers
+            .values()
+            .filter(|sender| now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS)
+            .peekable();
+        live.peek().is_some()
+            && live.all(|sender| {
+                sender.link_capabilities.is_some_and(|caps| {
+                    caps.flags & discovery::LINK_CAPABILITY_COMPACT_BUNDLE != 0
+                })
+            })
+    }
+
     /// Enable or disable egress toward a registered side.
     ///
     /// When `enabled` is `false`, the router keeps the side but stops routing packets toward it.
@@ -18614,6 +18682,15 @@ impl Router {
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
+        #[cfg(feature = "compact-bundle")]
+        if crate::wire_bundle::is_bundle(bytes) {
+            for frame in crate::wire_bundle::unpack_bundle_frames(bytes)? {
+                // Every record already passed the bundle CRC; one record's
+                // routing refusal must not drop the rest of the bundle.
+                let _ = self.rx_packed_queue_from_side(&frame, side);
+            }
+            return Ok(());
+        }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
         };
@@ -20819,6 +20896,15 @@ impl Router {
             return self.rx_packed_queue_from_side(bytes, side);
         }
         self.ensure_side_ingress_enabled(side)?;
+        #[cfg(feature = "compact-bundle")]
+        if crate::wire_bundle::is_bundle(bytes) {
+            for frame in crate::wire_bundle::unpack_bundle_frames(bytes)? {
+                // Every record already passed the bundle CRC; one record's
+                // routing refusal must not drop the rest of the bundle.
+                let _ = self.rx_packed_from_side(&frame, side);
+            }
+            return Ok(());
+        }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
         };
