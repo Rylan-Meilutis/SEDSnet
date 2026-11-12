@@ -83,10 +83,10 @@ pub fn is_bundle(bytes: &[u8]) -> bool {
 struct Fields<'a> {
     flags: u8,
     nep: u8,
-    ty: u64,
-    size: u64,
+    ty: u32,
+    size: u32,
     ts: u64,
-    nonce: u64,
+    nonce: u16,
     src: u32,
     eps: &'a [u8],
     contract: &'a [u8],
@@ -99,6 +99,7 @@ struct Reader<'a> {
     off: usize,
 }
 impl<'a> Reader<'a> {
+    #[inline(never)]
     fn take(&mut self, n: usize) -> TelemetryResult<&'a [u8]> {
         let end = self.off.checked_add(n).filter(|end| *end <= self.buf.len()).ok_or(BAD)?;
         let out = &self.buf[self.off..end];
@@ -108,11 +109,17 @@ impl<'a> Reader<'a> {
     fn byte(&mut self) -> TelemetryResult<u8> {
         Ok(self.take(1)?[0])
     }
+    #[inline(never)]
     fn uleb(&mut self) -> TelemetryResult<u64> {
         read_uleb128_local(self.buf, &mut self.off).map_err(|_| BAD)
     }
+    /// A ULEB128 field that must fit 32 bits (type, size, source, lengths).
+    #[inline(never)]
+    fn u32(&mut self) -> TelemetryResult<u32> {
+        u32::try_from(self.uleb()?).map_err(|_| BAD)
+    }
     fn len(&mut self) -> TelemetryResult<usize> {
-        usize::try_from(self.uleb()?).map_err(|_| BAD)
+        Ok(self.u32()? as usize)
     }
     fn rest(&mut self) -> &'a [u8] {
         let out = &self.buf[self.off..];
@@ -187,20 +194,21 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, p: Option<&Fields<'a>>, prev_ts: u6
         return Err(BAD);
     }
     let nep = if elide & E_NEP != 0 { p.nep } else { r.byte()? };
-    let ty = if elide & E_TYPE != 0 { p.ty } else { r.uleb()? };
-    let size = if !rec || flags & F_COMPRESSED != 0 { Some(r.uleb()?) } else { None };
+    let ty = if elide & E_TYPE != 0 { p.ty } else { r.u32()? };
+    let size = if !rec || flags & F_COMPRESSED != 0 { Some(r.u32()?) } else { None };
     let ts = if rec { prev_ts.wrapping_add(unzigzag(r.uleb()?)) } else { r.uleb()? };
     let nonce = if flags & F_NONCE != 0 {
-        let v = r.uleb()?;
-        let n = if elide & E_NONCE_DELTA != 0 { p.nonce.wrapping_add(unzigzag(v)) } else { v };
-        if n > u64::from(u16::MAX) {
-            return Err(BAD);
-        }
-        n
+        let v = r.u32()?;
+        let n = if elide & E_NONCE_DELTA != 0 {
+            u32::from(p.nonce).wrapping_add(unzigzag32(v))
+        } else {
+            v
+        };
+        u16::try_from(n).map_err(|_| BAD)?
     } else {
         0
     };
-    let src = if elide & E_SOURCE != 0 { p.src } else { u32::try_from(r.uleb()?).map_err(|_| BAD)? };
+    let src = if elide & E_SOURCE != 0 { p.src } else { r.u32()? };
     let eps = if elide & E_ENDPOINTS != 0 { p.eps } else { r.endpoints(flags, nep)? };
     let contract = if flags & F_CONTRACT == 0 {
         &[][..]
@@ -212,8 +220,9 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, p: Option<&Fields<'a>>, prev_ts: u6
     };
     let rel = r.reliable(flags)?;
     let payload = r.rest();
-    let size = size.unwrap_or(payload.len() as u64);
-    if flags & F_COMPRESSED == 0 && size != payload.len() as u64 {
+    let plen = u32::try_from(payload.len()).map_err(|_| BAD)?;
+    let size = size.unwrap_or(plen);
+    if flags & F_COMPRESSED == 0 && size != plen {
         return Err(BAD);
     }
     Ok(Fields { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
@@ -242,6 +251,17 @@ fn zigzag(delta: u64) -> u64 {
 #[inline]
 fn unzigzag(v: u64) -> u64 {
     (((v >> 1) as i64) ^ -((v & 1) as i64)) as u64
+}
+
+#[inline]
+fn zigzag32(delta: u32) -> u32 {
+    let delta = delta as i32;
+    ((delta << 1) ^ (delta >> 31)) as u32
+}
+
+#[inline]
+fn unzigzag32(v: u32) -> u32 {
+    (((v >> 1) as i32) ^ -((v & 1) as i32)) as u32
 }
 
 /// Write one frame's fields: a bundle record relative to `p` (`rec`), or
@@ -278,16 +298,19 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
         put(out, &[c.nep]);
     }
     if elide & E_TYPE == 0 {
-        put_uleb(out, c.ty);
+        put_uleb(out, u64::from(c.ty));
     }
     if !rec || c.flags & F_COMPRESSED != 0 {
-        put_uleb(out, c.size);
+        put_uleb(out, u64::from(c.size));
     }
     put_uleb(out, if rec { zigzag(c.ts.wrapping_sub(prev_ts)) } else { c.ts });
     if c.flags & F_NONCE != 0 {
-        let delta = elide & E_NONCE_DELTA != 0;
-        let v = c.nonce.wrapping_sub(if delta { p.map_or(0, |p| p.nonce) } else { 0 });
-        put_uleb(out, if delta { zigzag(v) } else { v });
+        let v = if elide & E_NONCE_DELTA != 0 {
+            zigzag32(u32::from(c.nonce).wrapping_sub(u32::from(p.map_or(0, |p| p.nonce))))
+        } else {
+            u32::from(c.nonce)
+        };
+        put_uleb(out, u64::from(v));
     }
     if elide & E_SOURCE == 0 {
         put_uleb(out, u64::from(c.src));

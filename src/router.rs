@@ -18674,6 +18674,22 @@ impl Router {
             })
     }
 
+    /// Receive each canonical frame of a compact bundle. The whole bundle is
+    /// verified first; one record's routing refusal does not drop the rest.
+    #[cfg(feature = "compact-bundle")]
+    #[inline(never)]
+    fn rx_compact_bundle(&self, bytes: &[u8], side: RouterSideId, queued: bool) -> TelemetryResult<()> {
+        crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
+            let _ = if queued {
+                self.rx_packed_queue_from_side(frame, side)
+            } else {
+                self.rx_packed_from_side(frame, side)
+            };
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Enqueue packed bytes for RX processing with an explicit ingress side.
     #[inline]
     pub fn rx_packed_queue_from_side(
@@ -18684,13 +18700,7 @@ impl Router {
         self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
         if crate::wire_bundle::is_bundle(bytes) {
-            // The whole bundle is verified first; one record's routing
-            // refusal must not drop the rest of the bundle.
-            crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
-                let _ = self.rx_packed_queue_from_side(frame, side);
-                Ok(())
-            })?;
-            return Ok(());
+            return self.rx_compact_bundle(bytes, side, true);
         }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
@@ -20899,13 +20909,7 @@ impl Router {
         self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
         if crate::wire_bundle::is_bundle(bytes) {
-            // The whole bundle is verified first; one record's routing
-            // refusal must not drop the rest of the bundle.
-            crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
-                let _ = self.rx_packed_from_side(frame, side);
-                Ok(())
-            })?;
-            return Ok(());
+            return self.rx_compact_bundle(bytes, side, false);
         }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
