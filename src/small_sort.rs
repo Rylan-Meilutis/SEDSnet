@@ -5,9 +5,9 @@
 //! retains O(n log n) worst-case work, no recursion, and no heap allocation.
 
 pub(crate) fn sort<T: Ord>(values: &mut [T]) {
-    #[cfg(not(feature = "embedded"))]
+    #[cfg(not(feature = "embedded-core"))]
     values.sort_unstable();
-    #[cfg(feature = "embedded")]
+    #[cfg(feature = "embedded-core")]
     heap_sort(values);
 }
 
@@ -15,18 +15,18 @@ pub(crate) fn sort<T: Ord>(values: &mut [T]) {
 /// heapsort instead of instantiating the standard pattern-defeating quicksort.
 #[cfg(feature = "discovery")]
 pub(crate) fn sort_by<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(values: &mut [T], compare: F) {
-    #[cfg(not(feature = "embedded"))]
+    #[cfg(not(feature = "embedded-core"))]
     values.sort_unstable_by(compare);
-    #[cfg(feature = "embedded")]
+    #[cfg(feature = "embedded-core")]
     heap_sort_by(values, compare);
 }
 
-#[cfg(any(feature = "embedded", test))]
+#[cfg(any(feature = "embedded-core", test))]
 fn heap_sort<T: Ord>(values: &mut [T]) {
     heap_sort_by(values, T::cmp);
 }
 
-#[cfg(any(feature = "embedded", test))]
+#[cfg(any(feature = "embedded-core", test))]
 fn heap_sort_by<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(values: &mut [T], mut compare: F) {
     use core::cmp::Ordering::Less;
     fn sift<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(

@@ -1053,7 +1053,7 @@ impl Registry {
             e2e_encryption: E2eEncryptionPolicy::PreferOff,
         })
         .expect("built-in type");
-        #[cfg(all(feature = "embedded", sedsnet_has_telemetry_config_json))]
+        #[cfg(all(feature = "embedded-core", sedsnet_has_telemetry_config_json))]
         if let Ok(snapshot) = bundled_schema_snapshot() {
             let _ = register_owned_schema_snapshot_into(&mut reg, snapshot);
         }
@@ -1393,7 +1393,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
 #[cfg(all(
     feature = "std",
     feature = "serde",
-    feature = "embedded",
+    feature = "embedded-core",
     sedsnet_has_telemetry_config_json
 ))]
 fn bundled_schema_snapshot() -> TelemetryResult<OwnedRuntimeSchemaSnapshot> {

@@ -54,6 +54,7 @@ set(SEDSNET_SCHEMA_PATH "" CACHE STRING
 # Detect embedded build
 # ============================================================
 option(SEDSNET_EMBEDDED_BUILD "Build sedsnet for embedded" OFF)
+option(SEDSNET_ENABLE_COMPRESSION "Embedded builds include zstd payload compression" ON)
 option(SEDSNET_PREFER_DYNAMIC "Prefer dynamic linking for host builds when supported" ON)
 option(SEDSNET_FORCE_RELEASE "Build sedsnet in release profile even when the parent CMake build is Debug" OFF)
 option(SEDSNET_ENABLE_C_WRAPPER
@@ -167,7 +168,12 @@ if (NOT SEDSNET_CRATE_TYPE STREQUAL "")
 endif ()
 
 if (SEDSNET_EMBEDDED_BUILD)
-    list(APPEND RS_ARGS_BOOTSTRAP "--features" "embedded")
+    if (SEDSNET_ENABLE_COMPRESSION)
+        list(APPEND RS_ARGS_BOOTSTRAP "--features" "embedded")
+    else ()
+        # Plain payloads on this node's links (codec negotiated per link).
+        list(APPEND RS_ARGS_BOOTSTRAP "--features" "embedded-core")
+    endif ()
 endif ()
 
 if (NOT RUST_TRIPLE STREQUAL "")
