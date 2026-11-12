@@ -18684,11 +18684,12 @@ impl Router {
         self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
         if crate::wire_bundle::is_bundle(bytes) {
-            for frame in crate::wire_bundle::unpack_bundle_frames(bytes)? {
-                // Every record already passed the bundle CRC; one record's
-                // routing refusal must not drop the rest of the bundle.
-                let _ = self.rx_packed_queue_from_side(&frame, side);
-            }
+            // The whole bundle is verified first; one record's routing
+            // refusal must not drop the rest of the bundle.
+            crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
+                let _ = self.rx_packed_queue_from_side(frame, side);
+                Ok(())
+            })?;
             return Ok(());
         }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
@@ -20898,11 +20899,12 @@ impl Router {
         self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
         if crate::wire_bundle::is_bundle(bytes) {
-            for frame in crate::wire_bundle::unpack_bundle_frames(bytes)? {
-                // Every record already passed the bundle CRC; one record's
-                // routing refusal must not drop the rest of the bundle.
-                let _ = self.rx_packed_from_side(&frame, side);
-            }
+            // The whole bundle is verified first; one record's routing
+            // refusal must not drop the rest of the bundle.
+            crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
+                let _ = self.rx_packed_from_side(frame, side);
+                Ok(())
+            })?;
             return Ok(());
         }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {

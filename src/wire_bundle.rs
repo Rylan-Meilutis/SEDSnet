@@ -42,6 +42,7 @@ const F_E2E: u8 = 0x10;
 const F_EP_BITMAP: u8 = 0x20;
 const F_COMPACT_RELIABLE: u8 = 0x40;
 const F_EP_LIST: u8 = 0x80;
+const F_EPS: u8 = F_EP_BITMAP | F_EP_LIST;
 const EP_BITMAP_BYTES: usize = 32;
 
 const E_TYPE: u8 = 0x01;
@@ -52,7 +53,9 @@ const E_NEP: u8 = 0x10;
 const E_ENDPOINTS: u8 = 0x20;
 const E_KNOWN: u8 = 0x3F;
 
-const MIN_BUNDLE: usize = 1 + 1 + 1 + 4;
+// One error for every malformed bundle or unbundleable frame keeps the
+// embedded image small; the cause is never acted on differently.
+const BAD: TelemetryError = TelemetryError::Unpack("bad compact bundle");
 
 /// Is `bytes` a compact bundle (by its first byte)?
 #[inline]
@@ -60,8 +63,9 @@ pub fn is_bundle(bytes: &[u8]) -> bool {
     bytes.first() == Some(&BUNDLE_MARKER)
 }
 
-#[derive(Clone, Copy)]
-struct Canon<'a> {
+/// Header fields of one frame, shared by the canonical and record forms.
+#[derive(Clone, Copy, Default)]
+struct Fields<'a> {
     flags: u8,
     nep: u8,
     ty: u64,
@@ -75,129 +79,146 @@ struct Canon<'a> {
     payload: &'a [u8],
 }
 
-fn take<'a>(buf: &'a [u8], off: &mut usize, n: usize) -> TelemetryResult<&'a [u8]> {
-    let end = off
-        .checked_add(n)
-        .filter(|end| *end <= buf.len())
-        .ok_or(TelemetryError::Unpack("bundle short read"))?;
-    let out = &buf[*off..end];
-    *off = end;
-    Ok(out)
+struct Reader<'a> {
+    buf: &'a [u8],
+    off: usize,
 }
-
-fn uleb(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {
-    read_uleb128_local(buf, off)
-}
-
-fn span_endpoints<'a>(buf: &'a [u8], off: &mut usize, flags: u8, nep: u8) -> TelemetryResult<&'a [u8]> {
-    let start = *off;
-    if flags & F_EP_LIST != 0 {
-        for _ in 0..nep {
-            uleb(buf, off)?;
-        }
-    } else if flags & F_EP_BITMAP != 0 {
-        take(buf, off, EP_BITMAP_BYTES)?;
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> TelemetryResult<&'a [u8]> {
+        let end = self.off.checked_add(n).filter(|end| *end <= self.buf.len()).ok_or(BAD)?;
+        let out = &self.buf[self.off..end];
+        self.off = end;
+        Ok(out)
     }
-    Ok(&buf[start..*off])
-}
-
-fn span_reliable<'a>(buf: &'a [u8], off: &mut usize, flags: u8) -> TelemetryResult<&'a [u8]> {
-    let start = *off;
-    if flags & F_RELIABLE != 0 {
-        if flags & F_COMPACT_RELIABLE != 0 {
-            let wire = take(buf, off, 1)?[0];
-            if wire & 0x04 != 0 {
-                uleb(buf, off)?;
+    fn byte(&mut self) -> TelemetryResult<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn uleb(&mut self) -> TelemetryResult<u64> {
+        read_uleb128_local(self.buf, &mut self.off).map_err(|_| BAD)
+    }
+    fn len(&mut self) -> TelemetryResult<usize> {
+        usize::try_from(self.uleb()?).map_err(|_| BAD)
+    }
+    fn rest(&mut self) -> &'a [u8] {
+        let out = &self.buf[self.off..];
+        self.off = self.buf.len();
+        out
+    }
+    /// Endpoint bytes as the canonical flags describe them.
+    fn endpoints(&mut self, flags: u8, nep: u8) -> TelemetryResult<&'a [u8]> {
+        let start = self.off;
+        if flags & F_EP_LIST != 0 {
+            for _ in 0..nep {
+                self.uleb()?;
             }
-            if wire & 0x08 != 0 {
-                uleb(buf, off)?;
-            }
-        } else {
-            take(buf, off, 9)?;
+        } else if flags & F_EP_BITMAP != 0 {
+            self.take(EP_BITMAP_BYTES)?;
         }
+        Ok(&self.buf[start..self.off])
     }
-    Ok(&buf[start..*off])
+    /// Reliable header bytes as the canonical flags describe them.
+    fn reliable(&mut self, flags: u8) -> TelemetryResult<&'a [u8]> {
+        let start = self.off;
+        if flags & F_RELIABLE != 0 {
+            if flags & F_COMPACT_RELIABLE != 0 {
+                let wire = self.byte()?;
+                if wire & 0x04 != 0 {
+                    self.uleb()?;
+                }
+                if wire & 0x08 != 0 {
+                    self.uleb()?;
+                }
+            } else {
+                self.take(9)?;
+            }
+        }
+        Ok(&self.buf[start..self.off])
+    }
 }
 
-fn parse_canonical(frame: &[u8]) -> TelemetryResult<Canon<'_>> {
-    if frame.len() < 4 + 4 {
-        return Err(TelemetryError::Unpack("bundle frame too short"));
+/// Split `bytes` into data and its trailing CRC32-LE, checking it.
+fn checked(bytes: &[u8]) -> TelemetryResult<&[u8]> {
+    let n = bytes.len().checked_sub(4).ok_or(BAD)?;
+    let (data, crc) = bytes.split_at(n);
+    if crc32_bytes(data).to_le_bytes() != crc {
+        return Err(BAD);
     }
-    let data_len = frame.len() - 4;
-    let crc = u32::from_le_bytes(frame[data_len..].try_into().expect("4-byte crc"));
-    let data = &frame[..data_len];
-    if crc32_bytes(data) != crc {
-        return Err(TelemetryError::Unpack("bundle frame crc"));
+    Ok(data)
+}
+
+fn usable_flags(flags: u8) -> TelemetryResult<u8> {
+    if flags & F_E2E != 0 || flags & F_EPS == F_EPS {
+        return Err(BAD);
     }
-    let mut off = 0usize;
-    let flags = take(data, &mut off, 1)?[0];
-    if flags & F_E2E != 0 || flags & (F_EP_BITMAP | F_EP_LIST) == (F_EP_BITMAP | F_EP_LIST) {
-        return Err(TelemetryError::Unpack("frame not bundleable"));
+    Ok(flags)
+}
+
+fn parse_canonical(frame: &[u8]) -> TelemetryResult<Fields<'_>> {
+    if frame.starts_with(b"SDT") {
+        return Err(BAD);
     }
-    let nep = take(data, &mut off, 1)?[0];
-    let ty = uleb(data, &mut off)?;
-    let size = uleb(data, &mut off)?;
-    let ts = uleb(data, &mut off)?;
-    let nonce = if flags & F_NONCE != 0 { uleb(data, &mut off)? } else { 0 };
-    let src = u32::try_from(uleb(data, &mut off)?)
-        .map_err(|_| TelemetryError::Unpack("frame not bundleable"))?;
-    let eps = span_endpoints(data, &mut off, flags, nep)?;
+    let mut r = Reader { buf: checked(frame)?, off: 0 };
+    let flags = usable_flags(r.byte()?)?;
+    let nep = r.byte()?;
+    let ty = r.uleb()?;
+    let size = r.uleb()?;
+    let ts = r.uleb()?;
+    let nonce = if flags & F_NONCE != 0 { r.uleb()? } else { 0 };
+    let src = u32::try_from(r.uleb()?).map_err(|_| BAD)?;
+    let eps = r.endpoints(flags, nep)?;
     let contract = if flags & F_CONTRACT != 0 {
-        let n = usize::try_from(uleb(data, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("bundle contract length"))?;
-        take(data, &mut off, n)?
+        let n = r.len()?;
+        r.take(n)?
     } else {
         &[]
     };
-    let rel = span_reliable(data, &mut off, flags)?;
-    let payload = &data[off..];
+    let rel = r.reliable(flags)?;
+    let payload = r.rest();
     if flags & F_COMPRESSED == 0 && size != payload.len() as u64 {
-        return Err(TelemetryError::Unpack("frame not bundleable"));
+        return Err(BAD);
     }
-    Ok(Canon { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
+    Ok(Fields { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
 }
 
 /// Whether `frame` can travel inside a bundle: a canonical (not side-wrapped),
 /// CRC-valid, unsealed frame. Urgency is the writer's decision: it keeps
 /// urgent frames out before asking.
 pub fn frame_bundleable(frame: &[u8]) -> bool {
-    !frame.starts_with(b"SDT") && parse_canonical(frame).is_ok()
+    parse_canonical(frame).is_ok()
 }
 
 #[inline]
-fn zigzag(delta: i64) -> u64 {
+fn zigzag(delta: u64) -> u64 {
+    let delta = delta as i64;
     ((delta << 1) ^ (delta >> 63)) as u64
 }
 
 #[inline]
-fn unzigzag(v: u64) -> i64 {
-    ((v >> 1) as i64) ^ -((v & 1) as i64)
+fn unzigzag(v: u64) -> u64 {
+    (((v >> 1) as i64) ^ -((v & 1) as i64)) as u64
 }
 
-fn encode_record(c: &Canon<'_>, prev: Option<&Canon<'_>>, prev_ts: u64, out: &mut Vec<u8>) {
+fn encode_record(c: &Fields<'_>, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
     let mut elide = 0u8;
-    if let Some(p) = prev {
+    let prev_ts = p.map_or(c.ts, |p| p.ts);
+    if let Some(p) = p {
         if p.ty == c.ty {
             elide |= E_TYPE;
         }
         if p.src == c.src {
             elide |= E_SOURCE;
-            if c.flags & F_NONCE != 0 && p.flags & F_NONCE != 0 {
+            if c.flags & p.flags & F_NONCE != 0 {
                 elide |= E_NONCE_DELTA;
             }
         }
-        if c.flags & F_CONTRACT != 0 && p.flags & F_CONTRACT != 0 && p.contract == c.contract {
+        if c.flags & p.flags & F_CONTRACT != 0 && p.contract == c.contract {
             elide |= E_CONTRACT;
         }
         if p.nep == c.nep {
             elide |= E_NEP;
-        }
-        if c.flags & (F_EP_BITMAP | F_EP_LIST) != 0
-            && p.nep == c.nep
-            && p.flags & (F_EP_BITMAP | F_EP_LIST) == c.flags & (F_EP_BITMAP | F_EP_LIST)
-            && p.eps == c.eps
-        {
-            elide |= E_ENDPOINTS;
+            if c.flags & F_EPS != 0 && p.flags & F_EPS == c.flags & F_EPS && p.eps == c.eps {
+                elide |= E_ENDPOINTS;
+            }
         }
     }
     out.push(c.flags);
@@ -211,14 +232,11 @@ fn encode_record(c: &Canon<'_>, prev: Option<&Canon<'_>>, prev_ts: u64, out: &mu
     if elide & E_SOURCE == 0 {
         out.extend_from_slice(&c.src.to_le_bytes());
     }
-    write_uleb128_local(zigzag(c.ts.wrapping_sub(prev_ts) as i64), out);
+    write_uleb128_local(zigzag(c.ts.wrapping_sub(prev_ts)), out);
     if c.flags & F_NONCE != 0 {
-        if elide & E_NONCE_DELTA != 0 {
-            let p = prev.expect("delta needs a previous record");
-            write_uleb128_local(zigzag(c.nonce.wrapping_sub(p.nonce) as i64), out);
-        } else {
-            write_uleb128_local(c.nonce, out);
-        }
+        let base = if elide & E_NONCE_DELTA != 0 { p.map_or(0, |p| p.nonce) } else { 0 };
+        let v = c.nonce.wrapping_sub(base);
+        write_uleb128_local(if elide & E_NONCE_DELTA != 0 { zigzag(v) } else { v }, out);
     }
     if elide & E_ENDPOINTS == 0 {
         out.extend_from_slice(c.eps);
@@ -236,202 +254,154 @@ fn encode_record(c: &Canon<'_>, prev: Option<&Canon<'_>>, prev_ts: u64, out: &mu
 
 /// Pack canonical frames, in the given order, into one bundle.
 ///
-/// Fails with `TelemetryError::BadArg` when `frames` is empty or holds more
-/// than [`MAX_BUNDLE_RECORDS`], and with `Unpack("frame not bundleable")` (or a
-/// CRC error) when a frame is not a valid canonical frame; the writer then
-/// sends that frame on its own.
+/// Fails when `frames` is empty, holds more than [`MAX_BUNDLE_RECORDS`], or
+/// holds a frame that is not a valid canonical frame; the writer then sends
+/// such a frame on its own.
 pub fn pack_bundle(frames: &[&[u8]]) -> TelemetryResult<Vec<u8>> {
     if frames.is_empty() || frames.len() > MAX_BUNDLE_RECORDS {
-        return Err(TelemetryError::BadArg);
+        return Err(BAD);
     }
-    let mut canon = Vec::with_capacity(frames.len());
-    let mut total = 0usize;
-    for frame in frames {
-        if frame.starts_with(b"SDT") {
-            return Err(TelemetryError::Unpack("frame not bundleable"));
-        }
-        canon.push(parse_canonical(frame)?);
-        total += frame.len();
-    }
+    let total: usize = frames.iter().map(|f| f.len()).sum();
     let mut out = Vec::with_capacity(total + 16);
-    out.push(BUNDLE_MARKER);
-    let base = canon[0].ts;
-    write_uleb128_local(base, &mut out);
     let mut record = Vec::with_capacity(64);
-    let mut prev_ts = base;
-    for (i, c) in canon.iter().enumerate() {
+    let mut prev: Option<Fields<'_>> = None;
+    out.push(BUNDLE_MARKER);
+    for frame in frames {
+        let c = parse_canonical(frame)?;
+        if prev.is_none() {
+            write_uleb128_local(c.ts, &mut out);
+        }
         record.clear();
-        encode_record(c, i.checked_sub(1).map(|p| &canon[p]), prev_ts, &mut record);
-        prev_ts = c.ts;
+        encode_record(&c, prev.as_ref(), &mut record);
         write_uleb128_local(record.len() as u64, &mut out);
         out.extend_from_slice(&record);
+        prev = Some(c);
     }
     let crc = crc32_bytes(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     Ok(out)
 }
 
-#[derive(Clone, Copy, Default)]
-struct Prev<'a> {
-    ty: u64,
-    src: u32,
-    nonce: u64,
-    has_nonce: bool,
-    contract: Option<&'a [u8]>,
-    nep: u8,
-    eps: &'a [u8],
-    ep_flags: u8,
-}
-
-fn rebuild_record<'a>(
-    rec: &'a [u8],
-    prev: Option<&Prev<'a>>,
-    prev_ts: u64,
-    out: &mut Vec<u8>,
-) -> TelemetryResult<(Prev<'a>, u64)> {
-    let mut off = 0usize;
-    let flags = take(rec, &mut off, 1)?[0];
-    let elide = take(rec, &mut off, 1)?[0];
-    if elide & !E_KNOWN != 0 || (prev.is_none() && elide != 0) {
-        return Err(TelemetryError::Unpack("bundle elide bits"));
+fn decode_record<'a>(rec: &'a [u8], p: Option<&Fields<'a>>, prev_ts: u64) -> TelemetryResult<Fields<'a>> {
+    let mut r = Reader { buf: rec, off: 0 };
+    let flags = usable_flags(r.byte()?)?;
+    let elide = r.byte()?;
+    let has_prev = p.is_some();
+    let p = p.copied().unwrap_or_default();
+    // Elision needs a previous record and the field it refers to.
+    if elide & !E_KNOWN != 0
+        || (!has_prev && elide != 0)
+        || (elide & E_NONCE_DELTA != 0 && (elide & E_SOURCE == 0 || flags & p.flags & F_NONCE == 0))
+        || (elide & E_CONTRACT != 0 && flags & p.flags & F_CONTRACT == 0)
+        || (elide & E_ENDPOINTS != 0
+            && (elide & E_NEP == 0 || flags & F_EPS == 0 || p.flags & F_EPS != flags & F_EPS))
+    {
+        return Err(BAD);
     }
-    if flags & F_E2E != 0 || flags & (F_EP_BITMAP | F_EP_LIST) == (F_EP_BITMAP | F_EP_LIST) {
-        return Err(TelemetryError::Unpack("bundle record flags"));
-    }
-    let p = prev.copied().unwrap_or_default();
-    let nep = if elide & E_NEP != 0 { p.nep } else { take(rec, &mut off, 1)?[0] };
-    let ty = if elide & E_TYPE != 0 { p.ty } else { uleb(rec, &mut off)? };
+    let nep = if elide & E_NEP != 0 { p.nep } else { r.byte()? };
+    let ty = if elide & E_TYPE != 0 { p.ty } else { r.uleb()? };
     let src = if elide & E_SOURCE != 0 {
         p.src
     } else {
-        u32::from_le_bytes(take(rec, &mut off, 4)?.try_into().expect("4-byte source"))
+        u32::from_le_bytes(r.take(4)?.try_into().map_err(|_| BAD)?)
     };
-    let ts = prev_ts.wrapping_add(unzigzag(uleb(rec, &mut off)?) as u64);
+    let ts = prev_ts.wrapping_add(unzigzag(r.uleb()?));
     let nonce = if flags & F_NONCE != 0 {
-        let v = uleb(rec, &mut off)?;
-        if elide & E_NONCE_DELTA != 0 {
-            if !p.has_nonce || elide & E_SOURCE == 0 {
-                return Err(TelemetryError::Unpack("bundle nonce delta"));
-            }
-            p.nonce.wrapping_add(unzigzag(v) as u64)
-        } else {
-            v
+        let v = r.uleb()?;
+        let n = if elide & E_NONCE_DELTA != 0 { p.nonce.wrapping_add(unzigzag(v)) } else { v };
+        if n > u64::from(u16::MAX) {
+            return Err(BAD);
         }
-    } else if elide & E_NONCE_DELTA != 0 {
-        return Err(TelemetryError::Unpack("bundle nonce delta"));
+        n
     } else {
         0
     };
-    if flags & F_NONCE != 0 && nonce > u64::from(u16::MAX) {
-        return Err(TelemetryError::Unpack("bundle nonce"));
-    }
-    let ep_flags = flags & (F_EP_BITMAP | F_EP_LIST);
-    let eps = if elide & E_ENDPOINTS != 0 {
-        if ep_flags == 0 || p.ep_flags != ep_flags || nep != p.nep {
-            return Err(TelemetryError::Unpack("bundle endpoints"));
-        }
-        p.eps
-    } else {
-        span_endpoints(rec, &mut off, flags, nep)?
-    };
-    let contract = if flags & F_CONTRACT != 0 {
-        if elide & E_CONTRACT != 0 {
-            p.contract.ok_or(TelemetryError::Unpack("bundle contract"))?
-        } else {
-            let n = usize::try_from(uleb(rec, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("bundle contract length"))?;
-            take(rec, &mut off, n)?
-        }
+    let eps = if elide & E_ENDPOINTS != 0 { p.eps } else { r.endpoints(flags, nep)? };
+    let contract = if flags & F_CONTRACT == 0 {
+        &[][..]
     } else if elide & E_CONTRACT != 0 {
-        return Err(TelemetryError::Unpack("bundle contract"));
+        p.contract
     } else {
-        &[]
+        let n = r.len()?;
+        r.take(n)?
     };
-    let rel = span_reliable(rec, &mut off, flags)?;
-    let size = if flags & F_COMPRESSED != 0 { Some(uleb(rec, &mut off)?) } else { None };
-    let payload = &rec[off..];
+    let rel = r.reliable(flags)?;
+    let size = if flags & F_COMPRESSED != 0 { Some(r.uleb()?) } else { None };
+    let payload = r.rest();
     let size = size.unwrap_or(payload.len() as u64);
-
-    out.clear();
-    out.push(flags);
-    out.push(nep);
-    write_uleb128_local(ty, out);
-    write_uleb128_local(size, out);
-    write_uleb128_local(ts, out);
-    if flags & F_NONCE != 0 {
-        write_uleb128_local(nonce, out);
-    }
-    write_uleb128_local(u64::from(src), out);
-    out.extend_from_slice(eps);
-    if flags & F_CONTRACT != 0 {
-        write_uleb128_local(contract.len() as u64, out);
-        out.extend_from_slice(contract);
-    }
-    out.extend_from_slice(rel);
-    out.extend_from_slice(payload);
-    let crc = crc32_bytes(out);
-    out.extend_from_slice(&crc.to_le_bytes());
-    Ok((
-        Prev {
-            ty,
-            src,
-            nonce,
-            has_nonce: flags & F_NONCE != 0,
-            contract: (flags & F_CONTRACT != 0).then_some(contract),
-            nep,
-            eps,
-            ep_flags,
-        },
-        ts,
-    ))
+    Ok(Fields { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
 }
 
-/// Verify a bundle and hand each rebuilt canonical frame to `each`, in order.
-///
-/// The whole bundle is checked (CRC and every record) before the first frame
-/// is delivered, so a damaged bundle delivers nothing. Returns the number of
-/// frames delivered.
+fn write_canonical(c: &Fields<'_>, out: &mut Vec<u8>) {
+    out.clear();
+    out.push(c.flags);
+    out.push(c.nep);
+    write_uleb128_local(c.ty, out);
+    write_uleb128_local(c.size, out);
+    write_uleb128_local(c.ts, out);
+    if c.flags & F_NONCE != 0 {
+        write_uleb128_local(c.nonce, out);
+    }
+    write_uleb128_local(u64::from(c.src), out);
+    out.extend_from_slice(c.eps);
+    if c.flags & F_CONTRACT != 0 {
+        write_uleb128_local(c.contract.len() as u64, out);
+        out.extend_from_slice(c.contract);
+    }
+    out.extend_from_slice(c.rel);
+    out.extend_from_slice(c.payload);
+    let crc = crc32_bytes(out);
+    out.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// Walk every record; with `each`, hand over each rebuilt canonical frame.
+fn walk(bytes: &[u8], mut each: Option<&mut dyn FnMut(&[u8]) -> TelemetryResult<()>>) -> TelemetryResult<usize> {
+    if !is_bundle(bytes) {
+        return Err(BAD);
+    }
+    let mut r = Reader { buf: checked(bytes)?, off: 1 };
+    let mut prev_ts = r.uleb()?;
+    let mut prev: Option<Fields<'_>> = None;
+    let mut count = 0usize;
+    let mut canonical = Vec::new();
+    while r.off < r.buf.len() {
+        if count == MAX_BUNDLE_RECORDS {
+            return Err(BAD);
+        }
+        let n = r.len()?;
+        let rec = r.take(n)?;
+        let c = decode_record(rec, prev.as_ref(), prev_ts)?;
+        if let Some(each) = each.as_mut() {
+            write_canonical(&c, &mut canonical);
+            each(&canonical)?;
+        }
+        prev_ts = c.ts;
+        prev = Some(c);
+        count += 1;
+    }
+    if count == 0 {
+        return Err(BAD);
+    }
+    Ok(count)
+}
+
+/// Verify a bundle completely (CRC and every record), then hand each rebuilt
+/// canonical frame to `each`, in order. A damaged bundle delivers nothing.
+/// Returns the number of frames delivered.
 pub fn unpack_bundle(
     bytes: &[u8],
-    mut each: impl FnMut(&[u8]) -> TelemetryResult<()>,
+    each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>,
 ) -> TelemetryResult<usize> {
-    let frames = unpack_bundle_frames(bytes)?;
-    for frame in &frames {
-        each(frame)?;
-    }
-    Ok(frames.len())
+    walk(bytes, None)?;
+    walk(bytes, Some(each))
 }
 
 /// Verify a bundle and return its rebuilt canonical frames.
 pub fn unpack_bundle_frames(bytes: &[u8]) -> TelemetryResult<Vec<Vec<u8>>> {
-    if bytes.len() < MIN_BUNDLE || !is_bundle(bytes) {
-        return Err(TelemetryError::Unpack("short bundle"));
-    }
-    let data_len = bytes.len() - 4;
-    let crc = u32::from_le_bytes(bytes[data_len..].try_into().expect("4-byte crc"));
-    let data = &bytes[..data_len];
-    if crc32_bytes(data) != crc {
-        return Err(TelemetryError::Unpack("bundle crc32 mismatch"));
-    }
-    let mut off = 1usize;
-    let mut prev_ts = uleb(data, &mut off)?;
-    let mut prev: Option<Prev<'_>> = None;
     let mut frames = Vec::new();
-    while off < data.len() {
-        if frames.len() == MAX_BUNDLE_RECORDS {
-            return Err(TelemetryError::Unpack("bundle has too many records"));
-        }
-        let n = usize::try_from(uleb(data, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("bundle record length"))?;
-        let rec = take(data, &mut off, n)?;
-        let mut out = Vec::with_capacity(n + 16);
-        let (p, ts) = rebuild_record(rec, prev.as_ref(), prev_ts, &mut out)?;
-        prev = Some(p);
-        prev_ts = ts;
-        frames.push(out);
-    }
-    if frames.is_empty() {
-        return Err(TelemetryError::Unpack("empty bundle"));
-    }
+    unpack_bundle(bytes, &mut |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })?;
     Ok(frames)
 }
