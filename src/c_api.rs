@@ -2016,7 +2016,7 @@ pub struct SedsTimeSyncStatus {
     pub stratum: u8,
     /// 1 when this node is the reference others follow.
     pub is_reference: u8,
-    /// Bit 7 synced, bits 0..7 error bound code (see `seds_timesync_error_code_us`).
+    /// Bit 7 synced; bits 0..7: 0 not reported, 1..=126 error code + 1, 127 unknown.
     pub health_byte: u8,
     /// Error bound of network time in microseconds (UINT32_MAX when unknown).
     pub error_bound_us: u32,

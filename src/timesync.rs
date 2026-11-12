@@ -683,16 +683,35 @@ pub struct TimeSyncStatus {
 }
 
 impl TimeSyncStatus {
-    /// One-byte health summary: bit 7 = synced (locked or holdover), bits 0..7 =
-    /// error bound code (127 = unknown).
+    /// One-byte health summary for spare BOARD_HEALTH bits.
+    ///
+    /// Bit 7: synced (locked or holdover). Bits 0..7: 0 = not reported (a
+    /// board without this firmware leaves the bits zero), 1..=126 = error
+    /// bound code + 1 (see [`crate::timesync_discipline::encode_error_code`],
+    /// codes above 125 saturate), 127 = bound unknown.
     pub fn health_byte(&self) -> u8 {
-        let code = if self.error_bound_ns == u64::MAX {
+        let low = if self.error_bound_ns == u64::MAX {
             127
         } else {
-            crate::timesync_discipline::encode_error_code(self.error_bound_ns)
+            crate::timesync_discipline::encode_error_code(self.error_bound_ns).min(125) + 1
         };
-        code | if self.state.is_synced() { 0x80 } else { 0 }
+        low | if self.state.is_synced() { 0x80 } else { 0 }
     }
+}
+
+/// Decodes [`TimeSyncStatus::health_byte`]: `None` when not reported, else
+/// (synced, error bound ns or `u64::MAX` when unknown).
+pub fn decode_health_byte(byte: u8) -> Option<(bool, u64)> {
+    let low = byte & 0x7F;
+    if low == 0 {
+        return None;
+    }
+    let bound = if low == 127 {
+        u64::MAX
+    } else {
+        crate::timesync_discipline::decode_error_code(low - 1)
+    };
+    Some((byte & 0x80 != 0, bound))
 }
 
 #[derive(Debug, Clone)]

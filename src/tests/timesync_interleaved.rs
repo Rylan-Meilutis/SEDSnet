@@ -299,6 +299,9 @@ fn quality_moves_from_unsynced_to_locked_and_holds_over() {
     let st = p.rf.timesync_status().unwrap();
     assert_eq!(st.state, SyncState::Locked, "{st:?}");
     assert_eq!(st.health_byte() & 0x80, 0x80);
+    let (synced, bound) = decode_health_byte(st.health_byte()).unwrap();
+    assert!(synced && bound >= st.error_bound_ns && bound <= st.error_bound_ns * 5 / 4 + 1_000);
+    assert_eq!(decode_health_byte(0), None);
     // GS silent for 60 s: holdover on the learned frequency.
     for _ in 0..60_000 {
         let _ = p.rf.periodic(0);

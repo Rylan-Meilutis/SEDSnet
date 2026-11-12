@@ -585,7 +585,7 @@ typedef struct SedsTimeSyncStatus {
     uint8_t state;            /**< 0 unsynced, 1 acquiring, 2 locked, 3 holdover */
     uint8_t stratum;          /**< hops from the reference; 0 = this node is the reference */
     uint8_t is_reference;     /**< 1 when others follow this node */
-    uint8_t health_byte;      /**< bit 7 synced, bits 0..6 error bound code */
+    uint8_t health_byte;      /**< bit 7 synced; bits 0..6: 0 not reported, 1..126 error code + 1, 127 unknown */
     uint32_t error_bound_us;  /**< error bound of network time; UINT32_MAX when unknown */
     int32_t offset_us;        /**< correction still being slewed out (positive: behind) */
     int32_t rate_ppb;         /**< learned oscillator frequency correction */

@@ -687,7 +687,12 @@ impl Router {
             Some(_) if anchored && !st.clock_anchored => true,
             // Before first lock timestamps are marked unsynced: converge now.
             // Once locked, slew only.
-            Some(e) => !st.v2.ever_locked && e > ACQUIRE_STEP_NS,
+            Some(e) => {
+                (!st.v2.ever_locked && e > ACQUIRE_STEP_NS)
+                    // The source re-anchored (a station coarse-set its UTC):
+                    // the first sample of the new timescale steps.
+                    || (st.v2.discipline.len() <= 1 && e > 1_000_000_000)
+            }
         };
         st.disciplined_clock
             .discipline_ns(now_mono_ns, target.net_ns, target.rate_ppb, allow_step);
@@ -762,6 +767,32 @@ impl Router {
         let has_usable_time = Self::timesync_has_usable_time_locked(&st, now_ns);
         let leader = st.tracker.as_ref().and_then(|t| t.leader(now_ms, has_usable_time));
         Some(Self::timesync_status_locked(&mut st, leader.as_ref(), now_ns))
+    }
+
+    /// Coarse-sets this node's network time to `unix_ns` at once (a step, not a
+    /// slew) while it leads, e.g. when a station without an RTC first learns
+    /// UTC. Followers see the step as a new timescale and re-acquire. Returns
+    /// `false` (nothing changed) while following a remote source. Callers
+    /// must not step once followers are locked during flight.
+    pub fn step_local_network_time_ns(&self, unix_ns: i64) -> bool {
+        let Some(t) = crate::timesync::NetworkTime::from_unix_ns(i128::from(unix_ns.max(0))) else {
+            return false;
+        };
+        if self.try_set_local_network_time(t.into()).is_err() {
+            return false;
+        }
+        let Some(runtime) = self.timesync.as_ref() else {
+            return false;
+        };
+        let now_ms = self.monotonic_now_ms();
+        let now_ns = self.monotonic_now_ns();
+        let mut st = runtime.lock();
+        if Self::timesync_following_remote_locked(&st, now_ms, now_ns) {
+            return false;
+        }
+        let rate = st.disciplined_clock.rate_ppb();
+        st.disciplined_clock.discipline_ns(now_ns, unix_ns, rate, true);
+        true
     }
 
     /// The router's monotonic clock, ns: the timebase of transport stamps
