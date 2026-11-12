@@ -6,11 +6,13 @@
 
 use super::*;
 use crate::timesync::{
-    TIMESYNC_UTC_REPORT, UtcReferenceReport, decode_utc_report_word, encode_utc_report_word,
+    TIMESYNC_UTC_REPORT, encode_utc_report_word,
     TIMESYNC_SEQ_COUNTER_MASK, TIMESYNC_V2_REQUEST, TIMESYNC_V2_RESPONSE, TimeSyncStatus,
     decode_v2_receive_word, decode_v2_transmit_word, encode_v2_receive_word,
     encode_v2_transmit_word,
 };
+#[cfg(feature = "std")]
+use crate::timesync::{UtcReferenceReport, decode_utc_report_word};
 use crate::timesync_discipline::{
     ClockDiscipline, SyncState, decode_error_code, encode_error_code, exchange_sample,
 };
@@ -22,6 +24,7 @@ const SERVED: usize = 6;
 /// Time sync frames awaiting a transmit-complete report.
 const TX_MARKS: usize = 4;
 /// Received time sync frames awaiting processing.
+#[cfg(feature = "std")]
 const RX_MARKS: usize = 4;
 /// Sides with a configured path asymmetry.
 const ASYMMETRY_SIDES: usize = 2;
@@ -74,6 +77,7 @@ struct TxMark {
     hash: u32,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, Default)]
 struct RxMark {
     used: bool,
@@ -96,7 +100,9 @@ pub(super) struct TimeSyncV2 {
     served_head: u8,
     tx_marks: [TxMark; TX_MARKS],
     tx_head: u8,
+    #[cfg(feature = "std")]
     rx_marks: [RxMark; RX_MARKS],
+    #[cfg(feature = "std")]
     rx_head: u8,
     /// (side, delay per frame byte after the stamps in ns, fixed asymmetry ns).
     asymmetry: [(RouterSideId, u32, i32); ASYMMETRY_SIDES],
@@ -111,7 +117,9 @@ pub(super) struct TimeSyncV2 {
     /// Local UTC reference report to send: (offset ns, error ns, set at mono ns).
     utc_report: Option<(i64, u64, u64)>,
     /// Reports received from followers (newest last, at most 4).
+    #[cfg(feature = "std")]
     utc_reports: [Option<UtcReferenceReport>; 4],
+    #[cfg(feature = "std")]
     utc_reports_head: u8,
 }
 
@@ -175,6 +183,12 @@ impl TimeSyncV2 {
         self.tx_marks[slot] = mark;
     }
 
+    #[cfg(not(feature = "std"))]
+    fn take_rx(&mut self, _: u32, _: bool, _: u64, _: u64) -> Option<(u64, u16)> {
+        None
+    }
+
+    #[cfg(feature = "std")]
     fn take_rx(&mut self, tag: u32, response: bool, word0: u64, word1: u64) -> Option<(u64, u16)> {
         let mark = self.rx_marks.iter_mut().find(|m| {
             m.used && m.response == response && m.tag == tag && m.word0 == word0 && m.word1 == word1
@@ -259,6 +273,11 @@ fn exchange_words(data: &RouterItem) -> Option<(DataType, u32, u64, u64)> {
 impl Router {
     /// Records the receive instant of a time sync request/response at the
     /// transport boundary. Ordinary frames return after a type peek.
+    #[cfg(not(feature = "std"))]
+    #[inline(always)]
+    pub(super) fn timesync_note_rx(&self, _: &RouterItem, _: u64) {}
+
+    #[cfg(feature = "std")]
     pub(super) fn timesync_note_rx(&self, data: &RouterItem, rx_mono_ns: u64) {
         let Some(runtime) = self.timesync.as_ref() else {
             return;
@@ -441,6 +460,11 @@ impl Router {
     }
 
     /// Stores a follower's UTC report carried by a request.
+    #[cfg(not(feature = "std"))]
+    #[inline(always)]
+    pub(super) fn timesync_note_utc_report_locked(_: &mut TimeSyncRuntime, _: &str, _: u64, _: u64, _: u64) {}
+
+    #[cfg(feature = "std")]
     pub(super) fn timesync_note_utc_report_locked(
         st: &mut TimeSyncRuntime,
         sender: &str,
@@ -477,6 +501,7 @@ impl Router {
     }
 
     /// Takes the UTC reports followers sent since the last call (oldest first).
+    #[cfg(feature = "std")]
     pub fn take_utc_reference_reports(&self) -> Vec<UtcReferenceReport> {
         let Some(runtime) = self.timesync.as_ref() else {
             return Vec::new();
