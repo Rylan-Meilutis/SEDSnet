@@ -9,12 +9,16 @@
 //!
 //! ```text
 //! bundle = MARKER | base_ts ULEB128 | record+ | CRC32-LE(MARKER .. last record)
-//! record = len ULEB128 | flags | elide | [nep] | [type ULEB128] | [source u32 LE]
+//! record = len ULEB128 | flags | elide | [nep] | [type ULEB128]
+//!        | [logical size ULEB128, only when the payload is compressed]
 //!        | ts zigzag ULEB128 (delta from the previous record, the first from base_ts)
 //!        | [nonce: ULEB128, or zigzag delta from the previous record's nonce]
-//!        | [endpoints] | [contract: ULEB128 len | bytes] | [reliable header]
-//!        | [logical size ULEB128, only when the payload is compressed] | payload
+//!        | [source ULEB128] | [endpoints] | [contract: ULEB128 len | bytes]
+//!        | [reliable header] | payload
 //! ```
+//! Fields are in canonical order, so one reader and one writer serve both
+//! forms (the canonical frame has no `elide`, always a size, an absolute
+//! timestamp and nonce, and its own CRC32).
 //! `flags` is the canonical flags byte. `elide` bits drop a field that equals
 //! the previous record's. `MARKER` sets both the endpoint-bitmap and the
 //! endpoint-list flag bits, which no canonical frame can carry, and is not the
@@ -164,31 +168,62 @@ fn usable_flags(flags: u8) -> TelemetryResult<u8> {
     Ok(flags)
 }
 
-fn parse_canonical(frame: &[u8]) -> TelemetryResult<Fields<'_>> {
-    if frame.starts_with(b"SDT") {
+/// Read one frame's fields: the canonical form (`prev` None, `rec` false) or
+/// a bundle record relative to the previous record.
+fn read_fields<'a>(buf: &'a [u8], rec: bool, p: Option<&Fields<'a>>, prev_ts: u64) -> TelemetryResult<Fields<'a>> {
+    let mut r = Reader { buf, off: 0 };
+    let flags = usable_flags(r.byte()?)?;
+    let elide = if rec { r.byte()? } else { 0 };
+    let has_prev = p.is_some();
+    let p = p.copied().unwrap_or_default();
+    // Elision needs a previous record and the field it refers to.
+    if elide & !E_KNOWN != 0
+        || (!has_prev && elide != 0)
+        || (elide & E_NONCE_DELTA != 0 && (elide & E_SOURCE == 0 || flags & p.flags & F_NONCE == 0))
+        || (elide & E_CONTRACT != 0 && flags & p.flags & F_CONTRACT == 0)
+        || (elide & E_ENDPOINTS != 0
+            && (elide & E_NEP == 0 || flags & F_EPS == 0 || p.flags & F_EPS != flags & F_EPS))
+    {
         return Err(BAD);
     }
-    let mut r = Reader { buf: checked(frame)?, off: 0 };
-    let flags = usable_flags(r.byte()?)?;
-    let nep = r.byte()?;
-    let ty = r.uleb()?;
-    let size = r.uleb()?;
-    let ts = r.uleb()?;
-    let nonce = if flags & F_NONCE != 0 { r.uleb()? } else { 0 };
-    let src = u32::try_from(r.uleb()?).map_err(|_| BAD)?;
-    let eps = r.endpoints(flags, nep)?;
-    let contract = if flags & F_CONTRACT != 0 {
+    let nep = if elide & E_NEP != 0 { p.nep } else { r.byte()? };
+    let ty = if elide & E_TYPE != 0 { p.ty } else { r.uleb()? };
+    let size = if !rec || flags & F_COMPRESSED != 0 { Some(r.uleb()?) } else { None };
+    let ts = if rec { prev_ts.wrapping_add(unzigzag(r.uleb()?)) } else { r.uleb()? };
+    let nonce = if flags & F_NONCE != 0 {
+        let v = r.uleb()?;
+        let n = if elide & E_NONCE_DELTA != 0 { p.nonce.wrapping_add(unzigzag(v)) } else { v };
+        if n > u64::from(u16::MAX) {
+            return Err(BAD);
+        }
+        n
+    } else {
+        0
+    };
+    let src = if elide & E_SOURCE != 0 { p.src } else { u32::try_from(r.uleb()?).map_err(|_| BAD)? };
+    let eps = if elide & E_ENDPOINTS != 0 { p.eps } else { r.endpoints(flags, nep)? };
+    let contract = if flags & F_CONTRACT == 0 {
+        &[][..]
+    } else if elide & E_CONTRACT != 0 {
+        p.contract
+    } else {
         let n = r.len()?;
         r.take(n)?
-    } else {
-        &[]
     };
     let rel = r.reliable(flags)?;
     let payload = r.rest();
+    let size = size.unwrap_or(payload.len() as u64);
     if flags & F_COMPRESSED == 0 && size != payload.len() as u64 {
         return Err(BAD);
     }
     Ok(Fields { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
+}
+
+fn parse_canonical(frame: &[u8]) -> TelemetryResult<Fields<'_>> {
+    if frame.starts_with(b"SDT") {
+        return Err(BAD);
+    }
+    read_fields(checked(frame)?, false, None, 0)
 }
 
 /// Whether `frame` can travel inside a bundle: a canonical (not side-wrapped),
@@ -209,10 +244,12 @@ fn unzigzag(v: u64) -> u64 {
     (((v >> 1) as i64) ^ -((v & 1) as i64)) as u64
 }
 
-fn encode_record(c: &Fields<'_>, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
+/// Write one frame's fields: a bundle record relative to `p` (`rec`), or
+/// the canonical frame with its CRC32.
+fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
     let mut elide = 0u8;
     let prev_ts = p.map_or(c.ts, |p| p.ts);
-    if let Some(p) = p {
+    if let (true, Some(p)) = (rec, p) {
         if p.ty == c.ty {
             elide |= E_TYPE;
         }
@@ -232,22 +269,28 @@ fn encode_record(c: &Fields<'_>, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
             }
         }
     }
+    out.clear();
     put(out, &[c.flags]);
-    put(out, &[elide]);
+    if rec {
+        put(out, &[elide]);
+    }
     if elide & E_NEP == 0 {
         put(out, &[c.nep]);
     }
     if elide & E_TYPE == 0 {
         put_uleb(out, c.ty);
     }
-    if elide & E_SOURCE == 0 {
-        put(out, &c.src.to_le_bytes());
+    if !rec || c.flags & F_COMPRESSED != 0 {
+        put_uleb(out, c.size);
     }
-    put_uleb(out, zigzag(c.ts.wrapping_sub(prev_ts)));
+    put_uleb(out, if rec { zigzag(c.ts.wrapping_sub(prev_ts)) } else { c.ts });
     if c.flags & F_NONCE != 0 {
-        let base = if elide & E_NONCE_DELTA != 0 { p.map_or(0, |p| p.nonce) } else { 0 };
-        let v = c.nonce.wrapping_sub(base);
-        put_uleb(out, if elide & E_NONCE_DELTA != 0 { zigzag(v) } else { v });
+        let delta = elide & E_NONCE_DELTA != 0;
+        let v = c.nonce.wrapping_sub(if delta { p.map_or(0, |p| p.nonce) } else { 0 });
+        put_uleb(out, if delta { zigzag(v) } else { v });
+    }
+    if elide & E_SOURCE == 0 {
+        put_uleb(out, u64::from(c.src));
     }
     if elide & E_ENDPOINTS == 0 {
         put(out, c.eps);
@@ -257,10 +300,11 @@ fn encode_record(c: &Fields<'_>, p: Option<&Fields<'_>>, out: &mut Vec<u8>) {
         put(out, c.contract);
     }
     put(out, c.rel);
-    if c.flags & F_COMPRESSED != 0 {
-        put_uleb(out, c.size);
-    }
     put(out, c.payload);
+    if !rec {
+        let crc = crc32_bytes(out);
+        put(out, &crc.to_le_bytes());
+    }
 }
 
 /// Pack canonical frames, in the given order, into one bundle.
@@ -282,8 +326,7 @@ pub fn pack_bundle(frames: &[&[u8]]) -> TelemetryResult<Vec<u8>> {
         if prev.is_none() {
             put_uleb(&mut out, c.ts);
         }
-        record.clear();
-        encode_record(&c, prev.as_ref(), &mut record);
+        write_fields(&c, true, prev.as_ref(), &mut record);
         put_uleb(&mut out, record.len() as u64);
         put(&mut out, &record);
         prev = Some(c);
@@ -291,78 +334,6 @@ pub fn pack_bundle(frames: &[&[u8]]) -> TelemetryResult<Vec<u8>> {
     let crc = crc32_bytes(&out);
     put(&mut out, &crc.to_le_bytes());
     Ok(out)
-}
-
-fn decode_record<'a>(rec: &'a [u8], p: Option<&Fields<'a>>, prev_ts: u64) -> TelemetryResult<Fields<'a>> {
-    let mut r = Reader { buf: rec, off: 0 };
-    let flags = usable_flags(r.byte()?)?;
-    let elide = r.byte()?;
-    let has_prev = p.is_some();
-    let p = p.copied().unwrap_or_default();
-    // Elision needs a previous record and the field it refers to.
-    if elide & !E_KNOWN != 0
-        || (!has_prev && elide != 0)
-        || (elide & E_NONCE_DELTA != 0 && (elide & E_SOURCE == 0 || flags & p.flags & F_NONCE == 0))
-        || (elide & E_CONTRACT != 0 && flags & p.flags & F_CONTRACT == 0)
-        || (elide & E_ENDPOINTS != 0
-            && (elide & E_NEP == 0 || flags & F_EPS == 0 || p.flags & F_EPS != flags & F_EPS))
-    {
-        return Err(BAD);
-    }
-    let nep = if elide & E_NEP != 0 { p.nep } else { r.byte()? };
-    let ty = if elide & E_TYPE != 0 { p.ty } else { r.uleb()? };
-    let src = if elide & E_SOURCE != 0 {
-        p.src
-    } else {
-        u32::from_le_bytes(r.take(4)?.try_into().map_err(|_| BAD)?)
-    };
-    let ts = prev_ts.wrapping_add(unzigzag(r.uleb()?));
-    let nonce = if flags & F_NONCE != 0 {
-        let v = r.uleb()?;
-        let n = if elide & E_NONCE_DELTA != 0 { p.nonce.wrapping_add(unzigzag(v)) } else { v };
-        if n > u64::from(u16::MAX) {
-            return Err(BAD);
-        }
-        n
-    } else {
-        0
-    };
-    let eps = if elide & E_ENDPOINTS != 0 { p.eps } else { r.endpoints(flags, nep)? };
-    let contract = if flags & F_CONTRACT == 0 {
-        &[][..]
-    } else if elide & E_CONTRACT != 0 {
-        p.contract
-    } else {
-        let n = r.len()?;
-        r.take(n)?
-    };
-    let rel = r.reliable(flags)?;
-    let size = if flags & F_COMPRESSED != 0 { Some(r.uleb()?) } else { None };
-    let payload = r.rest();
-    let size = size.unwrap_or(payload.len() as u64);
-    Ok(Fields { flags, nep, ty, size, ts, nonce, src, eps, contract, rel, payload })
-}
-
-fn write_canonical(c: &Fields<'_>, out: &mut Vec<u8>) {
-    out.clear();
-    put(out, &[c.flags]);
-    put(out, &[c.nep]);
-    put_uleb(out, c.ty);
-    put_uleb(out, c.size);
-    put_uleb(out, c.ts);
-    if c.flags & F_NONCE != 0 {
-        put_uleb(out, c.nonce);
-    }
-    put_uleb(out, u64::from(c.src));
-    put(out, c.eps);
-    if c.flags & F_CONTRACT != 0 {
-        put_uleb(out, c.contract.len() as u64);
-        put(out, c.contract);
-    }
-    put(out, c.rel);
-    put(out, c.payload);
-    let crc = crc32_bytes(out);
-    put(out, &crc.to_le_bytes());
 }
 
 /// Walk every record; with `each`, hand over each rebuilt canonical frame.
@@ -381,9 +352,9 @@ fn walk(bytes: &[u8], mut each: Option<&mut dyn FnMut(&[u8]) -> TelemetryResult<
         }
         let n = r.len()?;
         let rec = r.take(n)?;
-        let c = decode_record(rec, prev.as_ref(), prev_ts)?;
+        let c = read_fields(rec, true, prev.as_ref(), prev_ts)?;
         if let Some(each) = each.as_mut() {
-            write_canonical(&c, &mut canonical);
+            write_fields(&c, false, None, &mut canonical);
             each(&canonical)?;
         }
         prev_ts = c.ts;
