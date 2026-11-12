@@ -105,6 +105,9 @@ pub(super) struct TimeSyncV2 {
     locked: bool,
     stratum: u8,
     rx_override: u64,
+    /// A local reference (host clock, GPS) feeds this node's time; set by
+    /// `timesync_local_quality_locked`.
+    pub(super) local_reference: bool,
     /// Local UTC reference report to send: (offset ns, error ns, set at mono ns).
     utc_report: Option<(i64, u64, u64)>,
     /// Reports received from followers (newest last, at most 4).
@@ -124,6 +127,16 @@ impl TimeSyncV2 {
 
     pub(super) fn has_samples_from(&self, sender: &str) -> bool {
         !self.discipline.is_empty() && self.source.as_deref() == Some(sender)
+    }
+
+    /// Receive instant of the frame being processed synchronously: the
+    /// transport's stamp when given, else `now`.
+    fn rx_instant(&self, now_mono_ns: u64) -> u64 {
+        if self.rx_override != 0 { self.rx_override } else { now_mono_ns }
+    }
+
+    pub(super) fn discipline_is_empty(&self) -> bool {
+        self.discipline.is_empty()
     }
 
     pub(super) fn is_locked(&self) -> bool {
@@ -203,10 +216,15 @@ fn frame_hash(bytes: &[u8]) -> u32 {
     hash
 }
 
-fn exchange_words(data: &RouterItem) -> Option<(DataType, String, u64, u64)> {
+fn exchange_words(data: &RouterItem) -> Option<(DataType, u32, u64, u64)> {
+    #[cfg(feature = "std")]
     let owned;
     let pkt = match data {
         RouterItem::Packet(p) => p,
+        // Hosts queue received frames as packed bytes; decode only time sync
+        // frames. Embedded receive paths process synchronously and take the
+        // receive instant from the override instead (no decode, less flash).
+        #[cfg(feature = "std")]
         RouterItem::Packed(bytes) => {
             let ty = crate::shared_bytes::with_slice(bytes, wire_format::scheduling_type)
                 .ok()
@@ -219,16 +237,23 @@ fn exchange_words(data: &RouterItem) -> Option<(DataType, String, u64, u64)> {
                 .ok()?;
             &owned
         }
+        #[cfg(not(feature = "std"))]
+        RouterItem::Packed(_) => return None,
     };
     let ty = pkt.data_type();
     if !matches!(ty, DataType::TimeSyncRequest | DataType::TimeSyncResponse) {
         return None;
     }
-    let words = pkt.data_as_u64().ok()?;
-    if words.len() < 2 {
+    let payload = pkt.payload();
+    if payload.len() < 16 {
         return None;
     }
-    Some((ty, String::from(pkt.sender()), words[0], words[1]))
+    let word = |i: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&payload[i * 8..i * 8 + 8]);
+        u64::from_le_bytes(b)
+    };
+    Some((ty, timesync_sender_tag(pkt.sender()), word(0), word(1)))
 }
 
 impl Router {
@@ -238,7 +263,7 @@ impl Router {
         let Some(runtime) = self.timesync.as_ref() else {
             return;
         };
-        let Some((ty, sender, word0, word1)) = exchange_words(data) else {
+        let Some((ty, tag, word0, word1)) = exchange_words(data) else {
             return;
         };
         let len = match data {
@@ -257,7 +282,7 @@ impl Router {
         v2.rx_marks[slot] = RxMark {
             used: true,
             response: ty == DataType::TimeSyncResponse,
-            tag: timesync_sender_tag(&sender),
+            tag,
             word0,
             word1,
             rx_ns: rx_mono_ns,
@@ -503,16 +528,16 @@ impl Router {
         status: &TimeSyncStatus,
     ) -> (u64, u64, u64, u64) {
         let tag = timesync_sender_tag(requester);
-        let rx_ns = st.v2.take_rx(tag, false, seq, t1).map_or(now_mono_ns, |(ns, _)| ns);
+        let rx_ns = st.v2.take_rx(tag, false, seq, t1).map_or(st.v2.rx_instant(now_mono_ns), |(ns, _)| ns);
         let net_at = |st: &TimeSyncRuntime, mono: u64| {
             st.disciplined_clock.read_unix_ns_at(mono).or_else(|| {
                 st.clock
                     .current_time(mono)
                     .and_then(|t| t.unix_time_ms)
-                    .map(|ms| ms as i128 * 1_000_000)
+                    .map(|ms| ms.saturating_mul(1_000_000).min(i64::MAX as u64) as i64)
             })
         };
-        let t2_ns = net_at(st, rx_ns).unwrap_or(rx_ns as i128).max(0);
+        let t2_ns = net_at(st, rx_ns).unwrap_or(rx_ns as i64).max(0);
         let words = if seq & TIMESYNC_V2_REQUEST != 0 {
             let w2 = encode_v2_receive_word(
                 (t2_ns / 1_000) as u64,
@@ -568,7 +593,7 @@ impl Router {
             st.v2.locked = false;
         }
         let tag = timesync_sender_tag(sender);
-        let (t4_ns, response_len) = st.v2.take_rx(tag, true, seq, t1).unwrap_or((now_mono_ns, 0));
+        let (t4_ns, response_len) = st.v2.take_rx(tag, true, seq, t1).unwrap_or((st.v2.rx_instant(now_mono_ns), 0));
         let counter = (seq & TIMESYNC_SEQ_COUNTER_MASK) as u32;
         let Some(idx) = st
             .v2
@@ -599,8 +624,8 @@ impl Router {
                 let asymmetry = st.v2.asymmetry_ns(side, &ex);
                 exchange_sample(
                     ex.t1_ns,
-                    i128::from(ex.t2_net_us) * 1_000,
-                    i128::from(t3_us) * 1_000,
+                    (ex.t2_net_us as i64).saturating_mul(1_000),
+                    (t3_us as i64).saturating_mul(1_000),
                     ex.t4_ns,
                     ex.source_error_ns,
                     asymmetry,
@@ -615,8 +640,8 @@ impl Router {
             let asymmetry = st.v2.asymmetry_ns(side, &ex);
             exchange_sample(
                 ex.t1_ns,
-                i128::from(t2) * 1_000_000,
-                i128::from(t3) * 1_000_000,
+                (t2 as i64).saturating_mul(1_000_000),
+                (t3 as i64).saturating_mul(1_000_000),
                 t4_ns,
                 1_000_000,
                 asymmetry,
@@ -627,7 +652,9 @@ impl Router {
             return false;
         };
         if let Some(target) = st.v2.discipline.target(sample.mono_ns)
-            && (target.net_ns - (i128::from(sample.mono_ns) + i128::from(sample.phi_ns)))
+            && target
+                .net_ns
+                .wrapping_sub((sample.mono_ns as i64).wrapping_add(sample.phi_ns))
                 .unsigned_abs()
                 > 1_000_000_000
         {
@@ -646,9 +673,9 @@ impl Router {
         let Some(target) = st.v2.discipline.target(now_mono_ns) else {
             return;
         };
-        let floor_ns = TIMESYNC_UTC_FLOOR_MS as i128 * 1_000_000;
+        let floor_ns = TIMESYNC_UTC_FLOOR_MS as i64 * 1_000_000;
         let anchored = anchored && target.net_ns >= floor_ns;
-        let current = st.disciplined_clock.read_unix_ns(now_mono_ns);
+        let current = st.disciplined_clock.read_unix_ns_at(now_mono_ns);
         if !anchored && current.is_some_and(|c| c >= floor_ns) {
             // Unanchored time never drags a clock that already reads UTC.
             return;
@@ -660,7 +687,7 @@ impl Router {
             Some(_) if anchored && !st.clock_anchored => true,
             // Before first lock timestamps are marked unsynced: converge now.
             // Once locked, slew only.
-            Some(e) => !st.v2.ever_locked && e > u128::from(ACQUIRE_STEP_NS),
+            Some(e) => !st.v2.ever_locked && e > ACQUIRE_STEP_NS,
         };
         st.disciplined_clock
             .discipline_ns(now_mono_ns, target.net_ns, target.rate_ppb, allow_step);
@@ -674,25 +701,14 @@ impl Router {
         now_mono_ns: u64,
     ) -> TimeSyncStatus {
         let pending = st.disciplined_clock.pending_ns(now_mono_ns);
-        let offset_ns = st
-            .disciplined_clock
-            .pending_signed_ns(now_mono_ns)
-            .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let offset_ns = st.disciplined_clock.pending_signed_ns(now_mono_ns);
         let rate_ppb = st.disciplined_clock.rate_ppb();
         let last_sample_age_ms = st
             .v2
             .discipline
             .newest_mono_ns()
             .map_or(u64::MAX, |m| now_mono_ns.saturating_sub(m) / 1_000_000);
-        let local_reference = {
-            let remote = &st.remote_sources;
-            st.clock
-                .current_time_filtered(now_mono_ns, |name| {
-                    name != INTERNAL_TIMESYNC_SOURCE_ID && !remote.contains_key(name)
-                })
-                .and_then(|r| r.unix_time_ms)
-                .is_some()
-        };
+        let local_reference = st.v2.local_reference;
         let (state, error_bound_ns, stratum, is_reference) = match leader {
             Some(TimeSyncLeader::Local { .. }) if local_reference => {
                 (SyncState::Locked, pending, 0, true)

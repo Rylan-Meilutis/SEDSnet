@@ -1,17 +1,15 @@
 //! Clock discipline for two-way time sync exchanges.
 //!
 //! A follower measures `phi = network - monotonic` once per exchange, at the
-//! exchange midpoint, with an uncertainty of half the round-trip path delay plus
-//! the source's own error bound. This module:
-//! - keeps the last [`DISCIPLINE_SAMPLES`] accepted samples (NTP's clock filter);
-//! - rejects samples whose path delay is well above the recent minimum, so
+//! exchange midpoint. This module:
+//! - keeps the last [`DISCIPLINE_SAMPLES`] accepted samples (NTP's clock filter)
+//!   and rejects samples whose path delay is well above the recent minimum, so
 //!   queueing on a busy link costs sample rate, not accuracy;
-//! - estimates the local oscillator's frequency error from the lowest-delay
-//!   sample in the older half of the window and in the newer half;
-//! - projects the best recent sample to "now" for the phase target;
+//! - fits phase and oscillator frequency by weighted least squares;
 //! - reports an error bound and a locked/holdover state.
 //!
-//! It is pure arithmetic over monotonic nanoseconds and holds no clock itself.
+//! Pure 64-bit arithmetic over monotonic nanoseconds (one shared 128-bit
+//! multiply-divide helper), sized for Cortex-M flash budgets.
 
 /// Accepted samples kept per follower.
 pub const DISCIPLINE_SAMPLES: usize = 8;
@@ -26,13 +24,29 @@ pub const TIMESYNC_MAX_HALF_DELAY_NS: u64 = 2_000_000_000;
 pub const TIMESYNC_DRIFT_ALLOWANCE_PPB: u64 = 50_000;
 /// Largest frequency correction accepted: 3% covers a 1% HSI with margin.
 pub const TIMESYNC_MAX_RATE_PPB: i64 = 30_000_000;
-/// Minimum span between the two samples used for the frequency estimate.
+/// Minimum span of the window before the frequency is estimated.
 const MIN_FREQ_SPAN_NS: u64 = 3_000_000_000;
 /// Consecutive rejected samples after which the filter accepts a sample
 /// anyway: the path delay has changed and the old minimum is stale.
 const MAX_REJECT_RUN: u8 = 4;
 /// Samples needed before a follower may report itself locked.
 const MIN_LOCK_SAMPLES: u8 = 3;
+/// Longest round trip considered (bounds the arithmetic).
+const MAX_ROUND_TRIP_NS: u64 = 60_000_000_000;
+
+/// `a * b / c` in 64-bit arithmetic, splitting `a` by `c` when the product
+/// would overflow (callers keep `b` and `c` below 2^31), saturating. One
+/// out-of-line copy keeps the scaling small on Cortex-M.
+#[inline(never)]
+pub fn mul_div(a: i64, b: i64, c: i64) -> i64 {
+    if c == 0 {
+        return 0;
+    }
+    match a.checked_mul(b) {
+        Some(p) => p / c,
+        None => (a / c).saturating_mul(b).saturating_add((a % c).saturating_mul(b) / c),
+    }
+}
 
 /// One two-way exchange reduced to its midpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,27 +61,21 @@ pub struct DisciplineSample {
     pub source_error_ns: u32,
 }
 
-impl DisciplineSample {
-    fn uncertainty_ns(&self) -> u64 {
-        u64::from(self.half_delay_ns) + u64::from(self.source_error_ns)
-    }
-}
-
 /// Builds a sample from the four exchange stamps.
 ///
 /// `t1`/`t4` are the requester's monotonic transmit/receive instants (ns),
-/// `t2`/`t3` the responder's network receive/transmit instants (ns).
-/// Returns `None` for an impossible exchange (reply before request, negative
-/// turnaround) or one whose half delay exceeds [`TIMESYNC_MAX_HALF_DELAY_NS`].
-///
+/// `t2`/`t3` the responder's network receive/transmit instants (Unix ns).
 /// `local_rate_ppb` is the learned frequency correction: the round trip is
 /// measured on the local oscillator, the turnaround on the network clock, and
 /// a 1% HSI over a 7 s responder queue would otherwise add 70 ms of delay.
 /// `asymmetry_ns` is (response one-way delay - request one-way delay) / 2.
+/// Returns `None` for an impossible exchange (reply before request, negative
+/// turnaround or delay) or one whose half delay exceeds
+/// [`TIMESYNC_MAX_HALF_DELAY_NS`].
 pub fn exchange_sample(
     t1_mono_ns: u64,
-    t2_net_ns: i128,
-    t3_net_ns: i128,
+    t2_net_ns: i64,
+    t3_net_ns: i64,
     t4_mono_ns: u64,
     source_error_ns: u64,
     asymmetry_ns: i64,
@@ -76,8 +84,12 @@ pub fn exchange_sample(
     if t4_mono_ns < t1_mono_ns || t3_net_ns < t2_net_ns {
         return None;
     }
-    let round_trip_mono = (t4_mono_ns - t1_mono_ns) as i128;
-    let round_trip = round_trip_mono + round_trip_mono * i128::from(local_rate_ppb) / 1_000_000_000;
+    let round_trip_mono = t4_mono_ns - t1_mono_ns;
+    if round_trip_mono > MAX_ROUND_TRIP_NS {
+        return None;
+    }
+    let round_trip_mono = round_trip_mono as i64;
+    let round_trip = round_trip_mono + mul_div(round_trip_mono, local_rate_ppb, 1_000_000_000);
     let turnaround = t3_net_ns - t2_net_ns;
     let delay = round_trip - turnaround;
     if delay < 0 {
@@ -89,15 +101,13 @@ pub fn exchange_sample(
     if half > TIMESYNC_MAX_HALF_DELAY_NS {
         return None;
     }
-    let mono_mid = t1_mono_ns as i128 + round_trip_mono / 2;
-    // Midpoint of the responder's stamps, corrected for a known path asymmetry
-    // (downlink one-way delay minus uplink one-way delay, halved).
-    let net_mid = t2_net_ns + turnaround / 2 + asymmetry_ns as i128;
-    let phi = i64::try_from(net_mid - mono_mid).ok()?;
+    let mono_mid = t1_mono_ns + (round_trip_mono / 2) as u64;
+    // Midpoint of the responder's stamps, corrected for a known path asymmetry.
+    let net_mid = t2_net_ns + turnaround / 2 + asymmetry_ns;
     Some(DisciplineSample {
-        mono_ns: mono_mid as u64,
-        phi_ns: phi,
-        half_delay_ns: half.min(u64::from(u32::MAX)) as u32,
+        mono_ns: mono_mid,
+        phi_ns: net_mid.wrapping_sub(mono_mid as i64),
+        half_delay_ns: half as u32,
         source_error_ns: source_error_ns.min(u64::from(u32::MAX)) as u32,
     })
 }
@@ -136,8 +146,8 @@ impl SyncState {
 /// Steering decision for the local network clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisciplineTarget {
-    /// Network time the clock should read at `mono_ns`, ns.
-    pub net_ns: i128,
+    /// Network time the clock should read at `mono_ns`, Unix ns.
+    pub net_ns: i64,
     /// Monotonic instant of the target.
     pub mono_ns: u64,
     /// Frequency correction to apply to the local oscillator, ppb.
@@ -152,9 +162,9 @@ pub struct ClockDiscipline {
     head: u8,
     reject_run: u8,
     accepted: u8,
+    was_locked: bool,
     rate_ppb: i64,
     freq_uncertainty_ppb: u64,
-    was_locked: bool,
     fit_mono_ns: u64,
     fit_phi_ns: i64,
     fit_error_ns: u64,
@@ -168,10 +178,10 @@ impl Default for ClockDiscipline {
             head: 0,
             reject_run: 0,
             accepted: 0,
+            was_locked: false,
             rate_ppb: 0,
             // Unknown oscillator: assume the 1% HSI worst case until measured.
             freq_uncertainty_ppb: 10_000_000,
-            was_locked: false,
             fit_mono_ns: 0,
             fit_phi_ns: 0,
             fit_error_ns: u64::MAX,
@@ -210,119 +220,119 @@ impl ClockDiscipline {
         self.rate_ppb
     }
 
-    fn iter(&self) -> impl Iterator<Item = &DisciplineSample> {
-        self.ring[..usize::from(self.len)].iter()
+    fn samples(&self) -> &[DisciplineSample] {
+        &self.ring[..usize::from(self.len)]
     }
 
     /// Monotonic instant of the newest accepted sample.
     pub fn newest_mono_ns(&self) -> Option<u64> {
-        self.newest().map(|s| s.mono_ns)
+        self.samples().iter().map(|s| s.mono_ns).max()
     }
 
-    fn newest(&self) -> Option<&DisciplineSample> {
-        self.iter().max_by_key(|s| s.mono_ns)
+    fn min_half_delay(&self) -> u32 {
+        self.samples().iter().map(|s| s.half_delay_ns).min().unwrap_or(0)
     }
 
-    fn min_uncertainty(&self) -> Option<u64> {
-        self.iter().map(DisciplineSample::uncertainty_ns).min()
+    /// The random part of a sample's error: delay above the window minimum
+    /// (queueing that may be one-sided) plus the source's own error.
+    fn noise_ns(&self, s: &DisciplineSample, min_half: u32) -> u64 {
+        u64::from(s.half_delay_ns.saturating_sub(min_half)) + u64::from(s.source_error_ns)
     }
 
     /// Offers a sample. Returns `true` when it was accepted into the filter.
     pub fn offer(&mut self, sample: DisciplineSample) -> bool {
-        if let Some(newest) = self.newest()
-            && sample.mono_ns <= newest.mono_ns
-        {
+        if self.newest_mono_ns().is_some_and(|m| sample.mono_ns <= m) {
             return false;
         }
-        let accept = match self.min_uncertainty() {
-            Some(best) if self.len >= MIN_LOCK_SAMPLES => {
-                // Popcorn filter: within twice the recent best plus 2 ms.
-                sample.uncertainty_ns() <= best.saturating_mul(2).saturating_add(2_000_000)
-                    || self.reject_run >= MAX_REJECT_RUN
+        if self.len >= MIN_LOCK_SAMPLES && self.reject_run < MAX_REJECT_RUN {
+            let best = self
+                .samples()
+                .iter()
+                .map(|s| u64::from(s.half_delay_ns) + u64::from(s.source_error_ns))
+                .min()
+                .unwrap_or(0);
+            // Popcorn filter: within twice the recent best plus 2 ms.
+            let own = u64::from(sample.half_delay_ns) + u64::from(sample.source_error_ns);
+            if own > best.saturating_mul(2).saturating_add(2_000_000) {
+                self.reject_run += 1;
+                return false;
             }
-            _ => true,
-        };
-        if !accept {
-            self.reject_run = self.reject_run.saturating_add(1);
-            return false;
         }
         self.reject_run = 0;
         self.ring[usize::from(self.head)] = sample;
         self.head = (self.head + 1) % DISCIPLINE_SAMPLES as u8;
         self.len = (self.len + 1).min(DISCIPLINE_SAMPLES as u8);
         self.accepted = self.accepted.saturating_add(1);
-        self.update_frequency();
+        self.fit();
         true
     }
 
-    /// Weighted least-squares fit of `phi` against monotonic time over the
-    /// window. Weights are 1/error^2, so a sample taken while the source was
-    /// itself unsynced (error about 1 s) barely counts. The slope is the
-    /// oscillator's frequency error; the fit at the newest sample is the phase.
-    fn update_frequency(&mut self) {
-        let Some(newest) = self.newest().copied() else {
+    /// Weighted least-squares fit of `phi` against monotonic time. Weights are
+    /// 1/(1 + (noise/64 us)^2): a sample taken while the source itself was
+    /// unsynced (error about 1 s) barely counts. The slope is the oscillator's
+    /// frequency error; the fit at the newest sample is the phase.
+    fn fit(&mut self) {
+        let Some(newest) = self.newest_mono_ns() else {
             return;
         };
-        let oldest_mono = self.iter().map(|s| s.mono_ns).min().unwrap_or(newest.mono_ns);
-        let span = newest.mono_ns - oldest_mono;
-        // Sums in ms (x), ns (y) relative to the newest sample.
-        let (mut sw, mut sx, mut sy, mut sxx, mut sxy) = (0i128, 0i128, 0i128, 0i128, 0i128);
-        for smp in self.iter() {
-            let w = Self::weight(self.sample_noise_ns(smp));
-            let x = -(((newest.mono_ns - smp.mono_ns) / 1_000_000) as i128);
-            let y = i128::from(smp.phi_ns) - i128::from(newest.phi_ns);
-            sw += w;
-            sx += w * x;
-            sy += w * y;
-            sxx += w * x * x;
-            sxy += w * x * y;
+        let newest_phi = self
+            .samples()
+            .iter()
+            .find(|s| s.mono_ns == newest)
+            .map_or(0, |s| s.phi_ns);
+        let min_half = self.min_half_delay();
+        let mut w = [0i64; DISCIPLINE_SAMPLES];
+        let mut x = [0i64; DISCIPLINE_SAMPLES]; // ms before newest (<= 0)
+        let mut y = [0i64; DISCIPLINE_SAMPLES]; // us relative to newest phi
+        let (mut sw, mut swx, mut swy, mut swe) = (0i64, 0i64, 0i64, 0i64);
+        let mut oldest = newest;
+        for (i, s) in self.samples().iter().enumerate() {
+            let noise_us = (self.noise_ns(s, min_half) / 1_000).min(10_000_000) as i64;
+            let r = noise_us / 64;
+            w[i] = (1 << 20) / (1 + r.saturating_mul(r).min(1 << 20));
+            x[i] = -(((newest - s.mono_ns) / 1_000_000).min(1_000_000) as i64);
+            y[i] = (s.phi_ns.wrapping_sub(newest_phi) / 1_000).clamp(-1 << 40, 1 << 40);
+            sw += w[i];
+            swx += w[i] * x[i];
+            swy += w[i] * y[i];
+            swe += w[i].saturating_mul(noise_us);
+            oldest = oldest.min(s.mono_ns);
         }
         if sw == 0 {
             return;
         }
-        let var_x = sxx - sx * sx / sw;
-        if span >= MIN_FREQ_SPAN_NS && var_x > 0 {
-            let denom = sw * sxx - sx * sx;
-            if denom > 0 {
-                let rate = ((sw * sxy - sx * sy) * 1_000 / denom)
-                    .clamp(-TIMESYNC_MAX_RATE_PPB as i128, TIMESYNC_MAX_RATE_PPB as i128);
-                self.rate_ppb = rate as i64;
-                // sigma_b = sigma_phase / sigma_x; sigma_phase = 1e9/sqrt(sw) ns.
-                let sigma_x_ms = ((var_x / sw).max(1) as u128).isqrt().max(1);
-                let phase_ns = Self::fit_error_ns(sw).min(1_000_000_000);
+        let span = newest - oldest;
+        let noise_us = (swe / sw).max(1);
+        if span >= MIN_FREQ_SPAN_NS {
+            let (xm, ym) = (swx / sw, swy / sw);
+            let (mut sxx, mut sxy) = (0i64, 0i64);
+            for i in 0..self.samples().len() {
+                let dx = x[i] - xm;
+                sxx = sxx.saturating_add(w[i] * dx * dx / 1_024);
+                sxy = sxy.saturating_add(mul_div(w[i] * dx, y[i] - ym, 1_024));
+            }
+            if sxx > 0 {
+                // slope in us per ms = 1e-3 -> ppb = slope * 1e6
+                self.rate_ppb =
+                    mul_div(sxy, 1_000_000, sxx).clamp(-TIMESYNC_MAX_RATE_PPB, TIMESYNC_MAX_RATE_PPB);
+                // Two noise widths across the span.
                 self.freq_uncertainty_ppb =
-                    (2 * u128::from(phase_ns) * 1_000 / sigma_x_ms).min(10_000_000) as u64;
+                    (2 * noise_us as u64 * 1_000_000_000_000 / span.max(1)).min(10_000_000);
             }
         }
         // Phase at the newest sample on the fitted (or kept) frequency.
-        let rate = i128::from(self.rate_ppb);
-        let mut sa = 0i128;
-        for smp in self.iter() {
-            let w = Self::weight(self.sample_noise_ns(smp));
-            let dx_ns = i128::from(smp.mono_ns) - i128::from(newest.mono_ns);
-            let y = i128::from(smp.phi_ns) - i128::from(newest.phi_ns);
-            sa += w * (y - dx_ns * rate / 1_000_000_000);
+        let mut sa = 0i64;
+        for (i, s) in self.samples().iter().enumerate() {
+            let dx_ns = s.mono_ns as i64 - newest as i64;
+            let resid = s.phi_ns.wrapping_sub(newest_phi)
+                - mul_div(dx_ns, self.rate_ppb, 1_000_000_000);
+            sa = sa.saturating_add(mul_div(w[i], resid, 1));
         }
-        self.fit_mono_ns = newest.mono_ns;
-        self.fit_phi_ns = newest.phi_ns.saturating_add((sa / sw) as i64);
-        self.fit_error_ns = Self::fit_error_ns(sw)
-            .max(self.iter().map(|s| self.sample_noise_ns(s)).min().unwrap_or(0) / 4)
-            .saturating_add(self.fixed_asymmetry_allowance_ns());
-    }
-
-    /// 1/error^2 with error in microseconds, floored at 50 us.
-    fn weight(error_ns: u64) -> i128 {
-        let us = (error_ns / 1_000).max(50) as i128;
-        1_000_000_000_000 / (us * us)
-    }
-
-    /// Two standard errors of the weighted mean, ns.
-    fn fit_error_ns(sw: i128) -> u64 {
-        if sw <= 0 {
-            return u64::MAX;
-        }
-        // sigma = 1e6 us / sqrt(sw) -> ns
-        (2 * 1_000_000_000u128 / (sw as u128).isqrt().max(1)) as u64
+        self.fit_mono_ns = newest;
+        self.fit_phi_ns = newest_phi.wrapping_add(sa / sw);
+        // Half the weighted noise plus 1/8 of the smallest half delay for
+        // unmodelled fixed asymmetry.
+        self.fit_error_ns = noise_us as u64 * 500 + u64::from(min_half) / 8;
     }
 
     /// Network time the clock should read at `now_mono_ns`.
@@ -330,35 +340,13 @@ impl ClockDiscipline {
         if self.is_empty() {
             return None;
         }
-        let elapsed = i128::from(now_mono_ns) - i128::from(self.fit_mono_ns);
-        let phi =
-            i128::from(self.fit_phi_ns) + elapsed * i128::from(self.rate_ppb) / 1_000_000_000;
+        let elapsed = now_mono_ns as i64 - self.fit_mono_ns as i64;
+        let phi = self.fit_phi_ns + mul_div(elapsed, self.rate_ppb, 1_000_000_000);
         Some(DisciplineTarget {
-            net_ns: i128::from(now_mono_ns) + phi,
+            net_ns: (now_mono_ns as i64).wrapping_add(phi),
             mono_ns: now_mono_ns,
             rate_ppb: self.rate_ppb,
         })
-    }
-
-    /// Estimated phase error of one sample.
-    ///
-    /// The exchange is symmetric by construction (same link, same frame path,
-    /// size asymmetry corrected by the caller), so the error is not the
-    /// rigorous half round trip (about 25 ms on the radio) but the part of the
-    /// half delay that could be one-sided: the excess over the smallest half
-    /// delay seen, plus 1/8 of that minimum for unmodelled fixed asymmetry,
-    /// plus the source's own error.
-    /// The random part of a sample's error: delay above the window minimum
-    /// (queueing that may be one-sided) plus the source's own error. Used for
-    /// weighting; the fixed allowance below is common to all samples.
-    fn sample_noise_ns(&self, s: &DisciplineSample) -> u64 {
-        let min_half = self.iter().map(|x| x.half_delay_ns).min().unwrap_or(s.half_delay_ns);
-        u64::from(s.half_delay_ns - min_half.min(s.half_delay_ns)) + u64::from(s.source_error_ns)
-    }
-
-    /// Unmodelled fixed asymmetry: 1/8 of the smallest half delay.
-    fn fixed_asymmetry_allowance_ns(&self) -> u64 {
-        u64::from(self.iter().map(|x| x.half_delay_ns).min().unwrap_or(0)) / 8
     }
 
     /// Error bound of the target at `now_mono_ns`, excluding any correction
@@ -367,10 +355,9 @@ impl ClockDiscipline {
         if self.is_empty() {
             return None;
         }
-        let age = now_mono_ns.saturating_sub(self.fit_mono_ns);
-        let wander = (u128::from(age)
-            * u128::from(self.freq_uncertainty_ppb + TIMESYNC_DRIFT_ALLOWANCE_PPB)
-            / 1_000_000_000) as u64;
+        let age = now_mono_ns.saturating_sub(self.fit_mono_ns) / 1_000; // us
+        let wander = age.saturating_mul(self.freq_uncertainty_ppb + TIMESYNC_DRIFT_ALLOWANCE_PPB)
+            / 1_000_000;
         Some(self.fit_error_ns.saturating_add(wander))
     }
 
@@ -393,9 +380,7 @@ impl ClockDiscipline {
         let state = match (locked, source_live) {
             (true, true) => SyncState::Locked,
             (true, false) => SyncState::Holdover,
-            (false, true) => SyncState::Acquiring,
-            (false, false) if self.len > 0 => SyncState::Acquiring,
-            (false, false) => SyncState::Unsynced,
+            (false, _) => SyncState::Acquiring,
         };
         (state, bound)
     }
@@ -452,8 +437,8 @@ mod tests {
         fn local(&self, true_ns: u64) -> u64 {
             (true_ns as i128 + true_ns as i128 * self.skew_ppb as i128 / 1_000_000_000) as u64
         }
-        fn net(&self, true_ns: u64) -> i128 {
-            true_ns as i128 + self.offset_ns
+        fn net(&self, true_ns: u64) -> i64 {
+            (true_ns as i128 + self.offset_ns) as i64
         }
         /// One exchange starting at true time `t` with uplink/downlink delays and turnaround.
         fn exchange(&self, t: u64, up: u64, turn: u64, down: u64) -> DisciplineSample {
@@ -466,7 +451,7 @@ mod tests {
         /// Error of `target` against truth at local time `mono`.
         fn error(&self, d: &ClockDiscipline, true_ns: u64) -> i128 {
             let mono = self.local(true_ns);
-            d.target(mono).unwrap().net_ns - self.net(true_ns)
+            (d.target(mono).unwrap().net_ns - self.net(true_ns)) as i128
         }
     }
 

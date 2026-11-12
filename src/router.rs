@@ -7561,6 +7561,7 @@ impl Router {
                 .and_then(|reading| reading.unix_time_ms)
                 .filter(|unix_ms| *unix_ms >= TIMESYNC_UTC_FLOOR_MS)
         };
+        st.v2.local_reference = reference.is_some();
         if let Some(unix_ms) = reference
             && !st.clock_anchored
         {
@@ -7571,7 +7572,19 @@ impl Router {
             }
             st.clock_anchored = true;
         }
-        let anchored = reference.is_some()
+        // A node disciplined from an anchored source keeps carrying UTC when
+        // that source goes away: it may lead (holdover/bridge) as anchored.
+        // Only while no anchored remote is available (otherwise UTC learned
+        // from that remote would outrank it) and while the holdover bound is
+        // still within the lock threshold.
+        let held_utc = st.clock_anchored
+            && st.v2.is_locked()
+            && !st.v2.discipline_is_empty()
+            && !st.tracker.as_ref().is_some_and(|t| {
+                t.best_active_source(now_mono_ns / 1_000_000)
+                    .is_some_and(|src| src.quality().anchored)
+            });
+        let anchored = (reference.is_some() || held_utc)
             && st
                 .disciplined_clock
                 .read_unix_ms(now_mono_ns)
@@ -13951,7 +13964,8 @@ impl Router {
             .filter(|ns| *ns >= 0)
             && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
         {
-            st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
+            st.disciplined_clock
+                .steer_unix_ns(now_ns, unix_ns.min(i128::from(i64::MAX)) as i64);
         }
     }
 
@@ -14002,6 +14016,7 @@ impl Router {
                 .filter(|ns| *ns >= 0)
                 && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
             {
+                let unix_ns = unix_ns.min(i128::from(i64::MAX)) as i64;
                 // A node that follows a better remote source (an RRLS while the
                 // GS leads) keeps its host time as a candidate only; steering
                 // the clock to it would fight the exchange discipline.

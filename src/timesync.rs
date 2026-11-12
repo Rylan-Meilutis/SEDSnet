@@ -386,11 +386,14 @@ pub struct NetworkTimeReading {
 }
 
 /// Monotonic-anchor clock that slews toward target Unix time instead of stepping immediately.
+///
+/// Internally 64-bit (Unix ns fits until 2262); one shared multiply-divide
+/// helper does the scaling, which keeps 128-bit code off small targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlewedNetworkClock {
     anchor_mono_ns: u64,
-    anchor_unix_ns: i128,
-    pending_adjust_ns: i128,
+    anchor_unix_ns: i64,
+    pending_adjust_ns: i64,
     max_slew_ppm: u32,
     initialized: bool,
     /// Learned frequency correction of the local oscillator, ppb.
@@ -410,6 +413,10 @@ impl Default for SlewedNetworkClock {
     }
 }
 
+fn clamp_unix_ns(ns: i128) -> i64 {
+    ns.clamp(0, i128::from(i64::MAX)) as i64
+}
+
 impl SlewedNetworkClock {
     /// Creates a new slewed clock with the given slew-rate cap in parts per million.
     pub fn new(max_slew_ppm: u32) -> Self {
@@ -424,60 +431,61 @@ impl SlewedNetworkClock {
         self.initialized
     }
 
-    /// Reads the current estimated Unix time in nanoseconds from a monotonic timestamp.
-    pub fn read_unix_ns(&self, now_mono_ns: u64) -> Option<i128> {
+    /// Slew applied after `elapsed_ns` since the anchor, ns.
+    fn applied_slew(&self, elapsed_ns: i64) -> i64 {
+        let max_adjust = crate::timesync_discipline::mul_div(elapsed_ns, i64::from(self.max_slew_ppm), 1_000_000);
+        self.pending_adjust_ns.clamp(-max_adjust, max_adjust)
+    }
+
+    fn read_ns(&self, now_mono_ns: u64) -> Option<i64> {
         if !self.initialized {
             return None;
         }
-
-        let elapsed_ns = now_mono_ns.saturating_sub(self.anchor_mono_ns) as i128;
-        let max_adjust_ns = elapsed_ns.saturating_mul(self.max_slew_ppm as i128) / 1_000_000;
-        let applied_adjust_ns = if self.pending_adjust_ns >= 0 {
-            self.pending_adjust_ns.min(max_adjust_ns)
-        } else {
-            -(-self.pending_adjust_ns).min(max_adjust_ns)
-        };
-        let rate_adjust_ns = if self.rate_ppb == 0 {
-            0
-        } else {
-            elapsed_ns.saturating_mul(self.rate_ppb as i128) / 1_000_000_000
-        };
-
+        let elapsed = now_mono_ns.saturating_sub(self.anchor_mono_ns).min(i64::MAX as u64) as i64;
+        let rate = crate::timesync_discipline::mul_div(elapsed, self.rate_ppb, 1_000_000_000);
         Some(
             self.anchor_unix_ns
-                .saturating_add(elapsed_ns)
-                .saturating_add(rate_adjust_ns)
-                .saturating_add(applied_adjust_ns),
+                .saturating_add(elapsed)
+                .saturating_add(rate)
+                .saturating_add(self.applied_slew(elapsed)),
         )
     }
 
+    /// Reads the current estimated Unix time in nanoseconds from a monotonic timestamp.
+    pub fn read_unix_ns(&self, now_mono_ns: u64) -> Option<i128> {
+        self.read_ns(now_mono_ns).map(i128::from)
+    }
+
+    /// Reads the current estimated Unix time in milliseconds from a monotonic timestamp.
+    pub fn read_unix_ms(&self, now_mono_ns: u64) -> Option<u64> {
+        let unix_ns = self.read_ns(now_mono_ns)?;
+        (unix_ns >= 0).then_some(unix_ns as u64 / 1_000_000)
+    }
+
     /// Reads the clock at a monotonic instant that may precede the current
-    /// anchor (a stamp taken before the last steering update).
-    pub fn read_unix_ns_at(&self, mono_ns: u64) -> Option<i128> {
+    /// anchor (a stamp taken before the last steering update), Unix ns.
+    pub fn read_unix_ns_at(&self, mono_ns: u64) -> Option<i64> {
         if mono_ns >= self.anchor_mono_ns {
-            return self.read_unix_ns(mono_ns);
+            return self.read_ns(mono_ns);
         }
-        let before = (self.anchor_mono_ns - mono_ns) as i128;
-        let anchor = self.read_unix_ns(self.anchor_mono_ns)?;
-        Some(anchor - before - before * self.rate_ppb as i128 / 1_000_000_000)
+        let before = (self.anchor_mono_ns - mono_ns).min(i64::MAX as u64) as i64;
+        let anchor = self.read_ns(self.anchor_mono_ns)?;
+        Some(anchor - before - crate::timesync_discipline::mul_div(before, self.rate_ppb, 1_000_000_000))
+    }
+
+    /// Correction still to be slewed out at `now_mono_ns`, ns (signed:
+    /// positive when the clock reads behind its target).
+    pub fn pending_signed_ns(&self, now_mono_ns: u64) -> i64 {
+        if !self.initialized {
+            return 0;
+        }
+        let elapsed = now_mono_ns.saturating_sub(self.anchor_mono_ns).min(i64::MAX as u64) as i64;
+        self.pending_adjust_ns - self.applied_slew(elapsed)
     }
 
     /// Correction still to be slewed out at `now_mono_ns`, ns (absolute).
     pub fn pending_ns(&self, now_mono_ns: u64) -> u64 {
-        if !self.initialized {
-            return 0;
-        }
-        let elapsed_ns = now_mono_ns.saturating_sub(self.anchor_mono_ns) as i128;
-        let max_adjust_ns = elapsed_ns.saturating_mul(self.max_slew_ppm as i128) / 1_000_000;
-        (self.pending_adjust_ns.unsigned_abs().saturating_sub(max_adjust_ns.max(0) as u128))
-            .min(u128::from(u64::MAX)) as u64
-    }
-
-    /// Signed correction still to be slewed out at `now_mono_ns`, ns
-    /// (positive: the clock reads behind its target).
-    pub fn pending_signed_ns(&self, now_mono_ns: u64) -> i128 {
-        let remaining = self.pending_ns(now_mono_ns) as i128;
-        if self.pending_adjust_ns < 0 { -remaining } else { remaining }
+        self.pending_signed_ns(now_mono_ns).unsigned_abs()
     }
 
     /// Learned frequency correction, ppb.
@@ -491,15 +499,15 @@ impl SlewedNetworkClock {
     pub(crate) fn discipline_ns(
         &mut self,
         now_mono_ns: u64,
-        target_unix_ns: i128,
+        target_unix_ns: i64,
         rate_ppb: i64,
         allow_step: bool,
     ) {
-        let current = self.read_unix_ns(now_mono_ns);
+        let current = self.read_ns(now_mono_ns);
         self.rate_ppb = rate_ppb;
         self.anchor_mono_ns = now_mono_ns;
         match current {
-            Some(current) if self.initialized && !allow_step => {
+            Some(current) if !allow_step => {
                 self.anchor_unix_ns = current;
                 self.pending_adjust_ns = target_unix_ns.saturating_sub(current);
             }
@@ -512,27 +520,22 @@ impl SlewedNetworkClock {
     }
 
     /// Steers toward an absolute reading with nanosecond resolution.
-    pub fn steer_unix_ns(&mut self, now_mono_ns: u64, target_unix_ns: i128) {
-        if !self.initialized {
-            self.anchor_mono_ns = now_mono_ns;
-            self.anchor_unix_ns = target_unix_ns;
-            self.pending_adjust_ns = 0;
-            self.initialized = true;
-            return;
-        }
-        let current_unix_ns = self.read_unix_ns(now_mono_ns).unwrap_or(target_unix_ns);
+    pub fn steer_unix_ns(&mut self, now_mono_ns: u64, target_unix_ns: i64) {
+        let current = self.read_ns(now_mono_ns);
         self.anchor_mono_ns = now_mono_ns;
-        self.anchor_unix_ns = current_unix_ns;
-        self.pending_adjust_ns = target_unix_ns.saturating_sub(current_unix_ns);
-    }
-
-    /// Reads the current estimated Unix time in milliseconds from a monotonic timestamp.
-    pub fn read_unix_ms(&self, now_mono_ns: u64) -> Option<u64> {
-        let unix_ns = self.read_unix_ns(now_mono_ns)?;
-        if unix_ns < 0 {
-            return None;
+        match current {
+            Some(current) => {
+                self.anchor_unix_ns = current;
+                // The target is an absolute observation at `now`, not an
+                // incremental correction: it replaces the residual error.
+                self.pending_adjust_ns = target_unix_ns.saturating_sub(current);
+            }
+            None => {
+                self.anchor_unix_ns = target_unix_ns;
+                self.pending_adjust_ns = 0;
+                self.initialized = true;
+            }
         }
-        u64::try_from(unix_ns / 1_000_000).ok()
     }
 
     /// Corrects a gross forward error only after the caller validates a fresh
@@ -540,10 +543,10 @@ impl SlewedNetworkClock {
     /// traffic and ordinary source updates must continue using `steer_unix_ms`.
     /// Backward and <=5-second corrections retain the configured slew policy.
     pub(crate) fn steer_verified_response_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
-        let target_ns = (target_unix_ms as i128) * 1_000_000;
+        let target_ns = clamp_unix_ns(i128::from(target_unix_ms) * 1_000_000);
         if self.max_slew_ppm != 0
-            && self.read_unix_ns(now_mono_ns).is_some_and(|current| {
-                target_ns.saturating_sub(current) > TIMESYNC_STEP_THRESHOLD_MS as i128 * 1_000_000
+            && self.read_ns(now_mono_ns).is_some_and(|current| {
+                target_ns.saturating_sub(current) > TIMESYNC_STEP_THRESHOLD_MS as i64 * 1_000_000
             })
         {
             self.anchor_mono_ns = now_mono_ns;
@@ -558,16 +561,14 @@ impl SlewedNetworkClock {
     /// this only when replacing unanchored time with time traceable to UTC.
     pub(crate) fn step_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
         self.anchor_mono_ns = now_mono_ns;
-        self.anchor_unix_ns = (target_unix_ms as i128) * 1_000_000;
+        self.anchor_unix_ns = clamp_unix_ns(i128::from(target_unix_ms) * 1_000_000);
         self.pending_adjust_ns = 0;
         self.initialized = true;
     }
 
     /// Steers the clock toward a target Unix millisecond reading at the configured slew rate.
     pub fn steer_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
-        // The target is an absolute observation at `now`, not an incremental
-        // correction. Repeated observations must replace the residual error.
-        self.steer_unix_ns(now_mono_ns, (target_unix_ms as i128) * 1_000_000);
+        self.steer_unix_ns(now_mono_ns, clamp_unix_ns(i128::from(target_unix_ms) * 1_000_000));
     }
 }
 
