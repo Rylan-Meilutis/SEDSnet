@@ -2,11 +2,15 @@
 
 ## Unreleased
 
-**Breaking wire change.** A side opened with `SideOptions::compact_bundle`
-carries compact bundles, and nodes on such a link must all run a
-bundle-capable build. There is no negotiation and no fallback, so the whole
-network (ground station, relay station and every board) must be updated
-together. Sides without the option keep the 4.3.14 framing.
+
+## 5.0.0
+
+**Breaking wire changes (time sync and compact bundles).** SEDSnet 4.x and
+5.x nodes do not interoperate: the GS, RRLS and every board update together.
+Time sync uses the same words differently (frames do not grow), and sides
+opened with `SideOptions::compact_bundle` carry compact bundles with no
+negotiation or fallback. Message schemas, and the framing of sides without
+that option, keep their 4.3.14 representations.
 
 - Add `wire_bundle` (feature `compact-bundle`: on by default for std builds,
   opt-in for `embedded`; CMake `SEDSNET_COMPACT_BUNDLE`). A bundle carries
@@ -25,15 +29,6 @@ together. Sides without the option keep the 4.3.14 framing.
   urgent frames (ABORT) standalone. ABORT decodes with no prior state.
 - Router receive (`rx_packed_from_side`, `rx_packed_queue_from_side`)
   verifies a whole bundle before it delivers any of its frames.
-
-
-## 5.0.0
-
-**Breaking wire change (time sync).** SEDSnet 4.x and 5.x nodes do not keep
-time with each other: the GS, RRLS and every board update together. Frames
-do not grow; time sync uses the same words differently. Other wire framing and
-message schemas keep their 4.3.14 representations.
-
 - Time sync uses NTP interleaved mode in the existing request/response words.
   The response carries the microsecond receive stamp of this request (with the
   responder's sync flag and error-bound code) and the true transmit time of the
