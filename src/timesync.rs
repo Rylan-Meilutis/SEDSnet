@@ -393,6 +393,8 @@ pub struct SlewedNetworkClock {
     pending_adjust_ns: i128,
     max_slew_ppm: u32,
     initialized: bool,
+    /// Learned frequency correction of the local oscillator, ppb.
+    rate_ppb: i64,
 }
 
 impl Default for SlewedNetworkClock {
@@ -403,6 +405,7 @@ impl Default for SlewedNetworkClock {
             pending_adjust_ns: 0,
             max_slew_ppm: 50_000,
             initialized: false,
+            rate_ppb: 0,
         }
     }
 }
@@ -434,12 +437,93 @@ impl SlewedNetworkClock {
         } else {
             -(-self.pending_adjust_ns).min(max_adjust_ns)
         };
+        let rate_adjust_ns = if self.rate_ppb == 0 {
+            0
+        } else {
+            elapsed_ns.saturating_mul(self.rate_ppb as i128) / 1_000_000_000
+        };
 
         Some(
             self.anchor_unix_ns
                 .saturating_add(elapsed_ns)
+                .saturating_add(rate_adjust_ns)
                 .saturating_add(applied_adjust_ns),
         )
+    }
+
+    /// Reads the clock at a monotonic instant that may precede the current
+    /// anchor (a stamp taken before the last steering update).
+    pub fn read_unix_ns_at(&self, mono_ns: u64) -> Option<i128> {
+        if mono_ns >= self.anchor_mono_ns {
+            return self.read_unix_ns(mono_ns);
+        }
+        let before = (self.anchor_mono_ns - mono_ns) as i128;
+        let anchor = self.read_unix_ns(self.anchor_mono_ns)?;
+        Some(anchor - before - before * self.rate_ppb as i128 / 1_000_000_000)
+    }
+
+    /// Correction still to be slewed out at `now_mono_ns`, ns (absolute).
+    pub fn pending_ns(&self, now_mono_ns: u64) -> u64 {
+        if !self.initialized {
+            return 0;
+        }
+        let elapsed_ns = now_mono_ns.saturating_sub(self.anchor_mono_ns) as i128;
+        let max_adjust_ns = elapsed_ns.saturating_mul(self.max_slew_ppm as i128) / 1_000_000;
+        (self.pending_adjust_ns.unsigned_abs().saturating_sub(max_adjust_ns.max(0) as u128))
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    /// Signed correction still to be slewed out at `now_mono_ns`, ns
+    /// (positive: the clock reads behind its target).
+    pub fn pending_signed_ns(&self, now_mono_ns: u64) -> i128 {
+        let remaining = self.pending_ns(now_mono_ns) as i128;
+        if self.pending_adjust_ns < 0 { -remaining } else { remaining }
+    }
+
+    /// Learned frequency correction, ppb.
+    pub fn rate_ppb(&self) -> i64 {
+        self.rate_ppb
+    }
+
+    /// Disciplines the clock toward a two-way-exchange target: sets the
+    /// learned frequency and slews the remaining phase error. `allow_step`
+    /// re-anchors directly (only before the follower first locks).
+    pub(crate) fn discipline_ns(
+        &mut self,
+        now_mono_ns: u64,
+        target_unix_ns: i128,
+        rate_ppb: i64,
+        allow_step: bool,
+    ) {
+        let current = self.read_unix_ns(now_mono_ns);
+        self.rate_ppb = rate_ppb;
+        self.anchor_mono_ns = now_mono_ns;
+        match current {
+            Some(current) if self.initialized && !allow_step => {
+                self.anchor_unix_ns = current;
+                self.pending_adjust_ns = target_unix_ns.saturating_sub(current);
+            }
+            _ => {
+                self.anchor_unix_ns = target_unix_ns;
+                self.pending_adjust_ns = 0;
+            }
+        }
+        self.initialized = true;
+    }
+
+    /// Steers toward an absolute reading with nanosecond resolution.
+    pub fn steer_unix_ns(&mut self, now_mono_ns: u64, target_unix_ns: i128) {
+        if !self.initialized {
+            self.anchor_mono_ns = now_mono_ns;
+            self.anchor_unix_ns = target_unix_ns;
+            self.pending_adjust_ns = 0;
+            self.initialized = true;
+            return;
+        }
+        let current_unix_ns = self.read_unix_ns(now_mono_ns).unwrap_or(target_unix_ns);
+        self.anchor_mono_ns = now_mono_ns;
+        self.anchor_unix_ns = current_unix_ns;
+        self.pending_adjust_ns = target_unix_ns.saturating_sub(current_unix_ns);
     }
 
     /// Reads the current estimated Unix time in milliseconds from a monotonic timestamp.
@@ -481,22 +565,92 @@ impl SlewedNetworkClock {
 
     /// Steers the clock toward a target Unix millisecond reading at the configured slew rate.
     pub fn steer_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
-        let target_unix_ns = (target_unix_ms as i128) * 1_000_000;
-        if !self.initialized {
-            self.anchor_mono_ns = now_mono_ns;
-            self.anchor_unix_ns = target_unix_ns;
-            self.pending_adjust_ns = 0;
-            self.initialized = true;
-            return;
-        }
-
-        let current_unix_ns = self.read_unix_ns(now_mono_ns).unwrap_or(target_unix_ns);
-        self.anchor_mono_ns = now_mono_ns;
-        self.anchor_unix_ns = current_unix_ns;
         // The target is an absolute observation at `now`, not an incremental
         // correction. Repeated observations must replace the residual error.
-        self.pending_adjust_ns = target_unix_ns.saturating_sub(current_unix_ns);
-        self.initialized = true;
+        self.steer_unix_ns(now_mono_ns, (target_unix_ms as i128) * 1_000_000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interleaved (v2) exchange carried in the existing request/response words.
+//
+// Request  [seq, t1]: seq bit 31 asks for a v2 answer. The low 30 bits are the
+//          counter, bits 32..64 the target tag as before. t1 stays the
+//          requester's monotonic millisecond cookie; the precise transmit
+//          instant is kept locally.
+// Response [seq | bit 30, t1, t2, t3] when the request asked for v2:
+//          t2 = bits 0..56 responder network time in microseconds when the
+//               request was received; bit 63 = responder synced; bits 56..63
+//               = responder error bound code (timesync_discipline).
+//          t3 = bits 0..56 network microseconds at which the responder's
+//               PREVIOUS response to this requester actually left; bits
+//               56..64 = low byte of that previous request's counter. 0 when
+//               no earlier response is known.
+// A legacy responder echoes seq unchanged and answers in milliseconds, so the
+// requester sees bit 30 clear and uses the legacy meaning. A legacy requester
+// never sets bit 31 and gets a legacy answer. No frame grows.
+// ---------------------------------------------------------------------------
+
+/// Request seq flag asking for an interleaved microsecond answer.
+pub const TIMESYNC_V2_REQUEST: u64 = 1 << 31;
+/// Response seq flag marking an interleaved microsecond answer.
+pub const TIMESYNC_V2_RESPONSE: u64 = 1 << 30;
+/// Request counter bits of the seq word.
+pub const TIMESYNC_SEQ_COUNTER_MASK: u64 = (1 << 30) - 1;
+const V2_TIME_MASK: u64 = (1 << 56) - 1;
+
+/// Packs a v2 response t2 word.
+pub fn encode_v2_receive_word(t2_unix_us: u64, synced: bool, error_code: u8) -> u64 {
+    (t2_unix_us & V2_TIME_MASK)
+        | (u64::from(error_code & 0x7F) << 56)
+        | if synced { 1 << 63 } else { 0 }
+}
+
+/// Unpacks a v2 response t2 word: (unix microseconds, synced, error code).
+pub fn decode_v2_receive_word(word: u64) -> (u64, bool, u8) {
+    (word & V2_TIME_MASK, word >> 63 == 1, ((word >> 56) & 0x7F) as u8)
+}
+
+/// Packs a v2 response t3 word for the previous exchange.
+pub fn encode_v2_transmit_word(prev_counter: u64, t3_unix_us: u64) -> u64 {
+    (t3_unix_us & V2_TIME_MASK) | ((prev_counter & 0xFF) << 56)
+}
+
+/// Unpacks a v2 response t3 word: (previous counter low byte, unix microseconds).
+/// `None` when the responder had no earlier transmit stamp.
+pub fn decode_v2_transmit_word(word: u64) -> Option<(u8, u64)> {
+    (word != 0).then_some(((word >> 56) as u8, word & V2_TIME_MASK))
+}
+
+/// Per-node time sync quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSyncStatus {
+    /// Lock state.
+    pub state: crate::timesync_discipline::SyncState,
+    /// Hops from the reference: 0 for the reference itself.
+    pub stratum: u8,
+    /// Estimated error bound of network time, ns (`u64::MAX` when unknown).
+    pub error_bound_ns: u64,
+    /// Correction still being slewed out, ns (positive: clock is behind).
+    pub offset_ns: i64,
+    /// Learned oscillator frequency correction, ppb.
+    pub rate_ppb: i64,
+    /// Age of the newest accepted exchange sample, ms (`u64::MAX` when none).
+    pub last_sample_age_ms: u64,
+    /// The node is the reference others follow.
+    pub is_reference: bool,
+}
+
+impl TimeSyncStatus {
+    /// One-byte health summary: bit 7 = synced (locked or holdover), bits 0..7 =
+    /// error bound code (127 = unknown).
+    pub fn health_byte(&self) -> u8 {
+        let code = if self.error_bound_ns == u64::MAX {
+            127
+        } else {
+            crate::timesync_discipline::encode_error_code(self.error_bound_ns)
+        };
+        code | if self.state.is_synced() { 0x80 } else { 0 }
     }
 }
 

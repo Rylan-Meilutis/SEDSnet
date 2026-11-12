@@ -2005,6 +2005,134 @@ pub extern "C" fn seds_router_configure_timesync(
     status_from_result_code(SedsResult::SedsOk)
 }
 
+/// Time sync quality for C callers. See `seds_router_get_timesync_status`.
+#[cfg(feature = "timesync")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SedsTimeSyncStatus {
+    /// 0 unsynced, 1 acquiring, 2 locked, 3 holdover.
+    pub state: u8,
+    /// Hops from the reference (0 = this node is the reference).
+    pub stratum: u8,
+    /// 1 when this node is the reference others follow.
+    pub is_reference: u8,
+    /// Bit 7 synced, bits 0..7 error bound code (see `seds_timesync_error_code_us`).
+    pub health_byte: u8,
+    /// Error bound of network time in microseconds (UINT32_MAX when unknown).
+    pub error_bound_us: u32,
+    /// Correction still being slewed out, microseconds (positive: behind).
+    pub offset_us: i32,
+    /// Learned oscillator frequency correction, parts per billion.
+    pub rate_ppb: i32,
+    /// Age of the newest accepted exchange sample, ms (UINT32_MAX when none).
+    pub last_sample_age_ms: u32,
+}
+
+/// Reads this node's time sync quality.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_timesync_status(
+    r: *mut SedsRouter,
+    out: *mut SedsTimeSyncStatus,
+) -> i32 {
+    if r.is_null() || out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let Some(st) = router.timesync_status() else {
+        return status_from_err(TelemetryError::Io("time sync not configured"));
+    };
+    let clamp_u32 = |v: u64| v.min(u64::from(u32::MAX)) as u32;
+    unsafe {
+        *out = SedsTimeSyncStatus {
+            state: st.state.code(),
+            stratum: st.stratum,
+            is_reference: u8::from(st.is_reference),
+            health_byte: st.health_byte(),
+            error_bound_us: if st.error_bound_ns == u64::MAX {
+                u32::MAX
+            } else {
+                clamp_u32(st.error_bound_ns / 1_000)
+            },
+            offset_us: (st.offset_ns / 1_000).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            rate_ppb: st.rate_ppb.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            last_sample_age_ms: clamp_u32(st.last_sample_age_ms),
+        };
+    }
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Reports that the transport finished sending `bytes` (exactly the frame the
+/// side callback received) at `sent_us` on the router's clock (the same
+/// timebase as the router's now callback, in microseconds; a millisecond
+/// board passes ms * 1000). Call it from task context after the TX-complete
+/// interrupt recorded the instant. Frames other than time sync cost a length
+/// compare.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_note_frame_sent(
+    r: *mut SedsRouter,
+    side_id: u32,
+    bytes: *const u8,
+    len: usize,
+    sent_us: u64,
+) -> i32 {
+    if r.is_null() || (len > 0 && bytes.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let slice = unsafe { slice::from_raw_parts(bytes, len) };
+    router.note_frame_sent(side_id as usize, slice, sent_us.saturating_mul(1_000));
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// `seds_router_receive_packed_from_side` with the receive instant captured
+/// by the transport (router clock, microseconds), e.g. in the RX interrupt.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_receive_packed_from_side_at(
+    r: *mut SedsRouter,
+    side_id: u32,
+    bytes: *const u8,
+    len: usize,
+    rx_us: u64,
+) -> i32 {
+    if r.is_null() || (len > 0 && bytes.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let slice = unsafe { slice::from_raw_parts(bytes, len) };
+    ok_or_status(router.rx_packed_from_side_at(slice, side_id as usize, rx_us.saturating_mul(1_000)))
+}
+
+/// Describes a side's path for time sync: per-byte delay between the
+/// transmit and receive stamps (ns) and a fixed (response - request) / 2
+/// asymmetry (ns). See `Router::set_side_timesync_path`.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_timesync_path(
+    r: *mut SedsRouter,
+    side_id: u32,
+    byte_ns: u32,
+    fixed_asymmetry_ns: i32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_side_timesync_path(side_id as usize, byte_ns, fixed_asymmetry_ns);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Decodes a 7-bit time sync error code (health byte bits 0..7) to an upper
+/// bound in microseconds; UINT32_MAX for 127 (unknown).
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_timesync_error_code_us(code: u8) -> u32 {
+    let ns = crate::timesync_discipline::decode_error_code(code);
+    if ns == u64::MAX { u32::MAX } else { (ns / 1_000).min(u64::from(u32::MAX - 1)) as u32 }
+}
+
 #[cfg(feature = "timesync")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_poll_timesync(r: *mut SedsRouter, out_did_queue: *mut bool) -> i32 {
@@ -3109,6 +3237,14 @@ pub extern "C" fn seds_endpoint_exists(endpoint: u32) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_dtype_exists(ty: u32) -> bool {
     data_type_exists(DataType(ty))
+}
+
+/// Sets a type's signed scheduling class: < 0 urgent (above SEDSnet network
+/// control, e.g. ABORT), >= 0 ordinary schema order. Local policy only.
+/// Returns false when the urgent table is full.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_dtype_set_scheduling_class(ty: u32, class: i8) -> bool {
+    crate::set_type_scheduling_class(DataType(ty), class)
 }
 
 /// Derive an order-independent identity without requiring local registration.

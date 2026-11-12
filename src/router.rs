@@ -233,7 +233,7 @@ use crate::timesync::{
     NetworkTimeReading, PartialNetworkTime, SlewedNetworkClock, TIMESYNC_MAX_STRATUM,
     TIMESYNC_STEP_THRESHOLD_MS, TIMESYNC_UTC_FLOOR_MS, TimeSyncConfig, TimeSyncLeader,
     TimeSyncQuality, TimeSyncSource, TimeSyncTracker, advance_network_time,
-    compute_network_time_sample, decode_timesync_announce, decode_timesync_quality,
+    decode_timesync_announce, decode_timesync_quality,
     decode_timesync_request, decode_timesync_response, encode_timesync_priority,
     timesync_sender_tag,
 };
@@ -4136,6 +4136,10 @@ pub struct Router {
     clock: Box<dyn Clock + Send + Sync>,
     #[cfg(feature = "timesync")]
     timesync: Option<Box<RouterMutex<TimeSyncRuntime>>>,
+    /// Side and transmit-mark slot of a time sync frame being handed to a
+    /// side callback (`side << 8 | slot + 1`), 0 when none.
+    #[cfg(feature = "timesync")]
+    timesync_tx_arm: core::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "std")]
@@ -4185,7 +4189,6 @@ struct PendingTimeSyncRequest {
 #[cfg(feature = "timesync")]
 #[derive(Debug, Clone)]
 struct RemoteTimeSyncSource {
-    priority: u64,
     last_sample_mono_ms: u64,
     sample_unix_ms: u64,
     side: Option<RouterSideId>,
@@ -4204,6 +4207,7 @@ struct TimeSyncRuntime {
     next_request_mono_ms: u64,
     pending_request: Option<PendingTimeSyncRequest>,
     clock_anchored: bool,
+    v2: timesync_v2::TimeSyncV2,
 }
 
 #[cfg(feature = "timesync")]
@@ -4223,6 +4227,7 @@ impl TimeSyncRuntime {
             next_request_mono_ms: 0,
             pending_request: None,
             clock_anchored: false,
+            v2: Default::default(),
         }
     }
 }
@@ -7521,7 +7526,12 @@ impl Router {
                 Some(pending.source.as_str()) != active_remote
                     || now_ms < pending.t1_mono_ms
                     || now_ms.saturating_sub(pending.t1_mono_ms)
-                        > st.cfg.map(|cfg| cfg.source_timeout_ms).unwrap_or(0)
+                        > st.cfg.map_or(0, |cfg| {
+                            // A lost exchange must not block the next one for
+                            // the whole source timeout.
+                            cfg.source_timeout_ms
+                                .min(cfg.request_interval_ms.saturating_mul(2).max(1_000))
+                        })
             });
         if should_clear {
             st.pending_request = None;
@@ -13351,6 +13361,10 @@ impl Router {
             RouterTxHandlerFn::PackedWithPriority(handler) => handler(bytes, priority),
             RouterTxHandlerFn::Packet(_) => Err(TelemetryError::BadArg),
         };
+        #[cfg(feature = "timesync")]
+        if result.is_ok() {
+            self.timesync_note_handed_frame(side, bytes);
+        }
         #[cfg(feature = "latest-value-egress")]
         if result.is_ok() && _service.token != 0 && _service.side != 0 {
             let mut st = self.state.lock();
@@ -13473,6 +13487,24 @@ impl Router {
         ) {
             return Ok(());
         }
+        #[cfg(feature = "timesync")]
+        let timesync_frame = matches!(ty, DataType::TimeSyncRequest | DataType::TimeSyncResponse);
+        #[cfg(feature = "timesync")]
+        if timesync_frame {
+            self.timesync_note_handoff(side, data);
+        }
+        #[cfg(feature = "timesync")]
+        struct Disarm<'a>(&'a Router, bool);
+        #[cfg(feature = "timesync")]
+        impl Drop for Disarm<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.timesync_disarm();
+                }
+            }
+        }
+        #[cfg(feature = "timesync")]
+        let _disarm = Disarm(self, timesync_frame);
         let result = match (handler, data) {
             (
                 packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)),
@@ -13851,7 +13883,9 @@ impl Router {
             None
         };
         Self::reconcile_pending_timesync_request_locked(&mut st, &leader, now_mono_ms);
-        if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref() {
+        if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref()
+            && !st.v2.has_samples_from(&remote.sender)
+        {
             Self::timesync_steer_projected_locked(&mut st, remote, now_mono_ms, now_mono_ns);
         }
     }
@@ -13902,8 +13936,12 @@ impl Router {
         {
             return;
         }
-        if let Some(unix_ms) = time.to_network_time().and_then(|t| t.as_unix_ms()) {
-            st.disciplined_clock.steer_unix_ms(now_ns, unix_ms);
+        if let Some(unix_ns) = time
+            .to_network_time()
+            .and_then(|t| t.as_unix_ns())
+            .filter(|ns| *ns >= 0)
+        {
+            st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
         }
     }
 
@@ -13948,11 +13986,12 @@ impl Router {
             st.clock.remove_source(LOCAL_TIMESYNC_DATE_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_TOD_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_SUBSEC_SOURCE_ID);
-            if let Some(unix_ms) = adjusted
+            if let Some(unix_ns) = adjusted
                 .to_network_time()
-                .and_then(|time| time.as_unix_ms())
+                .and_then(|time| time.as_unix_ns())
+                .filter(|ns| *ns >= 0)
             {
-                st.disciplined_clock.steer_unix_ms(now_ns, unix_ms);
+                st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
             }
         } else {
             // Prepare every allocation first. In particular, do not erase an
@@ -14211,6 +14250,7 @@ impl Router {
         st.next_request_mono_ms = 0;
         st.pending_request = None;
         st.clock_anchored = false;
+        st.v2.reset();
         st.clock.remove_source(INTERNAL_TIMESYNC_SOURCE_ID);
         for source in stale_remote_sources {
             st.clock.remove_source(&source);
@@ -14385,9 +14425,12 @@ impl Router {
             };
             Self::reconcile_pending_timesync_request_locked(&mut st, &leader, now_ms);
 
-            if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref() {
+            if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref()
+                && !st.v2.has_samples_from(&remote.sender)
+            {
                 Self::timesync_steer_projected_locked(&mut st, remote, now_ms, now_ns);
             }
+            let _ = Self::timesync_status_locked(&mut st, leader.as_ref(), now_ns);
 
             if now_ms >= st.next_announce_mono_ms {
                 if let Some(priority) = announce_prio {
@@ -14410,15 +14453,27 @@ impl Router {
                 && now_ms >= st.next_request_mono_ms
                 && st.pending_request.is_none()
             {
-                let seq = st.next_seq;
-                st.next_seq = u64::from((seq as u32).wrapping_add(1).max(1));
+                let seq = st.next_seq & crate::timesync::TIMESYNC_SEQ_COUNTER_MASK;
+                st.next_seq = ((seq + 1) & crate::timesync::TIMESYNC_SEQ_COUNTER_MASK).max(1);
+                // Bit 31 asks a v2 responder for an interleaved microsecond
+                // answer; a legacy responder echoes it and answers as before.
+                let seq = seq | crate::timesync::TIMESYNC_V2_REQUEST;
                 // A request on a known side names its target so other servers on
                 // a shared segment stay silent. Legacy servers echo the word.
                 let side = st.remote_sources.get(&remote.sender).and_then(|src| src.side);
                 let seq = side.map_or(seq, |_| {
                     (u64::from(timesync_sender_tag(&remote.sender)) << 32) | seq
                 });
-                st.next_request_mono_ms = now_ms.saturating_add(cfg.request_interval_ms);
+                // Locked followers exchange less often: the learned frequency
+                // carries the clock between samples and the radio is busy.
+                let interval = if st.v2.is_locked() {
+                    cfg.request_interval_ms
+                        .saturating_mul(timesync_v2::LOCKED_REQUEST_DIVISOR)
+                } else {
+                    cfg.request_interval_ms
+                };
+                st.next_request_mono_ms = now_ms.saturating_add(interval);
+                Self::timesync_record_request_locked(&mut st, seq, now_ms, now_ns);
                 st.pending_request = Some(PendingTimeSyncRequest {
                     seq,
                     t1_mono_ms: now_ms,
@@ -14524,7 +14579,6 @@ impl Router {
                         &st.remote_sources,
                         pkt.sender(),
                         RemoteTimeSyncSource {
-                            priority: quality.priority,
                             last_sample_mono_ms: now_mono_ms,
                             sample_unix_ms: ann.time_ms,
                             side: src,
@@ -14545,7 +14599,10 @@ impl Router {
                         tracker.commit_source(tracker_update);
                         matches!(tracker.leader(now_mono_ms, has_usable_time),
                             Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pkt.sender())
-                    };
+                    } && (!st.v2.has_samples_from(pkt.sender())
+                        // UTC replacing unanchored time is taken from the
+                        // announce at once, as before.
+                        || (quality.anchored && !st.clock_anchored));
                     if should_steer {
                         Self::timesync_steer_remote_locked(
                             &mut st,
@@ -14570,80 +14627,58 @@ impl Router {
                         || target == timesync_sender_tag(&sender)
                         || target == local_address);
                     if should_serve {
-                        let network_now = st
-                            .disciplined_clock
-                            .read_unix_ms(now_mono_ns)
-                            .or_else(|| {
-                                st.clock
-                                    .current_time(now_mono_ns)
-                                    .and_then(|t| t.unix_time_ms)
-                            })
-                            .unwrap_or(now_mono_ms);
-                        let t2 = network_now;
-                        let t3 = network_now;
-                        response = Some((req.seq, req.t1_ms, t2, t3, src));
+                        let leader = st
+                            .tracker
+                            .as_ref()
+                            .and_then(|tracker| tracker.leader(now_mono_ms, has_usable_time));
+                        let status =
+                            Self::timesync_status_locked(&mut st, leader.as_ref(), now_mono_ns);
+                        let (seq, t1, t2, t3) = Self::timesync_build_response_locked(
+                            &mut st,
+                            pkt.sender(),
+                            req.seq,
+                            req.t1_ms,
+                            now_mono_ns,
+                            now_mono_ms,
+                            &status,
+                        );
+                        response = Some((seq, t1, t2, t3, src));
                     }
                 }
                 DataType::TimeSyncResponse => {
                     let resp = decode_timesync_response(pkt)?;
-                    let pending = st.pending_request.clone();
-                    if let Some(pending) = pending
-                        && pending.seq == resp.seq
-                        && pending.source == pkt.sender()
-                        && pending.t1_mono_ms == resp.t1_ms
-                        && now_mono_ms >= pending.t1_mono_ms
-                        && now_mono_ms - pending.t1_mono_ms <= cfg.source_timeout_ms
-                        && resp.t3_ms >= resp.t2_ms
-                        && resp.t3_ms - resp.t2_ms <= now_mono_ms - pending.t1_mono_ms
-                        && matches!(st.tracker.as_ref().and_then(|tracker|tracker.leader(now_mono_ms, has_usable_time)),
-                            Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pending.source)
-                    {
-                        let (source_priority, source_anchored) = {
-                            let tracker = st.tracker.as_ref().expect("tracker checked above");
-                            let quality = tracker.best_active_source(now_mono_ms).map(|s| s.quality());
-                            (
-                                quality
-                                    .map(|q| q.priority)
-                                    .or_else(|| st.remote_sources.get(pkt.sender()).map(|s| s.priority))
-                                    .unwrap_or(cfg.priority),
-                                quality.is_some_and(|q| q.anchored),
-                            )
-                        };
-                        let source_side = st.remote_sources.get(pkt.sender()).and_then(|s| s.side);
-                        let (estimate_ms, _delay_ms) = compute_network_time_sample(
-                            pending.t1_mono_ms,
-                            resp.t2_ms,
-                            resp.t3_ms,
-                            now_mono_ms,
-                        );
-                        let remote_update = crate::peer_record::prepare(
-                            &st.remote_sources,
-                            pkt.sender(),
-                            RemoteTimeSyncSource {
-                                priority: source_priority,
-                                last_sample_mono_ms: now_mono_ms,
-                                sample_unix_ms: estimate_ms,
-                                side: source_side.or(src),
-                            },
-                        )?;
-                        let clock_update = st.clock.prepare_source(
-                            pkt.sender(),
-                            source_priority,
-                            PartialNetworkTime::from_unix_ms(estimate_ms),
-                            now_mono_ms,
-                            now_mono_ns,
-                            Some(cfg.source_timeout_ms),
-                        )?;
-                        remote_update.commit(&mut st.remote_sources);
-                        st.clock.commit_source(clock_update);
-                        Self::timesync_steer_remote_locked(
+                    let source_quality = st.tracker.as_ref().and_then(|tracker| {
+                        match tracker.leader(now_mono_ms, has_usable_time) {
+                            Some(TimeSyncLeader::Remote(remote)) if remote.sender == pkt.sender() => {
+                                Some(remote.quality())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(quality) = source_quality {
+                        let answered = st.pending_request.as_ref().is_some_and(|pending| {
+                            pending.seq == resp.seq & !crate::timesync::TIMESYNC_V2_RESPONSE
+                                && pending.t1_mono_ms == resp.t1_ms
+                                && pending.source == pkt.sender()
+                        });
+                        if answered {
+                            st.pending_request = None;
+                        }
+                        let steered = Self::timesync_handle_response_locked(
                             &mut st,
+                            pkt.sender(),
+                            (resp.seq, resp.t1_ms, resp.t2_ms, resp.t3_ms),
+                            src,
                             now_mono_ns,
-                            estimate_ms,
-                            source_anchored,
-                            true,
+                            quality.anchored,
                         );
-                        st.pending_request = None;
+                        if steered
+                            && let Some(now_unix_ms) = st.disciplined_clock.read_unix_ms(now_mono_ns)
+                            && let Some(remote) = st.remote_sources.get_mut(pkt.sender())
+                        {
+                            remote.last_sample_mono_ms = now_mono_ms;
+                            remote.sample_unix_ms = now_unix_ms;
+                        }
                     }
                 }
                 _ => {}
@@ -14811,6 +14846,8 @@ impl Router {
             #[cfg(feature = "timesync")]
             timesync: local_services_enabled
                 .then(|| Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)))),
+            #[cfg(feature = "timesync")]
+            timesync_tx_arm: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -18474,6 +18511,8 @@ impl Router {
         };
         let data = RouterItem::Packed(decoded);
         let priority = self.item_service_priority(&data)?;
+        #[cfg(feature = "timesync")]
+        self.timesync_note_rx(&data, self.monotonic_now_ns());
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
             src: Some(side),
@@ -20676,6 +20715,8 @@ impl Router {
             return Ok(());
         };
         let data = RouterItem::Packed(decoded);
+        #[cfg(feature = "timesync")]
+        self.timesync_note_rx(&data, self.monotonic_now_ns());
         let item = RouterRxItem {
             src: Some(side),
             priority: Self::router_item_priority(&data)?,
@@ -22196,6 +22237,9 @@ mod retry_backpressure_native;
 
 #[path = "router_e2e_backpressure.rs"]
 mod e2e_backpressure;
+#[cfg(feature = "timesync")]
+#[path = "router_timesync.rs"]
+mod timesync_v2;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "timesync"))]
 #[path = "tests/peer_record_footprint.rs"]
 mod peer_record_footprint;

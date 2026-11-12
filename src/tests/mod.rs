@@ -466,3 +466,6 @@ mod borrowed_election;
 
 #[cfg(all(feature = "timesync", feature = "compression"))]
 mod timesync_hierarchy;
+
+#[cfg(all(feature = "timesync", feature = "std"))]
+mod timesync_interleaved;

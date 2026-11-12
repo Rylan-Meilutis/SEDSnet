@@ -202,6 +202,8 @@ mod small_payload;
 mod small_sort;
 #[cfg(feature = "timesync")]
 pub mod timesync;
+#[cfg(feature = "timesync")]
+pub mod timesync_discipline;
 mod type_stats;
 mod varint;
 pub mod wire_format;
@@ -674,23 +676,71 @@ pub fn message_priority(ty: DataType) -> u8 {
     config::message_delivery_meta(ty).1
 }
 
-/// Priority used by the router/relay schedulers.
+/// Types an application has placed above SEDSnet's own network control
+/// (signed scheduling priority < 0), e.g. ABORT. Stored as `type id + 1`;
+/// local scheduling policy only: it is not part of the schema identity and
+/// never travels on the wire, so old and new nodes interoperate.
+static URGENT_TYPES: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+
+/// Sets a type's signed scheduling class.
 ///
-/// Protocol control traffic has reserved bands so an application schema
-/// cannot accidentally starve discovery, managed variables, or time sync by
-/// assigning a user message priority of 255. The priority stored in the
-/// schema is otherwise preserved, including the relative ordering of all
-/// application-defined messages.
+/// SEDSnet schedules in three bands:
+/// - `class < 0`: urgent safety traffic (Abort first), served before
+///   everything except reliable-delivery control, which must stay first so
+///   full queues can drain;
+/// - `0`: SEDSnet network control (discovery, time sync, schema, managed
+///   variables) -- the application cannot place its own types here;
+/// - `class > 0` (the default for every application type): ordinary data in
+///   its schema priority order.
+///
+/// Returns `false` when the urgent table (8 types) is full.
+pub fn set_type_scheduling_class(ty: DataType, class: i8) -> bool {
+    use core::sync::atomic::Ordering;
+    let key = ty.0.wrapping_add(1);
+    if class >= 0 {
+        for slot in &URGENT_TYPES {
+            let _ = slot.compare_exchange(key, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+        return true;
+    }
+    if type_is_urgent(ty) {
+        return true;
+    }
+    URGENT_TYPES.iter().any(|slot| {
+        slot.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })
+}
+
+/// `true` when the application placed `ty` in the urgent band.
+#[inline]
+pub fn type_is_urgent(ty: DataType) -> bool {
+    let key = ty.0.wrapping_add(1);
+    URGENT_TYPES
+        .iter()
+        .any(|slot| slot.load(core::sync::atomic::Ordering::Relaxed) == key)
+}
+
+/// Internal scheduling value of SEDSnet network control (signed class 0).
+pub const NETWORK_CONTROL_PRIORITY: u8 = 254;
+
+/// Priority used by the router/relay schedulers (higher is served first).
+///
+/// - 255: reliable-delivery control (acks must release full queues), route
+///   establishment (discovery announce/topology/address) and the urgent types
+///   the application set with [`set_type_scheduling_class`];
+/// - 254: the rest of SEDSnet network control: time sync, schema transfer and
+///   managed variables;
+/// - 0..=253: application data in schema priority order.
 #[inline]
 pub fn transport_priority(ty: DataType) -> u8 {
     match ty {
-        // Delivery control must be able to release reliable packets already
-        // occupying queues. Treat it as part of the highest control band.
         DataType::ReliableAck | DataType::ReliablePartialAck | DataType::ReliablePacketRequest => {
             255
         }
-
-        // A usable route is a prerequisite for every other network service.
+        // Route establishment stays in the top band: bootstrap, reclaim and
+        // relay admission depend on it (a usable route precedes every service).
         DataType::DiscoveryAnnounce
         | DataType::DiscoveryTimeSyncSources
         | DataType::DiscoveryTopology
@@ -698,20 +748,14 @@ pub fn transport_priority(ty: DataType) -> u8 {
         | DataType::DiscoveryLeave
         | DataType::DiscoveryLinkCapabilities
         | DataType::DiscoveryAddress => 255,
-
-        // Schema transfer is discovery-plane repair, but unlike address and
-        // topology advertisements it is not needed to establish a route.
-        // Keep large schema frames below route convergence so they cannot
-        // head-of-line block a constrained serial or radio link.
         DataType::DiscoverySchema
         | DataType::DiscoverySchemaRequest
         | DataType::ManagedVariableRequest
         | DataType::ManagedVariableValue
         | DataType::TimeSyncAnnounce
         | DataType::TimeSyncRequest
-        | DataType::TimeSyncResponse => 254,
-
-        // Preserve application ordering below the reserved control bands.
+        | DataType::TimeSyncResponse => NETWORK_CONTROL_PRIORITY,
+        _ if type_is_urgent(ty) => 255,
         _ => message_priority(ty).min(253),
     }
 }

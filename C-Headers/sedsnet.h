@@ -579,6 +579,49 @@ SedsResult seds_router_configure_timesync(
 );
 
 /**
+ * @brief Time sync quality of this node (SEDSnet 4.4).
+ */
+typedef struct SedsTimeSyncStatus {
+    uint8_t state;            /**< 0 unsynced, 1 acquiring, 2 locked, 3 holdover */
+    uint8_t stratum;          /**< hops from the reference; 0 = this node is the reference */
+    uint8_t is_reference;     /**< 1 when others follow this node */
+    uint8_t health_byte;      /**< bit 7 synced, bits 0..6 error bound code */
+    uint32_t error_bound_us;  /**< error bound of network time; UINT32_MAX when unknown */
+    int32_t offset_us;        /**< correction still being slewed out (positive: behind) */
+    int32_t rate_ppb;         /**< learned oscillator frequency correction */
+    uint32_t last_sample_age_ms; /**< age of newest exchange sample; UINT32_MAX when none */
+} SedsTimeSyncStatus;
+
+/** @brief Read this node's time sync quality. */
+SedsResult seds_router_get_timesync_status(SedsRouter * r, SedsTimeSyncStatus * out);
+
+/**
+ * @brief Report that the transport finished sending a frame.
+ *
+ * `bytes`/`len` are exactly the frame the side callback received; `sent_us` is
+ * the transmit-complete instant on the router clock in microseconds (a
+ * millisecond router clock passes ms * 1000). Call from task context; the
+ * interrupt only records the instant. Non-time-sync frames cost a length compare.
+ */
+SedsResult seds_router_note_frame_sent(SedsRouter * r, uint32_t side_id, const uint8_t * bytes, size_t len, uint64_t sent_us);
+
+/**
+ * @brief `seds_router_receive_packed_from_side` with the transport's receive
+ * instant (router clock, microseconds), e.g. captured in the RX interrupt.
+ */
+SedsResult seds_router_receive_packed_from_side_at(SedsRouter * r, uint32_t side_id, const uint8_t * bytes, size_t len, uint64_t rx_us);
+
+/**
+ * @brief Describe a side's time sync path: delay per frame byte between the
+ * transmit and receive stamps (ns; radio = air + receiving UART per byte) and a
+ * fixed (response - request) / 2 one-way asymmetry (ns).
+ */
+SedsResult seds_router_set_side_timesync_path(SedsRouter * r, uint32_t side_id, uint32_t byte_ns, int32_t fixed_asymmetry_ns);
+
+/** @brief Decode a 7-bit time sync error code to microseconds (UINT32_MAX = unknown). */
+uint32_t seds_timesync_error_code_us(uint8_t code);
+
+/**
  * @brief Poll the router's internal time-sync runtime and queue any due announce/request traffic.
  *
  * This is the non-blocking hook intended for the application's main loop. Call it periodically,
@@ -1147,6 +1190,11 @@ SedsResult seds_router_clear_route_priority(SedsRouter * r, int32_t src_side_id,
 int32_t seds_dtype_expected_size(SedsDataType ty);
 bool seds_endpoint_exists(uint32_t endpoint);
 bool seds_dtype_exists(uint32_t ty);
+/* Signed scheduling class (SEDSnet 4.4): < 0 = urgent, above SEDSnet network
+ * control (discovery/time sync, class 0), e.g. ABORT; >= 0 = ordinary data in
+ * schema priority order. Local policy only, never on the wire. Returns false
+ * when the urgent table (8 types) is full. */
+bool seds_dtype_set_scheduling_class(uint32_t ty, int8_t scheduling_class);
 /* Stable wire identities for runtime declarations and unresolved references.
  * These do not register a definition and work with or without a schema seed. */
 SedsResult seds_endpoint_identity(const char *name, size_t name_len, uint32_t *out_id);
