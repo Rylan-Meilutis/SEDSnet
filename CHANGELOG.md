@@ -70,7 +70,10 @@ that option, keep their 4.3.14 representations.
   `complete_reliable` / `seds_router_complete_reliable` completes one pending
   send on other proof of delivery (never ABORT or urgent types);
   `relayed_frame_satisfied` / `seds_router_relayed_frame_satisfied` lets a
-  driver drop a queued relayed copy every owner already acknowledged.
+  driver drop a queued relayed copy every owner already acknowledged. A relay
+  that receives a duplicate whose every owner already acknowledged answers it
+  with the cached receipt (the one back to the sender was lost) instead of
+  dropping it: once per retry interval, at most four times per packet.
 
 
 ## 4.3.14

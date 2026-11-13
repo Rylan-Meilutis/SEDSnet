@@ -8655,3 +8655,135 @@ fn relayed_copy_held_by_a_driver_queue_is_known_satisfied_once_every_owner_acked
     exchange(false);
     assert!(relay.relayed_frame_satisfied(link, &copy), "every owner acknowledged");
 }
+
+#[test]
+fn relay_replays_cached_receipt_for_a_duplicate_every_owner_already_acked() {
+    // confirm6 at boot: FC's receipt for FLIGHT_STATE=1 passed through RF and
+    // was lost on air before the station heard it. RF had every receipt, so it
+    // dropped the station's next copies and the station retried to exhaustion.
+    // RF now answers such a duplicate with the cached receipt, rate-limited and
+    // bounded so repeated copies cannot flood the link.
+    crate::tests::ensure_common_test_schema();
+    type Wire = Arc<Mutex<Vec<Vec<u8>>>>;
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = |now: &Arc<AtomicU64>| {
+        let now = now.clone();
+        let clock: Box<dyn Clock + Send + Sync> = Box::new(move || now.load(Ordering::SeqCst));
+        clock
+    };
+    let (to_src, to_relay_up, to_dest, to_relay_down): (Wire, Wire, Wire, Wire) =
+        (Arc::default(), Arc::default(), Arc::default(), Arc::default());
+    let src = Router::new_with_clock(RouterConfig::default().with_sender("SRC"), clock(&now));
+    let relay = Router::new_with_clock(RouterConfig::default().with_sender("RELAY"), clock(&now));
+    let dest = Router::new_with_clock(
+        RouterConfig::new([EndpointHandler::new_packet_handler(DataEndpoint::named("RADIO"), |_| Ok(()))])
+            .with_sender("DEST_A"),
+        clock(&now),
+    );
+    let sink = |w: &Wire| {
+        let w = w.clone();
+        move |b: &[u8]| -> TelemetryResult<()> {
+            w.lock().unwrap().push(b.to_vec());
+            Ok(())
+        }
+    };
+    let src_down = src.add_side_packed("DOWN", sink(&to_relay_up));
+    let relay_up = relay.add_side_packed("UP", sink(&to_src));
+    let relay_down = relay.add_side_packed("DOWN", sink(&to_dest));
+    let dest_up = dest.add_side_packed("UP", sink(&to_relay_down));
+    let _ = src_down;
+    let is_receipt = |b: &[u8]| wire_format::unpack_packet(b).is_ok_and(|p| p.data_type() == DataType::ReliableAck);
+    let is_data = |b: &[u8]| {
+        wire_format::unpack_packet(b).is_ok_and(|p| p.data_type() == DataType::named("GPS_DATA"))
+    };
+    // One pass of the wires. `lose_receipts_to_src` drops relay->SRC receipts
+    // (lost on air); returns how many receipts the relay sent toward SRC.
+    let exchange = |lose_receipts_to_src: bool| -> usize {
+        let mut receipts = 0;
+        for _ in 0..4 {
+            for b in std::mem::take(&mut *to_relay_up.lock().unwrap()) {
+                let _ = relay.rx_packed_from_side(&b, relay_up);
+            }
+            for b in std::mem::take(&mut *to_dest.lock().unwrap()) {
+                let _ = dest.rx_packed_from_side(&b, dest_up);
+            }
+            for b in std::mem::take(&mut *to_relay_down.lock().unwrap()) {
+                let _ = relay.rx_packed_from_side(&b, relay_down);
+            }
+            for b in std::mem::take(&mut *to_src.lock().unwrap()) {
+                if is_receipt(&b) {
+                    receipts += 1;
+                    if lose_receipts_to_src {
+                        continue;
+                    }
+                }
+                let _ = src.rx_packed_from_side(&b, src_down);
+            }
+            let _ = src.process_all_queues();
+            let _ = relay.process_all_queues();
+            let _ = dest.process_all_queues();
+        }
+        receipts
+    };
+    for r in [&src, &relay, &dest] {
+        r.announce_discovery().unwrap();
+    }
+    exchange(false);
+    exchange(false);
+    let pkt = Packet::from_f32_slice(
+        DataType::named("GPS_DATA"),
+        &[7.0, 0.0, 0.0],
+        &[DataEndpoint::named("RADIO")],
+        7,
+    )
+    .unwrap();
+    src.tx(pkt).unwrap();
+    // The destination receives it and acknowledges; the relay forwards the
+    // receipt toward SRC, and that copy is lost.
+    assert!(exchange(true) >= 1, "the relay forwarded the destination's receipt");
+    let gps = DataType::named("GPS_DATA");
+    assert!(src.has_pending_reliable_tx_type(gps), "SRC never heard the receipt");
+    let dest_copies = |w: &Wire| w.lock().unwrap().iter().filter(|b| is_data(b)).count();
+    // SRC retries; the relay already holds every owner's receipt, so the copy
+    // goes no further, but the relay answers it with the cached receipt.
+    now.fetch_add(crate::config::runtime_reliable_retransmit_ms() + 1, Ordering::SeqCst);
+    let _ = src.process_all_queues();
+    let retry: Vec<Vec<u8>> = std::mem::take(&mut *to_relay_up.lock().unwrap());
+    assert!(retry.iter().any(|b| is_data(b)), "SRC retried");
+    for b in &retry {
+        let _ = relay.rx_packed_from_side(b, relay_up);
+    }
+    let _ = relay.process_all_queues();
+    assert_eq!(dest_copies(&to_dest), 0, "the satisfied copy is not forwarded again");
+    let replayed: Vec<Vec<u8>> = std::mem::take(&mut *to_src.lock().unwrap());
+    assert_eq!(replayed.iter().filter(|b| is_receipt(b)).count(), 1, "one cached receipt replayed");
+    // Rate limit: more copies inside one retransmit interval replay nothing.
+    for _ in 0..5 {
+        for b in retry.iter().filter(|b| is_data(b)) {
+            let _ = relay.rx_packed_from_side(b, relay_up);
+        }
+        let _ = relay.process_all_queues();
+    }
+    assert_eq!(
+        to_src.lock().unwrap().iter().filter(|b| is_receipt(b)).count(),
+        0,
+        "duplicates within one interval are not answered again"
+    );
+    // Bound: across many intervals the relay answers at most a few times.
+    let mut later = 0;
+    for _ in 0..50 {
+        now.fetch_add(crate::config::runtime_reliable_retransmit_ms() + 1, Ordering::SeqCst);
+        for b in retry.iter().filter(|b| is_data(b)) {
+            let _ = relay.rx_packed_from_side(b, relay_up);
+        }
+        let _ = relay.process_all_queues();
+        later += std::mem::take(&mut *to_src.lock().unwrap()).iter().filter(|b| is_receipt(b)).count();
+    }
+    assert!(later >= 1 && later <= 8, "bounded replays, got {later}");
+    // The replayed receipt completes SRC's send.
+    for b in replayed {
+        let _ = src.rx_packed_from_side(&b, src_down);
+    }
+    let _ = src.process_all_queues();
+    assert!(!src.has_pending_reliable_tx_type(gps), "SRC stops retrying");
+}

@@ -2629,7 +2629,15 @@ impl LocalServicesState {
 struct ForwardedReceiptCache {
     destinations: OrdMap<u64, OrdSet<u64>>,
     order: VecDeque<u64>,
+    /// Receipt replays answered for a satisfied duplicate: (last ms, count).
+    replays: OrdMap<u64, (u64, u8)>,
 }
+
+/// A relay answers a duplicate whose every owner already acknowledged at most
+/// this many times per packet, once per reliable retransmit interval, with at
+/// most `FORWARDED_RECEIPT_REPLAY_OWNERS` cached receipts each time.
+const FORWARDED_RECEIPT_REPLAY_MAX: u8 = 4;
+const FORWARDED_RECEIPT_REPLAY_OWNERS: usize = 4;
 
 // A send leaf borrows proof of the existing side gate; it never re-enters it.
 struct SideTxAdmission<'a> {
@@ -6783,6 +6791,7 @@ impl Router {
         while cache.order.len() >= entry_cap {
             if let Some(oldest) = cache.order.pop_front() {
                 cache.destinations.remove(&oldest);
+                cache.replays.remove(&oldest);
             } else {
                 break;
             }
@@ -6794,6 +6803,103 @@ impl Router {
         if acked.len() < sender_cap || acked.contains(&sender_hash) {
             acked.insert(sender_hash);
         }
+    }
+
+    /// A duplicate of a reliable frame arrived from `src` and every
+    /// destination owner behind this relay has already acknowledged it (the
+    /// forwarded-receipt cache): the receipt on its way back was lost. Send the
+    /// cached receipts back toward the sender, at most once per reliable
+    /// retransmit interval and `FORWARDED_RECEIPT_REPLAY_MAX` times per packet.
+    #[cfg(feature = "discovery")]
+    fn replay_forwarded_receipts(
+        &self,
+        data: &RouterItem,
+        src: RouterSideId,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
+        if !self.cfg.reliable_enabled() {
+            return Ok(());
+        }
+        let Ok(ty) = Self::item_data_type(data) else {
+            return Ok(());
+        };
+        if !is_reliable_type(ty) || is_internal_control_type(ty) {
+            return Ok(());
+        }
+        let (packet_id, sender) = match data {
+            RouterItem::Packet(pkt) => (pkt.packet_id(), pkt.sender().to_owned()),
+            RouterItem::Packed(bytes) => {
+                let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref()) else {
+                    return Ok(());
+                };
+                let Ok(pkt) = self.unpack_packet_for_role(bytes.as_ref()) else {
+                    return Ok(());
+                };
+                (packet_id, pkt.sender().to_owned())
+            }
+        };
+        let Ok((eps, _)) = self.item_route_info(data) else {
+            return Ok(());
+        };
+        let (owners, publisher_hash) = {
+            let mut st = self.state.lock();
+            let Some(owners) = st
+                .forwarded_receipts
+                .as_ref()
+                .and_then(|cache| cache.destinations.get(&packet_id))
+                .filter(|owners| !owners.is_empty())
+                .map(|owners| {
+                    owners
+                        .iter()
+                        .copied()
+                        .take(FORWARDED_RECEIPT_REPLAY_OWNERS)
+                        .collect::<Vec<u64>>()
+                })
+            else {
+                return Ok(());
+            };
+            let others: Vec<RouterSideId> = st
+                .discovery_routes
+                .keys()
+                .copied()
+                .filter(|side| *side != src)
+                .collect();
+            if others.is_empty()
+                || !self
+                    .filter_end_to_end_satisfied_sides_locked(&st, data, others, &eps, ty)
+                    .is_empty()
+            {
+                return Ok(());
+            }
+            let now = self.clock.now_ms();
+            let cache = st.forwarded_receipts.as_mut().expect("checked cache");
+            let (last, count) = cache.replays.get(&packet_id).copied().unwrap_or((0, 0));
+            if count >= FORWARDED_RECEIPT_REPLAY_MAX
+                || (count > 0 && now.saturating_sub(last) < runtime_reliable_retransmit_ms())
+            {
+                return Ok(());
+            }
+            cache.replays.insert(packet_id, (now, count + 1));
+            (owners, Self::sender_hash(&Self::canonical_sender_locked(&st, &sender)))
+        };
+        for owner in owners {
+            let ack = Packet::new_local(
+                DataType::ReliableAck,
+                message_meta(DataType::ReliableAck).endpoints_owned(),
+                Arc::from(self.encode_end_to_end_ack_sender()),
+                self.packet_timestamp_ms(),
+                crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
+            )?;
+            // The owner's identity first, as in the receipt it sent; the
+            // publisher second, as `build_end_to_end_ack_data` does.
+            let ack = self.attach_wire_contract_to_item(RouterItem::Packet(ack), &[owner, publisher_hash])?;
+            self.emit_internal_tx(
+                RouterTxItem::ToSide { src: None, dst: src, data: ack },
+                true,
+                called_from_queue,
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "discovery")]
@@ -6921,14 +7027,13 @@ impl Router {
                 }
             }
         }
-        st.forwarded_receipts
-            .as_mut()
-            .expect("checked cache")
-            .destinations
-            .retain(|_, acked| {
-                acked.retain(|sender_hash| active_senders.contains(sender_hash));
-                !acked.is_empty()
-            });
+        let cache = st.forwarded_receipts.as_mut().expect("checked cache");
+        cache.destinations.retain(|_, acked| {
+            acked.retain(|sender_hash| active_senders.contains(sender_hash));
+            !acked.is_empty()
+        });
+        let ForwardedReceiptCache { destinations, replays, .. } = &mut **cache;
+        replays.retain(|id, _| destinations.contains_key(id));
     }
 
     #[cfg(feature = "discovery")]
@@ -19659,6 +19764,13 @@ impl Router {
             let shared_pending = false;
             if shared_pending {
                 self.relay_send(item.data.clone(), item.src, called_from_queue)?;
+            }
+            // Every owner behind this relay already acknowledged: the sender
+            // missed the receipt, so answer with the cached one instead of
+            // dropping its copy (bounded, rate-limited).
+            #[cfg(feature = "discovery")]
+            if !shared_pending && let Some(src) = item.src {
+                self.replay_forwarded_receipts(&item.data, src, called_from_queue)?;
             }
 
             // A final-ACK retry must cross a router again. Do not redeliver it
