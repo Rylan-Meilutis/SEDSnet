@@ -158,6 +158,79 @@ mod compact_summary_tests {
         assert!(router.process_end_to_end_reliable_timeouts().is_err());
         assert!(router.state.lock().end_to_end_reliable_tx.is_empty());
     }
+    /// A newer status superseding older pending ones (the boards' Abort
+    /// push): completing the older sends works the same whether the type is
+    /// Ordered or Unordered. Ordered releases the newer send at once;
+    /// Unordered leaves the newer send pending and untouched. Either way the
+    /// completed sends are gone and never retransmitted.
+    #[test]
+    fn completing_older_sends_supersedes_them_for_ordered_and_unordered_types() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        for (name, mode) in [
+            ("SUPERSEDE_ORDERED", crate::ReliableMode::Ordered),
+            ("SUPERSEDE_UNORDERED", crate::ReliableMode::Unordered),
+        ] {
+            let ty = crate::config::register_data_type_with_description(
+                name,
+                "superseded by a newer send",
+                MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+                &[ep],
+                mode,
+                200,
+            )
+            .unwrap();
+            let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+            let clock = now.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new([]),
+                Box::new(move || clock.load(Ordering::Relaxed)),
+            );
+            let item = |seq: u64| {
+                RouterItem::Packet(
+                    Packet::new(ty, &[ep], "SOURCE", seq, Arc::<[u8]>::from([seq as u8])).unwrap(),
+                )
+            };
+            let ordered = mode == crate::ReliableMode::Ordered;
+            // Two older sends and the newer one that supersedes them.
+            for seq in 1..=3u64 {
+                assert_eq!(
+                    router.register_end_to_end_reliable_tx(&item(seq), None).unwrap(),
+                    !ordered || seq == 1,
+                    "{name}: send {seq} goes out now unless it waits behind an older one"
+                );
+            }
+            let ids: Vec<u64> = router
+                .state
+                .lock()
+                .end_to_end_reliable_tx_order
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(ids.len(), 3, "{name}");
+            let newest = ids[2];
+            for &older in &ids[..2] {
+                assert_eq!(router.complete_reliable(older), Ok(true), "{name}");
+            }
+            {
+                let state = router.state.lock();
+                assert_eq!(state.end_to_end_reliable_tx.len(), 1, "{name}");
+                let sent = state
+                    .end_to_end_reliable_tx
+                    .get(&newest)
+                    .expect("newer send stays pending");
+                assert!(!sent.waiting_for_predecessor, "{name}: the newer send is free to go");
+            }
+            for &older in &ids[..2] {
+                assert_eq!(router.complete_reliable(older), Ok(false), "{name}");
+            }
+            // Retries continue only for the newer send.
+            now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
+            let _ = router.process_end_to_end_reliable_timeouts();
+            let state = router.state.lock();
+            assert!(state.end_to_end_reliable_tx.keys().all(|id| *id == newest), "{name}");
+        }
+    }
     #[test]
     fn compact_reachability_survives_incomplete_detailed_topology() {
         crate::tests::ensure_common_test_schema();
