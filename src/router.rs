@@ -82,6 +82,9 @@ use crate::side_transport::{
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
 #[cfg(all(test, feature = "discovery"))]
+#[path = "tests/forget_peer.rs"]
+mod forget_peer;
+#[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_split_horizon.rs"]
 mod ack_split_horizon;
 
@@ -9253,6 +9256,33 @@ impl Router {
         boards
     }
 
+    /// Remove `leaving` from every discovery route: its own announcer entry and
+    /// every topology mention of it behind another announcer. Returns whether
+    /// any route changed.
+    #[cfg(feature = "discovery")]
+    fn remove_discovery_peer_locked(st: &mut RouterInner, leaving: &str) -> TelemetryResult<bool> {
+        let before = st
+            .discovery_routes
+            .iter()
+            .map(|(side, route)| Ok((*side, route.try_clone()?)))
+            .collect::<TelemetryResult<RouterMap<_, _>>>()?;
+        for route in st.discovery_routes.values_mut() {
+            route.announcers.remove(leaving);
+            for sender_state in route.announcers.values_mut() {
+                Arc::make_mut(&mut sender_state.topology_boards)
+                    .retain(|board| board.sender_id != leaving);
+                for board in Arc::make_mut(&mut sender_state.topology_boards).iter_mut() {
+                    board.connections.retain(|peer| peer != leaving);
+                }
+                Self::refresh_sender_topology_state(sender_state);
+            }
+            Self::recompute_discovery_side_state(route);
+        }
+        st.discovery_routes
+            .retain(|_, route| !route.announcers.is_empty());
+        Ok(st.discovery_routes != before)
+    }
+
     #[cfg(feature = "discovery")]
     fn prune_discovery_routes_locked(st: &mut RouterInner, now_ms: u64) -> bool {
         // Polling runs at the firmware service rate, not the advertisement
@@ -11479,27 +11509,7 @@ impl Router {
         let mut st = self.state.lock();
         let now_ms = self.clock.now_ms();
         if pkt.data_type() == DataType::DiscoveryLeave {
-            let leaving = packet_sender.as_str();
-            let before = st
-                .discovery_routes
-                .iter()
-                .map(|(side, route)| Ok((*side, route.try_clone()?)))
-                .collect::<TelemetryResult<RouterMap<_, _>>>()?;
-            for route in st.discovery_routes.values_mut() {
-                route.announcers.remove(leaving);
-                for sender_state in route.announcers.values_mut() {
-                    Arc::make_mut(&mut sender_state.topology_boards)
-                        .retain(|board| board.sender_id != leaving);
-                    for board in Arc::make_mut(&mut sender_state.topology_boards).iter_mut() {
-                        board.connections.retain(|peer| peer != leaving);
-                    }
-                    Self::refresh_sender_topology_state(sender_state);
-                }
-                Self::recompute_discovery_side_state(route);
-            }
-            st.discovery_routes
-                .retain(|_, route| !route.announcers.is_empty());
-            if st.discovery_routes != before {
+            if Self::remove_discovery_peer_locked(&mut st, packet_sender.as_str())? {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
             }
@@ -16437,6 +16447,66 @@ impl Router {
         let sender = self.sender_arc();
         let pkt = discovery::build_discovery_leave(sender.as_ref(), self.clock.now_ms())?;
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
+    }
+
+    /// Forget `hostname` as a reachable peer now, for an application that has
+    /// established by its own means that the peer is out of range (for
+    /// example a link-loss or takeover decision), instead of waiting for its
+    /// discovery routes to expire (`DISCOVERY_ROUTE_TTL_MS`).
+    ///
+    /// Its routes go as if it had sent a discovery leave, so no new reliable
+    /// frame is owed to it. It is also retired from the destinations of every
+    /// pending end-to-end reliable frame: a frame then completes once its
+    /// remaining destinations acknowledge it, and a frame owed to no one else
+    /// completes now. This is the caller's decision, not a receipt from the
+    /// peer, which is why topology expiry alone never does it. The peer
+    /// returns with its next discovery announcement.
+    ///
+    /// Returns the number of pending frames it was retired from.
+    #[cfg(feature = "discovery")]
+    pub fn forget_peer(&self, hostname: &str) -> TelemetryResult<usize> {
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        let leaving = Self::canonical_sender_locked(&st, hostname);
+        if Self::remove_discovery_peer_locked(&mut st, &leaving)? {
+            Self::note_discovery_topology_change_locked(&mut st, now_ms);
+            self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+        }
+        let mut owners = vec![Self::sender_hash(&leaving)];
+        if let Some(entry) = st.address_book.get(leaving.as_str()) {
+            owners.push(u64::from(entry.address));
+        }
+        let mut retired = 0;
+        let mut completed = Vec::new();
+        for (packet_id, sent) in st.end_to_end_reliable_tx.iter_mut() {
+            let before = sent.pending_destinations.len();
+            for owner in &owners {
+                sent.pending_destinations.remove(owner);
+            }
+            if sent.pending_destinations.len() != before {
+                retired += 1;
+                if sent.pending_destinations.is_empty() {
+                    completed.push(*packet_id);
+                }
+            }
+        }
+        #[cfg(feature = "std")]
+        let mut finished = Vec::new();
+        for packet_id in completed {
+            #[cfg(feature = "std")]
+            if let Some(sent) = st.end_to_end_reliable_tx.remove(&packet_id) {
+                finished.push((packet_id, sent, completion::serial()));
+            }
+            #[cfg(not(feature = "std"))]
+            st.end_to_end_reliable_tx.remove(&packet_id);
+        }
+        drop(st);
+        self.release_ordered_successors()?;
+        #[cfg(feature = "std")]
+        for (packet_id, sent, cutoff) in finished {
+            self.retire_completed_writes(packet_id, &sent, cutoff);
+        }
+        Ok(retired)
     }
 
     /// Queue a discovery advertisement if the adaptive cadence says one is due.
