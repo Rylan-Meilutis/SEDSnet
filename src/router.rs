@@ -158,6 +158,98 @@ mod compact_summary_tests {
         assert!(router.process_end_to_end_reliable_timeouts().is_err());
         assert!(router.state.lock().end_to_end_reliable_tx.is_empty());
     }
+    /// End-to-end duplicates: a sender re-sends a reliable frame for up to its
+    /// retry window (4.8 s at the GS). A copy that arrives after 64 other
+    /// packets (the 16-entry recent-RX ring long rolled over) must not reach
+    /// the application again, ordered or not; the receiver still ACKs it so
+    /// the sender stops; a new frame from the same sender is delivered.
+    #[test]
+    fn late_reliable_duplicates_are_not_delivered_twice_but_are_acked() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        for (name, mode) in [
+            ("LATE_DUP_ORDERED", crate::ReliableMode::Ordered),
+            ("LATE_DUP_UNORDERED", crate::ReliableMode::Unordered),
+        ] {
+            let ty = crate::config::register_data_type_with_description(
+                name,
+                "late duplicate",
+                MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+                &[ep],
+                mode,
+                200,
+            )
+            .unwrap();
+            let delivered = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+            let count = delivered.clone();
+            let now = Arc::new(core::sync::atomic::AtomicU64::new(10_000));
+            let clock = now.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new([EndpointHandler::new_packet_handler(ep, move |pkt: &Packet| {
+                    if pkt.data_type() == ty {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                })])
+                .with_sender("FC")
+                // The FC firmware's ring (MAX_RECENT_RX_IDS = 16).
+                .with_memory_config(
+                    crate::config::RuntimeMemoryConfig::new(
+                        crate::config::MAX_QUEUE_BUDGET,
+                        16,
+                        crate::config::STARTING_QUEUE_SIZE,
+                        crate::config::QUEUE_GROW_STEP,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                Box::new(move || clock.load(Ordering::Relaxed)),
+            );
+            let acks = Arc::new(std::sync::Mutex::new(0usize));
+            let seen = acks.clone();
+            let side = router.add_side_packed("RADIO", move |bytes: &[u8]| -> TelemetryResult<()> {
+                if crate::wire_format::unpack_packet(bytes).is_ok_and(|p| p.data_type() == DataType::ReliableAck) {
+                    *seen.lock().unwrap() += 1;
+                }
+                Ok(())
+            });
+            let deploy = Packet::new(ty, &[ep], "GS", 1_767_225_600_000, Arc::<[u8]>::from([7u8])).unwrap();
+            router.rx_from_side(&deploy, side).unwrap();
+            let _ = router.process_all_queues();
+            assert_eq!(delivered.load(Ordering::SeqCst), 1, "{name}");
+            // 64 other reliable packets (like the repro's FLIGHT_BUZZER writes)
+            // roll the recent-RX ring over many times.
+            let other = crate::config::DataType::try_named("LATE_DUP_FILL").unwrap_or_else(|| {
+                crate::config::register_data_type_with_description(
+                    "LATE_DUP_FILL",
+                    "telemetry",
+                    MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+                    &[ep],
+                    crate::ReliableMode::Unordered,
+                    10,
+                )
+                .unwrap()
+            });
+            for i in 0..64u64 {
+                now.fetch_add(20, Ordering::Relaxed);
+                let pkt = Packet::new(other, &[ep], "GS", 1_767_225_600_100 + i, Arc::<[u8]>::from([i as u8])).unwrap();
+                router.rx_from_side(&pkt, side).unwrap();
+                let _ = router.process_all_queues();
+            }
+            // The sender's re-send, 1.3 s later, inside its retry window.
+            let acks_before = *acks.lock().unwrap();
+            router.rx_from_side(&deploy, side).unwrap();
+            let _ = router.process_all_queues();
+            assert_eq!(delivered.load(Ordering::SeqCst), 1, "{name}: the late duplicate was delivered again");
+            assert!(*acks.lock().unwrap() > acks_before, "{name}: the duplicate is still acknowledged");
+            // A new frame from the same sender is delivered.
+            let next = Packet::new(ty, &[ep], "GS", 1_767_225_601_500, Arc::<[u8]>::from([8u8])).unwrap();
+            router.rx_from_side(&next, side).unwrap();
+            let _ = router.process_all_queues();
+            assert_eq!(delivered.load(Ordering::SeqCst), 2, "{name}: a new frame is delivered");
+        }
+    }
+
     /// A newer status superseding older pending ones (the boards' Abort
     /// push): completing the older sends works the same whether the type is
     /// Ordered or Unordered. Ordered releases the newer send at once;
@@ -2685,6 +2777,17 @@ struct RouterInner {
     ordered_claim_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
+    /// Reliable end-to-end packets delivered within the senders' retry
+    /// window: (id, receive ms). The recent-RX ring alone rolls over within
+    /// a second on a busy board (16 ids on the FC), so a sender's late
+    /// re-send would reach the application again.
+    e2e_rx_seen: VecDeque<(u64, u64)>,
+    /// Reliable end-to-end types: the last `ORDERED_RX_HISTORY` packet ids
+    /// delivered per type. An ordered sender re-sends only its head (it
+    /// holds the next until that is acknowledged), so its late copy is
+    /// always one of the stream's newest ids, however much other traffic
+    /// arrived; a command or state type is rare enough for the same to hold.
+    ordered_rx_last: VecDeque<(u32, [u64; crate::config::ORDERED_RX_HISTORY])>,
     reliable_tx: OrdMap<(RouterSideId, u32), ReliableTxState>,
     reliable_rx: OrdMap<(RouterSideId, u32), ReliableRxState>,
     reliable_return_routes: OrdMap<u64, ReliableReturnRouteState>,
@@ -4059,6 +4162,18 @@ impl RouterInner {
             Self::set_replay_queued(reliable_tx, end_to_end, key, true);
         }
         result
+    }
+
+    /// Forget a received id everywhere dedupe remembers it, so a packet whose
+    /// handling failed can be accepted when it is sent again.
+    fn forget_rx_id(&mut self, id: u64) {
+        self.recent_rx.remove_value(&id);
+        self.e2e_rx_seen.retain(|(seen, _)| *seen != id);
+        for (_, ids) in self.ordered_rx_last.iter_mut() {
+            for slot in ids.iter_mut().filter(|slot| **slot == id) {
+                *slot = 0;
+            }
+        }
     }
 
     fn push_recent_rx(&mut self, id: u64) -> TelemetryResult<()> {
@@ -15126,6 +15241,8 @@ impl Router {
                 latest_service_seq: 0,
                 ordered_claim_seq: 0,
                 rx_priority_burst: 0,
+                e2e_rx_seen: VecDeque::new(),
+                ordered_rx_last: VecDeque::new(),
                 recent_rx: BoundedDeque::new(
                     memory.recent_rx_queue_bytes(),
                     memory.recent_rx_queue_bytes(),
@@ -17580,26 +17697,106 @@ impl Router {
     fn remove_pkt_id(&self, item: &RouterItem) {
         let hash = Self::get_hash(item);
         let mut st = self.state.lock();
-        st.recent_rx.remove_value(&hash);
+        st.forget_rx_id(hash);
     }
 
     /// Compute a de-dupe ID for a RouterItem and record it.
     /// Returns true if this item was seen recently (and should be skipped).
     fn is_duplicate_pkt(&self, item: &RouterItem) -> TelemetryResult<bool> {
-        self.is_duplicate_packet_id(Self::get_hash(item))
+        let ty = Self::item_data_type(item)
+            .ok()
+            .filter(|ty| is_reliable_type(*ty) && !is_internal_control_type(*ty));
+        let id = Self::get_hash(item);
+        let Some(ty) = ty else {
+            return self.is_duplicate_packet_id_windowed(id, false);
+        };
+        {
+            let key = ty.as_u32();
+            {
+                let st = self.state.lock();
+                // 0 marks an empty or forgotten slot, never a match.
+                if id != 0
+                    && st
+                        .ordered_rx_last
+                        .iter()
+                        .any(|(t, ids)| *t == key && ids.contains(&id))
+                {
+                    return Ok(true);
+                }
+            }
+            let duplicate = self.is_duplicate_packet_id_windowed(id, true)?;
+            if !duplicate {
+                let mut st = self.state.lock();
+                if let Some(pos) = st.ordered_rx_last.iter().position(|(t, _)| *t == key) {
+                    let (t, mut ids) = st.ordered_rx_last.remove(pos).expect("found");
+                    ids.rotate_right(1);
+                    ids[0] = id;
+                    st.ordered_rx_last.push_back((t, ids));
+                } else {
+                    // Least recently delivered stream forgotten first: its late
+                    // copies then fall back to the window (never a new packet
+                    // dropped: an id only ever matches the same packet).
+                    if st.ordered_rx_last.len() >= crate::config::ORDERED_RX_STREAMS {
+                        st.ordered_rx_last.pop_front();
+                    }
+                    let mut ids = [0u64; crate::config::ORDERED_RX_HISTORY];
+                    ids[0] = id;
+                    st.ordered_rx_last.push_back((key, ids));
+                }
+            }
+            Ok(duplicate)
+        }
     }
 
     fn is_duplicate_packet_id(&self, id: u64) -> TelemetryResult<bool> {
+        self.is_duplicate_packet_id_windowed(id, false)
+    }
+
+    /// The senders' whole re-send window (every retry plus a second of
+    /// margin), over which a reliable end-to-end duplicate is recognised.
+    fn e2e_rx_window_ms() -> u64 {
+        // The sender's retry tuning is not known here: cover this node's own
+        // and at least E2E_RX_WINDOW_MIN_MS (the GS retries 12 x 400 ms).
+        runtime_reliable_retransmit_ms()
+            .saturating_mul(u64::from(runtime_reliable_max_retries()).saturating_add(1))
+            .saturating_add(1_000)
+            .max(crate::config::E2E_RX_WINDOW_MIN_MS)
+    }
+
+    /// `windowed`: a reliable end-to-end packet, also remembered for the
+    /// senders' re-send window in `E2E_RX_SEEN_SLOTS` entries. When those are
+    /// all younger than the window the oldest is forgotten first: its late
+    /// copy would then be delivered again (as before this window), never a
+    /// new packet dropped.
+    fn is_duplicate_packet_id_windowed(&self, id: u64, windowed: bool) -> TelemetryResult<bool> {
+        let now = self.clock.now_ms();
+        let window = Self::e2e_rx_window_ms();
         let mut st = self.state.lock();
+        if windowed {
+            while st
+                .e2e_rx_seen
+                .front()
+                .is_some_and(|(_, at)| now.saturating_sub(*at) > window)
+            {
+                st.e2e_rx_seen.pop_front();
+            }
+        }
         if st.recent_rx.contains(&id)
             || st
                 .reliable_return_routes
                 .get(&id)
                 .is_some_and(|route| route.delivery_completed)
+            || (windowed && st.e2e_rx_seen.iter().any(|(seen, _)| *seen == id))
         {
             Ok(true)
         } else {
             st.push_recent_rx(id)?;
+            if windowed {
+                if st.e2e_rx_seen.len() >= crate::config::E2E_RX_SEEN_SLOTS {
+                    st.e2e_rx_seen.pop_front();
+                }
+                st.e2e_rx_seen.push_back((id, now));
+            }
             Ok(false)
         }
     }
@@ -18403,7 +18600,7 @@ impl Router {
                     && let RouterTxItem::Broadcast(data) = &original.item
                 {
                     let id = Self::get_hash(data);
-                    st.recent_rx.remove_value(&id);
+                    st.forget_rx_id(id);
                 }
                 drop(st);
                 result = self.defer_accepted_original(&mut context);

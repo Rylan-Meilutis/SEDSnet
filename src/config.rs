@@ -83,6 +83,28 @@ pub const MAX_RECENT_RX_IDS: usize = match option_env!("MAX_RECENT_RX_IDS") {
     None => 128,
 };
 
+/// Shortest window a reliable end-to-end duplicate is recognised over, ms:
+/// the GS re-sends for 12 x 400 ms = 4.8 s, plus margin.
+pub const E2E_RX_WINDOW_MIN_MS: u64 = match option_env!("E2E_RX_WINDOW_MIN_MS") {
+    Some(val) => parse_usize(val) as u64,
+    None => 6_000,
+};
+
+/// Ordered end-to-end types whose newest delivered ids are kept, and how
+/// many ids each (8 bytes each): exact duplicate rejection for the stream.
+pub const ORDERED_RX_STREAMS: usize = match option_env!("ORDERED_RX_STREAMS") {
+    Some(val) => parse_usize(val),
+    None => 16,
+};
+pub const ORDERED_RX_HISTORY: usize = 4;
+
+/// Reliable end-to-end packets remembered for the senders' re-send window
+/// (16 bytes each), so a late re-send is not delivered twice.
+pub const E2E_RX_SEEN_SLOTS: usize = match option_env!("E2E_RX_SEEN_SLOTS") {
+    Some(val) => parse_usize(val),
+    None => 32,
+};
+
 pub const STARTING_QUEUE_SIZE: usize = match option_env!("STARTING_QUEUE_SIZE") {
     Some(val) => parse_usize(val),
     None => 128,

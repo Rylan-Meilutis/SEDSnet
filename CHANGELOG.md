@@ -80,6 +80,17 @@ that option, keep their 4.3.14 representations.
   conversions or software 64/128-bit division (Cortex-M4, firmware profile:
   `Router::network_time_ms` 10840 -> about 1800 instructions per call).
   `tools/mcu-icount/count.sh` measures it under QEMU.
+- End-to-end dedupe: a reliable end-to-end packet re-sent late (after the
+  recent-id ring, 16 ids on boards, has rolled over) is acknowledged again but
+  not delivered twice. Each reliable type keeps its last 4 delivered ids
+  (16 types, least recently delivered forgotten first), which is exact for
+  Ordered streams (one packet in flight per sender), and every reliable
+  end-to-end id is also remembered for the senders' re-send window (own retry
+  window plus 1 s, at least 6 s) in 32 slots. When those slots are full the
+  oldest id is forgotten first, so its late copy can be delivered again as
+  before; a new packet is never dropped (an id only matches the same packet).
+  A packet whose handling failed is forgotten everywhere, so its retry is
+  accepted. Heap per router: at most about 1.2 KB (640 B history, 512 B window).
 
 
 ## 4.3.14
