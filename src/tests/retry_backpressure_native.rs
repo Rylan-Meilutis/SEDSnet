@@ -1199,6 +1199,33 @@ fn retry_clock_starts_when_the_write_drains_not_at_handoff() {
     assert_eq!(leases.lock().unwrap().len(), 2, "one replay after drain + retry interval");
 }
 #[test]
+fn urgent_sends_keep_the_handoff_retry_clock_while_held() {
+    // ABORT-class traffic never re-sends slower than before the drain-based
+    // clock: a copy the writer still holds is replayed one interval after
+    // handoff, as in 4.x. Ordinary traffic keeps waiting for drain + interval.
+    let (f, _t, leases) = tracked_fixture(true);
+    assert!(crate::set_type_scheduling_class(f.ty, -1));
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    let interval = runtime_reliable_retransmit_ms();
+    let step = || {
+        f.now.fetch_add(10, Ordering::SeqCst);
+        f.router.process_end_to_end_reliable_timeouts().unwrap();
+        f.router.dispatch_tx_queue_with_timeout(0).unwrap();
+    };
+    for _ in 0..interval / 10 - 1 {
+        step();
+    }
+    assert_eq!(leases.lock().unwrap().len(), 1, "no replay before one interval");
+    for _ in 0..3 {
+        step();
+    }
+    let replays = leases.lock().unwrap().len();
+    assert!(crate::set_type_scheduling_class(f.ty, 1));
+    assert_eq!(replays, 2, "a held urgent copy replays one interval after handoff");
+}
+#[test]
 fn application_can_complete_a_pending_send_but_never_an_urgent_one() {
     let (f, _t, leases) = tracked_fixture(true);
     publish(&f);

@@ -66,7 +66,9 @@ that option, keep their 4.3.14 representations.
   control; time sync, schema and managed variables are 254; acks and route
   discovery stay 255; data is below.
 - Reliability: the end-to-end retry interval starts when a leased write
-  reports drained, and a held write covers its packet for up to two intervals;
+  reports drained, and a held write covers its packet for up to two intervals
+  (urgent types, the ABORT class, keep the handoff-based interval: they never
+  re-send later than in 4.x);
   `complete_reliable` / `seds_router_complete_reliable` completes one pending
   send on other proof of delivery (never ABORT or urgent types);
   `relayed_frame_satisfied` / `seds_router_relayed_frame_satisfied` lets a

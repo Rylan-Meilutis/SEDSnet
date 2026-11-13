@@ -7145,6 +7145,13 @@ impl Router {
         Ok(!waiting_for_predecessor)
     }
 
+    #[cfg(feature = "std")]
+    /// An urgent-class item (see [`crate::set_type_scheduling_class`]) or any
+    /// type named `ABORT`.
+    fn is_urgent_item(data: &RouterItem) -> bool {
+        Self::item_data_type(data).is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT")
+    }
+
     // Select at most one in-flight packet per ordered type. Waiting messages
     // share the existing bounded pending window, not an unbounded extra queue.
     /// Completes one pending end-to-end reliable send this router originated
@@ -14061,9 +14068,13 @@ impl Router {
 
         {
             let mut st = self.state.lock();
+            // Urgent traffic (the ABORT class) keeps the handoff-based clock:
+            // it never re-sends later than before drain tracking existed.
             #[cfg(feature = "std")]
             for (id, at) in drained {
-                if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&id) {
+                if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&id)
+                    && !Self::is_urgent_item(&sent.data)
+                {
                     sent.last_send_ms = sent.last_send_ms.max(at);
                 }
             }
@@ -14095,7 +14106,8 @@ impl Router {
                 let covered = covered
                     || (held.contains(&packet_id)
                         && now.wrapping_sub(sent.last_send_ms)
-                            < runtime_reliable_retransmit_ms().saturating_mul(2));
+                            < runtime_reliable_retransmit_ms().saturating_mul(2)
+                        && !Self::is_urgent_item(&sent.data));
                 if covered
                     || sent.waiting_for_predecessor
                     || sent.queued
