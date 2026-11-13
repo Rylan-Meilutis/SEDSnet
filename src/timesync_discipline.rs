@@ -34,6 +34,61 @@ const MIN_LOCK_SAMPLES: u8 = 3;
 /// Longest round trip considered (bounds the arithmetic).
 const MAX_ROUND_TRIP_NS: u64 = 60_000_000_000;
 
+/// `x / d` for `0 < d < 2^21`, exact, in 11-bit digits so every step is a
+/// 32-bit division (one instruction on Cortex-M4; a 64-bit division is a
+/// software routine of a few hundred).
+#[inline(never)]
+pub fn div_u64_small(x: u64, d: u32) -> u64 {
+    debug_assert!(d > 0 && d < 1 << 21);
+    // Constant shifts only: a variable 64-bit shift is a library call on
+    // Cortex-M at opt-level "z".
+    let hi = (x >> 32) as u32;
+    let lo = x as u32;
+    let digits = [
+        hi >> 23,
+        (hi >> 12) & 0x7FF,
+        (hi >> 1) & 0x7FF,
+        ((hi & 1) << 10) | (lo >> 22),
+        (lo >> 11) & 0x7FF,
+        lo & 0x7FF,
+    ];
+    let mut q = 0u64;
+    let mut r = 0u32;
+    for digit in digits {
+        let cur = (r << 11) | digit;
+        q = (q << 11) | u64::from(cur / d);
+        r = cur % d;
+    }
+    q
+}
+
+/// `x / 1_000_000` (exact).
+#[inline]
+pub fn div_u64_1e6(x: u64) -> u64 {
+    div_u64_small(x >> 6, 15_625)
+}
+
+/// `x / 1_000_000_000` (exact).
+#[inline]
+pub fn div_u64_1e9(x: u64) -> u64 {
+    div_u64_small(x >> 9, 1_953_125)
+}
+
+/// `a * b / c` for `c` = 1e6 or 1e9 with exactly [`mul_div`]'s result
+/// (truncation toward zero, the same overflow path), without the software
+/// 64-bit division in the common no-overflow case.
+#[inline]
+pub(crate) fn mul_div_pow10(a: i64, b: i64, c: i64) -> i64 {
+    debug_assert!(c == 1_000_000 || c == 1_000_000_000);
+    let Some(p) = a.checked_mul(b) else {
+        return mul_div(a, b, c);
+    };
+    let m = p.unsigned_abs();
+    let q = if c == 1_000_000 { div_u64_1e6(m) } else { div_u64_1e9(m) };
+    // |p| <= 2^63 so q < 2^54 fits i64.
+    if p < 0 { -(q as i64) } else { q as i64 }
+}
+
 /// `a * b / c` in 64-bit arithmetic, splitting `a` by `c` when the product
 /// would overflow (callers keep `b` and `c` below 2^31), saturating. One
 /// out-of-line copy keeps the scaling small on Cortex-M.

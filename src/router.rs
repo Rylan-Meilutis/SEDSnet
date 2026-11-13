@@ -7745,7 +7745,7 @@ impl Router {
 
     #[cfg(feature = "timesync")]
     fn timesync_has_usable_time_locked(st: &TimeSyncRuntime, now_mono_ns: u64) -> bool {
-        st.disciplined_clock.read_unix_ms(now_mono_ns).is_some()
+        st.disciplined_clock.has_unix_time(now_mono_ns)
             || st
                 .clock
                 .current_time(now_mono_ns)
@@ -7799,10 +7799,9 @@ impl Router {
         let reference = {
             let remote = &st.remote_sources;
             st.clock
-                .current_time_filtered(now_mono_ns, |name| {
+                .current_unix_ms_filtered(now_mono_ns, |name| {
                     name != INTERNAL_TIMESYNC_SOURCE_ID && !remote.contains_key(name)
                 })
-                .and_then(|reading| reading.unix_time_ms)
                 .filter(|unix_ms| *unix_ms >= TIMESYNC_UTC_FLOOR_MS)
         };
         st.v2.local_reference = reference.is_some();
@@ -14578,7 +14577,17 @@ impl Router {
     #[cfg(feature = "timesync")]
     /// Returns the current network time as Unix milliseconds when available.
     pub fn network_time_ms(&self) -> Option<u64> {
-        self.network_time().and_then(|t| t.unix_time_ms)
+        // `network_time` without the calendar fields every packet timestamp
+        // would build and throw away; the same reading.
+        let runtime = self.timesync.as_ref()?;
+        let now_ms = self.monotonic_now_ms();
+        let now_ns = self.monotonic_now_ns();
+        self.refresh_timesync_state(now_ms);
+        let st = runtime.lock();
+        if let Some(unix_ms) = st.disciplined_clock.read_unix_ms(now_ns) {
+            return Some(unix_ms);
+        }
+        st.clock.current_time(now_ns).and_then(|t| t.unix_time_ms)
     }
 
     #[cfg(feature = "timesync")]

@@ -329,10 +329,23 @@ impl NetworkTime {
             return None;
         }
 
-        let secs = u64::try_from(unix_ns / 1_000_000_000).ok()?;
-        let nanos = unix_ns.rem_euclid(1_000_000_000) as u32;
-        let days = secs / 86_400;
-        let sod = (secs % 86_400) as u32;
+        // Every Unix time before 2554 fits u64 nanoseconds: one 64-bit
+        // division instead of 128-bit ones (software division on Cortex-M).
+        let (secs, nanos) = match u64::try_from(unix_ns) {
+            Ok(ns) => {
+                let secs = crate::timesync_discipline::div_u64_1e9(ns);
+                (secs, (ns - secs * 1_000_000_000) as u32)
+            }
+            Err(_) => (
+                u64::try_from(unix_ns / 1_000_000_000).ok()?,
+                unix_ns.rem_euclid(1_000_000_000) as u32,
+            ),
+        };
+        // Before 2106 the seconds fit 32 bits and divide in hardware.
+        let (days, sod) = match u32::try_from(secs) {
+            Ok(secs) => (u64::from(secs / 86_400), secs % 86_400),
+            Err(_) => (secs / 86_400, (secs % 86_400) as u32),
+        };
         let (year, month, day) = civil_from_days(days)?;
 
         Some(Self {
@@ -346,8 +359,8 @@ impl NetworkTime {
         })
     }
 
-    /// Converts this calendar/time value into Unix nanoseconds if the fields are valid.
-    pub fn as_unix_ns(&self) -> Option<i128> {
+    /// Whole Unix seconds of valid fields (fits i64 for every i32 year).
+    fn unix_secs(&self) -> Option<i64> {
         if !(1..=12).contains(&self.month)
             || !(1..=31).contains(&self.day)
             || self.hour > 23
@@ -357,22 +370,32 @@ impl NetworkTime {
         {
             return None;
         }
-
         let days = days_from_civil(self.year, self.month as u32, self.day as u32);
-        let secs = (days as i128) * 86_400
-            + (self.hour as i128) * 3_600
-            + (self.minute as i128) * 60
-            + (self.second as i128);
-        Some(secs * 1_000_000_000 + self.nanosecond as i128)
+        Some(
+            days * 86_400
+                + i64::from(self.hour) * 3_600
+                + i64::from(self.minute) * 60
+                + i64::from(self.second),
+        )
+    }
+
+    /// Converts this calendar/time value into Unix nanoseconds if the fields are valid.
+    pub fn as_unix_ns(&self) -> Option<i128> {
+        Some(i128::from(self.unix_secs()?) * 1_000_000_000 + self.nanosecond as i128)
     }
 
     /// Converts this calendar/time value into non-negative Unix milliseconds.
     pub fn as_unix_ms(&self) -> Option<u64> {
-        let unix_ns = self.as_unix_ns()?;
-        if unix_ns < 0 {
+        // ns = secs * 1e9 + nanosecond with 0 <= nanosecond < 1e9, so ns < 0
+        // exactly when secs < 0, and ns / 1e6 = secs * 1000 + nanosecond / 1e6:
+        // no 128-bit division (a long software routine on Cortex-M).
+        let secs = self.unix_secs()?;
+        if secs < 0 {
             return None;
         }
-        u64::try_from(unix_ns / 1_000_000).ok()
+        (secs as u64)
+            .checked_mul(1_000)?
+            .checked_add(u64::from(self.nanosecond / 1_000_000))
     }
 }
 
@@ -433,8 +456,25 @@ impl SlewedNetworkClock {
 
     /// Slew applied after `elapsed_ns` since the anchor, ns.
     fn applied_slew(&self, elapsed_ns: i64) -> i64 {
-        let max_adjust = crate::timesync_discipline::mul_div(elapsed_ns, i64::from(self.max_slew_ppm), 1_000_000);
-        self.pending_adjust_ns.clamp(-max_adjust, max_adjust)
+        let pending = self.pending_adjust_ns;
+        if pending == 0 {
+            return 0;
+        }
+        // Once the slew has run its course (the common case between
+        // exchanges) the whole correction applies: floor(e*ppm/1e6) >= |p|
+        // exactly when e*ppm >= |p|*1e6, so two multiplies replace the
+        // software 64-bit division.
+        if let (Some(budget), Some(needed)) = (
+            elapsed_ns.checked_mul(i64::from(self.max_slew_ppm)),
+            pending.checked_abs().and_then(|p| p.checked_mul(1_000_000)),
+        ) && elapsed_ns >= 0
+            && budget >= needed
+        {
+            return pending;
+        }
+        let max_adjust =
+            crate::timesync_discipline::mul_div_pow10(elapsed_ns, i64::from(self.max_slew_ppm), 1_000_000);
+        pending.clamp(-max_adjust, max_adjust)
     }
 
     fn read_ns(&self, now_mono_ns: u64) -> Option<i64> {
@@ -442,7 +482,11 @@ impl SlewedNetworkClock {
             return None;
         }
         let elapsed = now_mono_ns.saturating_sub(self.anchor_mono_ns).min(i64::MAX as u64) as i64;
-        let rate = crate::timesync_discipline::mul_div(elapsed, self.rate_ppb, 1_000_000_000);
+        let rate = if self.rate_ppb == 0 {
+            0
+        } else {
+            crate::timesync_discipline::mul_div_pow10(elapsed, self.rate_ppb, 1_000_000_000)
+        };
         Some(
             self.anchor_unix_ns
                 .saturating_add(elapsed)
@@ -459,7 +503,12 @@ impl SlewedNetworkClock {
     /// Reads the current estimated Unix time in milliseconds from a monotonic timestamp.
     pub fn read_unix_ms(&self, now_mono_ns: u64) -> Option<u64> {
         let unix_ns = self.read_ns(now_mono_ns)?;
-        (unix_ns >= 0).then_some(unix_ns as u64 / 1_000_000)
+        (unix_ns >= 0).then(|| crate::timesync_discipline::div_u64_1e6(unix_ns as u64))
+    }
+
+    /// `read_unix_ms(now_mono_ns).is_some()` without the millisecond division.
+    pub(crate) fn has_unix_time(&self, now_mono_ns: u64) -> bool {
+        self.read_ns(now_mono_ns).is_some_and(|unix_ns| unix_ns >= 0)
     }
 
     /// Reads the clock at a monotonic instant that may precede the current
@@ -807,6 +856,41 @@ impl NetworkClock {
     }
 
     /// Like [`Self::current_time`], using only sources whose identifier passes `keep`.
+    /// `current_time_filtered(..).unix_time_ms` without building the calendar
+    /// reading in the usual case (a complete source and a time before 2262).
+    pub(crate) fn current_unix_ms_filtered(
+        &self,
+        now_mono_ns: u64,
+        keep: impl Fn(&str) -> bool,
+    ) -> Option<u64> {
+        {
+            let sources: Vec<(&str, &NetworkTimeSourceState)> = self
+                .sources
+                .iter()
+                .filter(|(name, _)| keep(name.as_str()))
+                .map(|(name, src)| (name.as_str(), src.as_ref()))
+                .collect();
+            if sources.is_empty() {
+                return None;
+            }
+            let full = best_source(&sources, |src| src.time.to_network_time().is_some());
+            if let Some((_, src)) = full
+                && let Some(base_ns) = src.time.to_network_time().and_then(|base| base.as_unix_ns())
+            {
+                let elapsed_ns = now_mono_ns.saturating_sub(src.anchor_mono_ns);
+                // In [0, i64::MAX] the calendar round trip is exact and lands
+                // on floor(ns / 1e6); anything else takes the full path.
+                if let Ok(ns) = u64::try_from(base_ns + elapsed_ns as i128)
+                    && ns <= i64::MAX as u64
+                {
+                    return Some(crate::timesync_discipline::div_u64_1e6(ns));
+                }
+            }
+        }
+        self.current_time_filtered(now_mono_ns, keep)
+            .and_then(|reading| reading.unix_time_ms)
+    }
+
     pub(crate) fn current_time_filtered(
         &self,
         now_mono_ns: u64,
@@ -927,7 +1011,11 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 fn civil_from_days(mut z: u64) -> Option<(i32, u32, u32)> {
     z += 719_468;
-    let era = z / 146_097;
+    // Days fit 32 bits for 11 million years: divide in hardware then.
+    let era = match u32::try_from(z) {
+        Ok(z) => u64::from(z / 146_097),
+        Err(_) => z / 146_097,
+    };
     // A Gregorian era contains exactly 146097 days. Its remaining
     // arithmetic fits in 32 bits, avoiding repeated software i64 divisions
     // on Cortex-M while retaining the full representable year range.
@@ -1497,3 +1585,176 @@ mod slew_absolute_target_tests {
     }
 }
 
+
+/// The Cortex-M fast paths (no 64/128-bit software division) give exactly
+/// the results of the straightforward formulas they replaced.
+#[cfg(test)]
+mod fast_path_equivalence_tests {
+    use super::{NetworkClock, NetworkTime, PartialNetworkTime, SlewedNetworkClock, civil_from_days};
+    use crate::timesync_discipline::{div_u64_1e6, div_u64_1e9, div_u64_small, mul_div, mul_div_pow10};
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// Values of every magnitude, not only huge ones.
+        fn wide(&mut self) -> u64 {
+            let bits = self.next() % 65;
+            if bits == 0 { 0 } else { self.next() >> (64 - bits) }
+        }
+    }
+
+    fn reference_from_unix_ns(unix_ns: i128) -> Option<NetworkTime> {
+        if unix_ns < 0 {
+            return None;
+        }
+        let secs = u64::try_from(unix_ns / 1_000_000_000).ok()?;
+        let nanos = unix_ns.rem_euclid(1_000_000_000) as u32;
+        let (year, month, day) = civil_from_days(secs / 86_400)?;
+        let sod = (secs % 86_400) as u32;
+        Some(NetworkTime {
+            year,
+            month: month as u8,
+            day: day as u8,
+            hour: (sod / 3_600) as u8,
+            minute: ((sod % 3_600) / 60) as u8,
+            second: (sod % 60) as u8,
+            nanosecond: nanos,
+        })
+    }
+
+    fn reference_as_unix_ms(t: &NetworkTime) -> Option<u64> {
+        let ns = t.as_unix_ns()?;
+        if ns < 0 {
+            return None;
+        }
+        u64::try_from(ns / 1_000_000).ok()
+    }
+
+    fn reference_read_ns(anchor_unix: i64, pending: i64, ppm: u32, rate: i64, elapsed: i64) -> i64 {
+        let max_adjust = mul_div(elapsed, i64::from(ppm), 1_000_000);
+        let slew = pending.clamp(-max_adjust, max_adjust);
+        anchor_unix
+            .saturating_add(elapsed)
+            .saturating_add(mul_div(elapsed, rate, 1_000_000_000))
+            .saturating_add(slew)
+    }
+
+    #[test]
+    fn small_divisor_division_is_exact() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let edges = [0, 1, 999_999, 1_000_000, 1_000_000_000, u64::MAX, u64::MAX - 1, 1 << 63, (1 << 63) - 1];
+        let randoms: Vec<u64> = (0..200_000).map(|_| rng.wide()).collect();
+        for x in edges.into_iter().chain(randoms) {
+            assert_eq!(div_u64_1e6(x), x / 1_000_000, "{x}");
+            assert_eq!(div_u64_1e9(x), x / 1_000_000_000, "{x}");
+            let d = (rng.next() % ((1 << 21) - 1)) as u32 + 1;
+            assert_eq!(div_u64_small(x, d), x / u64::from(d), "{x}/{d}");
+        }
+    }
+
+    #[test]
+    fn pow10_scaling_matches_mul_div_including_overflow_and_signs() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for _ in 0..200_000 {
+            let a = rng.wide() as i64;
+            let b = (rng.wide() >> 33) as i64 * if rng.next() & 1 == 0 { 1 } else { -1 };
+            for c in [1_000_000, 1_000_000_000] {
+                assert_eq!(mul_div_pow10(a, b, c), mul_div(a, b, c), "{a}*{b}/{c}");
+            }
+        }
+        for (a, b) in [(i64::MIN, 1), (i64::MAX, 1), (i64::MIN, -1), (i64::MAX, 999_999), (-1, 1)] {
+            for c in [1_000_000, 1_000_000_000] {
+                assert_eq!(mul_div_pow10(a, b, c), mul_div(a, b, c), "{a}*{b}/{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn calendar_conversions_match_the_128_bit_formulas() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let edges: [i128; 8] = [
+            -1,
+            0,
+            1_767_225_600_123_456_789,
+            i128::from(u32::MAX) * 1_000_000_000,
+            i128::from(u32::MAX) * 1_000_000_000 + 999_999_999,
+            i128::from(u64::MAX),
+            i128::from(u64::MAX) + 1,
+            i128::MAX,
+        ];
+        let randoms: Vec<i128> = (0..100_000)
+            .map(|_| {
+                let scale = if rng.next() % 4 == 0 { i128::from(rng.wide() % 1_000) } else { 1 };
+                let v = i128::from(rng.wide()) * scale;
+                if rng.next() % 16 == 0 { -v } else { v }
+            })
+            .collect();
+        for ns in edges.into_iter().chain(randoms) {
+            let fast = NetworkTime::from_unix_ns(ns);
+            assert_eq!(fast, reference_from_unix_ns(ns), "{ns}");
+            if let Some(t) = fast {
+                assert_eq!(t.as_unix_ms(), reference_as_unix_ms(&t), "{t:?}");
+            }
+        }
+        for year in [i32::MIN, -1, 0, 1969, 1970, 2026, 2106, 2262, 2263, 2554, i32::MAX] {
+            let t = NetworkTime { year, month: 7, day: 4, hour: 23, minute: 59, second: 59, nanosecond: 999_999_999 };
+            assert_eq!(t.as_unix_ms(), reference_as_unix_ms(&t), "{year}");
+        }
+    }
+
+    #[test]
+    fn slewed_clock_reads_match_the_reference_formula() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        for _ in 0..50_000 {
+            let ppm = [0u32, 1, 50, 500, 50_000, 999_999][(rng.next() % 6) as usize];
+            let mut clock = SlewedNetworkClock::new(ppm);
+            let anchor_mono = rng.next() % (1 << 50);
+            let target = (rng.next() % (1 << 62)) as i64;
+            let rate = (rng.next() % 40_000_001) as i64 - 20_000_000;
+            clock.discipline_ns(anchor_mono, target, rate, true);
+            // A second steer leaves a pending correction to slew out.
+            let later = anchor_mono + rng.next() % (1 << 40);
+            let offset = (rng.wide() >> 1) as i64 % 10_000_000_000 * if rng.next() & 1 == 0 { 1 } else { -1 };
+            let before = clock.read_unix_ns(later).unwrap() as i64;
+            clock.discipline_ns(later, before.saturating_add(offset), rate, false);
+            for _ in 0..4 {
+                let now = later + rng.wide() % (1 << 46);
+                let elapsed = (now - later).min(i64::MAX as u64) as i64;
+                let expect = reference_read_ns(clock.anchor_unix_ns, clock.pending_adjust_ns, ppm, rate, elapsed);
+                assert_eq!(clock.read_unix_ns(now), Some(i128::from(expect)));
+                let ms = (expect >= 0).then_some(expect as u64 / 1_000_000);
+                assert_eq!(clock.read_unix_ms(now), ms);
+                assert_eq!(clock.has_unix_time(now), ms.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn source_clock_millisecond_read_matches_the_calendar_reading() {
+        let mut rng = Rng(0x0F1E_2D3C_4B5A_6978);
+        for _ in 0..5_000 {
+            let mut clock = NetworkClock::default();
+            let base_ms = rng.next() % 9_000_000_000_000;
+            let anchor = rng.next() % (1 << 40);
+            if rng.next() % 3 == 0 {
+                // Date and time from separate sources (the merged path).
+                let full = PartialNetworkTime::from_unix_ms(base_ms);
+                clock.update_source("date", 1, PartialNetworkTime { hour: None, minute: None, second: None, nanosecond: None, ..full }, 0, anchor, None);
+                clock.update_source("tod", 2, PartialNetworkTime { year: None, month: None, day: None, ..full }, 0, anchor, None);
+            } else {
+                clock.update_source("gps", 1, PartialNetworkTime::from_unix_ms(base_ms), 0, anchor, None);
+            }
+            let now = anchor + rng.wide() % (1 << 50);
+            assert_eq!(
+                clock.current_unix_ms_filtered(now, |_| true),
+                clock.current_time_filtered(now, |_| true).and_then(|r| r.unix_time_ms)
+            );
+            assert_eq!(clock.current_unix_ms_filtered(now, |_| false), None);
+        }
+    }
+}
