@@ -74,6 +74,10 @@ that option, keep their 4.3.14 representations.
   that receives a duplicate whose every owner already acknowledged answers it
   with the cached receipt (the one back to the sender was lost) instead of
   dropping it: once per retry interval, at most four times per packet.
+- Performance: packet timestamps read network time without calendar
+  conversions or software 64/128-bit division (Cortex-M4, firmware profile:
+  `Router::network_time_ms` 10840 -> about 1800 instructions per call).
+  `tools/mcu-icount/count.sh` measures it under QEMU.
 
 
 ## 4.3.14
