@@ -88,6 +88,9 @@ mod forget_peer;
 #[path = "tests/silent_station_sim.rs"]
 mod silent_station_sim;
 #[cfg(all(test, feature = "discovery"))]
+#[path = "tests/own_network_variable.rs"]
+mod own_network_variable;
+#[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_split_horizon.rs"]
 mod ack_split_horizon;
 
@@ -2829,6 +2832,13 @@ struct RouterInner {
 struct ManagedVariableCacheEntry {
     packet: Packet,
     sender_address: u32,
+    // `packet` was written, seeded or sent by this router (not received).
+    packet_is_own: bool,
+    // This router's own latest value while `packet` is a received one (a
+    // board's report cached after the station's write). None when `packet`
+    // is its own or it never wrote one. A writer answers requests with its
+    // own value, never with a value it received.
+    own: Option<Box<Packet>>,
     #[cfg(feature = "discovery")]
     cached_at_ms: u64,
     // First actual ingress for this logical observation. Unlike the bounded
@@ -2836,6 +2846,31 @@ struct ManagedVariableCacheEntry {
     // the Option niche; a side index is represented by checked index + 1.
     #[cfg(feature = "discovery")]
     upstream: Option<core::num::NonZeroUsize>,
+}
+
+impl ManagedVariableCacheEntry {
+    #[inline]
+    fn own_packet(&self) -> Option<&Packet> {
+        if self.packet_is_own {
+            Some(&self.packet)
+        } else {
+            self.own.as_deref()
+        }
+    }
+    /// (packet_is_own, own) once `packet` replaces this entry's packet. The
+    /// same packet seen again keeps its provenance either way (a received
+    /// copy of the router's own value, or a received value it sends on).
+    fn own_after(&self, packet: &Packet, local: bool) -> (bool, Option<Box<Packet>>) {
+        if self.packet.packet_id() == packet.packet_id() {
+            (self.packet_is_own, self.own.clone())
+        } else if local {
+            (true, None)
+        } else if self.packet_is_own {
+            (false, Some(Box::new(self.packet.clone())))
+        } else {
+            (false, self.own.clone())
+        }
+    }
 }
 
 type NetworkVariableUpdateFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
@@ -4657,11 +4692,13 @@ impl Router {
         entry.note_local_handler_failure(ty, retries);
     }
 
+    /// `local`: written, seeded or sent by this router, not received.
     fn cache_managed_variable_packet(
         &self,
         pkt: &Packet,
         notify_handlers: bool,
         source_side: Option<RouterSideId>,
+        local: bool,
     ) -> TelemetryResult<()> {
         #[cfg(not(feature = "discovery"))]
         let _ = source_side;
@@ -4693,6 +4730,8 @@ impl Router {
             }) {
                 return Ok(());
             }
+            let (packet_is_own, own) =
+                existing.map_or((local, None), |entry| entry.own_after(pkt, local));
             // A proxy may change only the frozen transport recipients when
             // returning this exact source observation. That is not a new
             // application revision and must not replay update side effects.
@@ -4712,6 +4751,8 @@ impl Router {
             let updated = ManagedVariableCacheEntry {
                 packet: pkt.clone(),
                 sender_address,
+                packet_is_own,
+                own,
                 #[cfg(feature = "discovery")]
                 cached_at_ms: self.clock.now_ms(),
                 #[cfg(feature = "discovery")]
@@ -4751,8 +4792,25 @@ impl Router {
         Ok(())
     }
 
-    fn remember_managed_variable_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
-        self.cache_managed_variable_packet(pkt, true, None)
+    /// `local`: this router originated the packet (not forwarding one it received).
+    fn remember_managed_variable_packet(&self, pkt: &Packet, local: bool) -> TelemetryResult<()> {
+        self.cache_managed_variable_packet(pkt, true, None, local)
+    }
+
+    /// This router's own latest value of a network variable: the last packet
+    /// it wrote, seeded or sent for this type, even after a value received
+    /// from the network (another sender's report of the same type) became the
+    /// newest cached observation. A writer answers requests with this value.
+    /// None when it has written none, or the cache was invalidated or cleared
+    /// since.
+    pub fn own_network_variable(&self, ty: DataType) -> Option<Packet> {
+        let st = self.state.lock();
+        st.local_services
+            .as_ref()?
+            .managed_variable_latest
+            .get(&ty.as_u32())
+            .and_then(|entry| entry.own_packet())
+            .cloned()
     }
 
     fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
@@ -11316,7 +11374,7 @@ impl Router {
                         .as_ref()?
                         .managed_variable_latest
                         .get(&ty.as_u32())
-                        .map(|entry| entry.packet.clone())
+                        .and_then(|entry| entry.own_packet().cloned())
                 })
                 .collect();
             drop(st);
@@ -11477,7 +11535,10 @@ impl Router {
                 // subscriber restored an older persisted value at boot.
                 return Ok(false);
             }
-            if let Some(value) = self.managed_variable_latest(ty) {
+            // Its own value only: a writer that cached another sender's
+            // report of this type later (a board's state report) does not
+            // answer with it. Without one, the request keeps moving.
+            if let Some(value) = self.own_network_variable(ty) {
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
                         src: None,
@@ -16896,7 +16957,7 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
         }
-        self.cache_managed_variable_packet(&pkt, false, None)
+        self.cache_managed_variable_packet(&pkt, false, None, true)
     }
 
     pub fn cached_managed_variable(&self, ty: DataType) -> Option<Packet> {
@@ -16927,7 +16988,7 @@ impl Router {
                 return Err(TelemetryError::PermissionDenied);
             }
         }
-        self.cache_managed_variable_packet(&pkt, false, None)?;
+        self.cache_managed_variable_packet(&pkt, false, None, true)?;
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
@@ -19926,7 +19987,7 @@ impl Router {
         match &item.data {
             RouterItem::Packet(pkt) => {
                 if !is_internal_control_type(pkt.data_type()) {
-                    self.cache_managed_variable_packet(pkt, true, item.src)?;
+                    self.cache_managed_variable_packet(pkt, true, item.src, false)?;
                 }
             }
             RouterItem::Packed(bytes) => {
@@ -19936,7 +19997,7 @@ impl Router {
                 {
                     let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
-                    self.cache_managed_variable_packet(&pkt, true, item.src)?;
+                    self.cache_managed_variable_packet(&pkt, true, item.src, false)?;
                 }
             }
         }
@@ -20950,7 +21011,7 @@ impl Router {
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
-                    self.remember_managed_variable_packet(pkt)?;
+                    self.remember_managed_variable_packet(pkt, true)?;
                 }
                 #[cfg(feature = "discovery")]
                 let is_discovery = discovery::is_discovery_type(ty);
@@ -21209,7 +21270,7 @@ impl Router {
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
-                    self.remember_managed_variable_packet(pkt)?;
+                    self.remember_managed_variable_packet(pkt, src.is_none())?;
                 }
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {

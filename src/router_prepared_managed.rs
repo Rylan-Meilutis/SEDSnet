@@ -288,11 +288,14 @@ impl Router {
             let upstream = old
                 .filter(|e| e.packet.packet_id() == packet.packet_id())
                 .and_then(|e| e.upstream);
+            // A batch is this router's own write.
             latest.insert(
                 key,
                 Box::new(ManagedVariableCacheEntry {
                     packet: packet.clone(),
                     sender_address: item.sender_address,
+                    packet_is_own: true,
+                    own: None,
                     #[cfg(feature = "discovery")]
                     cached_at_ms: prepared.age_anchor_ms,
                     #[cfg(feature = "discovery")]
