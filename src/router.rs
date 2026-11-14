@@ -87,6 +87,9 @@ mod forget_peer;
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 #[path = "tests/silent_station_sim.rs"]
 mod silent_station_sim;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/proxy_upstream_receipt.rs"]
+mod proxy_upstream_receipt;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/own_network_variable.rs"]
 mod own_network_variable;
