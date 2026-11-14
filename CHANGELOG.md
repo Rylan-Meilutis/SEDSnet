@@ -80,6 +80,11 @@ that option, keep their 4.3.14 representations.
   conversions or software 64/128-bit division (Cortex-M4, firmware profile:
   `Router::network_time_ms` 10840 -> about 1800 instructions per call).
   `tools/mcu-icount/count.sh` measures it under QEMU.
+- `Router::forget_peer(hostname)` (discovery, Rust): an application that
+  knows a peer is out of range drops its routes now, as a discovery leave
+  does, and retires it from every pending end-to-end frame; a frame owed to
+  no one else completes. An ABORT or urgent frame is never completed this
+  way: owed only to the forgotten peer, it keeps retrying out its span.
 - End-to-end dedupe: a reliable end-to-end packet re-sent late (after the
   recent-id ring, 16 ids on boards, has rolled over) is acknowledged again but
   not delivered twice. Each reliable type keeps its last 4 delivered ids

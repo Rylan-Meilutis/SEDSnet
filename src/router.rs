@@ -16479,6 +16479,19 @@ impl Router {
         let mut retired = 0;
         let mut completed = Vec::new();
         for (packet_id, sent) in st.end_to_end_reliable_tx.iter_mut() {
+            // An ABORT or urgent frame is never completed this way (as with
+            // complete_reliable): it keeps the forgotten peer while no one
+            // else still owes it, and retries out its own span.
+            let protected = Self::item_data_type(&sent.data)
+                .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT");
+            if protected
+                && sent
+                    .pending_destinations
+                    .keys()
+                    .all(|owner| owners.contains(owner))
+            {
+                continue;
+            }
             let before = sent.pending_destinations.len();
             for owner in &owners {
                 sent.pending_destinations.remove(owner);
