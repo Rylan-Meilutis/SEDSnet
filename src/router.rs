@@ -14507,7 +14507,7 @@ impl Router {
                 }
             }
             // Retire them from this frame and every frame behind it.
-            self.retire_owners_from_pending(&silenced)?;
+            self.retire_owners_from_pending(&silenced, true)?;
         }
         for packet_id in requeue {
             self.queue_end_to_end_reliable_retransmit(packet_id)?;
@@ -16803,7 +16803,7 @@ impl Router {
             owners.push(u64::from(entry.address));
         }
         drop(st);
-        self.retire_owners_from_pending(&owners)
+        self.retire_owners_from_pending(&owners, false)
     }
 
     /// Retires `owners` from every pending end-to-end frame: a frame then
@@ -16813,11 +16813,12 @@ impl Router {
     /// one else still owes it, and retries out its own span. Returns the
     /// number of frames retired from.
     #[cfg(feature = "discovery")]
-    fn retire_owners_from_pending(&self, owners: &[u64]) -> TelemetryResult<usize> {
+    fn retire_owners_from_pending(&self, owners: &[u64], silent: bool) -> TelemetryResult<usize> {
         let mut st = self.state.lock();
         let mut retired = 0;
         let mut completed = Vec::new();
-        for (packet_id, sent) in st.end_to_end_reliable_tx.iter_mut() {
+        let RouterInner { end_to_end_reliable_tx, reliable_exhausted, .. } = &mut *st;
+        for (packet_id, sent) in end_to_end_reliable_tx.iter_mut() {
             let protected = Self::item_data_type(&sent.data)
                 .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT");
             if protected
@@ -16832,10 +16833,27 @@ impl Router {
             for owner in owners {
                 sent.pending_destinations.remove(owner);
             }
-            if sent.pending_destinations.len() != before {
+            let removed = (before - sent.pending_destinations.len()) as u64;
+            if removed != 0 {
                 retired += 1;
-                if sent.pending_destinations.is_empty() {
+                let done = sent.pending_destinations.is_empty();
+                if done {
                     completed.push(*packet_id);
+                }
+                if silent {
+                    let c = &mut *reliable_exhausted;
+                    let ordered = sent.ordered_type.is_some();
+                    let (owners_n, frames_n) = if ordered {
+                        (&mut c.silent_owner_retired_ordered, &mut c.silent_owner_completed_ordered)
+                    } else {
+                        (&mut c.silent_owner_retired_unordered, &mut c.silent_owner_completed_unordered)
+                    };
+                    *owners_n = owners_n.saturating_add(removed);
+                    // Completed for owners that acknowledged it, not a frame
+                    // owed to the silent owner alone.
+                    if done && Self::frozen_owner_count(&sent.data) as u64 > removed {
+                        *frames_n = frames_n.saturating_add(1);
+                    }
                 }
             }
         }

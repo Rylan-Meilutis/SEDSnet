@@ -215,6 +215,20 @@ fn an_owner_that_missed_every_retry_is_retired_not_the_stream() {
     );
     assert!(st.silent_owners.iter().any(|(owner, _)| *owner == rr));
     drop(st);
+    // Counted with the exhaustion counters: the RRLS retired from the head
+    // and the tail, the head completed only after its retirement.
+    let counts = node.export_runtime_stats().reliable.exhausted;
+    assert_eq!(
+        (
+            counts.silent_owner_retired_ordered,
+            counts.silent_owner_completed_ordered,
+            counts.silent_owner_retired_unordered,
+            counts.silent_owner_completed_unordered,
+            counts.end_to_end_ordered,
+        ),
+        (2, 1, 0, 0, 0),
+        "{counts:?}"
+    );
     // New frames leave the silent owner out.
     let mut pending: OrdMap<u64, RouterSideId> = [(gs, radio), (rr, radio)].into_iter().collect();
     {

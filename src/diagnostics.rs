@@ -146,6 +146,14 @@ pub struct ReliableExhaustionCounts {
     pub end_to_end_unordered: u64,
     pub hop_ordered: u64,
     pub hop_unordered: u64,
+    /// Owners retired from end-to-end frames after missing every retry of one
+    /// (a silent station), counted per frame, by the frame's mode.
+    pub silent_owner_retired_ordered: u64,
+    pub silent_owner_retired_unordered: u64,
+    /// End-to-end frames completed only because a silent owner was retired
+    /// (every other owner had acknowledged them).
+    pub silent_owner_completed_ordered: u64,
+    pub silent_owner_completed_unordered: u64,
 }
 
 /// One reliable delivery given up after its last retry (std builds keep the

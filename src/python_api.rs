@@ -844,6 +844,14 @@ fn runtime_stats_snapshot_to_pydict(
     exhausted.set_item("end_to_end_unordered", snap.reliable.exhausted.end_to_end_unordered)?;
     exhausted.set_item("hop_ordered", snap.reliable.exhausted.hop_ordered)?;
     exhausted.set_item("hop_unordered", snap.reliable.exhausted.hop_unordered)?;
+    for (key, value) in [
+        ("silent_owner_retired_ordered", snap.reliable.exhausted.silent_owner_retired_ordered),
+        ("silent_owner_retired_unordered", snap.reliable.exhausted.silent_owner_retired_unordered),
+        ("silent_owner_completed_ordered", snap.reliable.exhausted.silent_owner_completed_ordered),
+        ("silent_owner_completed_unordered", snap.reliable.exhausted.silent_owner_completed_unordered),
+    ] {
+        exhausted.set_item(key, value)?;
+    }
     reliable.set_item("exhausted", exhausted)?;
     out.set_item("reliable", reliable)?;
 
