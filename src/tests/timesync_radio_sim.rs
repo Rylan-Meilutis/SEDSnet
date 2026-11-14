@@ -69,6 +69,17 @@ const GS: usize = 0;
 const BYTE_UART_MS: f64 = 10.0 / 115.2;
 thread_local! {
     pub(crate) static PATH_DESCRIBED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// RF's radio stamps taken this much too early (ms): (t1 transmit, t4 receive).
+    pub(crate) static RF_STAMP_EARLY_MS: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
+/// RF radio stamp at local `ns`, moved early (negative: late) by the bias.
+fn rf_stamp(node: usize, radio: bool, receive: bool, ns: u64) -> u64 {
+    if node != RF || !radio {
+        return ns;
+    }
+    let (t1, t4) = RF_STAMP_EARLY_MS.with(|e| e.get());
+    (ns as i64 - ((if receive { t4 } else { t1 }) * 1e6) as i64) as u64
 }
 const RF: usize = 1;
 
@@ -159,7 +170,7 @@ impl Net {
             let (node, side, radio, out) = (self.sides[from].0, self.sides[from].1, self.sides[from].2, self.sides[from].3.clone());
             for b in std::mem::take(&mut *out.lock().unwrap()) {
                 // Transmit complete at the UART (radio) or the CAN controller.
-                self.nodes[node].note_frame_sent(side, &b, self.local_ns(node, t));
+                self.nodes[node].note_frame_sent(side, &b, rf_stamp(node, radio, false, self.local_ns(node, t)));
                 if radio {
                     let to = if from == 0 { 1 } else { 0 };
                     if self.rng.unit() < self.link.loss {
@@ -195,9 +206,10 @@ impl Net {
         });
         due.sort_by_key(|f| f.0);
         for (at, to, b) in due {
-            let (node, side) = (self.sides[to].0, self.sides[to].1);
+            let (node, side, radio) = (self.sides[to].0, self.sides[to].1, self.sides[to].2);
             // Receive stamp at the frame's last byte.
-            let _ = self.nodes[node].rx_packed_from_side_at(&b, side, self.local_ns(node, at));
+            let rx_ns = rf_stamp(node, radio, true, self.local_ns(node, at));
+            let _ = self.nodes[node].rx_packed_from_side_at(&b, side, rx_ns);
             let _ = self.nodes[node].drain_queues_with_timeout(0);
         }
         self.now.store(next, Ordering::SeqCst);
@@ -336,6 +348,70 @@ fn radio_sim_every_frame_waits() {
             }
         }
     }
+}
+
+/// Every 100 ms from boot, per board: samples reported synced (locked or
+/// holdover) with a bound below the real error. The honest report the boards
+/// owe: a bound that covers the error, or not synced.
+fn synced_with_short_bound(link: RadioLink, seconds: u64, seed: u64) -> Vec<(&'static str, usize, usize)> {
+    let mut net = Net::new(link, seed);
+    let mut out: Vec<(&'static str, usize, usize)> = (1..NODES.len()).map(|n| (NODES[n].0, 0, 0)).collect();
+    for i in 0..seconds * 1_000 {
+        net.step();
+        if i % 100 != 0 {
+            continue;
+        }
+        for node in 1..NODES.len() {
+            let (Some(err), Some(st)) = (net.error_ns(node), net.nodes[node].timesync_status()) else { continue };
+            if st.state.is_synced() {
+                out[node - 1].2 += 1;
+                if (st.error_bound_ns as u128) < err.unsigned_abs() {
+                    if out[node - 1].1 == 0 {
+                        println!(
+                            "first short bound: {} at {:.1} s err {:.3} ms bound {:.3} ms {:?}",
+                            NODES[node].0, i as f64 / 1e3, err as f64 / 1e6, st.error_bound_ns as f64 / 1e6, st.state
+                        );
+                    }
+                    out[node - 1].1 += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn assert_honest_with_rf_stamps_early(t1_ms: f64, t4_ms: f64) {
+    RF_STAMP_EARLY_MS.with(|e| e.set((t1_ms, t4_ms)));
+    let mut failures = Vec::new();
+    for (label, link) in [("0%", CLEAN), ("30%", LOSSY)] {
+        for seed in [0x5eed, 0x9e37_79b9, 7] {
+            let res = synced_with_short_bound(link, 300, seed);
+            println!("t1 early {t1_ms} ms, t4 early {t4_ms} ms, {label} seed {seed}: (board, synced with bound < error, synced samples) {res:?}");
+            if res.iter().any(|r| r.1 != 0) {
+                failures.push((label, seed, res));
+            }
+        }
+    }
+    RF_STAMP_EARLY_MS.with(|e| e.set((0.0, 0.0)));
+    assert!(failures.is_empty(), "synced with a bound below the real error: {failures:?}");
+}
+
+/// RF's transmit stamp (t1) 38 ms early: the round trip looks 38 ms longer
+/// and the phase 19 ms ahead. At every sample each board's bound covers its
+/// real error or the board does not report itself synced. 38 ms late (the
+/// round trip looks shorter, like an early t4) must stay honest too.
+#[test]
+fn radio_sim_rf_t1_stamped_38ms_early_stays_honest() {
+    assert_honest_with_rf_stamps_early(38.0, 0.0);
+    assert_honest_with_rf_stamps_early(-38.0, 0.0);
+}
+
+/// RF's receive stamp (t4) 38 ms early: the round trip looks 38 ms shorter,
+/// often below the radio's physical minimum, which proves a stamp is wrong;
+/// it must never make a sample look like a direct crossing.
+#[test]
+fn radio_sim_rf_t4_stamped_38ms_early_stays_honest() {
+    assert_honest_with_rf_stamps_early(0.0, 38.0);
 }
 
 /// Prints RF's error, bound, rate and sample age over time (diagnosis).
