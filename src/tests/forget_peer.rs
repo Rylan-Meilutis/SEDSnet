@@ -135,3 +135,91 @@ fn forgetting_a_peer_never_completes_an_abort_or_urgent_frame() {
     drop(st);
     assert!(crate::set_type_scheduling_class(urgent, 0));
 }
+
+/// A station that went silent (its discovery leave lost): an Ordered head
+/// that the GS acknowledged but the RRLS never did completes for the GS when
+/// its retries run out, and the frame queued behind it still goes (it is not
+/// cancelled with the head). The RRLS is retired from that frame and the
+/// ones after it, and left out of new frames until it is heard again. An
+/// ABORT owed only to the silent station is never completed this way.
+#[test]
+fn an_owner_that_missed_every_retry_is_retired_not_the_stream() {
+    crate::tests::ensure_common_test_schema();
+    let endpoint = DataEndpoint::named("RADIO");
+    let ty = crate::config::register_data_type_with_description(
+        "SILENT_OWNER_ORDERED",
+        "",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::Ordered,
+        16,
+    )
+    .unwrap();
+    let abort_ep = crate::config::register_endpoint("GENERIC_REFRESH_CHURN_ENDPOINT", false).unwrap();
+    let abort = crate::config::register_data_type_with_description(
+        "ABORT",
+        "Diagnostic application Stop ownership",
+        crate::MessageElement::Dynamic(crate::MessageDataType::String, crate::MessageClass::Error),
+        &[abort_ep],
+        crate::ReliableMode::Unordered,
+        0,
+    )
+    .unwrap();
+    let now = Arc::new(core::sync::atomic::AtomicU64::new(1_000));
+    let clock = now.clone();
+    let node = Router::new_with_clock(
+        RouterConfig::new([]).with_sender("RF"),
+        Box::new(move || clock.load(Ordering::SeqCst)),
+    );
+    let radio = node.add_side_packed("radio", |_| Ok(()));
+    node.clear_queues();
+    let (gs, rr) = (Router::sender_hash("GS"), Router::sender_hash("RRLS"));
+    let frame = |ty: DataType, ep: DataEndpoint, timestamp: u64, owners: &[u64]| {
+        let packet = Packet::new(ty, &[ep], "RF", timestamp, Arc::<[u8]>::from(*b"K")).unwrap();
+        let item = node.attach_wire_contract_to_item(RouterItem::Packet(packet), owners).unwrap();
+        let id = Router::get_hash(&item);
+        node.register_end_to_end_reliable_tx(
+            &item,
+            Some(owners.iter().map(|owner| (*owner, radio)).collect::<OrdMap<_, _>>()),
+        )
+        .unwrap();
+        id
+    };
+    let head = frame(ty, endpoint, 1, &[gs, rr]);
+    let tail = frame(ty, endpoint, 2, &[gs, rr]);
+    // The GS acknowledges the head; the RRLS never answers.
+    node.state.lock().end_to_end_reliable_tx.get_mut(&head).unwrap().pending_destinations.remove(&gs);
+    let span = runtime_reliable_retransmit_ms() * (u64::from(runtime_reliable_max_retries()) + 2);
+    let mut abort_rr = None;
+    let mut elapsed = 0;
+    while node.state.lock().end_to_end_reliable_tx.contains_key(&head) && elapsed < 2 * span {
+        if abort_rr.is_none() && elapsed >= span / 2 {
+            // An ABORT owed only to the RRLS, sent while the head still retries.
+            abort_rr = Some(frame(abort, abort_ep, 3, &[rr]));
+        }
+        now.fetch_add(10, Ordering::SeqCst);
+        elapsed += 10;
+        let _ = node.process_all_queues_with_timeout(0);
+    }
+    let st = node.state.lock();
+    assert!(!st.end_to_end_reliable_tx.contains_key(&head), "the head completed for the GS");
+    assert!(
+        st.end_to_end_reliable_tx.contains_key(&abort_rr.unwrap()),
+        "an ABORT owed only to the silent owner is never completed through its retirement"
+    );
+    let tail_sent = st.end_to_end_reliable_tx.get(&tail).expect("the tail was not cancelled with the head");
+    assert_eq!(
+        tail_sent.pending_destinations.keys().copied().collect::<Vec<_>>(),
+        vec![gs],
+        "the silent RRLS is retired from the frames behind the head"
+    );
+    assert!(st.silent_owners.iter().any(|(owner, _)| *owner == rr));
+    drop(st);
+    // New frames leave the silent owner out.
+    let mut pending: OrdMap<u64, RouterSideId> = [(gs, radio), (rr, radio)].into_iter().collect();
+    {
+        let st = node.state.lock();
+        node.filter_trackable_end_to_end_destinations_locked(&st, ty, &mut pending, false);
+    }
+    assert!(!pending.contains_key(&rr), "a silent owner is not owed new frames");
+}
