@@ -1345,6 +1345,11 @@ struct ReliableLocalAdmissionGuard<'a> {
     router: &'a Router,
     packet_id: u64,
     token: u64,
+    // A duplicate of an already-delivered packet on another side than the
+    // one its receipts return to: its receipt also goes back on this side,
+    // toward that side's sender (a cycle's other path, e.g. a segment proxy
+    // forwarding the same write). The return route itself is unchanged.
+    cross_side: Option<RouterSideId>,
 }
 #[cfg(all(test, feature = "std"))]
 std::thread_local! {
@@ -6503,6 +6508,11 @@ impl Router {
         if !Self::can_admit_reliable_return_route_growth_locked(&st, packet_id) {
             return Err(TelemetryError::Io("memory pressure"));
         }
+        let cross_side = st
+            .reliable_return_routes
+            .get(&packet_id)
+            .filter(|route| duplicate && !replace_side && route.side != side)
+            .map(|_| side);
         let token = st
             .local_admission_sequence
             .checked_add(1)
@@ -6536,6 +6546,7 @@ impl Router {
             router: self,
             packet_id,
             token,
+            cross_side,
         }))
     }
 
@@ -7814,6 +7825,26 @@ impl Router {
             .side;
         if !Self::side_ref(&state, dst)?.opts.egress_enabled {
             return Ok(());
+        }
+        if let Some(cross) = guard.cross_side
+            && cross != dst
+            && Self::side_ref(&state, cross).is_ok_and(|side| side.opts.egress_enabled)
+            && !Self::receipt_queued_locked(&state, cross, packet_id)
+        {
+            state.push_transmit(TxQueued {
+                disposable: TX_DISPOSABLE,
+                item: RouterTxItem::ToSide {
+                    src: None,
+                    dst: cross,
+                    data: data.clone(),
+                },
+                ignore_local: true,
+                priority,
+                delivery_state: QueuedDelivery::Untracked,
+                accepted_type: DataType::ReliableAck.as_u32(),
+                deferred_since_ms: 0,
+                retry_after_ms: 0,
+            })?;
         }
         state.push_transmit(TxQueued {
             disposable: TX_DISPOSABLE,
