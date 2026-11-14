@@ -255,7 +255,13 @@ fn utc_reports_ride_in_the_request_cookie_and_never_wrap() {
     assert!(!reports.is_empty(), "no report reached the GS");
     let r = reports.last().unwrap();
     assert_eq!(r.offset_ns, 12_345_000);
-    assert!(r.error_ns >= 20_000_000 && r.error_ns < 30_000_000, "{r:?}");
+    // The reference's error plus RF's own network-time bound (locked: at
+    // most the lock threshold).
+    assert!(
+        r.error_ns >= 20_000_000
+            && r.error_ns < 20_000_000 + crate::timesync_discipline::TIMESYNC_LOCK_THRESHOLD_NS,
+        "{r:?}"
+    );
     assert_eq!(r.sender_tag, timesync_sender_tag("RF"));
     // Sync keeps working with report cookies.
     assert!(p.rf_error_ns().abs() < 3_000_000);

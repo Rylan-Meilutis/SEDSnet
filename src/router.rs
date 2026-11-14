@@ -7910,14 +7910,18 @@ impl Router {
                     || now_ms.saturating_sub(pending.t1_mono_ms)
                         > st.cfg.map_or(0, |cfg| {
                             // A lost exchange must not block the next one for
-                            // the whole source timeout.
-                            cfg.source_timeout_ms
-                                .min(cfg.request_interval_ms.saturating_mul(2).max(1_000))
+                            // the whole source timeout: wait two round trips.
+                            st.v2
+                                .last_round_trip_ms()
+                                .saturating_mul(2)
+                                .saturating_add(500)
+                                .clamp(1_000, cfg.source_timeout_ms.max(1_000))
                         })
             });
         if should_clear {
+            // The next request still keeps its interval (never more requests
+            // outstanding than the round trip allows).
             st.pending_request = None;
-            st.next_request_mono_ms = now_ms;
         }
     }
 
@@ -14907,14 +14911,25 @@ impl Router {
                 let seq = side.map_or(seq, |_| {
                     (u64::from(timesync_sender_tag(&remote.sender)) << 32) | seq
                 });
-                // Locked followers exchange less often: the learned frequency
-                // carries the clock between samples and the radio is busy.
-                let interval = if st.v2.is_locked() {
+                // A follower whose bound is tight exchanges less often: the
+                // learned frequency carries the clock between samples and the
+                // radio is busy. One still acquiring, or whose bound grew (lost
+                // or queued exchanges, a step), asks twice as often.
+                let interval = if st.v2.is_locked()
+                    && st
+                        .v2
+                        .bound_ns(now_ns)
+                        .is_some_and(|bound| bound <= timesync_v2::RELAXED_REQUEST_BOUND_NS)
+                {
                     cfg.request_interval_ms
                         .saturating_mul(timesync_v2::LOCKED_REQUEST_DIVISOR)
-                } else {
+                } else if st.v2.is_locked() {
                     cfg.request_interval_ms
-                };
+                } else {
+                    (cfg.request_interval_ms / 2).max(timesync_v2::FAST_REQUEST_MIN_MS)
+                }
+                // Never more requests outstanding than the round trip allows.
+                .max(st.v2.last_round_trip_ms());
                 st.next_request_mono_ms = now_ms.saturating_add(interval);
                 // A fresh absolute-time report rides in the t1 cookie word.
                 let (seq, cookie) = Self::timesync_request_cookie_locked(&st, seq, now_ms, now_ns);

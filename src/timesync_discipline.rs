@@ -2,11 +2,17 @@
 //!
 //! A follower measures `phi = network - monotonic` once per exchange, at the
 //! exchange midpoint. This module:
-//! - keeps the last [`DISCIPLINE_SAMPLES`] accepted samples (NTP's clock filter)
-//!   and rejects samples whose path delay is well above the recent minimum, so
-//!   queueing on a busy link costs sample rate, not accuracy;
-//! - fits phase and oscillator frequency by weighted least squares;
-//! - reports an error bound and a locked/holdover state.
+//! - keeps the [`DISCIPLINE_SAMPLES`] samples that say most about the clock now
+//!   (NTP's clock filter): one whose path delay is well above the window's best
+//!   is rejected, and a full window replaces its worst (aged) sample, so
+//!   queueing or turn waits on a busy link cost sample rate, not accuracy;
+//! - fits phase and oscillator frequency by weighted least squares, weights
+//!   1/sigma^2 where sigma is each sample's worst-case path error;
+//! - reports an error bound built from those worst cases (never a statistic of
+//!   the fit), widened by the disagreement of the best samples, and a
+//!   locked/holdover state. The bound assumes the window's best exchange
+//!   crossed each way within an eighth of the minimum half delay of
+//!   symmetric, i.e. that some frames pass without waiting for a turn.
 //!
 //! Pure 64-bit arithmetic over monotonic nanoseconds (one shared 128-bit
 //! multiply-divide helper), sized for Cortex-M flash budgets.
@@ -288,44 +294,80 @@ impl ClockDiscipline {
         self.samples().iter().map(|s| s.half_delay_ns).min().unwrap_or(0)
     }
 
-    /// The random part of a sample's error: delay above the window minimum
-    /// (queueing that may be one-sided) plus the source's own error.
-    fn noise_ns(&self, s: &DisciplineSample, min_half: u32) -> u64 {
-        u64::from(s.half_delay_ns.saturating_sub(min_half)) + u64::from(s.source_error_ns)
+    /// Worst-case error of a sample's phase, us: path delay above the window
+    /// minimum (queueing or a turn wait on one side only), an eighth of the
+    /// minimum for asymmetry of the fixed path, the source's own error, and
+    /// a 20 us stamp floor. The true offset lies within this of `phi`.
+    fn sigma_us(s: &DisciplineSample, min_half: u32) -> u64 {
+        Self::path_sigma_us(s, min_half) + u64::from(s.source_error_ns) / 1_000
+    }
+
+    /// The path's part of [`Self::sigma_us`]: what differs from sample to
+    /// sample. The source's own error is a slowly varying common error (its
+    /// clock is disciplined), so it does not tilt the frequency estimate; it is
+    /// added to the phase bound once.
+    fn path_sigma_us(s: &DisciplineSample, min_half: u32) -> u64 {
+        let excess = u64::from(s.half_delay_ns.saturating_sub(min_half));
+        (excess + u64::from(min_half) / 8) / 1_000 + 20
     }
 
     /// Offers a sample. Returns `true` when it was accepted into the filter.
+    ///
+    /// The window keeps the samples that say most about the clock now: when
+    /// it is full, the new sample replaces the one whose error, aged by the
+    /// drift allowance, is worst, if the new one is better. A run of
+    /// [`MAX_REJECT_RUN`] worse samples replaces it anyway: the path itself
+    /// has changed and the old minimum is stale.
     pub fn offer(&mut self, sample: DisciplineSample) -> bool {
         if self.newest_mono_ns().is_some_and(|m| sample.mono_ns <= m) {
             return false;
         }
         if self.len >= MIN_LOCK_SAMPLES && self.reject_run < MAX_REJECT_RUN {
-            let best = self
-                .samples()
-                .iter()
-                .map(|s| u64::from(s.half_delay_ns) + u64::from(s.source_error_ns))
-                .min()
-                .unwrap_or(0);
-            // Popcorn filter: within twice the recent best plus 2 ms.
-            let own = u64::from(sample.half_delay_ns) + u64::from(sample.source_error_ns);
-            if own > best.saturating_mul(2).saturating_add(2_000_000) {
+            // Popcorn filter: well above the window's best (one-sided
+            // queueing) costs sample rate, not accuracy or a window slot.
+            let min_half = self.min_half_delay().min(sample.half_delay_ns);
+            let best = self.samples().iter().map(|s| Self::sigma_us(s, min_half)).min().unwrap_or(0);
+            if Self::sigma_us(&sample, min_half) > best.saturating_mul(2).saturating_add(2_000) {
                 self.reject_run += 1;
                 return false;
             }
         }
+        let slot = if usize::from(self.len) < DISCIPLINE_SAMPLES {
+            usize::from(self.len)
+        } else {
+            let min_half = self.min_half_delay().min(sample.half_delay_ns);
+            let score = |s: &DisciplineSample| {
+                let age_us = (sample.mono_ns - s.mono_ns) / 1_000;
+                Self::sigma_us(s, min_half)
+                    .saturating_add(age_us.saturating_mul(TIMESYNC_DRIFT_ALLOWANCE_PPB) / 1_000_000_000)
+            };
+            let (worst, worst_score) = self
+                .samples()
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, score(s)))
+                .max_by_key(|(_, sc)| *sc)
+                .unwrap_or((0, 0));
+            if Self::sigma_us(&sample, min_half) >= worst_score && self.reject_run < MAX_REJECT_RUN {
+                self.reject_run += 1;
+                return false;
+            }
+            worst
+        };
         self.reject_run = 0;
-        self.ring[usize::from(self.head)] = sample;
-        self.head = (self.head + 1) % DISCIPLINE_SAMPLES as u8;
+        self.ring[slot] = sample;
         self.len = (self.len + 1).min(DISCIPLINE_SAMPLES as u8);
+        self.head = (slot as u8 + 1) % DISCIPLINE_SAMPLES as u8;
         self.accepted = self.accepted.saturating_add(1);
         self.fit();
         true
     }
 
-    /// Weighted least-squares fit of `phi` against monotonic time. Weights are
-    /// 1/(1 + (noise/64 us)^2): a sample taken while the source itself was
-    /// unsynced (error about 1 s) barely counts. The slope is the oscillator's
-    /// frequency error; the fit at the newest sample is the phase.
+    /// Weighted least-squares fit of `phi` against monotonic time, weights
+    /// 1/sigma^2. The slope is the oscillator's frequency error; the fit at
+    /// the newest sample is the phase. Both carry worst-case bounds derived
+    /// from the per-sample errors (never a statistic of the fit itself, which
+    /// a single good sample among bad ones makes look precise).
     fn fit(&mut self) {
         let Some(newest) = self.newest_mono_ns() else {
             return;
@@ -336,58 +378,71 @@ impl ClockDiscipline {
             .find(|s| s.mono_ns == newest)
             .map_or(0, |s| s.phi_ns);
         let min_half = self.min_half_delay();
+        let n = self.samples().len();
+        // 64-bit only (Cortex-M flash: no 128-bit division routines): weights
+        // 2^30/sigma^2 with sigma in [20 us, 2^20 us], x in ms within 2^20,
+        // y in us within 2^31; products pass through `mul_div`.
         let mut w = [0i64; DISCIPLINE_SAMPLES];
+        let mut sig = [0i64; DISCIPLINE_SAMPLES]; // us
         let mut x = [0i64; DISCIPLINE_SAMPLES]; // ms before newest (<= 0)
         let mut y = [0i64; DISCIPLINE_SAMPLES]; // us relative to newest phi
-        let (mut sw, mut swx, mut swy, mut swe) = (0i64, 0i64, 0i64, 0i64);
+        let (mut sw, mut swx, mut swy) = (0i64, 0i64, 0i64);
         let mut oldest = newest;
         for (i, s) in self.samples().iter().enumerate() {
-            let noise_us = (self.noise_ns(s, min_half) / 1_000).min(10_000_000) as i64;
-            let r = noise_us / 64;
-            w[i] = (1 << 20) / (1 + r.saturating_mul(r).min(1 << 20));
-            x[i] = -(((newest - s.mono_ns) / 1_000_000).min(1_000_000) as i64);
-            y[i] = (s.phi_ns.wrapping_sub(newest_phi) / 1_000).clamp(-1 << 40, 1 << 40);
+            sig[i] = Self::path_sigma_us(s, min_half).min(1 << 20) as i64;
+            w[i] = ((1i64 << 30) / (sig[i] * sig[i])).max(1);
+            x[i] = -(((newest - s.mono_ns) / 1_000_000).min(1 << 20) as i64);
+            y[i] = (s.phi_ns.wrapping_sub(newest_phi) / 1_000).clamp(-(1 << 31), 1 << 31);
             sw += w[i];
             swx += w[i] * x[i];
             swy += w[i] * y[i];
-            swe += w[i].saturating_mul(noise_us);
             oldest = oldest.min(s.mono_ns);
         }
-        if sw == 0 {
-            return;
-        }
-        let span = newest - oldest;
-        let noise_us = (swe / sw).max(1);
-        if span >= MIN_FREQ_SPAN_NS {
+        if newest - oldest >= MIN_FREQ_SPAN_NS && n >= 2 {
             let (xm, ym) = (swx / sw, swy / sw);
-            let (mut sxx, mut sxy) = (0i64, 0i64);
-            for i in 0..self.samples().len() {
+            let (mut sxx, mut sxy, mut sxe) = (0i64, 0i64, 0i64);
+            for i in 0..n {
                 let dx = x[i] - xm;
-                sxx = sxx.saturating_add(w[i] * dx * dx / 1_024);
+                sxx = sxx.saturating_add(mul_div(w[i] * dx, dx, 1_024));
                 sxy = sxy.saturating_add(mul_div(w[i] * dx, y[i] - ym, 1_024));
+                sxe = sxe.saturating_add(mul_div(w[i] * dx.abs(), sig[i], 1_024));
             }
             if sxx > 0 {
                 // slope in us per ms = 1e-3 -> ppb = slope * 1e6
-                self.rate_ppb =
-                    mul_div(sxy, 1_000_000, sxx).clamp(-TIMESYNC_MAX_RATE_PPB, TIMESYNC_MAX_RATE_PPB);
-                // Two noise widths across the span.
-                self.freq_uncertainty_ppb =
-                    (2 * noise_us as u64 * 1_000_000_000_000 / span.max(1)).min(10_000_000);
+                self.rate_ppb = mul_div(sxy, 1_000_000, sxx).clamp(-TIMESYNC_MAX_RATE_PPB, TIMESYNC_MAX_RATE_PPB);
+                // Worst case over |error_i| <= sigma_i.
+                self.freq_uncertainty_ppb = mul_div(sxe, 1_000_000, sxx).clamp(0, 10_000_000) as u64;
             }
         }
-        // Phase at the newest sample on the fitted (or kept) frequency.
-        let mut sa = 0i64;
+        // Phase at the newest sample on the fitted (or kept) frequency, and
+        // its worst-case error: each sample's error plus the frequency's over
+        // its distance from the newest (both in us).
+        let (mut sa, mut se) = (0i64, 0i64);
         for (i, s) in self.samples().iter().enumerate() {
             let dx_ns = s.mono_ns as i64 - newest as i64;
-            let resid = s.phi_ns.wrapping_sub(newest_phi)
-                - mul_div(dx_ns, self.rate_ppb, 1_000_000_000);
-            sa = sa.saturating_add(mul_div(w[i], resid, 1));
+            let resid_us = (s.phi_ns.wrapping_sub(newest_phi) - mul_div(dx_ns, self.rate_ppb, 1_000_000_000)) / 1_000;
+            sa = sa.saturating_add(w[i].saturating_mul(resid_us.clamp(-(1 << 31), 1 << 31)));
+            let carry_us = mul_div((dx_ns.unsigned_abs() / 1_000) as i64, self.freq_uncertainty_ppb as i64, 1_000_000_000);
+            se = se.saturating_add(w[i].saturating_mul(sig[i] + carry_us.min(1 << 31)));
         }
         self.fit_mono_ns = newest;
-        self.fit_phi_ns = newest_phi.wrapping_add(sa / sw);
-        // Half the weighted noise plus 1/8 of the smallest half delay for
-        // unmodelled fixed asymmetry.
-        self.fit_error_ns = noise_us as u64 * 500 + u64::from(min_half) / 8;
+        self.fit_phi_ns = newest_phi.wrapping_add((sa / sw).saturating_mul(1_000));
+        // The best samples must agree with the fit within the bound: when they
+        // do not, their paths were asymmetric beyond the allowance (every frame
+        // queued on one side) and the spread is the evidence.
+        let best = sig[..n].iter().copied().min().unwrap_or(0);
+        let mut spread = 0i64;
+        for (i, s) in self.samples().iter().enumerate() {
+            if sig[i] <= best * 2 + 1_000 {
+                let dx_ns = s.mono_ns as i64 - newest as i64;
+                let fitted = self.fit_phi_ns.wrapping_add(mul_div(dx_ns, self.rate_ppb, 1_000_000_000));
+                spread = spread.max(s.phi_ns.wrapping_sub(fitted).saturating_abs());
+            }
+        }
+        // The source's own error, the worst it reported over the window: its
+        // clock moves under us between samples within that bound.
+        let source = self.samples().iter().map(|s| u64::from(s.source_error_ns)).max().unwrap_or(0);
+        self.fit_error_ns = ((se / sw).saturating_mul(1_000).max(spread.saturating_mul(3)) as u64).saturating_add(source);
     }
 
     /// Network time the clock should read at `now_mono_ns`.

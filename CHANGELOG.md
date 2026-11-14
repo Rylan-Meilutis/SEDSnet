@@ -80,6 +80,19 @@ that option, keep their 4.3.14 representations.
   conversions or software 64/128-bit division (Cortex-M4, firmware profile:
   `Router::network_time_ms` 10840 -> about 1800 instructions per call).
   `tools/mcu-icount/count.sh` measures it under QEMU.
+- Time sync over lossy, turn-taking links: the discipline weights each sample
+  by 1/sigma^2 of its worst-case path error and keeps the samples that say
+  most about the clock now (a full window replaces its worst aged sample). The
+  frequency fit and the reported error bound come from those worst cases,
+  widened by the disagreement of the best samples, so the bound is never a
+  statistic of a single good sample (it assumes some frames cross without a
+  turn wait). A follower asks twice as often while acquiring, at the
+  configured interval while its bound is above 5 ms, and four times less often
+  only while tighter; never faster than one request per round trip, and a lost
+  exchange no longer forces an immediate request. Host sim
+  (`tests/timesync_radio_sim.rs`: GS - radio - RF - CAN - FC/PB, crystals
+  +160/-90/+45 ppm, turn waits 0-200 ms on half the frames): p95 under 1 ms
+  at 0% and 30% loss each way, bound never below the real error.
 - `Router::forget_peer(hostname)` (discovery, Rust): an application that
   knows a peer is out of range drops its routes now, as a discovery leave
   does, and retires it from every pending end-to-end frame; a frame owed to

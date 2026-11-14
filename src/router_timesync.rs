@@ -30,6 +30,10 @@ const RX_MARKS: usize = 4;
 const ASYMMETRY_SIDES: usize = 2;
 /// Locked followers exchange this many times less often (air budget).
 pub(super) const LOCKED_REQUEST_DIVISOR: u64 = 4;
+/// Bound at or below which a locked follower relaxes to the slow request rate.
+pub(super) const RELAXED_REQUEST_BOUND_NS: u64 = 5_000_000;
+/// Fastest request interval while acquiring.
+pub(super) const FAST_REQUEST_MIN_MS: u64 = 250;
 /// Before first lock a follower steps instead of slewing beyond this error.
 const ACQUIRE_STEP_NS: u64 = 50_000_000;
 /// Source error assumed for a responder that reports an unknown bound.
@@ -110,6 +114,9 @@ pub(super) struct TimeSyncV2 {
     ever_locked: bool,
     locked: bool,
     stratum: u8,
+    /// Round trip of the newest answered request, ms (a responder that queues
+    /// for seconds must not have more requests outstanding than slots).
+    last_round_trip_ms: u32,
     rx_override: u64,
     /// A local reference (host clock, GPS) feeds this node's time; set by
     /// `timesync_local_quality_locked`.
@@ -149,6 +156,16 @@ impl TimeSyncV2 {
 
     pub(super) fn is_locked(&self) -> bool {
         self.locked
+    }
+
+    /// Error bound of the discipline at `now_mono_ns` (no pending slew).
+    pub(super) fn bound_ns(&self, now_mono_ns: u64) -> Option<u64> {
+        self.discipline.error_bound_ns(now_mono_ns)
+    }
+
+    /// Round trip of the newest answered request, ms.
+    pub(super) fn last_round_trip_ms(&self) -> u64 {
+        u64::from(self.last_round_trip_ms)
     }
 
     /// (response one-way delay - request one-way delay) / 2 for one exchange.
@@ -607,6 +624,15 @@ impl Router {
         }
         let tag = timesync_sender_tag(sender);
         let (t4_ns, response_len) = st.v2.take_rx(tag, true, seq, t1).unwrap_or((st.v2.rx_instant(now_mono_ns), 0));
+        // The t1 cookie is the request's monotonic ms (unless it carried a UTC
+        // report): the round trip is known even when the response came too
+        // late to match an exchange slot.
+        if seq & TIMESYNC_UTC_REPORT == 0 {
+            let round_trip_ms = (t4_ns / 1_000_000).saturating_sub(t1);
+            if round_trip_ms <= 60_000 {
+                st.v2.last_round_trip_ms = round_trip_ms as u32;
+            }
+        }
         let counter = (seq & TIMESYNC_SEQ_COUNTER_MASK) as u32;
         let Some(idx) = st
             .v2
@@ -624,6 +650,7 @@ impl Router {
             let ex = &mut st.v2.exchanges[idx];
             ex.answered = true;
             ex.t4_ns = t4_ns;
+
             ex.t2_net_us = t2_us;
             ex.source_error_ns = source_error_ns;
             ex.response_len = response_len;
