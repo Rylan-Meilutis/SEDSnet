@@ -63,6 +63,13 @@ fn lookup<T: Copy>(list: &VecDeque<(u32, T)>, id: u32) -> Option<T> {
     list.iter().rev().find(|(known, _)| *known == id).map(|(_, value)| *value)
 }
 
+/// A frame's type without side state: canonical frames, side-transport FULL
+/// frames (templated or not) and a chunk's first fragment. A compact frame or
+/// a later fragment needs a [`SideFramePeeker`] that saw its template.
+pub fn peek_side_frame_type(bytes: &[u8]) -> Option<DataType> {
+    SideFramePeeker::new(false).peek(bytes).map(|info| info.ty)
+}
+
 impl SideFramePeeker {
     /// `header_templates`: the side was configured with header templates
     /// (`SideOptions::header_template_enabled`, e.g. `with_small_packet_transport`).
@@ -87,19 +94,27 @@ impl SideFramePeeker {
     fn peek_body(&mut self, kind: u8, body: &[u8], complete: bool) -> Option<SideFrameInfo> {
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
-                let mut off = 0usize;
-                let template = if self.header_templates {
-                    Some(u32::try_from(read_uleb128_local(body, &mut off).ok()?).ok()?)
-                } else {
-                    None
+                // A templated side prefixes the template ID. A complete frame
+                // is CRC-checked under both readings, so a peeker built for
+                // the wrong side kind still reads it; a fragment uses the
+                // configured reading.
+                let read = |off: usize| -> Option<wire_format::TelemetryFrameInfo> {
+                    let raw = body.get(off..)?;
+                    if complete { wire_format::peek_frame_info(raw).ok() } else { wire_format::peek_frame_info_inner(raw).ok() }
                 };
-                let raw = body.get(off..)?;
-                let info = if complete {
-                    wire_format::peek_frame_info_unchecked(raw)
+                let mut prefixed = 0usize;
+                let template = read_uleb128_local(body, &mut prefixed).ok().and_then(|id| u32::try_from(id).ok());
+                let (template, info) = if self.header_templates || complete {
+                    match (template.and_then(|t| read(prefixed).map(|i| (Some(t), i))), self.header_templates) {
+                        (Some(found), true) => found,
+                        (found, _) => match read(0) {
+                            Some(info) => (None, info),
+                            None => found?,
+                        },
+                    }
                 } else {
-                    wire_format::peek_frame_info_inner(raw)
-                }
-                .ok()?;
+                    (None, read(0)?)
+                };
                 if let Some(template) = template {
                     remember(&mut self.templates, template, info.envelope.ty);
                 }

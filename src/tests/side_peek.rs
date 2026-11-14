@@ -46,5 +46,12 @@ fn a_peeker_classifies_every_frame_a_small_packet_side_emits() {
     // No frame is misclassified as another known type.
     let leaves = seen.iter().flatten().filter(|i| i.ty == DataType::DiscoveryLeave).count();
     assert!(leaves >= 4, "{leaves} leaves: {seen:?}");
+    // Without side state, a FULL or canonical frame still reads its type.
+    for (frame, info) in frames.iter().zip(&seen) {
+        let info = info.unwrap();
+        if matches!(info.kind, SideFrameKind::Full | SideFrameKind::Canonical) {
+            assert_eq!(crate::side_peek::peek_side_frame_type(frame), Some(info.ty));
+        }
+    }
     let _ = expected;
 }
