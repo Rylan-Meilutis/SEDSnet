@@ -17688,6 +17688,7 @@ impl Router {
 
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
         let now_ms = self.clock.now_ms();
+        let timesync_sub_minimum_rejects = self.timesync_sub_minimum_rejects();
         let isr_rx = self
             .isr_rx_queue
             .as_ref()
@@ -17925,6 +17926,7 @@ impl Router {
             discovery,
             total_handler_failures: st.total_handler_failures,
             total_handler_retries: st.total_handler_retries,
+            timesync_sub_minimum_rejects,
         }
     }
 

@@ -651,6 +651,14 @@ SedsResult seds_router_set_side_timesync_path(SedsRouter * r, uint32_t side_id, 
 SedsResult seds_router_set_side_timesync_min_delay(SedsRouter * r, uint32_t side_id, uint32_t min_one_way_ns);
 
 /**
+ * @brief Describe how far each end's time sync stamp on a side may be off
+ * (UART/DMA/ISR latency, ns). The reported error bound carries it, and a round
+ * trip may measure up to twice it (plus 1 ms) below the physical minimum
+ * before the exchange is rejected as proof of a wrong stamp.
+ */
+SedsResult seds_router_set_side_timesync_stamp_uncertainty(SedsRouter * r, uint32_t side_id, uint32_t stamp_ns);
+
+/**
  * @brief Report this node's absolute-time reference (e.g. GPS UTC minus network
  * time, microseconds, measured at the fix) to its time source. Sent in the
  * existing request words while fresh (5 s); `valid = false` stops it.

@@ -867,6 +867,7 @@ fn runtime_stats_snapshot_to_pydict(
 
     out.set_item("total_handler_failures", snap.total_handler_failures)?;
     out.set_item("total_handler_retries", snap.total_handler_retries)?;
+    out.set_item("timesync_sub_minimum_rejects", snap.timesync_sub_minimum_rejects)?;
     Ok(out.unbind())
 }
 

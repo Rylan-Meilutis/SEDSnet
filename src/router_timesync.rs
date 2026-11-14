@@ -14,7 +14,8 @@ use crate::timesync::{
 #[cfg(feature = "std")]
 use crate::timesync::{UtcReferenceReport, decode_utc_report_word};
 use crate::timesync_discipline::{
-    ClockDiscipline, SyncState, decode_error_code, encode_error_code, exchange_sample,
+    ClockDiscipline, SyncState, TIMESYNC_MIN_DELAY_TOLERANCE_NS, decode_error_code, encode_error_code,
+    exchange_sample,
 };
 
 /// Requests a follower keeps open for interleaved answers.
@@ -111,10 +112,14 @@ pub(super) struct TimeSyncV2 {
     /// (side, delay per frame byte after the stamps in ns, fixed asymmetry ns).
     asymmetry: [(RouterSideId, u32, i32); ASYMMETRY_SIDES],
     /// (side, physical minimum one-way delay after the stamps excluding the
-    /// per-byte part, ns): a sample's error is bounded by how far its round
-    /// trip exceeds the physical minimum.
-    min_delay: [(RouterSideId, u32); ASYMMETRY_SIDES],
+    /// per-byte part, ns, stamping uncertainty of each end ns): a sample's
+    /// error is bounded by how far its round trip exceeds the physical
+    /// minimum, plus the stamping uncertainty.
+    min_delay: [(RouterSideId, u32, u32); ASYMMETRY_SIDES],
     min_delay_len: u8,
+    /// Exchanges rejected because their round trip measured below the
+    /// path's physical minimum (a stamp was wrong).
+    sub_minimum_rejects: u32,
     asymmetry_len: u8,
     ever_locked: bool,
     locked: bool,
@@ -142,11 +147,41 @@ impl TimeSyncV2 {
         let asymmetry_len = self.asymmetry_len;
         let min_delay = self.min_delay;
         let min_delay_len = self.min_delay_len;
+        let sub_minimum_rejects = self.sub_minimum_rejects;
         *self = Self::default();
         self.asymmetry = asymmetry;
         self.asymmetry_len = asymmetry_len;
         self.min_delay = min_delay;
         self.min_delay_len = min_delay_len;
+        self.sub_minimum_rejects = sub_minimum_rejects;
+    }
+
+    /// Exchanges rejected for a round trip below the physical minimum.
+    pub(super) fn sub_minimum_rejects(&self) -> u32 {
+        self.sub_minimum_rejects
+    }
+
+    fn path_entry(&self, side: Option<RouterSideId>) -> Option<(u32, u32)> {
+        let side = side?;
+        self.min_delay[..usize::from(self.min_delay_len)]
+            .iter()
+            .find(|(s, _, _)| *s == side)
+            .map(|(_, min, stamp)| (*min, *stamp))
+    }
+
+    /// Mutable (min delay, stamp uncertainty) entry of a side, added when
+    /// absent (`None` when every slot is taken).
+    fn path_entry_mut(&mut self, side: RouterSideId) -> Option<&mut (RouterSideId, u32, u32)> {
+        let len = usize::from(self.min_delay_len);
+        if let Some(i) = self.min_delay[..len].iter().position(|(s, _, _)| *s == side) {
+            return Some(&mut self.min_delay[i]);
+        }
+        if len >= ASYMMETRY_SIDES {
+            return None;
+        }
+        self.min_delay[len] = (side, 0, 0);
+        self.min_delay_len += 1;
+        Some(&mut self.min_delay[len])
     }
 
     pub(super) fn has_samples_from(&self, sender: &str) -> bool {
@@ -180,17 +215,12 @@ impl TimeSyncV2 {
     /// Physical minimum round trip of one exchange (both one-way minima at
     /// their frame sizes), ns; 0 when the side's minimum is not described.
     fn min_round_trip_ns(&self, side: Option<RouterSideId>, ex: &Exchange) -> u64 {
-        let Some(side) = side else { return 0 };
-        let Some(fixed) = self.min_delay[..usize::from(self.min_delay_len)]
-            .iter()
-            .find(|(s, _)| *s == side)
-            .map(|(_, ns)| u64::from(*ns))
-        else {
+        let Some(fixed) = self.path_entry(side).map(|(min, _)| u64::from(min)).filter(|&m| m != 0) else {
             return 0;
         };
         let byte_ns = self.asymmetry[..usize::from(self.asymmetry_len)]
             .iter()
-            .find(|(s, _, _)| *s == side)
+            .find(|(s, _, _)| Some(*s) == side)
             .map_or(0, |(_, b, _)| u64::from(*b));
         2 * fixed + byte_ns * (u64::from(ex.request_len) + u64::from(ex.response_len))
     }
@@ -474,14 +504,22 @@ impl Router {
         let Some(runtime) = self.timesync.as_ref() else {
             return;
         };
-        let mut st = runtime.lock();
-        let v2 = &mut st.v2;
-        let len = usize::from(v2.min_delay_len);
-        if let Some(entry) = v2.min_delay[..len].iter_mut().find(|(s, _)| *s == side) {
-            *entry = (side, min_one_way_ns);
-        } else if len < ASYMMETRY_SIDES {
-            v2.min_delay[len] = (side, min_one_way_ns);
-            v2.min_delay_len += 1;
+        if let Some(entry) = runtime.lock().v2.path_entry_mut(side) {
+            entry.1 = min_one_way_ns;
+        }
+    }
+
+    /// Describes how far each end's time sync stamp on a side may be from the
+    /// instant it stands for (UART/DMA/ISR latency, tick resolution), ns. The
+    /// reported error bound carries it, and a round trip may measure up to
+    /// twice it (plus a small tolerance) below the physical minimum before the
+    /// exchange is rejected as proof of a wrong stamp.
+    pub fn set_side_timesync_stamp_uncertainty(&self, side: RouterSideId, stamp_ns: u32) {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return;
+        };
+        if let Some(entry) = runtime.lock().v2.path_entry_mut(side) {
+            entry.2 = stamp_ns;
         }
     }
 
@@ -712,6 +750,7 @@ impl Router {
             st.v2.exchanges[prev_idx].used = false;
             let asymmetry = st.v2.asymmetry_ns(side, &ex);
             let min_round_trip = st.v2.min_round_trip_ns(side, &ex);
+            let stamp_ns = st.v2.path_entry(side).map_or(0, |(_, stamp)| stamp);
             exchange_sample(
                 ex.t1_ns,
                 (ex.t2_net_us as i64).saturating_mul(1_000),
@@ -722,14 +761,25 @@ impl Router {
                 rate,
             )
             .map(|mut sample| {
+                let round_trip = 2 * u64::from(sample.half_delay_ns);
+                let slack = 2 * u64::from(stamp_ns) + TIMESYNC_MIN_DELAY_TOLERANCE_NS;
+                // Below the physical minimum: a stamp is wrong. Keep the
+                // deficit as evidence and leave the sample out.
+                let deficit = min_round_trip.saturating_sub(round_trip);
                 sample.min_half_delay_ns = (min_round_trip / 2).min(u64::from(sample.half_delay_ns)) as u32;
-                sample
+                sample.stamp_error_ns = stamp_ns;
+                (sample, if deficit > slack { deficit } else { 0 })
             })
         })
         };
-        let Some(sample) = sample else {
+        let Some((sample, deficit)) = sample else {
             return false;
         };
+        if deficit != 0 {
+            st.v2.sub_minimum_rejects = st.v2.sub_minimum_rejects.saturating_add(1);
+            st.v2.discipline.note_stamp_deficit(deficit, sample.mono_ns);
+            return false;
+        }
         if let Some(target) = st.v2.discipline.target(sample.mono_ns)
             && target
                 .net_ns
@@ -832,6 +882,12 @@ impl Router {
             last_sample_age_ms,
             is_reference,
         }
+    }
+
+    /// Time sync exchanges rejected because their round trip measured below
+    /// the side's physical minimum: some stamp was wrong.
+    pub fn timesync_sub_minimum_rejects(&self) -> u64 {
+        self.timesync.as_ref().map_or(0, |runtime| u64::from(runtime.lock().v2.sub_minimum_rejects()))
     }
 
     /// Current time sync quality: lock state, error bound, pending offset and

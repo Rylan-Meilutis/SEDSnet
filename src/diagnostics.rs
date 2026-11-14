@@ -219,4 +219,7 @@ pub struct RuntimeStatsSnapshot {
     pub discovery: DiscoveryRuntimeStats,
     pub total_handler_failures: u64,
     pub total_handler_retries: u64,
+    /// Time sync exchanges rejected because their round trip measured below
+    /// the path's physical minimum (proof of a wrong stamp).
+    pub timesync_sub_minimum_rejects: u64,
 }

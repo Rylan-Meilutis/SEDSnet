@@ -95,6 +95,14 @@ that option, keep their 4.3.14 representations.
   conversions or software 64/128-bit division (Cortex-M4, firmware profile:
   `Router::network_time_ms` 10840 -> about 1800 instructions per call).
   `tools/mcu-icount/count.sh` measures it under QEMU.
+- Time sync stamps that contradict the radio: an exchange whose round trip
+  measures below the side's physical minimum (beyond twice the stamping
+  uncertainty plus 1 ms) proves a stamp wrong and is rejected, never taken as
+  a direct crossing; its deficit stays in the error bound while such
+  exchanges keep appearing (600 s). `set_side_timesync_stamp_uncertainty` /
+  `seds_router_set_side_timesync_stamp_uncertainty` describes each end's
+  stamping uncertainty (UART/DMA/ISR latency), which the bound carries.
+  Rejections are counted in `RuntimeStatsSnapshot::timesync_sub_minimum_rejects`.
 - Time sync over lossy, turn-taking links. The error bound rests on evidence
   only: `set_side_timesync_min_delay` / `seds_router_set_side_timesync_min_delay`
   describes a side's physical minimum one-way delay (besides the per-byte part

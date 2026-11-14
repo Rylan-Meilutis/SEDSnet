@@ -13,7 +13,12 @@
 //!   locked/holdover state. The bound rests on evidence only: a sample is off
 //!   by at most half of its round trip above the path's physical minimum
 //!   (`Router::set_side_timesync_min_delay`), so the bound is tight only once
-//!   an exchange crossed without waiting for a turn.
+//!   an exchange crossed without waiting for a turn. Each end's stamps may be
+//!   off by the side's configured stamping uncertainty (UART, DMA and ISR
+//!   latency), which the bound carries as well. A round trip below the
+//!   physical minimum proves a stamp wrong, not the sample precise: such a
+//!   sample is rejected and its deficit raises the stamp term until stamps
+//!   stop contradicting the minimum (see [`ClockDiscipline::note_stamp_deficit`]).
 //!
 //! Pure 64-bit arithmetic over monotonic nanoseconds (one shared 128-bit
 //! multiply-divide helper), sized for Cortex-M flash budgets.
@@ -42,6 +47,9 @@ const MAX_REJECT_RUN: u8 = 4;
 const MIN_LOCK_SAMPLES: u8 = 3;
 /// Longest round trip considered (bounds the arithmetic).
 const MAX_ROUND_TRIP_NS: u64 = 60_000_000_000;
+/// How far below the physical minimum a round trip may measure (beyond both
+/// ends' stamping uncertainty) before it proves a stamp wrong.
+pub const TIMESYNC_MIN_DELAY_TOLERANCE_NS: u64 = 1_000_000;
 
 /// `x / d` for `0 < d < 2^21`, exact, in 11-bit digits so every step is a
 /// 32-bit division (one instruction on Cortex-M4; a 64-bit division is a
@@ -137,6 +145,10 @@ pub struct DisciplineSample {
     /// path's minimum is unknown), ns: the sample is off by at most
     /// `half_delay_ns - min_half_delay_ns`.
     pub min_half_delay_ns: u32,
+    /// Most either end's stamp of this exchange may be off (the side's
+    /// stamping uncertainty), ns: the phase is off by at most this beyond the
+    /// path term, since stamps that shorten the round trip hide path excess.
+    pub stamp_error_ns: u32,
 }
 
 /// Builds a sample from the four exchange stamps.
@@ -188,6 +200,7 @@ pub fn exchange_sample(
         half_delay_ns: half as u32,
         source_error_ns: source_error_ns.min(u64::from(u32::MAX)) as u32,
         min_half_delay_ns: 0,
+        stamp_error_ns: 0,
     })
 }
 
@@ -247,6 +260,10 @@ pub struct ClockDiscipline {
     fit_mono_ns: u64,
     fit_phi_ns: i64,
     fit_error_ns: u64,
+    /// Largest round-trip deficit below the physical minimum seen lately, ns,
+    /// and when (monotonic ns): proof the stamps can be off by that much.
+    stamp_deficit_ns: u64,
+    stamp_deficit_mono_ns: u64,
 }
 
 impl Default for ClockDiscipline {
@@ -264,6 +281,8 @@ impl Default for ClockDiscipline {
             fit_mono_ns: 0,
             fit_phi_ns: 0,
             fit_error_ns: u64::MAX,
+            stamp_deficit_ns: 0,
+            stamp_deficit_mono_ns: 0,
         }
     }
 }
@@ -275,13 +294,41 @@ impl ClockDiscipline {
     }
 
     /// Restarts sample collection after a source change but keeps the learned
-    /// frequency: the local oscillator did not change.
+    /// frequency and stamp evidence: the local oscillator and transport did
+    /// not change.
     pub fn restart_keep_frequency(&mut self) {
-        let rate = self.rate_ppb;
-        let unc = self.freq_uncertainty_ppb;
+        let keep = self.clone();
         *self = Self::default();
-        self.rate_ppb = rate;
-        self.freq_uncertainty_ppb = unc;
+        self.rate_ppb = keep.rate_ppb;
+        self.freq_uncertainty_ppb = keep.freq_uncertainty_ppb;
+        self.stamp_deficit_ns = keep.stamp_deficit_ns;
+        self.stamp_deficit_mono_ns = keep.stamp_deficit_mono_ns;
+    }
+
+    /// Records an exchange (not offered) whose round trip measured
+    /// `deficit_ns` below the path's physical minimum at `mono_ns`. Some stamp
+    /// was off by at least that much, and the samples accepted around it may
+    /// hide the same error inside a round trip that looks merely short: the
+    /// bound carries the deficit until none has been seen for the window span.
+    pub fn note_stamp_deficit(&mut self, deficit_ns: u64, mono_ns: u64) {
+        if mono_ns.saturating_sub(self.stamp_deficit_mono_ns) > MAX_WINDOW_SPAN_NS {
+            self.stamp_deficit_ns = 0;
+        }
+        self.stamp_deficit_ns = self.stamp_deficit_ns.max(deficit_ns);
+        self.stamp_deficit_mono_ns = mono_ns;
+    }
+
+    /// Stamp error the bound carries at `now_mono_ns`: the samples' configured
+    /// stamping uncertainty, or recent proof of a larger one.
+    fn stamp_error_ns(&self, now_mono_ns: u64) -> u64 {
+        let configured = self.samples().iter().map(|s| u64::from(s.stamp_error_ns)).max().unwrap_or(0);
+        if self.stamp_deficit_ns != 0
+            && now_mono_ns.saturating_sub(self.stamp_deficit_mono_ns) <= MAX_WINDOW_SPAN_NS
+        {
+            configured.max(self.stamp_deficit_ns + TIMESYNC_MIN_DELAY_TOLERANCE_NS)
+        } else {
+            configured
+        }
     }
 
     /// Number of samples currently held.
@@ -502,7 +549,7 @@ impl ClockDiscipline {
         let age = now_mono_ns.saturating_sub(self.fit_mono_ns) / 1_000; // us
         let wander = age.saturating_mul(self.freq_uncertainty_ppb + TIMESYNC_DRIFT_ALLOWANCE_PPB)
             / 1_000_000;
-        Some(self.fit_error_ns.saturating_add(wander))
+        Some(self.fit_error_ns.saturating_add(wander).saturating_add(self.stamp_error_ns(now_mono_ns)))
     }
 
     /// State and error bound at `now_mono_ns`.
@@ -709,6 +756,41 @@ mod tests {
         assert_eq!(d.quality(p.local(t + 30 * S), false, 0).0, SyncState::Holdover);
         let (state, _) = d.quality(p.local(t + 3_000 * S), false, 0);
         assert_eq!(state, SyncState::Acquiring);
+    }
+
+    #[test]
+    fn stamp_uncertainty_and_deficit_evidence_widen_the_bound() {
+        let p = Path { skew_ppb: 0, offset_ns: 0 };
+        let mut d = ClockDiscipline::default();
+        let mut t = 0;
+        for _ in 0..5 {
+            let mut s = p.exchange(t, 2 * MS, MS, 2 * MS);
+            s.stamp_error_ns = 300_000;
+            d.offer(s);
+            t += S;
+        }
+        let now = p.local(t);
+        let base = d.error_bound_ns(now).unwrap();
+        assert!(base >= 300_000, "configured stamp uncertainty carried: {base}");
+        // A round trip 38 ms below the minimum: some stamp is that far off.
+        d.note_stamp_deficit(38 * MS, now);
+        let (state, bound) = d.quality(now, true, 0);
+        assert!(bound >= base - 300_000 + 38 * MS, "deficit carried: {bound}");
+        assert_eq!(state, SyncState::Acquiring);
+        // The evidence survives a source change, and lapses after the window
+        // span without a new deficit.
+        d.restart_keep_frequency();
+        for _ in 0..5 {
+            d.offer(p.exchange(t, 2 * MS, MS, 2 * MS));
+            t += S;
+        }
+        assert!(d.error_bound_ns(p.local(t)).unwrap() >= 38 * MS);
+        let later = now + MAX_WINDOW_SPAN_NS + S;
+        for _ in 0..5 {
+            d.offer(p.exchange(later + t, 2 * MS, MS, 2 * MS));
+            t += S;
+        }
+        assert!(d.error_bound_ns(p.local(later + t)).unwrap() < 5 * MS);
     }
 
     #[test]

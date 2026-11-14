@@ -1166,8 +1166,8 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
     let _ = core::fmt::Write::write_fmt(
         &mut out,
         format_args!(
-            ",\"total_handler_failures\":{},\"total_handler_retries\":{}",
-            snap.total_handler_failures, snap.total_handler_retries
+            ",\"total_handler_failures\":{},\"total_handler_retries\":{},\"timesync_sub_minimum_rejects\":{}",
+            snap.total_handler_failures, snap.total_handler_retries, snap.timesync_sub_minimum_rejects
         ),
     );
     out.push('}');
@@ -2238,6 +2238,23 @@ pub extern "C" fn seds_router_set_side_timesync_min_delay(
     }
     let router = unsafe { &(*r).inner };
     router.set_side_timesync_min_delay(side_id as usize, min_one_way_ns);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Describes how far each end's time sync stamp on a side may be off (UART,
+/// DMA and ISR latency), ns. See `Router::set_side_timesync_stamp_uncertainty`.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_timesync_stamp_uncertainty(
+    r: *mut SedsRouter,
+    side_id: u32,
+    stamp_ns: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_side_timesync_stamp_uncertainty(side_id as usize, stamp_ns);
     status_from_result_code(SedsResult::SedsOk)
 }
 

@@ -312,6 +312,9 @@ fn radio_sim_clean_link() {
     let stats = run(CLEAN, 120, 180, 0x5eed);
     report("0%", &stats);
     for s in &stats {
+        assert!(s.synced_fraction > 0.9, "{s:?}");
+    }
+    for s in &stats {
         assert!(s.p95_ms <= 3.0, "{s:?}");
         assert_eq!(s.bound_violations, 0, "{s:?}");
     }
@@ -353,7 +356,7 @@ fn radio_sim_every_frame_waits() {
 /// Every 100 ms from boot, per board: samples reported synced (locked or
 /// holdover) with a bound below the real error. The honest report the boards
 /// owe: a bound that covers the error, or not synced.
-fn synced_with_short_bound(link: RadioLink, seconds: u64, seed: u64) -> Vec<(&'static str, usize, usize)> {
+fn synced_with_short_bound(link: RadioLink, seconds: u64, seed: u64) -> (Vec<(&'static str, usize, usize)>, u64) {
     let mut net = Net::new(link, seed);
     let mut out: Vec<(&'static str, usize, usize)> = (1..NODES.len()).map(|n| (NODES[n].0, 0, 0)).collect();
     for i in 0..seconds * 1_000 {
@@ -377,16 +380,19 @@ fn synced_with_short_bound(link: RadioLink, seconds: u64, seed: u64) -> Vec<(&'s
             }
         }
     }
-    out
+    (out, net.nodes[RF].export_runtime_stats().timesync_sub_minimum_rejects)
 }
 
-fn assert_honest_with_rf_stamps_early(t1_ms: f64, t4_ms: f64) {
+/// Returns RF's sub-minimum rejections over all runs.
+fn assert_honest_with_rf_stamps_early(t1_ms: f64, t4_ms: f64) -> u64 {
     RF_STAMP_EARLY_MS.with(|e| e.set((t1_ms, t4_ms)));
     let mut failures = Vec::new();
+    let mut rejects = 0;
     for (label, link) in [("0%", CLEAN), ("30%", LOSSY)] {
         for seed in [0x5eed, 0x9e37_79b9, 7] {
-            let res = synced_with_short_bound(link, 300, seed);
-            println!("t1 early {t1_ms} ms, t4 early {t4_ms} ms, {label} seed {seed}: (board, synced with bound < error, synced samples) {res:?}");
+            let (res, rf_rejects) = synced_with_short_bound(link, 300, seed);
+            rejects += rf_rejects;
+            println!("t1 early {t1_ms} ms, t4 early {t4_ms} ms, {label} seed {seed}: (board, synced with bound < error, synced samples) {res:?}, RF sub-minimum rejects {rf_rejects}");
             if res.iter().any(|r| r.1 != 0) {
                 failures.push((label, seed, res));
             }
@@ -394,6 +400,7 @@ fn assert_honest_with_rf_stamps_early(t1_ms: f64, t4_ms: f64) {
     }
     RF_STAMP_EARLY_MS.with(|e| e.set((0.0, 0.0)));
     assert!(failures.is_empty(), "synced with a bound below the real error: {failures:?}");
+    rejects
 }
 
 /// RF's transmit stamp (t1) 38 ms early: the round trip looks 38 ms longer
@@ -402,8 +409,8 @@ fn assert_honest_with_rf_stamps_early(t1_ms: f64, t4_ms: f64) {
 /// round trip looks shorter, like an early t4) must stay honest too.
 #[test]
 fn radio_sim_rf_t1_stamped_38ms_early_stays_honest() {
-    assert_honest_with_rf_stamps_early(38.0, 0.0);
-    assert_honest_with_rf_stamps_early(-38.0, 0.0);
+    assert_eq!(assert_honest_with_rf_stamps_early(38.0, 0.0), 0, "a longer round trip proves nothing");
+    assert!(assert_honest_with_rf_stamps_early(-38.0, 0.0) > 0, "sub-minimum round trips are counted");
 }
 
 /// RF's receive stamp (t4) 38 ms early: the round trip looks 38 ms shorter,
@@ -411,7 +418,8 @@ fn radio_sim_rf_t1_stamped_38ms_early_stays_honest() {
 /// it must never make a sample look like a direct crossing.
 #[test]
 fn radio_sim_rf_t4_stamped_38ms_early_stays_honest() {
-    assert_honest_with_rf_stamps_early(0.0, 38.0);
+    assert_eq!(assert_honest_with_rf_stamps_early(0.0, 0.0), 0, "true stamps never measure below the minimum");
+    assert!(assert_honest_with_rf_stamps_early(0.0, 38.0) > 0, "sub-minimum round trips are counted");
 }
 
 /// Prints RF's error, bound, rate and sample age over time (diagnosis).
