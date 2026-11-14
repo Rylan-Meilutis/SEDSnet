@@ -2181,6 +2181,23 @@ pub extern "C" fn seds_router_set_side_timesync_path(
     status_from_result_code(SedsResult::SedsOk)
 }
 
+/// Describes a side's physical minimum one-way delay between the stamps,
+/// excluding the per-byte part (ns). See `Router::set_side_timesync_min_delay`.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_timesync_min_delay(
+    r: *mut SedsRouter,
+    side_id: u32,
+    min_one_way_ns: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_side_timesync_min_delay(side_id as usize, min_one_way_ns);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
 /// Reports this node's absolute-time reference to its time source (e.g. RF
 /// GPS UTC minus network time, measured at the fix), carried in the next
 /// requests while fresh (5 s). `valid == false` stops reporting.

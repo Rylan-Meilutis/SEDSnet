@@ -55,6 +55,12 @@ pub(crate) struct RadioLink {
     pub hold_ms: f64,
     /// Fixed path after the stamp (modem, packet close, air), ms.
     pub base_ms: f64,
+    /// Shortest wait of a held frame, ms (above 0: a held frame never
+    /// crosses directly).
+    pub hold_min_ms: f64,
+    /// Only the station's frames wait (it waits for its gap; RF owns the
+    /// turns): a one-sided, consistent asymmetry.
+    pub station_only: bool,
 }
 
 pub(crate) const NODES: [(&str, i64); 4] = [("GS", 0), ("RF", 160), ("FC", -90), ("PB", 45)];
@@ -115,6 +121,10 @@ impl Net {
             let byte_ns = (1e6 / 8.0 + BYTE_UART_MS * 1e6) as u32;
             net.nodes[RF].set_side_timesync_path(net.sides[1].1, byte_ns, 0);
         }
+        // RF knows its radio path's physical minimum one-way delay: the fixed
+        // path after the stamps plus 20 B of air framing (a true lower bound).
+        let min_ns = ((link.base_ms + 20.0 / 8.0) * 1e6) as u32;
+        net.nodes[RF].set_side_timesync_min_delay(net.sides[1].1, min_ns);
         net
     }
 
@@ -158,8 +168,8 @@ impl Net {
                     // Air time plus the receiving UART per byte (store and
                     // forward), 20 B of air framing.
                     let mut ms = self.link.base_ms + (b.len() as f64 + 20.0) / 8.0 + b.len() as f64 * BYTE_UART_MS;
-                    if self.rng.unit() < self.link.hold_p {
-                        ms += self.rng.unit() * self.link.hold_ms;
+                    if (!self.link.station_only || from == 0) && self.rng.unit() < self.link.hold_p {
+                        ms += self.link.hold_min_ms + self.rng.unit() * (self.link.hold_ms - self.link.hold_min_ms);
                     }
                     self.flight.push((t + (ms * MS as f64) as u64, to, b));
                 } else {
@@ -232,13 +242,16 @@ pub(crate) fn run(link: RadioLink, warm_s: u64, measure_s: u64, seed: u64) -> Ve
         for node in 1..NODES.len() {
             let Some(err) = net.error_ns(node) else { continue };
             errs[node].push(err.unsigned_abs() as f64 / 1e6);
-            if let Some(st) = net.nodes[node].timesync_status()
-                && st.state.is_synced()
-            {
-                synced[node] += 1;
-                bounds[node].push(st.error_bound_ns as f64 / 1e6);
-                if (st.error_bound_ns as u128) < err.unsigned_abs() {
-                    violations[node] += 1;
+            if let Some(st) = net.nodes[node].timesync_status() {
+                if st.state.is_synced() {
+                    synced[node] += 1;
+                }
+                if st.error_bound_ns != u64::MAX {
+                    bounds[node].push(st.error_bound_ns as f64 / 1e6);
+                    // Any reported bound, locked or not, must cover the error.
+                    if (st.error_bound_ns as u128) < err.unsigned_abs() {
+                        violations[node] += 1;
+                    }
                 }
             }
         }
@@ -266,14 +279,19 @@ pub(crate) fn run(link: RadioLink, warm_s: u64, measure_s: u64, seed: u64) -> Ve
 fn report(label: &str, stats: &[Stats]) {
     for s in stats {
         println!(
-            "{label} {:>2}: |err| p50 {:7.3} p95 {:7.3} max {:8.3} ms; synced {:5.1}%; bound p50 {:7.3} ms; bound < err {}",
+            "{label} {:>2}: |err| p50 {:7.3} p95 {:7.3} max {:8.3} ms; synced {:5.1}%; reported bound p50 {:7.3} ms; bound < err {}",
             s.name, s.p50_ms, s.p95_ms, s.max_ms, s.synced_fraction * 100.0, s.bound_p50_ms, s.bound_violations
         );
     }
 }
 
-const CLEAN: RadioLink = RadioLink { loss: 0.0, hold_p: 0.5, hold_ms: 200.0, base_ms: 20.0 };
-const LOSSY: RadioLink = RadioLink { loss: 0.3, hold_p: 0.5, hold_ms: 200.0, base_ms: 20.0 };
+const CLEAN: RadioLink = RadioLink { loss: 0.0, hold_p: 0.5, hold_ms: 200.0, base_ms: 20.0, hold_min_ms: 0.0, station_only: false };
+const LOSSY: RadioLink = RadioLink { loss: 0.3, hold_p: 0.5, hold_ms: 200.0, base_ms: 20.0, hold_min_ms: 0.0, station_only: false };
+/// Every frame waits 20..200 ms after its stamps: no exchange ever crosses
+/// directly. `STATION_WAITS` makes it one-sided: only the station's frames
+/// wait (consistent asymmetry the samples cannot reveal by disagreeing).
+const EVERY_WAITS: RadioLink = RadioLink { hold_p: 1.0, hold_min_ms: 20.0, ..CLEAN };
+const STATION_WAITS: RadioLink = RadioLink { station_only: true, ..EVERY_WAITS };
 
 /// 0% loss with turn-taking holds: RF, FC and PB within 3 ms p95, and the
 /// reported bound never below the real error.
@@ -299,12 +317,35 @@ fn radio_sim_lossy_link() {
     }
 }
 
+/// Every frame waits 0..200 ms for a turn after its stamps: no exchange ever
+/// crosses directly, so there is no evidence for a tight bound. The bound must
+/// never be below the real error (it widens and the boards report Acquiring).
+#[test]
+fn radio_sim_every_frame_waits() {
+    for (label, link) in [
+        ("0% every waits", EVERY_WAITS),
+        ("30% every waits", RadioLink { loss: 0.3, ..EVERY_WAITS }),
+        ("0% station waits", STATION_WAITS),
+        ("30% station waits", RadioLink { loss: 0.3, ..STATION_WAITS }),
+    ] {
+        for seed in [0x5eed, 0x9e37_79b9] {
+            let stats = run(link, 120, 180, seed);
+            report(label, &stats);
+            for s in &stats {
+                assert_eq!(s.bound_violations, 0, "{link:?} seed {seed} {s:?}");
+            }
+        }
+    }
+}
+
 /// Prints RF's error, bound, rate and sample age over time (diagnosis).
 #[test]
 #[ignore = "host sim trace"]
 fn radio_sim_trace() {
     let loss: f64 = std::env::var("SIM_LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
-    let mut net = Net::new(RadioLink { loss, ..LOSSY }, 0x5eed);
+    let hold_p: f64 = std::env::var("SIM_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+    let seed: u64 = std::env::var("SIM_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x5eed);
+    let mut net = Net::new(RadioLink { loss, hold_p, ..LOSSY }, seed);
     for i in 0..300_000u64 {
         net.step();
         if i % 2_000 == 0 {
@@ -335,10 +376,8 @@ fn radio_sim_sweep() {
         ("50% hold .5", RadioLink { loss: 0.5, ..LOSSY }, true, true),
         ("0% undescribed", CLEAN, false, true),
         ("30% undescribed", LOSSY, false, true),
-        // Outside the bound's assumption (no exchange ever crosses without a
-        // turn wait): reported, not asserted.
-        ("0% hold 1", RadioLink { hold_p: 1.0, ..CLEAN }, true, false),
-        ("30% hold 1", RadioLink { hold_p: 1.0, ..LOSSY }, true, false),
+        ("0% hold 1", RadioLink { hold_p: 1.0, ..CLEAN }, true, true),
+        ("30% hold 1", RadioLink { hold_p: 1.0, ..LOSSY }, true, true),
     ] {
         PATH_DESCRIBED.with(|d| d.set(described));
         let mut p95 = 0f64;
@@ -354,7 +393,7 @@ fn radio_sim_sweep() {
                 if honest {
                     worst_violations += s.bound_violations;
                 }
-                if s.bound_violations > 0 {
+                if s.bound_violations > 0 || s.p95_ms > 3.0 {
                     println!("{label} seed {seed}: {s:?}");
                 }
             }

@@ -110,6 +110,11 @@ pub(super) struct TimeSyncV2 {
     rx_head: u8,
     /// (side, delay per frame byte after the stamps in ns, fixed asymmetry ns).
     asymmetry: [(RouterSideId, u32, i32); ASYMMETRY_SIDES],
+    /// (side, physical minimum one-way delay after the stamps excluding the
+    /// per-byte part, ns): a sample's error is bounded by how far its round
+    /// trip exceeds the physical minimum.
+    min_delay: [(RouterSideId, u32); ASYMMETRY_SIDES],
+    min_delay_len: u8,
     asymmetry_len: u8,
     ever_locked: bool,
     locked: bool,
@@ -135,9 +140,13 @@ impl TimeSyncV2 {
     pub(super) fn reset(&mut self) {
         let asymmetry = self.asymmetry;
         let asymmetry_len = self.asymmetry_len;
+        let min_delay = self.min_delay;
+        let min_delay_len = self.min_delay_len;
         *self = Self::default();
         self.asymmetry = asymmetry;
         self.asymmetry_len = asymmetry_len;
+        self.min_delay = min_delay;
+        self.min_delay_len = min_delay_len;
     }
 
     pub(super) fn has_samples_from(&self, sender: &str) -> bool {
@@ -166,6 +175,24 @@ impl TimeSyncV2 {
     /// Round trip of the newest answered request, ms.
     pub(super) fn last_round_trip_ms(&self) -> u64 {
         u64::from(self.last_round_trip_ms)
+    }
+
+    /// Physical minimum round trip of one exchange (both one-way minima at
+    /// their frame sizes), ns; 0 when the side's minimum is not described.
+    fn min_round_trip_ns(&self, side: Option<RouterSideId>, ex: &Exchange) -> u64 {
+        let Some(side) = side else { return 0 };
+        let Some(fixed) = self.min_delay[..usize::from(self.min_delay_len)]
+            .iter()
+            .find(|(s, _)| *s == side)
+            .map(|(_, ns)| u64::from(*ns))
+        else {
+            return 0;
+        };
+        let byte_ns = self.asymmetry[..usize::from(self.asymmetry_len)]
+            .iter()
+            .find(|(s, _, _)| *s == side)
+            .map_or(0, |(_, b, _)| u64::from(*b));
+        2 * fixed + byte_ns * (u64::from(ex.request_len) + u64::from(ex.response_len))
     }
 
     /// (response one-way delay - request one-way delay) / 2 for one exchange.
@@ -436,6 +463,28 @@ impl Router {
     /// report transmit completion), `fixed_asymmetry_ns` any constant
     /// (response - request) / 2 difference such as a wrapper only one direction
     /// adds. Sides without a description are treated as symmetric.
+    /// Describes a side's physical minimum one-way delay between the transmit
+    /// and receive stamps, excluding the per-byte part given to
+    /// [`Self::set_side_timesync_path`] (radio: modem packet close and TX
+    /// setup and air framing). It must be a true lower bound: a sample whose
+    /// round trip exceeds the minimum by `x` is off by at most `x / 2`, and
+    /// the reported error bound rests on it. Without it every sample counts
+    /// as off by up to its whole half round trip.
+    pub fn set_side_timesync_min_delay(&self, side: RouterSideId, min_one_way_ns: u32) {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return;
+        };
+        let mut st = runtime.lock();
+        let v2 = &mut st.v2;
+        let len = usize::from(v2.min_delay_len);
+        if let Some(entry) = v2.min_delay[..len].iter_mut().find(|(s, _)| *s == side) {
+            *entry = (side, min_one_way_ns);
+        } else if len < ASYMMETRY_SIDES {
+            v2.min_delay[len] = (side, min_one_way_ns);
+            v2.min_delay_len += 1;
+        }
+    }
+
     pub fn set_side_timesync_path(&self, side: RouterSideId, byte_ns: u32, fixed_asymmetry_ns: i32) {
         let Some(runtime) = self.timesync.as_ref() else {
             return;
@@ -662,6 +711,7 @@ impl Router {
             let ex = st.v2.exchanges[prev_idx];
             st.v2.exchanges[prev_idx].used = false;
             let asymmetry = st.v2.asymmetry_ns(side, &ex);
+            let min_round_trip = st.v2.min_round_trip_ns(side, &ex);
             exchange_sample(
                 ex.t1_ns,
                 (ex.t2_net_us as i64).saturating_mul(1_000),
@@ -671,6 +721,10 @@ impl Router {
                 asymmetry,
                 rate,
             )
+            .map(|mut sample| {
+                sample.min_half_delay_ns = (min_round_trip / 2).min(u64::from(sample.half_delay_ns)) as u32;
+                sample
+            })
         })
         };
         let Some(sample) = sample else {

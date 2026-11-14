@@ -75,6 +75,9 @@ impl Pair {
             tx.lock().unwrap().push(b.to_vec());
             Ok(())
         });
+        // The link's physical minimum one-way delay: the tests' 25 ms path
+        // (the bound rests on it).
+        rf.set_side_timesync_min_delay(rf_side, 25_000_000);
         Self { now, gs, rf, gs_side, rf_side, gs_out, rf_out, flight: Vec::new() }
     }
 

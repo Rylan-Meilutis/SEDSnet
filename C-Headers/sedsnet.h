@@ -632,6 +632,15 @@ SedsResult seds_router_receive_packed_from_side_at(SedsRouter * r, uint32_t side
 SedsResult seds_router_set_side_timesync_path(SedsRouter * r, uint32_t side_id, uint32_t byte_ns, int32_t fixed_asymmetry_ns);
 
 /**
+ * @brief Describe a side's physical minimum one-way delay between the transmit
+ * and receive stamps, excluding the per-byte part (ns; radio = modem packet
+ * close + TX setup + air framing). Must be a true lower bound: the reported
+ * error bound rests on it. Without it a sample counts as off by up to its
+ * whole half round trip.
+ */
+SedsResult seds_router_set_side_timesync_min_delay(SedsRouter * r, uint32_t side_id, uint32_t min_one_way_ns);
+
+/**
  * @brief Report this node's absolute-time reference (e.g. GPS UTC minus network
  * time, microseconds, measured at the fix) to its time source. Sent in the
  * existing request words while fresh (5 s); `valid = false` stops it.
