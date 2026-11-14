@@ -15,6 +15,8 @@ const MAX_TRACE: usize = 4096;
 #[derive(Default)]
 struct Loss {
     armed: bool,
+    /// Lose the Unordered type's data frames instead of the Ordered one's.
+    unordered: bool,
     once: bool,
     first_id: Option<u64>,
     first_seq: Option<u32>,
@@ -30,8 +32,9 @@ impl Wire {
     fn emit(&mut self, forward: bool, bytes: &[u8], now: u64) -> TelemetryResult<()> {
         let frame = crate::wire_format::peek_frame_info(bytes)?;
         let id = crate::wire_format::packet_id_from_wire(bytes)?;
+        let lossy = if self.loss.unordered { UNORDERED } else { ORDERED };
         let data = forward
-            && frame.envelope.ty == DataType::named(ORDERED)
+            && frame.envelope.ty == DataType::named(lossy)
             && frame
                 .reliable
                 .is_some_and(|h| h.flags & crate::wire_format::RELIABLE_FLAG_ACK_ONLY == 0);
@@ -316,6 +319,9 @@ fn exhaustion_is_terminal_and_sticky() {
             assert!(tx.sent_order.is_empty());
         }
         assert!(!s.history_has(lost.0));
+        let exhausted = s.a.export_runtime_stats().reliable.exhausted;
+        assert_eq!(exhausted.hop_ordered, 1, "{exhausted:?}");
+        assert_eq!(exhausted.hop_unordered, 0, "{exhausted:?}");
         s.wire.lock().unwrap().loss.armed = false;
         let before = s
             .wire
@@ -374,6 +380,37 @@ fn exhaustion_is_terminal_and_sticky() {
             "contract-cold"
         });
     }
+}
+
+/// An Unordered delivery that runs out of retries is dropped alone, with no
+/// error (nothing else is cancelled), but counted and kept for the
+/// application like an Ordered one.
+#[test]
+fn unordered_exhaustion_is_counted_and_reported_without_an_error() {
+    let _serialized = FIXTURE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut s = Scene::new();
+    {
+        let mut w = s.wire.lock().unwrap();
+        w.loss.armed = true;
+        w.loss.unordered = true;
+    }
+    let lost = s.send(10, false);
+    for _ in 0..(runtime_reliable_max_retries() + 2) * 2 {
+        s.tick();
+    }
+    assert!(s.errors.iter().all(|e| !e.contains("exhausted")), "{:?}", s.errors);
+    let exhausted = s.a.export_runtime_stats().reliable.exhausted;
+    eprintln!("UNORDERED_EXHAUSTED {exhausted:?}");
+    assert_eq!(exhausted.hop_unordered, 1, "{exhausted:?}");
+    assert_eq!((exhausted.hop_ordered, exhausted.end_to_end_ordered), (0, 0), "{exhausted:?}");
+    let taken = s.a.take_exhausted_reliable();
+    assert!(taken.iter().any(|e| !e.end_to_end && !e.ordered && e.data_type == Some(DataType::named(UNORDERED))), "{taken:?}");
+    assert!(taken.iter().all(|e| !e.ordered), "{taken:?}");
+    assert!(s.a.take_exhausted_reliable().is_empty(), "taken once");
+    assert!(!s.delivered.lock().unwrap().iter().any(|v| v.0 == lost.0));
+    s.wire.lock().unwrap().loss.armed = false;
+    let control = s.send(90, false);
+    assert!(s.delivered.lock().unwrap().iter().any(|v| v.0 == control.0));
 }
 
 #[test]

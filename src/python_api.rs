@@ -839,6 +839,12 @@ fn runtime_stats_snapshot_to_pydict(
         "end_to_end_acked_cache_count",
         snap.reliable.end_to_end_acked_cache_count,
     )?;
+    let exhausted = PyDict::new(py);
+    exhausted.set_item("end_to_end_ordered", snap.reliable.exhausted.end_to_end_ordered)?;
+    exhausted.set_item("end_to_end_unordered", snap.reliable.exhausted.end_to_end_unordered)?;
+    exhausted.set_item("hop_ordered", snap.reliable.exhausted.hop_ordered)?;
+    exhausted.set_item("hop_unordered", snap.reliable.exhausted.hop_unordered)?;
+    reliable.set_item("exhausted", exhausted)?;
     out.set_item("reliable", reliable)?;
 
     let discovery = PyDict::new(py);

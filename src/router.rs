@@ -166,6 +166,58 @@ mod compact_summary_tests {
         now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
         assert!(router.process_end_to_end_reliable_timeouts().is_err());
         assert!(router.state.lock().end_to_end_reliable_tx.is_empty());
+        let exhausted = router.export_runtime_stats().reliable.exhausted;
+        assert_eq!((exhausted.end_to_end_ordered, exhausted.end_to_end_unordered), (1, 0), "only the head ran out of retries");
+    }
+    /// An Unordered end-to-end delivery that runs out of retries is dropped
+    /// alone and with no error, but counted, and kept (the most recent
+    /// eight) for the application to log.
+    #[test]
+    #[cfg(feature = "std")]
+    fn unordered_end_to_end_exhaustion_is_counted_and_kept() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = crate::config::register_data_type_with_description(
+            "UNORDERED_EXHAUSTION_COUNT",
+            "unordered exhaustion",
+            MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[ep],
+            crate::ReliableMode::Unordered,
+            200,
+        )
+        .unwrap();
+        let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+        let clock = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([]),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        );
+        let mut ids = Vec::new();
+        for index in 0..10u8 {
+            let packet = Packet::new(ty, &[ep], "SOURCE", u64::from(index) + 1, Arc::<[u8]>::from([index])).unwrap();
+            ids.push(packet.packet_id());
+            router.register_end_to_end_reliable_tx(&RouterItem::Packet(packet), None).unwrap();
+        }
+        // One left with retries to spare stays pending.
+        let spared = ids[9];
+        {
+            let mut state = router.state.lock();
+            for (id, sent) in state.end_to_end_reliable_tx.iter_mut() {
+                sent.queued = false;
+                if *id != spared {
+                    sent.retries = runtime_reliable_max_retries();
+                }
+            }
+        }
+        now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
+        router.process_end_to_end_reliable_timeouts().unwrap();
+        assert_eq!(router.state.lock().end_to_end_reliable_tx.len(), 1, "an Unordered one is dropped alone");
+        let exhausted = router.export_runtime_stats().reliable.exhausted;
+        assert_eq!(exhausted, crate::diagnostics::ReliableExhaustionCounts { end_to_end_unordered: 9, ..Default::default() });
+        let taken = router.take_exhausted_reliable();
+        assert_eq!(taken.len(), 8, "the most recent eight are kept");
+        assert!(taken.iter().all(|e| e.end_to_end && !e.ordered && e.data_type == Some(ty) && ids[..9].contains(&e.packet_id)), "{taken:?}");
+        assert!(router.take_exhausted_reliable().is_empty());
     }
     /// End-to-end duplicates: a sender re-sends a reliable frame for up to its
     /// retry window (4.8 s at the GS). A copy that arrives after 64 other
@@ -2751,6 +2803,10 @@ struct SideTxAdmission<'a> {
     _guard: crate::lock::ReentryGuard<'a>,
 }
 
+/// Reliable deliveries given up kept for `take_exhausted_reliable` (std).
+#[cfg(feature = "std")]
+const EXHAUSTED_RECENT: usize = 8;
+
 struct RouterInner {
     #[cfg(feature = "std")]
     p2p_revision: u64,
@@ -2815,6 +2871,9 @@ struct RouterInner {
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
     total_handler_retries: u64,
+    reliable_exhausted: crate::diagnostics::ReliableExhaustionCounts,
+    #[cfg(feature = "std")]
+    exhausted_recent: VecDeque<crate::diagnostics::ExhaustedReliable>,
     #[cfg(feature = "discovery")]
     discovery_routes: RouterMap<RouterSideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
@@ -14206,6 +14265,38 @@ impl Router {
         }
     }
 
+    /// Count a reliable delivery given up after its last retry; std builds
+    /// also keep it (the most recent EXHAUSTED_RECENT) for the application.
+    fn note_exhausted(
+        counts: &mut crate::diagnostics::ReliableExhaustionCounts,
+        #[cfg(feature = "std")] recent: &mut VecDeque<crate::diagnostics::ExhaustedReliable>,
+        exhausted: crate::diagnostics::ExhaustedReliable,
+    ) {
+        let counter = match (exhausted.end_to_end, exhausted.ordered) {
+            (true, true) => &mut counts.end_to_end_ordered,
+            (true, false) => &mut counts.end_to_end_unordered,
+            (false, true) => &mut counts.hop_ordered,
+            (false, false) => &mut counts.hop_unordered,
+        };
+        *counter = counter.saturating_add(1);
+        #[cfg(feature = "std")]
+        {
+            if recent.len() >= EXHAUSTED_RECENT {
+                recent.pop_front();
+            }
+            recent.push_back(exhausted);
+        }
+    }
+
+    /// The reliable deliveries given up after their last retry since the
+    /// last call, oldest first (at most the most recent EXHAUSTED_RECENT;
+    /// the counters in `export_runtime_stats` count them all). An Unordered
+    /// delivery is dropped without any other notice.
+    #[cfg(feature = "std")]
+    pub fn take_exhausted_reliable(&self) -> Vec<crate::diagnostics::ExhaustedReliable> {
+        self.state.lock().exhausted_recent.drain(..).collect()
+    }
+
     fn process_reliable_timeouts(&self) -> TelemetryResult<()> {
         let now = self.clock.now_ms();
         let mut requeue: Vec<(RouterSideId, DataType, u32)> = Vec::new();
@@ -14217,7 +14308,8 @@ impl Router {
                 return Ok(());
             }
 
-            for ((side, ty_u32), tx_state) in st.reliable_tx.iter_mut() {
+            let RouterInner { reliable_tx, reliable_exhausted, #[cfg(feature = "std")] exhausted_recent, .. } = &mut *st;
+            for ((side, ty_u32), tx_state) in reliable_tx.iter_mut() {
                 let Some(ty) = DataType::try_from_u32(*ty_u32) else {
                     continue;
                 };
@@ -14243,7 +14335,14 @@ impl Router {
                         continue;
                     }
                     if sent.retries >= runtime_reliable_max_retries() {
-                        if matches!(reliable_mode(ty), crate::ReliableMode::Ordered) {
+                        let ordered = matches!(reliable_mode(ty), crate::ReliableMode::Ordered);
+                        Self::note_exhausted(
+                            reliable_exhausted,
+                            #[cfg(feature = "std")]
+                            exhausted_recent,
+                            crate::diagnostics::ExhaustedReliable { data_type: Some(ty), packet_id: u64::from(seq), ordered, end_to_end: false },
+                        );
+                        if ordered {
                             tx_state.next_seq = 0;
                             tx_state.sent.clear();
                             tx_state.sent_order.clear();
@@ -14319,6 +14418,9 @@ impl Router {
             let RouterInner {
                 transmit_queue,
                 end_to_end_reliable_tx,
+                reliable_exhausted,
+                #[cfg(feature = "std")]
+                exhausted_recent,
                 ..
             } = &mut *st;
             end_to_end_reliable_tx.retain(|&packet_id, sent| {
@@ -14361,6 +14463,21 @@ impl Router {
                     if let Some(ty) = sent.ordered_type {
                         failed_ordered_types.insert(ty);
                     }
+                    #[cfg(feature = "std")]
+                    let ty = sent.pending_type;
+                    #[cfg(not(feature = "std"))]
+                    let ty = sent.ordered_type.unwrap_or(0);
+                    Self::note_exhausted(
+                        reliable_exhausted,
+                        #[cfg(feature = "std")]
+                        exhausted_recent,
+                        crate::diagnostics::ExhaustedReliable {
+                            data_type: DataType::try_from_u32(ty),
+                            packet_id,
+                            ordered: sent.ordered_type.is_some(),
+                            end_to_end: true,
+                        },
+                    );
                     return false;
                 }
                 sent.retries += 1;
@@ -15411,6 +15528,9 @@ impl Router {
                 end_to_end_reliable_tx_order: VecDeque::new(),
                 total_handler_failures: 0,
                 total_handler_retries: 0,
+                reliable_exhausted: Default::default(),
+                #[cfg(feature = "std")]
+                exhausted_recent: VecDeque::new(),
                 #[cfg(feature = "discovery")]
                 discovery_routes: Default::default(),
                 #[cfg(feature = "discovery")]
@@ -17523,6 +17643,7 @@ impl Router {
                     .forwarded_receipts
                     .as_ref()
                     .map_or(0, |cache| cache.destinations.len()),
+                exhausted: st.reliable_exhausted,
             },
             discovery,
             total_handler_failures: st.total_handler_failures,

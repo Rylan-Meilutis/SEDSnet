@@ -133,6 +133,31 @@ pub struct ReliableRuntimeStats {
     pub end_to_end_pending_count: usize,
     pub end_to_end_pending_destination_count: usize,
     pub end_to_end_acked_cache_count: usize,
+    /// Reliable deliveries that ran out of retries since the router started.
+    pub exhausted: ReliableExhaustionCounts,
+}
+
+/// Reliable deliveries given up after the last retry, by path and mode. An
+/// Ordered one also fails the stream's queued tail (not counted here); an
+/// Unordered one is dropped alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReliableExhaustionCounts {
+    pub end_to_end_ordered: u64,
+    pub end_to_end_unordered: u64,
+    pub hop_ordered: u64,
+    pub hop_unordered: u64,
+}
+
+/// One reliable delivery given up after its last retry (std builds keep the
+/// most recent few for [`crate::router::Router::take_exhausted_reliable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExhaustedReliable {
+    /// None when the retained delivery's type is not known without decoding.
+    pub data_type: Option<DataType>,
+    /// The end-to-end packet ID; hop deliveries carry their hop sequence.
+    pub packet_id: u64,
+    pub ordered: bool,
+    pub end_to_end: bool,
 }
 
 /// Fixed-size, allocation-free pending-delivery summary for constrained diagnostics.

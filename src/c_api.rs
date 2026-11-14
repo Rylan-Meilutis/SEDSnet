@@ -1130,11 +1130,17 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
             ",\"reliable\":{{\"reliable_return_route_count\":{},\
               \"end_to_end_pending_count\":{},\
               \"end_to_end_pending_destination_count\":{},\
-              \"end_to_end_acked_cache_count\":{}}}",
+              \"end_to_end_acked_cache_count\":{},\
+              \"exhausted\":{{\"end_to_end_ordered\":{},\"end_to_end_unordered\":{},\
+              \"hop_ordered\":{},\"hop_unordered\":{}}}}}",
             snap.reliable.reliable_return_route_count,
             snap.reliable.end_to_end_pending_count,
             snap.reliable.end_to_end_pending_destination_count,
-            snap.reliable.end_to_end_acked_cache_count
+            snap.reliable.end_to_end_acked_cache_count,
+            snap.reliable.exhausted.end_to_end_ordered,
+            snap.reliable.exhausted.end_to_end_unordered,
+            snap.reliable.exhausted.hop_ordered,
+            snap.reliable.exhausted.hop_unordered
         ),
     );
 
