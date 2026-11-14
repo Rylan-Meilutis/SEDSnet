@@ -85,6 +85,9 @@ mod ack_return_identity;
 #[path = "tests/forget_peer.rs"]
 mod forget_peer;
 #[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/returning_owner.rs"]
+mod returning_owner;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
 #[path = "tests/silent_station_sim.rs"]
 mod silent_station_sim;
 #[cfg(all(test, feature = "discovery", feature = "std"))]
@@ -11067,7 +11070,14 @@ impl Router {
                                     && bridge
                                         .topology_boards
                                         .iter()
-                                        .any(|board| board.sender_id == *name)
+                                        // A bridge describes the peer only with its
+                                        // endpoints: an RRLS lists a primary it lost
+                                        // with none (R2-C: the returning primary owned
+                                        // no status for 5.4 s).
+                                        .any(|board| {
+                                            board.sender_id == *name
+                                                && !board.reachable_endpoints.is_empty()
+                                        })
                             })
                     })
                 });

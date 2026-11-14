@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Ask a peer heard again for its topology when no other topology describes it
+  with endpoints. A bridge (an RRLS) that lists a peer it lost with no
+  endpoints no longer counts as describing it, so the returning peer is asked
+  within the baseline grace and owns the next end-to-end frame for its
+  endpoints once its topology arrives (combined round R2-C: RF addressed its
+  Abort push and its readback reply to the RRLS alone for 5.4 s after a
+  takeover ended).
 
 ## 5.0.0
 
