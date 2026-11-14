@@ -189,6 +189,7 @@ pub mod relay;
 pub mod router;
 pub mod routing_config;
 mod side_transport;
+pub mod side_peek;
 #[cfg(any(test, all(feature = "embedded", not(feature = "std"))))]
 mod small_map;
 // Crate-internal ordered tables. Embedded no_std builds use one sorted-`Vec`

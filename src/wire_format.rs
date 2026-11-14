@@ -2015,7 +2015,7 @@ pub(crate) fn peek_routing_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFram
     })
 }
 
-fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
+pub(crate) fn peek_frame_info_inner(buf: &[u8]) -> TelemetryResult<TelemetryFrameInfo> {
     let mut r = ByteReader::new(buf);
     let header = read_routing_envelope(&mut r)?;
     let reliable = if header.is_reliable || header.has_reliable_header {

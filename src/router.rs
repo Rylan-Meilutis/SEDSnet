@@ -91,6 +91,9 @@ mod silent_station_sim;
 #[path = "tests/proxy_upstream_receipt.rs"]
 mod proxy_upstream_receipt;
 #[cfg(all(test, feature = "discovery"))]
+#[path = "tests/side_peek.rs"]
+mod side_peek_tests;
+#[cfg(all(test, feature = "discovery"))]
 #[path = "tests/own_network_variable.rs"]
 mod own_network_variable;
 #[cfg(all(test, feature = "discovery"))]
