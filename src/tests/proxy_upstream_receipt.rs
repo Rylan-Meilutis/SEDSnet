@@ -46,6 +46,9 @@ struct Sim {
     rrls_mute: bool,
     /// Drop the GS's receipts on the umbilical.
     gs_acks_lost: bool,
+    /// FC does not relay the variable onto CAN (the real FC on the pad: the
+    /// AV bay hears the GS's write over the radio, through RF).
+    fc_no_can_relay: bool,
     /// Every delivered frame: (from side index, to side index, bytes).
     log: Vec<(usize, usize, Vec<u8>)>,
 }
@@ -75,13 +78,25 @@ fn schema() -> (DataType, DataEndpoint) {
 
 impl Sim {
     fn new(gs_writer: bool) -> Self {
+        Self::with_fc_handler(gs_writer, false)
+    }
+
+    /// `fc_handler`: FC also has an endpoint handler for the variable (the
+    /// real FC handles FLIGHT_STATE locally), so it is a local owner, not a
+    /// segment proxy.
+    fn with_fc_handler(gs_writer: bool, fc_handler: bool) -> Self {
         let (ty, ep) = schema();
         let now = Arc::new(AtomicU64::new(1_000));
         let mut nodes = Vec::new();
         let mut applied = Vec::new();
         for (i, name) in NAMES.iter().enumerate() {
+            let handlers = if i == FC && fc_handler {
+                vec![EndpointHandler::new_packet_handler(ep, |_| Ok(()))]
+            } else {
+                Vec::new()
+            };
             let node = Router::new_with_clock(
-                RouterConfig::new([]).with_sender(*name),
+                RouterConfig::new(handlers).with_sender(*name),
                 Box::new(SimClock(now.clone())),
             );
             let perm = if i == GS && gs_writer {
@@ -109,6 +124,7 @@ impl Sim {
             applied,
             rrls_mute: false,
             gs_acks_lost: false,
+            fc_no_can_relay: false,
             log: Vec::new(),
         };
         for (node, name) in [
@@ -138,6 +154,22 @@ impl Sim {
         sim
     }
 
+    /// Close the cycle: the GS on the radio with RF (and the RRLS), as on the
+    /// pad: GS-umbilical-FC-CAN-RF-radio-GS.
+    fn with_gs_radio(mut self) -> Self {
+        let out: Outbox = Arc::default();
+        let tx = out.clone();
+        let id = self.nodes[GS].add_side_packed("radio", move |b: &[u8]| {
+            tx.lock().unwrap().push(b.to_vec());
+            Ok(())
+        });
+        self.sides.push(Side { node: GS, id, out, peers: vec![RADIO_RF, RADIO_RR] });
+        let gs_radio = self.sides.len() - 1;
+        self.sides[RADIO_RF].peers.push(gs_radio);
+        self.sides[RADIO_RR].peers.push(gs_radio);
+        self
+    }
+
     fn is_ack(bytes: &[u8]) -> bool {
         wire_format::peek_routing_envelope(bytes).is_ok_and(|e| e.ty == DataType::ReliableAck)
     }
@@ -150,6 +182,11 @@ impl Sim {
                     continue;
                 }
                 if from == UMB_GS && self.gs_acks_lost && Self::is_ack(&b) {
+                    continue;
+                }
+                if from == CAN_FC && self.fc_no_can_relay
+                    && wire_format::peek_routing_envelope(&b).is_ok_and(|e| e.ty == self.ty)
+                {
                     continue;
                 }
                 for to in self.sides[from].peers.clone() {
@@ -343,4 +380,38 @@ fn duplicate_on_the_original_side_is_acknowledged_again() {
     assert!(sim.acks_from(UMB_FC, id) > acks, "FC re-acknowledges a completed duplicate");
     // The duplicate recreated no downstream child contract.
     assert!(sim.pending(FC).is_empty(), "{:?}", sim.pending(FC));
+}
+
+/// The pad's cycle, GS-umbilical-FC-CAN-RF-radio-GS (P-fcprobe): FC gets the
+/// GS's write over the umbilical first and RF's forwarded copy over CAN as a
+/// duplicate. FC receipts that duplicate back toward RF on the side it came
+/// from, so RF's downstream contract completes and RF never exhausts.
+#[test]
+fn a_duplicate_on_another_side_is_receipted_back_on_that_side() {
+    let mut sim = Sim::with_fc_handler(true, true).with_gs_radio();
+    sim.fc_no_can_relay = true;
+    sim.bootstrap();
+    let before = sim.gave_up(RF);
+    sim.nodes[GS].set_network_variable(sim.packet(GS, 5_000, 15)).unwrap();
+    // RF forwards the GS's radio copy to FC over CAN; FC already has it over
+    // the umbilical. FC receipts that copy back over CAN at once: RF's
+    // downstream contract completes before RF has to retry it.
+    let mut forwarded = false;
+    for _ in 0..(u64::from(crate::config::runtime_reliable_retransmit_ms()) / 50).max(2) {
+        sim.run(50);
+        forwarded |= sim.pending(RF).iter().any(|(_, owners)| owners.contains(&"FC"));
+        if forwarded && sim.pending(RF).is_empty() {
+            break;
+        }
+    }
+    assert!(forwarded, "RF forwarded the write to FC");
+    let retry_ms = u64::from(crate::config::runtime_reliable_retransmit_ms());
+    assert!(sim.pending(RF).is_empty(), "RF's contract completes on FC's receipt of its first copy (within {retry_ms} ms): {:?}", sim.pending(RF));
+    for node in [FC, RF, PB, RR] {
+        assert_eq!(sim.value(node), Some(15), "{} applied the write", NAMES[node]);
+    }
+    sim.run(6_000);
+    assert!(sim.pending(GS).is_empty(), "GS write completes: {:?}", sim.pending(GS));
+    assert!(sim.pending(RF).is_empty(), "RF's downstream contract completes: {:?}", sim.pending(RF));
+    assert_eq!(sim.gave_up(RF), before, "no exhaustion at RF: {:?}", sim.exhausted(RF));
 }
