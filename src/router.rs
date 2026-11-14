@@ -6209,29 +6209,24 @@ impl Router {
         Ok(())
     }
 
-    // Close only a duplicate non-parent edge, never this router's aggregate
-    // receipt. The first ingress continues to own the full downstream subtree.
+    // Close a duplicate edge of a segment proxy. While it owns the downstream
+    // subtree any edge is answered, the parent's too once its segment receipt
+    // was sent (a retry there means that receipt was lost). After the subtree
+    // completed, a non-parent edge (a cycle's back edge) is still answered;
+    // the parent's retry is answered by the completed-contract path.
     fn queue_duplicate_proxy_edge_receipt(
         &self,
         item: &RouterRxItem,
         packet_id: u64,
     ) -> TelemetryResult<()> {
         let Some(src) = item.src else { return Ok(()) };
-        let eligible = |state: &RouterInner| {
-            state.end_to_end_reliable_tx.contains_key(&packet_id)
-                && state
-                    .reliable_return_routes
-                    .get(&packet_id)
-                    .is_some_and(|route| {
-                        route.side != src
-                            && route.local_admission_completed
-                            && !route.admission_cancelled
-                            && route.local_admission_token == 0
-                            && route.upstream_contract.is_some()
-                    })
-        };
-        if !eligible(&self.state.lock()) {
+        let eligible =
+            |state: &RouterInner| Self::proxy_edge_receipt_state(state, packet_id, src);
+        let Some(pending) = eligible(&self.state.lock()) else {
             return Ok(());
+        };
+        if !pending {
+            return self.queue_completed_proxy_edge_receipt(item, src, packet_id);
         }
         let local_sender = self.sender_arc();
         let local_hash = Self::sender_hash(local_sender.as_ref());
@@ -6265,7 +6260,7 @@ impl Router {
         // address are unchanged across the proxy's frozen child contracts.
         let publisher_hash = {
             let state = self.state.lock();
-            if !eligible(&state) {
+            if eligible(&state) != Some(true) {
                 return Ok(());
             }
             let retained = &state
@@ -6294,32 +6289,16 @@ impl Router {
             };
             publisher
         };
-        let ack = Packet::new_local(
-            DataType::ReliableAck,
-            message_meta(DataType::ReliableAck).endpoints_owned(),
-            Arc::from(self.encode_end_to_end_ack_sender()),
-            self.packet_timestamp_ms(),
-            crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
-        )?;
-        let ack = self
-            .attach_wire_contract_to_item(RouterItem::Packet(ack), &[local_hash, publisher_hash])?;
-        let priority = self.item_service_priority(&ack)?;
-        let mut state = self.state.lock();
-        if !eligible(&state)
-            || !Self::side_ref(&state, src).is_ok_and(|side| side.opts.egress_enabled)
-            || state
-                .reliable_return_routes
-                .get(&packet_id)
-                .and_then(|route| route.upstream_contract)
-                != Some((packet_id, publisher_hash))
-        {
-            return Ok(());
-        }
-        let already_queued = state.transmit_queue.iter().any(|queued| {
+        self.push_proxy_edge_receipt(src, packet_id, local_hash, publisher_hash, true)
+    }
+
+    // A receipt for `packet_id` already queued toward `side`.
+    fn receipt_queued_locked(state: &RouterInner, side: RouterSideId, packet_id: u64) -> bool {
+        state.transmit_queue.iter().any(|queued| {
             let RouterTxItem::ToSide { dst, data, .. } = &queued.item else {
                 return false;
             };
-            if *dst != src {
+            if *dst != side {
                 return false;
             }
             match data {
@@ -6334,8 +6313,93 @@ impl Router {
                 })
                 .unwrap_or(false),
             }
-        });
-        if !already_queued {
+        })
+    }
+
+    // Some(true): the proxy's downstream contract is pending; Some(false):
+    // it completed. None: no receipt is owed on `src`.
+    fn proxy_edge_receipt_state(
+        state: &RouterInner,
+        packet_id: u64,
+        src: RouterSideId,
+    ) -> Option<bool> {
+        let route = state.reliable_return_routes.get(&packet_id)?;
+        if !route.local_admission_completed
+            || route.admission_cancelled
+            || route.upstream_contract.map(|(id, _)| id) != Some(packet_id)
+        {
+            return None;
+        }
+        if state.end_to_end_reliable_tx.contains_key(&packet_id) {
+            ((route.side != src || route.delivery_completed) && route.local_admission_token == 0)
+                .then_some(true)
+        } else {
+            (route.delivery_completed && route.side != src).then_some(false)
+        }
+    }
+
+    // No retained frame binds a completed proxy's duplicate: bind it to the
+    // completed contract's publisher by the frame's own sender instead.
+    fn queue_completed_proxy_edge_receipt(
+        &self,
+        item: &RouterRxItem,
+        src: RouterSideId,
+        packet_id: u64,
+    ) -> TelemetryResult<()> {
+        let local_hash = Self::sender_hash(self.sender_arc().as_ref());
+        let packet = match &item.data {
+            RouterItem::Packet(packet) => packet.clone(),
+            RouterItem::Packed(bytes) => self.unpack_packet_for_role(bytes.as_ref())?,
+        };
+        packet.validate()?;
+        if !packet.wire_target_senders().contains(&local_hash) {
+            return Ok(());
+        }
+        let publisher_hash = {
+            let state = self.state.lock();
+            let sender = Self::sender_hash(&Self::canonical_sender_locked(&state, packet.sender()));
+            match state
+                .reliable_return_routes
+                .get(&packet_id)
+                .and_then(|route| route.upstream_contract)
+            {
+                Some((id, publisher)) if id == packet_id && publisher == sender => publisher,
+                _ => return Ok(()),
+            }
+        };
+        self.push_proxy_edge_receipt(src, packet_id, local_hash, publisher_hash, false)
+    }
+
+    fn push_proxy_edge_receipt(
+        &self,
+        src: RouterSideId,
+        packet_id: u64,
+        local_hash: u64,
+        publisher_hash: u64,
+        pending: bool,
+    ) -> TelemetryResult<()> {
+        let ack = Packet::new_local(
+            DataType::ReliableAck,
+            message_meta(DataType::ReliableAck).endpoints_owned(),
+            Arc::from(self.encode_end_to_end_ack_sender()),
+            self.packet_timestamp_ms(),
+            crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
+        )?;
+        let ack = self
+            .attach_wire_contract_to_item(RouterItem::Packet(ack), &[local_hash, publisher_hash])?;
+        let priority = self.item_service_priority(&ack)?;
+        let mut state = self.state.lock();
+        if Self::proxy_edge_receipt_state(&state, packet_id, src) != Some(pending)
+            || !Self::side_ref(&state, src).is_ok_and(|side| side.opts.egress_enabled)
+            || state
+                .reliable_return_routes
+                .get(&packet_id)
+                .and_then(|route| route.upstream_contract)
+                != Some((packet_id, publisher_hash))
+        {
+            return Ok(());
+        }
+        if !Self::receipt_queued_locked(&state, src, packet_id) {
             state.push_transmit(TxQueued {
                 disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
@@ -8578,14 +8642,22 @@ impl Router {
         // A completed proxy still owns the aggregate receipt. A delayed parent
         // retry must not recreate an ordered child cohort and block successors.
         // Keep the alias too, so late child receipts remain consumed locally.
+        // A receipt still queued toward the parent (say, physically refused)
+        // already answers this retry; never stack a second one behind it.
         let completed_contract = {
             let st = self.state.lock();
             st.reliable_return_routes
                 .get(&upstream_id)
                 .filter(|route| route.delivery_completed)
-                .and_then(|route| route.upstream_contract)
+                .and_then(|route| {
+                    let queued = Self::receipt_queued_locked(&st, route.side, upstream_id);
+                    route.upstream_contract.map(|contract| (contract, queued))
+                })
         };
-        if let Some((packet_id, publisher_hash)) = completed_contract {
+        if let Some(((_, _), true)) = completed_contract {
+            return Ok(None);
+        }
+        if let Some(((packet_id, publisher_hash), _)) = completed_contract {
             self.queue_end_to_end_reliable_ack_for_sender_hash(
                 packet_id,
                 publisher_hash,
@@ -8651,22 +8723,36 @@ impl Router {
                 "[sedsnet-reliable] proxy retain upstream={upstream_id:#x} downstream={downstream_id:#x} existing={already_pending} ready={ready}"
             );
         }
-        {
+        let publisher_hash = {
             let mut st = self.state.lock();
             let Some(mut route) = st.reliable_return_routes.get(&upstream_id).cloned() else {
                 st.end_to_end_reliable_tx.remove(&downstream_id);
                 return Err(TelemetryError::Io("no reliable return route"));
             };
-            route.upstream_contract = Some((
-                upstream_id,
-                Self::sender_hash(&Self::canonical_sender_locked(&st, pkt.sender())),
-            ));
+            let publisher_hash =
+                Self::sender_hash(&Self::canonical_sender_locked(&st, pkt.sender()));
+            route.upstream_contract = Some((upstream_id, publisher_hash));
             if !Self::remember_reliable_return_route_locked(&mut st, downstream_id) {
                 st.end_to_end_reliable_tx.remove(&downstream_id);
                 return Err(TelemetryError::Io("reliable return route window full"));
             }
             st.reliable_return_routes.insert(downstream_id, route);
-        }
+            // Accepted and queued downstream: this segment's receipt is due
+            // now. The downstream cohort is this router's own contract, with
+            // its own retries and exhaustion; a dead owner behind it must not
+            // exhaust the publisher's write. Completion also turns a delayed
+            // parent retry into a re-receipt (completed_contract above).
+            if let Some(upstream) = st.reliable_return_routes.get_mut(&upstream_id) {
+                upstream.delivery_completed = true;
+                upstream.upstream_contract = Some((upstream_id, publisher_hash));
+            }
+            publisher_hash
+        };
+        self.queue_end_to_end_reliable_ack_for_sender_hash(
+            upstream_id,
+            publisher_hash,
+            called_from_queue,
+        )?;
         Ok((ready && !already_pending).then_some(forwarded))
     }
 
@@ -19817,8 +19903,15 @@ impl Router {
                         return Ok(true);
                     }
                 };
+                // The segment receipt went upstream when the cohort was
+                // accepted; a lost one is answered on the parent's retry.
+                let mut already_acknowledged = false;
                 if completed {
                     let mut st = self.state.lock();
+                    already_acknowledged = st
+                        .reliable_return_routes
+                        .get(&upstream_id)
+                        .is_some_and(|route| route.delivery_completed);
                     if Self::remember_reliable_return_route_locked(&mut st, upstream_id) {
                         st.reliable_return_routes
                             .entry(upstream_id)
@@ -19838,11 +19931,13 @@ impl Router {
                             });
                     }
                 }
-                self.queue_end_to_end_reliable_ack_for_sender_hash(
-                    upstream_id,
-                    publisher_hash,
-                    called_from_queue,
-                )?;
+                if !already_acknowledged {
+                    self.queue_end_to_end_reliable_ack_for_sender_hash(
+                        upstream_id,
+                        publisher_hash,
+                        called_from_queue,
+                    )?;
+                }
                 self.release_ordered_successors()?;
                 return Ok(true);
             }
@@ -20430,6 +20525,10 @@ impl Router {
             #[cfg(feature = "discovery")]
             if !shared_pending && let Some(src) = item.src {
                 self.replay_forwarded_receipts(&item.data, src, called_from_queue)?;
+            }
+            // A completed segment proxy still answers a back edge's copy.
+            if let Some(guard) = _local_admission_guard.as_ref() {
+                self.queue_duplicate_proxy_edge_receipt(item, guard.packet_id)?;
             }
 
             // A final-ACK retry must cross a router again. Do not redeliver it
