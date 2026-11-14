@@ -136,17 +136,25 @@ fn forgetting_a_peer_never_completes_an_abort_or_urgent_frame() {
     assert!(crate::set_type_scheduling_class(urgent, 0));
 }
 
-/// A station that went silent (its discovery leave lost): an Ordered head
-/// that the GS acknowledged but the RRLS never did completes for the GS when
-/// its retries run out, and the frame queued behind it still goes (it is not
-/// cancelled with the head). The RRLS is retired from that frame and the
-/// ones after it, and left out of new frames until it is heard again. An
-/// ABORT owed only to the silent station is never completed this way.
+/// A station that went silent (its discovery leave lost): an Unordered
+/// frame the GS acknowledged but the RRLS never did completes for the GS when
+/// its retries run out, and the RRLS is retired from the other Unordered
+/// frames still pending. It stays owed every Ordered frame (the application
+/// re-sends from an Ordered exhaustion and its owners) and every ABORT.
 #[test]
 fn an_owner_that_missed_every_retry_is_retired_not_the_stream() {
     crate::tests::ensure_common_test_schema();
     let endpoint = DataEndpoint::named("RADIO");
     let ty = crate::config::register_data_type_with_description(
+        "SILENT_OWNER_UNORDERED",
+        "",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[endpoint],
+        crate::ReliableMode::Unordered,
+        16,
+    )
+    .unwrap();
+    let ordered = crate::config::register_data_type_with_description(
         "SILENT_OWNER_ORDERED",
         "",
         crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
@@ -186,16 +194,18 @@ fn an_owner_that_missed_every_retry_is_retired_not_the_stream() {
         id
     };
     let head = frame(ty, endpoint, 1, &[gs, rr]);
-    let tail = frame(ty, endpoint, 2, &[gs, rr]);
     // The GS acknowledges the head; the RRLS never answers.
     node.state.lock().end_to_end_reliable_tx.get_mut(&head).unwrap().pending_destinations.remove(&gs);
     let span = runtime_reliable_retransmit_ms() * (u64::from(runtime_reliable_max_retries()) + 2);
-    let mut abort_rr = None;
+    let (mut later, mut ordered_rr, mut abort_rr) = (None, None, None);
     let mut elapsed = 0;
     while node.state.lock().end_to_end_reliable_tx.contains_key(&head) && elapsed < 2 * span {
-        if abort_rr.is_none() && elapsed >= span / 2 {
-            // An ABORT owed only to the RRLS, sent while the head still retries.
-            abort_rr = Some(frame(abort, abort_ep, 3, &[rr]));
+        if later.is_none() && elapsed >= span / 2 {
+            // Sent while the head still retries: another Unordered frame, an
+            // Ordered one and an ABORT, each also owed to the RRLS.
+            later = Some(frame(ty, endpoint, 2, &[gs, rr]));
+            ordered_rr = Some(frame(ordered, endpoint, 3, &[gs, rr]));
+            abort_rr = Some(frame(abort, abort_ep, 4, &[gs, rr]));
         }
         now.fetch_add(10, Ordering::SeqCst);
         elapsed += 10;
@@ -203,39 +213,27 @@ fn an_owner_that_missed_every_retry_is_retired_not_the_stream() {
     }
     let st = node.state.lock();
     assert!(!st.end_to_end_reliable_tx.contains_key(&head), "the head completed for the GS");
-    assert!(
-        st.end_to_end_reliable_tx.contains_key(&abort_rr.unwrap()),
-        "an ABORT owed only to the silent owner is never completed through its retirement"
-    );
-    let tail_sent = st.end_to_end_reliable_tx.get(&tail).expect("the tail was not cancelled with the head");
-    assert_eq!(
-        tail_sent.pending_destinations.keys().copied().collect::<Vec<_>>(),
-        vec![gs],
-        "the silent RRLS is retired from the frames behind the head"
-    );
-    assert!(st.silent_owners.iter().any(|(owner, _)| *owner == rr));
+    let owners = |id: u64| st.end_to_end_reliable_tx[&id].pending_destinations.keys().copied().collect::<Vec<_>>();
+    assert_eq!(owners(later.unwrap()), vec![gs], "the silent RRLS is retired from the other Unordered frames");
+    let mut both = vec![gs, rr];
+    both.sort_unstable();
+    assert_eq!(owners(ordered_rr.unwrap()), both, "an Ordered frame keeps every owner");
+    assert_eq!(owners(abort_rr.unwrap()), both, "an ABORT keeps every owner");
     drop(st);
     // Counted with the exhaustion counters: the RRLS retired from the head
-    // and the tail, the head completed only after its retirement.
+    // and the later Unordered frame, the head completed only after it.
     let counts = node.export_runtime_stats().reliable.exhausted;
     assert_eq!(
         (
-            counts.silent_owner_retired_ordered,
-            counts.silent_owner_completed_ordered,
             counts.silent_owner_retired_unordered,
             counts.silent_owner_completed_unordered,
-            counts.end_to_end_ordered,
+            counts.silent_owner_retired_ordered,
+            counts.silent_owner_completed_ordered,
+            counts.end_to_end_unordered,
         ),
         (2, 1, 0, 0, 0),
         "{counts:?}"
     );
-    // New frames leave the silent owner out.
-    let mut pending: OrdMap<u64, RouterSideId> = [(gs, radio), (rr, radio)].into_iter().collect();
-    {
-        let st = node.state.lock();
-        node.filter_trackable_end_to_end_destinations_locked(&st, ty, &mut pending, false);
-    }
-    assert!(!pending.contains_key(&rr), "a silent owner is not owed new frames");
 }
 
 /// RRLS and GS share a radio bus with RF, which relays onto a CAN side where

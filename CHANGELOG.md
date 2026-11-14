@@ -99,14 +99,14 @@ that option, keep their 4.3.14 representations.
   +160/-90/+45 ppm, turn waits 0-200 ms on half the frames, 0-50% loss): p95
   under 0.6 ms, reported bound 1-6 ms (RF) and 4-6 ms (FC/PB), and in every
   case, including every frame waiting, never below the real error.
-- A silent end-to-end owner (a station whose discovery leave was lost) is
-  retired, not the stream: when a frame's retries run out with some owners
-  still pending, those owners are retired from it and from every frame
-  behind it, and left out of new frames until heard again (any discovery
-  frame from them) or for the 30 s route lifetime. A frame others
-  acknowledged then completes for them and an Ordered stream continues; one
-  no owner acknowledged still fails and cancels its Ordered tail, as before.
-  An ABORT or urgent frame is never completed this way.
+- A silent end-to-end owner (a station whose discovery leave was lost) no
+  longer holds Unordered deliveries: when an Unordered frame others
+  acknowledged runs out of retries, the owners still pending are retired from
+  it and from the other pending Unordered frames, and it completes for the
+  others. Ordered frames keep their exhaustion semantics (the application
+  re-sends from an Ordered exhaustion and the owners that missed it), ABORT and
+  urgent frames are never touched, and new frames still go to every owner.
+  Counted in `reliable.exhausted` (`silent_owner_*`; the Ordered ones stay 0).
 - `Router::forget_peer(hostname)` (discovery, Rust): an application that
   knows a peer is out of range drops its routes now, as a discovery leave
   does, and retires it from every pending end-to-end frame; a frame owed to

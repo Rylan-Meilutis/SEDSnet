@@ -147,7 +147,8 @@ pub struct ReliableExhaustionCounts {
     pub hop_ordered: u64,
     pub hop_unordered: u64,
     /// Owners retired from end-to-end frames after missing every retry of one
-    /// (a silent station), counted per frame, by the frame's mode.
+    /// (a silent station), counted per frame, by the frame's mode. Only
+    /// Unordered frames retire owners; the Ordered counts stay 0.
     pub silent_owner_retired_ordered: u64,
     pub silent_owner_retired_unordered: u64,
     /// End-to-end frames completed only because a silent owner was retired

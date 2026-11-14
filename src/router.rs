@@ -1320,9 +1320,7 @@ struct ReliableRxState {
 // This is not the full BTree allocation cost; allocator node deltas are measured
 // separately. The fixed RouterInner sequence is part of object footprint.
 const RELIABLE_RETURN_ROUTE_EXTRA_LOGICAL_BYTES: usize = size_of::<u64>();
-/// Silent owners remembered at once (oldest forgotten first).
-#[cfg(feature = "discovery")]
-const SILENT_OWNERS_MAX: usize = 4;
+
 
 #[derive(Debug, Clone)]
 struct ReliableReturnRouteState {
@@ -2856,11 +2854,7 @@ struct RouterInner {
     /// a second on a busy board (16 ids on the FC), so a sender's late
     /// re-send would reach the application again.
     e2e_rx_seen: VecDeque<(u64, u64)>,
-    /// End-to-end owners that missed every retry of a frame: (owner hash,
-    /// since ms). Left out of new frames' destinations until heard again
-    /// (any discovery frame from them) or the route lifetime passes.
-    #[cfg(feature = "discovery")]
-    silent_owners: VecDeque<(u64, u64)>,
+
     /// Reliable end-to-end types: the last `ORDERED_RX_HISTORY` packet ids
     /// delivered per type. An ordered sender re-sends only its head (it
     /// holds the next until that is acknowledged), so its late copy is
@@ -7662,11 +7656,8 @@ impl Router {
             return;
         }
         let now_ms = self.clock.now_ms();
-        pending.retain(|owner, side| {
-            !st.silent_owners
-                .iter()
-                .any(|(silent, since)| silent == owner && now_ms.saturating_sub(*since) <= DISCOVERY_ROUTE_TTL_MS)
-                && Self::side_supports_end_to_end_tracking_locked(st, *side)
+        pending.retain(|_, side| {
+            Self::side_supports_end_to_end_tracking_locked(st, *side)
                 && (st.is_managed_variable(ty.as_u32())
                     || is_reliable_type(ty)
                     || !self.side_has_multiple_announcers_locked(st, *side, now_ms))
@@ -11748,11 +11739,6 @@ impl Router {
         };
         let mut st = self.state.lock();
         let now_ms = self.clock.now_ms();
-        if !st.silent_owners.is_empty() {
-            // Heard again: owed frames again.
-            let heard = Self::sender_hash(packet_sender.as_str());
-            st.silent_owners.retain(|(owner, _)| *owner != heard);
-        }
         if pkt.data_type() == DataType::DiscoveryLeave {
             if Self::remove_discovery_peer_locked(&mut st, packet_sender.as_str())? {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
@@ -14535,22 +14521,25 @@ impl Router {
                     return true;
                 }
                 if sent.retries >= runtime_reliable_max_retries() {
-                    // The owners still pending missed every retry: silent.
+                    // An Unordered frame others acknowledged: the owners still
+                    // pending missed every retry (silent). It completes for the
+                    // others once they are retired below, from it and from the
+                    // other Unordered frames. Never an Ordered frame (its
+                    // exhaustion, with the owners that missed it, is what the
+                    // application re-sends from, e.g. the station's Aborted
+                    // FLIGHT_STATE) and never an ABORT or urgent frame.
                     #[cfg(feature = "discovery")]
+                    if sent.ordered_type.is_none()
+                        && !Self::item_data_type(&sent.data)
+                            .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT")
+                        && sent.pending_destinations.len() < Self::frozen_owner_count(&sent.data)
                     {
                         for owner in sent.pending_destinations.keys() {
                             if !silenced.contains(owner) {
                                 silenced.push(*owner);
                             }
                         }
-                        // Others acknowledged it: it completes for them once
-                        // the silent owners are retired below (never an ABORT
-                        // or urgent frame), and its stream continues.
-                        let protected = Self::item_data_type(&sent.data)
-                            .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT");
-                        if !protected && sent.pending_destinations.len() < Self::frozen_owner_count(&sent.data) {
-                            return true;
-                        }
+                        return true;
                     }
                     if let Some(ty) = sent.ordered_type {
                         failed_ordered_types.insert(ty);
@@ -14586,19 +14575,6 @@ impl Router {
 
         #[cfg(feature = "discovery")]
         if !silenced.is_empty() {
-            {
-                let mut st = self.state.lock();
-                let st = &mut *st;
-                st.silent_owners
-                    .retain(|(owner, since)| !silenced.contains(owner) && now.saturating_sub(*since) <= DISCOVERY_ROUTE_TTL_MS);
-                for owner in &silenced {
-                    if st.silent_owners.len() >= SILENT_OWNERS_MAX {
-                        st.silent_owners.pop_front();
-                    }
-                    st.silent_owners.push_back((*owner, now));
-                }
-            }
-            // Retire them from this frame and every frame behind it.
             self.retire_owners_from_pending(&silenced, true)?;
         }
         for packet_id in requeue {
@@ -15602,8 +15578,7 @@ impl Router {
                 ordered_claim_seq: 0,
                 rx_priority_burst: 0,
                 e2e_rx_seen: VecDeque::new(),
-                #[cfg(feature = "discovery")]
-                silent_owners: VecDeque::new(),
+
                 ordered_rx_last: VecDeque::new(),
                 recent_rx: BoundedDeque::new(
                     memory.recent_rx_queue_bytes(),
@@ -16913,6 +16888,11 @@ impl Router {
         for (packet_id, sent) in end_to_end_reliable_tx.iter_mut() {
             let protected = Self::item_data_type(&sent.data)
                 .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT");
+            // A silent owner stays owed every Ordered, ABORT and urgent frame:
+            // only the application decides to forget a peer from those.
+            if silent && (protected || sent.ordered_type.is_some()) {
+                continue;
+            }
             if protected
                 && sent
                     .pending_destinations
