@@ -1679,6 +1679,37 @@ pub extern "C" fn seds_router_configure_address(
     ok_or_status(router.set_address_assignment(mode).map(|_| ()))
 }
 
+/// Match a counted UTF-8 sender identity to a fixed station name (see
+/// `Router::sender_matches_station`): as `seds_router_sender_matches_hostname`,
+/// plus the station name's own compact identity when the receiver knows no
+/// other identity for that address. Returns false for null/empty/invalid
+/// inputs and compact collisions. Does not allocate.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_sender_matches_station(
+    r: *const SedsRouter,
+    sender: *const c_char,
+    sender_len: usize,
+    station: *const c_char,
+    station_len: usize,
+) -> bool {
+    if r.is_null()
+        || sender.is_null()
+        || station.is_null()
+        || sender_len == 0
+        || station_len == 0
+        || sender_len > isize::MAX as usize
+        || station_len > isize::MAX as usize
+    {
+        return false;
+    }
+    let sender = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+    let station = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(station), station_len) };
+    let (Ok(sender), Ok(station)) = (from_utf8(sender), from_utf8(station)) else {
+        return false;
+    };
+    unsafe { &(*r).inner }.sender_matches_station(sender, station)
+}
+
 /// Match a counted UTF-8 sender identity to a literal expected hostname.
 /// Returns false for null/empty/invalid inputs or unknown/ambiguous aliases.
 /// Input spans must be readable for their lengths; no output storage is needed.

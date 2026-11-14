@@ -15464,6 +15464,69 @@ impl Router {
         Self::hostname_for_address_borrowed_locked(&state, address) == Some(expected_hostname)
     }
 
+    /// Like `sender_matches_hostname`, for a fixed station name a receiver
+    /// checks by its literal name (the primary "GS", an "RRLS"), with one
+    /// narrow addition: a compact sender equal to the station name's
+    /// deterministic identity (`packet::sender_address_u32`) matches when the
+    /// receiver knows no other identity for that address. A board behind a
+    /// relay may never have learned a station's address (it rebooted, or never
+    /// heard the station before it went out of reach); without this it
+    /// refused an RRLS takeover's commands while the relay accepted them.
+    ///
+    /// An address assigned to any name still decides alone, and if any other
+    /// name the receiver knows (address book or discovery) has the same
+    /// compact identity the match fails closed. Like every name match, this
+    /// is identification, not authentication. Does not allocate.
+    pub fn sender_matches_station(&self, sender: &str, station: &str) -> bool {
+        if sender.is_empty()
+            || station.is_empty()
+            || sender.contains('\0')
+            || station.contains('\0')
+            || station.starts_with("@addr:")
+        {
+            return false;
+        }
+        let Some(value) = sender.strip_prefix("@addr:") else {
+            return sender == station;
+        };
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(address) = value.parse::<u32>() else {
+            return false;
+        };
+        let state = self.state.lock();
+        if let Some(hostname) = state.address_by_value.get(&address) {
+            return hostname.as_str() == station;
+        }
+        sender_address_u32(station) == address
+            && !Self::other_name_has_address_locked(&state, address, station)
+    }
+
+    /// Whether a name other than `station` that this router knows (address
+    /// book or discovery, the names `hostname_for_address_borrowed_locked`
+    /// considers) has the compact identity `address`.
+    fn other_name_has_address_locked(st: &RouterInner, address: NodeAddress, station: &str) -> bool {
+        let other = |candidate: &str| candidate != station && sender_address_u32(candidate) == address;
+        if st.address_book.values().any(|entry| other(entry.hostname.as_ref())) {
+            return true;
+        }
+        #[cfg(feature = "discovery")]
+        for route in st.discovery_routes.values() {
+            for (announcer, state) in &route.announcers {
+                if other(announcer) {
+                    return true;
+                }
+                for board in state.topology_boards.iter() {
+                    if other(&board.sender_id) || board.connections.iter().any(|peer| other(peer)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn address_book(&self) -> Vec<AddressBookEntry> {
         self.state
             .lock()

@@ -223,3 +223,133 @@ fn an_owner_that_missed_every_retry_is_retired_not_the_stream() {
     }
     assert!(!pending.contains_key(&rr), "a silent owner is not owed new frames");
 }
+
+/// RRLS and GS share a radio bus with RF, which relays onto a CAN side where
+/// FC is. After the GS is cut and the RRLS forgets it (its takeover), a
+/// reliable frame from the RRLS to an FC endpoint must still reach FC through
+/// RF and FC's receipt must complete it at the RRLS.
+#[test]
+fn after_forgetting_the_primary_a_frame_still_reaches_a_board_behind_the_relay() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let ep = DataEndpoint::named("RADIO");
+    let ty = crate::config::register_data_type_with_description(
+        "FORGET_RELAY_WRITE",
+        "",
+        crate::MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[ep],
+        crate::ReliableMode::Unordered,
+        16,
+    )
+    .unwrap();
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = |n: &Arc<AtomicU64>| { let n = n.clone(); Box::new(move || n.load(Ordering::Relaxed)) as Box<dyn Clock + Send + Sync> };
+    let got = Arc::new(AtomicU32::new(0));
+    let g = got.clone();
+    let fc = Arc::new(Router::new_with_clock(
+        RouterConfig::new([EndpointHandler::new_packet_handler(ep, move |_| { g.fetch_add(1, Ordering::Relaxed); Ok(()) })]).with_sender("FC"),
+        clock(&now)));
+    let rf = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), clock(&now)));
+    let rrls = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RRLS"), clock(&now)));
+    let gs = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), clock(&now)));
+    // Frames in flight: (destination, side, bytes)
+    let air: Arc<Mutex<Vec<(Arc<Router>, RouterSideId, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let gs_up = Arc::new(AtomicBool::new(true));
+    // Side ids: rf 0 radio, 1 can; rrls 0 radio; gs 0 radio; fc 0 can.
+    let (a, f, g2, r2) = (air.clone(), fc.clone(), gs.clone(), rrls.clone());
+    let up = gs_up.clone();
+    rf.add_side_packed("radio", move |b| { let mut q = a.lock().unwrap(); q.push((r2.clone(), 0, b.to_vec())); if up.load(Ordering::Relaxed) { q.push((g2.clone(), 0, b.to_vec())); } Ok(()) });
+    let a = air.clone();
+    rf.add_side_packed("can", move |b| { a.lock().unwrap().push((f.clone(), 0, b.to_vec())); Ok(()) });
+    let (a, rfc, g3) = (air.clone(), rf.clone(), gs.clone());
+    let up = gs_up.clone();
+    rrls.add_side_packed("radio", move |b| { let mut q = a.lock().unwrap(); q.push((rfc.clone(), 0, b.to_vec())); if up.load(Ordering::Relaxed) { q.push((g3.clone(), 0, b.to_vec())); } Ok(()) });
+    let (a, rfc, r3) = (air.clone(), rf.clone(), rrls.clone());
+    let up = gs_up.clone();
+    gs.add_side_packed("radio", move |b| { if up.load(Ordering::Relaxed) { let mut q = a.lock().unwrap(); q.push((rfc.clone(), 0, b.to_vec())); q.push((r3.clone(), 0, b.to_vec())); } Ok(()) });
+    let (a, rfc) = (air.clone(), rf.clone());
+    fc.add_side_packed("can", move |b| { a.lock().unwrap().push((rfc.clone(), 1, b.to_vec())); Ok(()) });
+    let all = [fc.clone(), rf.clone(), rrls.clone(), gs.clone()];
+    let pump = |rounds: usize| {
+        for _ in 0..rounds {
+            for r in &all { r.process_all_queues().unwrap(); }
+            let batch: Vec<_> = air.lock().unwrap().drain(..).collect();
+            for (to, side, bytes) in batch { let _ = to.rx_packed_from_side(&bytes, side); }
+        }
+    };
+    for r in &all { r.announce_discovery().unwrap(); }
+    pump(20);
+    for r in &all { r.announce_discovery().unwrap(); }
+    pump(20);
+    let send = |ts: u64| {
+        rrls.tx(Packet::new(ty, &[ep], "RRLS", ts, Arc::<[u8]>::from([1u8])).unwrap()).unwrap();
+        pump(20);
+    };
+    send(2);
+    assert_eq!(got.load(Ordering::Relaxed), 1, "baseline: FC receives through RF");
+    assert!(rrls.export_reliable_pending_stats().is_empty(), "baseline: FC's receipt completes it");
+    gs_up.store(false, Ordering::Relaxed);
+    assert!(rrls.forget_peer("GS").is_ok());
+    send(3);
+    assert_eq!(got.load(Ordering::Relaxed), 2, "after forgetting the primary FC still receives");
+    assert!(rrls.export_reliable_pending_stats().is_empty(), "and its receipt still completes it");
+}
+
+/// fullnet C-fix2/Cshort: the primary forgot an idle (listening) RRLS when it
+/// went Offline, and later the FC behind RF refused the RRLS's takeover
+/// FLIGHT_STATE and FLIGHT_COMMAND (its handler-level refusal counter rose)
+/// while RF accepted them. The FC authorizes a station by resolving the
+/// frame's compact sender address to its hostname. Does the primary's forget
+/// make a board behind the relay lose the RRLS?
+#[test]
+fn a_board_behind_the_relay_keeps_resolving_a_peer_another_station_forgot() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = |n: &Arc<AtomicU64>| { let n = n.clone(); Box::new(move || n.load(Ordering::Relaxed)) as Box<dyn Clock + Send + Sync> };
+    let fc = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("FC"), clock(&now)));
+    let rf = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), clock(&now)));
+    let rrls = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RRLS"), clock(&now)));
+    let gs = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), clock(&now)));
+    let air: Arc<Mutex<Vec<(Arc<Router>, RouterSideId, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let radio = [rf.clone(), rrls.clone(), gs.clone()];
+    for (me, side) in [(rf.clone(), 0usize), (rrls.clone(), 0), (gs.clone(), 0)] {
+        let (a, peers) = (air.clone(), radio.clone());
+        let mine = me.clone();
+        me.add_side_packed("radio", move |b| {
+            let mut q = a.lock().unwrap();
+            for p in &peers { if !Arc::ptr_eq(p, &mine) { q.push((p.clone(), 0, b.to_vec())); } }
+            Ok(())
+        });
+        let _ = side;
+    }
+    let (a, f) = (air.clone(), fc.clone());
+    rf.add_side_packed("can", move |b| { a.lock().unwrap().push((f.clone(), 0, b.to_vec())); Ok(()) });
+    let (a, r) = (air.clone(), rf.clone());
+    fc.add_side_packed("can", move |b| { a.lock().unwrap().push((r.clone(), 1, b.to_vec())); Ok(()) });
+    let all = [fc.clone(), rf.clone(), rrls.clone(), gs.clone()];
+    let pump = |rounds: usize| {
+        for _ in 0..rounds {
+            for r in &all { r.process_all_queues().unwrap(); }
+            let batch: Vec<_> = air.lock().unwrap().drain(..).collect();
+            for (to, side, bytes) in batch { let _ = to.rx_packed_from_side(&bytes, side); }
+        }
+    };
+    for _ in 0..2 {
+        for r in &all { r.announce_discovery().unwrap(); }
+        pump(20);
+    }
+    // What the RRLS's frames carry as their source (seen on air: the name's identity).
+    let rrls_sender = format!("@addr:{}", crate::packet::sender_address_u32("RRLS"));
+    assert!(rf.sender_matches_hostname(&rrls_sender, "RRLS"), "RF resolves the RRLS");
+    assert!(fc.sender_matches_hostname(&rrls_sender, "RRLS"), "FC resolves the RRLS through RF");
+    // The primary decides the RRLS is out of range and forgets it, then keeps announcing.
+    gs.forget_peer("RRLS").unwrap();
+    now.fetch_add(1_000, Ordering::Relaxed);
+    for r in [&gs, &rf] { r.announce_discovery().unwrap(); }
+    pump(20);
+    assert!(rf.sender_matches_hostname(&rrls_sender, "RRLS"), "RF still resolves the RRLS");
+    assert!(fc.sender_matches_hostname(&rrls_sender, "RRLS"), "FC still resolves the RRLS after the primary forgot it");
+}

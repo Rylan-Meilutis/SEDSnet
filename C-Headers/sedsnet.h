@@ -502,6 +502,16 @@ SedsResult seds_router_configure_address(SedsRouter * r,
 bool seds_router_sender_matches_hostname(const SedsRouter *r,
                                           const char *sender, size_t sender_len,
                                           const char *expected_hostname, size_t hostname_len);
+/** Match counted UTF-8 packet sender identity to a fixed station name ("GS",
+ * "RRLS") a receiver checks by literal name. As seds_router_sender_matches_hostname,
+ * plus: a compact sender equal to the station name's deterministic identity
+ * matches when the receiver knows no other identity for that address (a board
+ * that never learned the station's address). An assigned address still decides
+ * alone, and a compact collision with any other known name fails closed.
+ * Does not authenticate packets. Does not allocate. */
+bool seds_router_sender_matches_station(const SedsRouter *r,
+                                         const char *sender, size_t sender_len,
+                                         const char *station, size_t station_len);
 SedsResult seds_router_resolve_hostname_address(SedsRouter * r,
                                                 const char * hostname,
                                                 size_t hostname_len,
