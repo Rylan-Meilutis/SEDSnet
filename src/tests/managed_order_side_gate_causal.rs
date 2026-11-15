@@ -646,8 +646,10 @@ fn packed_local_origin_is_numeric_crc_checked_and_foreign_inert() {
     assert_eq!(sender_address_u32(&alias), sender_address_u32(p.sender()));
     let foreign = Packet::new(f.ty, &[f.ep], "foreign-audit", p.timestamp(), Arc::<[u8]>::from([3])).unwrap();
     assert!(!f.writer.local_ordered_candidate(&RouterItem::Packed(crate::shared_bytes::convert(wire_format::pack_packet(&foreign))), f.ty).unwrap());
+    // A corrupted local-origin frame is refused where it enters the router;
+    // the ordering predicate only ever sees admitted frames.
     let mut corrupt = wire.to_vec(); *corrupt.last_mut().unwrap() ^= 1;
-    assert!(f.writer.local_ordered_candidate(&RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(corrupt))), f.ty).is_err());
+    assert!(matches!(f.writer.tx_packed(Arc::<[u8]>::from(corrupt)), Err(TelemetryError::Unpack("crc32 mismatch"))));
     // Public packed owner path and actual second-router delivery, not predicate alone.
     let id = p.packet_id(); f.writer.tx_packed(wire).unwrap(); f.drain();
     assert_eq!(f.finish("packed_numeric", &[id]), vec![id]);

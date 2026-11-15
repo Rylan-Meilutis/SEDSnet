@@ -10,8 +10,11 @@ fn lost_chunk_cannot_poison_later_frames_from_same_router() {
     let rf = Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), Box::new(|| 0));
     let fc = Router::new_with_clock(RouterConfig::new([]).with_sender("FC"), Box::new(|| 0));
     let side = fc.add_side_packed_with_options("CAN", |_| Ok(()), RouterSideOptions::default());
-    let first = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 180]);
-    let second = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 180]);
+    // Real frames: a reassembled FULL body is CRC-checked as it enters.
+    let body_a = crate::tests::canonical_frame_with_payload(160, 1);
+    let body_b = crate::tests::canonical_frame_with_payload(160, 2);
+    let first = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body_a);
+    let second = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body_b);
     // CRC including the appended CRC has a constant residue: it is NOT an ID.
     assert_eq!(
         crate::side_transport::crc32_bytes(&first),
@@ -40,7 +43,7 @@ fn lost_chunk_cannot_poison_later_frames_from_same_router() {
     for frame in b {
         result = fc.decode_side_transport_frame(side, &frame).unwrap();
     }
-    assert_eq!(result.unwrap().as_ref(), &[2; 180]);
+    assert_eq!(result.unwrap().as_ref(), body_b.as_ref());
 }
 
 #[test]

@@ -110,6 +110,37 @@ fn get_handler(rx_count_c: Arc<AtomicUsize>) -> EndpointHandler {
     })
 }
 
+/// A valid canonical frame carrying `payload` incompressible bytes derived
+/// from `fill`. Side ingress verifies a frame's CRC, so transport tests that
+/// need a large frame use a real one rather than filler bytes.
+pub(crate) fn canonical_frame_with_payload(payload: usize, fill: u8) -> Arc<[u8]> {
+    ensure_common_test_schema();
+    let ep = DataEndpoint::try_named("SD_CARD").unwrap();
+    let name = format!("TEST_CANONICAL_BYTES_{payload}");
+    let ty = DataType::try_named(&name).unwrap_or_else(|| {
+        crate::config::register_data_type_with_description(
+            &name,
+            "",
+            crate::MessageElement::Static(payload, MessageDataType::UInt8, crate::MessageClass::Data),
+            &[ep],
+            crate::ReliableMode::None,
+            0,
+        )
+        .unwrap_or_else(|e| DataType::try_named(&name).unwrap_or_else(|| panic!("register {name}: {e:?}")))
+    });
+    let mut seed = 0x9E37_79B9u32 ^ u32::from(fill);
+    let bytes: Vec<u8> = (0..payload)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let packet = Packet::new(ty, &[ep], "TEST", 1, Arc::from(bytes)).unwrap();
+    crate::wire_format::pack_packet(&packet)
+}
+
 pub(crate) fn packed_frame_type(bytes: &[u8]) -> Option<DataType> {
     crate::wire_format::peek_envelope(bytes)
         .ok()
