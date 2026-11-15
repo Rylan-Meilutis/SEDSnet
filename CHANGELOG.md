@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 5.0.0
+
+**Breaking wire changes (time sync and compact bundles).** SEDSnet 4.x and
+5.x nodes do not interoperate: the GS, RRLS and every board update together.
+Time sync uses the same words differently (frames do not grow), and sides
+opened with `SideOptions::compact_bundle` carry compact bundles with no
+negotiation or fallback. Message schemas, and the framing of sides without
+that option, keep their 4.3.14 representations.
 
 - Ask a side for topology as soon as data is heard there from a sender that no
   fresh announcer or topology describes (its route aged out during a cut
@@ -17,15 +24,34 @@
   endpoints once its topology arrives (combined round R2-C: RF addressed its
   Abort push and its readback reply to the RRLS alone for 5.4 s after a
   takeover ended).
-
-## 5.0.0
-
-**Breaking wire changes (time sync and compact bundles).** SEDSnet 4.x and
-5.x nodes do not interoperate: the GS, RRLS and every board update together.
-Time sync uses the same words differently (frames do not grow), and sides
-opened with `SideOptions::compact_bundle` carry compact bundles with no
-negotiation or fallback. Message schemas, and the framing of sides without
-that option, keep their 4.3.14 representations.
+- A segment proxy acknowledges upstream as soon as it accepts a write and owns
+  the downstream delivery as its own contract (own retries, exhaustion and
+  silent-owner retirement). A silent or lost downstream owner is the proxy's
+  failure, no longer the publisher's. A duplicate that arrives on a side other
+  than the first copy's is receipted back on the side it came from, so a
+  local owner in a cycle (GS - umbilical - FC - CAN - RF - radio - GS)
+  answers the relay that forwarded it.
+- `sender_matches_station` / `seds_router_sender_matches_station`: matches a
+  fixed station name a board checks by its deterministic compact identity
+  when the receiver never learned that address, and refuses when the compact
+  value collides with any other name the receiver knows.
+  `sender_matches_hostname` is unchanged and still fails closed.
+- A writer router answers network-variable requests, replays to new owners
+  and re-sends only its own last write (`own_network_variable`), never a
+  report it received from another node.
+- `side_peek::SideFramePeeker` and `peek_side_frame_type` classify a packed
+  side's frames (canonical, FULL, compact, chunk) with their type and
+  reliable flags, for egress filters and priority classifiers.
+- Reliable deliveries that run out of retries are counted for Ordered and
+  Unordered types, end-to-end and per hop (`reliable.exhausted`, C and Python
+  runtime-stats JSON); std builds keep the last 8 for
+  `take_exhausted_reliable`. Unordered exhaustion still returns no error.
+- Time sync frequency uncertainty is bounded by the learned rate plus 1%
+  instead of a flat 1%; a follower whose newest sample came from an unsynced
+  source widens its holdover the same way, and a source bound above 1 s
+  passes through whole. `timesync_status` is a pure read. Under 50% loss the
+  reported bound now covers the real error in every state, Acquiring
+  included.
 
 - Add `wire_bundle` (feature `compact-bundle`: on by default for std builds,
   opt-in for `embedded`; CMake `SEDSNET_COMPACT_BUNDLE`). A bundle carries
