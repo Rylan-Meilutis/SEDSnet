@@ -71,10 +71,18 @@ thread_local! {
     pub(crate) static PATH_DESCRIBED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// RF's radio stamps taken this much too early (ms): (t1 transmit, t4 receive).
     pub(crate) static RF_STAMP_EARLY_MS: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+    /// FC's CAN stamps taken this much too early (ms): (t1 transmit, t4 receive),
+    /// and the stamping uncertainty FC describes for its CAN side (ms, 0: none).
+    pub(crate) static FC_CAN_STAMP_EARLY_MS: std::cell::Cell<(f64, f64, f64)> = const { std::cell::Cell::new((0.0, 0.0, 0.0)) };
 }
+const FC: usize = 2;
 
 /// RF radio stamp at local `ns`, moved early (negative: late) by the bias.
 fn rf_stamp(node: usize, radio: bool, receive: bool, ns: u64) -> u64 {
+    if node == FC && !radio {
+        let (t1, t4, _) = FC_CAN_STAMP_EARLY_MS.with(|e| e.get());
+        return (ns as i64 - ((if receive { t4 } else { t1 }) * 1e6) as i64) as u64;
+    }
     if node != RF || !radio {
         return ns;
     }
@@ -136,6 +144,10 @@ impl Net {
         // path after the stamps plus 20 B of air framing (a true lower bound).
         let min_ns = ((link.base_ms + 20.0 / 8.0) * 1e6) as u32;
         net.nodes[RF].set_side_timesync_min_delay(net.sides[1].1, min_ns);
+        let fc_can_stamp_ms = FC_CAN_STAMP_EARLY_MS.with(|e| e.get()).2;
+        if fc_can_stamp_ms > 0.0 {
+            net.nodes[FC].set_side_timesync_stamp_uncertainty(net.sides[3].1, (fc_can_stamp_ms * 1e6) as u32);
+        }
         net
     }
 
@@ -401,6 +413,56 @@ fn assert_honest_with_rf_stamps_early(t1_ms: f64, t4_ms: f64) -> u64 {
     RF_STAMP_EARLY_MS.with(|e| e.set((0.0, 0.0)));
     assert!(failures.is_empty(), "synced with a bound below the real error: {failures:?}");
     rejects
+}
+
+/// A downstream board inherits an honest bound from a biased upstream: RF's
+/// receive stamp early by 6..20 ms (small enough that RF may still lock on a
+/// widened bound), FC and PB syncing to RF over CAN. Neither may report itself
+/// synced with a bound below its real error, and the propagation is
+/// exercised: they do lock on RF's (honest, wider) bound.
+#[test]
+fn radio_sim_downstream_inherits_honest_bound_from_biased_rf() {
+    let mut downstream_synced = 0;
+    for t4_ms in [6.0, 12.0, 20.0] {
+        RF_STAMP_EARLY_MS.with(|e| e.set((0.0, t4_ms)));
+        let mut failures = Vec::new();
+        for (label, link) in [("0%", CLEAN), ("30%", LOSSY)] {
+            for seed in [0x5eed, 0x9e37_79b9, 7] {
+                let (res, rejects) = synced_with_short_bound(link, 300, seed);
+                println!("RF t4 early {t4_ms} ms, {label} seed {seed}: {res:?}, RF sub-minimum rejects {rejects}");
+                downstream_synced += res[1].2 + res[2].2;
+                if res.iter().any(|r| r.1 != 0) {
+                    failures.push((t4_ms, label, seed, res));
+                }
+            }
+        }
+        RF_STAMP_EARLY_MS.with(|e| e.set((0.0, 0.0)));
+        assert!(failures.is_empty(), "synced with a bound below the real error: {failures:?}");
+    }
+    assert!(downstream_synced > 0, "FC/PB never locked: the propagation was not exercised");
+}
+
+/// FC's own CAN stamps off: early by 0.5 ms within the stamping uncertainty
+/// FC describes for its CAN side (the bound must carry it), and by 1.5 ms
+/// and 5 ms with nothing described (a round trip shorter than the turnaround
+/// or than zero proves the stamp wrong; it must not tighten the bound).
+#[test]
+fn radio_sim_can_leg_stamp_error_stays_honest() {
+    for (t4_ms, described_ms) in [(0.5, 0.5), (1.5, 0.0), (5.0, 0.0)] {
+        FC_CAN_STAMP_EARLY_MS.with(|e| e.set((0.0, t4_ms, described_ms)));
+        let mut failures = Vec::new();
+        for (label, link) in [("0%", CLEAN), ("30%", LOSSY)] {
+            for seed in [0x5eed, 0x9e37_79b9, 7] {
+                let (res, _) = synced_with_short_bound(link, 300, seed);
+                println!("FC CAN t4 early {t4_ms} ms (described {described_ms} ms), {label} seed {seed}: {res:?}");
+                if res.iter().any(|r| r.1 != 0) {
+                    failures.push((t4_ms, label, seed, res));
+                }
+            }
+        }
+        FC_CAN_STAMP_EARLY_MS.with(|e| e.set((0.0, 0.0, 0.0)));
+        assert!(failures.is_empty(), "synced with a bound below the real error: {failures:?}");
+    }
 }
 
 /// RF's transmit stamp (t1) 38 ms early: the round trip looks 38 ms longer
