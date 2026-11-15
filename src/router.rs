@@ -17688,7 +17688,10 @@ impl Router {
 
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
         let now_ms = self.clock.now_ms();
+        #[cfg(feature = "timesync")]
         let timesync_sub_minimum_rejects = self.timesync_sub_minimum_rejects();
+        #[cfg(not(feature = "timesync"))]
+        let timesync_sub_minimum_rejects = 0;
         let isr_rx = self
             .isr_rx_queue
             .as_ref()
