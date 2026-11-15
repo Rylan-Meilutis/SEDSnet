@@ -549,3 +549,41 @@ fn radio_sim_sweep() {
     PATH_DESCRIBED.with(|d| d.set(true));
     assert_eq!(worst_violations, 0);
 }
+
+/// 50% loss each way, seed 11: an early fit on lossy samples learns a rate
+/// near 2% while the true one is -0.016%. Every reported bound, Acquiring
+/// included, must cover the real error from boot: the frequency uncertainty
+/// may not be capped below the rate the fit could be wrong by.
+#[test]
+fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
+    let stats = run(RadioLink { loss: 0.5, ..LOSSY }, 0, 420, 11 * 0x9e37_79b9);
+    report("50% seed 11", &stats);
+    for s in &stats {
+        assert_eq!(s.bound_violations, 0, "{s:?}");
+    }
+}
+
+/// Reading the time sync status is an observation: a network whose boards'
+/// status is read every 100 ms follows exactly the same trajectory as one
+/// whose status is never read.
+#[test]
+fn reading_timesync_status_does_not_change_the_trajectory() {
+    for (link, seed) in [(RadioLink { loss: 0.5, ..LOSSY }, 6 * 0x9e37_79b9), (LOSSY, 0x5eed)] {
+        let mut watched = Net::new(link, seed);
+        let mut quiet = Net::new(link, seed);
+        for i in 0..240_000u64 {
+            watched.step();
+            quiet.step();
+            if i % 100 == 0 {
+                for node in 1..NODES.len() {
+                    let _ = watched.nodes[node].timesync_status();
+                }
+            }
+            if i % 10_000 == 0 {
+                for node in 1..NODES.len() {
+                    assert_eq!(watched.error_ns(node), quiet.error_ns(node), "node {node} diverged at {} s", i / 1_000);
+                }
+            }
+        }
+    }
+}
