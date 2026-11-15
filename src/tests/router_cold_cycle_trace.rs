@@ -1214,12 +1214,28 @@ fn cycle_compact_positive_parked_owner_and_receipt_scans_stay_unpinned() {
     let id = packet.packet_id();
     f.routers[0].set_network_variable(packet).unwrap();
     f.pump(100, 20);
+    // A segment proxy acknowledges on acceptance and owns delivery behind it,
+    // so a router whose segment completed holds no record. The proxy (1),
+    // still owed over the held back edge, and the cycle's far router (3), whose
+    // record is the duplicate input below, both still own one.
+    for index in [1, 3] {
+        assert!(
+            f.routers[index]
+                .state
+                .lock()
+                .end_to_end_reliable_tx
+                .contains_key(&id),
+            "router {index} still owns its segment's delivery"
+        );
+    }
     // Move actual retained canonical owner bytes into the configured arena. The
     // bytes, frozen recipients and ownership maps stay exact; this gives a
     // positive witness even when automatic parking thresholds differ by profile.
     for router in &f.routers[0..4] {
         let mut st = router.state.lock();
-        let owner = st.end_to_end_reliable_tx.get_mut(&id).unwrap();
+        let Some(owner) = st.end_to_end_reliable_tx.get_mut(&id) else {
+            continue;
+        };
         if let super::RouterItem::Packed(bytes) = &mut owner.data {
             let handle = crate::shared_bytes::with_slice(bytes, |view| store.store(view))
                 .unwrap()

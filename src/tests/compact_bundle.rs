@@ -251,6 +251,8 @@ fn with_table() {
 }
 
 fn ack_and_battery_frames() -> Vec<Vec<u8>> {
+    // Run alone (one process per test), RADIO is known only once registered.
+    crate::tests::ensure_common_test_schema();
     let ts0 = 1_767_225_607_518u64;
     let gs = Router::sender_hash("GS");
     let pb = Router::sender_hash("PB");
