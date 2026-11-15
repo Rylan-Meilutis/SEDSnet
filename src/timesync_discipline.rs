@@ -149,6 +149,9 @@ pub struct DisciplineSample {
     /// stamping uncertainty), ns: the phase is off by at most this beyond the
     /// path term, since stamps that shorten the round trip hide path excess.
     pub stamp_error_ns: u32,
+    /// The source was not synced when it answered: its clock's rate is
+    /// unproven, and the follower's fit follows that rate.
+    pub source_unsynced: bool,
 }
 
 /// Builds a sample from the four exchange stamps.
@@ -201,6 +204,7 @@ pub fn exchange_sample(
         source_error_ns: source_error_ns.min(u64::from(u32::MAX)) as u32,
         min_half_delay_ns: 0,
         stamp_error_ns: 0,
+        source_unsynced: false,
     })
 }
 
@@ -498,7 +502,11 @@ impl ClockDiscipline {
                 // slope in us per ms = 1e-3 -> ppb = slope * 1e6
                 self.rate_ppb = ratio_e6(sxy, sxx).clamp(-TIMESYNC_MAX_RATE_PPB, TIMESYNC_MAX_RATE_PPB);
                 // Worst case over |error_i| <= sigma_i.
-                self.freq_uncertainty_ppb = ratio_e6(sxe, sxx).clamp(0, 10_000_000) as u64;
+                // The true frequency error is within 1% (HSI), so the
+                // estimate is off by at most its own size plus 1%: a cap
+                // below that (a flat 1%) understated a wild early fit.
+                self.freq_uncertainty_ppb =
+                    ratio_e6(sxe, sxx).clamp(0, self.rate_ppb.saturating_abs().saturating_add(10_000_000)) as u64;
             }
         }
         // Phase at the newest sample on the fitted (or kept) frequency, and
@@ -553,7 +561,20 @@ impl ClockDiscipline {
             return None;
         }
         let age = now_mono_ns.saturating_sub(self.fit_mono_ns) / 1_000; // us
-        let wander = age.saturating_mul(self.freq_uncertainty_ppb + TIMESYNC_DRIFT_ALLOWANCE_PPB)
+        // Following an unsynced source, the fitted rate is the source's,
+        // whose own error is unknown: up to the rate itself plus 1% (HSI).
+        let source_unsynced = self
+            .samples()
+            .iter()
+            .max_by_key(|s| s.mono_ns)
+            .is_some_and(|s| s.source_unsynced);
+        let source_rate_ppb = if source_unsynced {
+            self.rate_ppb.unsigned_abs().saturating_add(10_000_000)
+        } else {
+            0
+        };
+        let wander = age
+            .saturating_mul(self.freq_uncertainty_ppb + TIMESYNC_DRIFT_ALLOWANCE_PPB + source_rate_ppb)
             / 1_000_000;
         Some(self.fit_error_ns.saturating_add(wander))
     }
@@ -563,6 +584,16 @@ impl ClockDiscipline {
     /// `source_live` is false while no source is elected (holdover).
     /// `pending_ns` is the correction the clock has not slewed out yet.
     pub fn quality(&mut self, now_mono_ns: u64, source_live: bool, pending_ns: u64) -> (SyncState, u64) {
+        let (state, bound) = self.peek_quality(now_mono_ns, source_live, pending_ns);
+        if state != SyncState::Unsynced {
+            self.was_locked = state.is_synced();
+        }
+        (state, bound)
+    }
+
+    /// [`Self::quality`] without updating the lock hysteresis: what a status
+    /// read reports. Only the node's own periodic evaluation commits it.
+    pub fn peek_quality(&self, now_mono_ns: u64, source_live: bool, pending_ns: u64) -> (SyncState, u64) {
         let Some(bound) = self.error_bound_ns(now_mono_ns) else {
             return (SyncState::Unsynced, u64::MAX);
         };
@@ -573,7 +604,6 @@ impl ClockDiscipline {
             TIMESYNC_LOCK_THRESHOLD_NS
         };
         let locked = self.accepted >= MIN_LOCK_SAMPLES && bound <= threshold;
-        self.was_locked = locked;
         let state = match (locked, source_live) {
             (true, true) => SyncState::Locked,
             (true, false) => SyncState::Holdover,

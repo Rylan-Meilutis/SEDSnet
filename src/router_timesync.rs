@@ -731,8 +731,10 @@ impl Router {
         };
         let rate = st.disciplined_clock.rate_ppb();
         let sample = {
-        let (t2_us, _synced, code) = decode_v2_receive_word(t2);
-        let source_error_ns = decode_error_code(code).min(UNKNOWN_SOURCE_ERROR_NS);
+        let (t2_us, source_synced, code) = decode_v2_receive_word(t2);
+        // A known bound passes through whole (a source more than 1 s off
+        // says so); only an unknown one (code 127) stands in as 1 s.
+        let source_error_ns = if code == 127 { UNKNOWN_SOURCE_ERROR_NS } else { decode_error_code(code) };
         {
             let ex = &mut st.v2.exchanges[idx];
             ex.answered = true;
@@ -772,6 +774,7 @@ impl Router {
             exchange_sample(ex.t1_ns, t2_ns, t3_ns, ex.t4_ns, ex.source_error_ns, asymmetry, rate).map(|mut sample| {
                 sample.min_half_delay_ns = (min_round_trip / 2).min(u64::from(sample.half_delay_ns)) as u32;
                 sample.stamp_error_ns = stamp_ns;
+                sample.source_unsynced = !source_synced;
                 Ok(sample)
             })
         })
@@ -833,12 +836,35 @@ impl Router {
         st.clock_anchored = anchored;
     }
 
-    /// Quality of this node's network time.
+    /// Quality of this node's network time, committing the lock hysteresis
+    /// (the node's own periodic evaluation and the responses it serves).
     pub(super) fn timesync_status_locked(
         st: &mut TimeSyncRuntime,
         leader: Option<&TimeSyncLeader>,
         now_mono_ns: u64,
     ) -> TimeSyncStatus {
+        let (status, discipline_evaluated) = Self::timesync_status_peek_locked(st, leader, now_mono_ns);
+        if discipline_evaluated {
+            let pending = st.disciplined_clock.pending_ns(now_mono_ns);
+            let live = matches!(leader, Some(TimeSyncLeader::Remote(_)));
+            let _ = st.v2.discipline.quality(now_mono_ns, live, pending);
+        }
+        if matches!(leader, Some(TimeSyncLeader::Remote(_))) {
+            st.v2.stratum = status.stratum;
+        }
+        st.v2.locked = status.state.is_synced();
+        st.v2.ever_locked |= st.v2.locked;
+        status
+    }
+
+    /// Quality of this node's network time without changing any state, and
+    /// whether the discipline's quality was evaluated (its hysteresis is what
+    /// [`Self::timesync_status_locked`] commits).
+    fn timesync_status_peek_locked(
+        st: &TimeSyncRuntime,
+        leader: Option<&TimeSyncLeader>,
+        now_mono_ns: u64,
+    ) -> (TimeSyncStatus, bool) {
         let pending = st.disciplined_clock.pending_ns(now_mono_ns);
         let offset_ns = st.disciplined_clock.pending_signed_ns(now_mono_ns);
         let rate_ppb = st.disciplined_clock.rate_ppb();
@@ -848,18 +874,21 @@ impl Router {
             .newest_mono_ns()
             .map_or(u64::MAX, |m| now_mono_ns.saturating_sub(m) / 1_000_000);
         let local_reference = st.v2.local_reference;
+        let mut evaluated = false;
         let (state, error_bound_ns, stratum, is_reference) = match leader {
             Some(TimeSyncLeader::Local { .. }) if local_reference => {
                 (SyncState::Locked, pending, 0, true)
             }
             Some(TimeSyncLeader::Local { .. }) => {
-                let (state, bound) = st.v2.discipline.quality(now_mono_ns, false, pending);
+                evaluated = true;
+                let (state, bound) = st.v2.discipline.peek_quality(now_mono_ns, false, pending);
                 (state, bound, st.v2.stratum, true)
             }
             Some(TimeSyncLeader::Remote(remote)) => {
                 let stratum = remote.quality().stratum.saturating_add(1);
                 if st.v2.has_samples_from(&remote.sender) {
-                    let (state, bound) = st.v2.discipline.quality(now_mono_ns, true, pending);
+                    evaluated = true;
+                    let (state, bound) = st.v2.discipline.peek_quality(now_mono_ns, true, pending);
                     (state, bound, stratum, false)
                 } else if st.disciplined_clock.is_initialized() {
                     (SyncState::Acquiring, u64::MAX, stratum, false)
@@ -868,25 +897,16 @@ impl Router {
                 }
             }
             None if !st.v2.discipline.is_empty() => {
-                let (state, bound) = st.v2.discipline.quality(now_mono_ns, false, pending);
+                evaluated = true;
+                let (state, bound) = st.v2.discipline.peek_quality(now_mono_ns, false, pending);
                 (state, bound, st.v2.stratum, false)
             }
             None => (SyncState::Unsynced, u64::MAX, 0, false),
         };
-        if matches!(leader, Some(TimeSyncLeader::Remote(_))) {
-            st.v2.stratum = stratum;
-        }
-        st.v2.locked = state.is_synced();
-        st.v2.ever_locked |= st.v2.locked;
-        TimeSyncStatus {
-            state,
-            stratum,
-            error_bound_ns,
-            offset_ns,
-            rate_ppb,
-            last_sample_age_ms,
-            is_reference,
-        }
+        (
+            TimeSyncStatus { state, stratum, error_bound_ns, offset_ns, rate_ppb, last_sample_age_ms, is_reference },
+            evaluated,
+        )
     }
 
     /// Time sync exchanges rejected because their round trip measured below
@@ -897,16 +917,19 @@ impl Router {
 
     /// Current time sync quality: lock state, error bound, pending offset and
     /// learned frequency. `None` when time sync is not configured.
+    ///
+    /// A read only: it changes no state (the lock hysteresis is committed by
+    /// the node's own periodic evaluation), so observing a node never changes
+    /// what it does.
     pub fn timesync_status(&self) -> Option<TimeSyncStatus> {
         let runtime = self.timesync.as_ref()?;
         let now_ms = self.monotonic_now_ms();
-        self.refresh_timesync_state(now_ms);
         let now_ns = self.monotonic_now_ns();
-        let mut st = runtime.lock();
+        let st = runtime.lock();
         st.cfg?;
         let has_usable_time = Self::timesync_has_usable_time_locked(&st, now_ns);
         let leader = st.tracker.as_ref().and_then(|t| t.leader(now_ms, has_usable_time));
-        Some(Self::timesync_status_locked(&mut st, leader.as_ref(), now_ns))
+        Some(Self::timesync_status_peek_locked(&st, leader.as_ref(), now_ns).0)
     }
 
     /// Coarse-sets this node's network time to `unix_ns` at once (a step, not a

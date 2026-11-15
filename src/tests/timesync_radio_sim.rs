@@ -565,24 +565,49 @@ fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
 
 /// Reading the time sync status is an observation: a network whose boards'
 /// status is read every 100 ms follows exactly the same trajectory as one
-/// whose status is never read.
+/// whose status is never read. Each trajectory runs in a fresh process
+/// (the packet nonce counter is process-global, so nets sharing a process
+/// diverge whatever they read).
 #[test]
 fn reading_timesync_status_does_not_change_the_trajectory() {
+    let run = |read: bool| {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::timesync_radio_sim::timesync_trajectory_probe", "--nocapture", "--test-threads=1"])
+            .env("TRAJECTORY_READ_STATUS", if read { "1" } else { "0" })
+            .output()
+            .expect("run trajectory probe");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let lines: Vec<String> = text.lines().filter(|l| l.starts_with("TRAJ ")).map(String::from).collect();
+        assert!(lines.len() > 20, "probe produced no trajectory: {text}");
+        lines
+    };
+    let quiet = run(false);
+    let watched = run(true);
+    for (q, w) in quiet.iter().zip(&watched) {
+        assert_eq!(q, w);
+    }
+    assert_eq!(quiet.len(), watched.len());
+}
+
+/// Helper for [`reading_timesync_status_does_not_change_the_trajectory`]:
+/// prints each board's clock error every 10 s, reading every board's status
+/// every 100 ms when `TRAJECTORY_READ_STATUS=1`.
+#[test]
+#[ignore = "run by reading_timesync_status_does_not_change_the_trajectory"]
+fn timesync_trajectory_probe() {
+    let read = std::env::var("TRAJECTORY_READ_STATUS").is_ok_and(|v| v == "1");
     for (link, seed) in [(RadioLink { loss: 0.5, ..LOSSY }, 6 * 0x9e37_79b9), (LOSSY, 0x5eed)] {
-        let mut watched = Net::new(link, seed);
-        let mut quiet = Net::new(link, seed);
+        let mut net = Net::new(link, seed);
         for i in 0..240_000u64 {
-            watched.step();
-            quiet.step();
-            if i % 100 == 0 {
+            net.step();
+            if read && i % 100 == 0 {
                 for node in 1..NODES.len() {
-                    let _ = watched.nodes[node].timesync_status();
+                    let _ = net.nodes[node].timesync_status();
                 }
             }
             if i % 10_000 == 0 {
-                for node in 1..NODES.len() {
-                    assert_eq!(watched.error_ns(node), quiet.error_ns(node), "node {node} diverged at {} s", i / 1_000);
-                }
+                let errs: Vec<_> = (1..NODES.len()).map(|n| net.error_ns(n)).collect();
+                println!("TRAJ {seed} {i} {errs:?}");
             }
         }
     }
