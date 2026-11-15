@@ -1217,8 +1217,8 @@ fn cycle_compact_positive_parked_owner_and_receipt_scans_stay_unpinned() {
     // Move actual retained canonical owner bytes into the configured arena. The
     // bytes, frozen recipients and ownership maps stay exact; this gives a
     // positive witness even when automatic parking thresholds differ by profile.
-    for node in 0..4 {
-        let mut st = f.routers[node].state.lock();
+    for router in &f.routers[0..4] {
+        let mut st = router.state.lock();
         let owner = st.end_to_end_reliable_tx.get_mut(&id).unwrap();
         if let super::RouterItem::Packed(bytes) = &mut owner.data {
             let handle = crate::shared_bytes::with_slice(bytes, |view| store.store(view))

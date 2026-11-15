@@ -91,11 +91,14 @@ fn rf_stamp(node: usize, radio: bool, receive: bool, ns: u64) -> u64 {
 }
 const RF: usize = 1;
 
+/// (node, side, radio, outbox)
+type Side = (usize, RouterSideId, bool, Arc<Mutex<Vec<Vec<u8>>>>);
+
 struct Net {
     now: Arc<AtomicU64>,
     nodes: Vec<Router>,
     /// (node, side) of every side; outbox per side.
-    sides: Vec<(usize, RouterSideId, bool, Arc<Mutex<Vec<Vec<u8>>>>)>,
+    sides: Vec<Side>,
     /// In flight: (arrival true ns, to side index, bytes).
     flight: Vec<(u64, usize, Vec<u8>)>,
     rng: Rng,
@@ -601,8 +604,8 @@ fn timesync_trajectory_probe() {
         for i in 0..240_000u64 {
             net.step();
             if read && i % 100 == 0 {
-                for node in 1..NODES.len() {
-                    let _ = net.nodes[node].timesync_status();
+                for node in &net.nodes[1..NODES.len()] {
+                    let _ = node.timesync_status();
                 }
             }
             if i % 10_000 == 0 {

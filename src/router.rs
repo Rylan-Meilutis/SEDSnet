@@ -2832,7 +2832,9 @@ struct ForwardedReceiptCache {
 /// A relay answers a duplicate whose every owner already acknowledged at most
 /// this many times per packet, once per reliable retransmit interval, with at
 /// most `FORWARDED_RECEIPT_REPLAY_OWNERS` cached receipts each time.
+#[cfg(feature = "discovery")]
 const FORWARDED_RECEIPT_REPLAY_MAX: u8 = 4;
+#[cfg(feature = "discovery")]
 const FORWARDED_RECEIPT_REPLAY_OWNERS: usize = 4;
 
 // A send leaf borrows proof of the existing side gate; it never re-enters it.
@@ -7512,7 +7514,7 @@ impl Router {
     /// An urgent-class item (see [`crate::set_type_scheduling_class`]) or any
     /// type named `ABORT`.
     fn is_urgent_item(data: &RouterItem) -> bool {
-        Self::item_data_type(data).is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT")
+        Self::item_data_type(data).is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT")
     }
 
     // Select at most one in-flight packet per ordered type. Waiting messages
@@ -7533,7 +7535,7 @@ impl Router {
                 Some(sent) => Self::item_data_type(&sent.data)?,
             }
         };
-        if crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT" {
+        if crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT" {
             return Err(TelemetryError::PermissionDenied);
         }
         let removed = self
@@ -11174,11 +11176,9 @@ impl Router {
                 if heard.is_some_and(|(name, at)| {
                     now_ms.saturating_sub(at) > DISCOVERY_ROUTE_TTL_MS
                         || Self::sender_described_locked(&st, side, name, now_ms)
-                }) {
-                    if let Some((_, h)) = st.discovery_heard.iter_mut().find(|(s, _)| *s == side) {
-                        h.undescribed = None;
-                        h.heard_requests = 0;
-                    }
+                }) && let Some((_, h)) = st.discovery_heard.iter_mut().find(|(s, _)| *s == side) {
+                    h.undescribed = None;
+                    h.heard_requests = 0;
                 }
                 let missing = heard_missing || st.discovery_routes.get(&side).is_some_and(|route| {
                     route.announcers.iter().any(|(name, peer)| {
@@ -14716,7 +14716,7 @@ impl Router {
                     #[cfg(feature = "discovery")]
                     if sent.ordered_type.is_none()
                         && !Self::item_data_type(&sent.data)
-                            .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT")
+                            .is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT")
                         && sent.pending_destinations.len() < Self::frozen_owner_count(&sent.data)
                     {
                         for owner in sent.pending_destinations.keys() {
@@ -15943,9 +15943,6 @@ impl Router {
     /// considers) has the compact identity `address`.
     fn other_name_has_address_locked(st: &RouterInner, address: NodeAddress, station: &str) -> bool {
         let other = |candidate: &str| candidate != station && sender_address_u32(candidate) == address;
-        if st.address_book.values().any(|entry| other(entry.hostname.as_ref())) {
-            return true;
-        }
         #[cfg(feature = "discovery")]
         for route in st.discovery_routes.values() {
             for (announcer, state) in &route.announcers {
@@ -15959,7 +15956,7 @@ impl Router {
                 }
             }
         }
-        false
+        st.address_book.values().any(|entry| other(entry.hostname.as_ref()))
     }
 
     pub fn address_book(&self) -> Vec<AddressBookEntry> {
@@ -17074,7 +17071,7 @@ impl Router {
         let RouterInner { end_to_end_reliable_tx, reliable_exhausted, .. } = &mut *st;
         for (packet_id, sent) in end_to_end_reliable_tx.iter_mut() {
             let protected = Self::item_data_type(&sent.data)
-                .is_ok_and(|ty| crate::type_is_urgent(ty) || &*ty.as_str() == "ABORT");
+                .is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT");
             // A silent owner stays owed every Ordered, ABORT and urgent frame:
             // only the application decides to forget a peer from those.
             if silent && (protected || sent.ordered_type.is_some()) {

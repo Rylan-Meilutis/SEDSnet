@@ -29,7 +29,9 @@ fn value(ty: DataType, endpoint: DataEndpoint, sender: &str, timestamp: u64, byt
 
 /// A writer and a requesting client, linked both ways. Returns the writer,
 /// the client and what the client received from the writer.
-fn link(ty: DataType) -> (Arc<Router>, Arc<Router>, Arc<Mutex<Vec<(String, u8)>>>) {
+type Received = Arc<Mutex<Vec<(String, u8)>>>;
+
+fn link(ty: DataType) -> (Arc<Router>, Arc<Router>, Received) {
     let writer = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender(WRITER), Box::new(|| 1000)));
     writer.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE).unwrap();
     let client = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("CLIENT"), Box::new(|| 1000)));

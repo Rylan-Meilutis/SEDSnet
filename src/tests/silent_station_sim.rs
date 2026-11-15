@@ -19,11 +19,14 @@ const RR: usize = 1;
 const RF: usize = 2;
 const FC: usize = 3;
 
+/// (node, side, radio, outbox)
+type Side = (usize, RouterSideId, bool, Arc<Mutex<Vec<Vec<u8>>>>);
+
 pub(crate) struct Sim {
     pub now: Arc<AtomicU64>,
     pub nodes: Vec<Router>,
     /// (node, side, radio, outbox)
-    sides: Vec<(usize, RouterSideId, bool, Arc<Mutex<Vec<Vec<u8>>>>)>,
+    sides: Vec<Side>,
     flight: Vec<(u64, usize, Vec<u8>)>,
     pub rr_silent: bool,
     /// Frames of the station type delivered to the GS / RRLS handler, by sender.
@@ -192,7 +195,7 @@ pub(crate) fn run(mode: crate::ReliableMode, up_s: u64, silent_s: u64) -> (Sim, 
         if t >= cut {
             sim.rr_silent = true;
         }
-        if t % 1_000 == 0 {
+        if t.is_multiple_of(1_000) {
             seq += 1;
             sim.publish(RF, seq);
             published.push(("RF".into(), seq, t));
@@ -249,7 +252,8 @@ fn a_silent_station_does_not_stall_frames_to_the_other() {
     // Ordered frames keep their exhaustion semantics (the application
     // re-sends from it); a silent station still costs an Ordered stream its
     // tail, so station-bound Ordered types should not be relied on alone.
-    for mode in [crate::ReliableMode::Unordered] {
+    {
+        let mode = crate::ReliableMode::Unordered;
         let (sim, frames) = run(mode, 40, 50);
         let (lost, worst) = summary(&format!("{mode:?}"), &sim, &frames);
         println!("GS got {} total, RRLS got {}, RF air {}", sim.gs_got.lock().unwrap().len(), sim.rr_got.load(Ordering::SeqCst), sim.rf_air.len());

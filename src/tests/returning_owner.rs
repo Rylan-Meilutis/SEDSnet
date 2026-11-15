@@ -153,7 +153,9 @@ fn a_departed_owner_still_ages_out() {
     assert!(!owners.contains(&gs));
 }
 
-fn station_fixture() -> (Router, RouterSideId, DataType, DataEndpoint, std::sync::Arc<AtomicU64>, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+type Sent = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+fn station_fixture() -> (Router, RouterSideId, DataType, DataEndpoint, std::sync::Arc<AtomicU64>, Sent) {
     crate::tests::ensure_common_test_schema();
     let ep = crate::config::register_endpoint("RETURNING_OWNER_STATION", false).unwrap();
     let ty = crate::config::register_data_type_with_description(
@@ -253,7 +255,7 @@ fn replay_r2c_rf_status_owners() {
         for row in text.trim_start_matches('[').trim_end_matches(']').split("},") {
             let field = |k: &str| -> String {
                 let at = row.find(&format!("\"{k}\":")).unwrap() + k.len() + 3;
-                row[at..].trim_start().trim_start_matches('"').split(|c| c == '"' || c == ',' || c == '}').next().unwrap().to_string()
+                row[at..].trim_start().trim_start_matches('"').split(['"', ',', '}']).next().unwrap().to_string()
             };
             let hex = field("hex");
             let bytes = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();

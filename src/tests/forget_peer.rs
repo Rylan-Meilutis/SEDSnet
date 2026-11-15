@@ -1,5 +1,8 @@
 use super::*;
 
+/// Frames in flight: (destination, side, bytes).
+type Air = Arc<std::sync::Mutex<Vec<(Arc<Router>, RouterSideId, Vec<u8>)>>>;
+
 /// An application that has decided a peer is out of range (an RRLS that took
 /// over from a primary it can no longer hear) retires it at once: a frame
 /// owed to it and to a reachable owner completes on the reachable owner's
@@ -266,7 +269,7 @@ fn after_forgetting_the_primary_a_frame_still_reaches_a_board_behind_the_relay()
     let rrls = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RRLS"), clock(&now)));
     let gs = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), clock(&now)));
     // Frames in flight: (destination, side, bytes)
-    let air: Arc<Mutex<Vec<(Arc<Router>, RouterSideId, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let air: Air = Arc::new(Mutex::new(Vec::new()));
     let gs_up = Arc::new(AtomicBool::new(true));
     // Side ids: rf 0 radio, 1 can; rrls 0 radio; gs 0 radio; fc 0 can.
     let (a, f, g2, r2) = (air.clone(), fc.clone(), gs.clone(), rrls.clone());
@@ -325,7 +328,7 @@ fn a_board_behind_the_relay_keeps_resolving_a_peer_another_station_forgot() {
     let rf = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), clock(&now)));
     let rrls = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RRLS"), clock(&now)));
     let gs = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), clock(&now)));
-    let air: Arc<Mutex<Vec<(Arc<Router>, RouterSideId, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let air: Air = Arc::new(Mutex::new(Vec::new()));
     let radio = [rf.clone(), rrls.clone(), gs.clone()];
     for (me, side) in [(rf.clone(), 0usize), (rrls.clone(), 0), (gs.clone(), 0)] {
         let (a, peers) = (air.clone(), radio.clone());

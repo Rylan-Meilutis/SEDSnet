@@ -8779,7 +8779,7 @@ fn relay_replays_cached_receipt_for_a_duplicate_every_owner_already_acked() {
         let _ = relay.process_all_queues();
         later += std::mem::take(&mut *to_src.lock().unwrap()).iter().filter(|b| is_receipt(b)).count();
     }
-    assert!(later >= 1 && later <= 8, "bounded replays, got {later}");
+    assert!((1..=8).contains(&later), "bounded replays, got {later}");
     // The replayed receipt completes SRC's send.
     for b in replayed {
         let _ = src.rx_packed_from_side(&b, src_down);

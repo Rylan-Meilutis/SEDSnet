@@ -1689,9 +1689,9 @@ mod fast_path_equivalence_tests {
         ];
         let randoms: Vec<i128> = (0..100_000)
             .map(|_| {
-                let scale = if rng.next() % 4 == 0 { i128::from(rng.wide() % 1_000) } else { 1 };
+                let scale = if rng.next().is_multiple_of(4) { i128::from(rng.wide() % 1_000) } else { 1 };
                 let v = i128::from(rng.wide()) * scale;
-                if rng.next() % 16 == 0 { -v } else { v }
+                if rng.next().is_multiple_of(16) { -v } else { v }
             })
             .collect();
         for ns in edges.into_iter().chain(randoms) {
@@ -1741,7 +1741,7 @@ mod fast_path_equivalence_tests {
             let mut clock = NetworkClock::default();
             let base_ms = rng.next() % 9_000_000_000_000;
             let anchor = rng.next() % (1 << 40);
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 // Date and time from separate sources (the merged path).
                 let full = PartialNetworkTime::from_unix_ms(base_ms);
                 clock.update_source("date", 1, PartialNetworkTime { hour: None, minute: None, second: None, nanosecond: None, ..full }, 0, anchor, None);

@@ -397,7 +397,7 @@ fn a_duplicate_on_another_side_is_receipted_back_on_that_side() {
     // the umbilical. FC receipts that copy back over CAN at once: RF's
     // downstream contract completes before RF has to retry it.
     let mut forwarded = false;
-    for _ in 0..(u64::from(crate::config::runtime_reliable_retransmit_ms()) / 50).max(2) {
+    for _ in 0..(crate::config::runtime_reliable_retransmit_ms() / 50).max(2) {
         sim.run(50);
         forwarded |= sim.pending(RF).iter().any(|(_, owners)| owners.contains(&"FC"));
         if forwarded && sim.pending(RF).is_empty() {
@@ -405,7 +405,7 @@ fn a_duplicate_on_another_side_is_receipted_back_on_that_side() {
         }
     }
     assert!(forwarded, "RF forwarded the write to FC");
-    let retry_ms = u64::from(crate::config::runtime_reliable_retransmit_ms());
+    let retry_ms = crate::config::runtime_reliable_retransmit_ms();
     assert!(sim.pending(RF).is_empty(), "RF's contract completes on FC's receipt of its first copy (within {retry_ms} ms): {:?}", sim.pending(RF));
     for node in [FC, RF, PB, RR] {
         assert_eq!(sim.value(node), Some(15), "{} applied the write", NAMES[node]);

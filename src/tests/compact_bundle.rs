@@ -338,7 +338,9 @@ fn sender_node(side_bundle: bool) -> (Router, RouterSideId, Frames) {
     (node, side, out)
 }
 
-fn receiver_node() -> (Router, RouterSideId, Arc<Mutex<Vec<(DataType, Vec<u8>)>>>) {
+type Received = Arc<Mutex<Vec<(DataType, Vec<u8>)>>>;
+
+fn receiver_node() -> (Router, RouterSideId, Received) {
     crate::tests::ensure_common_test_schema();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
