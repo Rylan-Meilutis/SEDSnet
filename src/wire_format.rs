@@ -22,7 +22,6 @@ use alloc::collections::BTreeMap;
 #[cfg(feature = "cryptography")]
 use alloc::vec;
 use alloc::{sync::Arc, vec::Vec};
-use crc32fast::Hasher as Crc32Hasher;
 #[cfg(feature = "std")]
 use std::sync::{Mutex, OnceLock};
 
@@ -423,9 +422,7 @@ fn read_contract_epoch(cr: &mut ByteReader, flags: u8) -> Result<u16, TelemetryE
 
 #[inline]
 fn crc32_bytes(data: &[u8]) -> u32 {
-    let mut hasher = Crc32Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
+    crate::crc32::crc32(data)
 }
 
 #[inline]
@@ -437,7 +434,7 @@ fn append_crc32(out: &mut Vec<u8>) {
 // Initialize every byte before publishing the shared frame. Keeping the
 // payload separate avoids a second full-size allocation during Arc creation.
 fn join_frame_with_crc(header: &[u8], payload: &[u8]) -> Arc<[u8]> {
-    let mut hasher = Crc32Hasher::new();
+    let mut hasher = crate::crc32::Crc32::new();
     hasher.update(header);
     hasher.update(payload);
     let crc = hasher.finalize().to_le_bytes();

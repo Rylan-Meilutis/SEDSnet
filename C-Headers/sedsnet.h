@@ -48,6 +48,18 @@ void seds_set_memory_admission_probe_v2(SedsMemoryAdmissionProbeV2 probe);
 
 size_t seds_memory_admission_rejected(void);
 
+/* Optional CRC-32 implementation (e.g. a CRC peripheral) used to compute and
+ * verify every frame CRC. zlib-compatible: `crc` is the CRC of the bytes
+ * already processed (0 at the start) and the result is the CRC after `len`
+ * more bytes. It must equal IEEE CRC-32 bit for bit: polynomial 0x04C11DB7,
+ * reflected input and output, init 0xFFFFFFFF, final XOR 0xFFFFFFFF
+ * ("123456789" -> 0xCBF43926). Called from every thread (and ISR, when the
+ * ISR ingress APIs are used); must be reentrant or internally synchronized,
+ * nonblocking, and must not call SEDSnet. `data` may be dangling when len is
+ * 0. Install once before routers run; NULL restores the software default. */
+typedef uint32_t (*SedsCrc32Fn)(uint32_t crc, const uint8_t *data, size_t len);
+void seds_set_crc32_fn(SedsCrc32Fn fn);
+
 /* =================================================================
    Public built-in enums / constants. User schema entries are registered at runtime.
    ================================================================= */

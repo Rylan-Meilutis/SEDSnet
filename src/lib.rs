@@ -168,6 +168,7 @@ mod admission_fairness;
 mod binding_options;
 mod c_api;
 pub mod config;
+pub mod crc32;
 #[cfg(feature = "cryptography")]
 pub mod crypto;
 pub mod diagnostics;
