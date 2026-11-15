@@ -216,8 +216,8 @@ fn consumer_behind_relay_steps_from_uptime_to_utc() {
     // The ground station has no NTP fix yet, so every board anchors to uptime.
     net.run(3_000);
     assert_eq!(net.nodes[0].network_time_ms(), None);
-    for node in 1..3 {
-        assert!(net.nodes[node].network_time_ms().unwrap() < TIMESYNC_UTC_FLOOR_MS);
+    for node in &net.nodes[1..3] {
+        assert!(node.network_time_ms().unwrap() < TIMESYNC_UTC_FLOOR_MS);
     }
     let fixed = net.mono();
     net.set_utc(0);
@@ -352,9 +352,11 @@ fn relays_time_out_to_unanchored_without_a_loop() {
     for f in frames.iter().filter(|f| f.ty == DataType::TimeSyncAnnounce) {
         let quality = decode_timesync_quality(f.words[0], f.words[1]);
         assert!(quality.stratum <= 2, "stratum counted up: {f:?}");
-        if f.at > lost + 5_000 + 2_000 {
+        if f.at > lost + 5_000 + 2_000 && quality.anchored {
+            // Held UTC (holdover within the lock bound) may lead, but only
+            // one relay leads at stratum 0; the other follows it.
             assert!(
-                !quality.anchored,
+                quality.stratum == 0 || quality.upstream != 0,
                 "relays kept each other alive as UTC: {f:?}"
             );
         }

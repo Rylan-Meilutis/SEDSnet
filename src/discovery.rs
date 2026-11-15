@@ -28,6 +28,11 @@ pub const DISCOVERY_SLOW_LINK_PING_INTERVAL_MS: u64 = 15_000;
 pub const DISCOVERY_SLOW_LINK_FULL_INTERVAL_MS: u64 = 120_000;
 /// Retry only links with an unreceived topology baseline, not healthy links.
 pub const DISCOVERY_BASELINE_RETRY_MS: u64 = 5_000;
+/// A heard sender no discovery describes: the first retry interval (a lost
+/// request otherwise left the station without routes for 5 s); it doubles
+/// (1 s, 2 s, 4 s) for at most three requests and resets once described.
+/// Announcers still missing their baseline keep DISCOVERY_BASELINE_RETRY_MS.
+pub const DISCOVERY_TOPOLOGY_RETRY_MS: u64 = 1_000;
 /// Let the address and full topology in a normal bootstrap arrive together.
 pub const DISCOVERY_BASELINE_GRACE_MS: u64 = 1_000;
 /// Number of compact topology advertisements emitted for each change. These

@@ -27,7 +27,7 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress")
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress", "compact-bundle")
 
 def qualification_profiles(features: list[str]) -> list[list[str]]:
     """Exercise feature-OFF normal storage and feature-ON compact/fair storage.

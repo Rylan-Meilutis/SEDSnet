@@ -8,6 +8,7 @@ mod timesync_system_test {
     use sedsnet::packet::Packet;
     use sedsnet::router::{Clock, EndpointHandler, Router, RouterConfig};
     use sedsnet::timesync::{
+        encode_v2_receive_word, encode_v2_transmit_word,
         PartialNetworkTime, TimeSyncConfig, TimeSyncRole, TimeSyncTracker,
         build_timesync_announce_with_sender, build_timesync_request, build_timesync_response,
         compute_offset_delay,
@@ -465,10 +466,8 @@ mod timesync_system_test {
         );
         router.add_side_packet("CAP", move |pkt| {
             if pkt.data_type() == DataType::TimeSyncRequest {
-                request_seqs_c
-                    .lock()
-                    .unwrap()
-                    .push(pkt.data_as_u64().unwrap()[0]);
+                let words = pkt.data_as_u64().unwrap();
+                request_seqs_c.lock().unwrap().push((words[0], words[1]));
             }
             Ok(())
         });
@@ -482,24 +481,39 @@ mod timesync_system_test {
         router.rx(&leader_b).unwrap();
         router.process_tx_queue().unwrap();
 
-        let request_seqs = request_seqs.lock().unwrap().clone();
-        assert_eq!(request_seqs, vec![1, 2]);
+        let seqs: Vec<u64> = request_seqs.lock().unwrap().iter().map(|r| r.0).collect();
+        assert_eq!(seqs, vec![1, 2], "failover re-requests from the new source");
 
+        // SRC_B is 50 ms ahead. Interleaved: the answer to request 2 carries
+        // its receive stamp; the answer to request 3 carries the transmit
+        // stamp of answer 2, completing the first sample.
+        let respond = |seq: u64, cookie: u64, t2_ms: u64, prev: Option<(u64, u64)>| {
+            let w2 = encode_v2_receive_word(t2_ms * 1_000, true, 0);
+            let w3 = prev.map_or(0, |(c, t3_ms)| encode_v2_transmit_word(c, t3_ms * 1_000));
+            let wire = build_timesync_response(seq, cookie, w2, w3).unwrap();
+            Packet::new(
+                DataType::TimeSyncResponse,
+                &[DataEndpoint::TimeSync],
+                "SRC_B",
+                wire.timestamp(),
+                wire.payload().into(),
+            )
+            .unwrap()
+        };
+        let (seq2, cookie2) = request_seqs.lock().unwrap()[1];
+        router.rx(&respond(seq2, cookie2, 1_700_000_001_550, None)).unwrap();
+        now.store(2_600, Ordering::SeqCst);
+        // SRC_B keeps announcing (1 s source timeout); its next request goes out.
+        let again_b = build_timesync_announce_with_sender("SRC_B", 2, 1_700_000_002_650).unwrap();
+        router.rx(&again_b).unwrap();
+        router.process_tx_queue().unwrap();
+        let (seq3, cookie3) = *request_seqs.lock().unwrap().last().unwrap();
+        assert_ne!(seq3, seq2);
         let before_response = router.network_time_ms().expect("network time unavailable");
-        let resp_b_wire =
-            build_timesync_response(request_seqs[1], 1_500, 1_700_000_001_550, 1_700_000_001_550)
-                .unwrap();
-        let resp_b = Packet::new(
-            DataType::TimeSyncResponse,
-            &[DataEndpoint::TimeSync],
-            "SRC_B",
-            resp_b_wire.timestamp(),
-            resp_b_wire.payload().into(),
-        )
-        .unwrap();
-        router.rx(&resp_b).unwrap();
-
-        now.store(1_600, Ordering::SeqCst);
+        router
+            .rx(&respond(seq3, cookie3, 1_700_000_002_650, Some((seq2, 1_700_000_001_550))))
+            .unwrap();
+        now.store(2_700, Ordering::SeqCst);
         let after_response = router.network_time_ms().expect("network time unavailable");
         assert!(
             after_response >= before_response + 140,

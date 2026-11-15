@@ -1,6 +1,177 @@
 # Changelog
 
-## Unreleased
+## 5.0.0
+
+**Breaking wire changes (time sync and compact bundles).** SEDSnet 4.x and
+5.x nodes do not interoperate: the GS, RRLS and every board update together.
+Time sync uses the same words differently (frames do not grow), and sides
+opened with `SideOptions::compact_bundle` carry compact bundles with no
+negotiation or fallback. Message schemas, and the framing of sides without
+that option, keep their 4.3.14 representations.
+
+- Ask a side for topology as soon as data is heard there from a sender that no
+  fresh announcer or topology describes (its route aged out during a cut
+  longer than the route TTL), instead of waiting for that sender's next
+  discovery packet; while it stays undescribed, ask again after 1 s and 2 s
+  (`DISCOVERY_TOPOLOGY_RETRY_MS`, at most three requests), then stop until it
+  is described. Announcers still missing their baseline keep the 5 s retry
+  (combined round R3-C: the station's ABORT to FC had no route for 5.6 s and
+  PB's latch push was rejected).
+- Ask a peer heard again for its topology when no other topology describes it
+  with endpoints. A bridge (an RRLS) that lists a peer it lost with no
+  endpoints no longer counts as describing it, so the returning peer is asked
+  within the baseline grace and owns the next end-to-end frame for its
+  endpoints once its topology arrives (combined round R2-C: RF addressed its
+  Abort push and its readback reply to the RRLS alone for 5.4 s after a
+  takeover ended).
+- A segment proxy acknowledges upstream as soon as it accepts a write and owns
+  the downstream delivery as its own contract (own retries, exhaustion and
+  silent-owner retirement). A silent or lost downstream owner is the proxy's
+  failure, no longer the publisher's. A duplicate that arrives on a side other
+  than the first copy's is receipted back on the side it came from, so a
+  local owner in a cycle (GS - umbilical - FC - CAN - RF - radio - GS)
+  answers the relay that forwarded it.
+- `sender_matches_station` / `seds_router_sender_matches_station`: matches a
+  fixed station name a board checks by its deterministic compact identity
+  when the receiver never learned that address, and refuses when the compact
+  value collides with any other name the receiver knows.
+  `sender_matches_hostname` is unchanged and still fails closed.
+- A writer router answers network-variable requests, replays to new owners
+  and re-sends only its own last write (`own_network_variable`), never a
+  report it received from another node.
+- `side_peek::SideFramePeeker` and `peek_side_frame_type` classify a packed
+  side's frames (canonical, FULL, compact, chunk) with their type and
+  reliable flags, for egress filters and priority classifiers.
+- Reliable deliveries that run out of retries are counted for Ordered and
+  Unordered types, end-to-end and per hop (`reliable.exhausted`, C and Python
+  runtime-stats JSON); std builds keep the last 8 for
+  `take_exhausted_reliable`. Unordered exhaustion still returns no error.
+- Time sync frequency uncertainty is bounded by the learned rate plus 1%
+  instead of a flat 1%; a follower whose newest sample came from an unsynced
+  source widens its holdover the same way, and a source bound above 1 s
+  passes through whole. `timesync_status` is a pure read. Under 50% loss the
+  reported bound now covers the real error in every state, Acquiring
+  included.
+
+- Add `wire_bundle` (feature `compact-bundle`: on by default for std builds,
+  opt-in for `embedded`; CMake `SEDSNET_COMPACT_BUNDLE`). A bundle carries
+  several canonical frames in one side frame with one CRC32. Each record
+  drops header fields equal to the previous record's and carries its
+  timestamp and nonce as deltas. Records name sources and frozen target
+  hashes by their 1-byte position in a node table that every build shares
+  (`set_node_table`, `seds_set_node_table`). A bundle that uses the table
+  carries a check byte of the table, and a receiver with a different table,
+  or none, drops the bundle rather than guess. The receiver rebuilds every
+  canonical frame byte for byte, so packet ids, routing, hop and end-to-end
+  reliability and forwarding are unchanged.
+- A compact-bundle side hands its writer canonical frames: no header
+  templates. Writers pack the frames they already hold, in their own
+  priority order, with `pack_bundle` / `seds_compact_bundle_pack`, and keep
+  urgent frames (ABORT) standalone. ABORT decodes with no prior state.
+- Router receive (`rx_packed_from_side`, `rx_packed_queue_from_side`)
+  verifies a whole bundle before it delivers any of its frames.
+- Time sync uses NTP interleaved mode in the existing request/response words.
+  The response carries the microsecond receive stamp of this request (with the
+  responder's sync flag and error-bound code) and the true transmit time of the
+  responder's previous response to the same requester. Responder queueing
+  becomes turnaround instead of path delay: a 7 s radio queue no longer biases
+  the clock. The millisecond 4.x answer and the verified-forward-step path are
+  removed.
+- Stamps are local bookkeeping: the router stamps time sync frames at handoff
+  to the side and at receipt; transports can report the real transmit
+  completion (`note_frame_sent`, `seds_router_note_frame_sent`) and receive
+  instant (`rx_packed_from_side_at`, `rx_packed_queue_from_side_at`,
+  `seds_router_receive_packed_from_side_at`).
+- Followers keep 8 samples, reject delay outliers, fit phase and oscillator
+  frequency by weighted least squares and slew (they step only before first
+  lock or onto a re-anchored source). A 1% HSI is learned and held over.
+  Locked followers exchange 4x less often (time sync air at or below 4.3.14).
+- `timesync_status` / `seds_router_get_timesync_status`: state (unsynced,
+  acquiring, locked, holdover), error bound, pending offset, learned rate,
+  stratum, and a one-byte health summary for BOARD_HEALTH spare bits
+  (`decode_health_byte`).
+- `set_side_timesync_path` / `seds_router_set_side_timesync_path`: per-byte and
+  fixed path asymmetry of slow links.
+- UTC reference reports: a follower with GPS reports reference UTC minus
+  network time in its request (`set_utc_reference_offset`); the source reads
+  them (`take_utc_reference_reports`, std). An offset that does not fit is not
+  sent.
+- `seds_set_clock_us`: an optional microsecond clock for C routers (same epoch
+  as the millisecond callback); time sync then stamps at microsecond resolution.
+- `step_local_network_time_ns`: a leading station coarse-sets its UTC once.
+- A node following a better source keeps its own host time as a candidate
+  only; a node disciplined from an anchored source may lead as anchored during
+  holdover while its bound is within the lock threshold (RRLS/RF bridging).
+- Scheduling classes: `set_type_scheduling_class` / `seds_dtype_set_scheduling_class`
+  place application types (ABORT, operator commands) above SEDSnet network
+  control; time sync, schema and managed variables are 254; acks and route
+  discovery stay 255; data is below.
+- Reliability: the end-to-end retry interval starts when a leased write
+  reports drained, and a held write covers its packet for up to two intervals
+  (urgent types, the ABORT class, keep the handoff-based interval: they never
+  re-send later than in 4.x);
+  `complete_reliable` / `seds_router_complete_reliable` completes one pending
+  send on other proof of delivery (never ABORT or urgent types);
+  `relayed_frame_satisfied` / `seds_router_relayed_frame_satisfied` lets a
+  driver drop a queued relayed copy every owner already acknowledged. A relay
+  that receives a duplicate whose every owner already acknowledged answers it
+  with the cached receipt (the one back to the sender was lost) instead of
+  dropping it: once per retry interval, at most four times per packet.
+- Performance: packet timestamps read network time without calendar
+  conversions or software 64/128-bit division (Cortex-M4, firmware profile:
+  `Router::network_time_ms` 10840 -> about 1800 instructions per call).
+  `tools/mcu-icount/count.sh` measures it under QEMU.
+- Time sync stamps that contradict the radio: an exchange whose round trip
+  measures below the side's physical minimum (beyond twice the stamping
+  uncertainty plus 1 ms) proves a stamp wrong and is rejected, never taken as
+  a direct crossing; its deficit stays in the error bound while such
+  exchanges keep appearing (600 s). `set_side_timesync_stamp_uncertainty` /
+  `seds_router_set_side_timesync_stamp_uncertainty` describes each end's
+  stamping uncertainty (UART/DMA/ISR latency), which the bound carries.
+  Rejections are counted in `RuntimeStatsSnapshot::timesync_sub_minimum_rejects`.
+- Time sync over lossy, turn-taking links. The error bound rests on evidence
+  only: `set_side_timesync_min_delay` / `seds_router_set_side_timesync_min_delay`
+  describes a side's physical minimum one-way delay (besides the per-byte part
+  of `set_side_timesync_path`; radio: S6 serial break + 4 ms TX setup), and a
+  sample is off by at most half its round trip above that minimum. A window
+  with a direct crossing reports a tight bound; one without (every frame
+  waited for a turn) reports the half-round-trip bound and Acquiring. A side
+  without a described minimum counts every sample as off by its whole half
+  round trip. The discipline weights samples by 1/sigma^2 of that error, keeps
+  the best (a sample that waited never displaces a direct crossing; equal
+  ones rotate; none older than 600 s), and fits frequency and phase with
+  worst-case bounds in 64-bit arithmetic. A follower asks twice as often while
+  acquiring, at the configured interval while its bound is above 5 ms, four
+  times less often only while tighter; never faster than the round trip, and
+  a lost exchange no longer forces an immediate request. Host sim
+  (`tests/timesync_radio_sim.rs`: GS - radio - RF - CAN - FC/PB, crystals
+  +160/-90/+45 ppm, turn waits 0-200 ms on half the frames, 0-50% loss): p95
+  under 0.6 ms, reported bound 1-6 ms (RF) and 4-6 ms (FC/PB), and in every
+  case, including every frame waiting, never below the real error.
+- A silent end-to-end owner (a station whose discovery leave was lost) no
+  longer holds Unordered deliveries: when an Unordered frame others
+  acknowledged runs out of retries, the owners still pending are retired from
+  it and from the other pending Unordered frames, and it completes for the
+  others. Ordered frames keep their exhaustion semantics (the application
+  re-sends from an Ordered exhaustion and the owners that missed it), ABORT and
+  urgent frames are never touched, and new frames still go to every owner.
+  Counted in `reliable.exhausted` (`silent_owner_*`; the Ordered ones stay 0).
+- `Router::forget_peer(hostname)` (discovery, Rust): an application that
+  knows a peer is out of range drops its routes now, as a discovery leave
+  does, and retires it from every pending end-to-end frame; a frame owed to
+  no one else completes. An ABORT or urgent frame is never completed this
+  way: owed only to the forgotten peer, it keeps retrying out its span.
+- End-to-end dedupe: a reliable end-to-end packet re-sent late (after the
+  recent-id ring, 16 ids on boards, has rolled over) is acknowledged again but
+  not delivered twice. Each reliable type keeps its last 4 delivered ids
+  (16 types, least recently delivered forgotten first), which is exact for
+  Ordered streams (one packet in flight per sender), and every reliable
+  end-to-end id is also remembered for the senders' re-send window (own retry
+  window plus 1 s, at least 6 s) in 32 slots. When those slots are full the
+  oldest id is forgotten first, so its late copy can be delivered again as
+  before; a new packet is never dropped (an id only matches the same packet).
+  A packet whose handling failed is forgotten everywhere, so its retry is
+  accepted. Heap per router: at most about 1.2 KB (640 B history, 512 B window).
 
 
 ## 4.3.14

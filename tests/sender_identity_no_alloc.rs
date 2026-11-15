@@ -41,6 +41,13 @@ unsafe extern "C" {
         hostname: *const c_char,
         hostname_len: usize,
     ) -> bool;
+    safe fn seds_router_sender_matches_station(
+        router: *const c_void,
+        sender: *const c_char,
+        sender_len: usize,
+        station: *const c_char,
+        station_len: usize,
+    ) -> bool;
 }
 thread_local! {static COUNT:Cell<Option<usize>>=const{Cell::new(None)};}
 struct Counting;
@@ -151,4 +158,25 @@ fn sender_match_rust_and_c_predicates_allocate_nothing() {
     eprintln!(
         "SENDER_MATCH_ALLOCATION: calls=6000 Rust_and_C allocations={allocations} compact={compact} assigned={assigned}"
     );
+}
+
+/// The station predicate, Rust and C, allocates nothing either, and both agree.
+#[test]
+fn station_match_rust_and_c_predicates_allocate_nothing() {
+    let receiver = Router::new_with_clock(RouterConfig::new([]).with_hostname("station-allocation-receiver"), Box::new(|| 1));
+    let c = seds_router_new(None, ptr::null_mut(), ptr::null(), 0);
+    assert!(!c.is_null());
+    let station = "RRLS";
+    let compact = format!("@addr:{}", sedsnet::packet::sender_address_u32(station));
+    let other = "GS";
+    COUNT.with(|n| n.set(Some(0)));
+    for _ in 0..1000 {
+        assert!(receiver.sender_matches_station(&compact, station));
+        assert!(!receiver.sender_matches_station(&compact, other));
+        assert!(receiver.sender_matches_station(station, station));
+        assert!(seds_router_sender_matches_station(c, compact.as_ptr() as *const c_char, compact.len(), station.as_ptr() as *const c_char, station.len()));
+        assert!(!seds_router_sender_matches_station(c, compact.as_ptr() as *const c_char, compact.len(), other.as_ptr() as *const c_char, other.len()));
+    }
+    assert_eq!(COUNT.with(|n| n.replace(None)), Some(0));
+    seds_router_free(c);
 }

@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "4.3.14"
+version = "5.0.0"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -17,10 +17,10 @@ name = "sedsnet"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["std", "compression", "timesync", "discovery", "cryptography"]
+default = ["std", "compression", "timesync", "discovery", "cryptography", "compact-bundle"]
 std = ["serde", "serde/std", "serde_json", "serde_json/std"]
 embedded = ["compression", "timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
-python = ["std", "pyo3/extension-module", "pyo3/abi3-py39", "compression", "timesync", "discovery", "cryptography"]
+python = ["std", "pyo3/extension-module", "pyo3/abi3-py39", "compression", "timesync", "discovery", "cryptography", "compact-bundle"]
 compression = ["zstd-safe"]
 timesync = []
 discovery = []
@@ -30,6 +30,8 @@ fair-admission = []
 # Opt-in canonical latest-value policy; omitted from all default bundles.
 latest-value-egress = []
 ingress-target-filter = []
+# Stateless compact bundles on negotiated links (radio). Opt-in on embedded.
+compact-bundle = ["discovery"]
 compact-packet-store = []
 compact-packet-compression = ["compact-packet-store", "compression", "zstd-safe/experimental"]
 
