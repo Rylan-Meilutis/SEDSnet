@@ -46,6 +46,9 @@ mod independent_side_tx;
 #[path = "router_local_ordered.rs"]
 mod local_ordered;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/crc_once.rs"]
+mod crc_once_tests;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/ingress_target_filter.rs"]
 mod ingress_target_filter_tests;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
