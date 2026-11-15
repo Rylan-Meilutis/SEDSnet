@@ -1,0 +1,19 @@
+[package]
+name = "mcu-icount"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Counts Cortex-M4 instructions of SEDSnet time sync hot paths under QEMU (mps2-an386)"
+
+[workspace]
+
+[dependencies]
+sedsnet = { package = "SEDSnet", path = "../..", default-features = false, features = ["embedded"] }
+cortex-m-rt = "0.7"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 0

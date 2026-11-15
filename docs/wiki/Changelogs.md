@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## Version 5.0.0 highlights
+
+- Breaking time sync wire change (4.x and 5.x nodes do not keep time together; update the whole stack): NTP interleaved exchange in the existing request/response words, transport transmit/receive stamps, and a least-squares phase/frequency discipline with holdover. No frame grows.
+- Per-node sync quality (state, error bound, offset, learned rate) with a one-byte BOARD_HEALTH summary; UTC reference reports from GPS followers; coarse UTC set for RTC-less stations.
+- Application scheduling classes put ABORT and operator commands above SEDSnet network control.
+- Reliability: retries count from the physical drain; `complete_reliable` (never ABORT); drivers can drop relayed copies every owner acknowledged.
+- Breaking radio wire change: compact bundles (`SideOptions::compact_bundle`, feature `compact-bundle`) carry several frames in one side frame with one CRC, per-record header elision and a shared 1-byte node table; no negotiation or fallback, and ABORT stays a self-contained standalone frame.
+- Honest time sync error bound: exchanges whose round trip is below the side's physical minimum are rejected, per-side stamping uncertainty is carried in the bound, and frequency uncertainty follows the learned rate; the bound covers the real error in every state.
+- Reliability over lossy relays: segment proxies acknowledge upstream and own downstream delivery, duplicates are receipted on the side they arrived from, late duplicates are never delivered twice, silent Unordered owners are retired, and `forget_peer` drops an out-of-range peer (never completing ABORT).
+- Discovery recovers fast after a link cut: returning or undescribed senders are asked for topology within about a second, with a capped retry.
+- `sender_matches_station`, `own_network_variable`, `SideFramePeeker`, and exhaustion counters for Ordered and Unordered deliveries.
+
 ## Version 4.3.14 highlights
 
 - Fit the full `embedded` feature set (compression, cryptography, time sync, discovery, JSON schemas) on 512 KiB STM32G4 boards: zstd keeps only its level-1 compressor and small decoders, and embedded tables share one sorted-`Vec` map instead of per-type B-trees.

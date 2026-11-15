@@ -1168,3 +1168,82 @@ fn tracker_retry_provenance_survives_child_queue_admission_and_refusal() {
     finish_tracked(&f, first.bytes());
     assert!(retry.discard_if_retired());
 }
+#[test]
+fn retry_clock_starts_when_the_write_drains_not_at_handoff() {
+    // A transport that holds its write most of a retry interval (GS turn
+    // writer behind an RF burst) must not see a replay queued right behind
+    // the first copy: the retry interval counts from the physical drain.
+    let (f, _t, leases) = tracked_fixture(true);
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    let interval = runtime_reliable_retransmit_ms();
+    let step = || {
+        f.now.fetch_add(10, Ordering::SeqCst);
+        f.router.process_end_to_end_reliable_timeouts().unwrap();
+        f.router.dispatch_tx_queue_with_timeout(0).unwrap();
+    };
+    let hold = interval * 7 / 8;
+    for _ in 0..hold / 10 {
+        step();
+    }
+    assert_eq!(leases.lock().unwrap().len(), 1, "no replay while the first copy is held");
+    first.report_drained().unwrap();
+    for _ in 0..interval / 10 - 2 {
+        step();
+        assert_eq!(leases.lock().unwrap().len(), 1, "replay before drain + retry interval");
+    }
+    for _ in 0..4 {
+        step();
+    }
+    assert_eq!(leases.lock().unwrap().len(), 2, "one replay after drain + retry interval");
+}
+#[test]
+fn urgent_sends_keep_the_handoff_retry_clock_while_held() {
+    // ABORT-class traffic never re-sends slower than before the drain-based
+    // clock: a copy the writer still holds is replayed one interval after
+    // handoff, as in 4.x. Ordinary traffic keeps waiting for drain + interval.
+    let (f, _t, leases) = tracked_fixture(true);
+    assert!(crate::set_type_scheduling_class(f.ty, -1));
+    publish(&f);
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    let interval = runtime_reliable_retransmit_ms();
+    let step = || {
+        f.now.fetch_add(10, Ordering::SeqCst);
+        f.router.process_end_to_end_reliable_timeouts().unwrap();
+        f.router.dispatch_tx_queue_with_timeout(0).unwrap();
+    };
+    for _ in 0..interval / 10 - 1 {
+        step();
+    }
+    assert_eq!(leases.lock().unwrap().len(), 1, "no replay before one interval");
+    for _ in 0..3 {
+        step();
+    }
+    let replays = leases.lock().unwrap().len();
+    assert!(crate::set_type_scheduling_class(f.ty, 1));
+    assert_eq!(replays, 2, "a held urgent copy replays one interval after handoff");
+}
+#[test]
+fn application_can_complete_a_pending_send_but_never_an_urgent_one() {
+    let (f, _t, leases) = tracked_fixture(true);
+    publish(&f);
+    let id = *f.router.state.lock().end_to_end_reliable_tx.keys().next().unwrap();
+    // Urgent (ABORT-class) sends are never completed by the application.
+    assert!(crate::set_type_scheduling_class(f.ty, -1));
+    assert_eq!(f.router.complete_reliable(id), Err(TelemetryError::PermissionDenied));
+    assert!(f.router.state.lock().end_to_end_reliable_tx.contains_key(&id));
+    assert!(crate::set_type_scheduling_class(f.ty, 1));
+    // Proof of delivery from elsewhere: retries stop.
+    assert_eq!(f.router.complete_reliable(id), Ok(true));
+    assert!(!f.router.state.lock().end_to_end_reliable_tx.contains_key(&id));
+    assert_eq!(f.router.complete_reliable(id), Ok(false));
+    let first = leases.lock().unwrap()[0].clone();
+    assert_eq!(first.try_start(), WriteStart::Ready);
+    first.report_drained().unwrap();
+    let before = leases.lock().unwrap().len();
+    next_tracked_retry(&f);
+    next_tracked_retry(&f);
+    assert_eq!(leases.lock().unwrap().len(), before, "a completed send is not replayed");
+}

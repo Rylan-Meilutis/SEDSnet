@@ -383,10 +383,17 @@ fn receipt_loss_case(
                 )
             });
         }
-        if nodes[0].export_reliable_pending_stats().is_empty() {
+        // The bridge acknowledges the publisher once it has accepted the
+        // write and owns the downstream delivery itself: recovery is done
+        // when no router still owes this write to anyone.
+        if nodes.iter().all(|node| {
+            node.export_reliable_pending_stats()
+                .iter()
+                .all(|pending| pending.data_type != ty)
+        }) {
             assert!(
                 child_receipts.load(Ordering::Relaxed) == expected_receipts,
-                "bridge acknowledged before downstream receipt: bridge_reader={bridge_reader} drop_receipt={drop_receipt}"
+                "delivery retired before every downstream receipt: bridge_reader={bridge_reader} drop_receipt={drop_receipt}"
             );
             assert_eq!(effects.load(Ordering::Relaxed), expected_effects);
 

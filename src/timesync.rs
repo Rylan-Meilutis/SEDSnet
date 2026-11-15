@@ -329,10 +329,23 @@ impl NetworkTime {
             return None;
         }
 
-        let secs = u64::try_from(unix_ns / 1_000_000_000).ok()?;
-        let nanos = unix_ns.rem_euclid(1_000_000_000) as u32;
-        let days = secs / 86_400;
-        let sod = (secs % 86_400) as u32;
+        // Every Unix time before 2554 fits u64 nanoseconds: one 64-bit
+        // division instead of 128-bit ones (software division on Cortex-M).
+        let (secs, nanos) = match u64::try_from(unix_ns) {
+            Ok(ns) => {
+                let secs = crate::timesync_discipline::div_u64_1e9(ns);
+                (secs, (ns - secs * 1_000_000_000) as u32)
+            }
+            Err(_) => (
+                u64::try_from(unix_ns / 1_000_000_000).ok()?,
+                unix_ns.rem_euclid(1_000_000_000) as u32,
+            ),
+        };
+        // Before 2106 the seconds fit 32 bits and divide in hardware.
+        let (days, sod) = match u32::try_from(secs) {
+            Ok(secs) => (u64::from(secs / 86_400), secs % 86_400),
+            Err(_) => (secs / 86_400, (secs % 86_400) as u32),
+        };
         let (year, month, day) = civil_from_days(days)?;
 
         Some(Self {
@@ -346,8 +359,8 @@ impl NetworkTime {
         })
     }
 
-    /// Converts this calendar/time value into Unix nanoseconds if the fields are valid.
-    pub fn as_unix_ns(&self) -> Option<i128> {
+    /// Whole Unix seconds of valid fields (fits i64 for every i32 year).
+    fn unix_secs(&self) -> Option<i64> {
         if !(1..=12).contains(&self.month)
             || !(1..=31).contains(&self.day)
             || self.hour > 23
@@ -357,22 +370,32 @@ impl NetworkTime {
         {
             return None;
         }
-
         let days = days_from_civil(self.year, self.month as u32, self.day as u32);
-        let secs = (days as i128) * 86_400
-            + (self.hour as i128) * 3_600
-            + (self.minute as i128) * 60
-            + (self.second as i128);
-        Some(secs * 1_000_000_000 + self.nanosecond as i128)
+        Some(
+            days * 86_400
+                + i64::from(self.hour) * 3_600
+                + i64::from(self.minute) * 60
+                + i64::from(self.second),
+        )
+    }
+
+    /// Converts this calendar/time value into Unix nanoseconds if the fields are valid.
+    pub fn as_unix_ns(&self) -> Option<i128> {
+        Some(i128::from(self.unix_secs()?) * 1_000_000_000 + self.nanosecond as i128)
     }
 
     /// Converts this calendar/time value into non-negative Unix milliseconds.
     pub fn as_unix_ms(&self) -> Option<u64> {
-        let unix_ns = self.as_unix_ns()?;
-        if unix_ns < 0 {
+        // ns = secs * 1e9 + nanosecond with 0 <= nanosecond < 1e9, so ns < 0
+        // exactly when secs < 0, and ns / 1e6 = secs * 1000 + nanosecond / 1e6:
+        // no 128-bit division (a long software routine on Cortex-M).
+        let secs = self.unix_secs()?;
+        if secs < 0 {
             return None;
         }
-        u64::try_from(unix_ns / 1_000_000).ok()
+        (secs as u64)
+            .checked_mul(1_000)?
+            .checked_add(u64::from(self.nanosecond / 1_000_000))
     }
 }
 
@@ -386,13 +409,18 @@ pub struct NetworkTimeReading {
 }
 
 /// Monotonic-anchor clock that slews toward target Unix time instead of stepping immediately.
+///
+/// Internally 64-bit (Unix ns fits until 2262); one shared multiply-divide
+/// helper does the scaling, which keeps 128-bit code off small targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlewedNetworkClock {
     anchor_mono_ns: u64,
-    anchor_unix_ns: i128,
-    pending_adjust_ns: i128,
+    anchor_unix_ns: i64,
+    pending_adjust_ns: i64,
     max_slew_ppm: u32,
     initialized: bool,
+    /// Learned frequency correction of the local oscillator, ppb.
+    rate_ppb: i64,
 }
 
 impl Default for SlewedNetworkClock {
@@ -403,8 +431,13 @@ impl Default for SlewedNetworkClock {
             pending_adjust_ns: 0,
             max_slew_ppm: 50_000,
             initialized: false,
+            rate_ppb: 0,
         }
     }
+}
+
+fn clamp_unix_ns(ns: i128) -> i64 {
+    ns.clamp(0, i128::from(i64::MAX)) as i64
 }
 
 impl SlewedNetworkClock {
@@ -421,83 +454,288 @@ impl SlewedNetworkClock {
         self.initialized
     }
 
-    /// Reads the current estimated Unix time in nanoseconds from a monotonic timestamp.
-    pub fn read_unix_ns(&self, now_mono_ns: u64) -> Option<i128> {
+    /// Slew applied after `elapsed_ns` since the anchor, ns.
+    fn applied_slew(&self, elapsed_ns: i64) -> i64 {
+        let pending = self.pending_adjust_ns;
+        if pending == 0 {
+            return 0;
+        }
+        // Once the slew has run its course (the common case between
+        // exchanges) the whole correction applies: floor(e*ppm/1e6) >= |p|
+        // exactly when e*ppm >= |p|*1e6, so two multiplies replace the
+        // software 64-bit division.
+        if let (Some(budget), Some(needed)) = (
+            elapsed_ns.checked_mul(i64::from(self.max_slew_ppm)),
+            pending.checked_abs().and_then(|p| p.checked_mul(1_000_000)),
+        ) && elapsed_ns >= 0
+            && budget >= needed
+        {
+            return pending;
+        }
+        let max_adjust =
+            crate::timesync_discipline::mul_div_pow10(elapsed_ns, i64::from(self.max_slew_ppm), 1_000_000);
+        pending.clamp(-max_adjust, max_adjust)
+    }
+
+    fn read_ns(&self, now_mono_ns: u64) -> Option<i64> {
         if !self.initialized {
             return None;
         }
-
-        let elapsed_ns = now_mono_ns.saturating_sub(self.anchor_mono_ns) as i128;
-        let max_adjust_ns = elapsed_ns.saturating_mul(self.max_slew_ppm as i128) / 1_000_000;
-        let applied_adjust_ns = if self.pending_adjust_ns >= 0 {
-            self.pending_adjust_ns.min(max_adjust_ns)
+        let elapsed = now_mono_ns.saturating_sub(self.anchor_mono_ns).min(i64::MAX as u64) as i64;
+        let rate = if self.rate_ppb == 0 {
+            0
         } else {
-            -(-self.pending_adjust_ns).min(max_adjust_ns)
+            crate::timesync_discipline::mul_div_pow10(elapsed, self.rate_ppb, 1_000_000_000)
         };
-
         Some(
             self.anchor_unix_ns
-                .saturating_add(elapsed_ns)
-                .saturating_add(applied_adjust_ns),
+                .saturating_add(elapsed)
+                .saturating_add(rate)
+                .saturating_add(self.applied_slew(elapsed)),
         )
+    }
+
+    /// Reads the current estimated Unix time in nanoseconds from a monotonic timestamp.
+    pub fn read_unix_ns(&self, now_mono_ns: u64) -> Option<i128> {
+        self.read_ns(now_mono_ns).map(i128::from)
     }
 
     /// Reads the current estimated Unix time in milliseconds from a monotonic timestamp.
     pub fn read_unix_ms(&self, now_mono_ns: u64) -> Option<u64> {
-        let unix_ns = self.read_unix_ns(now_mono_ns)?;
-        if unix_ns < 0 {
-            return None;
-        }
-        u64::try_from(unix_ns / 1_000_000).ok()
+        let unix_ns = self.read_ns(now_mono_ns)?;
+        (unix_ns >= 0).then(|| crate::timesync_discipline::div_u64_1e6(unix_ns as u64))
     }
 
-    /// Corrects a gross forward error only after the caller validates a fresh
-    /// request/response exchange with its currently elected source. Announce
-    /// traffic and ordinary source updates must continue using `steer_unix_ms`.
-    /// Backward and <=5-second corrections retain the configured slew policy.
-    pub(crate) fn steer_verified_response_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
-        let target_ns = (target_unix_ms as i128) * 1_000_000;
-        if self.max_slew_ppm != 0
-            && self.read_unix_ns(now_mono_ns).is_some_and(|current| {
-                target_ns.saturating_sub(current) > TIMESYNC_STEP_THRESHOLD_MS as i128 * 1_000_000
-            })
-        {
-            self.anchor_mono_ns = now_mono_ns;
-            self.anchor_unix_ns = target_ns;
-            self.pending_adjust_ns = 0;
-            return;
+    /// `read_unix_ms(now_mono_ns).is_some()` without the millisecond division.
+    pub(crate) fn has_unix_time(&self, now_mono_ns: u64) -> bool {
+        self.read_ns(now_mono_ns).is_some_and(|unix_ns| unix_ns >= 0)
+    }
+
+    /// Reads the clock at a monotonic instant that may precede the current
+    /// anchor (a stamp taken before the last steering update), Unix ns.
+    pub fn read_unix_ns_at(&self, mono_ns: u64) -> Option<i64> {
+        if mono_ns >= self.anchor_mono_ns {
+            return self.read_ns(mono_ns);
         }
-        self.steer_unix_ms(now_mono_ns, target_unix_ms);
+        let before = (self.anchor_mono_ns - mono_ns).min(i64::MAX as u64) as i64;
+        let anchor = self.read_ns(self.anchor_mono_ns)?;
+        Some(anchor - before - crate::timesync_discipline::mul_div(before, self.rate_ppb, 1_000_000_000))
+    }
+
+    /// Correction still to be slewed out at `now_mono_ns`, ns (signed:
+    /// positive when the clock reads behind its target).
+    pub fn pending_signed_ns(&self, now_mono_ns: u64) -> i64 {
+        if !self.initialized {
+            return 0;
+        }
+        let elapsed = now_mono_ns.saturating_sub(self.anchor_mono_ns).min(i64::MAX as u64) as i64;
+        self.pending_adjust_ns - self.applied_slew(elapsed)
+    }
+
+    /// Correction still to be slewed out at `now_mono_ns`, ns (absolute).
+    pub fn pending_ns(&self, now_mono_ns: u64) -> u64 {
+        self.pending_signed_ns(now_mono_ns).unsigned_abs()
+    }
+
+    /// Learned frequency correction, ppb.
+    pub fn rate_ppb(&self) -> i64 {
+        self.rate_ppb
+    }
+
+    /// Disciplines the clock toward a two-way-exchange target: sets the
+    /// learned frequency and slews the remaining phase error. `allow_step`
+    /// re-anchors directly (only before the follower first locks).
+    pub(crate) fn discipline_ns(
+        &mut self,
+        now_mono_ns: u64,
+        target_unix_ns: i64,
+        rate_ppb: i64,
+        allow_step: bool,
+    ) {
+        let current = self.read_ns(now_mono_ns);
+        self.rate_ppb = rate_ppb;
+        self.anchor_mono_ns = now_mono_ns;
+        match current {
+            Some(current) if !allow_step => {
+                self.anchor_unix_ns = current;
+                self.pending_adjust_ns = target_unix_ns.saturating_sub(current);
+            }
+            _ => {
+                self.anchor_unix_ns = target_unix_ns;
+                self.pending_adjust_ns = 0;
+            }
+        }
+        self.initialized = true;
+    }
+
+    /// Steers toward an absolute reading with nanosecond resolution.
+    pub fn steer_unix_ns(&mut self, now_mono_ns: u64, target_unix_ns: i64) {
+        let current = self.read_ns(now_mono_ns);
+        self.anchor_mono_ns = now_mono_ns;
+        match current {
+            Some(current) => {
+                self.anchor_unix_ns = current;
+                // The target is an absolute observation at `now`, not an
+                // incremental correction: it replaces the residual error.
+                self.pending_adjust_ns = target_unix_ns.saturating_sub(current);
+            }
+            None => {
+                self.anchor_unix_ns = target_unix_ns;
+                self.pending_adjust_ns = 0;
+                self.initialized = true;
+            }
+        }
     }
 
     /// Re-anchors the clock at a target reading in either direction. Callers use
     /// this only when replacing unanchored time with time traceable to UTC.
     pub(crate) fn step_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
         self.anchor_mono_ns = now_mono_ns;
-        self.anchor_unix_ns = (target_unix_ms as i128) * 1_000_000;
+        self.anchor_unix_ns = clamp_unix_ns(i128::from(target_unix_ms) * 1_000_000);
         self.pending_adjust_ns = 0;
         self.initialized = true;
     }
 
     /// Steers the clock toward a target Unix millisecond reading at the configured slew rate.
     pub fn steer_unix_ms(&mut self, now_mono_ns: u64, target_unix_ms: u64) {
-        let target_unix_ns = (target_unix_ms as i128) * 1_000_000;
-        if !self.initialized {
-            self.anchor_mono_ns = now_mono_ns;
-            self.anchor_unix_ns = target_unix_ns;
-            self.pending_adjust_ns = 0;
-            self.initialized = true;
-            return;
-        }
-
-        let current_unix_ns = self.read_unix_ns(now_mono_ns).unwrap_or(target_unix_ns);
-        self.anchor_mono_ns = now_mono_ns;
-        self.anchor_unix_ns = current_unix_ns;
-        // The target is an absolute observation at `now`, not an incremental
-        // correction. Repeated observations must replace the residual error.
-        self.pending_adjust_ns = target_unix_ns.saturating_sub(current_unix_ns);
-        self.initialized = true;
+        self.steer_unix_ns(now_mono_ns, clamp_unix_ns(i128::from(target_unix_ms) * 1_000_000));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Time sync exchange (SEDSnet 5 wire format; 4.x nodes do not interoperate).
+//
+// Request  [seq, t1]: seq bits 0..29 are the counter, bit 29 flags a UTC
+//          report in t1, bits 32..64 the target tag. Otherwise t1 is the
+//          requester's monotonic millisecond cookie; the precise transmit
+//          instant is kept locally.
+// Response [seq, t1, t2, t3] (NTP interleaved mode):
+//          t2 = bits 0..56 responder network time in microseconds when the
+//               request was received; bit 63 = responder synced; bits 56..63
+//               = responder error bound code (timesync_discipline).
+//          t3 = bits 0..56 network microseconds at which the responder's
+//               PREVIOUS response to this requester actually left; bits
+//               56..64 = low byte of that previous request's counter. 0 when
+//               no earlier response is known.
+// Responder queueing becomes turnaround, not path delay. No frame grew.
+// ---------------------------------------------------------------------------
+
+/// Request seq flag: the t1 word carries an absolute-time (UTC) report.
+pub const TIMESYNC_UTC_REPORT: u64 = 1 << 29;
+/// Request counter bits of the seq word.
+pub const TIMESYNC_SEQ_COUNTER_MASK: u64 = (1 << 29) - 1;
+const UTC_REPORT_OFFSET_BITS: u32 = 41;
+
+/// Packs a UTC report into a request's t1 word: bits 0..41 signed offset in
+/// microseconds (reference UTC minus the requester's network time, +-12 days),
+/// bits 41..48 error code, bits 48..64 a cookie that keeps the word unique.
+/// Returns `None` when the offset does not fit (the report is then not sent;
+/// it is never wrapped).
+pub fn encode_utc_report_word(offset_us: i64, error_code: u8, cookie: u16) -> Option<u64> {
+    let limit = 1i64 << (UTC_REPORT_OFFSET_BITS - 1);
+    if offset_us <= -limit || offset_us >= limit {
+        return None;
+    }
+    let offset = (offset_us as u64) & ((1 << UTC_REPORT_OFFSET_BITS) - 1);
+    Some(offset | (u64::from(error_code & 0x7F) << UTC_REPORT_OFFSET_BITS) | (u64::from(cookie) << 48))
+}
+
+/// Unpacks [`encode_utc_report_word`]: (offset microseconds, error code).
+pub fn decode_utc_report_word(word: u64) -> (i64, u8) {
+    let raw = word & ((1 << UTC_REPORT_OFFSET_BITS) - 1);
+    let shift = 64 - UTC_REPORT_OFFSET_BITS;
+    (((raw << shift) as i64) >> shift, ((word >> UTC_REPORT_OFFSET_BITS) & 0x7F) as u8)
+}
+
+/// An absolute-time report a follower sent with its request: the follower's
+/// own UTC reference (e.g. GPS) minus network time, as the follower measured
+/// it. Followers are synced to this node, so it measures this node's
+/// network-time error against that reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtcReferenceReport {
+    /// [`timesync_sender_tag`] of the reporting follower.
+    pub sender_tag: u32,
+    /// Reference UTC minus network time, ns.
+    pub offset_ns: i64,
+    /// Error bound of the report (reference error plus the follower's sync error), ns.
+    pub error_ns: u64,
+    /// Local monotonic receive instant, ns.
+    pub received_mono_ns: u64,
+}
+const V2_TIME_MASK: u64 = (1 << 56) - 1;
+
+/// Packs a v2 response t2 word.
+pub fn encode_v2_receive_word(t2_unix_us: u64, synced: bool, error_code: u8) -> u64 {
+    (t2_unix_us & V2_TIME_MASK)
+        | (u64::from(error_code & 0x7F) << 56)
+        | if synced { 1 << 63 } else { 0 }
+}
+
+/// Unpacks a v2 response t2 word: (unix microseconds, synced, error code).
+pub fn decode_v2_receive_word(word: u64) -> (u64, bool, u8) {
+    (word & V2_TIME_MASK, word >> 63 == 1, ((word >> 56) & 0x7F) as u8)
+}
+
+/// Packs a v2 response t3 word for the previous exchange.
+pub fn encode_v2_transmit_word(prev_counter: u64, t3_unix_us: u64) -> u64 {
+    (t3_unix_us & V2_TIME_MASK) | ((prev_counter & 0xFF) << 56)
+}
+
+/// Unpacks a v2 response t3 word: (previous counter low byte, unix microseconds).
+/// `None` when the responder had no earlier transmit stamp.
+pub fn decode_v2_transmit_word(word: u64) -> Option<(u8, u64)> {
+    (word != 0).then_some(((word >> 56) as u8, word & V2_TIME_MASK))
+}
+
+/// Per-node time sync quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSyncStatus {
+    /// Lock state.
+    pub state: crate::timesync_discipline::SyncState,
+    /// Hops from the reference: 0 for the reference itself.
+    pub stratum: u8,
+    /// Estimated error bound of network time, ns (`u64::MAX` when unknown).
+    pub error_bound_ns: u64,
+    /// Correction still being slewed out, ns (positive: clock is behind).
+    pub offset_ns: i64,
+    /// Learned oscillator frequency correction, ppb.
+    pub rate_ppb: i64,
+    /// Age of the newest accepted exchange sample, ms (`u64::MAX` when none).
+    pub last_sample_age_ms: u64,
+    /// The node is the reference others follow.
+    pub is_reference: bool,
+}
+
+impl TimeSyncStatus {
+    /// One-byte health summary for spare BOARD_HEALTH bits.
+    ///
+    /// Bit 7: synced (locked or holdover). Bits 0..7: 0 = not reported (a
+    /// board without this firmware leaves the bits zero), 1..=126 = error
+    /// bound code + 1 (see [`crate::timesync_discipline::encode_error_code`],
+    /// codes above 125 saturate), 127 = bound unknown.
+    pub fn health_byte(&self) -> u8 {
+        let low = if self.error_bound_ns == u64::MAX {
+            127
+        } else {
+            crate::timesync_discipline::encode_error_code(self.error_bound_ns).min(125) + 1
+        };
+        low | if self.state.is_synced() { 0x80 } else { 0 }
+    }
+}
+
+/// Decodes [`TimeSyncStatus::health_byte`]: `None` when not reported, else
+/// (synced, error bound ns or `u64::MAX` when unknown).
+pub fn decode_health_byte(byte: u8) -> Option<(bool, u64)> {
+    let low = byte & 0x7F;
+    if low == 0 {
+        return None;
+    }
+    let bound = if low == 127 {
+        u64::MAX
+    } else {
+        crate::timesync_discipline::decode_error_code(low - 1)
+    };
+    Some((byte & 0x80 != 0, bound))
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +856,41 @@ impl NetworkClock {
     }
 
     /// Like [`Self::current_time`], using only sources whose identifier passes `keep`.
+    /// `current_time_filtered(..).unix_time_ms` without building the calendar
+    /// reading in the usual case (a complete source and a time before 2262).
+    pub(crate) fn current_unix_ms_filtered(
+        &self,
+        now_mono_ns: u64,
+        keep: impl Fn(&str) -> bool,
+    ) -> Option<u64> {
+        {
+            let sources: Vec<(&str, &NetworkTimeSourceState)> = self
+                .sources
+                .iter()
+                .filter(|(name, _)| keep(name.as_str()))
+                .map(|(name, src)| (name.as_str(), src.as_ref()))
+                .collect();
+            if sources.is_empty() {
+                return None;
+            }
+            let full = best_source(&sources, |src| src.time.to_network_time().is_some());
+            if let Some((_, src)) = full
+                && let Some(base_ns) = src.time.to_network_time().and_then(|base| base.as_unix_ns())
+            {
+                let elapsed_ns = now_mono_ns.saturating_sub(src.anchor_mono_ns);
+                // In [0, i64::MAX] the calendar round trip is exact and lands
+                // on floor(ns / 1e6); anything else takes the full path.
+                if let Ok(ns) = u64::try_from(base_ns + elapsed_ns as i128)
+                    && ns <= i64::MAX as u64
+                {
+                    return Some(crate::timesync_discipline::div_u64_1e6(ns));
+                }
+            }
+        }
+        self.current_time_filtered(now_mono_ns, keep)
+            .and_then(|reading| reading.unix_time_ms)
+    }
+
     pub(crate) fn current_time_filtered(
         &self,
         now_mono_ns: u64,
@@ -738,7 +1011,11 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 fn civil_from_days(mut z: u64) -> Option<(i32, u32, u32)> {
     z += 719_468;
-    let era = z / 146_097;
+    // Days fit 32 bits for 11 million years: divide in hardware then.
+    let era = match u32::try_from(z) {
+        Ok(z) => u64::from(z / 146_097),
+        Err(_) => z / 146_097,
+    };
     // A Gregorian era contains exactly 146097 days. Its remaining
     // arithmetic fits in 32 bits, avoiding repeated software i64 divisions
     // on Cortex-M while retaining the full representable year range.
@@ -1308,178 +1585,176 @@ mod slew_absolute_target_tests {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
-mod verified_forward_response_tests {
-    use super::*;
-    use crate::router::{Router, RouterConfig};
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
-    const EPOCH: u64 = 1_783_000_000_000;
-    type Requests = Arc<Mutex<Vec<(u64, u64)>>>;
-    fn fixture() -> (Router, Arc<AtomicU64>, Requests) {
-        let now = Arc::new(AtomicU64::new(0));
-        let read = now.clone();
-        let router = Router::new_with_clock(
-            RouterConfig::default().with_timesync(TimeSyncConfig {
-                role: TimeSyncRole::Consumer,
-                source_timeout_ms: 5000,
-                consumer_promotion_enabled: false,
-                ..Default::default()
-            }),
-            Box::new(move || read.load(Ordering::SeqCst)),
-        );
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let capture = requests.clone();
-        router.add_side_packet("capture", move |packet| {
-            if packet.data_type() == DataType::TimeSyncRequest {
-                let words = packet.data_as_u64()?;
-                capture.lock().unwrap().push((words[0], words[1]));
+
+/// The Cortex-M fast paths (no 64/128-bit software division) give exactly
+/// the results of the straightforward formulas they replaced.
+#[cfg(test)]
+mod fast_path_equivalence_tests {
+    use super::{NetworkClock, NetworkTime, PartialNetworkTime, SlewedNetworkClock, civil_from_days};
+    use crate::timesync_discipline::{div_u64_1e6, div_u64_1e9, div_u64_small, mul_div, mul_div_pow10};
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// Values of every magnitude, not only huge ones.
+        fn wide(&mut self) -> u64 {
+            let bits = self.next() % 65;
+            if bits == 0 { 0 } else { self.next() >> (64 - bits) }
+        }
+    }
+
+    fn reference_from_unix_ns(unix_ns: i128) -> Option<NetworkTime> {
+        if unix_ns < 0 {
+            return None;
+        }
+        let secs = u64::try_from(unix_ns / 1_000_000_000).ok()?;
+        let nanos = unix_ns.rem_euclid(1_000_000_000) as u32;
+        let (year, month, day) = civil_from_days(secs / 86_400)?;
+        let sod = (secs % 86_400) as u32;
+        Some(NetworkTime {
+            year,
+            month: month as u8,
+            day: day as u8,
+            hour: (sod / 3_600) as u8,
+            minute: ((sod % 3_600) / 60) as u8,
+            second: (sod % 60) as u8,
+            nanosecond: nanos,
+        })
+    }
+
+    fn reference_as_unix_ms(t: &NetworkTime) -> Option<u64> {
+        let ns = t.as_unix_ns()?;
+        if ns < 0 {
+            return None;
+        }
+        u64::try_from(ns / 1_000_000).ok()
+    }
+
+    fn reference_read_ns(anchor_unix: i64, pending: i64, ppm: u32, rate: i64, elapsed: i64) -> i64 {
+        let max_adjust = mul_div(elapsed, i64::from(ppm), 1_000_000);
+        let slew = pending.clamp(-max_adjust, max_adjust);
+        anchor_unix
+            .saturating_add(elapsed)
+            .saturating_add(mul_div(elapsed, rate, 1_000_000_000))
+            .saturating_add(slew)
+    }
+
+    #[test]
+    fn small_divisor_division_is_exact() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let edges = [0, 1, 999_999, 1_000_000, 1_000_000_000, u64::MAX, u64::MAX - 1, 1 << 63, (1 << 63) - 1];
+        let randoms: Vec<u64> = (0..200_000).map(|_| rng.wide()).collect();
+        for x in edges.into_iter().chain(randoms) {
+            assert_eq!(div_u64_1e6(x), x / 1_000_000, "{x}");
+            assert_eq!(div_u64_1e9(x), x / 1_000_000_000, "{x}");
+            let d = (rng.next() % ((1 << 21) - 1)) as u32 + 1;
+            assert_eq!(div_u64_small(x, d), x / u64::from(d), "{x}/{d}");
+        }
+    }
+
+    #[test]
+    fn pow10_scaling_matches_mul_div_including_overflow_and_signs() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for _ in 0..200_000 {
+            let a = rng.wide() as i64;
+            let b = (rng.wide() >> 33) as i64 * if rng.next() & 1 == 0 { 1 } else { -1 };
+            for c in [1_000_000, 1_000_000_000] {
+                assert_eq!(mul_div_pow10(a, b, c), mul_div(a, b, c), "{a}*{b}/{c}");
             }
-            Ok(())
-        });
-        router
-            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH - 466_000).unwrap())
-            .unwrap();
-        router.process_tx_queue().unwrap();
-        assert!(!requests.lock().unwrap().is_empty());
-        (router, now, requests)
-    }
-    fn response(sender: &'static str, seq: u64, t1: u64, t2: u64, t3: u64) -> Packet {
-        let packet = build_timesync_response(seq, t1, t2, t3).unwrap();
-        Packet::new(
-            DataType::TimeSyncResponse,
-            &[DataEndpoint::TimeSync],
-            sender,
-            packet.timestamp(),
-            packet.payload().into(),
-        )
-        .unwrap()
-    }
-    #[test]
-    fn verified_forward_threshold_and_backward_slew_are_monotonic() {
-        for (offset, expected) in [(5000, 10_000), (5001, 15_001)] {
-            let mut clock = SlewedNetworkClock::new(50_000);
-            clock.steer_unix_ms(0, 10_000);
-            clock.steer_verified_response_ms(0, 10_000 + offset);
-            assert_eq!(clock.read_unix_ms(0), Some(expected));
         }
-        let mut clock = SlewedNetworkClock::new(50_000);
-        clock.steer_unix_ms(0, EPOCH);
-        clock.steer_verified_response_ms(0, EPOCH - 466_000);
-        assert_eq!(clock.read_unix_ms(0), Some(EPOCH));
-        assert_eq!(clock.read_unix_ms(1_000_000_000), Some(EPOCH + 950));
-        let mut disabled = SlewedNetworkClock::new(0);
-        disabled.steer_unix_ms(0, EPOCH);
-        disabled.steer_verified_response_ms(0, EPOCH + 466_000);
-        assert_eq!(disabled.read_unix_ms(0), Some(EPOCH));
+        for (a, b) in [(i64::MIN, 1), (i64::MAX, 1), (i64::MIN, -1), (i64::MAX, 999_999), (-1, 1)] {
+            for c in [1_000_000, 1_000_000_000] {
+                assert_eq!(mul_div_pow10(a, b, c), mul_div(a, b, c), "{a}*{b}/{c}");
+            }
+        }
     }
+
     #[test]
-    fn fresh_elected_response_recovers_minutes_in_one_exchange_and_is_consumed() {
-        let (router, now, requests) = fixture();
-        let (seq, t1) = requests.lock().unwrap()[0];
-        now.store(200, Ordering::SeqCst);
-        // Announce alone cannot hard-correct an already initialized clock.
-        router
-            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH + 200).unwrap())
-            .unwrap();
-        assert!(router.network_time_ms().unwrap() < EPOCH);
-        router
-            .rx(&response("GS", seq, t1, EPOCH + 100, EPOCH + 100))
-            .unwrap();
-        assert_eq!(router.network_time_ms(), Some(EPOCH + 200));
-        now.store(250, Ordering::SeqCst);
-        router
-            .rx(&response(
-                "GS",
-                seq,
-                t1,
-                EPOCH + 1_000_000,
-                EPOCH + 1_000_000,
-            ))
-            .unwrap();
-        assert_eq!(
-            router.network_time_ms(),
-            Some(EPOCH + 250),
-            "consumed challenge cannot be replayed with fresh packet metadata"
-        );
+    fn calendar_conversions_match_the_128_bit_formulas() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let edges: [i128; 8] = [
+            -1,
+            0,
+            1_767_225_600_123_456_789,
+            i128::from(u32::MAX) * 1_000_000_000,
+            i128::from(u32::MAX) * 1_000_000_000 + 999_999_999,
+            i128::from(u64::MAX),
+            i128::from(u64::MAX) + 1,
+            i128::MAX,
+        ];
+        let randoms: Vec<i128> = (0..100_000)
+            .map(|_| {
+                let scale = if rng.next().is_multiple_of(4) { i128::from(rng.wide() % 1_000) } else { 1 };
+                let v = i128::from(rng.wide()) * scale;
+                if rng.next().is_multiple_of(16) { -v } else { v }
+            })
+            .collect();
+        for ns in edges.into_iter().chain(randoms) {
+            let fast = NetworkTime::from_unix_ns(ns);
+            assert_eq!(fast, reference_from_unix_ns(ns), "{ns}");
+            if let Some(t) = fast {
+                assert_eq!(t.as_unix_ms(), reference_as_unix_ms(&t), "{t:?}");
+            }
+        }
+        for year in [i32::MIN, -1, 0, 1969, 1970, 2026, 2106, 2262, 2263, 2554, i32::MAX] {
+            let t = NetworkTime { year, month: 7, day: 4, hour: 23, minute: 59, second: 59, nanosecond: 999_999_999 };
+            assert_eq!(t.as_unix_ms(), reference_as_unix_ms(&t), "{year}");
+        }
     }
+
     #[test]
-    fn malformed_wrong_source_or_expired_responses_cannot_rebase() {
-        for case in 0..7 {
-            let (router, now, requests) = fixture();
-            let (seq, t1) = requests.lock().unwrap()[0];
-            let elapsed = if case == 4 { 5001 } else { 200 };
-            now.store(elapsed, Ordering::SeqCst);
-            let before = router.network_time_ms().unwrap();
-            let packet = match case {
-                0 => response("other", seq, t1, EPOCH, EPOCH),
-                1 => response("GS", seq + 1, t1, EPOCH, EPOCH),
-                2 => response("GS", seq, t1 + 1, EPOCH, EPOCH),
-                3 => response("GS", seq, t1, EPOCH + 1, EPOCH),
-                5 => response("GS", seq, t1, EPOCH, EPOCH + 201),
-                6 => response("GS", seq, 201, EPOCH, EPOCH),
-                _ => response("GS", seq, t1, EPOCH, EPOCH),
-            };
-            router.rx(&packet).unwrap();
+    fn slewed_clock_reads_match_the_reference_formula() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        for _ in 0..50_000 {
+            let ppm = [0u32, 1, 50, 500, 50_000, 999_999][(rng.next() % 6) as usize];
+            let mut clock = SlewedNetworkClock::new(ppm);
+            let anchor_mono = rng.next() % (1 << 50);
+            let target = (rng.next() % (1 << 62)) as i64;
+            let rate = (rng.next() % 40_000_001) as i64 - 20_000_000;
+            clock.discipline_ns(anchor_mono, target, rate, true);
+            // A second steer leaves a pending correction to slew out.
+            let later = anchor_mono + rng.next() % (1 << 40);
+            let offset = (rng.wide() >> 1) as i64 % 10_000_000_000 * if rng.next() & 1 == 0 { 1 } else { -1 };
+            let before = clock.read_unix_ns(later).unwrap() as i64;
+            clock.discipline_ns(later, before.saturating_add(offset), rate, false);
+            for _ in 0..4 {
+                let now = later + rng.wide() % (1 << 46);
+                let elapsed = (now - later).min(i64::MAX as u64) as i64;
+                let expect = reference_read_ns(clock.anchor_unix_ns, clock.pending_adjust_ns, ppm, rate, elapsed);
+                assert_eq!(clock.read_unix_ns(now), Some(i128::from(expect)));
+                let ms = (expect >= 0).then_some(expect as u64 / 1_000_000);
+                assert_eq!(clock.read_unix_ms(now), ms);
+                assert_eq!(clock.has_unix_time(now), ms.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn source_clock_millisecond_read_matches_the_calendar_reading() {
+        let mut rng = Rng(0x0F1E_2D3C_4B5A_6978);
+        for _ in 0..5_000 {
+            let mut clock = NetworkClock::default();
+            let base_ms = rng.next() % 9_000_000_000_000;
+            let anchor = rng.next() % (1 << 40);
+            if rng.next().is_multiple_of(3) {
+                // Date and time from separate sources (the merged path).
+                let full = PartialNetworkTime::from_unix_ms(base_ms);
+                clock.update_source("date", 1, PartialNetworkTime { hour: None, minute: None, second: None, nanosecond: None, ..full }, 0, anchor, None);
+                clock.update_source("tod", 2, PartialNetworkTime { year: None, month: None, day: None, ..full }, 0, anchor, None);
+            } else {
+                clock.update_source("gps", 1, PartialNetworkTime::from_unix_ms(base_ms), 0, anchor, None);
+            }
+            let now = anchor + rng.wide() % (1 << 50);
             assert_eq!(
-                router.network_time_ms(),
-                Some(before),
-                "invalid response case {case}"
+                clock.current_unix_ms_filtered(now, |_| true),
+                clock.current_time_filtered(now, |_| true).and_then(|r| r.unix_time_ms)
             );
+            assert_eq!(clock.current_unix_ms_filtered(now, |_| false), None);
         }
-    }
-    #[test]
-    fn lost_challenge_expires_and_new_exchange_recovers_without_changing_leader() {
-        let (router, now, requests) = fixture();
-        let old = requests.lock().unwrap()[0];
-        now.store(5001, Ordering::SeqCst);
-        router
-            .rx(&build_timesync_announce_with_sender("GS", 1, EPOCH + 5001).unwrap())
-            .unwrap();
-        router.process_tx_queue().unwrap();
-        let fresh = *requests.lock().unwrap().last().unwrap();
-        assert_ne!(
-            fresh.0, old.0,
-            "lost challenge must not block subsequent requests forever"
-        );
-        let before = router.network_time_ms().unwrap();
-        router
-            .rx(&response(
-                "GS",
-                old.0,
-                old.1,
-                EPOCH + 50_000,
-                EPOCH + 50_000,
-            ))
-            .unwrap();
-        assert_eq!(
-            router.network_time_ms(),
-            Some(before),
-            "expired challenge cannot be reused after retry"
-        );
-        now.store(5101, Ordering::SeqCst);
-        router
-            .rx(&response(
-                "GS",
-                fresh.0,
-                fresh.1,
-                EPOCH + 5051,
-                EPOCH + 5051,
-            ))
-            .unwrap();
-        assert_eq!(router.network_time_ms(), Some(EPOCH + 5101));
-    }
-    #[test]
-    fn response_from_retired_leader_cannot_correct_clock() {
-        let (router, now, requests) = fixture();
-        let (seq, t1) = requests.lock().unwrap()[0];
-        now.store(100, Ordering::SeqCst);
-        router
-            .rx(&build_timesync_announce_with_sender("replacement", 0, EPOCH - 465_900).unwrap())
-            .unwrap();
-        let before = router.network_time_ms().unwrap();
-        router.rx(&response("GS", seq, t1, EPOCH, EPOCH)).unwrap();
-        assert_eq!(router.network_time_ms(), Some(before));
     }
 }

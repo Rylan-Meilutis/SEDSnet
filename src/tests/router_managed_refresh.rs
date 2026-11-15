@@ -1400,13 +1400,19 @@ fn generic_managed_refresh_actual_native_layout_and_queue_charge() {
     let current = super::ManagedVariableCacheEntry {
         packet,
         sender_address: 1,
+        packet_is_own: true,
+        own: None,
         cached_at_ms: 3,
         upstream: None,
     };
     assert_eq!(current.packet.timestamp(), 99);
     let old_size = std::mem::size_of::<OldCacheEntry>();
     let new_size = std::mem::size_of::<super::ManagedVariableCacheEntry>();
-    let field = std::mem::size_of::<Option<core::num::NonZeroUsize>>();
+    // The upstream side plus the router's own value (one pointer, empty
+    // unless a received report replaced the router's own write; its flag
+    // shares the sender address's padding).
+    let field = std::mem::size_of::<Option<core::num::NonZeroUsize>>()
+        + std::mem::size_of::<Option<Box<crate::packet::Packet>>>();
     assert!(new_size >= old_size && new_size - old_size <= field);
     let mut route = super::DiscoverySideState::default();
     let before = super::RouterInner::discovery_route_byte_cost(0, &route);

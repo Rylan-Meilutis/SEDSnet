@@ -51,6 +51,9 @@ mod ingress_target_filter_tests;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
 #[path = "tests/payload_codec_negotiation.rs"]
 mod payload_codec_negotiation;
+#[cfg(all(test, feature = "std", feature = "compact-bundle"))]
+#[path = "tests/compact_bundle.rs"]
+mod compact_bundle_tests;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/reliable_tx_window_backpressure.rs"]
 mod reliable_tx_window_backpressure_tests;
@@ -78,6 +81,24 @@ use crate::side_transport::{
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
+#[cfg(all(test, feature = "discovery"))]
+#[path = "tests/forget_peer.rs"]
+mod forget_peer;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/returning_owner.rs"]
+mod returning_owner;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/silent_station_sim.rs"]
+mod silent_station_sim;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/proxy_upstream_receipt.rs"]
+mod proxy_upstream_receipt;
+#[cfg(all(test, feature = "discovery"))]
+#[path = "tests/side_peek.rs"]
+mod side_peek_tests;
+#[cfg(all(test, feature = "discovery"))]
+#[path = "tests/own_network_variable.rs"]
+mod own_network_variable;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_split_horizon.rs"]
 mod ack_split_horizon;
@@ -154,6 +175,223 @@ mod compact_summary_tests {
         now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
         assert!(router.process_end_to_end_reliable_timeouts().is_err());
         assert!(router.state.lock().end_to_end_reliable_tx.is_empty());
+        let exhausted = router.export_runtime_stats().reliable.exhausted;
+        assert_eq!((exhausted.end_to_end_ordered, exhausted.end_to_end_unordered), (1, 0), "only the head ran out of retries");
+    }
+    /// An Unordered end-to-end delivery that runs out of retries is dropped
+    /// alone and with no error, but counted, and kept (the most recent
+    /// eight) for the application to log.
+    #[test]
+    #[cfg(feature = "std")]
+    fn unordered_end_to_end_exhaustion_is_counted_and_kept() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        let ty = crate::config::register_data_type_with_description(
+            "UNORDERED_EXHAUSTION_COUNT",
+            "unordered exhaustion",
+            MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[ep],
+            crate::ReliableMode::Unordered,
+            200,
+        )
+        .unwrap();
+        let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+        let clock = now.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([]),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        );
+        let mut ids = Vec::new();
+        for index in 0..10u8 {
+            let packet = Packet::new(ty, &[ep], "SOURCE", u64::from(index) + 1, Arc::<[u8]>::from([index])).unwrap();
+            ids.push(packet.packet_id());
+            router.register_end_to_end_reliable_tx(&RouterItem::Packet(packet), None).unwrap();
+        }
+        // One left with retries to spare stays pending.
+        let spared = ids[9];
+        {
+            let mut state = router.state.lock();
+            for (id, sent) in state.end_to_end_reliable_tx.iter_mut() {
+                sent.queued = false;
+                if *id != spared {
+                    sent.retries = runtime_reliable_max_retries();
+                }
+            }
+        }
+        now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
+        router.process_end_to_end_reliable_timeouts().unwrap();
+        assert_eq!(router.state.lock().end_to_end_reliable_tx.len(), 1, "an Unordered one is dropped alone");
+        let exhausted = router.export_runtime_stats().reliable.exhausted;
+        assert_eq!(exhausted, crate::diagnostics::ReliableExhaustionCounts { end_to_end_unordered: 9, ..Default::default() });
+        let taken = router.take_exhausted_reliable();
+        assert_eq!(taken.len(), 8, "the most recent eight are kept");
+        assert!(taken.iter().all(|e| e.end_to_end && !e.ordered && e.data_type == Some(ty) && ids[..9].contains(&e.packet_id)), "{taken:?}");
+        assert!(router.take_exhausted_reliable().is_empty());
+    }
+    /// End-to-end duplicates: a sender re-sends a reliable frame for up to its
+    /// retry window (4.8 s at the GS). A copy that arrives after 64 other
+    /// packets (the 16-entry recent-RX ring long rolled over) must not reach
+    /// the application again, ordered or not; the receiver still ACKs it so
+    /// the sender stops; a new frame from the same sender is delivered.
+    #[test]
+    fn late_reliable_duplicates_are_not_delivered_twice_but_are_acked() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        for (name, mode) in [
+            ("LATE_DUP_ORDERED", crate::ReliableMode::Ordered),
+            ("LATE_DUP_UNORDERED", crate::ReliableMode::Unordered),
+        ] {
+            let ty = crate::config::register_data_type_with_description(
+                name,
+                "late duplicate",
+                MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+                &[ep],
+                mode,
+                200,
+            )
+            .unwrap();
+            let delivered = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+            let count = delivered.clone();
+            let now = Arc::new(core::sync::atomic::AtomicU64::new(10_000));
+            let clock = now.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new([EndpointHandler::new_packet_handler(ep, move |pkt: &Packet| {
+                    if pkt.data_type() == ty {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                })])
+                .with_sender("FC")
+                // The FC firmware's ring (MAX_RECENT_RX_IDS = 16).
+                .with_memory_config(
+                    crate::config::RuntimeMemoryConfig::new(
+                        crate::config::MAX_QUEUE_BUDGET,
+                        16,
+                        crate::config::STARTING_QUEUE_SIZE,
+                        crate::config::QUEUE_GROW_STEP,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                Box::new(move || clock.load(Ordering::Relaxed)),
+            );
+            let acks = Arc::new(std::sync::Mutex::new(0usize));
+            let seen = acks.clone();
+            let side = router.add_side_packed("RADIO", move |bytes: &[u8]| -> TelemetryResult<()> {
+                if crate::wire_format::unpack_packet(bytes).is_ok_and(|p| p.data_type() == DataType::ReliableAck) {
+                    *seen.lock().unwrap() += 1;
+                }
+                Ok(())
+            });
+            let deploy = Packet::new(ty, &[ep], "GS", 1_767_225_600_000, Arc::<[u8]>::from([7u8])).unwrap();
+            router.rx_from_side(&deploy, side).unwrap();
+            let _ = router.process_all_queues();
+            assert_eq!(delivered.load(Ordering::SeqCst), 1, "{name}");
+            // 64 other reliable packets (like the repro's FLIGHT_BUZZER writes)
+            // roll the recent-RX ring over many times.
+            let other = crate::config::DataType::try_named("LATE_DUP_FILL").unwrap_or_else(|| {
+                crate::config::register_data_type_with_description(
+                    "LATE_DUP_FILL",
+                    "telemetry",
+                    MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+                    &[ep],
+                    crate::ReliableMode::Unordered,
+                    10,
+                )
+                .unwrap()
+            });
+            for i in 0..64u64 {
+                now.fetch_add(20, Ordering::Relaxed);
+                let pkt = Packet::new(other, &[ep], "GS", 1_767_225_600_100 + i, Arc::<[u8]>::from([i as u8])).unwrap();
+                router.rx_from_side(&pkt, side).unwrap();
+                let _ = router.process_all_queues();
+            }
+            // The sender's re-send, 1.3 s later, inside its retry window.
+            let acks_before = *acks.lock().unwrap();
+            router.rx_from_side(&deploy, side).unwrap();
+            let _ = router.process_all_queues();
+            assert_eq!(delivered.load(Ordering::SeqCst), 1, "{name}: the late duplicate was delivered again");
+            assert!(*acks.lock().unwrap() > acks_before, "{name}: the duplicate is still acknowledged");
+            // A new frame from the same sender is delivered.
+            let next = Packet::new(ty, &[ep], "GS", 1_767_225_601_500, Arc::<[u8]>::from([8u8])).unwrap();
+            router.rx_from_side(&next, side).unwrap();
+            let _ = router.process_all_queues();
+            assert_eq!(delivered.load(Ordering::SeqCst), 2, "{name}: a new frame is delivered");
+        }
+    }
+
+    /// A newer status superseding older pending ones (the boards' Abort
+    /// push): completing the older sends works the same whether the type is
+    /// Ordered or Unordered. Ordered releases the newer send at once;
+    /// Unordered leaves the newer send pending and untouched. Either way the
+    /// completed sends are gone and never retransmitted.
+    #[test]
+    fn completing_older_sends_supersedes_them_for_ordered_and_unordered_types() {
+        crate::tests::ensure_common_test_schema();
+        let ep = DataEndpoint::named("RADIO");
+        for (name, mode) in [
+            ("SUPERSEDE_ORDERED", crate::ReliableMode::Ordered),
+            ("SUPERSEDE_UNORDERED", crate::ReliableMode::Unordered),
+        ] {
+            let ty = crate::config::register_data_type_with_description(
+                name,
+                "superseded by a newer send",
+                MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+                &[ep],
+                mode,
+                200,
+            )
+            .unwrap();
+            let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+            let clock = now.clone();
+            let router = Router::new_with_clock(
+                RouterConfig::new([]),
+                Box::new(move || clock.load(Ordering::Relaxed)),
+            );
+            let item = |seq: u64| {
+                RouterItem::Packet(
+                    Packet::new(ty, &[ep], "SOURCE", seq, Arc::<[u8]>::from([seq as u8])).unwrap(),
+                )
+            };
+            let ordered = mode == crate::ReliableMode::Ordered;
+            // Two older sends and the newer one that supersedes them.
+            for seq in 1..=3u64 {
+                assert_eq!(
+                    router.register_end_to_end_reliable_tx(&item(seq), None).unwrap(),
+                    !ordered || seq == 1,
+                    "{name}: send {seq} goes out now unless it waits behind an older one"
+                );
+            }
+            let ids: Vec<u64> = router
+                .state
+                .lock()
+                .end_to_end_reliable_tx_order
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(ids.len(), 3, "{name}");
+            let newest = ids[2];
+            for &older in &ids[..2] {
+                assert_eq!(router.complete_reliable(older), Ok(true), "{name}");
+            }
+            {
+                let state = router.state.lock();
+                assert_eq!(state.end_to_end_reliable_tx.len(), 1, "{name}");
+                let sent = state
+                    .end_to_end_reliable_tx
+                    .get(&newest)
+                    .expect("newer send stays pending");
+                assert!(!sent.waiting_for_predecessor, "{name}: the newer send is free to go");
+            }
+            for &older in &ids[..2] {
+                assert_eq!(router.complete_reliable(older), Ok(false), "{name}");
+            }
+            // Retries continue only for the newer send.
+            now.store(runtime_reliable_retransmit_ms(), Ordering::Relaxed);
+            let _ = router.process_end_to_end_reliable_timeouts();
+            let state = router.state.lock();
+            assert!(state.end_to_end_reliable_tx.keys().all(|id| *id == newest), "{name}");
+        }
     }
     #[test]
     fn compact_reachability_survives_incomplete_detailed_topology() {
@@ -233,7 +471,7 @@ use crate::timesync::{
     NetworkTimeReading, PartialNetworkTime, SlewedNetworkClock, TIMESYNC_MAX_STRATUM,
     TIMESYNC_STEP_THRESHOLD_MS, TIMESYNC_UTC_FLOOR_MS, TimeSyncConfig, TimeSyncLeader,
     TimeSyncQuality, TimeSyncSource, TimeSyncTracker, advance_network_time,
-    compute_network_time_sample, decode_timesync_announce, decode_timesync_quality,
+    decode_timesync_announce, decode_timesync_quality,
     decode_timesync_request, decode_timesync_response, encode_timesync_priority,
     timesync_sender_tag,
 };
@@ -258,7 +496,6 @@ use alloc::{
     borrow::ToOwned,
     boxed::Box,
     collections::VecDeque,
-    format,
     sync::Arc,
     vec,
     vec::Vec,
@@ -1087,6 +1324,7 @@ struct ReliableRxState {
 // separately. The fixed RouterInner sequence is part of object footprint.
 const RELIABLE_RETURN_ROUTE_EXTRA_LOGICAL_BYTES: usize = size_of::<u64>();
 
+
 #[derive(Debug, Clone)]
 struct ReliableReturnRouteState {
     side: RouterSideId,
@@ -1110,6 +1348,11 @@ struct ReliableLocalAdmissionGuard<'a> {
     router: &'a Router,
     packet_id: u64,
     token: u64,
+    // A duplicate of an already-delivered packet on another side than the
+    // one its receipts return to: its receipt also goes back on this side,
+    // toward that side's sender (a cycle's other path, e.g. a segment proxy
+    // forwarding the same write). The return route itself is unchanged.
+    cross_side: Option<RouterSideId>,
 }
 #[cfg(all(test, feature = "std"))]
 std::thread_local! {
@@ -1290,6 +1533,35 @@ enum SchemaResponsePhase {
     CatalogWaiting,
     CatalogBuilding,
     Owned,
+}
+
+#[cfg(feature = "discovery")]
+const HEARD_REQUESTS_MAX: u8 = 3;
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Copy, Default)]
+struct HeardSenderState {
+    undescribed: Option<(u64, u64)>,
+    /// Topology requests made for `undescribed`: it stops arming after
+    /// HEARD_REQUESTS_MAX (a sender that never announces must not keep asking).
+    heard_requests: u8,
+    described: (u32, u64),
+    /// The next topology-request interval on this side while something stays
+    /// undescribed: 1 s, 2 s, 4 s, then 5 s; back to 1 s once described.
+    retry_ms: u32,
+}
+
+#[cfg(feature = "discovery")]
+#[inline(never)]
+fn heard_slot(heard: &mut Vec<(RouterSideId, HeardSenderState)>, side: RouterSideId) -> &mut HeardSenderState {
+    let index = match heard.iter().position(|(s, _)| *s == side) {
+        Some(index) => index,
+        None => {
+            heard.push((side, HeardSenderState::default()));
+            heard.len() - 1
+        }
+    };
+    &mut heard[index].1
 }
 
 #[cfg(feature = "discovery")]
@@ -2553,7 +2825,17 @@ impl LocalServicesState {
 struct ForwardedReceiptCache {
     destinations: OrdMap<u64, OrdSet<u64>>,
     order: VecDeque<u64>,
+    /// Receipt replays answered for a satisfied duplicate: (last ms, count).
+    replays: OrdMap<u64, (u64, u8)>,
 }
+
+/// A relay answers a duplicate whose every owner already acknowledged at most
+/// this many times per packet, once per reliable retransmit interval, with at
+/// most `FORWARDED_RECEIPT_REPLAY_OWNERS` cached receipts each time.
+#[cfg(feature = "discovery")]
+const FORWARDED_RECEIPT_REPLAY_MAX: u8 = 4;
+#[cfg(feature = "discovery")]
+const FORWARDED_RECEIPT_REPLAY_OWNERS: usize = 4;
 
 // A send leaf borrows proof of the existing side gate; it never re-enters it.
 struct SideTxAdmission<'a> {
@@ -2563,6 +2845,10 @@ struct SideTxAdmission<'a> {
     #[cfg(not(feature = "std"))]
     _guard: crate::lock::ReentryGuard<'a>,
 }
+
+/// Reliable deliveries given up kept for `take_exhausted_reliable` (std).
+#[cfg(feature = "std")]
+const EXHAUSTED_RECENT: usize = 8;
 
 struct RouterInner {
     #[cfg(feature = "std")]
@@ -2602,6 +2888,18 @@ struct RouterInner {
     ordered_claim_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
+    /// Reliable end-to-end packets delivered within the senders' retry
+    /// window: (id, receive ms). The recent-RX ring alone rolls over within
+    /// a second on a busy board (16 ids on the FC), so a sender's late
+    /// re-send would reach the application again.
+    e2e_rx_seen: VecDeque<(u64, u64)>,
+
+    /// Reliable end-to-end types: the last `ORDERED_RX_HISTORY` packet ids
+    /// delivered per type. An ordered sender re-sends only its head (it
+    /// holds the next until that is acknowledged), so its late copy is
+    /// always one of the stream's newest ids, however much other traffic
+    /// arrived; a command or state type is rare enough for the same to hold.
+    ordered_rx_last: VecDeque<(u32, [u64; crate::config::ORDERED_RX_HISTORY])>,
     reliable_tx: OrdMap<(RouterSideId, u32), ReliableTxState>,
     reliable_rx: OrdMap<(RouterSideId, u32), ReliableRxState>,
     reliable_return_routes: OrdMap<u64, ReliableReturnRouteState>,
@@ -2612,12 +2910,21 @@ struct RouterInner {
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
     total_handler_retries: u64,
+    reliable_exhausted: crate::diagnostics::ReliableExhaustionCounts,
+    #[cfg(feature = "std")]
+    exhausted_recent: VecDeque<crate::diagnostics::ExhaustedReliable>,
     #[cfg(feature = "discovery")]
     discovery_routes: RouterMap<RouterSideId, DiscoverySideState>,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
     #[cfg(feature = "discovery")]
     discovery_side_throttle: RouterMap<RouterSideId, DiscoverySideThrottleState>,
+    /// Per side, filled only once data is heard there: a sender no fresh
+    /// discovery describes (its name hash and when), so baseline recovery asks
+    /// that side for topology; and the last compact sender found described (so
+    /// the same sender is not re-checked for a second).
+    #[cfg(feature = "discovery")]
+    discovery_heard: Vec<(RouterSideId, HeardSenderState)>,
     #[cfg(feature = "discovery")]
     schema_response_sequence: u64,
     #[cfg(feature = "discovery")]
@@ -2629,6 +2936,13 @@ struct RouterInner {
 struct ManagedVariableCacheEntry {
     packet: Packet,
     sender_address: u32,
+    // `packet` was written, seeded or sent by this router (not received).
+    packet_is_own: bool,
+    // This router's own latest value while `packet` is a received one (a
+    // board's report cached after the station's write). None when `packet`
+    // is its own or it never wrote one. A writer answers requests with its
+    // own value, never with a value it received.
+    own: Option<Box<Packet>>,
     #[cfg(feature = "discovery")]
     cached_at_ms: u64,
     // First actual ingress for this logical observation. Unlike the bounded
@@ -2636,6 +2950,31 @@ struct ManagedVariableCacheEntry {
     // the Option niche; a side index is represented by checked index + 1.
     #[cfg(feature = "discovery")]
     upstream: Option<core::num::NonZeroUsize>,
+}
+
+impl ManagedVariableCacheEntry {
+    #[inline]
+    fn own_packet(&self) -> Option<&Packet> {
+        if self.packet_is_own {
+            Some(&self.packet)
+        } else {
+            self.own.as_deref()
+        }
+    }
+    /// (packet_is_own, own) once `packet` replaces this entry's packet. The
+    /// same packet seen again keeps its provenance either way (a received
+    /// copy of the router's own value, or a received value it sends on).
+    fn own_after(&self, packet: &Packet, local: bool) -> (bool, Option<Box<Packet>>) {
+        if self.packet.packet_id() == packet.packet_id() {
+            (self.packet_is_own, self.own.clone())
+        } else if local {
+            (true, None)
+        } else if self.packet_is_own {
+            (false, Some(Box::new(self.packet.clone())))
+        } else {
+            (false, self.own.clone())
+        }
+    }
 }
 
 type NetworkVariableUpdateFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
@@ -3978,6 +4317,18 @@ impl RouterInner {
         result
     }
 
+    /// Forget a received id everywhere dedupe remembers it, so a packet whose
+    /// handling failed can be accepted when it is sent again.
+    fn forget_rx_id(&mut self, id: u64) {
+        self.recent_rx.remove_value(&id);
+        self.e2e_rx_seen.retain(|(seen, _)| *seen != id);
+        for (_, ids) in self.ordered_rx_last.iter_mut() {
+            for slot in ids.iter_mut().filter(|slot| **slot == id) {
+                *slot = 0;
+            }
+        }
+    }
+
     fn push_recent_rx(&mut self, id: u64) -> TelemetryResult<()> {
         while self.recent_rx.len() >= self.memory.max_recent_rx_ids {
             let _ = self.recent_rx.pop_front();
@@ -4133,9 +4484,13 @@ pub struct Router {
     side_tx_activity: crate::lock::SideTxActivity,
     #[cfg(feature = "std")]
     active_queued_tx: core::sync::atomic::AtomicUsize,
-    clock: Box<dyn Clock + Send + Sync>,
+    clock: Arc<dyn Clock + Send + Sync>,
     #[cfg(feature = "timesync")]
     timesync: Option<Box<RouterMutex<TimeSyncRuntime>>>,
+    /// Side and transmit-mark slot of a time sync frame being handed to a
+    /// side callback (`side << 8 | slot + 1`), 0 when none.
+    #[cfg(feature = "timesync")]
+    timesync_tx_arm: core::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "std")]
@@ -4185,7 +4540,6 @@ struct PendingTimeSyncRequest {
 #[cfg(feature = "timesync")]
 #[derive(Debug, Clone)]
 struct RemoteTimeSyncSource {
-    priority: u64,
     last_sample_mono_ms: u64,
     sample_unix_ms: u64,
     side: Option<RouterSideId>,
@@ -4204,6 +4558,7 @@ struct TimeSyncRuntime {
     next_request_mono_ms: u64,
     pending_request: Option<PendingTimeSyncRequest>,
     clock_anchored: bool,
+    v2: timesync_v2::TimeSyncV2,
 }
 
 #[cfg(feature = "timesync")]
@@ -4223,6 +4578,7 @@ impl TimeSyncRuntime {
             next_request_mono_ms: 0,
             pending_request: None,
             clock_anchored: false,
+            v2: Default::default(),
         }
     }
 }
@@ -4440,11 +4796,13 @@ impl Router {
         entry.note_local_handler_failure(ty, retries);
     }
 
+    /// `local`: written, seeded or sent by this router, not received.
     fn cache_managed_variable_packet(
         &self,
         pkt: &Packet,
         notify_handlers: bool,
         source_side: Option<RouterSideId>,
+        local: bool,
     ) -> TelemetryResult<()> {
         #[cfg(not(feature = "discovery"))]
         let _ = source_side;
@@ -4476,6 +4834,8 @@ impl Router {
             }) {
                 return Ok(());
             }
+            let (packet_is_own, own) =
+                existing.map_or((local, None), |entry| entry.own_after(pkt, local));
             // A proxy may change only the frozen transport recipients when
             // returning this exact source observation. That is not a new
             // application revision and must not replay update side effects.
@@ -4495,6 +4855,8 @@ impl Router {
             let updated = ManagedVariableCacheEntry {
                 packet: pkt.clone(),
                 sender_address,
+                packet_is_own,
+                own,
                 #[cfg(feature = "discovery")]
                 cached_at_ms: self.clock.now_ms(),
                 #[cfg(feature = "discovery")]
@@ -4534,8 +4896,25 @@ impl Router {
         Ok(())
     }
 
-    fn remember_managed_variable_packet(&self, pkt: &Packet) -> TelemetryResult<()> {
-        self.cache_managed_variable_packet(pkt, true, None)
+    /// `local`: this router originated the packet (not forwarding one it received).
+    fn remember_managed_variable_packet(&self, pkt: &Packet, local: bool) -> TelemetryResult<()> {
+        self.cache_managed_variable_packet(pkt, true, None, local)
+    }
+
+    /// This router's own latest value of a network variable: the last packet
+    /// it wrote, seeded or sent for this type, even after a value received
+    /// from the network (another sender's report of the same type) became the
+    /// newest cached observation. A writer answers requests with this value.
+    /// None when it has written none, or the cache was invalidated or cleared
+    /// since.
+    pub fn own_network_variable(&self, ty: DataType) -> Option<Packet> {
+        let st = self.state.lock();
+        st.local_services
+            .as_ref()?
+            .managed_variable_latest
+            .get(&ty.as_u32())
+            .and_then(|entry| entry.own_packet())
+            .cloned()
     }
 
     fn managed_variable_latest(&self, ty: DataType) -> Option<Packet> {
@@ -5154,12 +5533,17 @@ impl Router {
             return base.to_string();
         }
         let stem = if base.is_empty() { "node" } else { base };
-        let mut candidate = format!("{stem}-{owner_hash:08x}");
+        let mut candidate = String::from(stem);
+        candidate.push('-');
+        crate::diag_text::push_hex(&mut candidate, owner_hash, 8);
+        let base_len = candidate.len();
         let mut suffix = 1u32;
         while st.address_book.contains_key(&candidate)
             || st.local_address.hostname.as_ref() == candidate
         {
-            candidate = format!("{stem}-{owner_hash:08x}-{suffix}");
+            candidate.truncate(base_len);
+            candidate.push('-');
+            crate::diag_text::push_dec(&mut candidate, u64::from(suffix));
             suffix = suffix.saturating_add(1);
         }
         candidate
@@ -5433,7 +5817,7 @@ impl Router {
 
     fn encode_end_to_end_ack_sender(&self) -> String {
         let sender = self.sender_arc();
-        format!("{}{}", Self::END_TO_END_ACK_PREFIX, sender)
+        crate::diag_text::concat(&[Self::END_TO_END_ACK_PREFIX, &sender])
     }
 
     #[cfg(feature = "discovery")]
@@ -5867,29 +6251,24 @@ impl Router {
         Ok(())
     }
 
-    // Close only a duplicate non-parent edge, never this router's aggregate
-    // receipt. The first ingress continues to own the full downstream subtree.
+    // Close a duplicate edge of a segment proxy. While it owns the downstream
+    // subtree any edge is answered, the parent's too once its segment receipt
+    // was sent (a retry there means that receipt was lost). After the subtree
+    // completed, a non-parent edge (a cycle's back edge) is still answered;
+    // the parent's retry is answered by the completed-contract path.
     fn queue_duplicate_proxy_edge_receipt(
         &self,
         item: &RouterRxItem,
         packet_id: u64,
     ) -> TelemetryResult<()> {
         let Some(src) = item.src else { return Ok(()) };
-        let eligible = |state: &RouterInner| {
-            state.end_to_end_reliable_tx.contains_key(&packet_id)
-                && state
-                    .reliable_return_routes
-                    .get(&packet_id)
-                    .is_some_and(|route| {
-                        route.side != src
-                            && route.local_admission_completed
-                            && !route.admission_cancelled
-                            && route.local_admission_token == 0
-                            && route.upstream_contract.is_some()
-                    })
-        };
-        if !eligible(&self.state.lock()) {
+        let eligible =
+            |state: &RouterInner| Self::proxy_edge_receipt_state(state, packet_id, src);
+        let Some(pending) = eligible(&self.state.lock()) else {
             return Ok(());
+        };
+        if !pending {
+            return self.queue_completed_proxy_edge_receipt(item, src, packet_id);
         }
         let local_sender = self.sender_arc();
         let local_hash = Self::sender_hash(local_sender.as_ref());
@@ -5923,7 +6302,7 @@ impl Router {
         // address are unchanged across the proxy's frozen child contracts.
         let publisher_hash = {
             let state = self.state.lock();
-            if !eligible(&state) {
+            if eligible(&state) != Some(true) {
                 return Ok(());
             }
             let retained = &state
@@ -5952,32 +6331,16 @@ impl Router {
             };
             publisher
         };
-        let ack = Packet::new_local(
-            DataType::ReliableAck,
-            message_meta(DataType::ReliableAck).endpoints_owned(),
-            Arc::from(self.encode_end_to_end_ack_sender()),
-            self.packet_timestamp_ms(),
-            crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
-        )?;
-        let ack = self
-            .attach_wire_contract_to_item(RouterItem::Packet(ack), &[local_hash, publisher_hash])?;
-        let priority = self.item_service_priority(&ack)?;
-        let mut state = self.state.lock();
-        if !eligible(&state)
-            || !Self::side_ref(&state, src).is_ok_and(|side| side.opts.egress_enabled)
-            || state
-                .reliable_return_routes
-                .get(&packet_id)
-                .and_then(|route| route.upstream_contract)
-                != Some((packet_id, publisher_hash))
-        {
-            return Ok(());
-        }
-        let already_queued = state.transmit_queue.iter().any(|queued| {
+        self.push_proxy_edge_receipt(src, packet_id, local_hash, publisher_hash, true)
+    }
+
+    // A receipt for `packet_id` already queued toward `side`.
+    fn receipt_queued_locked(state: &RouterInner, side: RouterSideId, packet_id: u64) -> bool {
+        state.transmit_queue.iter().any(|queued| {
             let RouterTxItem::ToSide { dst, data, .. } = &queued.item else {
                 return false;
             };
-            if *dst != src {
+            if *dst != side {
                 return false;
             }
             match data {
@@ -5992,8 +6355,93 @@ impl Router {
                 })
                 .unwrap_or(false),
             }
-        });
-        if !already_queued {
+        })
+    }
+
+    // Some(true): the proxy's downstream contract is pending; Some(false):
+    // it completed. None: no receipt is owed on `src`.
+    fn proxy_edge_receipt_state(
+        state: &RouterInner,
+        packet_id: u64,
+        src: RouterSideId,
+    ) -> Option<bool> {
+        let route = state.reliable_return_routes.get(&packet_id)?;
+        if !route.local_admission_completed
+            || route.admission_cancelled
+            || route.upstream_contract.map(|(id, _)| id) != Some(packet_id)
+        {
+            return None;
+        }
+        if state.end_to_end_reliable_tx.contains_key(&packet_id) {
+            ((route.side != src || route.delivery_completed) && route.local_admission_token == 0)
+                .then_some(true)
+        } else {
+            (route.delivery_completed && route.side != src).then_some(false)
+        }
+    }
+
+    // No retained frame binds a completed proxy's duplicate: bind it to the
+    // completed contract's publisher by the frame's own sender instead.
+    fn queue_completed_proxy_edge_receipt(
+        &self,
+        item: &RouterRxItem,
+        src: RouterSideId,
+        packet_id: u64,
+    ) -> TelemetryResult<()> {
+        let local_hash = Self::sender_hash(self.sender_arc().as_ref());
+        let packet = match &item.data {
+            RouterItem::Packet(packet) => packet.clone(),
+            RouterItem::Packed(bytes) => self.unpack_packet_for_role(bytes.as_ref())?,
+        };
+        packet.validate()?;
+        if !packet.wire_target_senders().contains(&local_hash) {
+            return Ok(());
+        }
+        let publisher_hash = {
+            let state = self.state.lock();
+            let sender = Self::sender_hash(&Self::canonical_sender_locked(&state, packet.sender()));
+            match state
+                .reliable_return_routes
+                .get(&packet_id)
+                .and_then(|route| route.upstream_contract)
+            {
+                Some((id, publisher)) if id == packet_id && publisher == sender => publisher,
+                _ => return Ok(()),
+            }
+        };
+        self.push_proxy_edge_receipt(src, packet_id, local_hash, publisher_hash, false)
+    }
+
+    fn push_proxy_edge_receipt(
+        &self,
+        src: RouterSideId,
+        packet_id: u64,
+        local_hash: u64,
+        publisher_hash: u64,
+        pending: bool,
+    ) -> TelemetryResult<()> {
+        let ack = Packet::new_local(
+            DataType::ReliableAck,
+            message_meta(DataType::ReliableAck).endpoints_owned(),
+            Arc::from(self.encode_end_to_end_ack_sender()),
+            self.packet_timestamp_ms(),
+            crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
+        )?;
+        let ack = self
+            .attach_wire_contract_to_item(RouterItem::Packet(ack), &[local_hash, publisher_hash])?;
+        let priority = self.item_service_priority(&ack)?;
+        let mut state = self.state.lock();
+        if Self::proxy_edge_receipt_state(&state, packet_id, src) != Some(pending)
+            || !Self::side_ref(&state, src).is_ok_and(|side| side.opts.egress_enabled)
+            || state
+                .reliable_return_routes
+                .get(&packet_id)
+                .and_then(|route| route.upstream_contract)
+                != Some((packet_id, publisher_hash))
+        {
+            return Ok(());
+        }
+        if !Self::receipt_queued_locked(&state, src, packet_id) {
             state.push_transmit(TxQueued {
                 disposable: TX_DISPOSABLE,
                 item: RouterTxItem::ToSide {
@@ -6100,6 +6548,11 @@ impl Router {
         if !Self::can_admit_reliable_return_route_growth_locked(&st, packet_id) {
             return Err(TelemetryError::Io("memory pressure"));
         }
+        let cross_side = st
+            .reliable_return_routes
+            .get(&packet_id)
+            .filter(|route| duplicate && !replace_side && route.side != side)
+            .map(|_| side);
         let token = st
             .local_admission_sequence
             .checked_add(1)
@@ -6133,6 +6586,7 @@ impl Router {
             router: self,
             packet_id,
             token,
+            cross_side,
         }))
     }
 
@@ -6702,6 +7156,7 @@ impl Router {
         while cache.order.len() >= entry_cap {
             if let Some(oldest) = cache.order.pop_front() {
                 cache.destinations.remove(&oldest);
+                cache.replays.remove(&oldest);
             } else {
                 break;
             }
@@ -6713,6 +7168,135 @@ impl Router {
         if acked.len() < sender_cap || acked.contains(&sender_hash) {
             acked.insert(sender_hash);
         }
+    }
+
+    /// A duplicate of a reliable frame arrived from `src` and every
+    /// destination owner behind this relay has already acknowledged it (the
+    /// forwarded-receipt cache): the receipt on its way back was lost. Send the
+    /// cached receipts back toward the sender, at most once per reliable
+    /// retransmit interval and `FORWARDED_RECEIPT_REPLAY_MAX` times per packet.
+    #[cfg(feature = "discovery")]
+    fn replay_forwarded_receipts(
+        &self,
+        data: &RouterItem,
+        src: RouterSideId,
+        called_from_queue: bool,
+    ) -> TelemetryResult<()> {
+        if !self.cfg.reliable_enabled() {
+            return Ok(());
+        }
+        let Ok(ty) = Self::item_data_type(data) else {
+            return Ok(());
+        };
+        if !is_reliable_type(ty) || is_internal_control_type(ty) {
+            return Ok(());
+        }
+        let (packet_id, sender) = match data {
+            RouterItem::Packet(pkt) => (pkt.packet_id(), pkt.sender().to_owned()),
+            RouterItem::Packed(bytes) => {
+                let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref()) else {
+                    return Ok(());
+                };
+                let Ok(pkt) = self.unpack_packet_for_role(bytes.as_ref()) else {
+                    return Ok(());
+                };
+                (packet_id, pkt.sender().to_owned())
+            }
+        };
+        let Ok((eps, _)) = self.item_route_info(data) else {
+            return Ok(());
+        };
+        let (owners, publisher_hash) = {
+            let mut st = self.state.lock();
+            let Some(owners) = st
+                .forwarded_receipts
+                .as_ref()
+                .and_then(|cache| cache.destinations.get(&packet_id))
+                .filter(|owners| !owners.is_empty())
+                .map(|owners| {
+                    owners
+                        .iter()
+                        .copied()
+                        .take(FORWARDED_RECEIPT_REPLAY_OWNERS)
+                        .collect::<Vec<u64>>()
+                })
+            else {
+                return Ok(());
+            };
+            let others: Vec<RouterSideId> = st
+                .discovery_routes
+                .keys()
+                .copied()
+                .filter(|side| *side != src)
+                .collect();
+            if others.is_empty()
+                || !self
+                    .filter_end_to_end_satisfied_sides_locked(&st, data, others, &eps, ty)
+                    .is_empty()
+            {
+                return Ok(());
+            }
+            let now = self.clock.now_ms();
+            let cache = st.forwarded_receipts.as_mut().expect("checked cache");
+            let (last, count) = cache.replays.get(&packet_id).copied().unwrap_or((0, 0));
+            if count >= FORWARDED_RECEIPT_REPLAY_MAX
+                || (count > 0 && now.saturating_sub(last) < runtime_reliable_retransmit_ms())
+            {
+                return Ok(());
+            }
+            cache.replays.insert(packet_id, (now, count + 1));
+            (owners, Self::sender_hash(&Self::canonical_sender_locked(&st, &sender)))
+        };
+        for owner in owners {
+            let ack = Packet::new_local(
+                DataType::ReliableAck,
+                message_meta(DataType::ReliableAck).endpoints_owned(),
+                Arc::from(self.encode_end_to_end_ack_sender()),
+                self.packet_timestamp_ms(),
+                crate::config::StandardSmallPayload::new(&packet_id.to_le_bytes()),
+            )?;
+            // The owner's identity first, as in the receipt it sent; the
+            // publisher second, as `build_end_to_end_ack_data` does.
+            let ack = self.attach_wire_contract_to_item(RouterItem::Packet(ack), &[owner, publisher_hash])?;
+            self.emit_internal_tx(
+                RouterTxItem::ToSide { src: None, dst: src, data: ack },
+                true,
+                called_from_queue,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "discovery")]
+    /// For a transport that queues frames itself (a radio or CAN driver
+    /// queue): `true` when `frame`, a reliable end-to-end copy this router
+    /// handed to `side`, no longer needs sending because every destination
+    /// owner behind that side has acknowledged it meanwhile. Call just before
+    /// the physical write and drop the frame when `true`. Frames that are not
+    /// reliable end-to-end copies, or cannot be parsed, return `false`.
+    #[cfg(feature = "discovery")]
+    pub fn relayed_frame_satisfied(&self, side: RouterSideId, frame: &[u8]) -> bool {
+        let Ok(Some(decoded)) = self.decode_side_transport_frame(side, frame) else {
+            return false;
+        };
+        let data = RouterItem::Packed(decoded);
+        let Ok(ty) = Self::item_data_type(&data) else {
+            return false;
+        };
+        is_reliable_type(ty) && self.relayed_copy_satisfied(side, &data, ty)
+    }
+
+    #[cfg(feature = "discovery")]
+    fn relayed_copy_satisfied(&self, side: RouterSideId, data: &RouterItem, ty: DataType) -> bool {
+        let Ok((eps, _)) = self.item_route_info(data) else {
+            return false;
+        };
+        let st = self.state.lock();
+        if st.forwarded_receipts.is_none() {
+            return false;
+        }
+        self.filter_end_to_end_satisfied_sides_locked(&st, data, alloc::vec![side], &eps, ty)
+            .is_empty()
     }
 
     #[cfg(feature = "discovery")]
@@ -6808,14 +7392,13 @@ impl Router {
                 }
             }
         }
-        st.forwarded_receipts
-            .as_mut()
-            .expect("checked cache")
-            .destinations
-            .retain(|_, acked| {
-                acked.retain(|sender_hash| active_senders.contains(sender_hash));
-                !acked.is_empty()
-            });
+        let cache = st.forwarded_receipts.as_mut().expect("checked cache");
+        cache.destinations.retain(|_, acked| {
+            acked.retain(|sender_hash| active_senders.contains(sender_hash));
+            !acked.is_empty()
+        });
+        let ForwardedReceiptCache { destinations, replays, .. } = &mut **cache;
+        replays.retain(|id, _| destinations.contains_key(id));
     }
 
     #[cfg(feature = "discovery")]
@@ -6927,8 +7510,46 @@ impl Router {
         Ok(!waiting_for_predecessor)
     }
 
+    #[cfg(feature = "std")]
+    /// An urgent-class item (see [`crate::set_type_scheduling_class`]) or any
+    /// type named `ABORT`.
+    fn is_urgent_item(data: &RouterItem) -> bool {
+        Self::item_data_type(data).is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT")
+    }
+
     // Select at most one in-flight packet per ordered type. Waiting messages
     // share the existing bounded pending window, not an unbounded extra queue.
+    /// Completes one pending end-to-end reliable send this router originated
+    /// when the application holds other proof of delivery (a board's
+    /// BOARD_STATE_STATUS reply to a BOARD_RECOVERY_REQUEST). Its retries stop
+    /// and ordered successors are released; copies already handed to a
+    /// transport still go out. Urgent types (ABORT, see
+    /// [`crate::set_type_scheduling_class`]) and any type named `ABORT` are
+    /// never completed this way: `Err(PermissionDenied)`, nothing changes.
+    /// `Ok(false)` when nothing was pending under that id.
+    pub fn complete_reliable(&self, packet_id: u64) -> TelemetryResult<bool> {
+        let ty = {
+            let st = self.state.lock();
+            match st.end_to_end_reliable_tx.get(&packet_id) {
+                None => return Ok(false),
+                Some(sent) => Self::item_data_type(&sent.data)?,
+            }
+        };
+        if crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT" {
+            return Err(TelemetryError::PermissionDenied);
+        }
+        let removed = self
+            .state
+            .lock()
+            .end_to_end_reliable_tx
+            .remove(&packet_id)
+            .is_some();
+        if removed {
+            self.release_ordered_successors()?;
+        }
+        Ok(removed)
+    }
+
     fn release_ordered_successors(&self) -> TelemetryResult<()> {
         let ready = {
             let mut st = self.state.lock();
@@ -7062,6 +7683,16 @@ impl Router {
                 .map(|side| &side.tx_handler),
             Some(RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_))
         )
+    }
+
+    /// Owners a frame was frozen to (its wire target senders).
+    #[cfg(feature = "discovery")]
+    fn frozen_owner_count(data: &RouterItem) -> usize {
+        match data {
+            RouterItem::Packet(packet) => packet.wire_target_senders().len(),
+            RouterItem::Packed(bytes) => wire_format::peek_routing_envelope(bytes)
+                .map_or(0, |envelope| envelope.target_senders().len()),
+        }
     }
 
     #[cfg(feature = "discovery")]
@@ -7234,6 +7865,26 @@ impl Router {
             .side;
         if !Self::side_ref(&state, dst)?.opts.egress_enabled {
             return Ok(());
+        }
+        if let Some(cross) = guard.cross_side
+            && cross != dst
+            && Self::side_ref(&state, cross).is_ok_and(|side| side.opts.egress_enabled)
+            && !Self::receipt_queued_locked(&state, cross, packet_id)
+        {
+            state.push_transmit(TxQueued {
+                disposable: TX_DISPOSABLE,
+                item: RouterTxItem::ToSide {
+                    src: None,
+                    dst: cross,
+                    data: data.clone(),
+                },
+                ignore_local: true,
+                priority,
+                delivery_state: QueuedDelivery::Untracked,
+                accepted_type: DataType::ReliableAck.as_u32(),
+                deferred_since_ms: 0,
+                retry_after_ms: 0,
+            })?;
         }
         state.push_transmit(TxQueued {
             disposable: TX_DISPOSABLE,
@@ -7496,12 +8147,21 @@ impl Router {
 
     #[cfg(feature = "timesync")]
     fn timesync_has_usable_time_locked(st: &TimeSyncRuntime, now_mono_ns: u64) -> bool {
-        st.disciplined_clock.read_unix_ms(now_mono_ns).is_some()
+        st.disciplined_clock.has_unix_time(now_mono_ns)
             || st
                 .clock
                 .current_time(now_mono_ns)
                 .and_then(|reading| reading.unix_time_ms)
                 .is_some()
+    }
+
+    #[cfg(feature = "timesync")]
+    fn timesync_following_remote_locked(st: &TimeSyncRuntime, now_ms: u64, now_ns: u64) -> bool {
+        let usable = Self::timesync_has_usable_time_locked(st, now_ns);
+        matches!(
+            st.tracker.as_ref().and_then(|t| t.leader(now_ms, usable)),
+            Some(TimeSyncLeader::Remote(_))
+        )
     }
 
     #[cfg(feature = "timesync")]
@@ -7521,11 +8181,20 @@ impl Router {
                 Some(pending.source.as_str()) != active_remote
                     || now_ms < pending.t1_mono_ms
                     || now_ms.saturating_sub(pending.t1_mono_ms)
-                        > st.cfg.map(|cfg| cfg.source_timeout_ms).unwrap_or(0)
+                        > st.cfg.map_or(0, |cfg| {
+                            // A lost exchange must not block the next one for
+                            // the whole source timeout: wait two round trips.
+                            st.v2
+                                .last_round_trip_ms()
+                                .saturating_mul(2)
+                                .saturating_add(500)
+                                .clamp(1_000, cfg.source_timeout_ms.max(1_000))
+                        })
             });
         if should_clear {
+            // The next request still keeps its interval (never more requests
+            // outstanding than the round trip allows).
             st.pending_request = None;
-            st.next_request_mono_ms = now_ms;
         }
     }
 
@@ -7536,12 +8205,12 @@ impl Router {
         let reference = {
             let remote = &st.remote_sources;
             st.clock
-                .current_time_filtered(now_mono_ns, |name| {
+                .current_unix_ms_filtered(now_mono_ns, |name| {
                     name != INTERNAL_TIMESYNC_SOURCE_ID && !remote.contains_key(name)
                 })
-                .and_then(|reading| reading.unix_time_ms)
                 .filter(|unix_ms| *unix_ms >= TIMESYNC_UTC_FLOOR_MS)
         };
+        st.v2.local_reference = reference.is_some();
         if let Some(unix_ms) = reference
             && !st.clock_anchored
         {
@@ -7552,7 +8221,19 @@ impl Router {
             }
             st.clock_anchored = true;
         }
-        let anchored = reference.is_some()
+        // A node disciplined from an anchored source keeps carrying UTC when
+        // that source goes away: it may lead (holdover/bridge) as anchored.
+        // Only while no anchored remote is available (otherwise UTC learned
+        // from that remote would outrank it) and while the holdover bound is
+        // still within the lock threshold.
+        let held_utc = st.clock_anchored
+            && st.v2.is_locked()
+            && !st.v2.discipline_is_empty()
+            && !st.tracker.as_ref().is_some_and(|t| {
+                t.best_active_source(now_mono_ns / 1_000_000)
+                    .is_some_and(|src| src.quality().anchored)
+            });
+        let anchored = (reference.is_some() || held_utc)
             && st
                 .disciplined_clock
                 .read_unix_ms(now_mono_ns)
@@ -7572,7 +8253,6 @@ impl Router {
         now_mono_ns: u64,
         target_ms: u64,
         anchored: bool,
-        verified: bool,
     ) {
         let anchored = anchored && target_ms >= TIMESYNC_UTC_FLOOR_MS;
         let clock = &mut st.disciplined_clock;
@@ -7590,11 +8270,7 @@ impl Router {
             || target_ms >= TIMESYNC_UTC_FLOOR_MS
             || current.is_none_or(|current| current < TIMESYNC_UTC_FLOOR_MS)
         {
-            if verified {
-                clock.steer_verified_response_ms(now_mono_ns, target_ms);
-            } else {
-                clock.steer_unix_ms(now_mono_ns, target_ms);
-            }
+            clock.steer_unix_ms(now_mono_ns, target_ms);
             st.clock_anchored = anchored;
         }
     }
@@ -8031,14 +8707,22 @@ impl Router {
         // A completed proxy still owns the aggregate receipt. A delayed parent
         // retry must not recreate an ordered child cohort and block successors.
         // Keep the alias too, so late child receipts remain consumed locally.
+        // A receipt still queued toward the parent (say, physically refused)
+        // already answers this retry; never stack a second one behind it.
         let completed_contract = {
             let st = self.state.lock();
             st.reliable_return_routes
                 .get(&upstream_id)
                 .filter(|route| route.delivery_completed)
-                .and_then(|route| route.upstream_contract)
+                .and_then(|route| {
+                    let queued = Self::receipt_queued_locked(&st, route.side, upstream_id);
+                    route.upstream_contract.map(|contract| (contract, queued))
+                })
         };
-        if let Some((packet_id, publisher_hash)) = completed_contract {
+        if let Some(((_, _), true)) = completed_contract {
+            return Ok(None);
+        }
+        if let Some(((packet_id, publisher_hash), _)) = completed_contract {
             self.queue_end_to_end_reliable_ack_for_sender_hash(
                 packet_id,
                 publisher_hash,
@@ -8104,22 +8788,36 @@ impl Router {
                 "[sedsnet-reliable] proxy retain upstream={upstream_id:#x} downstream={downstream_id:#x} existing={already_pending} ready={ready}"
             );
         }
-        {
+        let publisher_hash = {
             let mut st = self.state.lock();
             let Some(mut route) = st.reliable_return_routes.get(&upstream_id).cloned() else {
                 st.end_to_end_reliable_tx.remove(&downstream_id);
                 return Err(TelemetryError::Io("no reliable return route"));
             };
-            route.upstream_contract = Some((
-                upstream_id,
-                Self::sender_hash(&Self::canonical_sender_locked(&st, pkt.sender())),
-            ));
+            let publisher_hash =
+                Self::sender_hash(&Self::canonical_sender_locked(&st, pkt.sender()));
+            route.upstream_contract = Some((upstream_id, publisher_hash));
             if !Self::remember_reliable_return_route_locked(&mut st, downstream_id) {
                 st.end_to_end_reliable_tx.remove(&downstream_id);
                 return Err(TelemetryError::Io("reliable return route window full"));
             }
             st.reliable_return_routes.insert(downstream_id, route);
-        }
+            // Accepted and queued downstream: this segment's receipt is due
+            // now. The downstream cohort is this router's own contract, with
+            // its own retries and exhaustion; a dead owner behind it must not
+            // exhaust the publisher's write. Completion also turns a delayed
+            // parent retry into a re-receipt (completed_contract above).
+            if let Some(upstream) = st.reliable_return_routes.get_mut(&upstream_id) {
+                upstream.delivery_completed = true;
+                upstream.upstream_contract = Some((upstream_id, publisher_hash));
+            }
+            publisher_hash
+        };
+        self.queue_end_to_end_reliable_ack_for_sender_hash(
+            upstream_id,
+            publisher_hash,
+            called_from_queue,
+        )?;
         Ok((ready && !already_pending).then_some(forwarded))
     }
 
@@ -8855,6 +9553,33 @@ impl Router {
         }
         discovery::normalize_topology_boards(&mut boards);
         boards
+    }
+
+    /// Remove `leaving` from every discovery route: its own announcer entry and
+    /// every topology mention of it behind another announcer. Returns whether
+    /// any route changed.
+    #[cfg(feature = "discovery")]
+    fn remove_discovery_peer_locked(st: &mut RouterInner, leaving: &str) -> TelemetryResult<bool> {
+        let before = st
+            .discovery_routes
+            .iter()
+            .map(|(side, route)| Ok((*side, route.try_clone()?)))
+            .collect::<TelemetryResult<RouterMap<_, _>>>()?;
+        for route in st.discovery_routes.values_mut() {
+            route.announcers.remove(leaving);
+            for sender_state in route.announcers.values_mut() {
+                Arc::make_mut(&mut sender_state.topology_boards)
+                    .retain(|board| board.sender_id != leaving);
+                for board in Arc::make_mut(&mut sender_state.topology_boards).iter_mut() {
+                    board.connections.retain(|peer| peer != leaving);
+                }
+                Self::refresh_sender_topology_state(sender_state);
+            }
+            Self::recompute_discovery_side_state(route);
+        }
+        st.discovery_routes
+            .retain(|_, route| !route.announcers.is_empty());
+        Ok(st.discovery_routes != before)
     }
 
     #[cfg(feature = "discovery")]
@@ -10352,6 +11077,75 @@ impl Router {
         }
     }
 
+    /// Whether a fresh announcer on `side` is `name`, or describes it (a
+    /// topology board with endpoints).
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn sender_described_locked(st: &RouterInner, side: RouterSideId, name: u64, now_ms: u64) -> bool {
+        st.discovery_routes.get(&side).is_some_and(|route| {
+            now_ms.saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                && route.announcers.iter().any(|(announcer, peer)| {
+                    now_ms.saturating_sub(peer.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                        && (Self::sender_hash(announcer) == name
+                            || peer.topology_boards.iter().any(|board| {
+                                !board.reachable_endpoints.is_empty()
+                                    && Self::sender_hash(&board.sender_id) == name
+                            }))
+                })
+        })
+    }
+
+    /// Data heard on a side from a sender no fresh discovery describes (its
+    /// route aged out during a cut longer than the TTL): remember it so the
+    /// next poll asks that side for topology instead of waiting for the
+    /// sender's next discovery packet (R3-C: 4.7 s).
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn note_heard_sender(&self, sender: &str, src: Option<RouterSideId>) {
+        if src.is_none() || sender.starts_with("E2EACK:") {
+            return;
+        }
+        match sender.strip_prefix("@addr:").and_then(|value| value.parse::<u32>().ok()) {
+            Some(address) => self.note_heard_address(address, src),
+            None => self.note_heard_name(Self::sender_hash(sender), src),
+        }
+    }
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn note_heard_address(&self, address: u32, src: Option<RouterSideId>) {
+        let Some(side) = src else { return };
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if st.discovery_heard.iter().any(|(s, h)| {
+            *s == side && h.described.0 == address && now_ms.saturating_sub(h.described.1) < 1_000
+        }) {
+            return;
+        }
+        let Some(name) = Self::hostname_for_address_borrowed_locked(&st, address).map(Self::sender_hash) else {
+            return;
+        };
+        if name == Self::sender_hash(self.sender_arc().as_ref()) || Self::sender_described_locked(&st, side, name, now_ms) {
+            heard_slot(&mut st.discovery_heard, side).described = (address, now_ms);
+            return;
+        }
+        let slot = heard_slot(&mut st.discovery_heard, side);
+        if slot.undescribed.is_none_or(|(old, _)| old != name) { slot.heard_requests = 0; }
+        slot.undescribed = Some((name, now_ms));
+    }
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn note_heard_name(&self, name: u64, src: Option<RouterSideId>) {
+        let Some(side) = src else { return };
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if name == Self::sender_hash(self.sender_arc().as_ref()) || Self::sender_described_locked(&st, side, name, now_ms) {
+            return;
+        }
+        let slot = heard_slot(&mut st.discovery_heard, side);
+        if slot.undescribed.is_none_or(|(old, _)| old != name) { slot.heard_requests = 0; }
+        slot.undescribed = Some((name, now_ms));
+    }
+
     #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
@@ -10371,7 +11165,22 @@ impl Router {
             let mut st = self.state.lock();
             let mut due = Vec::new();
             for side in 0..st.sides.len() {
-                let missing = st.discovery_routes.get(&side).is_some_and(|route| {
+                let (heard, heard_requests) = st.discovery_heard.iter().find(|(s, _)| *s == side)
+                    .map_or((None, 0), |(_, h)| (h.undescribed, h.heard_requests));
+                let heard_missing = heard_requests < HEARD_REQUESTS_MAX && heard.is_some_and(|(name, at)| {
+                    now_ms.saturating_sub(at) <= DISCOVERY_ROUTE_TTL_MS
+                        && !Self::sender_described_locked(&st, side, name, now_ms)
+                });
+                // Described now (or aged): forget it. Past its request cap it is
+                // kept, so the same silent sender does not re-arm.
+                if heard.is_some_and(|(name, at)| {
+                    now_ms.saturating_sub(at) > DISCOVERY_ROUTE_TTL_MS
+                        || Self::sender_described_locked(&st, side, name, now_ms)
+                }) && let Some((_, h)) = st.discovery_heard.iter_mut().find(|(s, _)| *s == side) {
+                    h.undescribed = None;
+                    h.heard_requests = 0;
+                }
+                let missing = heard_missing || st.discovery_routes.get(&side).is_some_and(|route| {
                     route.announcers.iter().any(|(name, peer)| {
                         !peer.has_full_topology
                             && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
@@ -10382,20 +11191,50 @@ impl Router {
                                     && bridge
                                         .topology_boards
                                         .iter()
-                                        .any(|board| board.sender_id == *name)
+                                        // A bridge describes the peer only with its
+                                        // endpoints: an RRLS lists a primary it lost
+                                        // with none (R2-C: the returning primary owned
+                                        // no status for 5.4 s).
+                                        .any(|board| {
+                                            board.sender_id == *name
+                                                && !board.reachable_endpoints.is_empty()
+                                        })
                             })
                     })
                 });
                 if !missing {
+                    if let Some((_, h)) = st.discovery_heard.iter_mut().find(|(s, _)| *s == side) { h.retry_ms = 0; }
                     continue;
                 }
-                let throttle = st.discovery_side_throttle.entry(side).or_default();
-                if throttle.next_topology_request_ms == 0 {
-                    throttle.next_topology_request_ms =
-                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
-                } else if now_ms >= throttle.next_topology_request_ms {
-                    throttle.next_topology_request_ms =
-                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_RETRY_MS);
+                let due_now = {
+                    let throttle = st.discovery_side_throttle.entry(side).or_default();
+                    if throttle.next_topology_request_ms == 0 {
+                        throttle.next_topology_request_ms =
+                            now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
+                        false
+                    } else {
+                        now_ms >= throttle.next_topology_request_ms
+                    }
+                };
+                if due_now {
+                    // Bounded backoff: a lossy slow link must not storm requests
+                    // (and the replies they draw) at the retry floor.
+                    // Only a heard, undescribed sender (its route aged during a cut)
+                    // retries fast, backing off 1 s, 2 s, 4 s and capped at
+                    // HEARD_REQUESTS_MAX; an announcer still missing its
+                    // baseline keeps the 5 s retry (a lossy slow link otherwise
+                    // drew a storm of requests and replies that starved heartbeats).
+                    let slot = heard_slot(&mut st.discovery_heard, side);
+                    let step = if heard_missing {
+                        slot.heard_requests = slot.heard_requests.saturating_add(1);
+                        let step = if slot.retry_ms == 0 { discovery::DISCOVERY_TOPOLOGY_RETRY_MS as u32 } else { slot.retry_ms };
+                        slot.retry_ms = step.saturating_mul(2).min(discovery::DISCOVERY_BASELINE_RETRY_MS as u32);
+                        step
+                    } else {
+                        discovery::DISCOVERY_BASELINE_RETRY_MS as u32
+                    };
+                    st.discovery_side_throttle.entry(side).or_default().next_topology_request_ms =
+                        now_ms.saturating_add(u64::from(step));
                     due.push(side);
                 }
             }
@@ -10862,7 +11701,7 @@ impl Router {
                         .as_ref()?
                         .managed_variable_latest
                         .get(&ty.as_u32())
-                        .map(|entry| entry.packet.clone())
+                        .and_then(|entry| entry.own_packet().cloned())
                 })
                 .collect();
             drop(st);
@@ -11023,7 +11862,10 @@ impl Router {
                 // subscriber restored an older persisted value at boot.
                 return Ok(false);
             }
-            if let Some(value) = self.managed_variable_latest(ty) {
+            // Its own value only: a writer that cached another sender's
+            // report of this type later (a board's state report) does not
+            // answer with it. Without one, the request keeps moving.
+            if let Some(value) = self.own_network_variable(ty) {
                 self.emit_internal_tx(
                     RouterTxItem::ToSide {
                         src: None,
@@ -11083,27 +11925,7 @@ impl Router {
         let mut st = self.state.lock();
         let now_ms = self.clock.now_ms();
         if pkt.data_type() == DataType::DiscoveryLeave {
-            let leaving = packet_sender.as_str();
-            let before = st
-                .discovery_routes
-                .iter()
-                .map(|(side, route)| Ok((*side, route.try_clone()?)))
-                .collect::<TelemetryResult<RouterMap<_, _>>>()?;
-            for route in st.discovery_routes.values_mut() {
-                route.announcers.remove(leaving);
-                for sender_state in route.announcers.values_mut() {
-                    Arc::make_mut(&mut sender_state.topology_boards)
-                        .retain(|board| board.sender_id != leaving);
-                    for board in Arc::make_mut(&mut sender_state.topology_boards).iter_mut() {
-                        board.connections.retain(|peer| peer != leaving);
-                    }
-                    Self::refresh_sender_topology_state(sender_state);
-                }
-                Self::recompute_discovery_side_state(route);
-            }
-            st.discovery_routes
-                .retain(|_, route| !route.announcers.is_empty());
-            if st.discovery_routes != before {
+            if Self::remove_discovery_peer_locked(&mut st, packet_sender.as_str())? {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
             }
@@ -12252,6 +13074,17 @@ impl Router {
             stats.note_side_transport_chunks(frames.len());
             return Ok(frames);
         }
+        // A bundling writer packs canonical frames itself; templates or a
+        // side wrapper would only hide them from it.
+        #[cfg(feature = "compact-bundle")]
+        if self.side_compact_bundle_active(side) {
+            let mut st = self.state.lock();
+            st.side_runtime_stats
+                .entry(side)
+                .or_default()
+                .note_side_transport_full(raw_len, raw_len);
+            return Ok(SideTransportFrames::single(raw));
+        }
 
         if opts.header_template_enabled {
             // Shared buses cannot retain one coherent dictionary across
@@ -13351,6 +14184,10 @@ impl Router {
             RouterTxHandlerFn::PackedWithPriority(handler) => handler(bytes, priority),
             RouterTxHandlerFn::Packet(_) => Err(TelemetryError::BadArg),
         };
+        #[cfg(feature = "timesync")]
+        if result.is_ok() {
+            self.timesync_note_handed_frame(side, bytes);
+        }
         #[cfg(feature = "latest-value-egress")]
         if result.is_ok() && _service.token != 0 && _service.side != 0 {
             let mut st = self.state.lock();
@@ -13473,6 +14310,24 @@ impl Router {
         ) {
             return Ok(());
         }
+        #[cfg(feature = "timesync")]
+        let timesync_frame = matches!(ty, DataType::TimeSyncRequest | DataType::TimeSyncResponse);
+        #[cfg(feature = "timesync")]
+        if timesync_frame {
+            self.timesync_note_handoff(side, data);
+        }
+        #[cfg(feature = "timesync")]
+        struct Disarm<'a>(&'a Router, bool);
+        #[cfg(feature = "timesync")]
+        impl Drop for Disarm<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.timesync_disarm();
+                }
+            }
+        }
+        #[cfg(feature = "timesync")]
+        let _disarm = Disarm(self, timesync_frame);
         let result = match (handler, data) {
             (
                 packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)),
@@ -13673,6 +14528,38 @@ impl Router {
         }
     }
 
+    /// Count a reliable delivery given up after its last retry; std builds
+    /// also keep it (the most recent EXHAUSTED_RECENT) for the application.
+    fn note_exhausted(
+        counts: &mut crate::diagnostics::ReliableExhaustionCounts,
+        #[cfg(feature = "std")] recent: &mut VecDeque<crate::diagnostics::ExhaustedReliable>,
+        exhausted: crate::diagnostics::ExhaustedReliable,
+    ) {
+        let counter = match (exhausted.end_to_end, exhausted.ordered) {
+            (true, true) => &mut counts.end_to_end_ordered,
+            (true, false) => &mut counts.end_to_end_unordered,
+            (false, true) => &mut counts.hop_ordered,
+            (false, false) => &mut counts.hop_unordered,
+        };
+        *counter = counter.saturating_add(1);
+        #[cfg(feature = "std")]
+        {
+            if recent.len() >= EXHAUSTED_RECENT {
+                recent.pop_front();
+            }
+            recent.push_back(exhausted);
+        }
+    }
+
+    /// The reliable deliveries given up after their last retry since the
+    /// last call, oldest first (at most the most recent EXHAUSTED_RECENT;
+    /// the counters in `export_runtime_stats` count them all). An Unordered
+    /// delivery is dropped without any other notice.
+    #[cfg(feature = "std")]
+    pub fn take_exhausted_reliable(&self) -> Vec<crate::diagnostics::ExhaustedReliable> {
+        self.state.lock().exhausted_recent.drain(..).collect()
+    }
+
     fn process_reliable_timeouts(&self) -> TelemetryResult<()> {
         let now = self.clock.now_ms();
         let mut requeue: Vec<(RouterSideId, DataType, u32)> = Vec::new();
@@ -13684,7 +14571,8 @@ impl Router {
                 return Ok(());
             }
 
-            for ((side, ty_u32), tx_state) in st.reliable_tx.iter_mut() {
+            let RouterInner { reliable_tx, reliable_exhausted, #[cfg(feature = "std")] exhausted_recent, .. } = &mut *st;
+            for ((side, ty_u32), tx_state) in reliable_tx.iter_mut() {
                 let Some(ty) = DataType::try_from_u32(*ty_u32) else {
                     continue;
                 };
@@ -13710,7 +14598,14 @@ impl Router {
                         continue;
                     }
                     if sent.retries >= runtime_reliable_max_retries() {
-                        if matches!(reliable_mode(ty), crate::ReliableMode::Ordered) {
+                        let ordered = matches!(reliable_mode(ty), crate::ReliableMode::Ordered);
+                        Self::note_exhausted(
+                            reliable_exhausted,
+                            #[cfg(feature = "std")]
+                            exhausted_recent,
+                            crate::diagnostics::ExhaustedReliable { data_type: Some(ty), packet_id: u64::from(seq), ordered, end_to_end: false },
+                        );
+                        if ordered {
                             tx_state.next_seq = 0;
                             tx_state.sent.clear();
                             tx_state.sent_order.clear();
@@ -13749,9 +14644,27 @@ impl Router {
         let now = self.clock.now_ms();
         let mut requeue = Vec::new();
         let mut failed_ordered_types = OrdSet::new();
+        #[cfg(feature = "discovery")]
+        let mut silenced: Vec<u64> = Vec::new();
+        // Leased transports report physical drain: a copy's retry interval
+        // starts when it actually left, and a copy still held by the writer
+        // covers its packet for up to two intervals (a writer that never
+        // drains or discards cannot stall the retries forever).
+        #[cfg(feature = "std")]
+        let (drained, held) = self.retry_write_progress();
 
         {
             let mut st = self.state.lock();
+            // Urgent traffic (the ABORT class) keeps the handoff-based clock:
+            // it never re-sends later than before drain tracking existed.
+            #[cfg(feature = "std")]
+            for (id, at) in drained {
+                if let Some(sent) = st.end_to_end_reliable_tx.get_mut(&id)
+                    && !Self::is_urgent_item(&sent.data)
+                {
+                    sent.last_send_ms = sent.last_send_ms.max(at);
+                }
+            }
             #[cfg(feature = "discovery")]
             {
                 if Self::prune_discovery_routes_locked(&mut st, now) {
@@ -13768,6 +14681,9 @@ impl Router {
             let RouterInner {
                 transmit_queue,
                 end_to_end_reliable_tx,
+                reliable_exhausted,
+                #[cfg(feature = "std")]
+                exhausted_recent,
                 ..
             } = &mut *st;
             end_to_end_reliable_tx.retain(|&packet_id, sent| {
@@ -13776,6 +14692,12 @@ impl Router {
                         .pending_destinations
                         .values()
                         .all(|side| Self::e2e_child_owned(transmit_queue, *side, packet_id));
+                #[cfg(feature = "std")]
+                let covered = covered
+                    || (held.contains(&packet_id)
+                        && now.wrapping_sub(sent.last_send_ms)
+                            < runtime_reliable_retransmit_ms().saturating_mul(2)
+                        && !Self::is_urgent_item(&sent.data));
                 if covered
                     || sent.waiting_for_predecessor
                     || sent.queued
@@ -13784,9 +14706,44 @@ impl Router {
                     return true;
                 }
                 if sent.retries >= runtime_reliable_max_retries() {
+                    // An Unordered frame others acknowledged: the owners still
+                    // pending missed every retry (silent). It completes for the
+                    // others once they are retired below, from it and from the
+                    // other Unordered frames. Never an Ordered frame (its
+                    // exhaustion, with the owners that missed it, is what the
+                    // application re-sends from, e.g. the station's Aborted
+                    // FLIGHT_STATE) and never an ABORT or urgent frame.
+                    #[cfg(feature = "discovery")]
+                    if sent.ordered_type.is_none()
+                        && !Self::item_data_type(&sent.data)
+                            .is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT")
+                        && sent.pending_destinations.len() < Self::frozen_owner_count(&sent.data)
+                    {
+                        for owner in sent.pending_destinations.keys() {
+                            if !silenced.contains(owner) {
+                                silenced.push(*owner);
+                            }
+                        }
+                        return true;
+                    }
                     if let Some(ty) = sent.ordered_type {
                         failed_ordered_types.insert(ty);
                     }
+                    #[cfg(feature = "std")]
+                    let ty = sent.pending_type;
+                    #[cfg(not(feature = "std"))]
+                    let ty = sent.ordered_type.unwrap_or(0);
+                    Self::note_exhausted(
+                        reliable_exhausted,
+                        #[cfg(feature = "std")]
+                        exhausted_recent,
+                        crate::diagnostics::ExhaustedReliable {
+                            data_type: DataType::try_from_u32(ty),
+                            packet_id,
+                            ordered: sent.ordered_type.is_some(),
+                            end_to_end: true,
+                        },
+                    );
                     return false;
                 }
                 sent.retries += 1;
@@ -13801,6 +14758,10 @@ impl Router {
             });
         }
 
+        #[cfg(feature = "discovery")]
+        if !silenced.is_empty() {
+            self.retire_owners_from_pending(&silenced, true)?;
+        }
         for packet_id in requeue {
             self.queue_end_to_end_reliable_retransmit(packet_id)?;
         }
@@ -13851,7 +14812,9 @@ impl Router {
             None
         };
         Self::reconcile_pending_timesync_request_locked(&mut st, &leader, now_mono_ms);
-        if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref() {
+        if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref()
+            && !st.v2.has_samples_from(&remote.sender)
+        {
             Self::timesync_steer_projected_locked(&mut st, remote, now_mono_ms, now_mono_ns);
         }
     }
@@ -13871,7 +14834,7 @@ impl Router {
         });
         if let Some(target_ms) = target_ms {
             let anchored = remote.quality().anchored;
-            Self::timesync_steer_remote_locked(st, now_mono_ns, target_ms, anchored, false);
+            Self::timesync_steer_remote_locked(st, now_mono_ns, target_ms, anchored);
         }
     }
 
@@ -13902,8 +14865,14 @@ impl Router {
         {
             return;
         }
-        if let Some(unix_ms) = time.to_network_time().and_then(|t| t.as_unix_ms()) {
-            st.disciplined_clock.steer_unix_ms(now_ns, unix_ms);
+        if let Some(unix_ns) = time
+            .to_network_time()
+            .and_then(|t| t.as_unix_ns())
+            .filter(|ns| *ns >= 0)
+            && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
+        {
+            st.disciplined_clock
+                .steer_unix_ns(now_ns, unix_ns.min(i128::from(i64::MAX)) as i64);
         }
     }
 
@@ -13948,11 +14917,17 @@ impl Router {
             st.clock.remove_source(LOCAL_TIMESYNC_DATE_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_TOD_SOURCE_ID);
             st.clock.remove_source(LOCAL_TIMESYNC_SUBSEC_SOURCE_ID);
-            if let Some(unix_ms) = adjusted
+            if let Some(unix_ns) = adjusted
                 .to_network_time()
-                .and_then(|time| time.as_unix_ms())
+                .and_then(|time| time.as_unix_ns())
+                .filter(|ns| *ns >= 0)
+                && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
             {
-                st.disciplined_clock.steer_unix_ms(now_ns, unix_ms);
+                let unix_ns = unix_ns.min(i128::from(i64::MAX)) as i64;
+                // A node that follows a better remote source (an RRLS while the
+                // GS leads) keeps its host time as a candidate only; steering
+                // the clock to it would fight the exchange discipline.
+                st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
             }
         } else {
             // Prepare every allocation first. In particular, do not erase an
@@ -14211,6 +15186,7 @@ impl Router {
         st.next_request_mono_ms = 0;
         st.pending_request = None;
         st.clock_anchored = false;
+        st.v2.reset();
         st.clock.remove_source(INTERNAL_TIMESYNC_SOURCE_ID);
         for source in stale_remote_sources {
             st.clock.remove_source(&source);
@@ -14242,7 +15218,17 @@ impl Router {
     #[cfg(feature = "timesync")]
     /// Returns the current network time as Unix milliseconds when available.
     pub fn network_time_ms(&self) -> Option<u64> {
-        self.network_time().and_then(|t| t.unix_time_ms)
+        // `network_time` without the calendar fields every packet timestamp
+        // would build and throw away; the same reading.
+        let runtime = self.timesync.as_ref()?;
+        let now_ms = self.monotonic_now_ms();
+        let now_ns = self.monotonic_now_ns();
+        self.refresh_timesync_state(now_ms);
+        let st = runtime.lock();
+        if let Some(unix_ms) = st.disciplined_clock.read_unix_ms(now_ns) {
+            return Some(unix_ms);
+        }
+        st.clock.current_time(now_ns).and_then(|t| t.unix_time_ms)
     }
 
     #[cfg(feature = "timesync")]
@@ -14385,9 +15371,12 @@ impl Router {
             };
             Self::reconcile_pending_timesync_request_locked(&mut st, &leader, now_ms);
 
-            if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref() {
+            if let Some(TimeSyncLeader::Remote(remote)) = leader.as_ref()
+                && !st.v2.has_samples_from(&remote.sender)
+            {
                 Self::timesync_steer_projected_locked(&mut st, remote, now_ms, now_ns);
             }
+            let _ = Self::timesync_status_locked(&mut st, leader.as_ref(), now_ns);
 
             if now_ms >= st.next_announce_mono_ms {
                 if let Some(priority) = announce_prio {
@@ -14410,21 +15399,43 @@ impl Router {
                 && now_ms >= st.next_request_mono_ms
                 && st.pending_request.is_none()
             {
-                let seq = st.next_seq;
-                st.next_seq = u64::from((seq as u32).wrapping_add(1).max(1));
+                let seq = st.next_seq & crate::timesync::TIMESYNC_SEQ_COUNTER_MASK;
+                st.next_seq = ((seq + 1) & crate::timesync::TIMESYNC_SEQ_COUNTER_MASK).max(1);
                 // A request on a known side names its target so other servers on
                 // a shared segment stay silent. Legacy servers echo the word.
                 let side = st.remote_sources.get(&remote.sender).and_then(|src| src.side);
                 let seq = side.map_or(seq, |_| {
                     (u64::from(timesync_sender_tag(&remote.sender)) << 32) | seq
                 });
-                st.next_request_mono_ms = now_ms.saturating_add(cfg.request_interval_ms);
+                // A follower whose bound is tight exchanges less often: the
+                // learned frequency carries the clock between samples and the
+                // radio is busy. One still acquiring, or whose bound grew (lost
+                // or queued exchanges, a step), asks twice as often.
+                let interval = if st.v2.is_locked()
+                    && st
+                        .v2
+                        .bound_ns(now_ns)
+                        .is_some_and(|bound| bound <= timesync_v2::RELAXED_REQUEST_BOUND_NS)
+                {
+                    cfg.request_interval_ms
+                        .saturating_mul(timesync_v2::LOCKED_REQUEST_DIVISOR)
+                } else if st.v2.is_locked() {
+                    cfg.request_interval_ms
+                } else {
+                    (cfg.request_interval_ms / 2).max(timesync_v2::FAST_REQUEST_MIN_MS)
+                }
+                // Never more requests outstanding than the round trip allows.
+                .max(st.v2.last_round_trip_ms());
+                st.next_request_mono_ms = now_ms.saturating_add(interval);
+                // A fresh absolute-time report rides in the t1 cookie word.
+                let (seq, cookie) = Self::timesync_request_cookie_locked(&st, seq, now_ms, now_ns);
+                Self::timesync_record_request_locked(&mut st, seq, cookie, now_ns);
                 st.pending_request = Some(PendingTimeSyncRequest {
                     seq,
-                    t1_mono_ms: now_ms,
+                    t1_mono_ms: cookie,
                     source: remote.sender,
                 });
-                request = Some((seq, now_ms, side));
+                request = Some((seq, cookie, side));
             }
         }
 
@@ -14524,7 +15535,6 @@ impl Router {
                         &st.remote_sources,
                         pkt.sender(),
                         RemoteTimeSyncSource {
-                            priority: quality.priority,
                             last_sample_mono_ms: now_mono_ms,
                             sample_unix_ms: ann.time_ms,
                             side: src,
@@ -14545,14 +15555,16 @@ impl Router {
                         tracker.commit_source(tracker_update);
                         matches!(tracker.leader(now_mono_ms, has_usable_time),
                             Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pkt.sender())
-                    };
+                    } && (!st.v2.has_samples_from(pkt.sender())
+                        // UTC replacing unanchored time is taken from the
+                        // announce at once, as before.
+                        || (quality.anchored && !st.clock_anchored));
                     if should_steer {
                         Self::timesync_steer_remote_locked(
                             &mut st,
                             now_mono_ns,
                             ann.time_ms,
                             quality.anchored,
-                            false,
                         );
                     }
                     poll_after = true;
@@ -14570,80 +15582,64 @@ impl Router {
                         || target == timesync_sender_tag(&sender)
                         || target == local_address);
                     if should_serve {
-                        let network_now = st
-                            .disciplined_clock
-                            .read_unix_ms(now_mono_ns)
-                            .or_else(|| {
-                                st.clock
-                                    .current_time(now_mono_ns)
-                                    .and_then(|t| t.unix_time_ms)
-                            })
-                            .unwrap_or(now_mono_ms);
-                        let t2 = network_now;
-                        let t3 = network_now;
-                        response = Some((req.seq, req.t1_ms, t2, t3, src));
+                        let leader = st
+                            .tracker
+                            .as_ref()
+                            .and_then(|tracker| tracker.leader(now_mono_ms, has_usable_time));
+                        let status =
+                            Self::timesync_status_locked(&mut st, leader.as_ref(), now_mono_ns);
+                        Self::timesync_note_utc_report_locked(
+                            &mut st,
+                            pkt.sender(),
+                            req.seq,
+                            req.t1_ms,
+                            now_mono_ns,
+                        );
+                        let (seq, t1, t2, t3) = Self::timesync_build_response_locked(
+                            &mut st,
+                            pkt.sender(),
+                            req.seq,
+                            req.t1_ms,
+                            now_mono_ns,
+                            &status,
+                        );
+                        response = Some((seq, t1, t2, t3, src));
                     }
                 }
                 DataType::TimeSyncResponse => {
                     let resp = decode_timesync_response(pkt)?;
-                    let pending = st.pending_request.clone();
-                    if let Some(pending) = pending
-                        && pending.seq == resp.seq
-                        && pending.source == pkt.sender()
-                        && pending.t1_mono_ms == resp.t1_ms
-                        && now_mono_ms >= pending.t1_mono_ms
-                        && now_mono_ms - pending.t1_mono_ms <= cfg.source_timeout_ms
-                        && resp.t3_ms >= resp.t2_ms
-                        && resp.t3_ms - resp.t2_ms <= now_mono_ms - pending.t1_mono_ms
-                        && matches!(st.tracker.as_ref().and_then(|tracker|tracker.leader(now_mono_ms, has_usable_time)),
-                            Some(TimeSyncLeader::Remote(ref remote)) if remote.sender == pending.source)
-                    {
-                        let (source_priority, source_anchored) = {
-                            let tracker = st.tracker.as_ref().expect("tracker checked above");
-                            let quality = tracker.best_active_source(now_mono_ms).map(|s| s.quality());
-                            (
-                                quality
-                                    .map(|q| q.priority)
-                                    .or_else(|| st.remote_sources.get(pkt.sender()).map(|s| s.priority))
-                                    .unwrap_or(cfg.priority),
-                                quality.is_some_and(|q| q.anchored),
-                            )
-                        };
-                        let source_side = st.remote_sources.get(pkt.sender()).and_then(|s| s.side);
-                        let (estimate_ms, _delay_ms) = compute_network_time_sample(
-                            pending.t1_mono_ms,
-                            resp.t2_ms,
-                            resp.t3_ms,
-                            now_mono_ms,
-                        );
-                        let remote_update = crate::peer_record::prepare(
-                            &st.remote_sources,
-                            pkt.sender(),
-                            RemoteTimeSyncSource {
-                                priority: source_priority,
-                                last_sample_mono_ms: now_mono_ms,
-                                sample_unix_ms: estimate_ms,
-                                side: source_side.or(src),
-                            },
-                        )?;
-                        let clock_update = st.clock.prepare_source(
-                            pkt.sender(),
-                            source_priority,
-                            PartialNetworkTime::from_unix_ms(estimate_ms),
-                            now_mono_ms,
-                            now_mono_ns,
-                            Some(cfg.source_timeout_ms),
-                        )?;
-                        remote_update.commit(&mut st.remote_sources);
-                        st.clock.commit_source(clock_update);
-                        Self::timesync_steer_remote_locked(
+                    let source_quality = st.tracker.as_ref().and_then(|tracker| {
+                        match tracker.leader(now_mono_ms, has_usable_time) {
+                            Some(TimeSyncLeader::Remote(remote)) if remote.sender == pkt.sender() => {
+                                Some(remote.quality())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(quality) = source_quality {
+                        let answered = st.pending_request.as_ref().is_some_and(|pending| {
+                            pending.seq == resp.seq
+                                && pending.t1_mono_ms == resp.t1_ms
+                                && pending.source == pkt.sender()
+                        });
+                        if answered {
+                            st.pending_request = None;
+                        }
+                        let steered = Self::timesync_handle_response_locked(
                             &mut st,
+                            pkt.sender(),
+                            (resp.seq, resp.t1_ms, resp.t2_ms, resp.t3_ms),
+                            src,
                             now_mono_ns,
-                            estimate_ms,
-                            source_anchored,
-                            true,
+                            quality.anchored,
                         );
-                        st.pending_request = None;
+                        if steered
+                            && let Some(now_unix_ms) = st.disciplined_clock.read_unix_ms(now_mono_ns)
+                            && let Some(remote) = st.remote_sources.get_mut(pkt.sender())
+                        {
+                            remote.last_sample_mono_ms = now_mono_ms;
+                            remote.sample_unix_ms = now_unix_ms;
+                        }
                     }
                 }
                 _ => {}
@@ -14766,6 +15762,9 @@ impl Router {
                 latest_service_seq: 0,
                 ordered_claim_seq: 0,
                 rx_priority_burst: 0,
+                e2e_rx_seen: VecDeque::new(),
+
+                ordered_rx_last: VecDeque::new(),
                 recent_rx: BoundedDeque::new(
                     memory.recent_rx_queue_bytes(),
                     memory.recent_rx_queue_bytes(),
@@ -14781,12 +15780,17 @@ impl Router {
                 end_to_end_reliable_tx_order: VecDeque::new(),
                 total_handler_failures: 0,
                 total_handler_retries: 0,
+                reliable_exhausted: Default::default(),
+                #[cfg(feature = "std")]
+                exhausted_recent: VecDeque::new(),
                 #[cfg(feature = "discovery")]
                 discovery_routes: Default::default(),
                 #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
                 #[cfg(feature = "discovery")]
                 discovery_side_throttle: Default::default(),
+                #[cfg(feature = "discovery")]
+                discovery_heard: Vec::new(),
                 #[cfg(feature = "discovery")]
                 schema_response_sequence: 0,
                 #[cfg(feature = "discovery")]
@@ -14807,10 +15811,12 @@ impl Router {
             side_tx_activity: crate::lock::SideTxActivity::default(),
             #[cfg(feature = "std")]
             active_queued_tx: core::sync::atomic::AtomicUsize::new(0),
-            clock,
+            clock: Arc::from(clock),
             #[cfg(feature = "timesync")]
             timesync: local_services_enabled
                 .then(|| Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)))),
+            #[cfg(feature = "timesync")]
+            timesync_tx_arm: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -14891,6 +15897,66 @@ impl Router {
         };
         let state = self.state.lock();
         Self::hostname_for_address_borrowed_locked(&state, address) == Some(expected_hostname)
+    }
+
+    /// Like `sender_matches_hostname`, for a fixed station name a receiver
+    /// checks by its literal name (the primary "GS", an "RRLS"), with one
+    /// narrow addition: a compact sender equal to the station name's
+    /// deterministic identity (`packet::sender_address_u32`) matches when the
+    /// receiver knows no other identity for that address. A board behind a
+    /// relay may never have learned a station's address (it rebooted, or never
+    /// heard the station before it went out of reach); without this it
+    /// refused an RRLS takeover's commands while the relay accepted them.
+    ///
+    /// An address assigned to any name still decides alone, and if any other
+    /// name the receiver knows (address book or discovery) has the same
+    /// compact identity the match fails closed. Like every name match, this
+    /// is identification, not authentication. Does not allocate.
+    pub fn sender_matches_station(&self, sender: &str, station: &str) -> bool {
+        if sender.is_empty()
+            || station.is_empty()
+            || sender.contains('\0')
+            || station.contains('\0')
+            || station.starts_with("@addr:")
+        {
+            return false;
+        }
+        let Some(value) = sender.strip_prefix("@addr:") else {
+            return sender == station;
+        };
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(address) = value.parse::<u32>() else {
+            return false;
+        };
+        let state = self.state.lock();
+        if let Some(hostname) = state.address_by_value.get(&address) {
+            return hostname.as_str() == station;
+        }
+        sender_address_u32(station) == address
+            && !Self::other_name_has_address_locked(&state, address, station)
+    }
+
+    /// Whether a name other than `station` that this router knows (address
+    /// book or discovery, the names `hostname_for_address_borrowed_locked`
+    /// considers) has the compact identity `address`.
+    fn other_name_has_address_locked(st: &RouterInner, address: NodeAddress, station: &str) -> bool {
+        let other = |candidate: &str| candidate != station && sender_address_u32(candidate) == address;
+        #[cfg(feature = "discovery")]
+        for route in st.discovery_routes.values() {
+            for (announcer, state) in &route.announcers {
+                if other(announcer) {
+                    return true;
+                }
+                for board in state.topology_boards.iter() {
+                    if other(&board.sender_id) || board.connections.iter().any(|peer| other(peer)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        st.address_book.values().any(|entry| other(entry.hostname.as_ref()))
     }
 
     pub fn address_book(&self) -> Vec<AddressBookEntry> {
@@ -15638,6 +16704,33 @@ impl Router {
         Ok(())
     }
 
+    /// Switch a registered side to (or from) compact bundles.
+    #[cfg(feature = "compact-bundle")]
+    pub fn set_side_compact_bundle(&self, side: RouterSideId, enabled: bool) -> TelemetryResult<()> {
+        let mut st = self.state.lock();
+        let side_ref = st
+            .sides
+            .get_mut(side)
+            .and_then(|side| side.as_mut())
+            .ok_or(TelemetryError::BadArg)?;
+        side_ref.opts.compact_bundle = enabled;
+        Ok(())
+    }
+
+    /// Whether the writer for `side` sends compact bundles: the side was
+    /// opened (or switched) with [`crate::routing_config::SideOptions::compact_bundle`].
+    /// Every node on such a link runs a bundle-capable build, so there is no
+    /// negotiation and no legacy fallback on it.
+    #[cfg(feature = "compact-bundle")]
+    pub fn side_compact_bundle_active(&self, side: RouterSideId) -> bool {
+        self.state
+            .lock()
+            .sides
+            .get(side)
+            .and_then(|side| side.as_ref())
+            .is_some_and(|side| side.opts.compact_bundle)
+    }
+
     /// Enable or disable egress toward a registered side.
     ///
     /// When `enabled` is `false`, the router keeps the side but stops routing packets toward it.
@@ -15933,6 +17026,112 @@ impl Router {
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
+    /// Forget `hostname` as a reachable peer now, for an application that has
+    /// established by its own means that the peer is out of range (for
+    /// example a link-loss or takeover decision), instead of waiting for its
+    /// discovery routes to expire (`DISCOVERY_ROUTE_TTL_MS`).
+    ///
+    /// Its routes go as if it had sent a discovery leave, so no new reliable
+    /// frame is owed to it. It is also retired from the destinations of every
+    /// pending end-to-end reliable frame: a frame then completes once its
+    /// remaining destinations acknowledge it, and a frame owed to no one else
+    /// completes now. This is the caller's decision, not a receipt from the
+    /// peer, which is why topology expiry alone never does it. The peer
+    /// returns with its next discovery announcement.
+    ///
+    /// Returns the number of pending frames it was retired from.
+    #[cfg(feature = "discovery")]
+    pub fn forget_peer(&self, hostname: &str) -> TelemetryResult<usize> {
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        let leaving = Self::canonical_sender_locked(&st, hostname);
+        if Self::remove_discovery_peer_locked(&mut st, &leaving)? {
+            Self::note_discovery_topology_change_locked(&mut st, now_ms);
+            self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
+        }
+        let mut owners = vec![Self::sender_hash(&leaving)];
+        if let Some(entry) = st.address_book.get(leaving.as_str()) {
+            owners.push(u64::from(entry.address));
+        }
+        drop(st);
+        self.retire_owners_from_pending(&owners, false)
+    }
+
+    /// Retires `owners` from every pending end-to-end frame: a frame then
+    /// completes once its remaining owners acknowledge it, and one owed to no
+    /// one else completes now. An ABORT or urgent frame is never completed
+    /// this way (as with complete_reliable): it keeps such an owner while no
+    /// one else still owes it, and retries out its own span. Returns the
+    /// number of frames retired from.
+    #[cfg(feature = "discovery")]
+    fn retire_owners_from_pending(&self, owners: &[u64], silent: bool) -> TelemetryResult<usize> {
+        let mut st = self.state.lock();
+        let mut retired = 0;
+        let mut completed = Vec::new();
+        let RouterInner { end_to_end_reliable_tx, reliable_exhausted, .. } = &mut *st;
+        for (packet_id, sent) in end_to_end_reliable_tx.iter_mut() {
+            let protected = Self::item_data_type(&sent.data)
+                .is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT");
+            // A silent owner stays owed every Ordered, ABORT and urgent frame:
+            // only the application decides to forget a peer from those.
+            if silent && (protected || sent.ordered_type.is_some()) {
+                continue;
+            }
+            if protected
+                && sent
+                    .pending_destinations
+                    .keys()
+                    .all(|owner| owners.contains(owner))
+            {
+                continue;
+            }
+            let before = sent.pending_destinations.len();
+            for owner in owners {
+                sent.pending_destinations.remove(owner);
+            }
+            let removed = (before - sent.pending_destinations.len()) as u64;
+            if removed != 0 {
+                retired += 1;
+                let done = sent.pending_destinations.is_empty();
+                if done {
+                    completed.push(*packet_id);
+                }
+                if silent {
+                    let c = &mut *reliable_exhausted;
+                    let ordered = sent.ordered_type.is_some();
+                    let (owners_n, frames_n) = if ordered {
+                        (&mut c.silent_owner_retired_ordered, &mut c.silent_owner_completed_ordered)
+                    } else {
+                        (&mut c.silent_owner_retired_unordered, &mut c.silent_owner_completed_unordered)
+                    };
+                    *owners_n = owners_n.saturating_add(removed);
+                    // Completed for owners that acknowledged it, not a frame
+                    // owed to the silent owner alone.
+                    if done && Self::frozen_owner_count(&sent.data) as u64 > removed {
+                        *frames_n = frames_n.saturating_add(1);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "std")]
+        let mut finished = Vec::new();
+        for packet_id in completed {
+            #[cfg(feature = "std")]
+            if let Some(sent) = st.end_to_end_reliable_tx.remove(&packet_id) {
+                finished.push((packet_id, sent, completion::serial()));
+            }
+            #[cfg(not(feature = "std"))]
+            st.end_to_end_reliable_tx.remove(&packet_id);
+        }
+        drop(st);
+        self.release_ordered_successors()?;
+        #[cfg(feature = "std")]
+        for (packet_id, sent, cutoff) in finished {
+            self.retire_completed_writes(packet_id, &sent, cutoff);
+        }
+        Ok(retired)
+    }
+
     /// Queue a discovery advertisement if the adaptive cadence says one is due.
     #[cfg(feature = "discovery")]
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
@@ -16152,7 +17351,7 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
         }
-        self.cache_managed_variable_packet(&pkt, false, None)
+        self.cache_managed_variable_packet(&pkt, false, None, true)
     }
 
     pub fn cached_managed_variable(&self, ty: DataType) -> Option<Packet> {
@@ -16183,7 +17382,7 @@ impl Router {
                 return Err(TelemetryError::PermissionDenied);
             }
         }
-        self.cache_managed_variable_packet(&pkt, false, None)?;
+        self.cache_managed_variable_packet(&pkt, false, None, true)?;
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
@@ -16486,6 +17685,10 @@ impl Router {
 
     pub fn export_runtime_stats(&self) -> RuntimeStatsSnapshot {
         let now_ms = self.clock.now_ms();
+        #[cfg(feature = "timesync")]
+        let timesync_sub_minimum_rejects = self.timesync_sub_minimum_rejects();
+        #[cfg(not(feature = "timesync"))]
+        let timesync_sub_minimum_rejects = 0;
         let isr_rx = self
             .isr_rx_queue
             .as_ref()
@@ -16718,10 +17921,12 @@ impl Router {
                     .forwarded_receipts
                     .as_ref()
                     .map_or(0, |cache| cache.destinations.len()),
+                exhausted: st.reliable_exhausted,
             },
             discovery,
             total_handler_failures: st.total_handler_failures,
             total_handler_retries: st.total_handler_retries,
+            timesync_sub_minimum_rejects,
         }
     }
 
@@ -17191,26 +18396,106 @@ impl Router {
     fn remove_pkt_id(&self, item: &RouterItem) {
         let hash = Self::get_hash(item);
         let mut st = self.state.lock();
-        st.recent_rx.remove_value(&hash);
+        st.forget_rx_id(hash);
     }
 
     /// Compute a de-dupe ID for a RouterItem and record it.
     /// Returns true if this item was seen recently (and should be skipped).
     fn is_duplicate_pkt(&self, item: &RouterItem) -> TelemetryResult<bool> {
-        self.is_duplicate_packet_id(Self::get_hash(item))
+        let ty = Self::item_data_type(item)
+            .ok()
+            .filter(|ty| is_reliable_type(*ty) && !is_internal_control_type(*ty));
+        let id = Self::get_hash(item);
+        let Some(ty) = ty else {
+            return self.is_duplicate_packet_id_windowed(id, false);
+        };
+        {
+            let key = ty.as_u32();
+            {
+                let st = self.state.lock();
+                // 0 marks an empty or forgotten slot, never a match.
+                if id != 0
+                    && st
+                        .ordered_rx_last
+                        .iter()
+                        .any(|(t, ids)| *t == key && ids.contains(&id))
+                {
+                    return Ok(true);
+                }
+            }
+            let duplicate = self.is_duplicate_packet_id_windowed(id, true)?;
+            if !duplicate {
+                let mut st = self.state.lock();
+                if let Some(pos) = st.ordered_rx_last.iter().position(|(t, _)| *t == key) {
+                    let (t, mut ids) = st.ordered_rx_last.remove(pos).expect("found");
+                    ids.rotate_right(1);
+                    ids[0] = id;
+                    st.ordered_rx_last.push_back((t, ids));
+                } else {
+                    // Least recently delivered stream forgotten first: its late
+                    // copies then fall back to the window (never a new packet
+                    // dropped: an id only ever matches the same packet).
+                    if st.ordered_rx_last.len() >= crate::config::ORDERED_RX_STREAMS {
+                        st.ordered_rx_last.pop_front();
+                    }
+                    let mut ids = [0u64; crate::config::ORDERED_RX_HISTORY];
+                    ids[0] = id;
+                    st.ordered_rx_last.push_back((key, ids));
+                }
+            }
+            Ok(duplicate)
+        }
     }
 
     fn is_duplicate_packet_id(&self, id: u64) -> TelemetryResult<bool> {
+        self.is_duplicate_packet_id_windowed(id, false)
+    }
+
+    /// The senders' whole re-send window (every retry plus a second of
+    /// margin), over which a reliable end-to-end duplicate is recognised.
+    fn e2e_rx_window_ms() -> u64 {
+        // The sender's retry tuning is not known here: cover this node's own
+        // and at least E2E_RX_WINDOW_MIN_MS (the GS retries 12 x 400 ms).
+        runtime_reliable_retransmit_ms()
+            .saturating_mul(u64::from(runtime_reliable_max_retries()).saturating_add(1))
+            .saturating_add(1_000)
+            .max(crate::config::E2E_RX_WINDOW_MIN_MS)
+    }
+
+    /// `windowed`: a reliable end-to-end packet, also remembered for the
+    /// senders' re-send window in `E2E_RX_SEEN_SLOTS` entries. When those are
+    /// all younger than the window the oldest is forgotten first: its late
+    /// copy would then be delivered again (as before this window), never a
+    /// new packet dropped.
+    fn is_duplicate_packet_id_windowed(&self, id: u64, windowed: bool) -> TelemetryResult<bool> {
+        let now = self.clock.now_ms();
+        let window = Self::e2e_rx_window_ms();
         let mut st = self.state.lock();
+        if windowed {
+            while st
+                .e2e_rx_seen
+                .front()
+                .is_some_and(|(_, at)| now.saturating_sub(*at) > window)
+            {
+                st.e2e_rx_seen.pop_front();
+            }
+        }
         if st.recent_rx.contains(&id)
             || st
                 .reliable_return_routes
                 .get(&id)
                 .is_some_and(|route| route.delivery_completed)
+            || (windowed && st.e2e_rx_seen.iter().any(|(seen, _)| *seen == id))
         {
             Ok(true)
         } else {
             st.push_recent_rx(id)?;
+            if windowed {
+                if st.e2e_rx_seen.len() >= crate::config::E2E_RX_SEEN_SLOTS {
+                    st.e2e_rx_seen.pop_front();
+                }
+                st.e2e_rx_seen.push_back((id, now));
+            }
             Ok(false)
         }
     }
@@ -17238,11 +18523,10 @@ impl Router {
 
         let device = self.sender_arc();
         let error_msg = match dest {
-            Some(failed_local) => format!(
-                "Handler for endpoint {:?} failed on device {:?}: {:?}",
-                failed_local, device, e
-            ),
-            None => format!("TX Handler failed on device {:?}: {:?}", device, e),
+            Some(failed_local) => {
+                crate::diag_text::handler_failed(Some(failed_local), false, &device, &e)
+            }
+            None => crate::diag_text::tx_handler_failed(&device, &e),
         };
 
         let mut recipients: Vec<DataEndpoint> = pkt
@@ -18015,7 +19299,7 @@ impl Router {
                     && let RouterTxItem::Broadcast(data) = &original.item
                 {
                     let id = Self::get_hash(data);
-                    st.recent_rx.remove_value(&id);
+                    st.forget_rx_id(id);
                 }
                 drop(st);
                 result = self.defer_accepted_original(&mut context);
@@ -18461,6 +19745,22 @@ impl Router {
             })
     }
 
+    /// Receive each canonical frame of a compact bundle. The whole bundle is
+    /// verified first; one record's routing refusal does not drop the rest.
+    #[cfg(feature = "compact-bundle")]
+    #[inline(never)]
+    fn rx_compact_bundle(&self, bytes: &[u8], side: RouterSideId, queued: bool) -> TelemetryResult<()> {
+        crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
+            let _ = if queued {
+                self.rx_packed_queue_from_side(frame, side)
+            } else {
+                self.rx_packed_from_side(frame, side)
+            };
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Enqueue packed bytes for RX processing with an explicit ingress side.
     #[inline]
     pub fn rx_packed_queue_from_side(
@@ -18469,11 +19769,17 @@ impl Router {
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
+        #[cfg(feature = "compact-bundle")]
+        if crate::wire_bundle::is_bundle(bytes) {
+            return self.rx_compact_bundle(bytes, side, true);
+        }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
         };
         let data = RouterItem::Packed(decoded);
         let priority = self.item_service_priority(&data)?;
+        #[cfg(feature = "timesync")]
+        self.timesync_note_rx(&data, self.monotonic_now_ns());
         let mut st = self.state.lock();
         st.push_received(RouterRxItem {
             src: Some(side),
@@ -18664,10 +19970,7 @@ impl Router {
         }
 
         let device = self.sender_arc();
-        let error_msg = format!(
-            "Handler for endpoint {:?} failed on device {:?}: {:?}",
-            dest, device, e
-        );
+        let error_msg = crate::diag_text::handler_failed(dest, true, &device, &e);
 
         if recipients.is_empty() && dest.is_none() {
             fallback_stdout(&error_msg);
@@ -18772,8 +20075,15 @@ impl Router {
                         return Ok(true);
                     }
                 };
+                // The segment receipt went upstream when the cohort was
+                // accepted; a lost one is answered on the parent's retry.
+                let mut already_acknowledged = false;
                 if completed {
                     let mut st = self.state.lock();
+                    already_acknowledged = st
+                        .reliable_return_routes
+                        .get(&upstream_id)
+                        .is_some_and(|route| route.delivery_completed);
                     if Self::remember_reliable_return_route_locked(&mut st, upstream_id) {
                         st.reliable_return_routes
                             .entry(upstream_id)
@@ -18793,11 +20103,13 @@ impl Router {
                             });
                     }
                 }
-                self.queue_end_to_end_reliable_ack_for_sender_hash(
-                    upstream_id,
-                    publisher_hash,
-                    called_from_queue,
-                )?;
+                if !already_acknowledged {
+                    self.queue_end_to_end_reliable_ack_for_sender_hash(
+                        upstream_id,
+                        publisher_hash,
+                        called_from_queue,
+                    )?;
+                }
                 self.release_ordered_successors()?;
                 return Ok(true);
             }
@@ -19084,7 +20396,7 @@ impl Router {
         match &item.data {
             RouterItem::Packet(pkt) => {
                 if !is_internal_control_type(pkt.data_type()) {
-                    self.cache_managed_variable_packet(pkt, true, item.src)?;
+                    self.cache_managed_variable_packet(pkt, true, item.src, false)?;
                 }
             }
             RouterItem::Packed(bytes) => {
@@ -19094,7 +20406,7 @@ impl Router {
                 {
                     let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
-                    self.cache_managed_variable_packet(&pkt, true, item.src)?;
+                    self.cache_managed_variable_packet(&pkt, true, item.src, false)?;
                 }
             }
         }
@@ -19379,6 +20691,17 @@ impl Router {
             if shared_pending {
                 self.relay_send(item.data.clone(), item.src, called_from_queue)?;
             }
+            // Every owner behind this relay already acknowledged: the sender
+            // missed the receipt, so answer with the cached one instead of
+            // dropping its copy (bounded, rate-limited).
+            #[cfg(feature = "discovery")]
+            if !shared_pending && let Some(src) = item.src {
+                self.replay_forwarded_receipts(&item.data, src, called_from_queue)?;
+            }
+            // A completed segment proxy still answers a back edge's copy.
+            if let Some(guard) = _local_admission_guard.as_ref() {
+                self.queue_duplicate_proxy_edge_receipt(item, guard.packet_id)?;
+            }
 
             // A final-ACK retry must cross a router again. Do not redeliver it
             // locally, and rate-limit repeated forwarding to avoid echo loops.
@@ -19571,6 +20894,8 @@ impl Router {
                     return Ok(());
                 }
 
+                #[cfg(feature = "discovery")]
+                self.note_heard_sender(pkt.sender(), item.src);
                 let mut eps: Vec<DataEndpoint> = pkt.endpoints().to_vec();
                 crate::small_sort::sort(&mut eps);
                 eps.dedup();
@@ -19772,6 +21097,8 @@ impl Router {
                     return Ok(());
                 }
 
+                #[cfg(feature = "discovery")]
+                self.note_heard_address(env.source_address, item.src);
                 let any_packet_needed = env
                     .endpoints
                     .iter()
@@ -20101,7 +21428,7 @@ impl Router {
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
-                    self.remember_managed_variable_packet(pkt)?;
+                    self.remember_managed_variable_packet(pkt, true)?;
                 }
                 #[cfg(feature = "discovery")]
                 let is_discovery = discovery::is_discovery_type(ty);
@@ -20360,7 +21687,7 @@ impl Router {
                 if let RouterItem::Packet(pkt) = &data
                     && !is_internal_control_type(pkt.data_type())
                 {
-                    self.remember_managed_variable_packet(pkt)?;
+                    self.remember_managed_variable_packet(pkt, src.is_none())?;
                 }
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {
@@ -20672,10 +21999,16 @@ impl Router {
             return self.rx_packed_queue_from_side(bytes, side);
         }
         self.ensure_side_ingress_enabled(side)?;
+        #[cfg(feature = "compact-bundle")]
+        if crate::wire_bundle::is_bundle(bytes) {
+            return self.rx_compact_bundle(bytes, side, false);
+        }
         let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
             return Ok(());
         };
         let data = RouterItem::Packed(decoded);
+        #[cfg(feature = "timesync")]
+        self.timesync_note_rx(&data, self.monotonic_now_ns());
         let item = RouterRxItem {
             src: Some(side),
             priority: Self::router_item_priority(&data)?,
@@ -22196,6 +23529,9 @@ mod retry_backpressure_native;
 
 #[path = "router_e2e_backpressure.rs"]
 mod e2e_backpressure;
+#[cfg(feature = "timesync")]
+#[path = "router_timesync.rs"]
+mod timesync_v2;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "timesync"))]
 #[path = "tests/peer_record_footprint.rs"]
 mod peer_record_footprint;

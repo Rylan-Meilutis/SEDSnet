@@ -118,3 +118,45 @@ fn sender_match_retained_bridge_connections_without_address_advertisement() {
     receiver.process_all_queues_with_timeout(0).unwrap();
     assert!(receiver.sender_matches_hostname(&alias, name));
 }
+
+/// A board behind a relay that never learned a station's address (an empty
+/// address book) still identifies the station by the station predicate,
+/// while the general name match stays fail-closed.
+#[test]
+fn station_match_identifies_a_station_a_board_never_learned() {
+    let fc = Router::new_with_clock(RouterConfig::new([]).with_hostname("FC"), Box::new(|| 1_000));
+    let rrls = format!("@addr:{}", sender_address_u32("RRLS"));
+    assert!(fc.address_book().iter().all(|entry| entry.hostname.as_ref() != "RRLS"));
+    assert!(fc.sender_matches_station(&rrls, "RRLS"));
+    assert!(!fc.sender_matches_hostname(&rrls, "RRLS"), "the general rule is unchanged");
+    assert!(!fc.sender_matches_station(&rrls, "GS"));
+    assert!(fc.sender_matches_station("RRLS", "RRLS"), "a full-name sender, as before");
+    for bad in ["", "@addr:", "@addr:abc", "@addr:4294967296", "RRLS\0"] {
+        assert!(!fc.sender_matches_station(bad, "RRLS"), "{bad:?}");
+    }
+    assert!(!fc.sender_matches_station(&rrls, ""));
+    assert!(!fc.sender_matches_station(&rrls, &rrls));
+}
+
+/// The station predicate fails closed when another name the receiver knows
+/// has the same compact identity, and an assigned address still decides.
+#[test]
+fn station_match_refuses_a_compact_identity_another_known_name_shares() {
+    let receiver = Router::new_with_clock(
+        RouterConfig::new([])
+            .with_hostname("identity-station-receiver")
+            .with_static_address(5000),
+        Box::new(|| 1),
+    );
+    // A known colliding pair (sender_match_compact_collisions_fail_closed_while_assigned_owners_match).
+    let station = "identity-collision-51666";
+    let other = "identity-collision-117548";
+    let compact = format!("@addr:{}", sender_address_u32(station));
+    assert_eq!(sender_address_u32(station), sender_address_u32(other));
+    assert!(receiver.sender_matches_station(&compact, station), "nothing known: the station's own identity");
+    learn(&receiver, other, 102);
+    assert!(!receiver.sender_matches_station(&compact, station), "another known name shares it: refused");
+    assert!(receiver.sender_matches_station(&compact, other), "the known name itself, no other known name shares it");
+    learn(&receiver, "identity-explicit-address-owner", sender_address_u32(station));
+    assert!(!receiver.sender_matches_station(&compact, station), "an assigned address decides alone");
+}

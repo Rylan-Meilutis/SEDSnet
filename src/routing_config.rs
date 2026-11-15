@@ -67,6 +67,13 @@ pub struct SideOptions {
     pub ingress_enabled: bool,
     /// Allows the router to transmit packets toward this side.
     pub egress_enabled: bool,
+    /// Uses compact bundles on this side (feature `compact-bundle`).
+    ///
+    /// The router hands this side's writer canonical frames (no header
+    /// templates), which the writer packs with
+    /// [`crate::wire_bundle::pack_bundle`]. Every node on the link must run a
+    /// bundle-capable build: there is no negotiation and no legacy fallback.
+    pub compact_bundle: bool,
 }
 
 impl Default for SideOptions {
@@ -83,6 +90,7 @@ impl Default for SideOptions {
             side_transport_profile: SideTransportProfile::Canonical,
             ingress_enabled: true,
             egress_enabled: true,
+            compact_bundle: false,
         }
     }
 }
@@ -115,6 +123,13 @@ impl SideOptions {
         self.header_template_enabled = true;
         self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
         self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    /// Use compact bundles on this side.
+    #[inline]
+    pub fn with_compact_bundle(mut self) -> Self {
+        self.compact_bundle = true;
         self
     }
 

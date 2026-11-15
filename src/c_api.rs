@@ -1130,11 +1130,23 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
             ",\"reliable\":{{\"reliable_return_route_count\":{},\
               \"end_to_end_pending_count\":{},\
               \"end_to_end_pending_destination_count\":{},\
-              \"end_to_end_acked_cache_count\":{}}}",
+              \"end_to_end_acked_cache_count\":{},\
+              \"exhausted\":{{\"end_to_end_ordered\":{},\"end_to_end_unordered\":{},\
+              \"hop_ordered\":{},\"hop_unordered\":{},\
+              \"silent_owner_retired_ordered\":{},\"silent_owner_retired_unordered\":{},\
+              \"silent_owner_completed_ordered\":{},\"silent_owner_completed_unordered\":{}}}}}",
             snap.reliable.reliable_return_route_count,
             snap.reliable.end_to_end_pending_count,
             snap.reliable.end_to_end_pending_destination_count,
-            snap.reliable.end_to_end_acked_cache_count
+            snap.reliable.end_to_end_acked_cache_count,
+            snap.reliable.exhausted.end_to_end_ordered,
+            snap.reliable.exhausted.end_to_end_unordered,
+            snap.reliable.exhausted.hop_ordered,
+            snap.reliable.exhausted.hop_unordered,
+            snap.reliable.exhausted.silent_owner_retired_ordered,
+            snap.reliable.exhausted.silent_owner_retired_unordered,
+            snap.reliable.exhausted.silent_owner_completed_ordered,
+            snap.reliable.exhausted.silent_owner_completed_unordered
         ),
     );
 
@@ -1154,8 +1166,8 @@ fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapsho
     let _ = core::fmt::Write::write_fmt(
         &mut out,
         format_args!(
-            ",\"total_handler_failures\":{},\"total_handler_retries\":{}",
-            snap.total_handler_failures, snap.total_handler_retries
+            ",\"total_handler_failures\":{},\"total_handler_retries\":{},\"timesync_sub_minimum_rejects\":{}",
+            snap.total_handler_failures, snap.total_handler_retries, snap.timesync_sub_minimum_rejects
         ),
     );
     out.push('}');
@@ -1176,12 +1188,52 @@ struct FfiClock {
     user_addr: usize,
 }
 
+/// Optional microsecond clock for C routers (`seds_set_clock_us`): same
+/// epoch as the router's millisecond callback, for sub-millisecond time sync
+/// stamps. 0 when unset.
+static CLOCK_US: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+type CNowUs = extern "C" fn() -> u64;
+
+fn clock_us() -> Option<u64> {
+    match CLOCK_US.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        f => {
+            // SAFETY: only `seds_set_clock_us` stores, and only a `CNowUs`.
+            let f: CNowUs = unsafe { core::mem::transmute::<usize, CNowUs>(f) };
+            Some(f())
+        }
+    }
+}
+
+/// Installs a microsecond clock for every C-created router, in the same epoch
+/// as the millisecond callback each router was created with (e.g. board
+/// microseconds since the router's start). Time sync then stamps and
+/// disciplines at microsecond resolution. Pass NULL to remove it.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_clock_us(now_us: Option<CNowUs>) {
+    CLOCK_US.store(
+        now_us.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 impl Clock for FfiClock {
     fn now_ms(&self) -> u64 {
+        if let Some(us) = clock_us() {
+            return us / 1_000;
+        }
         if let Some(f) = self.cb {
             f(self.user_addr as *mut c_void)
         } else {
             0
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        match clock_us() {
+            Some(us) => us.saturating_mul(1_000),
+            None => self.now_ms().saturating_mul(1_000_000),
         }
     }
 }
@@ -1639,6 +1691,37 @@ pub extern "C" fn seds_router_configure_address(
     ok_or_status(router.set_address_assignment(mode).map(|_| ()))
 }
 
+/// Match a counted UTF-8 sender identity to a fixed station name (see
+/// `Router::sender_matches_station`): as `seds_router_sender_matches_hostname`,
+/// plus the station name's own compact identity when the receiver knows no
+/// other identity for that address. Returns false for null/empty/invalid
+/// inputs and compact collisions. Does not allocate.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_sender_matches_station(
+    r: *const SedsRouter,
+    sender: *const c_char,
+    sender_len: usize,
+    station: *const c_char,
+    station_len: usize,
+) -> bool {
+    if r.is_null()
+        || sender.is_null()
+        || station.is_null()
+        || sender_len == 0
+        || station_len == 0
+        || sender_len > isize::MAX as usize
+        || station_len > isize::MAX as usize
+    {
+        return false;
+    }
+    let sender = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(sender), sender_len) };
+    let station = unsafe { slice::from_raw_parts(c_char_ptr_as_u8(station), station_len) };
+    let (Ok(sender), Ok(station)) = (from_utf8(sender), from_utf8(station)) else {
+        return false;
+    };
+    unsafe { &(*r).inner }.sender_matches_station(sender, station)
+}
+
 /// Match a counted UTF-8 sender identity to a literal expected hostname.
 /// Returns false for null/empty/invalid inputs or unknown/ambiguous aliases.
 /// Input spans must be readable for their lengths; no output storage is needed.
@@ -2003,6 +2086,242 @@ pub extern "C" fn seds_router_configure_timesync(
         max_slew_ppm: 50_000,
     }));
     status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Current network time in Unix microseconds (time sync builds).
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_network_time_us(r: *mut SedsRouter, out_us: *mut u64) -> i32 {
+    if r.is_null() || out_us.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    match router.network_time_ns() {
+        Some(ns) if ns >= 0 => {
+            unsafe { *out_us = (ns / 1_000) as u64 };
+            status_from_result_code(SedsResult::SedsOk)
+        }
+        _ => status_from_err(TelemetryError::Io("network time unavailable")),
+    }
+}
+
+/// Time sync quality for C callers. See `seds_router_get_timesync_status`.
+#[cfg(feature = "timesync")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SedsTimeSyncStatus {
+    /// 0 unsynced, 1 acquiring, 2 locked, 3 holdover.
+    pub state: u8,
+    /// Hops from the reference (0 = this node is the reference).
+    pub stratum: u8,
+    /// 1 when this node is the reference others follow.
+    pub is_reference: u8,
+    /// Bit 7 synced; bits 0..7: 0 not reported, 1..=126 error code + 1, 127 unknown.
+    pub health_byte: u8,
+    /// Error bound of network time in microseconds (UINT32_MAX when unknown).
+    pub error_bound_us: u32,
+    /// Correction still being slewed out, microseconds (positive: behind).
+    pub offset_us: i32,
+    /// Learned oscillator frequency correction, parts per billion.
+    pub rate_ppb: i32,
+    /// Age of the newest accepted exchange sample, ms (UINT32_MAX when none).
+    pub last_sample_age_ms: u32,
+}
+
+/// Reads this node's time sync quality.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_timesync_status(
+    r: *mut SedsRouter,
+    out: *mut SedsTimeSyncStatus,
+) -> i32 {
+    if r.is_null() || out.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let Some(st) = router.timesync_status() else {
+        return status_from_err(TelemetryError::Io("time sync not configured"));
+    };
+    let clamp_u32 = |v: u64| v.min(u64::from(u32::MAX)) as u32;
+    unsafe {
+        *out = SedsTimeSyncStatus {
+            state: st.state.code(),
+            stratum: st.stratum,
+            is_reference: u8::from(st.is_reference),
+            health_byte: st.health_byte(),
+            error_bound_us: if st.error_bound_ns == u64::MAX {
+                u32::MAX
+            } else {
+                clamp_u32(st.error_bound_ns / 1_000)
+            },
+            offset_us: (st.offset_ns / 1_000).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            rate_ppb: st.rate_ppb.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            last_sample_age_ms: clamp_u32(st.last_sample_age_ms),
+        };
+    }
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Reports that the transport finished sending `bytes` (exactly the frame the
+/// side callback received) at `sent_us` on the router's clock (the same
+/// timebase as the router's now callback, in microseconds; a millisecond
+/// board passes ms * 1000). Call it from task context after the TX-complete
+/// interrupt recorded the instant. Frames other than time sync cost a length
+/// compare.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_note_frame_sent(
+    r: *mut SedsRouter,
+    side_id: u32,
+    bytes: *const u8,
+    len: usize,
+    sent_us: u64,
+) -> i32 {
+    if r.is_null() || (len > 0 && bytes.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let slice = unsafe { slice::from_raw_parts(bytes, len) };
+    router.note_frame_sent(side_id as usize, slice, sent_us.saturating_mul(1_000));
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// `seds_router_receive_packed_from_side` with the receive instant captured
+/// by the transport (router clock, microseconds), e.g. in the RX interrupt.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_receive_packed_from_side_at(
+    r: *mut SedsRouter,
+    side_id: u32,
+    bytes: *const u8,
+    len: usize,
+    rx_us: u64,
+) -> i32 {
+    if r.is_null() || (len > 0 && bytes.is_null()) {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let slice = unsafe { slice::from_raw_parts(bytes, len) };
+    ok_or_status(router.rx_packed_from_side_at(slice, side_id as usize, rx_us.saturating_mul(1_000)))
+}
+
+/// Describes a side's path for time sync: per-byte delay between the
+/// transmit and receive stamps (ns) and a fixed (response - request) / 2
+/// asymmetry (ns). See `Router::set_side_timesync_path`.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_timesync_path(
+    r: *mut SedsRouter,
+    side_id: u32,
+    byte_ns: u32,
+    fixed_asymmetry_ns: i32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_side_timesync_path(side_id as usize, byte_ns, fixed_asymmetry_ns);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Describes a side's physical minimum one-way delay between the stamps,
+/// excluding the per-byte part (ns). See `Router::set_side_timesync_min_delay`.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_timesync_min_delay(
+    r: *mut SedsRouter,
+    side_id: u32,
+    min_one_way_ns: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_side_timesync_min_delay(side_id as usize, min_one_way_ns);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Describes how far each end's time sync stamp on a side may be off (UART,
+/// DMA and ISR latency), ns. See `Router::set_side_timesync_stamp_uncertainty`.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_timesync_stamp_uncertainty(
+    r: *mut SedsRouter,
+    side_id: u32,
+    stamp_ns: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_side_timesync_stamp_uncertainty(side_id as usize, stamp_ns);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Reports this node's absolute-time reference to its time source (e.g. RF
+/// GPS UTC minus network time, measured at the fix), carried in the next
+/// requests while fresh (5 s). `valid == false` stops reporting.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_utc_reference_offset(
+    r: *mut SedsRouter,
+    valid: bool,
+    offset_us: i64,
+    error_us: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    router.set_utc_reference_offset(valid.then(|| {
+        (offset_us.saturating_mul(1_000), u64::from(error_us).saturating_mul(1_000))
+    }));
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Completes one pending end-to-end reliable send by packet id when the
+/// application holds other proof of delivery. Returns SEDS_OK when it was
+/// pending and is now complete, a not-found status when nothing was pending,
+/// and a permission-denied status for urgent types (ABORT is never completed).
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_complete_reliable(r: *mut SedsRouter, packet_id: u64) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    match router.complete_reliable(packet_id) {
+        Ok(true) => status_from_result_code(SedsResult::SedsOk),
+        Ok(false) => status_from_err(TelemetryError::Io("reliable send not pending")),
+        Err(e) => status_from_err(e),
+    }
+}
+
+/// For a driver that queues frames itself: true when `bytes` (a frame this
+/// router handed to `side_id`) is a relayed reliable copy every destination
+/// owner has already acknowledged. Drop it instead of writing it.
+#[cfg(feature = "discovery")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_relayed_frame_satisfied(
+    r: *mut SedsRouter,
+    side_id: u32,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if r.is_null() || bytes.is_null() || len == 0 {
+        return false;
+    }
+    let router = unsafe { &(*r).inner };
+    let slice = unsafe { slice::from_raw_parts(bytes, len) };
+    router.relayed_frame_satisfied(side_id as usize, slice)
+}
+
+/// Decodes a 7-bit time sync error code (health byte bits 0..7) to an upper
+/// bound in microseconds; UINT32_MAX for 127 (unknown).
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_timesync_error_code_us(code: u8) -> u32 {
+    let ns = crate::timesync_discipline::decode_error_code(code);
+    if ns == u64::MAX { u32::MAX } else { (ns / 1_000).min(u64::from(u32::MAX - 1)) as u32 }
 }
 
 #[cfg(feature = "timesync")]
@@ -3109,6 +3428,14 @@ pub extern "C" fn seds_endpoint_exists(endpoint: u32) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_dtype_exists(ty: u32) -> bool {
     data_type_exists(DataType(ty))
+}
+
+/// Sets a type's signed scheduling class: < 0 urgent (above SEDSnet network
+/// control, e.g. ABORT), >= 0 ordinary schema order. Local policy only.
+/// Returns false when the urgent table is full.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_dtype_set_scheduling_class(ty: u32, class: i8) -> bool {
+    crate::set_type_scheduling_class(DataType(ty), class)
 }
 
 /// Derive an order-independent identity without requiring local registration.
@@ -8295,3 +8622,110 @@ pub extern "C" fn seds_relay_set_latest_value_side(r: *mut SedsRelay, side: i32)
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/c_api_sender_identity_match.rs"]
 mod sender_identity_match_tests;
+
+// ============================================================================
+//  FFI: compact bundles (feature `compact-bundle`)
+// ============================================================================
+
+/// Switch a side to (1) or from (0) compact bundles.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_compact_bundle(
+    r: *mut SedsRouter,
+    side_id: u32,
+    enabled: bool,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    ok_or_status(unsafe { &(*r).inner }.set_side_compact_bundle(side_id as usize, enabled))
+}
+
+/// 1 when the side uses compact bundles, 0 when not, negative status for a
+/// bad router.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_side_compact_bundle_active(r: *mut SedsRouter, side_id: u32) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    i32::from(unsafe { &(*r).inner }.side_compact_bundle_active(side_id as usize))
+}
+
+/// 1 when `frame` may join a bundle (canonical, CRC-valid, unsealed), else 0.
+/// The caller keeps urgent frames out before asking.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_compact_bundle_frame_ok(frame: *const u8, len: usize) -> i32 {
+    if frame.is_null() || len == 0 {
+        return 0;
+    }
+    i32::from(crate::wire_bundle::frame_bundleable(unsafe {
+        slice::from_raw_parts(frame, len)
+    }))
+}
+
+/// Pack `count` frames (frame i at `base + offsets[i]`, `lengths[i]` bytes),
+/// in order, into one bundle written to `out` (capacity `cap`). `out` may
+/// overlap the input. Returns the bundle length, or a negative status:
+/// SEDS_BAD_ARG for bad arguments or a frame that cannot join a bundle,
+/// SEDS_SIZE_MISMATCH when the bundle does not fit `cap`.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_compact_bundle_pack(
+    base: *const u8,
+    offsets: *const u16,
+    lengths: *const u16,
+    count: usize,
+    out: *mut u8,
+    cap: usize,
+) -> i32 {
+    if base.is_null()
+        || offsets.is_null()
+        || lengths.is_null()
+        || out.is_null()
+        || count == 0
+        || count > crate::wire_bundle::MAX_BUNDLE_RECORDS
+    {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let offsets = unsafe { slice::from_raw_parts(offsets, count) };
+    let lengths = unsafe { slice::from_raw_parts(lengths, count) };
+    let frame = |i: usize| unsafe {
+        slice::from_raw_parts(base.add(usize::from(offsets[i])), usize::from(lengths[i]))
+    };
+    let Ok(bundle) = crate::wire_bundle::pack_bundle_with(count, &frame) else {
+        return status_from_err(TelemetryError::BadArg);
+    };
+    if bundle.len() > cap || bundle.len() > i32::MAX as usize {
+        return status_from_err(TelemetryError::SizeMismatch { expected: cap, got: bundle.len() });
+    }
+    // The input is no longer read: `out` may alias it.
+    unsafe { core::ptr::copy(bundle.as_ptr(), out, bundle.len()) };
+    bundle.len() as i32
+}
+
+/// Set the shared ordered node-name table for compact bundles (see
+/// `wire_bundle::set_node_table`). `names` and every string must stay valid
+/// for the program's lifetime (string literals). Call once at start-up.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_set_node_table(names: *const *const core::ffi::c_char, count: usize) -> i32 {
+    if names.is_null() || count == 0 || count > 64 {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let mut table: Vec<&'static str> = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = unsafe { *names.add(i) };
+        if name.is_null() {
+            return status_from_err(TelemetryError::BadArg);
+        }
+        // SAFETY: the caller passes NUL-terminated strings that live forever.
+        let Ok(name) = unsafe { core::ffi::CStr::from_ptr(name) }.to_str() else {
+            return status_from_err(TelemetryError::BadArg);
+        };
+        table.push(name);
+    }
+    crate::wire_bundle::set_node_table(alloc::boxed::Box::leak(table.into_boxed_slice()));
+    0
+}

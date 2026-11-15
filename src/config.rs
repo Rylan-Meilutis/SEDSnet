@@ -83,6 +83,28 @@ pub const MAX_RECENT_RX_IDS: usize = match option_env!("MAX_RECENT_RX_IDS") {
     None => 128,
 };
 
+/// Shortest window a reliable end-to-end duplicate is recognised over, ms:
+/// the GS re-sends for 12 x 400 ms = 4.8 s, plus margin.
+pub const E2E_RX_WINDOW_MIN_MS: u64 = match option_env!("E2E_RX_WINDOW_MIN_MS") {
+    Some(val) => parse_usize(val) as u64,
+    None => 6_000,
+};
+
+/// Ordered end-to-end types whose newest delivered ids are kept, and how
+/// many ids each (8 bytes each): exact duplicate rejection for the stream.
+pub const ORDERED_RX_STREAMS: usize = match option_env!("ORDERED_RX_STREAMS") {
+    Some(val) => parse_usize(val),
+    None => 16,
+};
+pub const ORDERED_RX_HISTORY: usize = 4;
+
+/// Reliable end-to-end packets remembered for the senders' re-send window
+/// (16 bytes each), so a late re-send is not delivered twice.
+pub const E2E_RX_SEEN_SLOTS: usize = match option_env!("E2E_RX_SEEN_SLOTS") {
+    Some(val) => parse_usize(val),
+    None => 32,
+};
+
 pub const STARTING_QUEUE_SIZE: usize = match option_env!("STARTING_QUEUE_SIZE") {
     Some(val) => parse_usize(val),
     None => 128,
@@ -513,22 +535,29 @@ impl DataEndpoint {
     }
 }
 
+impl DataEndpoint {
+    /// Calls `f` with the name `Debug` prints, or `None` when it prints
+    /// `DataEndpoint(<id>)`.
+    pub(crate) fn with_debug_name<R>(self, f: impl FnOnce(Option<&str>) -> R) -> R {
+        match self {
+            Self::TelemetryError => f(Some("SEDSNET_ERROR")),
+            Self::TimeSync => f(Some("SEDSNET_TIME_SYNC")),
+            Self::Discovery => f(Some("SEDSNET_DISCOVERY")),
+            _ => {
+                let meta = get_endpoint_meta(self);
+                let meta_name = meta.name_ref();
+                f((meta_name != "UNKNOWN_ENDPOINT").then_some(meta_name))
+            }
+        }
+    }
+}
+
 impl core::fmt::Debug for DataEndpoint {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let name = match *self {
-            Self::TelemetryError => "SEDSNET_ERROR",
-            Self::TimeSync => "SEDSNET_TIME_SYNC",
-            Self::Discovery => "SEDSNET_DISCOVERY",
-            _ => {
-                let meta = get_endpoint_meta(*self);
-                let meta_name = meta.name_ref();
-                if meta_name != "UNKNOWN_ENDPOINT" {
-                    return f.write_str(meta_name);
-                }
-                return write!(f, "DataEndpoint({})", self.0);
-            }
-        };
-        f.write_str(name)
+        self.with_debug_name(|name| match name {
+            Some(name) => f.write_str(name),
+            None => write!(f, "DataEndpoint({})", self.0),
+        })
     }
 }
 

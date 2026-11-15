@@ -420,7 +420,7 @@ fn ack_count(f: &Fixture, node: usize, id: u64) -> usize {
         .count()
 }
 #[test]
-fn cycle_missing_leaf_never_gets_false_root_completion() {
+fn cycle_missing_leaf_is_owed_by_its_segment_proxy_not_the_root() {
     let mut f = cycle_fixture(&[(0, 1), (1, 2), (2, 3), (3, 1), (2, 4)]);
     f.links
         .iter()
@@ -431,8 +431,10 @@ fn cycle_missing_leaf_never_gets_false_root_completion() {
     f.publish(1, 1);
     let id = owner_id(&f);
     f.pump(100, 500);
+    // Each segment proxy acknowledges once it accepted the write; the
+    // missing leaf is router 2's own delivery, never a root completion.
     assert!(
-        f.routers[0]
+        !f.routers[0]
             .state
             .lock()
             .end_to_end_reliable_tx
@@ -534,19 +536,25 @@ fn cycle_edge_receipt_refusal_duplicates_and_parent_are_bounded() {
     for _ in 0..32 {
         f.routers[1].rx_packed_from_side(&first, parent).unwrap();
     }
-    assert_eq!(ack_count(&f, 1, id), 1);
+    // The parent's segment receipt went out on acceptance; its retries are
+    // answered again, once per queue (the edge receipt plus one parent).
+    assert_eq!(ack_count(&f, 1, id), 2);
     {
         let st = f.routers[1].state.lock();
         let route = st.reliable_return_routes.get(&id).unwrap();
         assert_eq!(route.side, parent);
-        assert!(!route.delivery_completed);
+        assert!(route.delivery_completed);
+        // Router 2 acknowledged as a segment proxy; router 3's receipt is
+        // behind the held back edge.
         assert_eq!(
             st.end_to_end_reliable_tx
                 .get(&id)
                 .unwrap()
                 .pending_destinations
-                .len(),
-            2
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Router::sender_hash(f.routers[3].sender().as_ref())]
         );
     }
     let busy = f
@@ -559,8 +567,9 @@ fn cycle_edge_receipt_refusal_duplicates_and_parent_are_bounded() {
     busy.store(true, Ordering::Relaxed);
     f.links.push(held);
     f.pump(101, 10);
+    // The root holds router 1's segment receipt.
     assert!(
-        f.routers[0]
+        !f.routers[0]
             .state
             .lock()
             .end_to_end_reliable_tx
@@ -680,7 +689,9 @@ fn cycle_disabled_nonparent_egress_does_not_consume_receipt() {
         let st = f.routers[1].state.lock();
         let route = st.reliable_return_routes.get(&id).unwrap();
         assert_eq!(route.side, parent);
-        assert!(!route.delivery_completed);
+        // Completed toward the parent on acceptance (the segment receipt),
+        // not by the refused non-parent edge.
+        assert!(route.delivery_completed);
     }
     f.routers[1]
         .set_side_egress_enabled(held.side, true)
@@ -1145,12 +1156,12 @@ fn cycle_after_drain_duplicates_have_one_receipt_per_input_and_no_data_replay() 
         "duplicate closure never expands/reforwards the value"
     );
     assert!(
-        f.routers[0]
+        f.routers[2]
             .state
             .lock()
             .end_to_end_reliable_tx
             .contains_key(&id),
-        "the distinct missing child remains owed"
+        "the distinct missing child remains owed by its segment proxy"
     );
 }
 #[cfg(feature = "compact-packet-store")]
@@ -1203,12 +1214,28 @@ fn cycle_compact_positive_parked_owner_and_receipt_scans_stay_unpinned() {
     let id = packet.packet_id();
     f.routers[0].set_network_variable(packet).unwrap();
     f.pump(100, 20);
+    // A segment proxy acknowledges on acceptance and owns delivery behind it,
+    // so a router whose segment completed holds no record. The proxy (1),
+    // still owed over the held back edge, and the cycle's far router (3), whose
+    // record is the duplicate input below, both still own one.
+    for index in [1, 3] {
+        assert!(
+            f.routers[index]
+                .state
+                .lock()
+                .end_to_end_reliable_tx
+                .contains_key(&id),
+            "router {index} still owns its segment's delivery"
+        );
+    }
     // Move actual retained canonical owner bytes into the configured arena. The
     // bytes, frozen recipients and ownership maps stay exact; this gives a
     // positive witness even when automatic parking thresholds differ by profile.
-    for node in 0..4 {
-        let mut st = f.routers[node].state.lock();
-        let owner = st.end_to_end_reliable_tx.get_mut(&id).unwrap();
+    for router in &f.routers[0..4] {
+        let mut st = router.state.lock();
+        let Some(owner) = st.end_to_end_reliable_tx.get_mut(&id) else {
+            continue;
+        };
         if let super::RouterItem::Packed(bytes) = &mut owner.data {
             let handle = crate::shared_bytes::with_slice(bytes, |view| store.store(view))
                 .unwrap()
@@ -1375,21 +1402,26 @@ fn cycle_edge_receipt_requires_exact_target_source_and_crc_binding() {
     assert_eq!(ack_count(&f, 1, id), 0);
     {
         let state = f.routers[1].state.lock();
+        // Only the segment receipt sent on acceptance completed it.
         assert!(
-            !state
+            state
                 .reliable_return_routes
                 .get(&id)
                 .unwrap()
                 .delivery_completed
         );
+        // Router 2 acknowledged as a segment proxy; router 3's receipt is
+        // behind the held back edge.
         assert_eq!(
             state
                 .end_to_end_reliable_tx
                 .get(&id)
                 .unwrap()
                 .pending_destinations
-                .len(),
-            2
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Router::sender_hash(f.routers[3].sender().as_ref())]
         );
     }
 }

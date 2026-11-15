@@ -93,7 +93,8 @@ impl Router {
             | DataType::ManagedVariableValue
             | DataType::TimeSyncAnnounce
             | DataType::TimeSyncRequest
-            | DataType::TimeSyncResponse => 254,
+            | DataType::TimeSyncResponse => crate::NETWORK_CONTROL_PRIORITY,
+            _ if crate::type_is_urgent(ty) => 255,
             _ => meta.priority.min(253),
         };
         let small_control = packet.payload().len() <= 16
