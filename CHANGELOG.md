@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Ask a side for topology as soon as data is heard there from a sender that no
+  fresh announcer or topology describes (its route aged out during a cut
+  longer than the route TTL), instead of waiting for that sender's next
+  discovery packet; while it stays undescribed, ask again after 1 s and 2 s
+  (`DISCOVERY_TOPOLOGY_RETRY_MS`, at most three requests), then stop until it
+  is described. Announcers still missing their baseline keep the 5 s retry
+  (combined round R3-C: the station's ABORT to FC had no route for 5.6 s and
+  PB's latch push was rejected).
 - Ask a peer heard again for its topology when no other topology describes it
   with endpoints. A bridge (an RRLS) that lists a peer it lost with no
   endpoints no longer counts as describing it, so the returning peer is asked

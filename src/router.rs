@@ -1536,6 +1536,35 @@ enum SchemaResponsePhase {
 }
 
 #[cfg(feature = "discovery")]
+const HEARD_REQUESTS_MAX: u8 = 3;
+
+#[cfg(feature = "discovery")]
+#[derive(Debug, Clone, Copy, Default)]
+struct HeardSenderState {
+    undescribed: Option<(u64, u64)>,
+    /// Topology requests made for `undescribed`: it stops arming after
+    /// HEARD_REQUESTS_MAX (a sender that never announces must not keep asking).
+    heard_requests: u8,
+    described: (u32, u64),
+    /// The next topology-request interval on this side while something stays
+    /// undescribed: 1 s, 2 s, 4 s, then 5 s; back to 1 s once described.
+    retry_ms: u32,
+}
+
+#[cfg(feature = "discovery")]
+#[inline(never)]
+fn heard_slot(heard: &mut Vec<(RouterSideId, HeardSenderState)>, side: RouterSideId) -> &mut HeardSenderState {
+    let index = match heard.iter().position(|(s, _)| *s == side) {
+        Some(index) => index,
+        None => {
+            heard.push((side, HeardSenderState::default()));
+            heard.len() - 1
+        }
+    };
+    &mut heard[index].1
+}
+
+#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default)]
 struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
@@ -2888,6 +2917,12 @@ struct RouterInner {
     discovery_cadence: DiscoveryCadenceState,
     #[cfg(feature = "discovery")]
     discovery_side_throttle: RouterMap<RouterSideId, DiscoverySideThrottleState>,
+    /// Per side, filled only once data is heard there: a sender no fresh
+    /// discovery describes (its name hash and when), so baseline recovery asks
+    /// that side for topology; and the last compact sender found described (so
+    /// the same sender is not re-checked for a second).
+    #[cfg(feature = "discovery")]
+    discovery_heard: Vec<(RouterSideId, HeardSenderState)>,
     #[cfg(feature = "discovery")]
     schema_response_sequence: u64,
     #[cfg(feature = "discovery")]
@@ -11040,6 +11075,75 @@ impl Router {
         }
     }
 
+    /// Whether a fresh announcer on `side` is `name`, or describes it (a
+    /// topology board with endpoints).
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn sender_described_locked(st: &RouterInner, side: RouterSideId, name: u64, now_ms: u64) -> bool {
+        st.discovery_routes.get(&side).is_some_and(|route| {
+            now_ms.saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                && route.announcers.iter().any(|(announcer, peer)| {
+                    now_ms.saturating_sub(peer.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                        && (Self::sender_hash(announcer) == name
+                            || peer.topology_boards.iter().any(|board| {
+                                !board.reachable_endpoints.is_empty()
+                                    && Self::sender_hash(&board.sender_id) == name
+                            }))
+                })
+        })
+    }
+
+    /// Data heard on a side from a sender no fresh discovery describes (its
+    /// route aged out during a cut longer than the TTL): remember it so the
+    /// next poll asks that side for topology instead of waiting for the
+    /// sender's next discovery packet (R3-C: 4.7 s).
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn note_heard_sender(&self, sender: &str, src: Option<RouterSideId>) {
+        if src.is_none() || sender.starts_with("E2EACK:") {
+            return;
+        }
+        match sender.strip_prefix("@addr:").and_then(|value| value.parse::<u32>().ok()) {
+            Some(address) => self.note_heard_address(address, src),
+            None => self.note_heard_name(Self::sender_hash(sender), src),
+        }
+    }
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn note_heard_address(&self, address: u32, src: Option<RouterSideId>) {
+        let Some(side) = src else { return };
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if st.discovery_heard.iter().any(|(s, h)| {
+            *s == side && h.described.0 == address && now_ms.saturating_sub(h.described.1) < 1_000
+        }) {
+            return;
+        }
+        let Some(name) = Self::hostname_for_address_borrowed_locked(&st, address).map(Self::sender_hash) else {
+            return;
+        };
+        if name == Self::sender_hash(self.sender_arc().as_ref()) || Self::sender_described_locked(&st, side, name, now_ms) {
+            heard_slot(&mut st.discovery_heard, side).described = (address, now_ms);
+            return;
+        }
+        let slot = heard_slot(&mut st.discovery_heard, side);
+        if slot.undescribed.is_none_or(|(old, _)| old != name) { slot.heard_requests = 0; }
+        slot.undescribed = Some((name, now_ms));
+    }
+    #[cfg(feature = "discovery")]
+    #[inline(never)]
+    fn note_heard_name(&self, name: u64, src: Option<RouterSideId>) {
+        let Some(side) = src else { return };
+        let now_ms = self.clock.now_ms();
+        let mut st = self.state.lock();
+        if name == Self::sender_hash(self.sender_arc().as_ref()) || Self::sender_described_locked(&st, side, name, now_ms) {
+            return;
+        }
+        let slot = heard_slot(&mut st.discovery_heard, side);
+        if slot.undescribed.is_none_or(|(old, _)| old != name) { slot.heard_requests = 0; }
+        slot.undescribed = Some((name, now_ms));
+    }
+
     #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
@@ -11059,7 +11163,24 @@ impl Router {
             let mut st = self.state.lock();
             let mut due = Vec::new();
             for side in 0..st.sides.len() {
-                let missing = st.discovery_routes.get(&side).is_some_and(|route| {
+                let (heard, heard_requests) = st.discovery_heard.iter().find(|(s, _)| *s == side)
+                    .map_or((None, 0), |(_, h)| (h.undescribed, h.heard_requests));
+                let heard_missing = heard_requests < HEARD_REQUESTS_MAX && heard.is_some_and(|(name, at)| {
+                    now_ms.saturating_sub(at) <= DISCOVERY_ROUTE_TTL_MS
+                        && !Self::sender_described_locked(&st, side, name, now_ms)
+                });
+                // Described now (or aged): forget it. Past its request cap it is
+                // kept, so the same silent sender does not re-arm.
+                if heard.is_some_and(|(name, at)| {
+                    now_ms.saturating_sub(at) > DISCOVERY_ROUTE_TTL_MS
+                        || Self::sender_described_locked(&st, side, name, now_ms)
+                }) {
+                    if let Some((_, h)) = st.discovery_heard.iter_mut().find(|(s, _)| *s == side) {
+                        h.undescribed = None;
+                        h.heard_requests = 0;
+                    }
+                }
+                let missing = heard_missing || st.discovery_routes.get(&side).is_some_and(|route| {
                     route.announcers.iter().any(|(name, peer)| {
                         !peer.has_full_topology
                             && now_ms.saturating_sub(peer.last_seen_ms) < DISCOVERY_ROUTE_TTL_MS
@@ -11082,15 +11203,38 @@ impl Router {
                     })
                 });
                 if !missing {
+                    if let Some((_, h)) = st.discovery_heard.iter_mut().find(|(s, _)| *s == side) { h.retry_ms = 0; }
                     continue;
                 }
-                let throttle = st.discovery_side_throttle.entry(side).or_default();
-                if throttle.next_topology_request_ms == 0 {
-                    throttle.next_topology_request_ms =
-                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
-                } else if now_ms >= throttle.next_topology_request_ms {
-                    throttle.next_topology_request_ms =
-                        now_ms.saturating_add(discovery::DISCOVERY_BASELINE_RETRY_MS);
+                let due_now = {
+                    let throttle = st.discovery_side_throttle.entry(side).or_default();
+                    if throttle.next_topology_request_ms == 0 {
+                        throttle.next_topology_request_ms =
+                            now_ms.saturating_add(discovery::DISCOVERY_BASELINE_GRACE_MS);
+                        false
+                    } else {
+                        now_ms >= throttle.next_topology_request_ms
+                    }
+                };
+                if due_now {
+                    // Bounded backoff: a lossy slow link must not storm requests
+                    // (and the replies they draw) at the retry floor.
+                    // Only a heard, undescribed sender (its route aged during a cut)
+                    // retries fast, backing off 1 s, 2 s, 4 s and capped at
+                    // HEARD_REQUESTS_MAX; an announcer still missing its
+                    // baseline keeps the 5 s retry (a lossy slow link otherwise
+                    // drew a storm of requests and replies that starved heartbeats).
+                    let slot = heard_slot(&mut st.discovery_heard, side);
+                    let step = if heard_missing {
+                        slot.heard_requests = slot.heard_requests.saturating_add(1);
+                        let step = if slot.retry_ms == 0 { discovery::DISCOVERY_TOPOLOGY_RETRY_MS as u32 } else { slot.retry_ms };
+                        slot.retry_ms = step.saturating_mul(2).min(discovery::DISCOVERY_BASELINE_RETRY_MS as u32);
+                        step
+                    } else {
+                        discovery::DISCOVERY_BASELINE_RETRY_MS as u32
+                    };
+                    st.discovery_side_throttle.entry(side).or_default().next_topology_request_ms =
+                        now_ms.saturating_add(u64::from(step));
                     due.push(side);
                 }
             }
@@ -15645,6 +15789,8 @@ impl Router {
                 discovery_cadence: DiscoveryCadenceState::default(),
                 #[cfg(feature = "discovery")]
                 discovery_side_throttle: Default::default(),
+                #[cfg(feature = "discovery")]
+                discovery_heard: Vec::new(),
                 #[cfg(feature = "discovery")]
                 schema_response_sequence: 0,
                 #[cfg(feature = "discovery")]
@@ -20746,6 +20892,8 @@ impl Router {
                     return Ok(());
                 }
 
+                #[cfg(feature = "discovery")]
+                self.note_heard_sender(pkt.sender(), item.src);
                 let mut eps: Vec<DataEndpoint> = pkt.endpoints().to_vec();
                 crate::small_sort::sort(&mut eps);
                 eps.dedup();
@@ -20947,6 +21095,8 @@ impl Router {
                     return Ok(());
                 }
 
+                #[cfg(feature = "discovery")]
+                self.note_heard_address(env.source_address, item.src);
                 let any_packet_needed = env
                     .endpoints
                     .iter()

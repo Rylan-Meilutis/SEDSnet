@@ -153,6 +153,93 @@ fn a_departed_owner_still_ages_out() {
     assert!(!owners.contains(&gs));
 }
 
+fn station_fixture() -> (Router, RouterSideId, DataType, DataEndpoint, std::sync::Arc<AtomicU64>, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    crate::tests::ensure_common_test_schema();
+    let ep = crate::config::register_endpoint("RETURNING_OWNER_STATION", false).unwrap();
+    let ty = crate::config::register_data_type_with_description(
+        "RETURNING_OWNER_STATUS", "",
+        MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+        &[ep], crate::ReliableMode::Unordered, 16).unwrap();
+    let clock = std::sync::Arc::new(AtomicU64::new(1_000));
+    let now = clock.clone();
+    let gs = Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), Box::new(move || now.load(Ordering::SeqCst)));
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let out = sent.clone();
+    let radio = gs.add_side_packed("radio", move |bytes| { out.lock().unwrap().push(bytes.to_vec()); Ok(()) });
+    (gs, radio, ty, ep, clock, sent)
+}
+fn topology_requests(sent: &std::sync::Mutex<Vec<Vec<u8>>>) -> usize {
+    sent.lock().unwrap().iter().filter(|b| {
+        wire_format::peek_frame_info(b).is_ok_and(|f| f.envelope.ty == DataType::DiscoveryTopologyRequest)
+    }).count()
+}
+
+/// R3-C: after a 45 s cut (longer than the 30 s route TTL) the station heard
+/// RF's data from 350 s but re-learned the AV bay only from RF's next
+/// discovery packet (~354.7 s); its topology request was then lost and retried
+/// 5 s later, so the operator's ABORT to FC had no route until 361.5 s and
+/// PB's latch push was rejected as unverified. Data from a sender that no
+/// fresh announcer or topology describes asks that side for topology within
+/// the baseline grace; while it stays undescribed the request repeats every
+/// DISCOVERY_TOPOLOGY_RETRY_MS (1 s), not 5 s.
+#[test]
+fn data_from_an_undescribed_sender_asks_for_topology_and_retries_quickly() {
+    let (gs, radio, ty, ep, clock, sent) = station_fixture();
+    // RF was known, then the cut aged it out.
+    gs.rx_from_side(&crate::discovery::build_discovery_announce("RF", 1_000, &[ep]).unwrap(), radio).unwrap();
+    gs.process_all_queues_with_timeout(0).unwrap();
+    for t in (2_000..=40_000).step_by(1_000) {
+        clock.store(t, Ordering::SeqCst);
+        gs.poll_discovery().unwrap();
+        gs.process_all_queues_with_timeout(0).unwrap();
+    }
+    sent.lock().unwrap().clear();
+    // RF's data is heard again; no discovery packet from it yet.
+    let mut asked = Vec::new();
+    for t in (40_000..=44_000).step_by(100) {
+        clock.store(t, Ordering::SeqCst);
+        let data = Packet::new(ty, &[ep], "RF", t, Arc::<[u8]>::from([1u8])).unwrap();
+        gs.rx_from_side(&data, radio).unwrap();
+        gs.poll_discovery().unwrap();
+        gs.process_all_queues_with_timeout(0).unwrap();
+        let n = topology_requests(&sent);
+        if n > asked.len() { asked.push(t); }
+    }
+    assert!(!asked.is_empty(), "data from the undescribed RF asks for topology");
+    assert!(asked[0] - 40_000 <= discovery::DISCOVERY_BASELINE_GRACE_MS + 100, "first request {} ms after RF was heard", asked[0] - 40_000);
+    assert!(asked.len() >= 2 && asked[1] - asked[0] <= discovery::DISCOVERY_TOPOLOGY_RETRY_MS + 100,
+            "an unanswered request is repeated within 1 s: {asked:?}");
+    // Still undescribed: the retry backs off (1, 2, 4, then 5 s), never storms.
+    for t in (44_100..=80_000).step_by(100) {
+        clock.store(t, Ordering::SeqCst);
+        let data = Packet::new(ty, &[ep], "RF", t, Arc::<[u8]>::from([1u8])).unwrap();
+        gs.rx_from_side(&data, radio).unwrap();
+        gs.poll_discovery().unwrap();
+        gs.process_all_queues_with_timeout(0).unwrap();
+        let n = topology_requests(&sent);
+        if n > asked.len() { asked.push(t); }
+    }
+    // A sender that stays undescribed is asked a bounded number of times
+    // (backing off 1 s, 2 s), never at the retry floor for the whole outage.
+    let gaps: Vec<u64> = asked.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps.iter().all(|g| *g + 100 >= discovery::DISCOVERY_TOPOLOGY_RETRY_MS), "backs off: {gaps:?}");
+    assert!(asked.len() <= 4, "no storm over 40 s: {} requests at {asked:?}", asked.len());
+    // RF's topology arrives: no further requests.
+    let board = crate::discovery::TopologyBoardNode { sender_id: "RF".into(), reachable_endpoints: vec![ep],
+        reachable_timesync_sources: Vec::new(), connections: vec!["GS".into()] };
+    gs.rx_from_side(&crate::discovery::build_discovery_topology("RF", 80_000, &[board]).unwrap(), radio).unwrap();
+    gs.process_all_queues_with_timeout(0).unwrap();
+    sent.lock().unwrap().clear();
+    for t in (80_100..=86_000).step_by(100) {
+        clock.store(t, Ordering::SeqCst);
+        let data = Packet::new(ty, &[ep], "RF", t, Arc::<[u8]>::from([1u8])).unwrap();
+        gs.rx_from_side(&data, radio).unwrap();
+        gs.poll_discovery().unwrap();
+        gs.process_all_queues_with_timeout(0).unwrap();
+    }
+    assert_eq!(topology_requests(&sent), 0, "a described sender asks for nothing");
+}
+
 /// Replay of RF's radio receive in R2-C (frames extracted from the radio
 /// trace): which owners RF gives a BOARD_STATE_STATUS around the hand-back.
 #[test]
