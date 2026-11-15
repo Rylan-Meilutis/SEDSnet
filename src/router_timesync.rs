@@ -15,7 +15,7 @@ use crate::timesync::{
 use crate::timesync::{UtcReferenceReport, decode_utc_report_word};
 use crate::timesync_discipline::{
     ClockDiscipline, SyncState, TIMESYNC_MIN_DELAY_TOLERANCE_NS, decode_error_code, encode_error_code,
-    exchange_sample,
+    exchange_sample, mul_div,
 };
 
 /// Requests a follower keeps open for interleaved answers.
@@ -751,35 +751,40 @@ impl Router {
             let asymmetry = st.v2.asymmetry_ns(side, &ex);
             let min_round_trip = st.v2.min_round_trip_ns(side, &ex);
             let stamp_ns = st.v2.path_entry(side).map_or(0, |(_, stamp)| stamp);
-            exchange_sample(
-                ex.t1_ns,
-                (ex.t2_net_us as i64).saturating_mul(1_000),
-                (t3_us as i64).saturating_mul(1_000),
-                ex.t4_ns,
-                ex.source_error_ns,
-                asymmetry,
-                rate,
-            )
-            .map(|mut sample| {
-                let round_trip = 2 * u64::from(sample.half_delay_ns);
-                let slack = 2 * u64::from(stamp_ns) + TIMESYNC_MIN_DELAY_TOLERANCE_NS;
-                // Below the physical minimum: a stamp is wrong. Keep the
-                // deficit as evidence and leave the sample out.
-                let deficit = min_round_trip.saturating_sub(round_trip);
+            let (t2_ns, t3_ns) = ((ex.t2_net_us as i64).saturating_mul(1_000), (t3_us as i64).saturating_mul(1_000));
+            if t3_ns < t2_ns {
+                // The responder's own stamps are inconsistent.
+                return None;
+            }
+            // Path delay (round trip less turnaround) on our stamps. Below a
+            // described physical minimum, even negative (a reply before its
+            // request), it proves one of our stamps wrong: keep the deficit as
+            // evidence and leave the exchange out; never clamp it into a
+            // direct crossing. (On an undescribed side a negative delay is
+            // dropped as before: the responder's slewing clock can cause it.)
+            let round_trip = ex.t4_ns as i64 - ex.t1_ns as i64;
+            let delay = round_trip + mul_div(round_trip, rate, 1_000_000_000) - (t3_ns - t2_ns);
+            let slack = 2 * i64::from(stamp_ns) + TIMESYNC_MIN_DELAY_TOLERANCE_NS as i64;
+            let floor = min_round_trip.min(i64::MAX as u64) as i64;
+            if floor != 0 && delay < floor - slack {
+                return Some(Err((floor - delay) as u64));
+            }
+            exchange_sample(ex.t1_ns, t2_ns, t3_ns, ex.t4_ns, ex.source_error_ns, asymmetry, rate).map(|mut sample| {
                 sample.min_half_delay_ns = (min_round_trip / 2).min(u64::from(sample.half_delay_ns)) as u32;
                 sample.stamp_error_ns = stamp_ns;
-                (sample, if deficit > slack { deficit } else { 0 })
+                Ok(sample)
             })
         })
         };
-        let Some((sample, deficit)) = sample else {
-            return false;
+        let sample = match sample {
+            None => return false,
+            Some(Err(deficit)) => {
+                st.v2.sub_minimum_rejects = st.v2.sub_minimum_rejects.saturating_add(1);
+                st.v2.discipline.note_stamp_deficit(deficit, now_mono_ns);
+                return false;
+            }
+            Some(Ok(sample)) => sample,
         };
-        if deficit != 0 {
-            st.v2.sub_minimum_rejects = st.v2.sub_minimum_rejects.saturating_add(1);
-            st.v2.discipline.note_stamp_deficit(deficit, sample.mono_ns);
-            return false;
-        }
         if let Some(target) = st.v2.discipline.target(sample.mono_ns)
             && target
                 .net_ns

@@ -316,15 +316,20 @@ impl ClockDiscipline {
         }
         self.stamp_deficit_ns = self.stamp_deficit_ns.max(deficit_ns);
         self.stamp_deficit_mono_ns = mono_ns;
+        if !self.is_empty() {
+            self.fit();
+        }
     }
 
-    /// Stamp error the bound carries at `now_mono_ns`: the samples' configured
-    /// stamping uncertainty, or recent proof of a larger one.
-    fn stamp_error_ns(&self, now_mono_ns: u64) -> u64 {
+    /// Most any held sample's stamps may be off: the samples' configured
+    /// stamping uncertainty, or proof of a larger one seen within the window
+    /// span of the newest sample. Per sample, a stamp error hides up to this
+    /// much path excess on top of what its round trip shows, so it widens
+    /// every sample's worst case (phase and frequency alike).
+    fn stamp_error_ns(&self) -> u64 {
         let configured = self.samples().iter().map(|s| u64::from(s.stamp_error_ns)).max().unwrap_or(0);
-        if self.stamp_deficit_ns != 0
-            && now_mono_ns.saturating_sub(self.stamp_deficit_mono_ns) <= MAX_WINDOW_SPAN_NS
-        {
+        let newest = self.newest_mono_ns().unwrap_or(0);
+        if self.stamp_deficit_ns != 0 && newest.saturating_sub(self.stamp_deficit_mono_ns) <= MAX_WINDOW_SPAN_NS {
             configured.max(self.stamp_deficit_ns + TIMESYNC_MIN_DELAY_TOLERANCE_NS)
         } else {
             configured
@@ -460,6 +465,7 @@ impl ClockDiscipline {
             .map_or(0, |s| s.phi_ns);
         let min_half = self.min_half_delay();
         let n = self.samples().len();
+        let stamp_us = (self.stamp_error_ns() / 1_000).min(1 << 31) as i64;
         // 64-bit only (Cortex-M flash: no 128-bit division routines): weights
         // 2^30/sigma^2 with sigma in [20 us, 2^20 us], x in ms within 2^20,
         // y in us within 2^31; products pass through `mul_div`.
@@ -486,7 +492,7 @@ impl ClockDiscipline {
                 let dx = x[i] - xm;
                 sxx = sxx.saturating_add(mul_div(w[i] * dx, dx, 1_024));
                 sxy = sxy.saturating_add(mul_div(w[i] * dx, y[i] - ym, 1_024));
-                sxe = sxe.saturating_add(mul_div(w[i] * dx.abs(), sig[i], 1_024));
+                sxe = sxe.saturating_add(mul_div(w[i] * dx.abs(), sig[i] + stamp_us, 1_024));
             }
             if sxx > 0 {
                 // slope in us per ms = 1e-3 -> ppb = slope * 1e6
@@ -504,7 +510,7 @@ impl ClockDiscipline {
             let resid_us = (s.phi_ns.wrapping_sub(newest_phi) - mul_div(dx_ns, self.rate_ppb, 1_000_000_000)) / 1_000;
             sa = sa.saturating_add(w[i].saturating_mul(resid_us.clamp(-(1 << 31), 1 << 31)));
             let carry_us = mul_div((dx_ns.unsigned_abs() / 1_000) as i64, self.freq_uncertainty_ppb as i64, 1_000_000_000);
-            se = se.saturating_add(w[i].saturating_mul(sig[i] + carry_us.min(1 << 31)));
+            se = se.saturating_add(w[i].saturating_mul(sig[i] + stamp_us + carry_us.min(1 << 31)));
         }
         self.fit_mono_ns = newest;
         self.fit_phi_ns = newest_phi.wrapping_add((sa / sw).saturating_mul(1_000));
@@ -549,7 +555,7 @@ impl ClockDiscipline {
         let age = now_mono_ns.saturating_sub(self.fit_mono_ns) / 1_000; // us
         let wander = age.saturating_mul(self.freq_uncertainty_ppb + TIMESYNC_DRIFT_ALLOWANCE_PPB)
             / 1_000_000;
-        Some(self.fit_error_ns.saturating_add(wander).saturating_add(self.stamp_error_ns(now_mono_ns)))
+        Some(self.fit_error_ns.saturating_add(wander))
     }
 
     /// State and error bound at `now_mono_ns`.
