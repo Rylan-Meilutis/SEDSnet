@@ -487,6 +487,30 @@ fn verify_crc32(buf: &[u8]) -> Result<&[u8], TelemetryError> {
     Ok(data)
 }
 
+/// Data bytes of an admitted frame without re-hashing them.
+///
+/// Router-held frames are immutable and their CRC was verified once where
+/// they entered the router (or computed when the router built them); see
+/// [`verify_frame_crc`]. Internal lookups on such frames still parse and
+/// bound-check every field, they only skip the checksum.
+#[inline]
+fn admitted_data(buf: &[u8]) -> Result<&[u8], TelemetryError> {
+    split_crc32(buf).map(|(data, _)| data)
+}
+
+#[inline]
+fn frame_data(buf: &[u8], verify: bool) -> Result<&[u8], TelemetryError> {
+    if verify { verify_crc32(buf) } else { admitted_data(buf) }
+}
+
+/// Verify a canonical frame's CRC32 trailer. The router calls this once where
+/// bytes enter it; everything it later does with the frame uses the
+/// `_unchecked` peeks.
+#[inline]
+pub(crate) fn verify_frame_crc(buf: &[u8]) -> TelemetryResult<()> {
+    verify_crc32(buf).map(|_| ())
+}
+
 #[cfg(feature = "cryptography")]
 #[inline]
 fn e2e_nonce_for_packet(pkt: &Packet) -> [u8; E2E_NONCE_LEN] {
@@ -1155,7 +1179,8 @@ pub(crate) fn payload_encoding_for_side(
             return Ok(None);
         }
     }
-    let data = verify_crc32(raw)?;
+    // Only router-held (admitted) frames are re-encoded for a side.
+    let data = admitted_data(raw)?;
     let mut reader = ByteReader::new(data);
     let envelope = read_routing_envelope(&mut reader)?;
     #[cfg(feature = "discovery")]
@@ -1489,7 +1514,19 @@ pub fn unpack_packet(buf: &[u8]) -> Result<Packet, TelemetryError> {
 }
 
 pub(crate) fn unpack_packet_with_role(buf: &[u8], managed: bool) -> Result<Packet, TelemetryError> {
-    let data = verify_crc32(buf)?;
+    unpack_packet_frame(buf, managed, true)
+}
+
+/// [`unpack_packet_with_role`] for an admitted frame (CRC already verified).
+pub(crate) fn unpack_packet_with_role_unchecked(
+    buf: &[u8],
+    managed: bool,
+) -> Result<Packet, TelemetryError> {
+    unpack_packet_frame(buf, managed, false)
+}
+
+fn unpack_packet_frame(buf: &[u8], managed: bool, verify: bool) -> Result<Packet, TelemetryError> {
+    let data = frame_data(buf, verify)?;
     if data.is_empty() {
         return Err(TelemetryError::Unpack("short prelude"));
     }
@@ -1681,6 +1718,11 @@ pub(crate) fn unpack_packet_with_role(buf: &[u8], managed: bool) -> Result<Packe
 /// - [`TelemetryError::InvalidType`] if the type ID cannot be resolved.
 pub fn peek_envelope(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
     Ok(peek_routing_envelope(buf)?.into_owned())
+}
+
+/// [`peek_envelope`] for an admitted frame (CRC already verified).
+pub(crate) fn peek_envelope_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryEnvelope> {
+    Ok(peek_routing_envelope_unchecked(buf)?.into_owned())
 }
 
 /// Validated routing metadata without owned strings or heap-backed arrays.
@@ -1906,7 +1948,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
 }
 
 /// Read only the bounded type prefix for queue scheduling. This is deliberately
-/// not frame validation: dispatch must still verify CRC and the full envelope.
+/// not frame validation: ingress verifies the CRC and dispatch the envelope.
 /// Scanning an RX queue must not checksum every retained payload on each pass.
 pub(crate) fn scheduling_type(buf: &[u8]) -> Option<DataType> {
     let mut reader = ByteReader::new(buf.get(..buf.len().min(12))?);
@@ -1930,6 +1972,11 @@ pub(crate) fn chunked_schema_source(prefix: &[u8]) -> Option<u32> {
 pub(crate) fn peek_routing_envelope(buf: &[u8]) -> TelemetryResult<RoutingEnvelope<'_>> {
     let data = verify_crc32(buf)?;
     read_routing_envelope(&mut ByteReader::new(data))
+}
+
+/// [`peek_routing_envelope`] for an admitted frame (CRC already verified).
+pub(crate) fn peek_routing_envelope_unchecked(buf: &[u8]) -> TelemetryResult<RoutingEnvelope<'_>> {
+    read_routing_envelope(&mut ByteReader::new(admitted_data(buf)?))
 }
 
 /// Decode the header/envelope and optional reliable header without touching the payload.
@@ -2014,19 +2061,20 @@ impl RoutingFrameInfo<'_> {
 }
 /// Borrow an uncompressed discovery payload without owning its envelope or bytes.
 /// Sequenced, piggyback-ACK, compressed, targeted and encrypted frames retain normal processing.
+/// The frame must be admitted: its CRC was verified at router ingress.
 #[cfg(feature = "discovery")]
-pub(crate) fn peek_plain_discovery_payload(
+pub(crate) fn peek_plain_discovery_payload_unchecked(
     buf: &[u8],
     expected: DataType,
 ) -> TelemetryResult<Option<(u32, &[u8])>> {
-    // Avoid a second CRC pass for ordinary telemetry. Its existing receive
-    // and decode path remains responsible for complete frame validation.
+    // Ordinary telemetry pays only this type peek. Its normal decode path
+    // remains responsible for complete frame validation.
     let mut prelude = ByteReader::new(buf);
     prelude.read_bytes(2)?;
     if data_type_id_from_wire(read_uleb128(&mut prelude)?)? != expected.as_u32() {
         return Ok(None);
     }
-    let data = verify_crc32(buf)?;
+    let data = admitted_data(buf)?;
     let mut reader = ByteReader::new(data);
     let envelope = read_routing_envelope(&mut reader)?;
     if envelope.ty != expected
@@ -2063,11 +2111,12 @@ pub(crate) fn peek_plain_discovery_payload(
 /// Fully validate a replaceable plaintext sample without owning its payload.
 /// Contract/codec/reliable frames never enter freshness coalescing.
 #[cfg(feature = "latest-value-egress")]
+/// Latest-value candidates are router-held frames, verified at ingress.
 pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
     if buf.first().is_none_or(|flags| flags & 0x13 != 0) {
         return Err(TelemetryError::BadArg);
     }
-    let data = verify_crc32(buf)?;
+    let data = admitted_data(buf)?;
     let mut reader = ByteReader::new(data);
     let envelope = read_routing_envelope(&mut reader)?;
     // A contract that only carries the time epoch is still plain data; a
@@ -2099,8 +2148,21 @@ pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<Routin
     })
 }
 
+/// Verifying variant, for tests that inspect raw frames. The router itself
+/// verifies at ingress and then uses [`peek_routing_frame_info_unchecked`].
+#[cfg(test)]
 pub(crate) fn peek_routing_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
-    let data = verify_crc32(buf)?;
+    routing_frame_info(verify_crc32(buf)?)
+}
+
+/// [`peek_routing_frame_info`] for an admitted frame (CRC already verified).
+pub(crate) fn peek_routing_frame_info_unchecked(
+    buf: &[u8],
+) -> TelemetryResult<RoutingFrameInfo<'_>> {
+    routing_frame_info(admitted_data(buf)?)
+}
+
+fn routing_frame_info(data: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
     let mut reader = ByteReader::new(data);
     let envelope = read_routing_envelope(&mut reader)?;
     let reliable = if envelope.is_reliable || envelope.has_reliable_header {
@@ -2395,7 +2457,16 @@ pub fn packet_wire_size(pkt: &Packet) -> usize {
 #[inline]
 /// Computes the same packet ID as [`Packet::packet_id`] directly from a packed wire frame.
 pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
-    let data = verify_crc32(buf)?;
+    packet_id_from_data(verify_crc32(buf)?)
+}
+
+/// [`packet_id_from_wire`] for an admitted frame (CRC already verified).
+#[inline]
+pub(crate) fn packet_id_from_wire_unchecked(buf: &[u8]) -> Result<u64, TelemetryError> {
+    packet_id_from_data(admitted_data(buf)?)
+}
+
+fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
     if data.len() < 2 {
         return Err(TelemetryError::Unpack("short prelude"));
     }

@@ -544,8 +544,14 @@ pub fn pack_bundle_with<'a>(count: usize, frame: &dyn Fn(usize) -> &'a [u8]) -> 
 }
 
 /// Walk every record, handing each rebuilt canonical frame to `each`.
-fn walk(bytes: &[u8], each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>) -> TelemetryResult<usize> {
-    let mut r = Reader { buf: checked(bytes).filter(|_| is_bundle(bytes)).ok_or(BAD)?, off: 1 };
+/// `check_crc` false is only for bytes a previous walk verified.
+fn walk(
+    bytes: &[u8],
+    check_crc: bool,
+    mut each: Option<&mut dyn FnMut(&[u8]) -> TelemetryResult<()>>,
+) -> TelemetryResult<usize> {
+    let data = if check_crc { checked(bytes) } else { bytes.get(..bytes.len().wrapping_sub(4)) };
+    let mut r = Reader { buf: data.filter(|_| is_bundle(bytes)).ok_or(BAD)?, off: 1 };
     // A table bundle decodes only against the same node table, never a guess.
     let table = bytes[0] == BUNDLE_MARKER_TABLE;
     if table && (nodes().is_empty() || r.byte() != Some(table_check())) {
@@ -559,8 +565,10 @@ fn walk(bytes: &[u8], each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>) -> Tel
         if count == MAX_BUNDLE_RECORDS || read_fields(rec, true, count == 0, table, &mut cur).is_none() {
             return Err(BAD);
         }
-        write_fields(&cur, false, None, &mut canonical);
-        each(&canonical)?;
+        if let Some(each) = each.as_mut() {
+            write_fields(&cur, false, None, &mut canonical);
+            each(&canonical)?;
+        }
         count += 1;
     }
     if count == 0 {
@@ -576,8 +584,10 @@ pub fn unpack_bundle(
     bytes: &[u8],
     each: &mut dyn FnMut(&[u8]) -> TelemetryResult<()>,
 ) -> TelemetryResult<usize> {
-    walk(bytes, &mut |_| Ok(()))?;
-    walk(bytes, each)
+    // The first pass checks the CRC and parses every record; the second
+    // rebuilds the frames from the bytes the first pass already verified.
+    walk(bytes, true, None)?;
+    walk(bytes, false, Some(each))
 }
 
 /// Verify a bundle and return its rebuilt canonical frames.
