@@ -416,8 +416,10 @@ Two opt-in zstd size options leave compressed frames byte-for-byte unchanged:
 - `SEDSNET_ZSTD_LTO=ON` (CMake; `build.py --env SEDSNET_EMBEDDED_ZSTD_LTO=1`): compile
   zstd as fat GCC LTO objects with the parent project's `CMAKE_C_COMPILER`. A firmware
   linked with `-flto` then optimises zstd together with its callers (8.7-9.7 KB on the
-  STM32 Cortex-M firmware); a non-LTO link uses the objects' ordinary machine code,
-  unchanged. LTO bytecode only links with the same GCC version.
+  STM32 Cortex-M firmware). GCC's linker plugin also LTO-optimises the fat objects when
+  the firmware link does not pass `-flto` (measured: the same ~8.7 KB saving); with
+  the plugin disabled, the link uses their ordinary machine code. LTO bytecode only
+  links with the same GCC version.
 
 ### Fair admission under pressure
 

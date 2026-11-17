@@ -22,8 +22,9 @@
   - `SEDSNET_ZSTD_LTO` (build.py `SEDSNET_EMBEDDED_ZSTD_LTO=1`): zstd compiled as
     fat LTO objects with the firmware's GCC joins an `-flto` firmware link,
     about 8.7-9.7 KB smaller with identical frames and level-1
-    compress/decompress time within 2% on Cortex-M33; non-LTO links are
-    unchanged.
+    compress/decompress time within 2% on Cortex-M33. With GCC's linker plugin
+    the fat objects are LTO-optimised even when the firmware link itself does
+    not use `-flto` (measured: the same ~8.7 KB saving).
 - No wire, schema or API change; 6.0.2 interoperates with 6.0.0 and 6.0.1.
 
 ## Version 6.0.1 highlights
