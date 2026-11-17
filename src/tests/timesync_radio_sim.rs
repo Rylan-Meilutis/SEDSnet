@@ -566,8 +566,7 @@ fn radio_sim_sweep() {
 /// near 2% while the true one is -0.016%. Every reported bound, Acquiring
 /// included, must cover the real error from boot: the frequency uncertainty
 /// may not be capped below the rate the fit could be wrong by.
-#[test]
-fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
+fn heavy_loss_scenario() {
     let stats = run(RadioLink { loss: 0.5, ..LOSSY }, 0, 420, 11 * 0x9e37_79b9);
     report("50% seed 11", &stats);
     for s in &stats {
@@ -634,6 +633,55 @@ fn timesync_trajectory_probe() {
 /// correction took 76 h.)
 #[test]
 fn radio_sim_station_steps_hours_both_ways() {
+    station_steps_scenario();
+}
+
+#[test]
+fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
+    heavy_loss_scenario();
+}
+
+/// Runs one scenario under the packet nonce sequence named by
+/// `SEDS_TEST_NONCE_SEED` (as another test order would leave it).
+#[test]
+#[ignore = "probe run by the seeded sweeps in a fresh process"]
+fn radio_sim_seeded_probe() {
+    let seed: u32 = std::env::var("SEDS_TEST_NONCE_SEED").unwrap().parse().unwrap();
+    crate::packet::seed_packet_nonce(seed);
+    crate::router::seed_timesync_nonce(seed as u16);
+    match std::env::var("SEDS_TEST_SCENARIO").as_deref() {
+        Ok("heavy_loss") => heavy_loss_scenario(),
+        _ => station_steps_scenario(),
+    }
+}
+
+/// Both scenarios under 20 nonce sequences each, every run in a fresh
+/// process: their outcome depends on the nonce sequence (frame sizes and
+/// receipt IDs), which the order of the other tests in a process sets.
+#[test]
+#[ignore = "about two minutes; run explicitly"]
+fn radio_sim_scenarios_hold_under_20_nonce_sequences() {
+    let mut failures = Vec::new();
+    for scenario in ["station_steps", "heavy_loss"] {
+        for i in 0..20u32 {
+            let seed = 0xA5C3_1F27u32.wrapping_add(i.wrapping_mul(0x0101_7F4B));
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "tests::timesync_radio_sim::radio_sim_seeded_probe", "--test-threads=1"])
+                .env("SEDS_TEST_NONCE_SEED", seed.to_string())
+                .env("SEDS_TEST_SCENARIO", scenario)
+                .output()
+                .expect("run seeded probe");
+            if !out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                let why = text.lines().find(|l| l.contains("panicked") || l.contains("assert")).unwrap_or("").to_string();
+                failures.push(format!("{scenario} seed {seed:#x}: {why}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} of 40 runs failed:\n{}", failures.len(), failures.join("\n"));
+}
+
+fn station_steps_scenario() {
     const H: i128 = 3_600_000_000_000;
     let field = -(3 * H + 49 * 60_000_000_000);
     for (label, link, seed) in [("0%", CLEAN, 0x5eed), ("30%", LOSSY, 0x9e37_79b9)] {

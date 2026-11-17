@@ -1117,7 +1117,7 @@ fn a_time_sync_response_fits_one_board_can_fragment_after_steps() {
             let mut w = words;
             w[0] ^= seq;
             let pkt = gw.timesync_packet(DataType::TimeSyncResponse, &w, UTC + 3 * HOUR, epoch).unwrap();
-            assert!((1..=16_383).contains(&pkt.nonce()));
+            assert!((128..=16_383).contains(&pkt.nonce()));
             let frame = crate::wire_format::pack_packet(&pkt);
             assert!(frame.len() <= 55, "epoch {epoch}: {} bytes", frame.len());
             let back = crate::wire_format::unpack_packet(&frame).unwrap();

@@ -235,6 +235,24 @@ impl HeardStamp {
     }
 }
 
+/// Nonces of time sync packets: a counter cycling through 128..=16383 (always
+/// two ULEB128 bytes on the wire), unique across 16256 consecutive packets.
+/// (Never one byte: one byte shorter time sync frames change which of an
+/// announce and a response reaches a relay first over a radio, and a relay
+/// that adopts a step from the announce lands a transit behind; see the
+/// seeded radio sweeps in the radio sim tests.)
+static TIMESYNC_NONCE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// Test only: restart the time sync nonce sequence at `seed`.
+#[cfg(test)]
+pub(crate) fn seed_timesync_nonce(seed: u16) {
+    TIMESYNC_NONCE.store(seed, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn next_timesync_nonce() -> u16 {
+    TIMESYNC_NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 16_256 + 128
+}
+
 /// What a follower did with a target from its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Follow {

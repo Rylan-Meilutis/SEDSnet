@@ -51,6 +51,9 @@ mod ingress_target_filter_tests;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
 #[path = "tests/payload_codec_negotiation.rs"]
 mod payload_codec_negotiation;
+#[cfg(all(test, feature = "std", feature = "timesync", feature = "cryptography", feature = "compression"))]
+#[path = "tests/timesync_nonce_e2e.rs"]
+mod timesync_nonce_e2e_tests;
 #[cfg(all(test, feature = "std", feature = "compact-bundle"))]
 #[path = "tests/compact_bundle.rs"]
 mod compact_bundle_tests;
@@ -15360,13 +15363,15 @@ impl Router {
     #[cfg(feature = "timesync")]
     pub(crate) fn timesync_packet(&self, ty: DataType, words: &[u64], timestamp: u64, epoch: u16) -> TelemetryResult<Packet> {
         let sender = self.sender_arc();
-        // Time sync packets keep the usual per-packet nonce folded into two
-        // ULEB128 bytes (1..=16383; a full nonce takes up to three), so a
-        // board's CAN time sync response fits one 64-byte frame with the
-        // epoch. (A one-byte range makes same-millisecond receipt IDs collide
-        // often enough to cost exchanges.)
+        // Time sync packets take their nonce from their own counter,
+        // 128..=16383 in turn (two ULEB128 bytes; a hashed packet nonce takes
+        // up to three), so a board's CAN time sync response fits one 64-byte frame
+        // with the epoch, and no two of the last 16256 time sync packets of
+        // this node share a nonce (receipt IDs stay distinct). Time sync
+        // packets are never sealed end to end (internal control traffic; the
+        // frame encoder refuses it), so this nonce never feeds an AEAD nonce.
         let pkt = Packet::new(ty, &[DataEndpoint::TimeSync], sender.as_ref(), timestamp, encode_slice_le(words))?;
-        let nonce = pkt.nonce() % 16_383 + 1;
+        let nonce = timesync_v2::next_timesync_nonce();
         Ok(pkt.with_nonce(nonce).with_time_epoch(epoch))
     }
 
@@ -23705,6 +23710,8 @@ mod e2e_backpressure;
 #[cfg(feature = "timesync")]
 #[path = "router_timesync.rs"]
 mod timesync_v2;
+#[cfg(all(test, feature = "timesync"))]
+pub(crate) use timesync_v2::seed_timesync_nonce;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "timesync"))]
 #[path = "tests/peer_record_footprint.rs"]
 mod peer_record_footprint;

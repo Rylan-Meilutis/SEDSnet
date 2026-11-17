@@ -1303,6 +1303,18 @@ fn with_packet_frame_parts<T>(
     compression_allowed: bool,
     consume: impl FnOnce(&[u8], &[u8]) -> TelemetryResult<T>,
 ) -> TelemetryResult<T> {
+    // Time sync packets are never sealed end to end: their nonce comes from a
+    // short counter (see the router's time sync packets), which must never
+    // feed an AEAD nonce.
+    #[cfg(feature = "cryptography")]
+    if e2e.is_some()
+        && matches!(
+            pkt.data_type(),
+            DataType::TimeSyncAnnounce | DataType::TimeSyncRequest | DataType::TimeSyncResponse
+        )
+    {
+        return Err(TelemetryError::BadArg);
+    }
     // A time epoch alone rides in the contract but freezes nothing: endpoint
     // encoding follows only the delivery contract (shape/targets).
     let carries_wire_contract =

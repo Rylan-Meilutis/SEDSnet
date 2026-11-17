@@ -37,6 +37,13 @@ const DEFAULT_STRING_CAPACITY: usize = 96;
 /// distinct for recent-ID dedupe even when their logical payload matches.
 static PACKET_NONCE_COUNTER: AtomicU32 = AtomicU32::new(0xA5C3_1F27);
 
+/// Test only: restart the packet nonce sequence from `seed`, so a test can
+/// replay a scenario under the nonce sequences other test orders produce.
+#[cfg(test)]
+pub(crate) fn seed_packet_nonce(seed: u32) {
+    PACKET_NONCE_COUNTER.store(seed, Ordering::Relaxed);
+}
+
 #[inline]
 pub(crate) fn next_packet_nonce() -> u16 {
     let mut x = PACKET_NONCE_COUNTER.fetch_add(0x9E37_79B9, Ordering::Relaxed);
