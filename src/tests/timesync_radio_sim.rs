@@ -726,10 +726,10 @@ fn station_steps_scenario() {
             assert!(fine.is_some_and(|t| t <= 30_000), "{label} {step}: fine {fine:?}");
             assert_eq!(violations, 0, "{label} {step}");
             let gs_epoch = net.nodes[GS].network_time_epoch();
-            for n in 1..NODES.len() {
-                let st = net.nodes[n].timesync_status().unwrap();
-                assert!(st.state.is_synced(), "{label} {step} {}: {st:?}", NODES[n].0);
-                assert_eq!(st.epoch, gs_epoch, "{label} {step} {}", NODES[n].0);
+            for (node, (name, _)) in net.nodes.iter().zip(NODES.iter()).skip(1) {
+                let st = node.timesync_status().unwrap();
+                assert!(st.state.is_synced(), "{label} {step} {name}: {st:?}");
+                assert_eq!(st.epoch, gs_epoch, "{label} {step} {name}");
             }
         }
         GS_HOST_OFFSET_NS.with(|o| o.set(0));
