@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (6.0.2 candidate)
+
+- Missing-schema recovery backs off a peer whose discovery catalog this
+  node's chunk receive budget refused, instead of naming it every 5 s
+  forever. An 8 KiB board (MAX_QUEUE_BUDGET 8192) cannot reassemble another
+  board's 4-5 KiB catalog, so each request made that peer, and any other peer
+  named with it, resend its whole catalog on the shared link. In a native
+  fill-side bench (GB, AB, VB, DAQ) this was 18% of all CAN bytes (5.3 KB/s,
+  83 frames/s); it is now 3%, almost all of it at boot. The next request
+  waits 5 s doubled per refusal, up to 160 s. A catalog that is only lost
+  (nothing refused here) keeps the 5 s retry, which also prompts
+  re-announcement on lossy links.
+- No wire, schema or API change; interoperates with 6.0.0 and 6.0.1.
+
 ## 6.0.1
 
 Frame CRC performance release.
