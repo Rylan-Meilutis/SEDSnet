@@ -152,6 +152,45 @@ class BuildCliTests(unittest.TestCase):
         self.assertIn("--profile",command)
         self.assertIn("release-embedded",command)
 
+    def test_zstd_lean_is_an_opt_in_build_feature(self):
+        import subprocess, tempfile
+        args = build.parse_args(["build", "--features", "embedded,zstd-lean"])
+        self.assertEqual(args.features, ["embedded", "zstd-lean"])
+        for value, expected in ((None, False), ("ON", True)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                command = ["cmake", "-S", str(Path(__file__).parents[1]), "-B", directory]
+                if value is not None:
+                    command.append(f"-DSEDSNET_ZSTD_LEAN={value}")
+                result = subprocess.run(command, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual("--features zstd-lean" in result.stdout, expected)
+
+    def test_zstd_lto_flags_are_opt_in(self):
+        target = "thumbv8m.main-none-eabihf"
+        with contextlib.redirect_stdout(io.StringIO()):
+            default, lto = {}, {"SEDSNET_EMBEDDED_ZSTD_LTO": "1"}
+            build.apply_embedded_cflags_defaults(target, default)
+            build.apply_embedded_cflags_defaults(target, lto)
+        self.assertNotIn("-flto", default[f"CFLAGS_{target}"].split())
+        flags = lto[f"CFLAGS_{target}"].split()
+        self.assertEqual(flags[-2:], ["-flto", "-ffat-lto-objects"])
+        self.assertEqual(flags[:-2], default[f"CFLAGS_{target}"].split())
+
+    def test_cmake_zstd_lto_pins_the_firmware_c_compiler(self):
+        import subprocess, tempfile
+        for value in (None, "ON"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                command = ["cmake", "-S", str(Path(__file__).parents[1]), "-B", directory,
+                           "-DSEDSNET_EMBEDDED_BUILD=ON", "-DSEDSNET_TARGET=thumbv8m.main-none-eabihf",
+                           "-DCMAKE_C_COMPILER=/opt/firmware-gcc/bin/arm-none-eabi-gcc"]
+                if value is not None:
+                    command.append(f"-DSEDSNET_ZSTD_LTO={value}")
+                result = subprocess.run(command, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                pinned = ("--env SEDSNET_EMBEDDED_ZSTD_LTO=1 --env "
+                          "CC_thumbv8m_main_none_eabihf=/opt/firmware-gcc/bin/arm-none-eabi-gcc")
+                self.assertEqual(pinned in result.stdout, value == "ON")
+
     def test_cmake_staticlib_selector_is_opt_in_and_validated(self):
         import subprocess, tempfile
         for value in [None, "staticlib", "cdylib"]:

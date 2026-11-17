@@ -181,6 +181,10 @@ pub mod memory_admission;
 pub mod packet;
 #[cfg(feature = "compression")]
 mod payload_codec;
+// zstd internals SEDSnet never enables; see the module for the contract.
+#[cfg(feature = "zstd-lean")]
+#[allow(non_snake_case)]
+mod zstd_lean;
 mod shared_bytes;
 pub use shared_bytes::SharedBytes;
 #[cfg(feature = "compact-packet-store")]

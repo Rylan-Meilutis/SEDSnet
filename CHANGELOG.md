@@ -1,18 +1,32 @@
 # Changelog
 
-## Unreleased (6.0.2 candidate)
+## 6.0.2
 
-- Missing-schema recovery backs off a peer whose discovery catalog this
-  node's chunk receive budget refused, instead of naming it every 5 s
-  forever. An 8 KiB board (MAX_QUEUE_BUDGET 8192) cannot reassemble another
-  board's 4-5 KiB catalog, so each request made that peer, and any other peer
-  named with it, resend its whole catalog on the shared link. In a native
-  fill-side bench (GB, AB, VB, DAQ) this was 18% of all CAN bytes (5.3 KB/s,
-  83 frames/s); it is now 3%, almost all of it at boot. The next request
-  waits 5 s doubled per refusal, up to 160 s. A catalog that is only lost
-  (nothing refused here) keeps the 5 s retry, which also prompts
-  re-announcement on lossy links.
-- No wire, schema or API change; interoperates with 6.0.0 and 6.0.1.
+Discovery recovery and embedded size release.
+
+- Missing-schema recovery backs off a peer whose discovery catalog this node's
+  chunk receive budget refused, instead of naming it every 5 s forever. A node
+  with a small `MAX_QUEUE_BUDGET` (e.g. 8192) cannot reassemble a peer's larger
+  catalog (4-5 KiB), so each request made that peer, and any peer named with it,
+  resend its whole catalog on the shared link; in a measured four-node CAN
+  network this was 18% of all bus bytes, now 3%, almost all at startup. The next
+  request waits 10 s, doubled per refusal, up to 160 s, and is never abandoned.
+  A catalog that is only lost (nothing refused here) keeps the 5 s retry, which
+  also prompts re-announcement on lossy links.
+- Opt-in embedded size options; defaults are unchanged:
+  - Feature `zstd-lean` (CMake `SEDSNET_ZSTD_LEAN`): SEDSnet supplies zstd's
+    long-distance-matching and target-block-size entry points, which its
+    level-1 calls never reach, so `zstd_ldm.o` and `zstd_compress_superblock.o`
+    stay out of the link (about 7.6-8.6 KB on Cortex-M firmware). Frames are
+    byte-identical (golden test with and without the feature); requesting LDM, a
+    target block size or external sequences panics instead. Pinned to zstd
+    1.5.7 internals.
+  - `SEDSNET_ZSTD_LTO` (build.py `SEDSNET_EMBEDDED_ZSTD_LTO=1`): zstd compiled as
+    fat LTO objects with the firmware's GCC joins an `-flto` firmware link,
+    about 8.7-9.7 KB smaller with identical frames and level-1
+    compress/decompress time within 2% on Cortex-M33; non-LTO links are
+    unchanged.
+- No wire, schema or API change; 6.0.2 interoperates with 6.0.0 and 6.0.1.
 
 ## 6.0.1
 

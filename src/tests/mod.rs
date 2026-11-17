@@ -67,6 +67,8 @@ impl Clock for UnixClock {
 
 #[cfg(feature = "compression")]
 mod compression_memory_tests;
+#[cfg(feature = "compression")]
+mod zstd_frame_golden;
 
 fn test_payload_len_for(ty: DataType) -> usize {
     match message_meta(ty).element {
