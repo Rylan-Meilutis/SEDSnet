@@ -196,6 +196,32 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 6.0.2 highlights
+
+- Missing-schema recovery backs off a peer whose discovery catalog this node's
+  chunk receive budget refused, instead of naming it every 5 s forever. A node
+  with a small `MAX_QUEUE_BUDGET` (e.g. 8192) cannot reassemble a peer's larger
+  catalog (4-5 KiB), so each request made that peer, and any peer named with it,
+  resend its whole catalog on the shared link; in a measured four-node CAN
+  network this was 18% of all bus bytes, now 3%, almost all at startup. The next
+  request waits 10 s, doubled per refusal, up to 160 s, and is never abandoned.
+  A catalog that is only lost (nothing refused here) keeps the 5 s retry, which
+  also prompts re-announcement on lossy links.
+- Opt-in embedded size options; defaults are unchanged:
+  - Feature `zstd-lean` (CMake `SEDSNET_ZSTD_LEAN`): SEDSnet supplies zstd's
+    long-distance-matching and target-block-size entry points, which its
+    level-1 calls never reach, so `zstd_ldm.o` and `zstd_compress_superblock.o`
+    stay out of the link (about 7.6-8.6 KB on Cortex-M firmware). Frames are
+    byte-identical (golden test with and without the feature); requesting LDM, a
+    target block size or external sequences panics instead. Pinned to zstd
+    1.5.7 internals.
+  - `SEDSNET_ZSTD_LTO` (build.py `SEDSNET_EMBEDDED_ZSTD_LTO=1`): zstd compiled as
+    fat LTO objects with the firmware's GCC joins an `-flto` firmware link,
+    about 8.7-9.7 KB smaller with identical frames and level-1
+    compress/decompress time within 2% on Cortex-M33; non-LTO links are
+    unchanged.
+- No wire, schema or API change; 6.0.2 interoperates with 6.0.0 and 6.0.1.
+
 ### Version 6.0.1 highlights
 
 - `seds_set_crc32_fn` (Rust: `crc32::set_crc32_fn`) installs an application CRC-32
