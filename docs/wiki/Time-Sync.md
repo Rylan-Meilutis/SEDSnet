@@ -157,9 +157,44 @@ like this:
 | above `step_threshold_ms` | **step**, start a new epoch | slew at `reference_slew_ppm` |
 
 `step_local_network_time_ns` always steps (a new epoch) unless steps are inhibited.
+
+#### Step policy (`set_timesync_steps_allowed`)
+
 `Router::set_timesync_steps_allowed(false)` (C `seds_router_set_timesync_steps_allowed`, Python
-`set_timesync_steps_allowed`) inhibits steps, for example from Armed until Recovery; inhibited, even
-hours are slewed and the network stays together around the leading clock.
+`set_timesync_steps_allowed`) is the safety hook: the application that owns flight state (the GS)
+inhibits steps from Armed until Recovery. The policy acts where steps originate, on the leading
+node; followers always follow their source, so the network as a whole steps only when its leader's
+policy allows it.
+
+| While steps are inhibited | What happens |
+| --- | --- |
+| a local source disagrees by any amount | slewed at `reference_slew_ppm` (20 ppm, 72 ms per hour); followers stay locked; no epoch starts; `status.offset_ns` shows what is still to slew |
+| `step_local_network_time_ns` | refused (returns `false`), nothing changes |
+| steps are allowed again | the next local-source update still more than `step_threshold_ms` away steps (one new epoch) |
+| the leader restarted (no follower shares its epoch yet) and its clock disagrees with a follower's fresh request stamp in a newer epoch | the leader **joins** the network's time base and epoch (reason `Joined`): no follower steps; its local sources then correct it under this policy |
+| a follower diverged (named a newer epoch on another base) from a leader it was following | the leader names a still newer epoch and the follower steps back onto the leader |
+
+#### Authority
+
+The elected source is deterministic: anchored UTC beats unanchored time, then the lower priority
+(GS 50, RRLS 60, RF with a GPS fix 70), then the lower stratum, then the sender ID. Time-base
+epochs never override the election; they only decide how a node moves onto its elected source:
+a newer source epoch is adopted with a step, an older one is held for until the source adopts the
+follower's epoch, and two bases under one epoch number (partitions that stepped on their own) are
+separated by the follower naming a newer epoch. A standby source that takes over (RRLS during a GS
+outage) keeps its followers' time base, so a hand-over between agreeing sources steps no one.
+
+#### Restarts and persisted marks
+
+A restarted node starts in epoch 0 with no time and adopts the network's epoch within about one
+exchange (a follower steps onto its source; a leader adopts a newer epoch whose stamp agrees with
+its clock from the first packet it hears, otherwise names a newer one). An application that
+persists an ordering mark as `(epoch, timestamp)` (a replay floor) calls
+`Router::raise_network_time_epoch(mark_epoch)` (C `seds_router_raise_time_epoch`) at boot: the
+network's epoch then never falls below an epoch any node remembers, even after every node
+restarted, so new commands order after the mark while replays of older ones stay refused. A relay
+that passes a follower's newer epoch upstream stamps its request 0, because its own clock is not in
+that epoch's time base.
 
 The reference slew is deliberately slow. Followers see it as a change of their source's frequency,
 which their exchange discipline tracks and bounds honestly only within its drift allowance
@@ -200,9 +235,21 @@ egress replacement uses the same order.
 Freshness checks must not compare a raw timestamp with `network_time_ms()` across a step. Use
 `Router::network_stamp_age_ms(epoch, timestamp)` (C `seds_router_network_stamp_age_ms`, Python
 `network_stamp_age_ms`): it translates the stamp across the last four epoch changes this node
-remembers and returns its age, `NewerEpoch` (this node has not re-anchored yet; it is doing so) or
-`OlderEpoch` (stamped before a step no longer remembered: stale). A command stamped 2 s before a
-4 h step back is 2 s old, not 4 h in the future. Applications that stamp packets themselves read
+remembers and returns its age, `NewerEpoch { since_ms }` (this node has not re-anchored yet and is
+doing so; `since_ms` is how long ago it first heard of a newer epoch, which bounds the stamp's age)
+or `OlderEpoch` (stamped before a step no longer remembered: stale). A command stamped 2 s before a
+4 h step back is 2 s old, not 4 h in the future.
+
+Command-validity windows (for example an actuator accepting a quick-disconnect command only within
+5 s of its stamp) use `Router::network_stamp_is_fresh(epoch, timestamp, max_age_ms, max_ahead_ms)`
+(C `seds_router_network_stamp_fresh`, Python `network_stamp_is_fresh`): a translated age inside the
+window passes; a newer-epoch stamp passes while `since_ms <= max_age_ms`, so a command sent right
+after a step is not refused by a board that is a few milliseconds from re-anchoring; an
+untranslatable older epoch and a node without network time never pass. Ordering marks (replay
+floors, last accepted command) store `(epoch, timestamp)` and compare with
+`sedsnet::timesync::compare_network_stamps` (C `seds_stamp_cmp`). Receipt dedupe keys include the
+epoch, so a post-step packet that happens to repeat a pre-step stamp and nonce is never dropped as
+a duplicate. Applications that stamp packets themselves read
 `network_time_ms_with_epoch()` and set `Packet::with_time_epoch`; packets a router originates
 with epoch 0 and its own sender are stamped with its current epoch automatically.
 
@@ -212,9 +259,23 @@ with epoch 0 and its own sender are stamped with its current epoch automatically
 addition to state, error bound, pending offset and rate: `epoch`, `newest_seen_epoch` (above
 `epoch`: this node is re-anchoring), `holding`, `steps`, `steps_allowed` and `last_step` (delta,
 reason, epochs, age). Reasons: `LocalSource`, `Explicit`, `UtcAnchor`, `SourceEpoch`, `Resync`
-(followed forward beyond the threshold in the same epoch), `Diverged` and `Renamed`. A node
+(followed forward beyond the threshold in the same epoch), `Diverged`, `Renamed`, `Joined` (a
+restarted leader with steps inhibited joined the network's base) and `Raised`
+(`raise_network_time_epoch`). A node
 holding for its source reports Acquiring. A station should show and alarm on: state not Locked,
 `holding`, `newest_seen_epoch > epoch`, and a recent `last_step`.
+
+### Scenarios covered by tests
+
+`src/tests/timesync_step_epoch.rs` and `tests/timesync_station_step.rs` simulate the field network
+(GS, gateway, actuator over Wi-Fi/CAN; RF over a radio; FC behind RF) and check: jumps of seconds to
+hours both ways from an operator set, a host/NTP source and a GPS-led RF; a station restart (clock
+agreeing or not, steps allowed or inhibited); a board restart and a late joiner; a relay hop over a
+45 ms radio at 0-50% loss; two sources (GS and RRLS) handing over without steps; partition and
+re-merge with both sides stepping under one epoch number; repeated steps; a command sequence judged
+with the validity window through steps both ways; the managed-variable cache across a step back;
+a whole-stack restart raised by a persisted epoch; and that every node's own packets order by
+`(epoch, timestamp)`.
 
 ### Configuration
 

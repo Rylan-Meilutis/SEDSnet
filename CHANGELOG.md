@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (proposed 6.0.0)
+## 6.0.0 (unreleased)
 
 **Breaking wire and API changes (network time steps).** Once network time has
 been stepped, frames carry their time-base epoch in the wire contract, which
@@ -60,8 +60,29 @@ write as "older".
   `network_time_ms_with_epoch`, `network_stamp_age_ms`,
   `set_timesync_steps_allowed`, `set_timesync_step_policy`, and
   `configure_timesync(step_threshold_ms=, reference_slew_ppm=)`.
+- Command-validity windows: `Router::network_stamp_is_fresh(epoch, ts,
+  max_age_ms, max_ahead_ms)` / `NetworkStampAge::is_fresh` (C
+  `seds_router_network_stamp_fresh`, Python `network_stamp_is_fresh`).
+  `NetworkStampAge::NewerEpoch` now carries `since_ms` (how long ago this node
+  first heard of a newer epoch); a newer-epoch stamp is fresh while that is
+  inside the window, so a command sent right after a step is not refused by a
+  board still re-anchoring. Ordering helpers `compare_network_stamps` (C
+  `seds_stamp_cmp`).
+- `Router::raise_network_time_epoch(min)` (C `seds_router_raise_time_epoch`,
+  Python `raise_network_time_epoch`): restore an epoch persisted with an
+  ordering mark at boot; the network's epoch never falls below it, even after
+  every node restarted (step reason `Raised`).
+- A leading node adopts an agreeing newer epoch from the first packet it hears
+  (a restarted station's own writes order after the network's at once). While
+  steps are inhibited, a leader no follower shares a base with yet (a station
+  restarted in flight) joins the network's time base from a fresh request
+  stamp instead of making every follower step (reason `Joined`). A relay that
+  passes a follower's newer epoch upstream stamps the request 0 so its own
+  clock cannot vouch for that epoch's base.
 - Rust API: `TimeSyncConfig` has two new public fields (struct literals need
-  `..Default::default()`); `TimeSyncStatus` has new fields.
+  `..Default::default()`); `TimeSyncStatus` has new fields;
+  `NetworkStampAge::NewerEpoch` is a struct variant; `TimeSyncStepReason`
+  gains `Joined` and `Raised`.
 
 ## 5.0.0
 
