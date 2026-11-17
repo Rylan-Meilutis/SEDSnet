@@ -37,6 +37,13 @@ const DEFAULT_STRING_CAPACITY: usize = 96;
 /// distinct for recent-ID dedupe even when their logical payload matches.
 static PACKET_NONCE_COUNTER: AtomicU32 = AtomicU32::new(0xA5C3_1F27);
 
+/// Test only: restart the packet nonce sequence from `seed`, so a test can
+/// replay a scenario under the nonce sequences other test orders produce.
+#[cfg(test)]
+pub(crate) fn seed_packet_nonce(seed: u32) {
+    PACKET_NONCE_COUNTER.store(seed, Ordering::Relaxed);
+}
+
 #[inline]
 pub(crate) fn next_packet_nonce() -> u16 {
     let mut x = PACKET_NONCE_COUNTER.fetch_add(0x9E37_79B9, Ordering::Relaxed);
@@ -54,6 +61,39 @@ pub(crate) fn next_packet_nonce() -> u16 {
 ///
 /// This is the primary data structure passed around inside the crate and
 /// across FFI boundaries (via views / wrappers).
+/// Largest network time-base epoch (65535 is never used, so a stated epoch
+/// fits beside its flag in 16 bits).
+pub const MAX_TIME_EPOCH: u16 = u16::MAX - 1;
+
+/// A packet's time epoch and whether it was stated, in 16 bits: 0 is epoch 0
+/// not stated (the originating router fills in its own), `e + 1` is epoch `e`
+/// stated. Equality compares the epoch only. A stated epoch is at most 65534.
+#[derive(Clone, Copy, Debug, Default)]
+struct TimeEpoch(u16);
+
+impl TimeEpoch {
+    #[inline]
+    fn stated(epoch: u16) -> Self {
+        Self(epoch.min(MAX_TIME_EPOCH) + 1)
+    }
+    #[inline]
+    fn epoch(self) -> u16 {
+        self.0.saturating_sub(1)
+    }
+    #[inline]
+    fn is_stated(self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl PartialEq for TimeEpoch {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch() == other.epoch()
+    }
+}
+
+impl Eq for TimeEpoch {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
     /// Logical message type (schema selector).
@@ -83,6 +123,16 @@ pub struct Packet {
     /// calculation so otherwise-identical packets emitted in the same
     /// millisecond do not collapse in recent-ID dedupe.
     nonce: u16,
+
+    /// Network time-base epoch the timestamp was taken in (0: the sender has
+    /// not seen a step). Routers advance the epoch whenever network time is
+    /// stepped, so `(time_epoch, timestamp)` orders one sender's packets across
+    /// a step in either direction. Carried in the wire contract when nonzero.
+    /// Whether the epoch was stated (by the application, or decoded from the
+    /// wire) rather than left for the originating router to fill in rides in
+    /// the same 16 bits; it is not on the wire and not part of identity or
+    /// equality.
+    time_epoch: TimeEpoch,
 
     /// Raw payload bytes, stored via [`SmallPayload`] for small/large optimization.
     payload: StandardSmallPayload,
@@ -324,6 +374,7 @@ impl Packet {
             endpoints: Arc::<[DataEndpoint]>::from(endpoints),
             timestamp,
             nonce,
+            time_epoch: TimeEpoch(0),
             payload: StandardSmallPayload::from_arc(payload),
             wire_shape,
             wire_target_senders: (!wire_target_senders.is_empty()).then_some(wire_target_senders),
@@ -355,6 +406,7 @@ impl Packet {
             endpoints,
             timestamp,
             nonce,
+            time_epoch: TimeEpoch(0),
             payload,
             wire_shape,
             wire_target_senders,
@@ -543,6 +595,10 @@ impl Packet {
         h = hash_bytes_u64(h, &self.timestamp.to_le_bytes());
         h = hash_bytes_u64(h, &self.nonce.to_le_bytes());
         h = hash_bytes_u64(h, &(self.data_size as u64).to_le_bytes());
+        // Epoch 0 (never stepped) keeps the historical identity.
+        if self.time_epoch.epoch() != 0 {
+            h = hash_bytes_u64(h, &self.time_epoch.epoch().to_le_bytes());
+        }
 
         h
     }
@@ -629,7 +685,39 @@ impl Packet {
         self.timestamp
     }
 
-    /// Get the packet nonce.
+    /// Network time-base epoch of [`Packet::timestamp`]: 0 until the sender
+    /// has seen network time stepped, then advanced on every step. Compare
+    /// one sender's packets by `(time_epoch, timestamp)`.
+    #[inline]
+    pub fn time_epoch(&self) -> u16 {
+        self.time_epoch.epoch()
+    }
+
+    /// Returns this packet with its network time-base epoch stated (see
+    /// [`Packet::time_epoch`]), 0 included. A packet whose epoch was never
+    /// stated is stamped with the originating router's current epoch when it
+    /// is sent; state it only when the timestamp was taken in a known earlier
+    /// epoch (for example a stamp saved before a step).
+    #[inline]
+    pub fn with_time_epoch(mut self, epoch: u16) -> Self {
+        self.time_epoch = TimeEpoch::stated(epoch);
+        self
+    }
+
+    /// The epoch was stated with [`Packet::with_time_epoch`] or decoded from
+    /// the wire; otherwise the originating router fills in its own.
+    #[inline]
+    pub fn time_epoch_stated(&self) -> bool {
+        self.time_epoch.is_stated()
+    }
+
+    #[inline]
+    #[cfg_attr(not(feature = "timesync"), allow(dead_code))]
+    pub(crate) fn set_time_epoch(&mut self, epoch: u16) {
+        self.time_epoch = TimeEpoch::stated(epoch);
+    }
+
+    /// Returns the per-packet nonce.
     #[inline]
     pub fn nonce(&self) -> u16 {
         self.nonce

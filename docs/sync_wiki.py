@@ -90,7 +90,28 @@ def parse_git_remote_url(url: str) -> tuple[str, str, str]:
     )
 
 
-def wiki_url(host: str, owner: str, repo: str) -> str:
+def remote_uses_ssh(url: str) -> bool:
+    u = url.strip()
+    return u.startswith("ssh://") or bool(re.match(r"^[^@/]+@[^:/]+:", u))
+
+
+def wiki_url(
+        host: str,
+        owner: str,
+        repo: str,
+        ssh: bool = False,
+        ssh_host: Optional[str] = None,
+        ssh_port: Optional[int] = None,
+) -> str:
+    """Wiki repo URL, over SSH when the source remote uses SSH.
+
+    Some servers (the GitLab mirror) serve SSH on a separate host and port.
+    """
+    if ssh:
+        h = ssh_host or host
+        if ssh_port and ssh_port != 22:
+            return f"ssh://git@{h}:{ssh_port}/{owner}/{repo}.wiki.git"
+        return f"git@{h}:{owner}/{repo}.wiki.git"
     return f"https://{host}/{owner}/{repo}.wiki.git"
 
 
@@ -100,6 +121,9 @@ def derive_wiki_urls(
         gitlab_url: Optional[str],
         gitlab_from_github: bool,
         gitlab_host: str,
+        gitlab_https: bool = False,
+        gitlab_ssh_host: Optional[str] = None,
+        gitlab_ssh_port: Optional[int] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     if github_url and gitlab_url:
         return github_url, gitlab_url
@@ -107,18 +131,24 @@ def derive_wiki_urls(
     remote_url = git_output(["git", "remote", "get-url", remote])
     host, owner, repo = parse_git_remote_url(remote_url)
     host_l = host.lower()
+    ssh = remote_uses_ssh(remote_url)
 
     resolved_github = github_url
     resolved_gitlab = gitlab_url
 
     if resolved_github is None and "github.com" in host_l:
-        resolved_github = wiki_url(host, owner, repo)
+        resolved_github = wiki_url(host, owner, repo, ssh)
 
     if resolved_gitlab is None:
         if "gitlab" in host_l:
-            resolved_gitlab = wiki_url(host, owner, repo)
+            resolved_gitlab = wiki_url(host, owner, repo, ssh)
         elif "github.com" in host_l and gitlab_from_github:
-            resolved_gitlab = wiki_url(gitlab_host, owner, repo)
+            # The mirror follows the remote's scheme; its SSH lives on
+            # --gitlab-ssh-host:--gitlab-ssh-port.
+            resolved_gitlab = wiki_url(
+                gitlab_host, owner, repo, ssh and not gitlab_https,
+                gitlab_ssh_host, gitlab_ssh_port,
+            )
 
     return resolved_github, resolved_gitlab
 
@@ -145,6 +175,10 @@ def ensure_repo(url: str, repo_dir: Path):
         shutil.rmtree(repo_dir, ignore_errors=True)
         run(["git", "clone", url, str(repo_dir)])
         return
+
+    # Keep an existing clone on the URL this run derived (e.g. SSH instead of HTTPS).
+    if git_output(["git", "remote", "get-url", "origin"], cwd=repo_dir) != url:
+        run(["git", "remote", "set-url", "origin", url], cwd=repo_dir)
 
     run(["git", "fetch", "--all", "--prune"], cwd=repo_dir)
     branch = git_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir)
@@ -231,6 +265,15 @@ def commit_and_push(repo_dir: Path, message: str):
     run(["git", "push"], cwd=repo_dir)
 
 
+def has_unpushed_commits(repo_dir: Path) -> bool:
+    """A previous run may have committed and then failed to push."""
+    try:
+        ahead = git_output(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=repo_dir)
+    except SystemExit:
+        return False
+    return ahead.strip() not in ("", "0")
+
+
 def sync_one(name: str, url: str, source_dir: Path, workdir: Path, message: str):
     repo_dir = workdir / name
     ensure_repo(url, repo_dir)
@@ -241,6 +284,9 @@ def sync_one(name: str, url: str, source_dir: Path, workdir: Path, message: str)
     if has_changes(repo_dir):
         commit_and_push(repo_dir, message)
         print(f"[{name}] pushed")
+    elif has_unpushed_commits(repo_dir):
+        run(["git", "push"], cwd=repo_dir)
+        print(f"[{name}] pushed earlier unpushed commits")
     else:
         print(f"[{name}] no changes")
 
@@ -278,6 +324,22 @@ def main():
         help="If remote host is GitHub, derive GitLab wiki URL using --gitlab-host and same owner/repo",
     )
     parser.add_argument(
+        "--gitlab-https",
+        action="store_true",
+        help="Use HTTPS for the derived GitLab wiki URL even when the remote uses SSH",
+    )
+    parser.add_argument(
+        "--gitlab-ssh-host",
+        default="ssh.gitlab.rylanswebsite.com",
+        help="SSH host for the derived GitLab wiki URL (default: ssh.gitlab.rylanswebsite.com)",
+    )
+    parser.add_argument(
+        "--gitlab-ssh-port",
+        type=int,
+        default=2224,
+        help="SSH port for the derived GitLab wiki URL (default: 2224)",
+    )
+    parser.add_argument(
         "--gitlab-host",
         default="gitlab.rylanswebsite.com",
         help="GitLab host used with --gitlab-from-github",
@@ -312,6 +374,9 @@ def main():
         gitlab_url=args.gitlab_url,
         gitlab_from_github=args.gitlab_from_github,
         gitlab_host=args.gitlab_host,
+        gitlab_https=args.gitlab_https,
+        gitlab_ssh_host=args.gitlab_ssh_host,
+        gitlab_ssh_port=args.gitlab_ssh_port,
     )
 
     if not github_url and not gitlab_url:

@@ -45,6 +45,12 @@ pub const TIMESYNC_LEGACY_STRATUM: u8 = 8;
 /// Forward error, in milliseconds, above which a verified exchange steps an anchored
 /// clock; unanchored clocks step onto UTC whenever their error exceeds it.
 pub(crate) const TIMESYNC_STEP_THRESHOLD_MS: u64 = 5_000;
+/// Default [`TimeSyncConfig::step_threshold_ms`].
+pub const TIMESYNC_DEFAULT_STEP_THRESHOLD_MS: u64 = 1_000;
+/// Default [`TimeSyncConfig::reference_slew_ppm`]: a leading clock slews at
+/// most 20 ppm, inside the frequency wander followers' disciplines allow for
+/// (50 ppm), so they track it without losing lock or bound honesty.
+pub const TIMESYNC_DEFAULT_REFERENCE_SLEW_PPM: u32 = 20;
 const QUALITY_MARKER: u64 = 1 << 63;
 const QUALITY_UNANCHORED: u64 = 1 << 62;
 const QUALITY_PRIORITY_SHIFT: u32 = 36;
@@ -77,8 +83,23 @@ pub struct TimeSyncConfig {
     pub request_interval_ms: u64,
     /// Allows a consumer with usable local time to promote itself when no remote source exists.
     pub consumer_promotion_enabled: bool,
-    /// Maximum slew rate applied by [`SlewedNetworkClock`] in parts per million.
+    /// Largest rate, in parts per million, at which a follower slews out the
+    /// phase error of its exchange discipline (small, measured corrections).
     pub max_slew_ppm: u32,
+    /// Error, in milliseconds, above which network time is stepped instead of
+    /// slewed: a local time source that disagrees with a leading node's clock
+    /// by more than this steps it (unless steps are inhibited, see
+    /// [`crate::router::Router::set_timesync_steps_allowed`]) and starts a new
+    /// time-base epoch; a follower whose error exceeds it re-anchors at once.
+    /// Smaller errors are slewed. Default 1000 ms.
+    pub step_threshold_ms: u64,
+    /// Largest rate, in parts per million, at which a leading node slews its
+    /// own clock toward a local time source (operator/host time, GPS). Its
+    /// followers see the slew as a change of the reference's frequency, which
+    /// their exchange discipline tracks (and bounds honestly) only within its
+    /// drift allowance ([`crate::timesync_discipline::TIMESYNC_DRIFT_ALLOWANCE_PPB`],
+    /// 50 ppm): keep it below that. Default 20 ppm (72 ms per hour).
+    pub reference_slew_ppm: u32,
 }
 
 impl Default for TimeSyncConfig {
@@ -91,7 +112,16 @@ impl Default for TimeSyncConfig {
             request_interval_ms: 1_000,
             consumer_promotion_enabled: true,
             max_slew_ppm: 50_000,
+            step_threshold_ms: TIMESYNC_DEFAULT_STEP_THRESHOLD_MS,
+            reference_slew_ppm: TIMESYNC_DEFAULT_REFERENCE_SLEW_PPM,
         }
+    }
+}
+
+impl TimeSyncConfig {
+    /// [`TimeSyncConfig::step_threshold_ms`] in nanoseconds (at least 1 ms).
+    pub(crate) fn step_threshold_ns(&self) -> u64 {
+        self.step_threshold_ms.max(1).saturating_mul(1_000_000)
     }
 }
 
@@ -418,6 +448,9 @@ pub struct SlewedNetworkClock {
     anchor_unix_ns: i64,
     pending_adjust_ns: i64,
     max_slew_ppm: u32,
+    /// Rate of the pending correction (`max_slew_ppm` unless a slower
+    /// reference slew was requested), ppm.
+    slew_ppm: u32,
     initialized: bool,
     /// Learned frequency correction of the local oscillator, ppb.
     rate_ppb: i64,
@@ -430,6 +463,7 @@ impl Default for SlewedNetworkClock {
             anchor_unix_ns: 0,
             pending_adjust_ns: 0,
             max_slew_ppm: 50_000,
+            slew_ppm: 50_000,
             initialized: false,
             rate_ppb: 0,
         }
@@ -443,8 +477,10 @@ fn clamp_unix_ns(ns: i128) -> i64 {
 impl SlewedNetworkClock {
     /// Creates a new slewed clock with the given slew-rate cap in parts per million.
     pub fn new(max_slew_ppm: u32) -> Self {
+        let max_slew_ppm = max_slew_ppm.min(999_999);
         Self {
-            max_slew_ppm: max_slew_ppm.min(999_999),
+            max_slew_ppm,
+            slew_ppm: max_slew_ppm,
             ..Default::default()
         }
     }
@@ -465,7 +501,7 @@ impl SlewedNetworkClock {
         // exactly when e*ppm >= |p|*1e6, so two multiplies replace the
         // software 64-bit division.
         if let (Some(budget), Some(needed)) = (
-            elapsed_ns.checked_mul(i64::from(self.max_slew_ppm)),
+            elapsed_ns.checked_mul(i64::from(self.slew_ppm)),
             pending.checked_abs().and_then(|p| p.checked_mul(1_000_000)),
         ) && elapsed_ns >= 0
             && budget >= needed
@@ -473,7 +509,7 @@ impl SlewedNetworkClock {
             return pending;
         }
         let max_adjust =
-            crate::timesync_discipline::mul_div_pow10(elapsed_ns, i64::from(self.max_slew_ppm), 1_000_000);
+            crate::timesync_discipline::mul_div_pow10(elapsed_ns, i64::from(self.slew_ppm), 1_000_000);
         pending.clamp(-max_adjust, max_adjust)
     }
 
@@ -555,6 +591,7 @@ impl SlewedNetworkClock {
         let current = self.read_ns(now_mono_ns);
         self.rate_ppb = rate_ppb;
         self.anchor_mono_ns = now_mono_ns;
+        self.slew_ppm = self.max_slew_ppm;
         match current {
             Some(current) if !allow_step => {
                 self.anchor_unix_ns = current;
@@ -570,8 +607,15 @@ impl SlewedNetworkClock {
 
     /// Steers toward an absolute reading with nanosecond resolution.
     pub fn steer_unix_ns(&mut self, now_mono_ns: u64, target_unix_ns: i64) {
+        self.steer_unix_ns_at_rate(now_mono_ns, target_unix_ns, self.max_slew_ppm);
+    }
+
+    /// Steers toward an absolute reading, slewing the difference at no more
+    /// than `slew_ppm` (capped by the clock's own maximum).
+    pub fn steer_unix_ns_at_rate(&mut self, now_mono_ns: u64, target_unix_ns: i64, slew_ppm: u32) {
         let current = self.read_ns(now_mono_ns);
         self.anchor_mono_ns = now_mono_ns;
+        self.slew_ppm = slew_ppm.clamp(1, self.max_slew_ppm.max(1));
         match current {
             Some(current) => {
                 self.anchor_unix_ns = current;
@@ -704,6 +748,146 @@ pub struct TimeSyncStatus {
     pub last_sample_age_ms: u64,
     /// The node is the reference others follow.
     pub is_reference: bool,
+    /// Network time-base epoch of this node's clock (see
+    /// [`crate::packet::Packet::time_epoch`]). Advances on every step.
+    pub epoch: u16,
+    /// Newest epoch seen on any received packet. Above `epoch`, this node's
+    /// time base is behind the network's and it is re-anchoring.
+    pub newest_seen_epoch: u16,
+    /// The elected source is in an older epoch than this node: this node keeps
+    /// its clock until the source adopts a newer epoch (it learns of this node's
+    /// epoch from its requests).
+    pub holding: bool,
+    /// Steps (and epoch changes) since start.
+    pub steps: u32,
+    /// The most recent step or epoch change, if any.
+    pub last_step: Option<TimeSyncLastStep>,
+    /// A local time source may step this node's clock (see
+    /// [`crate::router::Router::set_timesync_steps_allowed`]).
+    pub steps_allowed: bool,
+}
+
+/// Why a node's network time was stepped or its epoch changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TimeSyncStepReason {
+    /// A local time source (operator, host or GPS time) disagreed with the
+    /// leading node's clock by more than the step threshold.
+    LocalSource = 1,
+    /// [`crate::router::Router::step_local_network_time_ns`].
+    Explicit = 2,
+    /// Unanchored (uptime) time was replaced by UTC.
+    UtcAnchor = 3,
+    /// The elected source moved to a newer epoch; this node followed it.
+    SourceEpoch = 4,
+    /// Following in the same epoch, the error exceeded the step threshold:
+    /// re-anchored forward (or either way before the node first locked in the
+    /// epoch, while its stamps are still marked unsynced).
+    Resync = 5,
+    /// Following in the same epoch, the clock was ahead of its source by more
+    /// than the step threshold: a newer epoch was announced to the source
+    /// (no time change yet; the source adopts it and this node steps back).
+    Diverged = 6,
+    /// The epoch number advanced without a time change: a follower carried a
+    /// newer epoch, which this leading node adopted.
+    Renamed = 7,
+    /// A leading node whose steps are inhibited heard a follower in a newer
+    /// epoch on another time base (a leader restarted while steps are inhibited): it joined
+    /// the network's time base instead of making the network step to its own.
+    Joined = 8,
+    /// [`crate::router::Router::raise_network_time_epoch`] advanced the epoch
+    /// (a persisted epoch restored at boot); no time change.
+    Raised = 9,
+}
+
+impl TimeSyncStepReason {
+    /// Numeric code for C and Python.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Short lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LocalSource => "local_source",
+            Self::Explicit => "explicit",
+            Self::UtcAnchor => "utc_anchor",
+            Self::SourceEpoch => "source_epoch",
+            Self::Resync => "resync",
+            Self::Diverged => "diverged",
+            Self::Renamed => "renamed",
+            Self::Joined => "joined",
+            Self::Raised => "raised",
+        }
+    }
+}
+
+/// The most recent step or epoch change of a node's network time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSyncLastStep {
+    /// New reading minus old reading at the step, ns (0 for a rename).
+    pub delta_ns: i64,
+    /// Why it happened.
+    pub reason: TimeSyncStepReason,
+    /// Epoch before.
+    pub from_epoch: u16,
+    /// Epoch after (equal to `from_epoch` for a forward re-anchor that kept it).
+    pub to_epoch: u16,
+    /// Age of the event, ms.
+    pub age_ms: u64,
+}
+
+/// How a `(time_epoch, timestamp)` stamp relates to this node's network time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkStampAge {
+    /// The stamp's epoch is this node's or one it can translate (a recent
+    /// step): current network time minus the stamp, translated into the
+    /// current time base, ms (negative: the stamp is in the future).
+    Age(i64),
+    /// The stamp is from a newer epoch than this node's clock: this node has
+    /// not re-anchored yet (it is doing so, normally within one exchange); its
+    /// clock cannot translate the stamp. `since_ms` is how long ago this node
+    /// first heard of an epoch newer than its own (0 when this stamp is the
+    /// first): a stamp from that epoch was taken after the network entered
+    /// it, so its age is about `since_ms` at most (plus its transit).
+    NewerEpoch {
+        /// Milliseconds since this node first heard of a newer epoch.
+        since_ms: u64,
+    },
+    /// The stamp is from an older epoch this node cannot translate: it was
+    /// taken before a step that is no longer remembered, or by a node whose
+    /// time base was never adopted. Treat it as stale.
+    OlderEpoch,
+    /// This node has no network time.
+    NoTime,
+}
+
+impl NetworkStampAge {
+    /// Freshness verdict for a validity window: the stamp is at most
+    /// `max_age_ms` old and at most `max_ahead_ms` in the future. A stamp
+    /// from a newer epoch than this node's clock passes while this node has
+    /// known of that epoch for at most `max_age_ms` (it is re-anchoring and
+    /// the stamp cannot be older than the epoch); an untranslatable older
+    /// epoch, and no network time, never pass.
+    pub fn is_fresh(self, max_age_ms: u64, max_ahead_ms: u64) -> bool {
+        match self {
+            Self::Age(age) => {
+                age >= -(max_ahead_ms.min(i64::MAX as u64) as i64) && age <= max_age_ms.min(i64::MAX as u64) as i64
+            }
+            Self::NewerEpoch { since_ms } => since_ms <= max_age_ms,
+            Self::OlderEpoch | Self::NoTime => false,
+        }
+    }
+}
+
+/// Orders two `(time_epoch, timestamp_ms)` stamps of one network: epoch
+/// first, then timestamp. Every node's epoch only grows and a node never steps
+/// back inside an epoch, so this orders one sender's stamps across steps in
+/// either direction, and stamps of different senders that share the
+/// network's epochs.
+#[inline]
+pub fn compare_network_stamps(a: (u16, u64), b: (u16, u64)) -> core::cmp::Ordering {
+    a.cmp(&b)
 }
 
 impl TimeSyncStatus {
@@ -1069,6 +1253,15 @@ impl TimeSyncTracker {
     /// Returns the tracker's active configuration.
     pub fn config(&self) -> TimeSyncConfig {
         self.cfg
+    }
+
+    pub(crate) fn set_step_policy(&mut self, step_threshold_ms: Option<u64>, reference_slew_ppm: Option<u32>) {
+        if let Some(ms) = step_threshold_ms {
+            self.cfg.step_threshold_ms = ms;
+        }
+        if let Some(ppm) = reference_slew_ppm {
+            self.cfg.reference_slew_ppm = ppm;
+        }
     }
 
     /// Returns the currently selected remote source, if any.

@@ -74,6 +74,9 @@ thread_local! {
     /// FC's CAN stamps taken this much too early (ms): (t1 transmit, t4 receive),
     /// and the stamping uncertainty FC describes for its CAN side (ms, 0: none).
     pub(crate) static FC_CAN_STAMP_EARLY_MS: std::cell::Cell<(f64, f64, f64)> = const { std::cell::Cell::new((0.0, 0.0, 0.0)) };
+    /// The GS host clock's error (ns): what the GS sets its network time to
+    /// each second is UTC plus this.
+    pub(crate) static GS_HOST_OFFSET_NS: std::cell::Cell<i128> = const { std::cell::Cell::new(0) };
 }
 const FC: usize = 2;
 
@@ -114,6 +117,7 @@ fn cfg(source: bool, request_ms: u64, announce_ms: u64) -> TimeSyncConfig {
         request_interval_ms: request_ms,
         consumer_promotion_enabled: true,
         max_slew_ppm: 50_000,
+        ..Default::default()
     }
 }
 
@@ -175,7 +179,8 @@ impl Net {
     fn step(&mut self) {
         let t = self.true_ns();
         if t % 1_000_000_000 < MS {
-            let gs = NetworkTime::from_unix_ns(UTC_NS + t as i128).unwrap();
+            let offset = GS_HOST_OFFSET_NS.with(|o| o.get());
+            let gs = NetworkTime::from_unix_ns(UTC_NS + t as i128 + offset).unwrap();
             self.nodes[GS].set_local_network_time(gs.into());
         }
         for node in &self.nodes {
@@ -500,14 +505,18 @@ fn radio_sim_trace() {
         if i % 2_000 == 0 {
             let st = net.nodes[RF].timesync_status().unwrap();
             println!(
-                "t {:5.0}s RF err {:9.3} ms bound {:9.3} ms state {:?} rate {:8} ppb offset {:9.3} ms age {} ms",
+                "t {:5.0}s RF err {:9.3} ms bound {:9.3} ms state {:?} rate {:8} ppb offset {:9.3} ms age {} ms epoch {} steps {} last {:?} GS epoch {}",
                 i as f64 / 1e3,
                 net.error_ns(RF).unwrap_or(0) as f64 / 1e6,
                 st.error_bound_ns as f64 / 1e6,
                 st.state,
                 st.rate_ppb,
                 st.offset_ns as f64 / 1e6,
-                st.last_sample_age_ms
+                st.last_sample_age_ms,
+                st.epoch,
+                st.steps,
+                st.last_step,
+                net.nodes[GS].network_time_epoch()
             );
         }
     }
@@ -557,8 +566,7 @@ fn radio_sim_sweep() {
 /// near 2% while the true one is -0.016%. Every reported bound, Acquiring
 /// included, must cover the real error from boot: the frequency uncertainty
 /// may not be capped below the rate the fit could be wrong by.
-#[test]
-fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
+fn heavy_loss_scenario() {
     let stats = run(RadioLink { loss: 0.5, ..LOSSY }, 0, 420, 11 * 0x9e37_79b9);
     report("50% seed 11", &stats);
     for s in &stats {
@@ -613,5 +621,122 @@ fn timesync_trajectory_probe() {
                 println!("TRAJ {seed} {i} {errs:?}");
             }
         }
+    }
+}
+
+/// The field fault on the AV-bay model (lossy turn-taking radio, RF relaying
+/// to FC and PB over CAN, every board on its own crystal): the GS host clock
+/// is 3 h 49 min behind, the network syncs to it, then the host clock is
+/// corrected (+3 h 49 min) and later wrongly set 4 h back. After each, every
+/// board is within 5 ms of the GS within seconds and reports itself synced
+/// with an honest bound; nobody is left behind. (Slewed at 5% the first
+/// correction took 76 h.)
+#[test]
+fn radio_sim_station_steps_hours_both_ways() {
+    station_steps_scenario();
+}
+
+#[test]
+fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
+    heavy_loss_scenario();
+}
+
+/// Runs one scenario under the packet nonce sequence named by
+/// `SEDS_TEST_NONCE_SEED` (as another test order would leave it).
+#[test]
+#[ignore = "probe run by the seeded sweeps in a fresh process"]
+fn radio_sim_seeded_probe() {
+    // Only meaningful when a seeded sweep launches it; a plain run of the
+    // ignored tests has nothing to probe.
+    let Ok(seed) = std::env::var("SEDS_TEST_NONCE_SEED") else {
+        return;
+    };
+    let seed: u32 = seed.parse().unwrap();
+    crate::packet::seed_packet_nonce(seed);
+    crate::router::seed_timesync_nonce(seed as u16);
+    match std::env::var("SEDS_TEST_SCENARIO").as_deref() {
+        Ok("heavy_loss") => heavy_loss_scenario(),
+        _ => station_steps_scenario(),
+    }
+}
+
+/// Both scenarios under 20 nonce sequences each, every run in a fresh
+/// process: their outcome depends on the nonce sequence (frame sizes and
+/// receipt IDs), which the order of the other tests in a process sets.
+#[test]
+#[ignore = "about two minutes; run explicitly"]
+fn radio_sim_scenarios_hold_under_20_nonce_sequences() {
+    let mut failures = Vec::new();
+    for scenario in ["station_steps", "heavy_loss"] {
+        for i in 0..20u32 {
+            let seed = 0xA5C3_1F27u32.wrapping_add(i.wrapping_mul(0x0101_7F4B));
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "tests::timesync_radio_sim::radio_sim_seeded_probe", "--test-threads=1"])
+                .env("SEDS_TEST_NONCE_SEED", seed.to_string())
+                .env("SEDS_TEST_SCENARIO", scenario)
+                .output()
+                .expect("run seeded probe");
+            if !out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                let why = text.lines().find(|l| l.contains("panicked") || l.contains("assert")).unwrap_or("").to_string();
+                failures.push(format!("{scenario} seed {seed:#x}: {why}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} of 40 runs failed:\n{}", failures.len(), failures.join("\n"));
+}
+
+fn station_steps_scenario() {
+    const H: i128 = 3_600_000_000_000;
+    let field = -(3 * H + 49 * 60_000_000_000);
+    for (label, link, seed) in [("0%", CLEAN, 0x5eed), ("30%", LOSSY, 0x9e37_79b9)] {
+        GS_HOST_OFFSET_NS.with(|o| o.set(field));
+        let mut net = Net::new(link, seed);
+        for _ in 0..60_000 {
+            net.step();
+        }
+        for (step, offset) in [("+3h49m", 0), ("-4h", -4 * H)] {
+            GS_HOST_OFFSET_NS.with(|o| o.set(offset));
+            let rel = |net: &Net, n: usize| -> Option<i128> {
+                Some(net.nodes[n].network_time_ns()? - net.nodes[GS].network_time_ns()?)
+            };
+            let within = |net: &Net, ns: u128| (1..NODES.len()).all(|n| rel(net, n).is_some_and(|e| e.unsigned_abs() <= ns));
+            let (mut coarse, mut fine, mut violations) = (None, None, 0usize);
+            for i in 0..40_000u64 {
+                net.step();
+                if coarse.is_none() && within(&net, 50_000_000) {
+                    coarse = Some(i);
+                }
+                if fine.is_none() && within(&net, 5_000_000) {
+                    fine = Some(i);
+                }
+                if i % 100 == 0 {
+                    for n in 1..NODES.len() {
+                        let (Some(err), Some(st)) = (rel(&net, n), net.nodes[n].timesync_status()) else { continue };
+                        // Every bound a board reports in the GS's epoch covers
+                        // its real error to the GS. (A board still in the old
+                        // epoch, until it hears of the step, bounds its error to
+                        // the old time base.)
+                        if st.epoch == net.nodes[GS].network_time_epoch()
+                            && st.error_bound_ns != u64::MAX
+                            && u128::from(st.error_bound_ns) < err.unsigned_abs()
+                        {
+                            violations += 1;
+                        }
+                    }
+                }
+            }
+            println!("{label} {step}: every board within 50 ms after {coarse:?} ms, within 5 ms after {fine:?} ms; bound < error {violations}");
+            assert!(coarse.is_some_and(|t| t <= 3_000), "{label} {step}: coarse {coarse:?}");
+            assert!(fine.is_some_and(|t| t <= 30_000), "{label} {step}: fine {fine:?}");
+            assert_eq!(violations, 0, "{label} {step}");
+            let gs_epoch = net.nodes[GS].network_time_epoch();
+            for (node, (name, _)) in net.nodes.iter().zip(NODES.iter()).skip(1) {
+                let st = node.timesync_status().unwrap();
+                assert!(st.state.is_synced(), "{label} {step} {name}: {st:?}");
+                assert_eq!(st.epoch, gs_epoch, "{label} {step} {name}");
+            }
+        }
+        GS_HOST_OFFSET_NS.with(|o| o.set(0));
     }
 }

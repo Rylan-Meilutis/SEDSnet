@@ -87,6 +87,7 @@ const E_SOURCE_INDEX: u8 = 0x40;
 const E_TARGET_INDEX: u8 = 0x80;
 const CONTRACT_TARGETS: u8 = 0x01;
 const CONTRACT_SHAPE: u8 = 0x02;
+const CONTRACT_TIME_EPOCH: u8 = 0x08;
 
 // One error for every malformed bundle or unbundleable frame keeps the
 // embedded image small; the cause is never acted on differently.
@@ -166,6 +167,9 @@ struct Fields<'a> {
     src: u32,
     eps: &'a [u8],
     contract: &'a [u8],
+    /// `contract` is the raw bytes of an epoch-only contract (a zero length
+    /// and the ULEB128 epoch), written back verbatim.
+    contract_epoch_only: bool,
     /// `contract` holds 1-byte node indices for its targets (record form).
     targets_indexed: bool,
     rel: &'a [u8],
@@ -216,13 +220,21 @@ impl<'a> Reader<'a> {
         }
         Some(&self.buf[start..self.off])
     }
-    /// The contract's flags and shape bytes, and its target count.
-    fn contract_head(&mut self) -> Option<usize> {
+    /// The contract's flags and shape bytes: its flags and target count.
+    fn contract_head(&mut self) -> Option<(u8, usize)> {
         let flags = self.byte()?;
         if flags & CONTRACT_SHAPE != 0 && self.byte()? & 0x40 != 0 {
             self.uleb()?;
         }
-        if flags & CONTRACT_TARGETS != 0 { self.len() } else { Some(0) }
+        Some((flags, if flags & CONTRACT_TARGETS != 0 { self.len()? } else { 0 }))
+    }
+    /// The bytes after the contract's targets (its time epoch, if any).
+    fn contract_tail(&mut self, flags: u8) -> Option<&'a [u8]> {
+        let start = self.off;
+        if flags & CONTRACT_TIME_EPOCH != 0 {
+            self.uleb()?;
+        }
+        Some(&self.buf[start..self.off])
     }
     /// Reliable header bytes as the canonical flags describe them.
     fn reliable(&mut self, flags: u8) -> Option<&'a [u8]> {
@@ -307,17 +319,31 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, table: bool, p: &mut F
     }
     if flags & F_CONTRACT == 0 {
         p.contract = &[];
+        p.contract_epoch_only = false;
+        p.targets_indexed = false;
+    } else if elide & E_CONTRACT == 0 && r.buf.get(r.off) == Some(&0) {
+        // Epoch-only contract: a zero length, then the ULEB128 epoch.
+        let start = r.off;
+        r.uleb()?;
+        let epoch = r.uleb()?;
+        if epoch == 0 || epoch > u64::from(crate::packet::MAX_TIME_EPOCH) || elide & E_TARGET_INDEX != 0 {
+            return None;
+        }
+        p.contract = &r.buf[start..r.off];
+        p.contract_epoch_only = true;
         p.targets_indexed = false;
     } else if elide & E_CONTRACT == 0 {
         let n = r.len()?;
         p.contract = r.take(n)?;
+        p.contract_epoch_only = false;
         p.targets_indexed = elide & E_TARGET_INDEX != 0;
         // The contract must describe exactly its own bytes, and every index
         // must name a node in this table.
         let mut c = Reader { buf: p.contract, off: 0 };
-        let targets = c.contract_head()?;
+        let (contract_flags, targets) = c.contract_head()?;
         let each = if p.targets_indexed { 1 } else { 8 };
         let list = c.take(targets.checked_mul(each)?)?;
+        c.contract_tail(contract_flags)?;
         if c.off != p.contract.len() || (p.targets_indexed && list.iter().any(|&i| target_of(usize::from(i)).is_none())) {
             return None;
         }
@@ -377,11 +403,12 @@ fn unzigzag32(v: u32) -> u32 {
 /// reverse), length-prefixed; `None` when a target is not in the table.
 fn put_contract(out: &mut Vec<u8>, contract: &[u8], from_index: bool, to_index: bool) -> Option<()> {
     let mut r = Reader { buf: contract, off: 0 };
-    let targets = r.contract_head()?;
+    let (flags, targets) = r.contract_head()?;
     let head = &contract[..r.off];
     let width = if from_index { 1 } else { 8 };
     let list = r.take(targets.checked_mul(width)?)?;
-    put_uleb(out, (head.len() + targets * if to_index { 1 } else { 8 }) as u64);
+    let tail = r.contract_tail(flags)?;
+    put_uleb(out, (head.len() + targets * if to_index { 1 } else { 8 } + tail.len()) as u64);
     put(out, head);
     for target in list.chunks_exact(width) {
         let hash = if from_index {
@@ -395,6 +422,7 @@ fn put_contract(out: &mut Vec<u8>, contract: &[u8], from_index: bool, to_index: 
             put(out, &hash.to_le_bytes());
         }
     }
+    put(out, tail);
     Some(())
 }
 
@@ -411,7 +439,7 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
                 elide |= E_NONCE_DELTA;
             }
         }
-        if c.flags & p.flags & F_CONTRACT != 0 && p.contract == c.contract {
+        if c.flags & p.flags & F_CONTRACT != 0 && p.contract_epoch_only == c.contract_epoch_only && p.contract == c.contract {
             elide |= E_CONTRACT;
         }
         if p.nep == c.nep {
@@ -427,7 +455,9 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
         elide |= E_SOURCE_INDEX;
     }
     let mut contract = Vec::new();
-    if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
+    if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 && c.contract_epoch_only {
+        put(&mut contract, c.contract);
+    } else if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
         let indexed = rec && !nodes().is_empty() && put_contract(&mut contract, c.contract, c.targets_indexed, true).is_some();
         if indexed {
             elide |= E_TARGET_INDEX;

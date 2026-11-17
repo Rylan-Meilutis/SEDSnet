@@ -51,6 +51,9 @@ mod ingress_target_filter_tests;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
 #[path = "tests/payload_codec_negotiation.rs"]
 mod payload_codec_negotiation;
+#[cfg(all(test, feature = "std", feature = "timesync", feature = "cryptography", feature = "compression"))]
+#[path = "tests/timesync_nonce_e2e.rs"]
+mod timesync_nonce_e2e_tests;
 #[cfg(all(test, feature = "std", feature = "compact-bundle"))]
 #[path = "tests/compact_bundle.rs"]
 mod compact_bundle_tests;
@@ -2977,6 +2980,13 @@ impl ManagedVariableCacheEntry {
     }
 }
 
+/// One writer's managed-variable update `new` is older than `current`: by
+/// time-base epoch first, then timestamp (see [`Packet::time_epoch`]).
+#[inline]
+pub(crate) fn managed_stamp_is_older(new: &Packet, current: &Packet) -> bool {
+    (new.time_epoch(), new.timestamp()) < (current.time_epoch(), current.timestamp())
+}
+
 type NetworkVariableUpdateFn = dyn Fn(&Packet) -> TelemetryResult<()> + Send + Sync + 'static;
 
 #[derive(Clone)]
@@ -4491,6 +4501,14 @@ pub struct Router {
     /// side callback (`side << 8 | slot + 1`), 0 when none.
     #[cfg(feature = "timesync")]
     timesync_tx_arm: core::sync::atomic::AtomicUsize,
+    /// Network time-base epoch, mirrored from the time sync runtime for
+    /// stamping packets without its lock.
+    #[cfg(feature = "timesync")]
+    timesync_epoch: Arc<core::sync::atomic::AtomicU16>,
+    /// Newest plausible-UTC stamp heard on any received packet, for judging
+    /// stamps while this node has no network time of its own.
+    #[cfg(feature = "timesync")]
+    timesync_heard: timesync_v2::HeardStamp,
 }
 
 #[cfg(feature = "std")]
@@ -4543,6 +4561,8 @@ struct RemoteTimeSyncSource {
     last_sample_mono_ms: u64,
     sample_unix_ms: u64,
     side: Option<RouterSideId>,
+    /// Time-base epoch of `sample_unix_ms`.
+    epoch: u16,
 }
 
 #[cfg(feature = "timesync")]
@@ -4559,11 +4579,13 @@ struct TimeSyncRuntime {
     pending_request: Option<PendingTimeSyncRequest>,
     clock_anchored: bool,
     v2: timesync_v2::TimeSyncV2,
+    /// Survives configuration changes: an epoch never goes back.
+    epoch: timesync_v2::EpochState,
 }
 
 #[cfg(feature = "timesync")]
 impl TimeSyncRuntime {
-    fn new(cfg: Option<TimeSyncConfig>) -> Self {
+    fn new(cfg: Option<TimeSyncConfig>, epoch: Arc<core::sync::atomic::AtomicU16>) -> Self {
         Self {
             tracker: cfg.map(TimeSyncTracker::new),
             cfg,
@@ -4579,6 +4601,7 @@ impl TimeSyncRuntime {
             pending_request: None,
             clock_anchored: false,
             v2: Default::default(),
+            epoch: timesync_v2::EpochState::new(epoch),
         }
     }
 }
@@ -4828,9 +4851,11 @@ impl Router {
             // are deliberately pseudo-random deduplication keys rather than
             // revisions. Accept equal-timestamp updates in arrival order so
             // rapid toggles made during one clock tick are not discarded.
+            // The time-base epoch orders first: a write made after a network
+            // time step back supersedes the writer's earlier ones, and a late
+            // copy stamped before the step never supersedes it.
             if existing.is_some_and(|entry| {
-                let current = &entry.packet;
-                sender_address == entry.sender_address && pkt.timestamp() < current.timestamp()
+                sender_address == entry.sender_address && managed_stamp_is_older(pkt, &entry.packet)
             }) {
                 return Ok(());
             }
@@ -8214,10 +8239,19 @@ impl Router {
         if let Some(unix_ms) = reference
             && !st.clock_anchored
         {
-            if st.disciplined_clock.read_unix_ms(now_mono_ns).is_none_or(|current| {
-                current.abs_diff(unix_ms) > TIMESYNC_STEP_THRESHOLD_MS
-            }) {
-                st.disciplined_clock.step_unix_ms(now_mono_ns, unix_ms);
+            match st.disciplined_clock.read_unix_ms(now_mono_ns) {
+                None => st.disciplined_clock.step_unix_ms(now_mono_ns, unix_ms),
+                // Unanchored time replaced by UTC: a new time base.
+                Some(current) if current.abs_diff(unix_ms) > TIMESYNC_STEP_THRESHOLD_MS => {
+                    let target_ns = (i128::from(unix_ms) * 1_000_000).min(i128::from(i64::MAX)) as i64;
+                    Self::timesync_local_step_locked(
+                        st,
+                        now_mono_ns,
+                        target_ns,
+                        crate::timesync::TimeSyncStepReason::UtcAnchor,
+                    );
+                }
+                Some(_) => {}
             }
             st.clock_anchored = true;
         }
@@ -8245,33 +8279,52 @@ impl Router {
         anchored
     }
 
-    /// Steers toward the elected remote. UTC replaces unanchored time with a
-    /// step; unanchored time never drags a clock that already reads plausible UTC.
+    /// Steers toward the elected remote's announced time (`src_epoch` is the
+    /// epoch its announce carried). UTC replaces unanchored time with a step;
+    /// unanchored time never drags a clock that already reads plausible UTC.
+    /// Announced time lags the truth by its queueing, so it may step a clock
+    /// forward or into a newer epoch, but never names a divergence.
     #[cfg(feature = "timesync")]
     fn timesync_steer_remote_locked(
         st: &mut TimeSyncRuntime,
         now_mono_ns: u64,
         target_ms: u64,
         anchored: bool,
+        src_epoch: u16,
     ) {
         let anchored = anchored && target_ms >= TIMESYNC_UTC_FLOOR_MS;
-        let clock = &mut st.disciplined_clock;
-        let current = clock.read_unix_ms(now_mono_ns);
-        if !clock.is_initialized() {
-            clock.steer_unix_ms(now_mono_ns, target_ms);
+        let current = st.disciplined_clock.read_unix_ms(now_mono_ns);
+        let target_ns = (i128::from(target_ms) * 1_000_000).min(i128::from(i64::MAX)) as i64;
+        if !st.disciplined_clock.is_initialized() {
+            if src_epoch < st.epoch.epoch {
+                st.epoch.holding = true;
+                return;
+            }
+            st.disciplined_clock.steer_unix_ms(now_mono_ns, target_ms);
             st.clock_anchored = anchored;
-        } else if anchored
-            && !st.clock_anchored
-            && current.is_none_or(|current| current.abs_diff(target_ms) > TIMESYNC_STEP_THRESHOLD_MS)
-        {
-            clock.step_unix_ms(now_mono_ns, target_ms);
-            st.clock_anchored = true;
+            if src_epoch > st.epoch.epoch {
+                Self::timesync_epoch_changed_locked(
+                    st,
+                    src_epoch,
+                    0,
+                    crate::timesync::TimeSyncStepReason::SourceEpoch,
+                    now_mono_ns,
+                );
+            }
         } else if anchored
             || target_ms >= TIMESYNC_UTC_FLOOR_MS
             || current.is_none_or(|current| current < TIMESYNC_UTC_FLOOR_MS)
         {
-            clock.steer_unix_ms(now_mono_ns, target_ms);
-            st.clock_anchored = anchored;
+            // UTC replacing unanchored time steps (5 s, or the configured
+            // step threshold when smaller).
+            let allow_step = anchored
+                && !st.clock_anchored
+                && current.is_none_or(|current| current.abs_diff(target_ms) > TIMESYNC_STEP_THRESHOLD_MS);
+            let followed =
+                Self::timesync_follow_locked(st, now_mono_ns, target_ns, None, src_epoch, None, allow_step);
+            if followed != timesync_v2::Follow::Held {
+                st.clock_anchored = anchored;
+            }
         }
     }
 
@@ -14828,13 +14881,16 @@ impl Router {
     ) {
         // Remote samples are anchored at receipt, just like local sources.
         // Steering repeatedly toward the unprojected sample slows the clock.
-        let target_ms = st.remote_sources.get(remote.sender.as_str()).map(|src| {
-            src.sample_unix_ms
-                .saturating_add(now_mono_ms.saturating_sub(src.last_sample_mono_ms))
+        let target = st.remote_sources.get(remote.sender.as_str()).map(|src| {
+            (
+                src.sample_unix_ms
+                    .saturating_add(now_mono_ms.saturating_sub(src.last_sample_mono_ms)),
+                src.epoch,
+            )
         });
-        if let Some(target_ms) = target_ms {
+        if let Some((target_ms, epoch)) = target {
             let anchored = remote.quality().anchored;
-            Self::timesync_steer_remote_locked(st, now_mono_ns, target_ms, anchored);
+            Self::timesync_steer_remote_locked(st, now_mono_ns, target_ms, anchored, epoch);
         }
     }
 
@@ -14871,8 +14927,7 @@ impl Router {
             .filter(|ns| *ns >= 0)
             && !Self::timesync_following_remote_locked(&st, now_ms, now_ns)
         {
-            st.disciplined_clock
-                .steer_unix_ns(now_ns, unix_ns.min(i128::from(i64::MAX)) as i64);
+            Self::timesync_local_steer_locked(&mut st, now_ns, unix_ns.min(i128::from(i64::MAX)) as i64);
         }
     }
 
@@ -14926,8 +14981,10 @@ impl Router {
                 let unix_ns = unix_ns.min(i128::from(i64::MAX)) as i64;
                 // A node that follows a better remote source (an RRLS while the
                 // GS leads) keeps its host time as a candidate only; steering
-                // the clock to it would fight the exchange discipline.
-                st.disciplined_clock.steer_unix_ns(now_ns, unix_ns);
+                // the clock to it would fight the exchange discipline. A
+                // leading clock steps beyond the step threshold (a new epoch)
+                // and otherwise slews at the reference rate its followers track.
+                Self::timesync_local_steer_locked(&mut st, now_ns, unix_ns);
             }
         } else {
             // Prepare every allocation first. In particular, do not erase an
@@ -15242,22 +15299,84 @@ impl Router {
         self.clock.now_ms()
     }
 
+    /// Packet timestamp and the epoch it was taken in.
+    #[cfg(feature = "timesync")]
+    fn packet_stamp(&self) -> (u64, u16) {
+        self.network_time_ms_with_epoch()
+            .unwrap_or_else(|| (self.monotonic_now_ms(), self.network_time_epoch()))
+    }
+
+    #[cfg(not(feature = "timesync"))]
+    fn packet_stamp(&self) -> (u64, u16) {
+        (self.clock.now_ms(), 0)
+    }
+
+    /// Epoch for an application-supplied timestamp: the current one.
+    #[inline]
+    fn packet_epoch(&self) -> u16 {
+        #[cfg(feature = "timesync")]
+        {
+            self.network_time_epoch()
+        }
+        #[cfg(not(feature = "timesync"))]
+        {
+            0
+        }
+    }
+
     #[cfg(feature = "timesync")]
     fn queue_internal_timesync_request(
         &self,
         seq: u64,
         t1_mono_ms: u64,
         called_from_queue: bool,
+        epoch: u16,
     ) -> TelemetryResult<()> {
-        let pkt_ts = self.packet_timestamp_ms();
+        let pkt = self.timesync_packet(DataType::TimeSyncRequest, &[seq, t1_mono_ms], self.timesync_request_stamp(epoch), epoch)?;
+        let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
         if called_from_queue {
-            self.log_queue_ts(DataType::TimeSyncRequest, pkt_ts, &[seq, t1_mono_ms])
+            self.tx_queue_item(item)
         } else {
-            self.log_ts(DataType::TimeSyncRequest, pkt_ts, &[seq, t1_mono_ms])
+            self.tx_item(item)
         }
     }
 
+    /// Timestamp of a time sync request carrying `epoch`. A relay that passes
+    /// a follower's newer epoch upstream stamps 0: its own clock is not in that
+    /// epoch's time base, so its stamp must not let the leader conclude that
+    /// the bases agree (the leader then names a newer epoch of its own).
     #[cfg(feature = "timesync")]
+    fn timesync_request_stamp(&self, epoch: u16) -> u64 {
+        if epoch > self.network_time_epoch() { 0 } else { self.packet_timestamp_ms() }
+    }
+
+    /// Network time and its epoch for an announce (monotonic time and epoch
+    /// 0 before network time exists).
+    #[cfg(feature = "timesync")]
+    fn timesync_announce_stamp(&self) -> (u64, u16) {
+        self.network_time_ms_with_epoch()
+            .unwrap_or_else(|| (self.monotonic_now_ms(), self.network_time_epoch()))
+    }
+
+    /// A time sync packet stamped with `epoch`: the epoch its payload times
+    /// were taken in (requests carry the newest epoch this node knows of).
+    #[cfg(feature = "timesync")]
+    pub(crate) fn timesync_packet(&self, ty: DataType, words: &[u64], timestamp: u64, epoch: u16) -> TelemetryResult<Packet> {
+        let sender = self.sender_arc();
+        // Time sync packets take their nonce from their own counter,
+        // 128..=16383 in turn (two ULEB128 bytes; a hashed packet nonce takes
+        // up to three), so a time sync response stays as small as a frame allows
+        // with the epoch, and no two of the last 16256 time sync packets of
+        // this node share a nonce (receipt IDs stay distinct). Time sync
+        // packets are never sealed end to end (internal control traffic; the
+        // frame encoder refuses it), so this nonce never feeds an AEAD nonce.
+        let pkt = Packet::new(ty, &[DataEndpoint::TimeSync], sender.as_ref(), timestamp, encode_slice_le(words))?;
+        let nonce = timesync_v2::next_timesync_nonce();
+        Ok(pkt.with_nonce(nonce).with_time_epoch(epoch))
+    }
+
+    #[cfg(feature = "timesync")]
+    #[allow(clippy::too_many_arguments)]
     fn queue_internal_timesync_response(
         &self,
         seq: u64,
@@ -15266,16 +15385,13 @@ impl Router {
         t3_network_ms: u64,
         dst: Option<RouterSideId>,
         called_from_queue: bool,
+        epoch: u16,
     ) -> TelemetryResult<()> {
-        let pkt_ts = self.packet_timestamp_ms();
-        let payload = encode_slice_le(&[seq, t1_mono_ms, t2_network_ms, t3_network_ms]);
-        let sender = self.sender_arc();
-        let pkt = Packet::new(
+        let pkt = self.timesync_packet(
             DataType::TimeSyncResponse,
-            &[DataEndpoint::TimeSync],
-            sender.as_ref(),
-            pkt_ts,
-            payload,
+            &[seq, t1_mono_ms, t2_network_ms, t3_network_ms],
+            self.packet_timestamp_ms(),
+            epoch,
         )?;
         match dst {
             Some(dst) => self.emit_internal_tx(
@@ -15301,15 +15417,10 @@ impl Router {
         ty: DataType,
         words: &[u64],
         sides: &[RouterSideId],
+        timestamp: u64,
+        epoch: u16,
     ) -> TelemetryResult<()> {
-        let sender = self.sender_arc();
-        let pkt = Packet::new(
-            ty,
-            &[DataEndpoint::TimeSync],
-            sender.as_ref(),
-            self.packet_timestamp_ms(),
-            encode_slice_le(words),
-        )?;
+        let pkt = self.timesync_packet(ty, words, timestamp, epoch)?;
         for &dst in sides {
             self.emit_internal_tx(
                 RouterTxItem::ToSide {
@@ -15386,12 +15497,14 @@ impl Router {
                         priority,
                         upstream: 0,
                     }));
-                    st.next_announce_mono_ms = now_ms.saturating_add(cfg.announce_interval_ms);
+                    let interval = Self::timesync_next_announce_interval_locked(&mut st, cfg.announce_interval_ms);
+                    st.next_announce_mono_ms = now_ms.saturating_add(interval);
                 } else if let Some(found) =
                     Self::timesync_reserve_locked(&st, leader.as_ref(), now_ns, multi_side)
                 {
                     reserve = Some(found);
-                    st.next_announce_mono_ms = now_ms.saturating_add(cfg.announce_interval_ms);
+                    let interval = Self::timesync_next_announce_interval_locked(&mut st, cfg.announce_interval_ms);
+                    st.next_announce_mono_ms = now_ms.saturating_add(interval);
                 }
             }
 
@@ -15435,13 +15548,14 @@ impl Router {
                     t1_mono_ms: cookie,
                     source: remote.sender,
                 });
-                request = Some((seq, cookie, side));
+                request = Some((seq, cookie, side, Self::timesync_request_epoch_locked(&st)));
             }
         }
 
         if let Some(priority) = announce_priority {
-            let time_ms = self.packet_timestamp_ms();
-            self.log_queue_ts(DataType::TimeSyncAnnounce, time_ms, &[priority, time_ms])?;
+            let (time_ms, epoch) = self.timesync_announce_stamp();
+            let pkt = self.timesync_packet(DataType::TimeSyncAnnounce, &[priority, time_ms], time_ms, epoch)?;
+            self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))?;
             queued_any = true;
         }
         if let Some((priority, upstream)) = reserve {
@@ -15453,26 +15567,30 @@ impl Router {
                     .collect()
             };
             if !sides.is_empty() {
-                let time_ms = self.packet_timestamp_ms();
+                let (time_ms, epoch) = self.timesync_announce_stamp();
                 self.queue_internal_timesync_to_sides(
                     DataType::TimeSyncAnnounce,
                     &[priority, time_ms],
                     &sides,
+                    time_ms,
+                    epoch,
                 )?;
                 queued_any = true;
             }
         }
         match request {
-            Some((seq, t1_mono_ms, Some(side))) => {
+            Some((seq, t1_mono_ms, Some(side), epoch)) => {
                 self.queue_internal_timesync_to_sides(
                     DataType::TimeSyncRequest,
                     &[seq, t1_mono_ms],
                     &[side],
+                    self.timesync_request_stamp(epoch),
+                    epoch,
                 )?;
                 queued_any = true;
             }
-            Some((seq, t1_mono_ms, None)) => {
-                self.queue_internal_timesync_request(seq, t1_mono_ms, true)?;
+            Some((seq, t1_mono_ms, None, epoch)) => {
+                self.queue_internal_timesync_request(seq, t1_mono_ms, true, epoch)?;
                 queued_any = true;
             }
             None => {}
@@ -15538,6 +15656,7 @@ impl Router {
                             last_sample_mono_ms: now_mono_ms,
                             sample_unix_ms: ann.time_ms,
                             side: src,
+                            epoch: pkt.time_epoch(),
                         },
                     )?;
                     let clock_update = st.clock.prepare_source(
@@ -15558,13 +15677,16 @@ impl Router {
                     } && (!st.v2.has_samples_from(pkt.sender())
                         // UTC replacing unanchored time is taken from the
                         // announce at once, as before.
-                        || (quality.anchored && !st.clock_anchored));
+                        || (quality.anchored && !st.clock_anchored)
+                        // So is a new epoch: the source stepped.
+                        || pkt.time_epoch() > st.epoch.epoch);
                     if should_steer {
                         Self::timesync_steer_remote_locked(
                             &mut st,
                             now_mono_ns,
                             ann.time_ms,
                             quality.anchored,
+                            pkt.time_epoch(),
                         );
                     }
                     poll_after = true;
@@ -15586,6 +15708,19 @@ impl Router {
                             .tracker
                             .as_ref()
                             .and_then(|tracker| tracker.leader(now_mono_ms, has_usable_time));
+                        // A follower in a newer epoch: the leader adopts it,
+                        // a relay passes it upstream.
+                        if matches!(leader, Some(TimeSyncLeader::Local { .. })) {
+                            Self::timesync_leader_note_request_epoch_locked(
+                                &mut st,
+                                pkt.time_epoch(),
+                                pkt.timestamp(),
+                                now_mono_ns,
+                                true,
+                            );
+                        } else if pkt.time_epoch() > st.epoch.epoch {
+                            Self::timesync_note_subtree_epoch_locked(&mut st, pkt.time_epoch(), now_mono_ns);
+                        }
                         let status =
                             Self::timesync_status_locked(&mut st, leader.as_ref(), now_mono_ns);
                         Self::timesync_note_utc_report_locked(
@@ -15603,7 +15738,7 @@ impl Router {
                             now_mono_ns,
                             &status,
                         );
-                        response = Some((seq, t1, t2, t3, src));
+                        response = Some((seq, t1, t2, t3, src, st.epoch.epoch));
                     }
                 }
                 DataType::TimeSyncResponse => {
@@ -15632,13 +15767,16 @@ impl Router {
                             src,
                             now_mono_ns,
                             quality.anchored,
+                            pkt.time_epoch(),
                         );
+                        let epoch = st.epoch.epoch;
                         if steered
                             && let Some(now_unix_ms) = st.disciplined_clock.read_unix_ms(now_mono_ns)
                             && let Some(remote) = st.remote_sources.get_mut(pkt.sender())
                         {
                             remote.last_sample_mono_ms = now_mono_ms;
                             remote.sample_unix_ms = now_unix_ms;
+                            remote.epoch = epoch;
                         }
                     }
                 }
@@ -15646,8 +15784,8 @@ impl Router {
             }
         }
 
-        if let Some((seq, t1, t2, t3, dst)) = response {
-            self.queue_internal_timesync_response(seq, t1, t2, t3, dst, called_from_queue)?;
+        if let Some((seq, t1, t2, t3, dst, epoch)) = response {
+            self.queue_internal_timesync_response(seq, t1, t2, t3, dst, called_from_queue, epoch)?;
         }
         if poll_after {
             let _ = crate::memory_admission::allow_drain(self.poll_timesync())?;
@@ -15667,6 +15805,8 @@ impl Router {
     pub fn new_with_clock(cfg: RouterConfig, clock: Box<dyn Clock + Send + Sync>) -> Self {
         #[cfg(feature = "timesync")]
         let timesync_cfg = cfg.timesync_config();
+        #[cfg(feature = "timesync")]
+        let timesync_epoch = Arc::new(core::sync::atomic::AtomicU16::new(0));
         #[cfg(feature = "discovery")]
         let preferred_discovery_master = cfg.preferred_discovery_master.clone();
         let memory = cfg.memory_config();
@@ -15813,10 +15953,15 @@ impl Router {
             active_queued_tx: core::sync::atomic::AtomicUsize::new(0),
             clock: Arc::from(clock),
             #[cfg(feature = "timesync")]
-            timesync: local_services_enabled
-                .then(|| Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg)))),
+            timesync: local_services_enabled.then(|| {
+                Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg, timesync_epoch.clone())))
+            }),
             #[cfg(feature = "timesync")]
             timesync_tx_arm: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "timesync")]
+            timesync_epoch,
+            #[cfg(feature = "timesync")]
+            timesync_heard: Default::default(),
         }
     }
 
@@ -17363,10 +17508,11 @@ impl Router {
     /// The packet is cached locally and sent as normal user data. Routers that have seen or enabled
     /// this variable update their local cache internally; applications do not need to register a
     /// managed-variable endpoint.
-    pub fn set_network_variable(&self, pkt: Packet) -> TelemetryResult<()> {
+    pub fn set_network_variable(&self, mut pkt: Packet) -> TelemetryResult<()> {
         if is_internal_control_type(pkt.data_type()) {
             return Err(TelemetryError::InvalidType);
         }
+        self.stamp_origin_epoch(&mut pkt);
         pkt.validate()?;
         let ty = pkt.data_type();
         {
@@ -20362,6 +20508,16 @@ impl Router {
                     }
                 }
             }
+            // A packet from a newer time-base epoch: re-anchor promptly.
+            #[cfg(feature = "timesync")]
+            match &item.data {
+                RouterItem::Packet(pkt) => self.timesync_note_rx_epoch(pkt.time_epoch(), pkt.timestamp()),
+                RouterItem::Packed(_) => {
+                    if let Some(env) = packed_routing.as_ref() {
+                        self.timesync_note_rx_epoch(env.time_epoch, env.timestamp_ms);
+                    }
+                }
+            }
             match &item.data {
                 RouterItem::Packet(pkt) => {
                     if (is_reliable_type(pkt.data_type()) || !pkt.wire_target_senders().is_empty())
@@ -22017,6 +22173,22 @@ impl Router {
         self.rx_item(&item, false)
     }
 
+    /// Stamps this router's network time-base epoch on a packet it originates
+    /// (its own sender, epoch never stated), so receivers order its stamps
+    /// across steps. Packets carrying another sender or a stated epoch (0
+    /// included, see [`Packet::with_time_epoch`]) keep theirs.
+    #[inline]
+    pub(crate) fn stamp_origin_epoch(&self, pkt: &mut Packet) {
+        #[cfg(feature = "timesync")]
+        {
+            if !pkt.time_epoch_stated() && pkt.sender() == self.sender_arc().as_ref() {
+                pkt.set_time_epoch(self.network_time_epoch());
+            }
+        }
+        #[cfg(not(feature = "timesync"))]
+        let _ = pkt;
+    }
+
     fn ensure_application_origin_allowed(&self) -> TelemetryResult<()> {
         if self.cfg.role.local_services() {
             Ok(())
@@ -22051,8 +22223,9 @@ impl Router {
     /// The router delivers locally where appropriate and forwards toward eligible sides. If called
     /// from inside a side TX callback, the packet is queued instead of being sent re-entrantly.
     #[inline]
-    pub fn tx(&self, pkt: Packet) -> TelemetryResult<()> {
+    pub fn tx(&self, mut pkt: Packet) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
+        self.stamp_origin_epoch(&mut pkt);
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
@@ -22086,8 +22259,9 @@ impl Router {
     /// Discovery/time-sync maintenance stays on the worker calling `periodic`.
     /// Enqueueing must not serialize topology on a producer's small stack.
     #[inline]
-    pub fn tx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
+    pub fn tx_queue(&self, mut pkt: Packet) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
+        self.stamp_origin_epoch(&mut pkt);
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
@@ -22099,8 +22273,9 @@ impl Router {
     /// Local handlers and transport callbacks run later on a queue worker.
     /// A caller that needs to retry must retain its own packet copy.
     #[cfg(feature = "std")]
-    pub fn try_tx_queue(&self, pkt: Packet) -> TelemetryResult<()> {
+    pub fn try_tx_queue(&self, mut pkt: Packet) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
+        self.stamp_origin_epoch(&mut pkt);
         let data = RouterItem::Packet(pkt);
         let (ty, priority) = Self::item_type_priority(&data)?;
         let mut state = self
@@ -22152,9 +22327,12 @@ impl Router {
             let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
             queued = self.side_tx_active();
         }
-        let timestamp = timestamp.unwrap_or_else(|| self.packet_timestamp_ms());
+        let (timestamp, epoch) = match timestamp {
+            Some(timestamp) => (timestamp, self.packet_epoch()),
+            None => self.packet_stamp(),
+        };
         log_raw(self.sender_arc(), ty, data, timestamp, |pkt| {
-            let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
+            let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt.with_time_epoch(epoch)));
             if queued {
                 self.tx_queue_item(item)
             } else {
@@ -23532,6 +23710,8 @@ mod e2e_backpressure;
 #[cfg(feature = "timesync")]
 #[path = "router_timesync.rs"]
 mod timesync_v2;
+#[cfg(all(test, feature = "timesync"))]
+pub(crate) use timesync_v2::seed_timesync_nonce;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "timesync"))]
 #[path = "tests/peer_record_footprint.rs"]
 mod peer_record_footprint;

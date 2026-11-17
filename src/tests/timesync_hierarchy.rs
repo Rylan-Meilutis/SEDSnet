@@ -48,6 +48,7 @@ fn cfg(role: TimeSyncRole, priority: u64) -> TimeSyncConfig {
         request_interval_ms: 1_000,
         consumer_promotion_enabled: true,
         max_slew_ppm: 50_000,
+        ..Default::default()
     }
 }
 

@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::timesync::{
-    TIMESYNC_UTC_REPORT, encode_utc_report_word,
+    NetworkStampAge, TIMESYNC_UTC_REPORT, TimeSyncLastStep, TimeSyncStepReason, encode_utc_report_word,
     TIMESYNC_SEQ_COUNTER_MASK, TimeSyncStatus,
     decode_v2_receive_word, decode_v2_transmit_word, encode_v2_receive_word,
     encode_v2_transmit_word,
@@ -39,6 +39,230 @@ pub(super) const FAST_REQUEST_MIN_MS: u64 = 250;
 const ACQUIRE_STEP_NS: u64 = 50_000_000;
 /// Source error assumed for a responder that reports an unknown bound.
 const UNKNOWN_SOURCE_ERROR_NS: u64 = 1_000_000_000;
+/// Epoch transitions remembered for translating older stamps.
+const EPOCH_LINKS: usize = 4;
+/// Announces sent at [`EPOCH_ANNOUNCE_BURST_MS`] after an epoch change.
+const EPOCH_ANNOUNCE_BURST: u8 = 4;
+/// Interval of the announce burst after an epoch change, ms.
+pub(super) const EPOCH_ANNOUNCE_BURST_MS: u64 = 150;
+
+/// One remembered epoch transition: a stamp taken in `from` reads `delta_ns`
+/// later in `to`'s time base.
+#[derive(Debug, Clone, Copy, Default)]
+struct EpochLink {
+    from: u16,
+    to: u16,
+    delta_ns: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StepRecord {
+    delta_ns: i64,
+    reason: TimeSyncStepReason,
+    from_epoch: u16,
+    to_epoch: u16,
+    at_mono_ns: u64,
+}
+
+/// Network time-base epoch of this node.
+///
+/// An epoch names one continuous time base. A node never steps its clock
+/// backward without moving to a newer epoch, and never moves to an older one,
+/// so one sender's `(epoch, timestamp)` stamps order its packets across every
+/// step. A leading node starts a new epoch on each step of its own clock; a
+/// follower adopts its source's epoch (stepping to the source at once) and
+/// holds its clock while the source is in an older epoch; the leader adopts
+/// a newer epoch its followers carry in their requests.
+#[derive(Debug, Clone)]
+pub(super) struct EpochState {
+    pub(super) epoch: u16,
+    /// Newest epoch seen on any received packet.
+    pub(super) newest_seen: u16,
+    /// Monotonic ns at which this node first heard of an epoch newer than its
+    /// own (cleared once it reaches it): bounds the age of newer-epoch stamps.
+    newer_since_ns: Option<u64>,
+    /// Newest epoch carried by requests this node served (its followers).
+    subtree: u16,
+    /// This node served a request carrying its own current epoch: followers
+    /// share its time base (a leader that has never been followed in its
+    /// epoch, e.g. a restarted station, may join the network's instead).
+    followed: bool,
+    links: [EpochLink; EPOCH_LINKS],
+    links_head: u8,
+    last_step: Option<StepRecord>,
+    steps: u32,
+    /// The elected source is in an older epoch: the clock is held.
+    pub(super) holding: bool,
+    /// A local source may step a leading clock.
+    pub(super) steps_allowed: bool,
+    /// Announces still to send at the short burst interval after an epoch
+    /// change, so lossy links learn of it within a fraction of a second.
+    pub(super) announce_burst: u8,
+    /// Mirror of `epoch` read without the runtime lock when stamping packets.
+    shared: Arc<core::sync::atomic::AtomicU16>,
+}
+
+impl EpochState {
+    pub(super) fn new(shared: Arc<core::sync::atomic::AtomicU16>) -> Self {
+        Self {
+            epoch: shared.load(core::sync::atomic::Ordering::Acquire),
+            newest_seen: 0,
+            newer_since_ns: None,
+            subtree: 0,
+            followed: false,
+            links: [EpochLink::default(); EPOCH_LINKS],
+            links_head: 0,
+            last_step: None,
+            steps: 0,
+            holding: false,
+            steps_allowed: true,
+            announce_burst: 0,
+            shared,
+        }
+    }
+
+    /// Epoch this node's requests carry: its own, or a newer one a follower
+    /// carried (so the leader learns of it through relays).
+    fn request_epoch(&self) -> u16 {
+        self.epoch.max(self.subtree)
+    }
+
+    /// Notes an epoch heard from the network (`true` when it is newer than
+    /// every epoch heard before).
+    pub(super) fn see(&mut self, epoch: u16, now_ns: u64) -> bool {
+        if epoch > self.epoch && self.newer_since_ns.is_none() {
+            self.newer_since_ns = Some(now_ns);
+        }
+        let newer = epoch > self.newest_seen;
+        self.newest_seen = self.newest_seen.max(epoch);
+        newer
+    }
+
+    /// Milliseconds since this node first heard of an epoch newer than its own.
+    fn newer_since_ms(&self, now_ns: u64) -> u64 {
+        self.newer_since_ns.map_or(0, |at| now_ns.saturating_sub(at) / 1_000_000)
+    }
+
+    fn record(&mut self, to: u16, delta_ns: i64, reason: TimeSyncStepReason, now_ns: u64) {
+        let from = self.epoch;
+        if to != from {
+            self.announce_burst = EPOCH_ANNOUNCE_BURST;
+            let head = usize::from(self.links_head);
+            self.links[head] = EpochLink { from, to, delta_ns };
+            self.links_head = ((head + 1) % EPOCH_LINKS) as u8;
+            self.epoch = to;
+            self.followed = false;
+            self.newest_seen = self.newest_seen.max(to);
+            self.shared.store(to, core::sync::atomic::Ordering::Release);
+            if self.newest_seen <= to {
+                self.newer_since_ns = None;
+            }
+        }
+        self.steps = self.steps.saturating_add(1);
+        self.last_step = Some(StepRecord { delta_ns, reason, from_epoch: from, to_epoch: to, at_mono_ns: now_ns });
+    }
+
+    /// Next epoch for a step of this node's own clock: newer than every epoch
+    /// it has seen, so no other time base can already carry the number.
+    fn next_epoch(&self) -> u16 {
+        self.epoch.max(self.newest_seen).max(self.subtree).saturating_add(1).min(crate::packet::MAX_TIME_EPOCH)
+    }
+
+    /// Translates a stamp taken in `epoch` into this node's current time base:
+    /// the sum of remembered step deltas from that epoch to now.
+    fn translate(&self, epoch: u16) -> Option<i64> {
+        let mut at = epoch;
+        let mut total = 0i64;
+        for _ in 0..=EPOCH_LINKS {
+            if at == self.epoch {
+                return Some(total);
+            }
+            let link = self.links.iter().find(|l| l.from == at && l.to != l.from && l.to > at)?;
+            total = total.saturating_add(link.delta_ns);
+            at = link.to;
+        }
+        None
+    }
+
+    fn last_step(&self, now_ns: u64) -> Option<TimeSyncLastStep> {
+        self.last_step.map(|r| TimeSyncLastStep {
+            delta_ns: r.delta_ns,
+            reason: r.reason,
+            from_epoch: r.from_epoch,
+            to_epoch: r.to_epoch,
+            age_ms: now_ns.saturating_sub(r.at_mono_ns) / 1_000_000,
+        })
+    }
+}
+
+/// The newest plausible-UTC `(epoch, timestamp)` heard on any received
+/// packet and the local monotonic instant it was heard, kept under its own small
+/// lock, never the time sync runtime's. It stands in for network time only while this node has none of
+/// its own (it cannot sync: no reachable source, a broken exchange), so command
+/// windows stay judgeable from the stamps the station sends: a lower bound of
+/// network time advanced by local elapsed time, re-anchored (either direction)
+/// by a newer epoch and never moved back inside one.
+pub(super) struct HeardStamp(RouterMutex<Option<(u16, u64, u64)>>);
+
+impl core::fmt::Debug for HeardStamp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("HeardStamp")
+    }
+}
+
+impl Default for HeardStamp {
+    fn default() -> Self {
+        Self(RouterMutex::new(None))
+    }
+}
+
+impl HeardStamp {
+    fn read(&self, now_mono_ms: u64) -> Option<(u16, u64)> {
+        self.0
+            .lock()
+            .map(|(epoch, ms, at)| (epoch, ms.saturating_add(now_mono_ms.saturating_sub(at))))
+    }
+
+    fn note(&self, epoch: u16, ms: u64, now_mono_ms: u64) {
+        if ms < TIMESYNC_UTC_FLOOR_MS {
+            return;
+        }
+        let mut heard = self.0.lock();
+        let current = heard.map(|(e, m, at)| (e, m.saturating_add(now_mono_ms.saturating_sub(at))));
+        if current.is_none_or(|cur| (epoch, ms) > cur) {
+            *heard = Some((epoch, ms, now_mono_ms));
+        }
+    }
+}
+
+/// Nonces of time sync packets: a counter cycling through 128..=16383 (always
+/// two ULEB128 bytes on the wire), unique across 16256 consecutive packets.
+/// (Never one byte: one byte shorter time sync frames change which of an
+/// announce and a response reaches a relay first over a radio, and a relay
+/// that adopts a step from the announce lands a transit behind; see the
+/// seeded radio sweeps in the radio sim tests.)
+static TIMESYNC_NONCE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// Test only: restart the time sync nonce sequence at `seed`.
+#[cfg(test)]
+pub(crate) fn seed_timesync_nonce(seed: u16) {
+    TIMESYNC_NONCE.store(seed, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn next_timesync_nonce() -> u16 {
+    TIMESYNC_NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 16_256 + 128
+}
+
+/// What a follower did with a target from its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Follow {
+    /// Disciplined or slewed as usual.
+    Steered,
+    /// Stepped (new epoch, or re-anchored forward).
+    Stepped,
+    /// Clock left alone (source in an older epoch, or diverged ahead).
+    Held,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Exchange {
@@ -287,6 +511,27 @@ impl TimeSyncV2 {
                 head
             });
         self.served[slot] = Served { used: true, counter, tag, t3_net_us };
+    }
+
+    /// Forgets every exchange and transmit stamp: they were taken in a time
+    /// base that just changed (a step or a new epoch on either end).
+    pub(super) fn clear_exchanges(&mut self) {
+        self.exchanges = Default::default();
+        self.served = Default::default();
+        self.tx_marks = Default::default();
+        #[cfg(feature = "std")]
+        {
+            self.rx_marks = Default::default();
+        }
+    }
+
+    /// Restarts acquisition after this node's time base changed: the samples
+    /// describe the old base and lock must be proven again.
+    pub(super) fn restart_acquisition(&mut self) {
+        self.discipline.restart_keep_frequency();
+        self.clear_exchanges();
+        self.locked = false;
+        self.ever_locked = false;
     }
 
     fn push_exchange(&mut self, exchange: Exchange) {
@@ -691,8 +936,8 @@ impl Router {
         words
     }
 
-    /// Handles a response from the elected source. Returns `true` when the
-    /// clock was steered.
+    /// Handles a response from the elected source, whose packet carries
+    /// `src_epoch`. Returns `true` when the clock was steered.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn timesync_handle_response_locked(
         st: &mut TimeSyncRuntime,
@@ -701,6 +946,7 @@ impl Router {
         side: Option<RouterSideId>,
         now_mono_ns: u64,
         anchored: bool,
+        src_epoch: u16,
     ) -> bool {
         let (seq, t1, t2, t3) = words;
         if st.v2.source.as_deref() != Some(sender) {
@@ -711,6 +957,29 @@ impl Router {
         }
         let tag = timesync_sender_tag(sender);
         let (t4_ns, response_len) = st.v2.take_rx(tag, true, seq, t1).unwrap_or((st.v2.rx_instant(now_mono_ns), 0));
+        if src_epoch != st.epoch.epoch {
+            // Stamps of another time base never form a sample. A newer epoch
+            // is adopted at the responder's receive stamp of this request: a
+            // lower bound of its time now, so the exchanges that follow only
+            // ever move the clock forward within the new epoch.
+            let (t2_us, _, _) = decode_v2_receive_word(t2);
+            let target = (t2_us as i64).saturating_mul(1_000);
+            let elapsed = now_mono_ns.saturating_sub(t4_ns).min(i64::MAX as u64) as i64;
+            let floor_ns = TIMESYNC_UTC_FLOOR_MS as i64 * 1_000_000;
+            if src_epoch > st.epoch.epoch && (target >= floor_ns || !st.clock_anchored) {
+                let target = target.saturating_add(elapsed);
+                let followed = Self::timesync_follow_locked(st, now_mono_ns, target, None, src_epoch, None, true);
+                if followed != Follow::Held {
+                    st.clock_anchored = anchored && target >= floor_ns;
+                    return true;
+                }
+            } else {
+                st.epoch.holding = src_epoch < st.epoch.epoch;
+            }
+            return false;
+        }
+        // The source is in this node's epoch: nothing to hold for.
+        st.epoch.holding = false;
         // The t1 cookie is the request's monotonic ms (unless it carried a UTC
         // report): the round trip is known even when the response came too
         // late to match an exchange slot.
@@ -802,11 +1071,11 @@ impl Router {
         if !st.v2.discipline.offer(sample) {
             return false;
         }
-        Self::timesync_discipline_steer_locked(st, now_mono_ns, anchored);
+        Self::timesync_discipline_steer_locked(st, now_mono_ns, anchored, src_epoch);
         true
     }
 
-    fn timesync_discipline_steer_locked(st: &mut TimeSyncRuntime, now_mono_ns: u64, anchored: bool) {
+    fn timesync_discipline_steer_locked(st: &mut TimeSyncRuntime, now_mono_ns: u64, anchored: bool, src_epoch: u16) {
         let Some(target) = st.v2.discipline.target(now_mono_ns) else {
             return;
         };
@@ -831,9 +1100,419 @@ impl Router {
                     || (st.v2.discipline.len() <= 1 && e > 1_000_000_000)
             }
         };
-        st.disciplined_clock
-            .discipline_ns(now_mono_ns, target.net_ns, target.rate_ppb, allow_step);
-        st.clock_anchored = anchored;
+        // A forward error beyond the step threshold steps; one as far ahead,
+        // beyond what the exchange itself may be off, names a newer epoch.
+        let bound = st.v2.discipline.error_bound_ns(now_mono_ns);
+        let followed = Self::timesync_follow_locked(
+            st,
+            now_mono_ns,
+            target.net_ns,
+            Some(target.rate_ppb),
+            src_epoch,
+            bound,
+            allow_step,
+        );
+        if followed != Follow::Held {
+            st.clock_anchored = anchored;
+        }
+    }
+
+    /// Step threshold of the active configuration, ns.
+    pub(super) fn timesync_step_threshold_ns(st: &TimeSyncRuntime) -> u64 {
+        st.cfg.map_or(
+            crate::timesync::TIMESYNC_DEFAULT_STEP_THRESHOLD_MS * 1_000_000,
+            |cfg| cfg.step_threshold_ns(),
+        )
+    }
+
+    /// Records an epoch change (or a step within the epoch when `to` is the
+    /// current epoch) and invalidates every exchange stamp of the old base.
+    /// The next announce and request go out at once.
+    pub(super) fn timesync_epoch_changed_locked(
+        st: &mut TimeSyncRuntime,
+        to: u16,
+        delta_ns: i64,
+        reason: TimeSyncStepReason,
+        now_ns: u64,
+    ) {
+        st.epoch.record(to, delta_ns, reason, now_ns);
+        st.v2.clear_exchanges();
+        st.pending_request = None;
+        st.next_announce_mono_ms = 0;
+        st.next_request_mono_ms = 0;
+    }
+
+    /// Steps this (leading) node's own clock to `target_ns` and starts a new
+    /// epoch, so followers re-anchor at once and every node can order stamps
+    /// across the step.
+    pub(super) fn timesync_local_step_locked(
+        st: &mut TimeSyncRuntime,
+        now_ns: u64,
+        target_ns: i64,
+        reason: TimeSyncStepReason,
+    ) {
+        let delta = st
+            .disciplined_clock
+            .read_unix_ns_at(now_ns)
+            .map_or(0, |current| target_ns.saturating_sub(current));
+        let rate = st.disciplined_clock.rate_ppb();
+        st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, true);
+        let next = st.epoch.next_epoch();
+        Self::timesync_epoch_changed_locked(st, next, delta, reason, now_ns);
+        st.v2.restart_acquisition();
+    }
+
+    /// Applies a local time source reading to this node's own clock while it
+    /// does not follow a remote: a step and a new epoch beyond the step
+    /// threshold (steps allowed), otherwise a slew at the reference rate.
+    pub(super) fn timesync_local_steer_locked(st: &mut TimeSyncRuntime, now_ns: u64, target_ns: i64) {
+        let threshold = Self::timesync_step_threshold_ns(st);
+        let current = st.disciplined_clock.read_unix_ns_at(now_ns);
+        match current {
+            Some(current)
+                if st.epoch.steps_allowed
+                    && target_ns.saturating_sub(current).unsigned_abs() > threshold =>
+            {
+                Self::timesync_local_step_locked(st, now_ns, target_ns, TimeSyncStepReason::LocalSource);
+            }
+            _ => {
+                let ppm = st.cfg.map_or(
+                    crate::timesync::TIMESYNC_DEFAULT_REFERENCE_SLEW_PPM,
+                    |cfg| cfg.reference_slew_ppm,
+                );
+                st.disciplined_clock.steer_unix_ns_at_rate(now_ns, target_ns, ppm);
+            }
+        }
+    }
+
+    /// Applies a target from the elected source, whose packets carry
+    /// `src_epoch`.
+    ///
+    /// - Source in a newer epoch: adopt it, step to the target when it is off
+    ///   by more than the acquisition step, and prove lock again.
+    /// - Source in an older epoch: hold the clock (the source adopts this
+    ///   node's epoch from its requests).
+    /// - Same epoch: more than the step threshold behind, step forward; more
+    ///   than the threshold (plus the target's own error bound, when known)
+    ///   ahead, announce a newer epoch upstream and hold (before this node
+    ///   first locked in the epoch it steps back instead, as when acquiring:
+    ///   its stamps are still marked unsynced); otherwise
+    ///   discipline (`rate_ppb`) or slew as before (`allow_step` permits the
+    ///   usual acquisition step).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn timesync_follow_locked(
+        st: &mut TimeSyncRuntime,
+        now_ns: u64,
+        target_ns: i64,
+        rate_ppb: Option<i64>,
+        src_epoch: u16,
+        target_bound_ns: Option<u64>,
+        allow_step: bool,
+    ) -> Follow {
+        let own = st.epoch.epoch;
+        if src_epoch < own {
+            st.epoch.holding = true;
+            return Follow::Held;
+        }
+        st.epoch.holding = false;
+        let threshold = Self::timesync_step_threshold_ns(st);
+        let current = st.disciplined_clock.read_unix_ns_at(now_ns);
+        let error = current.map(|c| target_ns.saturating_sub(c));
+        let rate = rate_ppb.unwrap_or_else(|| st.disciplined_clock.rate_ppb());
+        if src_epoch > own {
+            let step = error.is_none_or(|e| e.unsigned_abs() > ACQUIRE_STEP_NS);
+            if step {
+                st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, true);
+            } else if rate_ppb.is_some() {
+                st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, false);
+            } else {
+                st.disciplined_clock.steer_unix_ns(now_ns, target_ns);
+            }
+            let delta = if step { error.unwrap_or(0) } else { 0 };
+            Self::timesync_epoch_changed_locked(st, src_epoch, delta, TimeSyncStepReason::SourceEpoch, now_ns);
+            st.v2.restart_acquisition();
+            return if step { Follow::Stepped } else { Follow::Steered };
+        }
+        // Before it first locks in this epoch a node's stamps are marked
+        // unsynced, and it may still step either way (as when acquiring).
+        let locked_before = st.v2.ever_locked;
+        match error {
+            Some(e)
+                if e.unsigned_abs() > threshold
+                    && (e > 0 || (!locked_before && target_bound_ns.is_some())) =>
+            {
+                // The samples describe the source, which did not change: only
+                // this node's clock (and the stamps it served) moved.
+                st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, true);
+                Self::timesync_epoch_changed_locked(st, own, e, TimeSyncStepReason::Resync, now_ns);
+                Follow::Stepped
+            }
+            Some(e)
+                if e < 0
+                    && locked_before
+                    && target_bound_ns
+                        .is_some_and(|bound| e.unsigned_abs() > threshold.saturating_add(bound)) =>
+            {
+                // Stepping back inside this epoch would let this node's later
+                // stamps sort before its earlier ones. Name a newer epoch
+                // instead; the source adopts it from the next request.
+                let next = st.epoch.next_epoch();
+                Self::timesync_epoch_changed_locked(st, next, 0, TimeSyncStepReason::Diverged, now_ns);
+                st.epoch.holding = true;
+                Follow::Held
+            }
+            _ => {
+                match rate_ppb {
+                    Some(rate) => st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, allow_step),
+                    None if allow_step => {
+                        let rate = st.disciplined_clock.rate_ppb();
+                        st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, true);
+                    }
+                    None => st.disciplined_clock.steer_unix_ns(now_ns, target_ns),
+                }
+                Follow::Steered
+            }
+        }
+    }
+
+    /// A leading node serving a request that carries a newer epoch adopts it:
+    /// the follower's time base is the network's. When the follower's stamp
+    /// disagrees with this clock by more than the step threshold the bases
+    /// differ, and a still newer epoch names this node's base.
+    ///
+    /// `fresh_stamp` marks a time sync request, whose stamp is taken as it is
+    /// sent: only such a stamp may serve as the network's time. While steps
+    /// are inhibited ([`Router::set_timesync_steps_allowed`]) a leader that
+    /// disagrees with a fresh, plausible (UTC) request stamp joins the
+    /// network's time base instead of making every follower step to its own:
+    /// the network stays continuous (a leader restarted while steps are inhibited), and the
+    /// leader's local sources then correct it under the usual policy (slewed
+    /// while inhibited, stepped once steps are allowed again). Any other packet
+    /// in a newer epoch is adopted only when its stamp agrees with this clock.
+    pub(super) fn timesync_leader_note_request_epoch_locked(
+        st: &mut TimeSyncRuntime,
+        req_epoch: u16,
+        req_stamp_ms: u64,
+        now_ns: u64,
+        fresh_stamp: bool,
+    ) {
+        st.epoch.see(req_epoch, now_ns);
+        if req_epoch <= st.epoch.epoch {
+            if fresh_stamp && req_epoch == st.epoch.epoch {
+                st.epoch.followed = true;
+            }
+            return;
+        }
+        let threshold_ms = Self::timesync_step_threshold_ns(st) / 1_000_000;
+        let current = st.disciplined_clock.read_unix_ms(now_ns);
+        let agrees = current.is_some_and(|now_ms| now_ms.abs_diff(req_stamp_ms) <= threshold_ms);
+        if agrees {
+            Self::timesync_epoch_changed_locked(st, req_epoch, 0, TimeSyncStepReason::Renamed, now_ns);
+            return;
+        }
+        if !fresh_stamp {
+            // A data packet's stamp may have waited in queues: never act on
+            // a disagreement it shows. The next request settles it.
+            return;
+        }
+        // Only a leader no follower shares a base with yet joins: one that is
+        // followed is the reference, and a follower in a newer epoch on
+        // another base (one that named a divergence) steps back onto it.
+        if !st.epoch.steps_allowed && !st.epoch.followed && req_stamp_ms >= TIMESYNC_UTC_FLOOR_MS {
+            let target_ns = (i128::from(req_stamp_ms) * 1_000_000).min(i128::from(i64::MAX)) as i64;
+            let delta = current.map_or(0, |c| target_ns.saturating_sub((i128::from(c) * 1_000_000) as i64));
+            let rate = st.disciplined_clock.rate_ppb();
+            st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, true);
+            st.clock_anchored = true;
+            Self::timesync_epoch_changed_locked(st, req_epoch, delta, TimeSyncStepReason::Joined, now_ns);
+            st.v2.restart_acquisition();
+            return;
+        }
+        // A different base: a still newer epoch names this node's, and the
+        // followers step onto it.
+        Self::timesync_epoch_changed_locked(st, req_epoch.saturating_add(1).min(crate::packet::MAX_TIME_EPOCH), 0, TimeSyncStepReason::Renamed, now_ns);
+    }
+
+    /// A relay serving a request that carries a newer epoch passes it upstream
+    /// in its own requests.
+    pub(super) fn timesync_note_subtree_epoch_locked(st: &mut TimeSyncRuntime, req_epoch: u16, now_ns: u64) {
+        st.epoch.subtree = st.epoch.subtree.max(req_epoch);
+        st.epoch.see(req_epoch, now_ns);
+        if req_epoch > st.epoch.epoch {
+            st.next_request_mono_ms = 0;
+        }
+    }
+
+    /// Epoch this node's requests carry.
+    pub(super) fn timesync_request_epoch_locked(st: &TimeSyncRuntime) -> u16 {
+        st.epoch.request_epoch()
+    }
+
+    /// Interval to the next announce: short while an epoch change is still
+    /// being announced in a burst.
+    pub(super) fn timesync_next_announce_interval_locked(st: &mut TimeSyncRuntime, interval_ms: u64) -> u64 {
+        if st.epoch.announce_burst > 0 {
+            st.epoch.announce_burst -= 1;
+            interval_ms.min(EPOCH_ANNOUNCE_BURST_MS)
+        } else {
+            interval_ms
+        }
+    }
+
+    /// Notes the epoch of any received packet: a newer one means this node's
+    /// time base is behind the network's, so it asks its source at once.
+    ///
+    /// A leading node (a restarted station, epoch 0) adopts a newer epoch
+    /// whose stamp agrees with its clock at once, so its own writes order
+    /// after everything the network already holds from the first packet it
+    /// hears rather than from the first request it serves.
+    pub(super) fn timesync_note_rx_epoch(&self, epoch: u16, timestamp_ms: u64) {
+        self.timesync_heard.note(epoch, timestamp_ms, self.monotonic_now_ms());
+        if epoch == 0 || epoch <= self.timesync_epoch.load(core::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let Some(runtime) = self.timesync.as_ref() else {
+            return;
+        };
+        let now_ms = self.monotonic_now_ms();
+        let now_ns = self.monotonic_now_ns();
+        let mut st = runtime.lock();
+        if st.epoch.see(epoch, now_ns) {
+            st.next_request_mono_ms = 0;
+        }
+        if st.cfg.is_some() && !Self::timesync_following_remote_locked(&st, now_ms, now_ns) {
+            Self::timesync_leader_note_request_epoch_locked(&mut st, epoch, timestamp_ms, now_ns, false);
+        }
+    }
+
+    /// Raises this node's network time-base epoch to at least `min_epoch`
+    /// without changing its clock, e.g. at boot from an epoch persisted with
+    /// an ordering mark (a replay floor stored as `(epoch, timestamp)`).
+    ///
+    /// A follower raised above its source holds until the source adopts the
+    /// epoch from its requests (or names a newer one when the clocks disagree),
+    /// so the network's epoch never falls below an epoch any node remembers,
+    /// even after every node restarted. Returns the epoch after the call.
+    pub fn raise_network_time_epoch(&self, min_epoch: u16) -> u16 {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return 0;
+        };
+        let now_ns = self.monotonic_now_ns();
+        let mut st = runtime.lock();
+        let min_epoch = min_epoch.min(crate::packet::MAX_TIME_EPOCH);
+        if min_epoch > st.epoch.epoch {
+            Self::timesync_epoch_changed_locked(&mut st, min_epoch, 0, TimeSyncStepReason::Raised, now_ns);
+        }
+        st.epoch.epoch
+    }
+
+    /// Current network time-base epoch (0 before any step was seen).
+    pub fn network_time_epoch(&self) -> u16 {
+        self.timesync_epoch.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Current network time with its epoch, read together: a stamp to compare
+    /// with [`Router::network_stamp_age_ms`] or to put on a packet built by
+    /// the application ([`Packet::with_time_epoch`]).
+    pub fn network_time_ms_with_epoch(&self) -> Option<(u64, u16)> {
+        for _ in 0..2 {
+            let before = self.network_time_epoch();
+            let ms = self.network_time_ms()?;
+            if self.network_time_epoch() == before {
+                return Some((ms, before));
+            }
+        }
+        let epoch = self.network_time_epoch();
+        self.network_time_ms().map(|ms| (ms, epoch))
+    }
+
+    /// Age of a `(time_epoch, timestamp)` stamp against this node's network
+    /// time, translated across the recent steps this node remembers. Use it
+    /// for freshness checks instead of comparing a raw timestamp with
+    /// `network_time_ms()`: a command stamped just before a 4 h step back is
+    /// seconds old, not 4 h in the future, and a copy stamped before an older
+    /// step is reported as [`NetworkStampAge::OlderEpoch`].
+    pub fn network_stamp_age_ms(&self, epoch: u16, timestamp_ms: u64) -> NetworkStampAge {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return NetworkStampAge::NoTime;
+        };
+        // Our own time judges a UTC stamp only when it reads UTC itself (a
+        // follower whose source has no absolute time holds uptime-based time).
+        let own = self
+            .network_time_ms()
+            .filter(|ms| *ms >= TIMESYNC_UTC_FLOOR_MS || timestamp_ms < TIMESYNC_UTC_FLOOR_MS);
+        let Some(now_ms) = own else {
+            // No usable network time of our own (never synced, or no source
+            // can be reached): judge against the newest stamp heard.
+            return match self.timesync_heard.read(self.monotonic_now_ms()) {
+                Some((heard_epoch, heard_ms)) if epoch == heard_epoch => {
+                    NetworkStampAge::Age((i128::from(heard_ms) - i128::from(timestamp_ms)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
+                }
+                Some((heard_epoch, _)) if epoch > heard_epoch => NetworkStampAge::NewerEpoch { since_ms: 0 },
+                Some(_) => NetworkStampAge::OlderEpoch,
+                None => NetworkStampAge::NoTime,
+            };
+        };
+        let now_ns = self.monotonic_now_ns();
+        let st = runtime.lock();
+        if epoch > st.epoch.epoch {
+            let since_ms = if epoch > st.epoch.newest_seen { 0 } else { st.epoch.newer_since_ms(now_ns) };
+            return NetworkStampAge::NewerEpoch { since_ms };
+        }
+        match st.epoch.translate(epoch) {
+            Some(delta_ns) => {
+                let stamp = i128::from(timestamp_ms) + i128::from(delta_ns / 1_000_000);
+                NetworkStampAge::Age((i128::from(now_ms) - stamp).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
+            }
+            None => NetworkStampAge::OlderEpoch,
+        }
+    }
+
+    /// Whether a `(time_epoch, timestamp)` stamp is inside a validity window
+    /// of this node's network time: at most `max_age_ms` old and at most
+    /// `max_ahead_ms` ahead, judged by [`Router::network_stamp_age_ms`] and
+    /// [`NetworkStampAge::is_fresh`]. This is the check for command-validity
+    /// windows: it never compares a stamp with this node's clock across a
+    /// step, accepts a command stamped in a newer epoch only while this node
+    /// is still re-anchoring onto it, and refuses stamps from before steps it
+    /// no longer remembers, and everything while it has no network time.
+    pub fn network_stamp_is_fresh(&self, epoch: u16, timestamp_ms: u64, max_age_ms: u64, max_ahead_ms: u64) -> bool {
+        self.network_stamp_age_ms(epoch, timestamp_ms).is_fresh(max_age_ms, max_ahead_ms)
+    }
+
+    /// Allows or inhibits steps of this node's clock by local time sources
+    /// (operator/host time, GPS) and [`Router::step_local_network_time_ns`].
+    /// Inhibited, such corrections are slewed at the reference rate however
+    /// large; followers still follow their source's steps. Inhibit while the
+    /// application needs a leading clock to stay continuous.
+    pub fn set_timesync_steps_allowed(&self, allowed: bool) {
+        if let Some(runtime) = self.timesync.as_ref() {
+            runtime.lock().epoch.steps_allowed = allowed;
+        }
+    }
+
+    /// Changes the step threshold and/or reference slew rate of the active
+    /// configuration in place, keeping all time sync state (unlike
+    /// [`Router::set_timesync_config`]). `None` keeps a value. Returns `false`
+    /// when time sync is not configured.
+    pub fn set_timesync_step_policy(&self, step_threshold_ms: Option<u64>, reference_slew_ppm: Option<u32>) -> bool {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return false;
+        };
+        let mut st = runtime.lock();
+        let Some(cfg) = st.cfg.as_mut() else {
+            return false;
+        };
+        if let Some(ms) = step_threshold_ms {
+            cfg.step_threshold_ms = ms;
+        }
+        if let Some(ppm) = reference_slew_ppm {
+            cfg.reference_slew_ppm = ppm;
+        }
+        if let Some(tracker) = st.tracker.as_mut() {
+            tracker.set_step_policy(step_threshold_ms, reference_slew_ppm);
+        }
+        true
     }
 
     /// Quality of this node's network time, committing the lock hysteresis
@@ -904,7 +1583,24 @@ impl Router {
             None => (SyncState::Unsynced, u64::MAX, 0, false),
         };
         (
-            TimeSyncStatus { state, stratum, error_bound_ns, offset_ns, rate_ppb, last_sample_age_ms, is_reference },
+            TimeSyncStatus {
+                // A clock held for its source's newer epoch is not synced.
+                state: if st.epoch.holding && state.is_synced() { SyncState::Acquiring } else { state },
+                stratum,
+                // A held clock is off its source by more than the discipline
+                // knows: report the bound as unknown.
+                error_bound_ns: if st.epoch.holding { u64::MAX } else { error_bound_ns },
+                offset_ns,
+                rate_ppb,
+                last_sample_age_ms,
+                is_reference,
+                epoch: st.epoch.epoch,
+                newest_seen_epoch: st.epoch.newest_seen.max(st.epoch.epoch),
+                holding: st.epoch.holding,
+                steps: st.epoch.steps,
+                last_step: st.epoch.last_step(now_mono_ns),
+                steps_allowed: st.epoch.steps_allowed,
+            },
             evaluated,
         )
     }
@@ -934,12 +1630,23 @@ impl Router {
 
     /// Coarse-sets this node's network time to `unix_ns` at once (a step, not a
     /// slew) while it leads, e.g. when a station without an RTC first learns
-    /// UTC. Followers see the step as a new timescale and re-acquire. Returns
-    /// `false` (nothing changed) while following a remote source. Callers
-    /// must not step once followers are locked during flight.
+    /// UTC. The step starts a new time-base epoch: followers re-anchor to it
+    /// at once and order stamps across it. Returns `false` (nothing changed)
+    /// while following a remote source or while steps are inhibited
+    /// ([`Router::set_timesync_steps_allowed`]).
     pub fn step_local_network_time_ns(&self, unix_ns: i64) -> bool {
         let Some(t) = crate::timesync::NetworkTime::from_unix_ns(i128::from(unix_ns.max(0))) else {
             return false;
+        };
+        let steps_before = {
+            let Some(runtime) = self.timesync.as_ref() else {
+                return false;
+            };
+            let st = runtime.lock();
+            if !st.epoch.steps_allowed {
+                return false;
+            }
+            st.epoch.steps
         };
         if self.try_set_local_network_time(t.into()).is_err() {
             return false;
@@ -953,8 +1660,15 @@ impl Router {
         if Self::timesync_following_remote_locked(&st, now_ms, now_ns) {
             return false;
         }
-        let rate = st.disciplined_clock.rate_ppb();
-        st.disciplined_clock.discipline_ns(now_ns, unix_ns, rate, true);
+        // The local setter above already stepped beyond the step threshold;
+        // a step to the same reading needs no second epoch.
+        if st.epoch.steps != steps_before {
+            if let Some(last) = st.epoch.last_step.as_mut() {
+                last.reason = TimeSyncStepReason::Explicit;
+            }
+        } else {
+            Self::timesync_local_step_locked(&mut st, now_ns, unix_ns, TimeSyncStepReason::Explicit);
+        }
         true
     }
 

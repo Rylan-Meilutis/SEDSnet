@@ -117,6 +117,7 @@ impl Router {
         }
         let mut descriptors = Vec::with_capacity(originals.len());
         for packet in &mut originals {
+            self.stamp_origin_epoch(packet);
             let Some(meta) = crate::config::try_get_message_meta(packet.data_type()) else {
                 return fail(TryManagedBatchError::InvalidPacket, originals);
             };
@@ -280,7 +281,7 @@ impl Router {
             let key = packet.data_type().as_u32();
             let old = latest.get(&key);
             if old.is_some_and(|e| {
-                e.sender_address == item.sender_address && packet.timestamp() < e.packet.timestamp()
+                e.sender_address == item.sender_address && super::managed_stamp_is_older(packet, &e.packet)
             }) {
                 return Err(TryManagedBatchError::OriginalValueObsolete);
             }

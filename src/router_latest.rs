@@ -47,10 +47,18 @@ impl View<'_> {
             Self::Packed(p) => p.envelope.source_address,
         }
     }
+    #[cfg(test)]
     fn timestamp(&self) -> u64 {
         match self {
             Self::Packet(p) => p.timestamp(),
             Self::Packed(p) => p.envelope.timestamp_ms,
+        }
+    }
+    /// Source order across network time steps: the time epoch first.
+    fn stamp(&self) -> (u16, u64) {
+        match self {
+            Self::Packet(p) => (p.time_epoch(), p.timestamp()),
+            Self::Packed(p) => (p.envelope.time_epoch, p.envelope.timestamp_ms),
         }
     }
     fn endpoints(&self) -> Endpoints<'_> {
@@ -74,7 +82,8 @@ fn with_view<R>(data: &RouterItem, inspect: impl FnOnce(View<'_>) -> R) -> Optio
         RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |raw| {
             // Compressed/encrypted or contract-bearing owners may already have
             // codec/receipt obligations; they are deliberately never replaceable.
-            if raw.first().is_none_or(|flags| flags & 0x15 != 0) {
+            // A contract carrying only the time epoch is checked by the peek.
+            if raw.first().is_none_or(|flags| flags & 0x11 != 0) {
                 return None;
             }
             let frame = wire_format::peek_latest_plain_frame_info(raw).ok()?;
@@ -377,7 +386,7 @@ impl RouterInner {
                         (new_view.ty() == old_view.ty()
                             && new_view.source() == old_view.source()
                             && same_endpoints(new_view.endpoints(), old_view.endpoints()))
-                        .then(|| (index, new_view.timestamp().cmp(&old_view.timestamp())))
+                        .then(|| (index, new_view.stamp().cmp(&old_view.stamp())))
                     })
                     .flatten()
                 })
