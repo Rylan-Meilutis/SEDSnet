@@ -15358,10 +15358,16 @@ impl Router {
     /// A time sync packet stamped with `epoch`: the epoch its payload times
     /// were taken in (requests carry the newest epoch this node knows of).
     #[cfg(feature = "timesync")]
-    fn timesync_packet(&self, ty: DataType, words: &[u64], timestamp: u64, epoch: u16) -> TelemetryResult<Packet> {
+    pub(crate) fn timesync_packet(&self, ty: DataType, words: &[u64], timestamp: u64, epoch: u16) -> TelemetryResult<Packet> {
         let sender = self.sender_arc();
-        Ok(Packet::new(ty, &[DataEndpoint::TimeSync], sender.as_ref(), timestamp, encode_slice_le(words))?
-            .with_time_epoch(epoch))
+        // Time sync packets keep the usual per-packet nonce folded into two
+        // ULEB128 bytes (1..=16383; a full nonce takes up to three), so a
+        // board's CAN time sync response fits one 64-byte frame with the
+        // epoch. (A one-byte range makes same-millisecond receipt IDs collide
+        // often enough to cost exchanges.)
+        let pkt = Packet::new(ty, &[DataEndpoint::TimeSync], sender.as_ref(), timestamp, encode_slice_le(words))?;
+        let nonce = pkt.nonce() % 16_383 + 1;
+        Ok(pkt.with_nonce(nonce).with_time_epoch(epoch))
     }
 
     #[cfg(feature = "timesync")]

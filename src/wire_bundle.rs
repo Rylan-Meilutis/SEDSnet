@@ -167,6 +167,9 @@ struct Fields<'a> {
     src: u32,
     eps: &'a [u8],
     contract: &'a [u8],
+    /// `contract` is the raw bytes of an epoch-only contract (a zero length
+    /// and the ULEB128 epoch), written back verbatim.
+    contract_epoch_only: bool,
     /// `contract` holds 1-byte node indices for its targets (record form).
     targets_indexed: bool,
     rel: &'a [u8],
@@ -316,10 +319,23 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, table: bool, p: &mut F
     }
     if flags & F_CONTRACT == 0 {
         p.contract = &[];
+        p.contract_epoch_only = false;
+        p.targets_indexed = false;
+    } else if elide & E_CONTRACT == 0 && r.buf.get(r.off) == Some(&0) {
+        // Epoch-only contract: a zero length, then the ULEB128 epoch.
+        let start = r.off;
+        r.uleb()?;
+        let epoch = r.uleb()?;
+        if epoch == 0 || epoch > u64::from(crate::packet::MAX_TIME_EPOCH) || elide & E_TARGET_INDEX != 0 {
+            return None;
+        }
+        p.contract = &r.buf[start..r.off];
+        p.contract_epoch_only = true;
         p.targets_indexed = false;
     } else if elide & E_CONTRACT == 0 {
         let n = r.len()?;
         p.contract = r.take(n)?;
+        p.contract_epoch_only = false;
         p.targets_indexed = elide & E_TARGET_INDEX != 0;
         // The contract must describe exactly its own bytes, and every index
         // must name a node in this table.
@@ -423,7 +439,7 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
                 elide |= E_NONCE_DELTA;
             }
         }
-        if c.flags & p.flags & F_CONTRACT != 0 && p.contract == c.contract {
+        if c.flags & p.flags & F_CONTRACT != 0 && p.contract_epoch_only == c.contract_epoch_only && p.contract == c.contract {
             elide |= E_CONTRACT;
         }
         if p.nep == c.nep {
@@ -439,7 +455,9 @@ fn write_fields(c: &Fields<'_>, rec: bool, p: Option<&Fields<'_>>, out: &mut Vec
         elide |= E_SOURCE_INDEX;
     }
     let mut contract = Vec::new();
-    if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
+    if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 && c.contract_epoch_only {
+        put(&mut contract, c.contract);
+    } else if c.flags & F_CONTRACT != 0 && elide & E_CONTRACT == 0 {
         let indexed = rec && !nodes().is_empty() && put_contract(&mut contract, c.contract, c.targets_indexed, true).is_some();
         if indexed {
             elide |= E_TARGET_INDEX;

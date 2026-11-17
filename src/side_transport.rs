@@ -210,8 +210,11 @@ impl SideHeaderTemplate {
                 }
             }
         }
-        if read_uleb128_local(between, &mut off).is_err() {
-            return true;
+        match read_uleb128_local(between, &mut off) {
+            Err(_) => return true,
+            // An epoch-only contract (zero length) freezes nothing.
+            Ok(0) => return false,
+            Ok(_) => {}
         }
         // Contract flag 0x01: explicit target hashes follow.
         between.get(off).is_none_or(|flags| flags & 0x01 != 0)
@@ -451,6 +454,10 @@ pub(crate) fn extract_side_header_template_view(
     if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
         let contract_len = usize::try_from(read_uleb128_local(data, &mut off)?)
             .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
+        // A zero length is an epoch-only contract: the epoch follows.
+        if contract_len == 0 {
+            read_uleb128_local(data, &mut off)?;
+        }
         if data.len() < off + contract_len {
             return Err(TelemetryError::Unpack("short buffer"));
         }

@@ -317,9 +317,12 @@ fn decode_wire_contract(
             time_epoch: 0,
         });
     }
-    let contract_len = usize::try_from(read_uleb128(r)?)
-        .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
-    let contract_bytes = r.read_bytes(contract_len)?;
+    let contract_bytes = match read_contract_field(r)? {
+        ContractField::Epoch(time_epoch) => {
+            return Ok(WireContract { shape: None, target_senders: None, has_reliable_header: false, time_epoch });
+        }
+        ContractField::Body(bytes) => bytes,
+    };
     let mut cr = ByteReader::new(contract_bytes);
     // Parsing through a bounded sub-reader lets us reject trailing garbage in
     // the contract cleanly instead of accidentally treating it as payload or
@@ -362,6 +365,47 @@ fn decode_wire_contract(
         has_reliable_header: (flags & CONTRACT_FLAG_RELIABLE_HEADER) != 0,
         time_epoch,
     })
+}
+
+/// A contract that carries nothing but the time epoch is written as a zero
+/// length (no other contract can be empty: it always has its flags byte)
+/// followed by the ULEB128 epoch, so a step costs two bytes (epochs below 128)
+/// instead of three. Every other contract keeps its length and bytes. A
+/// reliable packet keeps the full form, which carries the "reliable header
+/// present" bit.
+#[inline]
+fn epoch_only_contract(shape: Option<MessageElement>, targets: &[u64], reliable: bool, time_epoch: u16) -> bool {
+    shape.is_none() && targets.is_empty() && !reliable && time_epoch != 0
+}
+
+/// Bytes of the contract field (length included) when one is carried.
+#[inline]
+fn contract_field_size(shape: Option<MessageElement>, targets: &[u64], reliable: bool, time_epoch: u16) -> usize {
+    if epoch_only_contract(shape, targets, reliable, time_epoch) {
+        1 + uleb128_size(u64::from(time_epoch))
+    } else {
+        let body = wire_contract_size(shape, targets, time_epoch);
+        uleb128_size(body as u64) + body
+    }
+}
+
+/// A contract field read from a frame: an epoch-only contract, or the body.
+enum ContractField<'a> {
+    Epoch(u16),
+    Body(&'a [u8]),
+}
+
+#[inline]
+fn read_contract_field<'a>(r: &mut ByteReader<'a>) -> Result<ContractField<'a>, TelemetryError> {
+    let len = read_uleb128(r)?;
+    if len == 0 {
+        return match u16::try_from(read_uleb128(r)?) {
+            Ok(epoch) if epoch != 0 && epoch <= crate::packet::MAX_TIME_EPOCH => Ok(ContractField::Epoch(epoch)),
+            _ => Err(TelemetryError::Unpack("wire contract time epoch")),
+        };
+    }
+    let len = usize::try_from(len).map_err(|_| TelemetryError::Unpack("wire contract length"))?;
+    Ok(ContractField::Body(r.read_bytes(len)?))
 }
 
 /// Reads the optional trailing time epoch of a contract. A zero epoch is
@@ -1290,7 +1334,7 @@ fn with_packet_frame_parts<T>(
     };
     let contract_bytes = wire_contract_size(shape, target_senders, pkt.time_epoch());
     let contract_len = if carries_wire_contract {
-        uleb128_size(contract_bytes as u64) + contract_bytes
+        contract_field_size(shape, target_senders, reliable.is_some(), pkt.time_epoch())
     } else {
         0
     };
@@ -1381,8 +1425,13 @@ fn with_packet_frame_parts<T>(
         // The contract must appear before the reliable header because it may
         // carry the "reliable header present" bit for packets whose current
         // runtime schema lookup no longer reflects the original wire semantics.
-        write_uleb128(contract_bytes as u64, &mut out);
-        write_wire_contract(shape, target_senders, reliable.is_some(), pkt.time_epoch(), &mut out)?;
+        if epoch_only_contract(shape, target_senders, reliable.is_some(), pkt.time_epoch()) {
+            write_uleb128(0, &mut out);
+            write_uleb128(u64::from(pkt.time_epoch()), &mut out);
+        } else {
+            write_uleb128(contract_bytes as u64, &mut out);
+            write_wire_contract(shape, target_senders, reliable.is_some(), pkt.time_epoch(), &mut out)?;
+        }
     }
     if let Some(hdr) = reliable {
         write_reliable_header_encoded(hdr, reliable_is_compact, &mut out);
@@ -1793,10 +1842,11 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
     let mut targets: &'a [u8] = &[];
     let mut has_reliable_header = false;
     let mut time_epoch = 0;
-    if flags & FLAG_WIRE_CONTRACT != 0 {
-        let len = usize::try_from(read_uleb128(r)?)
-            .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
-        let mut cr = ByteReader::new(r.read_bytes(len)?);
+    let field = if flags & FLAG_WIRE_CONTRACT != 0 { Some(read_contract_field(r)?) } else { None };
+    if let Some(ContractField::Epoch(epoch)) = field {
+        time_epoch = epoch;
+    } else if let Some(ContractField::Body(body)) = field {
+        let mut cr = ByteReader::new(body);
         let contract_flags = cr.read_bytes(1)?[0];
         if contract_flags & CONTRACT_FLAG_SHAPE != 0 {
             shape = Some(decode_wire_shape(&mut cr)?);
@@ -2298,9 +2348,8 @@ pub fn header_size_bytes(pkt: &Packet) -> usize {
 pub fn packet_wire_size(pkt: &Packet) -> usize {
     let shape = pkt.wire_shape();
     let targets = pkt.wire_target_senders();
-    let contract_bytes = wire_contract_size(shape, targets, pkt.time_epoch());
     let contract_len = if shape.is_some() || !targets.is_empty() || pkt.time_epoch() != 0 {
-        uleb128_size(contract_bytes as u64) + contract_bytes
+        contract_field_size(shape, targets, is_reliable_type(pkt.data_type()), pkt.time_epoch())
     } else {
         0
     };
@@ -2612,8 +2661,19 @@ mod endpoint_decode_tests {
         let bundle = crate::wire_bundle::pack_bundle(&[&a, &b, &c]).unwrap();
         let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
         assert_eq!(frames, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+        // Consecutive epoch-only contracts (the second one elided), a
+        // two-byte epoch, and a full contract between them.
+        let a2 = pack_packet(&plain.clone().with_time_epoch(3).with_nonce(78));
+        let d = pack_packet(&plain.clone().with_time_epoch(200));
+        let bundle = crate::wire_bundle::pack_bundle(&[&a, &a2, &d, &b, &a]).unwrap();
+        let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
+        assert_eq!(frames, vec![a.to_vec(), a2.to_vec(), d.to_vec(), b.to_vec(), a.to_vec()]);
+        // The side transport reads past an epoch-only contract.
+        for frame in [&a, &d] {
+            assert!(crate::side_transport::extract_side_header_template(frame).is_ok());
+        }
 
-        // A present zero epoch is malformed; so is one beyond 16 bits.
+        // A present zero epoch is malformed.
         let contract_at = |bytes: &[u8]| {
             let mut r = ByteReader::new(bytes);
             let _ = read_routing_envelope(&mut r);
@@ -2621,8 +2681,10 @@ mod endpoint_decode_tests {
         };
         let one = pack_packet(&plain.clone().with_time_epoch(1));
         let end = contract_at(&one);
-        // The epoch is the contract's last byte (ULEB128 1).
-        assert_eq!(one[end - 1], 1);
+        // An epoch-only contract is a zero length and the epoch.
+        assert_eq!(&one[end - 2..end], &[0, 1]);
+        assert_eq!(one.len(), c.len() + 2, "a step costs two bytes below epoch 128");
+        assert_eq!(pack_packet(&plain.clone().with_time_epoch(128)).len(), c.len() + 3);
         let mut zero = one[..one.len() - 4].to_vec();
         zero[end - 1] = 0;
         append_crc32(&mut zero);

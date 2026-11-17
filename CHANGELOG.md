@@ -37,7 +37,9 @@ write as "older".
   stamp their epoch on the packets they originate (own sender, epoch never
   stated; `with_time_epoch(0)` states epoch 0). C: a nonzero `time_epoch` on a
   view passed in states the epoch. Wire: contract flag `0x08`
-  plus a ULEB128 epoch (1..=65535) after the targets, folded into the packet
+  plus a ULEB128 epoch (1..=65534) after the targets, or, when the epoch is
+  all the contract carries, a zero contract length followed by the epoch (two
+  bytes below epoch 128), folded into the packet
   ID when nonzero; an epoch-only contract freezes nothing (endpoint encoding,
   fairness and latest-value eligibility unchanged). Compact bundles and side
   templates carry it.
@@ -74,6 +76,9 @@ write as "older".
   unanchored time) judges stamps against the newest plausible-UTC stamp heard
   on any packet, advanced by its monotonic clock, so a board whose source is
   lost still accepts fresh station recovery commands.
+- Time sync packets carry a nonce of at most two ULEB128 bytes, so with the
+  two-byte epoch a board's CAN time sync response (its largest) stays in one
+  64-byte CAN frame (55-byte fragment) below epoch 128.
 - `Router::raise_network_time_epoch(min)` (C `seds_router_raise_time_epoch`,
   Python `raise_network_time_epoch`): restore an epoch persisted with an
   ordering mark at boot; the network's epoch never falls below it, even after

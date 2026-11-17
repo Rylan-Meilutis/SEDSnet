@@ -1099,3 +1099,33 @@ fn a_stated_epoch_zero_is_kept_and_an_unstated_one_is_filled_in() {
     assert_eq!(stated, base, "stating the epoch is not part of equality");
     assert_eq!(sent(stated), Some(0), "stated 0 is kept");
 }
+
+/// A board's time sync response is its largest time sync frame (four 64-bit
+/// words). Board CAN fragments carry 55 bytes, so the canonical frame must
+/// stay within 55 bytes once the network has stepped (the epoch rides in the
+/// frame): an epoch-only contract costs two bytes below epoch 128 and time
+/// sync nonces at most two. Receipt IDs stay distinct.
+#[test]
+fn a_time_sync_response_fits_one_board_can_fragment_after_steps() {
+    crate::tests::ensure_common_test_schema();
+    let now = Arc::new(AtomicU64::new(60_000));
+    let gw = router("GATEWAY", board(), &now);
+    let words = [u64::MAX >> 1, u64::MAX >> 2, u64::MAX >> 3, u64::MAX >> 4];
+    let mut ids = std::collections::BTreeSet::new();
+    for epoch in [0u16, 1, 2, 63, 127] {
+        for seq in 0..64u64 {
+            let mut w = words;
+            w[0] ^= seq;
+            let pkt = gw.timesync_packet(DataType::TimeSyncResponse, &w, UTC + 3 * HOUR, epoch).unwrap();
+            assert!((1..=16_383).contains(&pkt.nonce()));
+            let frame = crate::wire_format::pack_packet(&pkt);
+            assert!(frame.len() <= 55, "epoch {epoch}: {} bytes", frame.len());
+            let back = crate::wire_format::unpack_packet(&frame).unwrap();
+            assert_eq!(back.time_epoch(), epoch);
+            assert!(ids.insert(back.packet_id()), "receipt IDs stay distinct");
+        }
+    }
+    // One byte more from epoch 128 on.
+    let pkt = gw.timesync_packet(DataType::TimeSyncResponse, &words, UTC + 3 * HOUR, 128).unwrap();
+    assert!(crate::wire_format::pack_packet(&pkt).len() <= 56);
+}

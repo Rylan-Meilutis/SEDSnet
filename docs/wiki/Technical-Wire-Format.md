@@ -136,7 +136,14 @@ VARINT(contract_len)
 [target sender hash 0: u64 LE]
 [target sender hash 1: u64 LE]
 ...
-[time epoch: ULEB128, 1..=65535]  // if contract flag 0x08 set
+[time epoch: ULEB128, 1..=65534]  // if contract flag 0x08 set
+```
+
+An epoch-only contract (no shape, no targets, not reliable) is written instead as
+
+```text
+VARINT(0)                         // a zero contract length: no other contract is empty
+VARINT(time epoch)                // 1..=65534
 ```
 
 ### Time epoch
@@ -145,8 +152,8 @@ A frame whose timestamp was taken in network time-base epoch 0 (no step ever see
 epoch, so such frames are byte-for-byte what SEDSnet 5 sent. Otherwise the contract carries the
 epoch (frame flag `0x04` set) even when it freezes nothing else; an epoch-only contract does not
 change endpoint encoding, does not count as a frozen delivery contract, and is part of the packet
-ID (folded in after the payload size when nonzero). A present zero, or a value above 65535, is
-malformed. SEDSnet 5 decoders reject such frames as trailing contract bytes: the whole network
+ID (folded in after the payload size when nonzero). It costs two bytes below epoch 128 (the
+zero-length form). A present zero, or a value above 65534, is malformed. SEDSnet 5 decoders reject such frames as trailing contract bytes: the whole network
 updates together. See [Time-Sync](Time-Sync#steps-slews-and-the-time-base-epoch-sedsnet-6).
 
 Contract flags:
