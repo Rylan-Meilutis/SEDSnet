@@ -646,7 +646,12 @@ fn radio_sim_heavy_loss_bound_covers_error_while_acquiring() {
 #[test]
 #[ignore = "probe run by the seeded sweeps in a fresh process"]
 fn radio_sim_seeded_probe() {
-    let seed: u32 = std::env::var("SEDS_TEST_NONCE_SEED").unwrap().parse().unwrap();
+    // Only meaningful when a seeded sweep launches it; a plain run of the
+    // ignored tests has nothing to probe.
+    let Ok(seed) = std::env::var("SEDS_TEST_NONCE_SEED") else {
+        return;
+    };
+    let seed: u32 = seed.parse().unwrap();
     crate::packet::seed_packet_nonce(seed);
     crate::router::seed_timesync_nonce(seed as u16);
     match std::env::var("SEDS_TEST_SCENARIO").as_deref() {
