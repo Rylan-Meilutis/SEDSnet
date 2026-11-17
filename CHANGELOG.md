@@ -1,6 +1,6 @@
 # Changelog
 
-## 6.0.0 (unreleased)
+## 6.0.0 (2026-11-17)
 
 **Breaking wire and API changes (network time steps).** Once network time has
 been stepped, frames carry their time-base epoch in the wire contract, which
