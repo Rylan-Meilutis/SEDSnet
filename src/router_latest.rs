@@ -47,12 +47,6 @@ impl View<'_> {
             Self::Packed(p) => p.envelope.source_address,
         }
     }
-    fn timestamp(&self) -> u64 {
-        match self {
-            Self::Packet(p) => p.timestamp(),
-            Self::Packed(p) => p.envelope.timestamp_ms,
-        }
-    }
     /// Source order across network time steps: the time epoch first.
     fn stamp(&self) -> (u16, u64) {
         match self {

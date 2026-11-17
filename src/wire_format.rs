@@ -2077,7 +2077,7 @@ pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<Routin
     // shape or frozen targets are delivery obligations.
     if envelope.has_reliable_header
         || envelope.wire_shape.is_some()
-        || envelope.targets.len() != 0
+        || !envelope.targets.is_empty()
         || envelope.endpoints().next().is_none()
     {
         return Err(TelemetryError::BadArg);
