@@ -4,11 +4,11 @@
 
 **Breaking wire and API changes (network time steps).** Once network time has
 been stepped, frames carry their time-base epoch in the wire contract, which
-5.0 decoders reject; the GS, RRLS and every board update together. Frames
+5.0 decoders reject; every node on a network must update together. Frames
 stamped in epoch 0 (no step ever seen) are unchanged. Field fault of
 2026-11-16: a station clock 3 h 49 min off was corrected by a 5% slew (76 h),
 followers (3% frequency range) fell seconds behind and flickered to
-Acquiring, and after a step back the managed FLIGHT_STATE refused every later
+Acquiring, and after a step back a managed network variable refused every later
 write as "older".
 
 - A leading node steps instead of slews when a local time source (operator,
@@ -17,13 +17,13 @@ write as "older".
   `TimeSyncConfig::reference_slew_ppm` (default 20 ppm, inside the 50 ppm
   drift followers' disciplines allow for) instead of `max_slew_ppm` (5%).
   `max_slew_ppm` now only limits a follower's own phase corrections.
-  `Router::set_timesync_steps_allowed(false)` inhibits steps (flight phases):
+  `Router::set_timesync_steps_allowed(false)` inhibits steps (application-defined phases):
   then even hours are slewed. `set_timesync_step_policy` changes threshold and
   slew in place. `step_local_network_time_ns` returns false while inhibited.
 - Network time-base epoch: every step of a leading clock starts a new epoch,
   newer than any it has seen. Followers adopt a newer source epoch at once
   from the first announce or response carrying it and step to the source in
-  either direction (a 4 h step: every board, including those behind relays
+  either direction (a 4 h step: every node, including those behind relays
   and a 30%-loss radio, within 50 ms in under 0.4 s and within 2 ms in about
   4 s in the host sims); relays re-announce it at once, and a node that
   changes epoch sends four announces 150 ms apart. A follower never steps back
@@ -70,15 +70,15 @@ write as "older".
   `NetworkStampAge::NewerEpoch` now carries `since_ms` (how long ago this node
   first heard of a newer epoch); a newer-epoch stamp is fresh while that is
   inside the window, so a command sent right after a step is not refused by a
-  board still re-anchoring. Ordering helpers `compare_network_stamps` (C
+  node still re-anchoring. Ordering helpers `compare_network_stamps` (C
   `seds_stamp_cmp`).
   A node with no usable network time of its own (cannot sync, or follows
   unanchored time) judges stamps against the newest plausible-UTC stamp heard
-  on any packet, advanced by its monotonic clock, so a board whose source is
+  on any packet, advanced by its monotonic clock, so a node whose source is
   lost still accepts fresh station recovery commands.
 - Time sync packets carry a nonce of at most two ULEB128 bytes, so with the
-  two-byte epoch a board's CAN time sync response (its largest) stays in one
-  64-byte CAN frame (55-byte fragment) below epoch 128.
+  two-byte epoch a time sync response (its largest time sync frame) grows by at most
+  two bytes below epoch 128.
 - `Router::raise_network_time_epoch(min)` (C `seds_router_raise_time_epoch`,
   Python `raise_network_time_epoch`): restore an epoch persisted with an
   ordering mark at boot; the network's epoch never falls below it, even after
@@ -86,7 +86,7 @@ write as "older".
 - A leading node adopts an agreeing newer epoch from the first packet it hears
   (a restarted station's own writes order after the network's at once). While
   steps are inhibited, a leader no follower shares a base with yet (a station
-  restarted in flight) joins the network's time base from a fresh request
+  restarted while steps are inhibited) joins the network's time base from a fresh request
   stamp instead of making every follower step (reason `Joined`). A relay that
   passes a follower's newer epoch upstream stamps the request 0 so its own
   clock cannot vouch for that epoch's base.

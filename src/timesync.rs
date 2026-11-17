@@ -792,7 +792,7 @@ pub enum TimeSyncStepReason {
     /// newer epoch, which this leading node adopted.
     Renamed = 7,
     /// A leading node whose steps are inhibited heard a follower in a newer
-    /// epoch on another time base (a station restarted in flight): it joined
+    /// epoch on another time base (a leader restarted while steps are inhibited): it joined
     /// the network's time base instead of making the network step to its own.
     Joined = 8,
     /// [`crate::router::Router::raise_network_time_epoch`] advanced the epoch

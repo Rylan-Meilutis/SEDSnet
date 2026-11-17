@@ -1285,7 +1285,7 @@ impl Router {
     /// are inhibited ([`Router::set_timesync_steps_allowed`]) a leader that
     /// disagrees with a fresh, plausible (UTC) request stamp joins the
     /// network's time base instead of making every follower step to its own:
-    /// the network stays continuous (a station restarted in flight), and the
+    /// the network stays continuous (a leader restarted while steps are inhibited), and the
     /// leader's local sources then correct it under the usual policy (slewed
     /// while inhibited, stepped once steps are allowed again). Any other packet
     /// in a newer epoch is adopted only when its stamp agrees with this clock.
@@ -1437,7 +1437,7 @@ impl Router {
             return NetworkStampAge::NoTime;
         };
         // Our own time judges a UTC stamp only when it reads UTC itself (a
-        // board following an RF without a GPS fix holds uptime-based time).
+        // follower whose source has no absolute time holds uptime-based time).
         let own = self
             .network_time_ms()
             .filter(|ms| *ms >= TIMESYNC_UTC_FLOOR_MS || timestamp_ms < TIMESYNC_UTC_FLOOR_MS);
@@ -1483,8 +1483,8 @@ impl Router {
     /// Allows or inhibits steps of this node's clock by local time sources
     /// (operator/host time, GPS) and [`Router::step_local_network_time_ns`].
     /// Inhibited, such corrections are slewed at the reference rate however
-    /// large; followers still follow their source's steps. Inhibit during
-    /// flight phases where a leading clock must stay continuous.
+    /// large; followers still follow their source's steps. Inhibit while the
+    /// application needs a leading clock to stay continuous.
     pub fn set_timesync_steps_allowed(&self, allowed: bool) {
         if let Some(runtime) = self.timesync.as_ref() {
             runtime.lock().epoch.steps_allowed = allowed;

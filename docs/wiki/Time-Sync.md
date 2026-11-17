@@ -147,7 +147,7 @@ Failover uses holdover plus slew:
 
 ## Steps, slews and the time-base epoch (SEDSnet 6)
 
-A leading node (the elected reference, for example the GS) corrects its own clock from local time
+A leading node (the elected reference) corrects its own clock from local time
 sources (`try_set_local_network_time` and the other local setters, `update_network_time_source`)
 like this:
 
@@ -161,8 +161,10 @@ like this:
 #### Step policy (`set_timesync_steps_allowed`)
 
 `Router::set_timesync_steps_allowed(false)` (C `seds_router_set_timesync_steps_allowed`, Python
-`set_timesync_steps_allowed`) is the safety hook: the application that owns flight state (the GS)
-inhibits steps from Armed until Recovery. The policy acts where steps originate, on the leading
+`set_timesync_steps_allowed`) is the application's hook for phases in which its clock must stay
+continuous: SEDSnet has no notion of those phases, so the application that owns them decides and
+calls it. (Example: a launch-control station inhibits steps while a timed sequence is armed or
+running.) The policy acts where steps originate, on the leading
 node; followers always follow their source, so the network as a whole steps only when its leader's
 policy allows it.
 
@@ -176,12 +178,12 @@ policy allows it.
 
 #### Authority
 
-The elected source is deterministic: anchored UTC beats unanchored time, then the lower priority
-(GS 50, RRLS 60, RF with a GPS fix 70), then the lower stratum, then the sender ID. Time-base
+The elected source is deterministic: anchored UTC beats unanchored time, then the lower configured
+priority (`TimeSyncConfig` priority; the application assigns it per node), then the lower stratum, then the sender ID. Time-base
 epochs never override the election; they only decide how a node moves onto its elected source:
 a newer source epoch is adopted with a step, an older one is held for until the source adopts the
 follower's epoch, and two bases under one epoch number (partitions that stepped on their own) are
-separated by the follower naming a newer epoch. A standby source that takes over (RRLS during a GS
+separated by the follower naming a newer epoch. A standby source that takes over (during the primary's
 outage) keeps its followers' time base, so a hand-over between agreeing sources steps no one.
 
 #### Restarts and persisted marks
@@ -240,7 +242,7 @@ doing so; `since_ms` is how long ago it first heard of a newer epoch, which boun
 or `OlderEpoch` (stamped before a step no longer remembered: stale). A command stamped 2 s before a
 4 h step back is 2 s old, not 4 h in the future.
 
-Command-validity windows (for example an actuator accepting a quick-disconnect command only within
+Command-validity windows (for example a node accepting a command only within
 5 s of its stamp) use `Router::network_stamp_is_fresh(epoch, timestamp, max_age_ms, max_ahead_ms)`
 (C `seds_router_network_stamp_fresh`, Python `network_stamp_is_fresh`): a translated age inside the
 window passes; a newer-epoch stamp passes while `since_ms <= max_age_ms`, so a command sent right
@@ -273,11 +275,12 @@ holding for its source reports Acquiring. A station should show and alarm on: st
 
 ### Scenarios covered by tests
 
-`src/tests/timesync_step_epoch.rs` and `tests/timesync_station_step.rs` simulate the field network
-(GS, gateway, actuator over Wi-Fi/CAN; RF over a radio; FC behind RF) and check: jumps of seconds to
-hours both ways from an operator set, a host/NTP source and a GPS-led RF; a station restart (clock
+`src/tests/timesync_step_epoch.rs` and `tests/timesync_station_step.rs` simulate a mixed network
+(a leading station; nodes on low-latency links; a relay over a lossy radio with nodes behind it)
+and check: jumps of seconds to
+hours both ways from an operator set, a host/NTP source and a GPS-led relay; a station restart (clock
 agreeing or not, steps allowed or inhibited); a board restart and a late joiner; a relay hop over a
-45 ms radio at 0-50% loss; two sources (GS and RRLS) handing over without steps; partition and
+45 ms radio at 0-50% loss; two sources (a primary and a standby) handing over without steps; partition and
 re-merge with both sides stepping under one epoch number; repeated steps; a command sequence judged
 with the validity window through steps both ways; the managed-variable cache across a step back;
 a whole-stack restart raised by a persisted epoch; and that every node's own packets order by

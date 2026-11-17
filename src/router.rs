@@ -15365,7 +15365,7 @@ impl Router {
         let sender = self.sender_arc();
         // Time sync packets take their nonce from their own counter,
         // 128..=16383 in turn (two ULEB128 bytes; a hashed packet nonce takes
-        // up to three), so a board's CAN time sync response fits one 64-byte frame
+        // up to three), so a time sync response stays as small as a frame allows
         // with the epoch, and no two of the last 16256 time sync packets of
         // this node share a nonce (receipt IDs stay distinct). Time sync
         // packets are never sealed end to end (internal control traffic; the

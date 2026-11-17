@@ -2228,7 +2228,7 @@ pub extern "C" fn seds_router_set_timesync_step_policy(
 }
 
 /// Allows or inhibits steps of this node's clock by local sources (inhibit
-/// during flight phases).
+/// while the application needs this clock continuous).
 #[cfg(feature = "timesync")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_set_timesync_steps_allowed(r: *mut SedsRouter, allowed: bool) -> i32 {
