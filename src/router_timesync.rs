@@ -165,7 +165,7 @@ impl EpochState {
     /// Next epoch for a step of this node's own clock: newer than every epoch
     /// it has seen, so no other time base can already carry the number.
     fn next_epoch(&self) -> u16 {
-        self.epoch.max(self.newest_seen).max(self.subtree).saturating_add(1)
+        self.epoch.max(self.newest_seen).max(self.subtree).saturating_add(1).min(crate::packet::MAX_TIME_EPOCH)
     }
 
     /// Translates a stamp taken in `epoch` into this node's current time base:
@@ -1312,7 +1312,7 @@ impl Router {
         }
         // A different base: a still newer epoch names this node's, and the
         // followers step onto it.
-        Self::timesync_epoch_changed_locked(st, req_epoch.saturating_add(1), 0, TimeSyncStepReason::Renamed, now_ns);
+        Self::timesync_epoch_changed_locked(st, req_epoch.saturating_add(1).min(crate::packet::MAX_TIME_EPOCH), 0, TimeSyncStepReason::Renamed, now_ns);
     }
 
     /// A relay serving a request that carries a newer epoch passes it upstream
@@ -1381,6 +1381,7 @@ impl Router {
         };
         let now_ns = self.monotonic_now_ns();
         let mut st = runtime.lock();
+        let min_epoch = min_epoch.min(crate::packet::MAX_TIME_EPOCH);
         if min_epoch > st.epoch.epoch {
             Self::timesync_epoch_changed_locked(&mut st, min_epoch, 0, TimeSyncStepReason::Raised, now_ns);
         }

@@ -372,7 +372,7 @@ fn read_contract_epoch(cr: &mut ByteReader, flags: u8) -> Result<u16, TelemetryE
         return Ok(0);
     }
     match u16::try_from(read_uleb128(cr)?) {
-        Ok(epoch) if epoch != 0 => Ok(epoch),
+        Ok(epoch) if epoch != 0 && epoch <= crate::packet::MAX_TIME_EPOCH => Ok(epoch),
         _ => Err(TelemetryError::Unpack("wire contract time epoch")),
     }
 }
@@ -2568,7 +2568,7 @@ mod endpoint_decode_tests {
         assert_eq!(bytes[0] & FLAG_WIRE_CONTRACT, 0, "epoch 0 adds nothing");
         assert_eq!(unpack_packet(&bytes).unwrap().time_epoch(), 0);
         let mut ids = alloc::collections::BTreeSet::new();
-        for epoch in [1u16, 127, 128, 300, u16::MAX] {
+        for epoch in [1u16, 127, 128, 300, crate::packet::MAX_TIME_EPOCH] {
             let pkt = plain.clone().with_time_epoch(epoch);
             let bytes = pack_packet(&pkt);
             assert_ne!(bytes[0] & FLAG_WIRE_CONTRACT, 0);
