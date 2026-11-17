@@ -935,3 +935,102 @@ fn throttle_boolean_flags_preserve_all_combinations_and_independent_state() {
         }
     }
 }
+
+/// Run SMALL_BUDGET_NODE for ten minutes with one full-topology peer missing
+/// its catalog. Whenever the node names that peer in a schema request, the
+/// peer answers with its whole catalog in SDT chunks (`answer`), as on a CAN
+/// bus. Returns the request times.
+fn unanswerable_catalog_requests(answer: bool) -> (Vec<u64>, u8) {
+    crate::tests::ensure_common_test_schema();
+    let clock = Arc::new(AtomicU64::new(1000));
+    let (node, side, sent) = capture_node("SMALL_BUDGET_NODE", clock.clone());
+    let peer = "LARGE_CATALOG_PEER";
+    let address = sender_address_u32(peer);
+    seed_missing(&node, side, &[address], 1000);
+    {
+        let mut st = node.state.lock();
+        let route = st.discovery_routes.get_mut(&side).unwrap();
+        let state = route.announcers.remove("PEER_0").unwrap();
+        route.announcers.insert(peer.into(), state);
+    }
+    let catalog = discovery::build_discovery_schema(peer, 1000).unwrap();
+    let mut chunks = Vec::new();
+    crate::side_transport::send_packet_chunks(&catalog, 110, peer.as_bytes(), &mut 0, |chunk| {
+        chunks.push(chunk.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    assert!(chunks.len() > 8, "catalog spans many chunks: {}", chunks.len());
+    // Far less room than the catalog's chunk assembly needs, as on an 8 KiB
+    // board receiving another board's 4-5 KiB catalog.
+    let needed: usize = chunks.iter().map(|c| c.len() + 48).sum();
+    {
+        let mut st = node.state.lock();
+        let protected = st.protected_metadata_bytes_used();
+        st.memory.max_queue_budget = protected + needed / 2;
+    }
+    let mut handled = 0;
+    for now in (1000..=600_000u64).step_by(1000) {
+        clock.store(now, Ordering::Relaxed);
+        {
+            let mut st = node.state.lock();
+            for state in st.discovery_routes.get_mut(&side).unwrap().announcers.values_mut() {
+                state.last_seen_ms = now;
+            }
+        }
+        node.poll_discovery_announce().unwrap();
+        node.drain_queues_with_timeout(0).unwrap();
+        let requests: Vec<_> = sent
+            .lock()
+            .iter()
+            .filter(|p| p.data_type() == DataType::DiscoverySchemaRequest)
+            .cloned()
+            .collect();
+        for request in &requests[handled..] {
+            let targets = scope_addresses(discovery::schema_request_targets(request.payload()).unwrap());
+            assert_eq!(targets, vec![address]);
+            if answer {
+                for chunk in &chunks {
+                    let _ = node.rx_packed_from_side(chunk, side);
+                }
+                let _ = node.drain_queues_with_timeout(0);
+            }
+        }
+        handled = requests.len();
+    }
+    let st = node.state.lock();
+    let state = &st.discovery_routes[&side].announcers[peer];
+    assert!(!state.has_schema);
+    let times = sent
+        .lock()
+        .iter()
+        .filter(|p| p.data_type() == DataType::DiscoverySchemaRequest)
+        .map(|p| p.timestamp())
+        .collect();
+    (times, state.schema_refusals)
+}
+
+/// A catalog this node's chunk receive budget refuses can never be
+/// reassembled here. Asking for it every 5 s forever makes the peer resend
+/// the whole catalog on the shared link each time (the fullnet's endless
+/// 4-5 KiB re-sends). Back off per refusal; never give up entirely.
+#[test]
+fn refused_catalog_backs_off_instead_of_being_requested_forever() {
+    let (times, refusals) = unanswerable_catalog_requests(true);
+    assert!(refusals >= 3, "refusals {refusals}");
+    // 10 minutes at the 5 s baseline retry would be about 120 requests.
+    assert!(times.len() <= 12, "requests after refusals: {times:?}");
+    assert!(*times.last().unwrap() >= 400_000, "backed off, not abandoned: {times:?}");
+    for pair in times.windows(2) {
+        assert!(pair[1] - pair[0] <= discovery::DISCOVERY_SCHEMA_REFUSED_RETRY_MAX_MS + 1000);
+    }
+}
+
+/// A catalog that is merely lost (lossy link, nothing refused here) keeps the
+/// baseline recovery cadence: those requests also make the peer re-announce.
+#[test]
+fn lost_catalog_keeps_the_baseline_recovery_cadence() {
+    let (times, refusals) = unanswerable_catalog_requests(false);
+    assert_eq!(refusals, 0);
+    assert!(times.len() >= 100, "lost-catalog requests: {}", times.len());
+}

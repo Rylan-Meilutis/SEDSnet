@@ -35,6 +35,11 @@ pub const DISCOVERY_BASELINE_RETRY_MS: u64 = 5_000;
 pub const DISCOVERY_TOPOLOGY_RETRY_MS: u64 = 1_000;
 /// Let the address and full topology in a normal bootstrap arrive together.
 pub const DISCOVERY_BASELINE_GRACE_MS: u64 = 1_000;
+/// A peer whose catalog this node's own chunk receive budget refused is asked
+/// again only after DISCOVERY_BASELINE_RETRY_MS doubled per refusal, up to
+/// this. Each request makes the peer send its whole catalog on the shared
+/// link; a catalog too large to reassemble here never completes.
+pub const DISCOVERY_SCHEMA_REFUSED_RETRY_MAX_MS: u64 = 160_000;
 /// Number of compact topology advertisements emitted for each change. These
 /// packets are intentionally idempotent, so a small bounded repeat avoids a
 /// 120-second repair delay after one lossy control frame without resending the

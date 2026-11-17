@@ -1440,6 +1440,10 @@ struct DiscoverySenderState {
     topology_boards: Arc<Vec<TopologyBoardNode>>,
     has_full_topology: bool,
     has_schema: bool,
+    /// Times this node's chunk receive budget refused this peer's catalog,
+    /// and the earliest time a missing-schema request may name it again.
+    schema_refusals: u8,
+    schema_retry_at_ms: u64,
     // Address/Schema publishers may be behind a transparent relay. Only a
     // validated, nonforwardable hop-local advertisement proves an immediate
     // peer. Its age must not be renewed by forwarded traffic or telemetry.
@@ -10818,6 +10822,7 @@ impl Router {
             for (name, peer) in &route.announcers {
                 if !peer.has_full_topology
                     || peer.has_schema
+                    || now < peer.schema_retry_at_ms
                     || now.saturating_sub(peer.last_seen_ms) >= DISCOVERY_ROUTE_TTL_MS
                 {
                     continue;
@@ -10861,6 +10866,28 @@ impl Router {
             }
         }
         (targets, count, legacy_broadcast)
+    }
+
+    /// This node's chunk receive budget refused a catalog from `address`
+    /// arriving on `side`: it cannot be reassembled here, so asking for it
+    /// again at the baseline retry only makes the peer resend it on the link
+    /// for nothing. Back that peer off (doubling per refusal); a lost catalog
+    /// on a lossy link is not a refusal and keeps the baseline retry.
+    #[cfg(feature = "discovery")]
+    fn note_schema_refused_locked(st: &mut RouterInner, side: RouterSideId, address: u32, now: u64) {
+        let Some(route) = st.discovery_routes.get_mut(&side) else {
+            return;
+        };
+        for (name, peer) in &mut route.announcers {
+            if peer.advertised_address == Some(address) || sender_address_u32(name) == address {
+                peer.schema_refusals = peer.schema_refusals.saturating_add(1);
+                let delay = discovery::DISCOVERY_BASELINE_RETRY_MS
+                    .saturating_mul(1u64 << u32::from(peer.schema_refusals.min(16)))
+                    .min(discovery::DISCOVERY_SCHEMA_REFUSED_RETRY_MAX_MS);
+                peer.schema_retry_at_ms = now.saturating_add(delay);
+                break;
+            }
+        }
     }
 
     #[cfg(feature = "discovery")]
@@ -14179,7 +14206,27 @@ impl Router {
                 let assembled = {
                     let mut st = self.state.lock();
                     let now_ms = self.clock.now_ms();
-                    st.make_side_chunk_room(side, transfer_id, index, total, body.len() - 8)?;
+                    // A refusal discards the assembly; name a refused catalog's
+                    // sender from its first chunk (this one or the retained one).
+                    #[cfg(feature = "discovery")]
+                    let refused_schema = if index == 0 {
+                        wire_format::chunked_schema_source(&body[8..])
+                    } else {
+                        st.side_transport
+                            .get(&side)
+                            .and_then(|state| state.rx_chunks.get(&transfer_id))
+                            .and_then(|assembly| assembly.received.first()?.as_deref())
+                            .and_then(wire_format::chunked_schema_source)
+                    };
+                    let room =
+                        st.make_side_chunk_room(side, transfer_id, index, total, body.len() - 8);
+                    #[cfg(feature = "discovery")]
+                    if let (Err(TelemetryError::PacketTooLarge(_)), Some(address)) =
+                        (&room, refused_schema)
+                    {
+                        Self::note_schema_refused_locked(&mut st, side, address, now_ms);
+                    }
+                    room?;
                     // A CRC-validated retry of a retained fragment needs no
                     // allocation. Do not discard other traffic or reject the
                     // retry because unrelated work consumed the idle reserve.

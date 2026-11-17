@@ -71,6 +71,12 @@ option(SEDSNET_COMPACT_PACKET_COMPRESSION "Enable indexed Zstd arena buffers" OF
 option(SEDSNET_ENABLE_CRYPTOGRAPHY
     "Enable cryptography provider APIs and define SEDS_ENABLE_CRYPTOGRAPHY for C/C++ users"
     ON)
+option(SEDSNET_ZSTD_LEAN
+    "Opt-in: omit zstd long-distance matching and target-block-size code SEDSnet never uses (frames unchanged)"
+    OFF)
+option(SEDSNET_ZSTD_LTO
+    "Opt-in (embedded GCC): build zstd as fat LTO objects with CMAKE_C_COMPILER for an -flto firmware link"
+    OFF)
 option(SEDSNET_EMBEDDED_BUILD_STD
     "Opt-in: rebuild core/alloc for size with nightly + rust-src on embedded release builds"
     OFF)
@@ -220,6 +226,16 @@ if (SEDSNET_ENABLE_CRYPTOGRAPHY)
 endif ()
 if (SEDSNET_EMBEDDED_BUILD_STD)
     list(APPEND RS_ARGS_BOOTSTRAP "--env" "SEDSNET_EMBEDDED_BUILD_STD=1")
+endif ()
+if (SEDSNET_ZSTD_LEAN)
+    list(APPEND RS_ARGS_BOOTSTRAP "--features" "zstd-lean")
+endif ()
+if (SEDSNET_ZSTD_LTO AND SEDSNET_EMBEDDED_BUILD AND NOT RUST_TRIPLE STREQUAL "")
+    # LTO bytecode only links with the GCC that wrote it: compile zstd with
+    # the firmware's compiler. A SEDSNET_ENV_CC_<target> cache entry still wins.
+    string(REGEX REPLACE "[^A-Za-z0-9_]" "_" _RS_TARGET_KEY "${RUST_TRIPLE}")
+    list(APPEND RS_ARGS_BOOTSTRAP "--env" "SEDSNET_EMBEDDED_ZSTD_LTO=1"
+         "--env" "CC_${_RS_TARGET_KEY}=${CMAKE_C_COMPILER}")
 endif ()
 
 # New: forward arbitrary option_env config vars: SEDSNET_ENV_<KEY> => --env KEY=VALUE

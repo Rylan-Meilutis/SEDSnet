@@ -71,6 +71,8 @@ Cargo.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/Cargo.t
 - `compression` (default): enables payload compression (implemented with `zstd-safe`).
 - `timesync`: enables time sync helpers and built-in time sync packet types.
 - `cryptography` (default): enables Rust cryptography provider helpers plus optional C callback registration APIs.
+- `zstd-lean` (opt-in, implies `compression`): leaves zstd's long-distance matcher and
+  target-block-size compressor out of the link (see "Embedded flash size").
 
 Examples:
 
@@ -399,6 +401,25 @@ For extra headroom, `SEDSNET_EMBEDDED_BUILD_STD=1` (or CMake
 `panic = "immediate-abort"` for bare-metal `--release` builds. It needs a nightly
 toolchain with `rust-src` (`SEDSNET_EMBEDDED_BUILD_STD_TOOLCHAIN`, default `nightly`)
 and is off by default. Panics then trap without calling `telemetry_panic_hook`.
+
+Two opt-in zstd size options leave compressed frames byte-for-byte unchanged:
+
+- `zstd-lean` (CMake `SEDSNET_ZSTD_LEAN=ON`): SEDSnet only compresses at level 1
+  without long-distance matching (LDM) or a target compressed-block size. With this
+  feature SEDSnet defines zstd's internal LDM and superblock entry points itself, so
+  the static link never pulls `zstd_ldm.o` or `zstd_compress_superblock.o` (about 8.6
+  KB on Cortex-M, 7.6 KB together with `SEDSNET_ZSTD_LTO`). The definitions behave
+  exactly like zstd's with LDM off and an empty external sequence store; anything that
+  would need the omitted code (an application enabling LDM, `ZSTD_c_targetCBlockSize`
+  or external sequences through the same zstd library) panics instead. It is pinned to
+  zstd 1.5.7 internals and stops compiling on another zstd version until re-verified.
+- `SEDSNET_ZSTD_LTO=ON` (CMake; `build.py --env SEDSNET_EMBEDDED_ZSTD_LTO=1`): compile
+  zstd as fat GCC LTO objects with the parent project's `CMAKE_C_COMPILER`. A firmware
+  linked with `-flto` then optimises zstd together with its callers (8.7-9.7 KB on the
+  STM32 Cortex-M firmware). GCC's linker plugin also LTO-optimises the fat objects when
+  the firmware link does not pass `-flto` (measured: the same ~8.7 KB saving); with
+  the plugin disabled, the link uses their ordinary machine code. LTO bytecode only
+  links with the same GCC version.
 
 ### Fair admission under pressure
 

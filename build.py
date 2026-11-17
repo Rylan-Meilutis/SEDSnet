@@ -27,7 +27,7 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress", "compact-bundle")
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress", "compact-bundle", "zstd-lean")
 
 def qualification_profiles(features: list[str]) -> list[list[str]]:
     """Exercise feature-OFF normal storage and feature-ON compact/fair storage.
@@ -785,6 +785,13 @@ def apply_embedded_cflags_defaults(target: str, env: dict[str, str]) -> None:
         "-DZSTD_STRIP_ERROR_STRINGS=1",
         "-DDYNAMIC_BMI2=0",
     ]
+    # Opt-in: emit fat LTO objects so a GCC `-flto` firmware link can optimise
+    # zstd together with its callers (inlining single-use helpers, merging
+    # header-inlined copies). The objects keep ordinary machine code, so a
+    # non-LTO link is unchanged. LTO bytecode is compiler-version specific:
+    # build zstd with the firmware's own GCC (CMake passes CC_<target>).
+    if env.get("SEDSNET_EMBEDDED_ZSTD_LTO", "0").lower() in ("1", "true", "on", "yes"):
+        defaults += ["-flto", "-ffat-lto-objects"]
 
     keys = [
         "CFLAGS",

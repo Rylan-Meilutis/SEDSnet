@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "6.0.1"
+version = "6.0.2"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -22,6 +22,9 @@ std = ["serde", "serde/std", "serde_json", "serde_json/std"]
 embedded = ["compression", "timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
 python = ["std", "pyo3/extension-module", "pyo3/abi3-py39", "compression", "timesync", "discovery", "cryptography", "compact-bundle"]
 compression = ["zstd-safe"]
+# Opt-in flash reduction: drop zstd's long-distance matcher and target-block-size
+# compressor, which SEDSnet never enables. Frames are unchanged. See src/zstd_lean.rs.
+zstd-lean = ["compression"]
 timesync = []
 discovery = []
 cryptography = []
