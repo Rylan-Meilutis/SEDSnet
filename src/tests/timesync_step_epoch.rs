@@ -135,12 +135,15 @@ impl Net {
         self.nodes[node] = router(self.names[node], self.cfgs[node], &self.now);
         for i in 0..self.links.len() {
             let (a, b) = (self.links[i].a, self.links[i].b);
+            let min_ns = (self.links[i].spec.delay_ms.saturating_sub(1) * 1_000_000) as u32;
             if a == node {
                 let out = self.links[i].a_out.clone();
                 self.links[i].side_a = self.side(node, b, &out);
+                self.nodes[node].set_side_timesync_min_delay(self.links[i].side_a, min_ns);
             } else if b == node {
                 let out = self.links[i].b_out.clone();
                 self.links[i].side_b = self.side(node, a, &out);
+                self.nodes[node].set_side_timesync_min_delay(self.links[i].side_b, min_ns);
             }
         }
     }
@@ -645,5 +648,396 @@ fn a_newer_epoch_on_any_packet_triggers_a_prompt_request() {
     assert_eq!(net.nodes[GW].timesync_status().unwrap().newest_seen_epoch, 4);
     net.tick();
     assert!(gw_requested(&net), "no prompt request");
+}
+
+
+// ---------------------------------------------------------------------------
+// Scenario matrix (SEDSnet 6): sources, restarts, relays, authority,
+// sequences, repeated steps and the step policy.
+// ---------------------------------------------------------------------------
+
+/// Every node's own packets (time sync included) must order by
+/// `(epoch, timestamp)` in the order it sent them: no node ever steps back
+/// inside an epoch. Checks every frame tapped since the net was built.
+fn assert_senders_ordered(net: &Net, label: &str) {
+    let tapped = net.tapped.lock().unwrap();
+    for (node, name) in net.names.iter().enumerate() {
+        let mut last: Option<(u16, u64)> = None;
+        for (from, bytes) in tapped.iter() {
+            if *from != node {
+                continue;
+            }
+            let Ok(pkt) = crate::wire_format::unpack_packet(bytes) else {
+                continue;
+            };
+            if pkt.sender() != *name {
+                continue;
+            }
+            let stamp = (pkt.time_epoch(), pkt.timestamp());
+            if let Some(prev) = last {
+                assert!(
+                    stamp >= prev || pkt.timestamp() < crate::timesync::TIMESYNC_UTC_FLOOR_MS,
+                    "{label}: {name} sent {stamp:?} after {prev:?} ({:?})",
+                    pkt.data_type()
+                );
+            }
+            if pkt.timestamp() >= crate::timesync::TIMESYNC_UTC_FLOOR_MS {
+                last = Some(stamp);
+            }
+        }
+    }
+}
+
+/// Seconds to hours, forward and back, from each kind of local source the
+/// leading station has: an operator/client set (`try_set_local_network_time`)
+/// and a host/NTP correction fed as a named source (`update_network_time_source`).
+/// Every follower, including those one relay away, converges within one or
+/// two exchanges (under 2 s on clean links), and each step starts exactly one
+/// new epoch.
+#[test]
+fn jumps_of_seconds_to_hours_from_operator_and_host_sources_converge() {
+    let mut net = synced_on_stale_station(0.0, 21);
+    let mut epoch = 0u16;
+    let jumps: [i64; 8] = [2_000, -2_000, 90_000, -90_000, 6 * HOUR as i64, -6 * HOUR as i64, 1_500, -(13_700_000)];
+    for (i, jump) in jumps.iter().enumerate() {
+        let target = (net.nodes[GS].network_time_ms().unwrap() as i64 + jump) as u64;
+        if i % 2 == 0 {
+            net.station_sets(target);
+        } else {
+            net.nodes[GS].update_network_time_source("host-ntp", 10, PartialNetworkTime::from_unix_ms(target), None);
+        }
+        epoch += 1;
+        assert_eq!(net.nodes[GS].network_time_epoch(), epoch, "jump {jump}");
+        let took = net.converge(&BOARDS, 50, 2_000);
+        println!("jump {jump} ms: every board within 50 ms after {took} ms");
+        net.run(3_000);
+        assert_eq!(net.epochs(), vec![epoch; 5], "jump {jump}");
+    }
+    net.run(20_000);
+    assert_locked_together(&net, "after the jump series");
+    assert_senders_ordered(&net, "jump series");
+}
+
+/// RF leads the AV bay from its GPS (station out of reach). A GPS fix that
+/// jumps (a wrong cold-start fix corrected, either way) steps RF and FC
+/// follows within two exchanges. When the station is heard again, its better
+/// priority (50 vs RF's 70) wins deterministically, and RF and FC re-anchor
+/// onto the station's time base whatever the two clocks' epochs were.
+#[test]
+fn gps_source_jumps_and_station_authority_on_merge() {
+    let rf_cfg = TimeSyncConfig { role: TimeSyncRole::Source, priority: 70, ..board() };
+    let mut net = Net::new(&[("GS", station()), ("RF", rf_cfg), ("FC", board())], 31);
+    let radio = net.link(0, 1, LinkSpec { delay_ms: 45, loss: 0.2 });
+    net.link(1, 2, CAN);
+    net.links[radio].up = false;
+    net.station_sets(UTC + net.mono());
+    let gps = |net: &Net, off: i64| {
+        net.nodes[1].try_set_local_network_time(PartialNetworkTime::from_unix_ms((UTC as i64 + net.mono() as i64 + off) as u64)).unwrap()
+    };
+    gps(&net, 0);
+    let fc_off = |net: &Net| net.nodes[2].network_time_ms().unwrap() as i64 - net.nodes[1].network_time_ms().unwrap() as i64;
+    net.run(15_000);
+    assert!(fc_off(&net).abs() <= 5, "FC follows RF's GPS: {}", fc_off(&net));
+    for off in [2 * HOUR as i64, -(3 * HOUR as i64), 4_000, 0] {
+        gps(&net, off);
+        let start = net.mono();
+        while fc_off(&net).abs() > 50 {
+            assert!(net.mono() - start < 2_000, "FC did not follow a GPS jump of {off} ms: {}", fc_off(&net));
+            net.tick();
+        }
+        net.run(2_000);
+    }
+    let rf_epoch = net.nodes[1].network_time_epoch();
+    assert!(rf_epoch >= 3, "each GPS jump stepped RF: epoch {rf_epoch}");
+    // The station returns: it outranks RF, which (and FC) follow it.
+    net.links[radio].up = true;
+    net.converge(&[1, 2], 20, 20_000);
+    net.run(20_000);
+    for n in [1, 2] {
+        let st = net.nodes[n].timesync_status().unwrap();
+        assert_eq!(st.state, SyncState::Locked, "{st:?}");
+        assert!(!st.is_reference, "{} must follow the station", net.names[n]);
+        assert!(net.offset_ms(n).unwrap().unsigned_abs() <= 5);
+    }
+    assert!(net.nodes[0].timesync_status().unwrap().is_reference);
+    let epochs = net.epochs();
+    assert!(epochs.iter().all(|&e| e == epochs[0]), "epochs {epochs:?}");
+    assert_senders_ordered(&net, "gps and merge");
+}
+
+/// Two would-be sources: the GS (priority 50) and an RRLS (60), each with its
+/// own host clock 400 ms apart, both reaching RF. The GS leads; the RRLS
+/// follows it. When the GS goes silent the RRLS takes over without any
+/// follower stepping; when the GS returns it leads again, again without steps.
+#[test]
+fn two_sources_have_a_deterministic_authority_and_hand_over_without_steps() {
+    let rrls_cfg = TimeSyncConfig { role: TimeSyncRole::Source, priority: 60, ..board() };
+    let mut net = Net::new(&[("GS", station()), ("RRLS", rrls_cfg), ("RF", board()), ("FC", board())], 41);
+    let gs_radio = net.link(0, 2, LinkSpec { delay_ms: 45, loss: 0.1 });
+    net.link(1, 2, LinkSpec { delay_ms: 45, loss: 0.1 });
+    net.link(2, 3, CAN);
+    net.station_sets(UTC + net.mono());
+    net.nodes[1].try_set_local_network_time(PartialNetworkTime::from_unix_ms(UTC + net.mono() + 400)).unwrap();
+    net.converge(&[1, 2, 3], 10, 30_000);
+    net.run(20_000);
+    let rf = net.nodes[2].timesync_status().unwrap();
+    assert!(!rf.is_reference);
+    assert!(net.nodes[0].timesync_status().unwrap().is_reference, "the GS leads");
+    assert!(!net.nodes[1].timesync_status().unwrap().is_reference, "the RRLS follows the GS");
+    assert!(net.offset_ms(1).unwrap().unsigned_abs() <= 10, "RRLS follows: {:?}", net.offset_ms(1));
+    let steps = |net: &Net| [2usize, 3].map(|n| net.nodes[n].timesync_status().unwrap().steps);
+    let before = steps(&net);
+    let epochs_before = net.epochs();
+    // GS silent: the RRLS takes over after the source timeout.
+    net.links[gs_radio].up = false;
+    net.run(20_000);
+    assert!(net.nodes[1].timesync_status().unwrap().is_reference, "the RRLS leads during the outage");
+    assert_eq!(steps(&net), before, "no follower stepped at the hand-over");
+    for n in [2, 3] {
+        assert_eq!(net.nodes[n].timesync_status().unwrap().state, SyncState::Locked);
+    }
+    // GS back: it leads again.
+    net.links[gs_radio].up = true;
+    net.run(20_000);
+    assert!(net.nodes[0].timesync_status().unwrap().is_reference);
+    assert!(!net.nodes[1].timesync_status().unwrap().is_reference);
+    assert_eq!(steps(&net), before, "no follower stepped when the GS returned");
+    assert_eq!(net.epochs(), epochs_before);
+    for n in [1, 2, 3] {
+        assert!(net.offset_ms(n).unwrap().unsigned_abs() <= 10, "{}: {:?}", net.names[n], net.offset_ms(n));
+    }
+}
+
+/// A board restarts (no time, epoch 0) after the network stepped twice, and a
+/// node joins late: both adopt the network's epoch and time within seconds.
+#[test]
+fn board_restart_and_late_joiner_adopt_the_network_epoch() {
+    let mut net = synced_on_stale_station(0.3, 51);
+    net.station_sets(UTC + net.mono());
+    net.converge(&BOARDS, 20, 5_000);
+    net.station_sets(net.nodes[GS].network_time_ms().unwrap() - 4 * HOUR);
+    net.converge(&BOARDS, 20, 5_000);
+    assert_eq!(net.epochs(), vec![2; 5]);
+    net.restart(AB);
+    assert_eq!(net.nodes[AB].network_time_epoch(), 0);
+    net.converge(&[AB], 20, 5_000);
+    net.restart(FC);
+    net.converge(&[FC], 20, 10_000);
+    assert_eq!(net.epochs(), vec![2; 5]);
+    // A late joiner behind the gateway.
+    let late = net.nodes.len();
+    net.names.push("LATE");
+    net.cfgs.push(board());
+    let r = router("LATE", board(), &net.now);
+    net.nodes.push(r);
+    net.link(GW, late, CAN);
+    net.converge(&[late], 20, 5_000);
+    net.run(10_000);
+    assert_eq!(net.nodes[late].network_time_epoch(), 2);
+    assert_eq!(net.nodes[late].timesync_status().unwrap().state, SyncState::Locked);
+}
+
+/// A step through the RF relay hop over a radio with ~45 ms air packets and
+/// 0%, 25% and 50% loss: RF and FC (behind RF) follow within seconds, and stay
+/// locked afterwards.
+#[test]
+fn relay_hop_over_a_lossy_radio_follows_steps() {
+    for (loss, limit_ms) in [(0.0, 2_000), (0.25, 6_000), (0.5, 20_000)] {
+        let mut net = Net::new(&[("GS", station()), ("RF", board()), ("FC", board())], 61);
+        net.link(0, 1, LinkSpec { delay_ms: 45, loss });
+        net.link(1, 2, CAN);
+        net.station_sets(UTC + net.mono() - FIELD_OFFSET);
+        net.converge(&[1, 2], 5, 60_000);
+        net.run(20_000);
+        for jump in [FIELD_OFFSET as i64, -(4 * HOUR as i64)] {
+            let target = (net.nodes[0].network_time_ms().unwrap() as i64 + jump) as u64;
+            net.station_sets(target);
+            let took = net.converge(&[1, 2], 50, limit_ms);
+            println!("loss {loss}: {jump} ms step followed through the relay within 50 ms after {took} ms");
+            // Afterwards every reading stays within 50 ms and inside the
+            // node's own reported error bound; below 50% loss both lock.
+            for _ in 0..20 {
+                net.run(1_000);
+                for n in [1, 2] {
+                    let st = net.nodes[n].timesync_status().unwrap();
+                    let off = net.offset_ms(n).unwrap().unsigned_abs();
+                    assert!(off <= 50, "loss {loss}: {} off by {off} ms", net.names[n]);
+                    assert!(off * 1_000_000 <= st.error_bound_ns.saturating_add(1_000_000), "loss {loss}: bound dishonest {st:?} off {off}");
+                    assert_eq!(st.epoch, net.nodes[0].network_time_epoch());
+                }
+            }
+            if loss < 0.5 {
+                for n in [1, 2] {
+                    let st = net.nodes[n].timesync_status().unwrap();
+                    assert_eq!(st.state, SyncState::Locked, "loss {loss}: {st:?}");
+                    assert!(net.offset_ms(n).unwrap().unsigned_abs() <= 5, "loss {loss}");
+                }
+            }
+        }
+        assert_senders_ordered(&net, &format!("relay loss {loss}"));
+    }
+}
+
+/// Repeated steps in quick succession (2 s apart, alternating directions,
+/// 1.5 s to 3 h): the network ends in one epoch, locked together, and no node
+/// ever sent a stamp that orders before an earlier one of its own.
+#[test]
+fn repeated_steps_settle_in_one_epoch_with_ordered_stamps() {
+    let mut net = synced_on_stale_station(0.2, 71);
+    for jump in [1_500i64, -3 * HOUR as i64, 2 * HOUR as i64, -5_000, 3 * HOUR as i64, -1_200] {
+        let target = (net.nodes[GS].network_time_ms().unwrap() as i64 + jump) as u64;
+        net.station_sets(target);
+        net.run(2_000);
+    }
+    net.converge(&BOARDS, 20, 10_000);
+    net.run(30_000);
+    assert_locked_together(&net, "after repeated steps");
+    assert_eq!(net.nodes[GS].network_time_epoch(), 6);
+    assert_senders_ordered(&net, "repeated steps");
+}
+
+/// A command sequence in progress (one GS command every 100 ms, each judged by
+/// the receiving boards with a 5 s / 1 s validity window as AB judges an AUX
+/// QD) while the station steps 4 h back and then 3 h 49 min forward: no
+/// command is refused, before, during or after either step; a copy of a
+/// pre-step command delivered 6 s later is refused.
+#[test]
+fn command_windows_hold_through_steps_during_an_active_sequence() {
+    let mut net = synced_on_stale_station(0.0, 81);
+    let mut refused = Vec::new();
+    let mut late_copies = Vec::new();
+    for i in 0..200u64 {
+        if i == 50 {
+            net.station_sets(net.nodes[GS].network_time_ms().unwrap() - 4 * HOUR);
+        }
+        if i == 120 {
+            net.station_sets(net.nodes[GS].network_time_ms().unwrap() + FIELD_OFFSET);
+        }
+        let (ts, epoch) = net.nodes[GS].network_time_ms_with_epoch().unwrap();
+        if i == 45 || i == 115 {
+            late_copies.push((i, epoch, ts));
+        }
+        net.run(30); // transit through the gateway
+        for &n in &[GW, AB, RF, FC] {
+            if !net.nodes[n].network_stamp_is_fresh(epoch, ts, 5_000, 1_000) {
+                refused.push((i, net.names[n], net.nodes[n].network_stamp_age_ms(epoch, ts)));
+            }
+        }
+        net.run(70);
+    }
+    assert!(refused.is_empty(), "refused commands: {refused:?}");
+    net.run(6_000);
+    for (i, epoch, ts) in late_copies {
+        for &n in &[AB, FC] {
+            assert!(
+                !net.nodes[n].network_stamp_is_fresh(epoch, ts, 5_000, 1_000),
+                "{}: a copy of command {i} delivered seconds after a step passed: {:?}",
+                net.names[n],
+                net.nodes[n].network_stamp_age_ms(epoch, ts)
+            );
+        }
+    }
+}
+
+/// The step policy. Inhibited (flight), a 4 h correction is slewed; when
+/// steps are allowed again the next local-source update steps. A station
+/// restarted while steps are inhibited, with a host clock 10 s off the
+/// network's, joins the network's time base: no follower steps; once steps
+/// are allowed its host time steps the network as usual.
+#[test]
+fn step_policy_inhibited_then_allowed_and_a_restarted_station_joins_in_flight() {
+    let mut net = synced_on_stale_station(0.1, 91);
+    net.station_sets(UTC + net.mono());
+    net.converge(&BOARDS, 20, 5_000);
+    net.run(10_000);
+    assert_eq!(net.epochs(), vec![1; 5]);
+    net.nodes[GS].set_timesync_steps_allowed(false);
+    net.station_sets(net.nodes[GS].network_time_ms().unwrap() + 4 * HOUR);
+    net.run(5_000);
+    assert_eq!(net.epochs(), vec![1; 5], "inhibited: no step");
+    assert_locked_together(&net, "slewing in flight");
+    net.nodes[GS].set_timesync_steps_allowed(true);
+    // The host refresh feeds the same (still 4 h away) time: now it steps.
+    net.station_sets(net.nodes[GS].network_time_ms().unwrap() + 4 * HOUR);
+    assert_eq!(net.nodes[GS].network_time_epoch(), 2);
+    net.converge(&BOARDS, 20, 5_000);
+    net.run(10_000);
+    assert_locked_together(&net, "stepped once allowed");
+
+    let steps = |net: &Net| BOARDS.map(|n| net.nodes[n].timesync_status().unwrap().steps);
+    let before = steps(&net);
+    let network_now = net.nodes[GW].network_time_ms().unwrap();
+    net.restart(GS);
+    net.nodes[GS].set_timesync_steps_allowed(false);
+    net.station_sets(network_now + 10_000);
+    net.run(5_000);
+    let st = net.nodes[GS].timesync_status().unwrap();
+    assert_eq!(st.epoch, 2, "joined the network's epoch: {st:?}");
+    assert_eq!(st.last_step.unwrap().reason, TimeSyncStepReason::Joined);
+    assert_eq!(steps(&net), before, "no follower stepped for the restarted station");
+    net.converge(&BOARDS, 20, 5_000);
+    net.run(10_000);
+    assert_locked_together(&net, "after the station joined");
+    net.nodes[GS].set_timesync_steps_allowed(true);
+    let host = net.nodes[GS].network_time_ms().unwrap() + 10_000;
+    net.station_sets(host);
+    assert_eq!(net.nodes[GS].network_time_epoch(), 3);
+    net.converge(&BOARDS, 20, 5_000);
+    net.run(10_000);
+    assert_locked_together(&net, "after the station's host time stepped the network");
+}
+
+/// Every node restarts at once (a whole-stack power cycle). The actuator
+/// persisted a replay floor stamped in epoch 3 and raises its epoch to it at
+/// boot: the network settles in an epoch at or above 3, so the station's next
+/// command orders after the floor, while the floor still refuses anything
+/// stamped before it.
+#[test]
+fn a_persisted_epoch_raises_the_network_after_a_whole_stack_restart() {
+    let mut net = synced_on_stale_station(0.0, 101);
+    for _ in 0..3 {
+        net.station_sets(net.nodes[GS].network_time_ms().unwrap() + 2 * HOUR);
+        net.converge(&BOARDS, 20, 5_000);
+    }
+    let floor = net.nodes[GS].network_time_ms_with_epoch().map(|(ms, e)| (e, ms)).unwrap();
+    assert_eq!(floor.0, 3);
+    for n in 0..net.nodes.len() {
+        net.restart(n);
+    }
+    assert_eq!(net.nodes[AB].raise_network_time_epoch(floor.0), 3);
+    // The station's host clock is earlier than the floor's stamp.
+    net.station_sets(floor.1 - HOUR);
+    net.converge(&BOARDS, 20, 10_000);
+    net.run(20_000);
+    assert_locked_together(&net, "after the whole-stack restart");
+    let (ms, epoch) = net.nodes[GS].network_time_ms_with_epoch().unwrap();
+    assert!(epoch >= 3, "network epoch {epoch}");
+    assert_eq!(crate::timesync::compare_network_stamps((epoch, ms), floor), std::cmp::Ordering::Greater);
+    assert_eq!(
+        crate::timesync::compare_network_stamps((floor.0, floor.1 - 1), floor),
+        std::cmp::Ordering::Less
+    );
+}
+
+/// Freshness verdicts and packet identity across epochs.
+#[test]
+fn stamp_freshness_verdicts_and_identity_across_epochs() {
+    use NetworkStampAge::*;
+    assert!(Age(0).is_fresh(5_000, 1_000));
+    assert!(Age(5_000).is_fresh(5_000, 1_000));
+    assert!(!Age(5_001).is_fresh(5_000, 1_000));
+    assert!(Age(-1_000).is_fresh(5_000, 1_000));
+    assert!(!Age(-1_001).is_fresh(5_000, 1_000));
+    assert!(NewerEpoch { since_ms: 0 }.is_fresh(5_000, 0));
+    assert!(!NewerEpoch { since_ms: 5_001 }.is_fresh(5_000, 0));
+    assert!(!OlderEpoch.is_fresh(u64::MAX, u64::MAX));
+    assert!(!NoTime.is_fresh(u64::MAX, u64::MAX));
+    // The same stamp and nonce in another epoch is another packet: receipt
+    // dedupe never mistakes a post-step packet for a pre-step one.
+    let (ty, ep) = flight_state();
+    let a = Packet::new_with_nonce(ty, &[ep], "GS", UTC, 7, Arc::<[u8]>::from([1u8])).unwrap();
+    let b = a.clone().with_time_epoch(1);
+    assert_ne!(a.packet_id(), b.packet_id());
+    assert_eq!(a.packet_id(), a.clone().with_time_epoch(0).packet_id());
 }
 

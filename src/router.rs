@@ -15325,13 +15325,22 @@ impl Router {
         called_from_queue: bool,
         epoch: u16,
     ) -> TelemetryResult<()> {
-        let pkt = self.timesync_packet(DataType::TimeSyncRequest, &[seq, t1_mono_ms], self.packet_timestamp_ms(), epoch)?;
+        let pkt = self.timesync_packet(DataType::TimeSyncRequest, &[seq, t1_mono_ms], self.timesync_request_stamp(epoch), epoch)?;
         let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
         if called_from_queue {
             self.tx_queue_item(item)
         } else {
             self.tx_item(item)
         }
+    }
+
+    /// Timestamp of a time sync request carrying `epoch`. A relay that passes
+    /// a follower's newer epoch upstream stamps 0: its own clock is not in that
+    /// epoch's time base, so its stamp must not let the leader conclude that
+    /// the bases agree (the leader then names a newer epoch of its own).
+    #[cfg(feature = "timesync")]
+    fn timesync_request_stamp(&self, epoch: u16) -> u64 {
+        if epoch > self.network_time_epoch() { 0 } else { self.packet_timestamp_ms() }
     }
 
     /// Network time and its epoch for an announce (monotonic time and epoch
@@ -15560,7 +15569,7 @@ impl Router {
                     DataType::TimeSyncRequest,
                     &[seq, t1_mono_ms],
                     &[side],
-                    self.packet_timestamp_ms(),
+                    self.timesync_request_stamp(epoch),
                     epoch,
                 )?;
                 queued_any = true;

@@ -48,5 +48,25 @@ fn c_station_step_reports_epoch_status_and_translated_stamp_age() {
     assert_eq!(seds_router_network_stamp_age_ms(router, 2, before, &mut kind, &mut age), SedsResult::SedsOk as i32);
     assert_eq!(kind, 1, "newer epoch");
     assert_ne!(seds_router_network_stamp_age_ms(ptr::null_mut(), 0, 0, &mut kind, &mut age), SedsResult::SedsOk as i32);
+
+    // The validity-window check: the pre-step stamp is fresh within 5 s; a
+    // 6 s old one is not; a newer epoch passes while just heard of.
+    let mut fresh = false;
+    assert_eq!(seds_router_network_stamp_fresh(router, epoch0, before, 5_000, 1_000, &mut fresh), SedsResult::SedsOk as i32);
+    assert!(fresh);
+    assert_eq!(seds_router_network_stamp_fresh(router, epoch0, before - 6_000, 5_000, 1_000, &mut fresh), SedsResult::SedsOk as i32);
+    assert!(!fresh);
+    assert_eq!(seds_router_network_stamp_fresh(router, 2, before, 5_000, 1_000, &mut fresh), SedsResult::SedsOk as i32);
+    assert!(fresh);
+    assert_ne!(seds_router_network_stamp_fresh(router, 0, 0, 0, 0, ptr::null_mut()), SedsResult::SedsOk as i32);
+
+    // A persisted epoch raises the clock's epoch, never lowers it.
+    let mut epoch = 0u16;
+    assert_eq!(seds_router_raise_time_epoch(router, 5, &mut epoch), SedsResult::SedsOk as i32);
+    assert_eq!(epoch, 5);
+    assert_eq!(seds_router_raise_time_epoch(router, 3, ptr::null_mut()), SedsResult::SedsOk as i32);
+    assert_eq!(seds_router_get_timesync_status(router, &mut status), SedsResult::SedsOk as i32);
+    assert_eq!(status.epoch, 5);
+    assert_eq!(status.last_step_reason, crate::timesync::TimeSyncStepReason::Raised.code());
     seds_router_free(router);
 }
