@@ -256,7 +256,8 @@ floors, last accepted command) store `(epoch, timestamp)` and compare with
 epoch, so a post-step packet that happens to repeat a pre-step stamp and nonce is never dropped as
 a duplicate. Applications that stamp packets themselves read
 `network_time_ms_with_epoch()` and set `Packet::with_time_epoch`; packets a router originates
-with epoch 0 and its own sender are stamped with its current epoch automatically.
+with its own sender and an epoch never stated are stamped with its current epoch automatically
+(`with_time_epoch(0)` states epoch 0; C: a nonzero `time_epoch` on a view passed in is stated).
 
 ### Status
 

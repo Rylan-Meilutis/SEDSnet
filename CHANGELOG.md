@@ -33,8 +33,10 @@ write as "older".
   stepped separately under one number reconcile). A follower whose source is
   in an older epoch holds its clock; any packet from a newer epoch makes a
   follower ask its source at once. Exchange stamps never mix time bases.
-- `Packet::time_epoch` / `with_time_epoch`; routers stamp their epoch on the
-  packets they originate (own sender, epoch 0). Wire: contract flag `0x08`
+- `Packet::time_epoch` / `with_time_epoch` / `time_epoch_stated`; routers
+  stamp their epoch on the packets they originate (own sender, epoch never
+  stated; `with_time_epoch(0)` states epoch 0). C: a nonzero `time_epoch` on a
+  view passed in states the epoch. Wire: contract flag `0x08`
   plus a ULEB128 epoch (1..=65535) after the targets, folded into the packet
   ID when nonzero; an epoch-only contract freezes nothing (endpoint encoding,
   fairness and latest-value eligibility unchanged). Compact bundles and side

@@ -225,8 +225,9 @@ typedef struct SedsPacketView
 
     /** Network time-base epoch of `timestamp` (SEDSnet 6): 0 until network
      *  time was first stepped. Order one sender's packets by
-     *  (time_epoch, timestamp). Filled on views the library hands out;
-     *  ignored on views passed in (the router stamps its own epoch). */
+     *  (time_epoch, timestamp). Filled on views the library hands out. On a
+     *  view passed in, nonzero states the epoch the timestamp was taken in;
+     *  0 lets the router fill in its current epoch. */
     uint16_t time_epoch;
 } SedsPacketView;
 

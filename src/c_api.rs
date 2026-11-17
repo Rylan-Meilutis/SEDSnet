@@ -351,8 +351,8 @@ pub struct SedsPacketView {
     payload: *const u8,
     payload_len: usize,
     /// Network time-base epoch of `timestamp` (SEDSnet 6). Filled on views
-    /// the library hands out; ignored on views passed in (the router stamps
-    /// its own epoch on packets it originates).
+    /// the library hands out. On a view passed in, nonzero states the epoch
+    /// the timestamp was taken in; 0 lets the router fill in its current one.
     time_epoch: u16,
 }
 
@@ -487,7 +487,11 @@ fn view_to_packet(view: &SedsPacketView) -> Result<Packet, ()> {
 
     let payload = Arc::<[u8]>::from(bytes);
 
-    Packet::new(ty, &eps, sender_owned, view.timestamp, payload).map_err(|_| ())
+    // A nonzero epoch on a view passed in is stated (a stamp taken in that
+    // epoch); 0 leaves it to the router, which fills in its current epoch.
+    Packet::new(ty, &eps, sender_owned, view.timestamp, payload)
+        .map(|pkt| if view.time_epoch != 0 { pkt.with_time_epoch(view.time_epoch) } else { pkt })
+        .map_err(|_| ())
 }
 
 /// Write a Rust string into a C buffer, respecting "query mode":

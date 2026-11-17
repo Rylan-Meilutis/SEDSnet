@@ -22163,15 +22163,15 @@ impl Router {
     }
 
     /// Stamps this router's network time-base epoch on a packet it originates
-    /// (its own sender, epoch still 0), so receivers order its stamps across
-    /// steps. Packets carrying another sender or an explicit epoch keep theirs.
+    /// (its own sender, epoch never stated), so receivers order its stamps
+    /// across steps. Packets carrying another sender or a stated epoch (0
+    /// included, see [`Packet::with_time_epoch`]) keep theirs.
     #[inline]
     pub(crate) fn stamp_origin_epoch(&self, pkt: &mut Packet) {
         #[cfg(feature = "timesync")]
         {
-            let epoch = self.network_time_epoch();
-            if epoch != 0 && pkt.time_epoch() == 0 && pkt.sender() == self.sender_arc().as_ref() {
-                pkt.set_time_epoch(epoch);
+            if !pkt.time_epoch_stated() && pkt.sender() == self.sender_arc().as_ref() {
+                pkt.set_time_epoch(self.network_time_epoch());
             }
         }
         #[cfg(not(feature = "timesync"))]

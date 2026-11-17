@@ -1073,3 +1073,29 @@ fn a_board_that_cannot_sync_judges_commands_from_heard_stamps() {
     hear(2, UTC + 10_000);
     assert!(board_router.network_stamp_is_fresh(3, UTC - 4 * HOUR, 15_000, 1_000));
 }
+
+/// Epoch 0 can be stated explicitly: a packet built with a stamp saved before
+/// the network's first step keeps epoch 0 when sent after it, while a packet
+/// whose epoch was never stated is stamped with the router's current epoch.
+#[test]
+fn a_stated_epoch_zero_is_kept_and_an_unstated_one_is_filled_in() {
+    let (ty, ep) = flight_state();
+    let net = {
+        let mut net = synced_on_stale_station(0.0, 111);
+        net.station_sets(UTC + net.mono());
+        net.converge(&BOARDS, 20, 5_000);
+        net
+    };
+    assert_eq!(net.nodes[GS].network_time_epoch(), 1);
+    let sent = |mut pkt: Packet| {
+        net.nodes[GS].stamp_origin_epoch(&mut pkt);
+        crate::wire_format::unpack_packet(&crate::wire_format::pack_packet(&pkt)).ok().map(|p| p.time_epoch())
+    };
+    let base = Packet::new(ty, &[ep], "GS", UTC, Arc::<[u8]>::from([1u8])).unwrap();
+    assert!(!base.time_epoch_stated());
+    assert_eq!(sent(base.clone()), Some(1), "unstated: the router's epoch");
+    let stated = base.clone().with_time_epoch(0);
+    assert!(stated.time_epoch_stated());
+    assert_eq!(stated, base, "stating the epoch is not part of equality");
+    assert_eq!(sent(stated), Some(0), "stated 0 is kept");
+}
