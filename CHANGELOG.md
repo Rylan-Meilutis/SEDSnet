@@ -68,6 +68,10 @@ write as "older".
   inside the window, so a command sent right after a step is not refused by a
   board still re-anchoring. Ordering helpers `compare_network_stamps` (C
   `seds_stamp_cmp`).
+  A node with no usable network time of its own (cannot sync, or follows
+  unanchored time) judges stamps against the newest plausible-UTC stamp heard
+  on any packet, advanced by its monotonic clock, so a board whose source is
+  lost still accepts fresh station recovery commands.
 - `Router::raise_network_time_epoch(min)` (C `seds_router_raise_time_epoch`,
   Python `raise_network_time_epoch`): restore an epoch persisted with an
   ordering mark at boot; the network's epoch never falls below it, even after

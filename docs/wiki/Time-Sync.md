@@ -245,7 +245,12 @@ Command-validity windows (for example an actuator accepting a quick-disconnect c
 (C `seds_router_network_stamp_fresh`, Python `network_stamp_is_fresh`): a translated age inside the
 window passes; a newer-epoch stamp passes while `since_ms <= max_age_ms`, so a command sent right
 after a step is not refused by a board that is a few milliseconds from re-anchoring; an
-untranslatable older epoch and a node without network time never pass. Ordering marks (replay
+untranslatable older epoch never passes. A node with no usable network time of its own (it never
+synced, its source is lost, or it follows unanchored time while the stamp is UTC) judges stamps
+against the newest plausible-UTC stamp it has heard on any packet, advanced by its own monotonic
+time: a lower bound of network time, re-anchored by a newer epoch (either direction) and never moved
+back inside one. So recovery and other station commands stay reachable on a board that cannot sync
+at all; only a node that has heard no UTC stamp yet reports `NoTime` (never fresh). Ordering marks (replay
 floors, last accepted command) store `(epoch, timestamp)` and compare with
 `sedsnet::timesync::compare_network_stamps` (C `seds_stamp_cmp`). Receipt dedupe keys include the
 epoch, so a post-step packet that happens to repeat a pre-step stamp and nonce is never dropped as

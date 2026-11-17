@@ -1041,3 +1041,35 @@ fn stamp_freshness_verdicts_and_identity_across_epochs() {
     assert_eq!(a.packet_id(), a.clone().with_time_epoch(0).packet_id());
 }
 
+
+/// A board that cannot sync at all (its only source is gone before it ever
+/// got time) still judges station commands from the stamps it hears: a fresh
+/// command passes, a stale one and one from before a step it never followed
+/// do not, and a newer epoch re-anchors the estimate (a step back included).
+#[test]
+fn a_board_that_cannot_sync_judges_commands_from_heard_stamps() {
+    let (ty, ep) = flight_state();
+    let now = Arc::new(AtomicU64::new(10_000));
+    let board_router = router("LONELY", TimeSyncConfig::default(), &now);
+    let side = board_router.add_side_packed("gs", |_| Ok(()));
+    assert_eq!(board_router.network_stamp_age_ms(0, UTC), NetworkStampAge::NoTime);
+    let hear = |epoch: u16, ms: u64| {
+        let pkt = Packet::new(ty, &[ep], "GS", ms, Arc::<[u8]>::from([1u8])).unwrap().with_time_epoch(epoch);
+        board_router.rx_packed_from_side(&crate::wire_format::pack_packet(&pkt), side).unwrap();
+        let _ = board_router.drain_queues_with_timeout(0);
+    };
+    hear(2, UTC);
+    assert!(board_router.network_time_ms().is_none_or(|ms| ms < crate::timesync::TIMESYNC_UTC_FLOOR_MS));
+    now.fetch_add(3_000, Ordering::SeqCst);
+    assert_eq!(board_router.network_stamp_age_ms(2, UTC + 2_500), NetworkStampAge::Age(500));
+    assert!(board_router.network_stamp_is_fresh(2, UTC + 2_500, 15_000, 1_000));
+    assert!(!board_router.network_stamp_is_fresh(2, UTC - 20_000, 15_000, 1_000));
+    assert_eq!(board_router.network_stamp_age_ms(1, UTC), NetworkStampAge::OlderEpoch);
+    // A step back four hours in epoch 3 re-anchors the estimate.
+    hear(3, UTC - 4 * HOUR);
+    assert!(board_router.network_stamp_is_fresh(3, UTC - 4 * HOUR, 15_000, 1_000));
+    assert!(!board_router.network_stamp_is_fresh(2, UTC + 3_000, 15_000, 1_000));
+    // An older-epoch packet never moves it back.
+    hear(2, UTC + 10_000);
+    assert!(board_router.network_stamp_is_fresh(3, UTC - 4 * HOUR, 15_000, 1_000));
+}

@@ -195,6 +195,46 @@ impl EpochState {
     }
 }
 
+/// The newest plausible-UTC `(epoch, timestamp)` heard on any received
+/// packet and the local monotonic instant it was heard, kept without the time
+/// sync lock. It stands in for network time only while this node has none of
+/// its own (it cannot sync: no reachable source, a broken exchange), so command
+/// windows stay judgeable from the stamps the station sends: a lower bound of
+/// network time advanced by local elapsed time, re-anchored (either direction)
+/// by a newer epoch and never moved back inside one.
+#[derive(Debug, Default)]
+pub(super) struct HeardStamp {
+    epoch: core::sync::atomic::AtomicU32,
+    ms: core::sync::atomic::AtomicU64,
+    mono_ms: core::sync::atomic::AtomicU64,
+}
+
+impl HeardStamp {
+    fn read(&self, now_mono_ms: u64) -> Option<(u16, u64)> {
+        use core::sync::atomic::Ordering::Acquire;
+        let epoch = self.epoch.load(Acquire);
+        if epoch == 0 {
+            return None;
+        }
+        let ms = self.ms.load(Acquire);
+        let at = self.mono_ms.load(Acquire);
+        Some(((epoch - 1) as u16, ms.saturating_add(now_mono_ms.saturating_sub(at))))
+    }
+
+    fn note(&self, epoch: u16, ms: u64, now_mono_ms: u64) {
+        use core::sync::atomic::Ordering::Release;
+        if ms < TIMESYNC_UTC_FLOOR_MS {
+            return;
+        }
+        if self.read(now_mono_ms).is_some_and(|cur| (epoch, ms) <= cur) {
+            return;
+        }
+        self.mono_ms.store(now_mono_ms, Release);
+        self.ms.store(ms, Release);
+        self.epoch.store(u32::from(epoch) + 1, Release);
+    }
+}
+
 /// What a follower did with a target from its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Follow {
@@ -1309,6 +1349,7 @@ impl Router {
     /// after everything the network already holds from the first packet it
     /// hears rather than from the first request it serves.
     pub(super) fn timesync_note_rx_epoch(&self, epoch: u16, timestamp_ms: u64) {
+        self.timesync_heard.note(epoch, timestamp_ms, self.monotonic_now_ms());
         if epoch == 0 || epoch <= self.timesync_epoch.load(core::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -1376,8 +1417,22 @@ impl Router {
         let Some(runtime) = self.timesync.as_ref() else {
             return NetworkStampAge::NoTime;
         };
-        let Some(now_ms) = self.network_time_ms() else {
-            return NetworkStampAge::NoTime;
+        // Our own time judges a UTC stamp only when it reads UTC itself (a
+        // board following an RF without a GPS fix holds uptime-based time).
+        let own = self
+            .network_time_ms()
+            .filter(|ms| *ms >= TIMESYNC_UTC_FLOOR_MS || timestamp_ms < TIMESYNC_UTC_FLOOR_MS);
+        let Some(now_ms) = own else {
+            // No usable network time of our own (never synced, or no source
+            // can be reached): judge against the newest stamp heard.
+            return match self.timesync_heard.read(self.monotonic_now_ms()) {
+                Some((heard_epoch, heard_ms)) if epoch == heard_epoch => {
+                    NetworkStampAge::Age((i128::from(heard_ms) - i128::from(timestamp_ms)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
+                }
+                Some((heard_epoch, _)) if epoch > heard_epoch => NetworkStampAge::NewerEpoch { since_ms: 0 },
+                Some(_) => NetworkStampAge::OlderEpoch,
+                None => NetworkStampAge::NoTime,
+            };
         };
         let now_ns = self.monotonic_now_ns();
         let st = runtime.lock();

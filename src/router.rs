@@ -4502,6 +4502,10 @@ pub struct Router {
     /// stamping packets without its lock.
     #[cfg(feature = "timesync")]
     timesync_epoch: Arc<core::sync::atomic::AtomicU16>,
+    /// Newest plausible-UTC stamp heard on any received packet, for judging
+    /// stamps while this node has no network time of its own.
+    #[cfg(feature = "timesync")]
+    timesync_heard: timesync_v2::HeardStamp,
 }
 
 #[cfg(feature = "std")]
@@ -15945,6 +15949,8 @@ impl Router {
             timesync_tx_arm: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "timesync")]
             timesync_epoch,
+            #[cfg(feature = "timesync")]
+            timesync_heard: Default::default(),
         }
     }
 
