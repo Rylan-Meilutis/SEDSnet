@@ -142,10 +142,90 @@ Failover uses holdover plus slew:
 - the network clock keeps running monotonically during producer loss or producer change
 - a new leader does not step an anchored clock backward or forward immediately
 - instead, the router slews toward the new leader at the configured `max_slew_ppm` rate
-- a fresh, matched response from the elected source may step an anchored clock forward by more than
-  five seconds
 - a clock holding unanchored time steps onto UTC from the first anchored announce, verified response
   or local reference, and a clock reading plausible UTC is never steered toward unanchored time
+
+## Steps, slews and the time-base epoch (SEDSnet 6)
+
+A leading node (the elected reference, for example the GS) corrects its own clock from local time
+sources (`try_set_local_network_time` and the other local setters, `update_network_time_source`)
+like this:
+
+| Error vs the local source | Steps allowed (default) | Steps inhibited |
+| --- | --- | --- |
+| at most `step_threshold_ms` (default 1000 ms) | slew at `reference_slew_ppm` (default 20 ppm) | slew at `reference_slew_ppm` |
+| above `step_threshold_ms` | **step**, start a new epoch | slew at `reference_slew_ppm` |
+
+`step_local_network_time_ns` always steps (a new epoch) unless steps are inhibited.
+`Router::set_timesync_steps_allowed(false)` (C `seds_router_set_timesync_steps_allowed`, Python
+`set_timesync_steps_allowed`) inhibits steps, for example from Armed until Recovery; inhibited, even
+hours are slewed and the network stays together around the leading clock.
+
+The reference slew is deliberately slow. Followers see it as a change of their source's frequency,
+which their exchange discipline tracks and bounds honestly only within its drift allowance
+(`TIMESYNC_DRIFT_ALLOWANCE_PPB`, 50 ppm). Before SEDSnet 6 local corrections slewed at
+`max_slew_ppm` (5%): a 3 h 49 min correction took 76 h, and followers, whose frequency range is 3%,
+fell seconds behind and dropped to Acquiring. `max_slew_ppm` now only limits the slew of a
+follower's own small, measured phase corrections.
+
+### Epochs
+
+Every packet a router originates carries the **time-base epoch** its timestamp was taken in
+(`Packet::time_epoch`, 0 until a step was ever seen; on the wire in the contract, see
+[Technical-Wire-Format](Technical-Wire-Format)). An epoch names one continuous time base:
+
+- a leading node starts a new epoch, newer than every epoch it has seen, on each step of its own
+  clock;
+- a follower adopts its source's newer epoch at once from the first announce or response that
+  carries it, steps to the source (any size, either direction) and proves lock again; a relay
+  then announces the new epoch downstream at once, and every node that changes epoch sends its
+  next four announces 150 ms apart so lossy links learn of the change within a fraction of a
+  second;
+- a follower never steps back inside an epoch: if it finds itself ahead of its source by more than
+  the step threshold (plus the exchange's own error bound) in the same epoch, it names a newer
+  epoch and holds its clock; its requests carry that epoch upstream (relays pass the newest epoch
+  their followers carry), the leader adopts a newer epoch (the same number when the follower's
+  stamp agrees with its clock within the step threshold, otherwise one more) and the follower then
+  steps onto it;
+- a follower whose source is in an older epoch (a restarted station) holds its clock until the
+  source adopts the network's epoch from its requests, normally within one round trip;
+- any received packet from a newer epoch makes a follower ask its source at once.
+
+So one sender's packets are always ordered by `(time_epoch, timestamp)`, across steps in either
+direction. The router uses that order for managed network variables: a write made after a 4 h
+step back supersedes the writer's earlier ones, and a late copy stamped before the step never
+re-applies (before SEDSnet 6 every write for the next 4 h was refused as "older"). Latest-value
+egress replacement uses the same order.
+
+Freshness checks must not compare a raw timestamp with `network_time_ms()` across a step. Use
+`Router::network_stamp_age_ms(epoch, timestamp)` (C `seds_router_network_stamp_age_ms`, Python
+`network_stamp_age_ms`): it translates the stamp across the last four epoch changes this node
+remembers and returns its age, `NewerEpoch` (this node has not re-anchored yet; it is doing so) or
+`OlderEpoch` (stamped before a step no longer remembered: stale). A command stamped 2 s before a
+4 h step back is 2 s old, not 4 h in the future. Applications that stamp packets themselves read
+`network_time_ms_with_epoch()` and set `Packet::with_time_epoch`; packets a router originates
+with epoch 0 and its own sender are stamped with its current epoch automatically.
+
+### Status
+
+`timesync_status()` (C `seds_router_get_timesync_status`, Python `timesync_status()`) reports, in
+addition to state, error bound, pending offset and rate: `epoch`, `newest_seen_epoch` (above
+`epoch`: this node is re-anchoring), `holding`, `steps`, `steps_allowed` and `last_step` (delta,
+reason, epochs, age). Reasons: `LocalSource`, `Explicit`, `UtcAnchor`, `SourceEpoch`, `Resync`
+(followed forward beyond the threshold in the same epoch), `Diverged` and `Renamed`. A node
+holding for its source reports Acquiring. A station should show and alarm on: state not Locked,
+`holding`, `newest_seen_epoch > epoch`, and a recent `last_step`.
+
+### Configuration
+
+| `TimeSyncConfig` field | Default | Meaning |
+| --- | --- | --- |
+| `step_threshold_ms` | 1000 | local corrections above it step a leading clock; followers more than this behind step forward |
+| `reference_slew_ppm` | 20 | slew of a leading clock toward its local source; keep below 50 ppm |
+| `max_slew_ppm` | 50000 | slew of a follower's own small phase corrections |
+
+`Router::set_timesync_step_policy(threshold, slew)` (C `seds_router_set_timesync_step_policy`,
+Python `set_timesync_step_policy`) changes the first two without resetting time sync state.
 
 The internal clock also supports merging partial absolute sources:
 

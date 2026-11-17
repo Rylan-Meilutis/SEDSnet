@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased (proposed 6.0.0)
+
+**Breaking wire and API changes (network time steps).** Once network time has
+been stepped, frames carry their time-base epoch in the wire contract, which
+5.0 decoders reject; the GS, RRLS and every board update together. Frames
+stamped in epoch 0 (no step ever seen) are unchanged. Field fault of
+2026-11-16: a station clock 3 h 49 min off was corrected by a 5% slew (76 h),
+followers (3% frequency range) fell seconds behind and flickered to
+Acquiring, and after a step back the managed FLIGHT_STATE refused every later
+write as "older".
+
+- A leading node steps instead of slews when a local time source (operator,
+  host or GPS time) disagrees by more than `TimeSyncConfig::step_threshold_ms`
+  (default 1000 ms), and slews smaller corrections at
+  `TimeSyncConfig::reference_slew_ppm` (default 20 ppm, inside the 50 ppm
+  drift followers' disciplines allow for) instead of `max_slew_ppm` (5%).
+  `max_slew_ppm` now only limits a follower's own phase corrections.
+  `Router::set_timesync_steps_allowed(false)` inhibits steps (flight phases):
+  then even hours are slewed. `set_timesync_step_policy` changes threshold and
+  slew in place. `step_local_network_time_ns` returns false while inhibited.
+- Network time-base epoch: every step of a leading clock starts a new epoch,
+  newer than any it has seen. Followers adopt a newer source epoch at once
+  from the first announce or response carrying it and step to the source in
+  either direction (a 4 h step: every board, including those behind relays
+  and a 30%-loss radio, within 50 ms in under 0.4 s and within 2 ms in about
+  4 s in the host sims); relays re-announce it at once, and a node that
+  changes epoch sends four announces 150 ms apart. A follower never steps back
+  inside an epoch: ahead of its source beyond the threshold it names a newer
+  epoch, its requests carry it upstream, and the leader adopts it (a restarted
+  station adopts the network's epoch from the first requests; partitions that
+  stepped separately under one number reconcile). A follower whose source is
+  in an older epoch holds its clock; any packet from a newer epoch makes a
+  follower ask its source at once. Exchange stamps never mix time bases.
+- `Packet::time_epoch` / `with_time_epoch`; routers stamp their epoch on the
+  packets they originate (own sender, epoch 0). Wire: contract flag `0x08`
+  plus a ULEB128 epoch (1..=65535) after the targets, folded into the packet
+  ID when nonzero; an epoch-only contract freezes nothing (endpoint encoding,
+  fairness and latest-value eligibility unchanged). Compact bundles and side
+  templates carry it.
+- Managed network variables and latest-value egress order one sender's
+  updates by `(time_epoch, timestamp)`: a write made after a step back
+  supersedes the writer's earlier ones and a late copy stamped before the step
+  never re-applies.
+- `Router::network_stamp_age_ms(epoch, timestamp)` (`NetworkStampAge`):
+  freshness of a stamp translated across the last four epoch changes, or
+  `NewerEpoch` / `OlderEpoch`. `network_time_epoch`,
+  `network_time_ms_with_epoch`.
+- `TimeSyncStatus` adds `epoch`, `newest_seen_epoch`, `holding`, `steps`,
+  `last_step` (`TimeSyncLastStep`: delta, `TimeSyncStepReason`, epochs, age)
+  and `steps_allowed`; a holding node reports Acquiring.
+- C: `SedsPacketView.time_epoch` (filled on views handed out, ignored on views
+  passed in), `SedsTimeSyncStatus` epoch/step fields (struct grew),
+  `seds_router_set_timesync_step_policy`,
+  `seds_router_set_timesync_steps_allowed`,
+  `seds_router_get_network_time_ms_with_epoch`,
+  `seds_router_network_stamp_age_ms`. Python: `Packet.time_epoch`,
+  `Router.timesync_status`, `network_time_epoch`,
+  `network_time_ms_with_epoch`, `network_stamp_age_ms`,
+  `set_timesync_steps_allowed`, `set_timesync_step_policy`, and
+  `configure_timesync(step_threshold_ms=, reference_slew_ppm=)`.
+- Rust API: `TimeSyncConfig` has two new public fields (struct literals need
+  `..Default::default()`); `TimeSyncStatus` has new fields.
+
 ## 5.0.0
 
 **Breaking wire changes (time sync and compact bundles).** SEDSnet 4.x and
