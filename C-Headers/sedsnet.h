@@ -222,6 +222,12 @@ typedef struct SedsPacketView
     uint64_t timestamp;
     const uint8_t * payload;
     size_t payload_len;
+
+    /** Network time-base epoch of `timestamp` (SEDSnet 6): 0 until network
+     *  time was first stepped. Order one sender's packets by
+     *  (time_epoch, timestamp). Filled on views the library hands out;
+     *  ignored on views passed in (the router stamps its own epoch). */
+    uint16_t time_epoch;
 } SedsPacketView;
 
 typedef struct SedsP2pMessageView
@@ -600,6 +606,18 @@ typedef struct SedsTimeSyncStatus {
     int32_t offset_us;        /**< correction still being slewed out (positive: behind) */
     int32_t rate_ppb;         /**< learned oscillator frequency correction */
     uint32_t last_sample_age_ms; /**< age of newest exchange sample; UINT32_MAX when none */
+    /* SEDSnet 6: network time-base epoch and steps. */
+    uint16_t epoch;               /**< time-base epoch of this node's clock */
+    uint16_t newest_seen_epoch;   /**< newest epoch on any received packet (above epoch: re-anchoring) */
+    uint8_t holding;              /**< 1 while held for a source in an older epoch */
+    uint8_t steps_allowed;        /**< 1 when local sources may step this clock */
+    uint8_t last_step_reason;     /**< 0 none, 1 local source, 2 explicit, 3 UTC anchor, 4 source epoch, 5 resync, 6 diverged, 7 renamed */
+    uint8_t _reserved;
+    uint32_t steps;               /**< steps and epoch changes since start */
+    uint32_t last_step_age_ms;    /**< UINT32_MAX when none */
+    int64_t last_step_delta_ms;   /**< new minus old reading at the last step */
+    uint16_t last_step_from_epoch;
+    uint16_t last_step_to_epoch;
 } SedsTimeSyncStatus;
 
 /**
@@ -617,6 +635,33 @@ SedsResult seds_router_get_network_time_us(SedsRouter * r, uint64_t * out_us);
 
 /** @brief Read this node's time sync quality. */
 SedsResult seds_router_get_timesync_status(SedsRouter * r, SedsTimeSyncStatus * out);
+
+/**
+ * @brief Set the step policy in place (SEDSnet 6), keeping time sync state.
+ *
+ * A local time source that disagrees with a leading clock by more than
+ * `step_threshold_ms` steps it and starts a new time-base epoch (while steps
+ * are allowed); smaller corrections, and all while inhibited, slew at most at
+ * `reference_slew_ppm`. 0 keeps the current value. Defaults: 1000 ms, 20 ppm (keep the slew below
+ * the followers' 50 ppm drift allowance so they track it).
+ */
+SedsResult seds_router_set_timesync_step_policy(SedsRouter * r, uint64_t step_threshold_ms, uint32_t reference_slew_ppm);
+
+/** @brief Allow or inhibit steps of this node's clock by local sources (inhibit in flight). */
+SedsResult seds_router_set_timesync_steps_allowed(SedsRouter * r, bool allowed);
+
+/** @brief Current network time (Unix ms) and its time-base epoch, read together. */
+SedsResult seds_router_get_network_time_ms_with_epoch(SedsRouter * r, uint64_t * out_ms, uint16_t * out_epoch);
+
+/**
+ * @brief Age of a (time_epoch, timestamp_ms) stamp against this node's network
+ * time, translated across the steps it remembers (use for command freshness).
+ *
+ * `out_kind`: 0 `out_age_ms` valid (negative: future), 1 newer epoch than this
+ * node's clock (re-anchoring; cannot judge), 2 older epoch that cannot be
+ * translated (stale), 3 no network time.
+ */
+SedsResult seds_router_network_stamp_age_ms(SedsRouter * r, uint16_t time_epoch, uint64_t timestamp_ms, uint8_t * out_kind, int64_t * out_age_ms);
 
 /**
  * @brief Report that the transport finished sending a frame.

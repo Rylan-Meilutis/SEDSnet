@@ -472,3 +472,6 @@ mod timesync_interleaved;
 
 #[cfg(all(feature = "timesync", feature = "std"))]
 pub(crate) mod timesync_radio_sim;
+
+#[cfg(all(feature = "timesync", feature = "std"))]
+mod timesync_step_epoch;

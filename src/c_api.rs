@@ -103,6 +103,7 @@ pub struct SedsOwnedHeader {
     sender: Arc<str>,        // own the sender so view can borrow it
     endpoints_u32: Vec<u32>, // own endpoints.as_u32() for stable pointers
     timestamp: u64,
+    time_epoch: u16,
 }
 
 /// Opaque relay handle exposed to C.
@@ -349,6 +350,10 @@ pub struct SedsPacketView {
     timestamp: u64,
     payload: *const u8,
     payload_len: usize,
+    /// Network time-base epoch of `timestamp` (SEDSnet 6). Filled on views
+    /// the library hands out; ignored on views passed in (the router stamps
+    /// its own epoch on packets it originates).
+    time_epoch: u16,
 }
 
 #[repr(C)]
@@ -1502,6 +1507,7 @@ fn with_packet_view<T>(pkt: &Packet, callback: impl FnOnce(&SedsPacketView) -> T
         timestamp: pkt.timestamp(),
         payload: pkt.payload().as_ptr(),
         payload_len: pkt.payload().len(),
+        time_epoch: pkt.time_epoch(),
     };
 
     callback(&view)
@@ -2083,7 +2089,7 @@ pub extern "C" fn seds_router_configure_timesync(
         announce_interval_ms,
         request_interval_ms,
         consumer_promotion_enabled: true,
-        max_slew_ppm: 50_000,
+        ..TimeSyncConfig::default()
     }));
     status_from_result_code(SedsResult::SedsOk)
 }
@@ -2126,6 +2132,26 @@ pub struct SedsTimeSyncStatus {
     pub rate_ppb: i32,
     /// Age of the newest accepted exchange sample, ms (UINT32_MAX when none).
     pub last_sample_age_ms: u32,
+    /// Network time-base epoch of this node's clock (SEDSnet 6).
+    pub epoch: u16,
+    /// Newest epoch seen on any received packet (above `epoch`: re-anchoring).
+    pub newest_seen_epoch: u16,
+    /// 1 while the clock is held for a source in an older epoch.
+    pub holding: u8,
+    /// 1 when local sources may step this node's clock.
+    pub steps_allowed: u8,
+    /// Reason of the last step (`TimeSyncStepReason` code), 0 when none.
+    pub last_step_reason: u8,
+    pub _reserved: u8,
+    /// Steps and epoch changes since start.
+    pub steps: u32,
+    /// Age of the last step, ms (UINT32_MAX when none).
+    pub last_step_age_ms: u32,
+    /// New minus old reading at the last step, ms (0 for a rename or none).
+    pub last_step_delta_ms: i64,
+    /// Epochs before and after the last step.
+    pub last_step_from_epoch: u16,
+    pub last_step_to_epoch: u16,
 }
 
 /// Reads this node's time sync quality.
@@ -2157,7 +2183,107 @@ pub extern "C" fn seds_router_get_timesync_status(
             offset_us: (st.offset_ns / 1_000).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             rate_ppb: st.rate_ppb.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             last_sample_age_ms: clamp_u32(st.last_sample_age_ms),
+            epoch: st.epoch,
+            newest_seen_epoch: st.newest_seen_epoch,
+            holding: u8::from(st.holding),
+            steps_allowed: u8::from(st.steps_allowed),
+            last_step_reason: st.last_step.map_or(0, |s| s.reason.code()),
+            _reserved: 0,
+            steps: st.steps,
+            last_step_age_ms: st.last_step.map_or(u32::MAX, |s| clamp_u32(s.age_ms)),
+            last_step_delta_ms: st.last_step.map_or(0, |s| s.delta_ns / 1_000_000),
+            last_step_from_epoch: st.last_step.map_or(0, |s| s.from_epoch),
+            last_step_to_epoch: st.last_step.map_or(0, |s| s.to_epoch),
         };
+    }
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Sets the step policy without resetting time sync state: corrections by a
+/// local source above `step_threshold_ms` step (a new epoch) while steps are
+/// allowed; smaller ones, and all while inhibited, slew at most at
+/// `reference_slew_ppm`. 0 keeps the current value of either.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_timesync_step_policy(
+    r: *mut SedsRouter,
+    step_threshold_ms: u64,
+    reference_slew_ppm: u32,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let router = unsafe { &(*r).inner };
+    let threshold = (step_threshold_ms != 0).then_some(step_threshold_ms);
+    let slew = (reference_slew_ppm != 0).then_some(reference_slew_ppm);
+    if router.set_timesync_step_policy(threshold, slew) {
+        status_from_result_code(SedsResult::SedsOk)
+    } else {
+        status_from_err(TelemetryError::Io("time sync not configured"))
+    }
+}
+
+/// Allows or inhibits steps of this node's clock by local sources (inhibit
+/// during flight phases).
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_timesync_steps_allowed(r: *mut SedsRouter, allowed: bool) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    unsafe { &(*r).inner }.set_timesync_steps_allowed(allowed);
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Current network time (Unix ms) and its time-base epoch, read together.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_get_network_time_ms_with_epoch(
+    r: *mut SedsRouter,
+    out_ms: *mut u64,
+    out_epoch: *mut u16,
+) -> i32 {
+    if r.is_null() || out_ms.is_null() || out_epoch.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    match unsafe { &(*r).inner }.network_time_ms_with_epoch() {
+        Some((ms, epoch)) => {
+            unsafe {
+                *out_ms = ms;
+                *out_epoch = epoch;
+            }
+            status_from_result_code(SedsResult::SedsOk)
+        }
+        None => status_from_err(TelemetryError::Io("network time unavailable")),
+    }
+}
+
+/// Age of a `(time_epoch, timestamp_ms)` stamp against this node's network
+/// time, translated across the steps it remembers. `out_kind`: 0 the age in
+/// `out_age_ms` is valid (negative: in the future), 1 the stamp is from a
+/// newer epoch than this node's clock (it is re-anchoring), 2 the stamp is
+/// from an older epoch it cannot translate (stale), 3 no network time.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_network_stamp_age_ms(
+    r: *mut SedsRouter,
+    time_epoch: u16,
+    timestamp_ms: u64,
+    out_kind: *mut u8,
+    out_age_ms: *mut i64,
+) -> i32 {
+    if r.is_null() || out_kind.is_null() || out_age_ms.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let (kind, age) = match unsafe { &(*r).inner }.network_stamp_age_ms(time_epoch, timestamp_ms) {
+        crate::timesync::NetworkStampAge::Age(age) => (0, age),
+        crate::timesync::NetworkStampAge::NewerEpoch => (1, 0),
+        crate::timesync::NetworkStampAge::OlderEpoch => (2, 0),
+        crate::timesync::NetworkStampAge::NoTime => (3, 0),
+    };
+    unsafe {
+        *out_kind = kind;
+        *out_age_ms = age;
     }
     status_from_result_code(SedsResult::SedsOk)
 }
@@ -6098,6 +6224,7 @@ pub extern "C" fn seds_owned_pkt_view(
         timestamp: inner.timestamp(),
         payload: inner.payload().as_ptr(),
         payload_len: inner.payload().len(),
+        time_epoch: inner.time_epoch(),
     };
 
     unsafe {
@@ -6142,6 +6269,7 @@ pub extern "C" fn seds_pkt_unpack_header_owned(
         sender: env.sender,
         endpoints_u32,
         timestamp: env.timestamp_ms,
+        time_epoch: env.time_epoch,
     };
     Box::into_raw(Box::new(owned))
 }
@@ -6177,6 +6305,7 @@ pub extern "C" fn seds_owned_header_view(
         timestamp: h.timestamp,
         payload: ptr::null(),
         payload_len: 0,
+        time_epoch: h.time_epoch,
     };
 
     unsafe {
@@ -8622,6 +8751,10 @@ pub extern "C" fn seds_relay_set_latest_value_side(r: *mut SedsRelay, side: i32)
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/c_api_sender_identity_match.rs"]
 mod sender_identity_match_tests;
+
+#[cfg(all(test, feature = "std", feature = "timesync"))]
+#[path = "tests/c_api_timesync_epoch.rs"]
+mod timesync_epoch_tests;
 
 // ============================================================================
 //  FFI: compact bundles (feature `compact-bundle`)

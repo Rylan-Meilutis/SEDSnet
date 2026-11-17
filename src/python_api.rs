@@ -190,6 +190,7 @@ fn build_router_config(
             request_interval_ms: timesync_request_interval_ms,
             consumer_promotion_enabled: timesync_consumer_promotion_enabled,
             max_slew_ppm: timesync_max_slew_ppm,
+            ..TimeSyncConfig::default()
         })
     } else {
         cfg
@@ -933,6 +934,13 @@ impl PyPacket {
     #[getter]
     fn timestamp_ms(&self) -> u64 {
         self.inner.timestamp()
+    }
+
+    /// Network time-base epoch of the timestamp (0 until network time was
+    /// first stepped). Order one sender's packets by (time_epoch, timestamp_ms).
+    #[getter]
+    fn time_epoch(&self) -> u16 {
+        self.inner.time_epoch()
     }
 
     /// Raw payload bytes.
@@ -1969,7 +1977,9 @@ impl PyRouter {
         announce_interval_ms=1000,
         request_interval_ms=1000,
         consumer_promotion_enabled=true,
-        max_slew_ppm=50000
+        max_slew_ppm=50000,
+        step_threshold_ms=1000,
+        reference_slew_ppm=20
     ))]
     #[allow(clippy::too_many_arguments)]
     fn configure_timesync(
@@ -1982,6 +1992,8 @@ impl PyRouter {
         request_interval_ms: u64,
         consumer_promotion_enabled: bool,
         max_slew_ppm: u32,
+        step_threshold_ms: u64,
+        reference_slew_ppm: u32,
     ) -> PyResult<()> {
         let role = match role {
             0 => TimeSyncRole::Consumer,
@@ -1999,6 +2011,8 @@ impl PyRouter {
                 request_interval_ms,
                 consumer_promotion_enabled,
                 max_slew_ppm,
+                step_threshold_ms,
+                reference_slew_ppm,
             }));
         } else {
             rtr.set_timesync_config(None);
@@ -2165,6 +2179,84 @@ impl PyRouter {
     fn network_time_ms(&self) -> PyResult<Option<u64>> {
         let rtr = self.inner.as_ref();
         Ok(rtr.network_time_ms())
+    }
+
+    /// Current network time-base epoch (0 before any step was seen).
+    #[cfg(feature = "timesync")]
+    fn network_time_epoch(&self) -> u16 {
+        self.inner.as_ref().network_time_epoch()
+    }
+
+    /// `(unix_ms, epoch)` read together, or None without network time.
+    #[cfg(feature = "timesync")]
+    fn network_time_ms_with_epoch(&self) -> Option<(u64, u16)> {
+        self.inner.as_ref().network_time_ms_with_epoch()
+    }
+
+    /// Age of a (time_epoch, timestamp_ms) stamp against this node's network
+    /// time, translated across remembered steps: `("age", ms)`, or
+    /// `("newer_epoch", None)`, `("older_epoch", None)`, `("no_time", None)`.
+    #[cfg(feature = "timesync")]
+    fn network_stamp_age_ms(&self, time_epoch: u16, timestamp_ms: u64) -> (&'static str, Option<i64>) {
+        match self.inner.as_ref().network_stamp_age_ms(time_epoch, timestamp_ms) {
+            crate::timesync::NetworkStampAge::Age(age) => ("age", Some(age)),
+            crate::timesync::NetworkStampAge::NewerEpoch => ("newer_epoch", None),
+            crate::timesync::NetworkStampAge::OlderEpoch => ("older_epoch", None),
+            crate::timesync::NetworkStampAge::NoTime => ("no_time", None),
+        }
+    }
+
+    /// Allow or inhibit steps of this node's clock by local time sources.
+    #[cfg(feature = "timesync")]
+    fn set_timesync_steps_allowed(&self, allowed: bool) {
+        self.inner.as_ref().set_timesync_steps_allowed(allowed);
+    }
+
+    /// Change the step threshold / reference slew rate in place (None keeps).
+    #[cfg(feature = "timesync")]
+    #[pyo3(signature = (step_threshold_ms=None, reference_slew_ppm=None))]
+    fn set_timesync_step_policy(&self, step_threshold_ms: Option<u64>, reference_slew_ppm: Option<u32>) -> bool {
+        self.inner.as_ref().set_timesync_step_policy(step_threshold_ms, reference_slew_ppm)
+    }
+
+    /// Time sync quality as a dict, or None when time sync is not configured.
+    #[cfg(feature = "timesync")]
+    fn timesync_status(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some(st) = self.inner.as_ref().timesync_status() else {
+            return Ok(None);
+        };
+        let out = PyDict::new(py);
+        out.set_item("state", match st.state {
+            crate::timesync_discipline::SyncState::Unsynced => "unsynced",
+            crate::timesync_discipline::SyncState::Acquiring => "acquiring",
+            crate::timesync_discipline::SyncState::Locked => "locked",
+            crate::timesync_discipline::SyncState::Holdover => "holdover",
+        })?;
+        out.set_item("synced", st.state.is_synced())?;
+        out.set_item("stratum", st.stratum)?;
+        out.set_item("is_reference", st.is_reference)?;
+        out.set_item("error_bound_ns", (st.error_bound_ns != u64::MAX).then_some(st.error_bound_ns))?;
+        out.set_item("offset_ns", st.offset_ns)?;
+        out.set_item("rate_ppb", st.rate_ppb)?;
+        out.set_item("last_sample_age_ms", (st.last_sample_age_ms != u64::MAX).then_some(st.last_sample_age_ms))?;
+        out.set_item("epoch", st.epoch)?;
+        out.set_item("newest_seen_epoch", st.newest_seen_epoch)?;
+        out.set_item("holding", st.holding)?;
+        out.set_item("steps", st.steps)?;
+        out.set_item("steps_allowed", st.steps_allowed)?;
+        match st.last_step {
+            Some(step) => {
+                let last = PyDict::new(py);
+                last.set_item("delta_ns", step.delta_ns)?;
+                last.set_item("reason", step.reason.name())?;
+                last.set_item("from_epoch", step.from_epoch)?;
+                last.set_item("to_epoch", step.to_epoch)?;
+                last.set_item("age_ms", step.age_ms)?;
+                out.set_item("last_step", last)?;
+            }
+            None => out.set_item("last_step", py.None())?,
+        }
+        Ok(Some(out.unbind()))
     }
 
     #[cfg(feature = "timesync")]
