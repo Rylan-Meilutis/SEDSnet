@@ -87,6 +87,7 @@ const E_SOURCE_INDEX: u8 = 0x40;
 const E_TARGET_INDEX: u8 = 0x80;
 const CONTRACT_TARGETS: u8 = 0x01;
 const CONTRACT_SHAPE: u8 = 0x02;
+const CONTRACT_TIME_EPOCH: u8 = 0x08;
 
 // One error for every malformed bundle or unbundleable frame keeps the
 // embedded image small; the cause is never acted on differently.
@@ -216,13 +217,21 @@ impl<'a> Reader<'a> {
         }
         Some(&self.buf[start..self.off])
     }
-    /// The contract's flags and shape bytes, and its target count.
-    fn contract_head(&mut self) -> Option<usize> {
+    /// The contract's flags and shape bytes: its flags and target count.
+    fn contract_head(&mut self) -> Option<(u8, usize)> {
         let flags = self.byte()?;
         if flags & CONTRACT_SHAPE != 0 && self.byte()? & 0x40 != 0 {
             self.uleb()?;
         }
-        if flags & CONTRACT_TARGETS != 0 { self.len() } else { Some(0) }
+        Some((flags, if flags & CONTRACT_TARGETS != 0 { self.len()? } else { 0 }))
+    }
+    /// The bytes after the contract's targets (its time epoch, if any).
+    fn contract_tail(&mut self, flags: u8) -> Option<&'a [u8]> {
+        let start = self.off;
+        if flags & CONTRACT_TIME_EPOCH != 0 {
+            self.uleb()?;
+        }
+        Some(&self.buf[start..self.off])
     }
     /// Reliable header bytes as the canonical flags describe them.
     fn reliable(&mut self, flags: u8) -> Option<&'a [u8]> {
@@ -315,9 +324,10 @@ fn read_fields<'a>(buf: &'a [u8], rec: bool, first: bool, table: bool, p: &mut F
         // The contract must describe exactly its own bytes, and every index
         // must name a node in this table.
         let mut c = Reader { buf: p.contract, off: 0 };
-        let targets = c.contract_head()?;
+        let (contract_flags, targets) = c.contract_head()?;
         let each = if p.targets_indexed { 1 } else { 8 };
         let list = c.take(targets.checked_mul(each)?)?;
+        c.contract_tail(contract_flags)?;
         if c.off != p.contract.len() || (p.targets_indexed && list.iter().any(|&i| target_of(usize::from(i)).is_none())) {
             return None;
         }
@@ -377,11 +387,12 @@ fn unzigzag32(v: u32) -> u32 {
 /// reverse), length-prefixed; `None` when a target is not in the table.
 fn put_contract(out: &mut Vec<u8>, contract: &[u8], from_index: bool, to_index: bool) -> Option<()> {
     let mut r = Reader { buf: contract, off: 0 };
-    let targets = r.contract_head()?;
+    let (flags, targets) = r.contract_head()?;
     let head = &contract[..r.off];
     let width = if from_index { 1 } else { 8 };
     let list = r.take(targets.checked_mul(width)?)?;
-    put_uleb(out, (head.len() + targets * if to_index { 1 } else { 8 }) as u64);
+    let tail = r.contract_tail(flags)?;
+    put_uleb(out, (head.len() + targets * if to_index { 1 } else { 8 } + tail.len()) as u64);
     put(out, head);
     for target in list.chunks_exact(width) {
         let hash = if from_index {
@@ -395,6 +406,7 @@ fn put_contract(out: &mut Vec<u8>, contract: &[u8], from_index: bool, to_index: 
             put(out, &hash.to_le_bytes());
         }
     }
+    put(out, tail);
     Some(())
 }
 

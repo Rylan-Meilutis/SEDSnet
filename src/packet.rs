@@ -84,6 +84,12 @@ pub struct Packet {
     /// millisecond do not collapse in recent-ID dedupe.
     nonce: u16,
 
+    /// Network time-base epoch the timestamp was taken in (0: the sender has
+    /// not seen a step). Routers advance the epoch whenever network time is
+    /// stepped, so `(time_epoch, timestamp)` orders one sender's packets across
+    /// a step in either direction. Carried in the wire contract when nonzero.
+    time_epoch: u16,
+
     /// Raw payload bytes, stored via [`SmallPayload`] for small/large optimization.
     payload: StandardSmallPayload,
 
@@ -324,6 +330,7 @@ impl Packet {
             endpoints: Arc::<[DataEndpoint]>::from(endpoints),
             timestamp,
             nonce,
+            time_epoch: 0,
             payload: StandardSmallPayload::from_arc(payload),
             wire_shape,
             wire_target_senders: (!wire_target_senders.is_empty()).then_some(wire_target_senders),
@@ -355,6 +362,7 @@ impl Packet {
             endpoints,
             timestamp,
             nonce,
+            time_epoch: 0,
             payload,
             wire_shape,
             wire_target_senders,
@@ -543,6 +551,10 @@ impl Packet {
         h = hash_bytes_u64(h, &self.timestamp.to_le_bytes());
         h = hash_bytes_u64(h, &self.nonce.to_le_bytes());
         h = hash_bytes_u64(h, &(self.data_size as u64).to_le_bytes());
+        // Epoch 0 (never stepped) keeps the historical identity.
+        if self.time_epoch != 0 {
+            h = hash_bytes_u64(h, &self.time_epoch.to_le_bytes());
+        }
 
         h
     }
@@ -629,7 +641,31 @@ impl Packet {
         self.timestamp
     }
 
-    /// Get the packet nonce.
+    /// Network time-base epoch of [`Packet::timestamp`]: 0 until the sender
+    /// has seen network time stepped, then advanced on every step. Compare
+    /// one sender's packets by `(time_epoch, timestamp)`.
+    #[inline]
+    pub fn time_epoch(&self) -> u16 {
+        self.time_epoch
+    }
+
+    /// Returns this packet with its network time-base epoch set (see
+    /// [`Packet::time_epoch`]). Routers stamp their current epoch on packets
+    /// they originate with epoch 0; set it explicitly only when the timestamp
+    /// was taken in a known earlier epoch.
+    #[inline]
+    pub fn with_time_epoch(mut self, epoch: u16) -> Self {
+        self.time_epoch = epoch;
+        self
+    }
+
+    #[inline]
+    #[cfg_attr(not(feature = "timesync"), allow(dead_code))]
+    pub(crate) fn set_time_epoch(&mut self, epoch: u16) {
+        self.time_epoch = epoch;
+    }
+
+    /// Returns the per-packet nonce.
     #[inline]
     pub fn nonce(&self) -> u16 {
         self.nonce

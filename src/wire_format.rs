@@ -41,6 +41,8 @@ pub struct TelemetryEnvelope {
     pub source_address: u32,
     /// Timestamp in milliseconds (as stored on the wire).
     pub timestamp_ms: u64,
+    /// Network time-base epoch of the timestamp (0 when not carried).
+    pub time_epoch: u16,
     /// Inline wire-format payload shape, if present.
     pub wire_shape: Option<MessageElement>,
     /// Frozen destination sender hashes, if present.
@@ -111,6 +113,9 @@ const FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
 const CONTRACT_FLAG_TARGETS: u8 = 0x01;
 const CONTRACT_FLAG_SHAPE: u8 = 0x02;
 const CONTRACT_FLAG_RELIABLE_HEADER: u8 = 0x04;
+/// The contract ends with the ULEB128 network time-base epoch of the
+/// timestamp (see [`Packet::time_epoch`]); absent means epoch 0.
+const CONTRACT_FLAG_TIME_EPOCH: u8 = 0x08;
 const RELIABLE_WIRE_FLAG_SEQ_PRESENT: u8 = 0x04;
 const RELIABLE_WIRE_FLAG_ACK_PRESENT: u8 = 0x08;
 const RELIABLE_PUBLIC_FLAGS_MASK: u8 =
@@ -125,6 +130,7 @@ struct WireContract {
     shape: Option<MessageElement>,
     target_senders: Option<Arc<[u64]>>,
     has_reliable_header: bool,
+    time_epoch: u16,
 }
 
 /// Encode a `u64` as ULEB128 and append it to `out`.
@@ -250,6 +256,7 @@ fn write_wire_contract(
     shape: Option<MessageElement>,
     target_senders: &[u64],
     has_reliable_header: bool,
+    time_epoch: u16,
     out: &mut Vec<u8>,
 ) -> Result<(), TelemetryError> {
     // Keep the contract self-contained and compact. It exists only to preserve
@@ -265,6 +272,9 @@ fn write_wire_contract(
     if has_reliable_header {
         flags |= CONTRACT_FLAG_RELIABLE_HEADER;
     }
+    if time_epoch != 0 {
+        flags |= CONTRACT_FLAG_TIME_EPOCH;
+    }
     out.push(flags);
     if let Some(shape) = shape {
         write_wire_shape(shape, out)?;
@@ -275,12 +285,16 @@ fn write_wire_contract(
             out.extend_from_slice(&hash.to_le_bytes());
         }
     }
+    if time_epoch != 0 {
+        write_uleb128(u64::from(time_epoch), out);
+    }
     Ok(())
 }
 
 /// Size the frozen contract without constructing temporary shape/target buffers.
-fn wire_contract_size(shape: Option<MessageElement>, target_senders: &[u64]) -> usize {
-    1 + shape.map_or(0, |shape| match shape {
+fn wire_contract_size(shape: Option<MessageElement>, target_senders: &[u64], time_epoch: u16) -> usize {
+    1 + if time_epoch == 0 { 0 } else { uleb128_size(u64::from(time_epoch)) }
+        + shape.map_or(0, |shape| match shape {
         MessageElement::Static(count, _, _) => 1 + uleb128_size(count as u64),
         _ => 1,
     }) + if target_senders.is_empty() {
@@ -300,6 +314,7 @@ fn decode_wire_contract(
             shape: None,
             target_senders: None,
             has_reliable_header: false,
+            time_epoch: 0,
         });
     }
     let contract_len = usize::try_from(read_uleb128(r)?)
@@ -337,6 +352,7 @@ fn decode_wire_contract(
     } else {
         None
     };
+    let time_epoch = read_contract_epoch(&mut cr, flags)?;
     if cr.remaining() != 0 {
         return Err(TelemetryError::Unpack("wire contract trailing bytes"));
     }
@@ -344,7 +360,21 @@ fn decode_wire_contract(
         shape,
         target_senders,
         has_reliable_header: (flags & CONTRACT_FLAG_RELIABLE_HEADER) != 0,
+        time_epoch,
     })
+}
+
+/// Reads the optional trailing time epoch of a contract. A zero epoch is
+/// never encoded, so a present zero is rejected like any other malformation.
+#[inline]
+fn read_contract_epoch(cr: &mut ByteReader, flags: u8) -> Result<u16, TelemetryError> {
+    if flags & CONTRACT_FLAG_TIME_EPOCH == 0 {
+        return Ok(0);
+    }
+    match u16::try_from(read_uleb128(cr)?) {
+        Ok(epoch) if epoch != 0 => Ok(epoch),
+        _ => Err(TelemetryError::Unpack("wire contract time epoch")),
+    }
 }
 
 #[inline]
@@ -1229,7 +1259,10 @@ fn with_packet_frame_parts<T>(
     compression_allowed: bool,
     consume: impl FnOnce(&[u8], &[u8]) -> TelemetryResult<T>,
 ) -> TelemetryResult<T> {
-    let carries_wire_contract = shape.is_some() || !target_senders.is_empty();
+    // A time epoch alone rides in the contract but freezes nothing: endpoint
+    // encoding follows only the delivery contract (shape/targets).
+    let carries_wire_contract =
+        shape.is_some() || !target_senders.is_empty() || pkt.time_epoch() != 0;
     let endpoint_bitmap_present = packet_endpoint_bitmap_present(pkt, shape, target_senders);
     let endpoint_list_present = endpoint_bitmap_present && explicit_endpoint_list(pkt.endpoints());
     let nep_unique = unique_sorted_endpoints(pkt.endpoints()).count();
@@ -1255,7 +1288,7 @@ fn with_packet_frame_parts<T>(
     } else {
         0
     };
-    let contract_bytes = wire_contract_size(shape, target_senders);
+    let contract_bytes = wire_contract_size(shape, target_senders, pkt.time_epoch());
     let contract_len = if carries_wire_contract {
         uleb128_size(contract_bytes as u64) + contract_bytes
     } else {
@@ -1349,7 +1382,7 @@ fn with_packet_frame_parts<T>(
         // carry the "reliable header present" bit for packets whose current
         // runtime schema lookup no longer reflects the original wire semantics.
         write_uleb128(contract_bytes as u64, &mut out);
-        write_wire_contract(shape, target_senders, reliable.is_some(), &mut out)?;
+        write_wire_contract(shape, target_senders, reliable.is_some(), pkt.time_epoch(), &mut out)?;
     }
     if let Some(hdr) = reliable {
         write_reliable_header_encoded(hdr, reliable_is_compact, &mut out);
@@ -1565,6 +1598,7 @@ pub(crate) fn unpack_packet_with_role(buf: &[u8], managed: bool) -> Result<Packe
         contract.shape,
         contract.target_senders,
     )
+    .map(|pkt| pkt.with_time_epoch(contract.time_epoch))
 }
 
 // ===========================================================================
@@ -1605,6 +1639,7 @@ pub(crate) struct RoutingEnvelope<'a> {
     schema_endpoints: Option<&'static [DataEndpoint]>,
     pub source_address: u32,
     pub timestamp_ms: u64,
+    pub time_epoch: u16,
     pub wire_shape: Option<MessageElement>,
     pub is_reliable: bool,
     payload_is_empty: bool,
@@ -1692,6 +1727,7 @@ impl RoutingEnvelope<'_> {
             sender: sender_name_for_address(self.source_address),
             source_address: self.source_address,
             timestamp_ms: self.timestamp_ms,
+            time_epoch: self.time_epoch,
             wire_shape: self.wire_shape,
             target_senders: self.target_senders().collect::<Arc<[_]>>(),
         }
@@ -1756,6 +1792,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
     let mut shape = None;
     let mut targets: &'a [u8] = &[];
     let mut has_reliable_header = false;
+    let mut time_epoch = 0;
     if flags & FLAG_WIRE_CONTRACT != 0 {
         let len = usize::try_from(read_uleb128(r)?)
             .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
@@ -1772,6 +1809,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
                 .ok_or(TelemetryError::Unpack("wire contract target count"))?;
             targets = cr.read_bytes(bytes)?;
         }
+        time_epoch = read_contract_epoch(&mut cr, contract_flags)?;
         if cr.remaining() != 0 {
             return Err(TelemetryError::Unpack("wire contract trailing bytes"));
         }
@@ -1799,6 +1837,7 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
         schema_endpoints,
         source_address,
         timestamp_ms,
+        time_epoch,
         wire_shape: shape,
         is_reliable,
         payload_is_empty,
@@ -1966,13 +2005,19 @@ pub(crate) fn peek_plain_discovery_payload(
 /// Contract/codec/reliable frames never enter freshness coalescing.
 #[cfg(feature = "latest-value-egress")]
 pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
-    if buf.first().is_none_or(|flags| flags & 0x17 != 0) {
+    if buf.first().is_none_or(|flags| flags & 0x13 != 0) {
         return Err(TelemetryError::BadArg);
     }
     let data = verify_crc32(buf)?;
     let mut reader = ByteReader::new(data);
     let envelope = read_routing_envelope(&mut reader)?;
-    if envelope.has_reliable_header || envelope.endpoints().next().is_none() {
+    // A contract that only carries the time epoch is still plain data; a
+    // shape or frozen targets are delivery obligations.
+    if envelope.has_reliable_header
+        || envelope.wire_shape.is_some()
+        || envelope.targets.len() != 0
+        || envelope.endpoints().next().is_none()
+    {
         return Err(TelemetryError::BadArg);
     }
     let mut prelude = ByteReader::new(data);
@@ -2253,8 +2298,8 @@ pub fn header_size_bytes(pkt: &Packet) -> usize {
 pub fn packet_wire_size(pkt: &Packet) -> usize {
     let shape = pkt.wire_shape();
     let targets = pkt.wire_target_senders();
-    let contract_bytes = wire_contract_size(shape, targets);
-    let contract_len = if shape.is_some() || !targets.is_empty() {
+    let contract_bytes = wire_contract_size(shape, targets, pkt.time_epoch());
+    let contract_len = if shape.is_some() || !targets.is_empty() || pkt.time_epoch() != 0 {
         uleb128_size(contract_bytes as u64) + contract_bytes
     } else {
         0
@@ -2400,6 +2445,9 @@ pub fn packet_id_from_wire(buf: &[u8]) -> Result<u64, TelemetryError> {
     h = hash_bytes_u64(h, &ts_v.to_le_bytes());
     h = hash_bytes_u64(h, &nonce.to_le_bytes());
     h = hash_bytes_u64(h, &(dsz as u64).to_le_bytes());
+    if envelope.time_epoch != 0 {
+        h = hash_bytes_u64(h, &envelope.time_epoch.to_le_bytes());
+    }
 
     // Payload bytes (logical payload)
     h = hash_bytes_u64(h, payload_bytes);
@@ -2498,6 +2546,89 @@ mod payload_compression {
 #[cfg(test)]
 mod endpoint_decode_tests {
     use super::*;
+
+    /// The time-base epoch rides at the end of the wire contract: absent for
+    /// epoch 0 (frames unchanged), round-tripped with and without a delivery
+    /// contract, folded into packet identity on both the decoded and the wire
+    /// path, visible to envelope peeks, sized exactly, carried through compact
+    /// bundles, and a present zero is malformed.
+    #[test]
+    fn time_epoch_round_trips_in_the_contract() {
+        let ep = message_meta(DataType::TimeSyncAnnounce).endpoints_ref()[0];
+        let plain = Packet::new_with_nonce(
+            DataType::TimeSyncAnnounce,
+            &[ep],
+            "GS",
+            1_793_000_000_000,
+            77,
+            crate::router::encode_slice_le(&[5u64, 6]),
+        )
+        .unwrap();
+        let bytes = pack_packet(&plain);
+        assert_eq!(bytes[0] & FLAG_WIRE_CONTRACT, 0, "epoch 0 adds nothing");
+        assert_eq!(unpack_packet(&bytes).unwrap().time_epoch(), 0);
+        let mut ids = alloc::collections::BTreeSet::new();
+        for epoch in [1u16, 127, 128, 300, u16::MAX] {
+            let pkt = plain.clone().with_time_epoch(epoch);
+            let bytes = pack_packet(&pkt);
+            assert_ne!(bytes[0] & FLAG_WIRE_CONTRACT, 0);
+            assert_eq!(bytes.len(), packet_wire_size(&pkt));
+            let back = unpack_packet(&bytes).unwrap();
+            assert_eq!(back.time_epoch(), epoch);
+            assert_eq!(back.timestamp(), pkt.timestamp());
+            assert_eq!(back.packet_id(), pkt.packet_id());
+            assert_eq!(packet_id_from_wire(&bytes).unwrap(), pkt.packet_id());
+            assert_eq!(peek_envelope(&bytes).unwrap().time_epoch, epoch);
+            assert!(peek_envelope(&bytes).unwrap().target_senders.is_empty());
+            assert!(ids.insert(pkt.packet_id()), "epoch is part of identity");
+        }
+        assert!(!ids.contains(&plain.packet_id()));
+
+        // With a frozen delivery contract (shape and targets).
+        let frozen = Packet::new_with_wire_contract(
+            DataType::ReliableAck,
+            message_meta(DataType::ReliableAck).endpoints_ref(),
+            "E2EACK:GS",
+            100,
+            1,
+            Arc::from(42u64.to_le_bytes()),
+            Some(MessageElement::Static(2, crate::MessageDataType::UInt32, crate::MessageClass::Data)),
+            Arc::from([123u64, 456]),
+        )
+        .unwrap()
+        .with_time_epoch(9);
+        let bytes = pack_packet(&frozen);
+        assert_eq!(bytes.len(), packet_wire_size(&frozen));
+        let back = unpack_packet(&bytes).unwrap();
+        assert_eq!(back.time_epoch(), 9);
+        assert_eq!(back.wire_target_senders(), &[123, 456]);
+        assert_eq!(back.packet_id(), frozen.packet_id());
+        assert_eq!(packet_id_from_wire(&bytes).unwrap(), frozen.packet_id());
+
+        // Compact bundles rebuild the canonical frames byte for byte.
+        let a = pack_packet(&plain.clone().with_time_epoch(3));
+        let b = pack_packet(&frozen);
+        let c = pack_packet(&plain);
+        let bundle = crate::wire_bundle::pack_bundle(&[&a, &b, &c]).unwrap();
+        let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
+        assert_eq!(frames, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+
+        // A present zero epoch is malformed; so is one beyond 16 bits.
+        let contract_at = |bytes: &[u8]| {
+            let mut r = ByteReader::new(bytes);
+            let _ = read_routing_envelope(&mut r);
+            r.off
+        };
+        let one = pack_packet(&plain.clone().with_time_epoch(1));
+        let end = contract_at(&one);
+        // The epoch is the contract's last byte (ULEB128 1).
+        assert_eq!(one[end - 1], 1);
+        let mut zero = one[..one.len() - 4].to_vec();
+        zero[end - 1] = 0;
+        append_crc32(&mut zero);
+        assert!(unpack_packet(&zero).is_err());
+        assert!(peek_envelope(&zero).is_err());
+    }
 
     #[test]
     fn numeric_sender_alias_keeps_packet_wire_and_receipt_identity() {

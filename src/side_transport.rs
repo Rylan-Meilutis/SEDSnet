@@ -187,6 +187,36 @@ impl SideHeaderTemplate {
         u32::try_from(read_uleb128_local(self.between(), &mut off).ok()?).ok()
     }
 
+    /// The retained header froze explicit destination holders (contract
+    /// targets). A contract that only carries a shape or the time epoch does
+    /// not freeze delivery.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    pub(crate) fn has_target_contract(&self) -> bool {
+        if self.base_flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT == 0 {
+            return false;
+        }
+        let between = self.between();
+        let mut off = 0;
+        let Ok(_source) = read_uleb128_local(between, &mut off) else {
+            return true;
+        };
+        if self.base_flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT != 0 {
+            off += SIDE_TRANSPORT_EP_BITMAP_BYTES;
+        } else if self.base_flags & SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT != 0 {
+            let nep = self.prefix().first().copied().unwrap_or(0);
+            for _ in 0..nep {
+                if read_uleb128_local(between, &mut off).is_err() {
+                    return true;
+                }
+            }
+        }
+        if read_uleb128_local(between, &mut off).is_err() {
+            return true;
+        }
+        // Contract flag 0x01: explicit target hashes follow.
+        between.get(off).is_none_or(|flags| flags & 0x01 != 0)
+    }
+
     pub(crate) fn data_type(&self) -> Option<DataType> {
         // The retained prefix begins with endpoint count, then type ULEB128.
         let mut off = 1;
