@@ -1389,16 +1389,12 @@ fn cycle_edge_receipt_requires_exact_target_source_and_crc_binding() {
     let mut damaged = body;
     let last = damaged.len() - 1;
     damaged[last] ^= 1;
-    let malformed = super::RouterRxItem {
-        src: Some(held.side),
-        data: super::RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(damaged))),
-        priority: 254,
-    };
-    assert!(
-        f.routers[1]
-            .queue_duplicate_proxy_edge_receipt(&malformed, id)
-            .is_err()
-    );
+    // A damaged CRC is refused where the frame enters; internal receipt
+    // bookkeeping only ever sees admitted frames.
+    assert!(matches!(
+        f.routers[1].rx_packed_from_side(&damaged, held.side),
+        Err(sedsnet::TelemetryError::Unpack("crc32 mismatch"))
+    ));
     assert_eq!(ack_count(&f, 1, id), 0);
     {
         let state = f.routers[1].state.lock();

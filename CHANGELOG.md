@@ -1,5 +1,21 @@
 # Changelog
 
+## 6.0.1
+
+Frame CRC performance release.
+
+- `seds_set_crc32_fn` (Rust: `crc32::set_crc32_fn`) installs an application CRC-32
+  (zlib-compatible, incremental), such as a CRC peripheral, for computing and
+  verifying frame, side-transport and bundle CRCs. Software `crc32fast` stays
+  the default; dispatch is one atomic load and one indirect call per frame.
+- Every frame is CRC-checked exactly once, where it enters the router
+  (receive, ISR enqueue, side decode, relay ingress and `tx_packed*`); frames
+  the router holds or builds are read with non-verifying, still bounds-checked
+  peeks. Four relayed frames held by a busy egress went from 1056 CRC checks
+  over 25 polls to 4. The public peek functions keep verifying.
+- Wire format, schemas and the time sync of 6.0.0 are unchanged; 6.0.0 and
+  6.0.1 nodes interoperate.
+
 ## 6.0.0
 
 **Breaking wire and API changes (network time steps).** Once network time has

@@ -3,7 +3,7 @@
 use crate::{DataType, TelemetryError, TelemetryResult, packet::hash_bytes_u64, wire_format};
 use crate::OrdMap;
 use alloc::{sync::Arc, vec::Vec};
-use crc32fast::Hasher as Crc32Hasher;
+use crate::crc32::Crc32 as Crc32Hasher;
 
 const SIDE_TX_PROGRESS_TIMEOUT_MS: u64 = 2000;
 pub(crate) const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
@@ -304,9 +304,7 @@ pub(crate) enum SideCompactTimestampMode {
 
 #[inline]
 pub(crate) fn crc32_bytes(data: &[u8]) -> u32 {
-    let mut hasher = Crc32Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
+    crate::crc32::crc32(data)
 }
 
 pub(crate) fn read_uleb128_local(buf: &[u8], off: &mut usize) -> TelemetryResult<u64> {

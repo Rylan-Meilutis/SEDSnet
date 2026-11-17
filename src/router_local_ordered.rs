@@ -137,7 +137,7 @@ impl Router {
             RouterItem::Packed(bytes) => {
                 // CRC/shape-validated numeric identity works without std's
                 // hostname registry. Do not decode/decrypt/hash payloads here.
-                let frame = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+                let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
                 frame.envelope.source_address == sender_address_u32(local.as_ref())
                     && frame.envelope.target_senders().len() == 0
             }
@@ -634,7 +634,7 @@ impl Router {
                         let _ = self.handle_callback_error(packet, None, error, called_from_queue);
                     }
                     RouterItem::Packed(bytes) => {
-                        if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                        if let Ok(env) = wire_format::peek_envelope_unchecked(bytes.as_ref()) {
                             let _ = self.handle_callback_error_from_env(&env, None, error, called_from_queue);
                         }
                     }

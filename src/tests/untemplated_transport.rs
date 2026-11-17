@@ -97,16 +97,14 @@ fn zero_dictionary_keeps_canonical_bytes_and_rejects_bad_crc() {
             0
         );
     }
+    // Egress encodes only admitted frames; a bad CRC is refused where it
+    // would enter the router.
     let mut bad = raw.as_ref().to_vec();
     bad[3] ^= 1;
-    assert!(
-        node.encode_side_transport_frames(
-            side,
-            opts,
-            crate::shared_bytes::convert(Arc::<[u8]>::from(bad))
-        )
-        .is_err()
-    );
+    assert!(matches!(
+        node.decode_side_transport_frame(side, &bad),
+        Err(TelemetryError::Unpack("crc32 mismatch"))
+    ));
 }
 
 #[test]

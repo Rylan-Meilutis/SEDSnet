@@ -111,7 +111,7 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
     }
     // Keep smaller admission for ACKs that release replay buffers and short
     // discovery keepalives that preserve the return path. Side wrappers are classified after their header is decoded.
-    let frame = crate::wire_format::peek_routing_frame_info(bytes).ok();
+    let frame = crate::wire_format::peek_routing_frame_info_unchecked(bytes).ok();
     let ack = frame.as_ref().is_some_and(|frame| {
         frame.ack_only()
             || matches!(

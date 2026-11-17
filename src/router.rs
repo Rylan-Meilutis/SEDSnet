@@ -46,6 +46,9 @@ mod independent_side_tx;
 #[path = "router_local_ordered.rs"]
 mod local_ordered;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/crc_once.rs"]
+mod crc_once_tests;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/ingress_target_filter.rs"]
 mod ingress_target_filter_tests;
 #[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
@@ -3791,7 +3794,7 @@ impl RouterInner {
                     || (!is_reliable_type(pkt.data_type()) && pkt.wire_target_senders().is_empty())
             }
             RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
-                wire_format::peek_routing_frame_info(view).map_or(true, |frame| {
+                wire_format::peek_routing_frame_info_unchecked(view).map_or(true, |frame| {
                     is_internal_control_type(frame.envelope.ty)
                         || (!is_reliable_type(frame.envelope.ty)
                             && frame.reliable.is_none()
@@ -5156,7 +5159,7 @@ impl Router {
             RouterItem::Packet(pkt) => Some(pkt.data_type()),
             RouterItem::Packed(bytes) => {
                 if bytes.len() <= 128
-                    && wire_format::peek_routing_frame_info(bytes)
+                    && wire_format::peek_routing_frame_info_unchecked(bytes)
                         .is_ok_and(|frame| frame.ack_only())
                 {
                     return true;
@@ -5390,7 +5393,7 @@ impl Router {
                 Self::decode_end_to_end_reliable_ack(pkt.payload()).map(Some)
             }
             RouterItem::Packed(bytes) => {
-                if wire_format::peek_routing_frame_info(bytes.as_ref())
+                if wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())
                     .ok()
                     .is_some_and(|frame| {
                         frame.envelope.ty != DataType::ReliableAck || frame.ack_only()
@@ -6307,7 +6310,7 @@ impl Router {
             }
             RouterItem::Packed(bytes) => {
                 let address = crate::shared_bytes::with_slice(bytes, |view| {
-                    let frame = wire_format::peek_routing_frame_info(view)?;
+                    let frame = wire_format::peek_routing_frame_info_unchecked(view)?;
                     Ok::<_, TelemetryError>(
                         frame
                             .envelope
@@ -6338,7 +6341,7 @@ impl Router {
             let retained_address = match retained {
                 RouterItem::Packet(packet) => sender_address_u32(packet.sender()),
                 RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
-                    wire_format::peek_routing_envelope(view).map(|envelope| envelope.source_address)
+                    wire_format::peek_routing_envelope_unchecked(view).map(|envelope| envelope.source_address)
                 })??,
             };
             if retained_address != source_address {
@@ -6703,7 +6706,7 @@ impl Router {
                 }
                 RouterItem::Packed(bytes) => {
                     let address = crate::shared_bytes::with_slice(bytes, |view| {
-                        wire_format::peek_routing_envelope(view)
+                        wire_format::peek_routing_envelope_unchecked(view)
                             .map(|envelope| envelope.source_address)
                     })??;
                     Self::hostname_for_address_borrowed_locked(st, address).map(Self::sender_hash)
@@ -6723,7 +6726,7 @@ impl Router {
                     wire_format::TargetSenderSet::Hashes(packet.wire_target_senders())
                 }
                 RouterItem::Packed(bytes) => {
-                    wire_format::peek_routing_envelope(bytes)?.target_sender_set()
+                    wire_format::peek_routing_envelope_unchecked(bytes)?.target_sender_set()
                 }
             }
         };
@@ -7219,7 +7222,7 @@ impl Router {
         let (packet_id, sender) = match data {
             RouterItem::Packet(pkt) => (pkt.packet_id(), pkt.sender().to_owned()),
             RouterItem::Packed(bytes) => {
-                let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref()) else {
+                let Ok(packet_id) = wire_format::packet_id_from_wire_unchecked(bytes.as_ref()) else {
                     return Ok(());
                 };
                 let Ok(pkt) = self.unpack_packet_for_role(bytes.as_ref()) else {
@@ -7343,7 +7346,7 @@ impl Router {
         }
         let packet_id = match data {
             RouterItem::Packet(pkt) => pkt.packet_id(),
-            RouterItem::Packed(bytes) => match wire_format::packet_id_from_wire(bytes.as_ref()) {
+            RouterItem::Packed(bytes) => match wire_format::packet_id_from_wire_unchecked(bytes.as_ref()) {
                 Ok(packet_id) => packet_id,
                 Err(TelemetryError::Unpack("reliable control frame")) => return sides,
                 Err(_) => return sides,
@@ -7438,7 +7441,7 @@ impl Router {
         let now_ms = self.clock.now_ms();
         let ty = match data {
             RouterItem::Packet(pkt) => pkt.data_type(),
-            RouterItem::Packed(bytes) => wire_format::peek_routing_envelope(bytes.as_ref())?.ty,
+            RouterItem::Packed(bytes) => wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?.ty,
         };
         let mut st = self.state.lock();
         #[cfg(feature = "discovery")]
@@ -7454,7 +7457,7 @@ impl Router {
         let frozen = match data {
             RouterItem::Packet(pkt) => !pkt.wire_target_senders().is_empty(),
             RouterItem::Packed(bytes) => {
-                wire_format::peek_routing_envelope(bytes)?
+                wire_format::peek_routing_envelope_unchecked(bytes)?
                     .target_senders()
                     .len()
                     != 0
@@ -7715,7 +7718,7 @@ impl Router {
     fn frozen_owner_count(data: &RouterItem) -> usize {
         match data {
             RouterItem::Packet(packet) => packet.wire_target_senders().len(),
-            RouterItem::Packed(bytes) => wire_format::peek_routing_envelope(bytes)
+            RouterItem::Packed(bytes) => wire_format::peek_routing_envelope_unchecked(bytes)
                 .map_or(0, |envelope| envelope.target_senders().len()),
         }
     }
@@ -7958,7 +7961,7 @@ impl Router {
                 match data {
                     RouterItem::Packet(packet) => packet.packet_id() == ack_id,
                     RouterItem::Packed(bytes) => crate::shared_bytes::with_slice(bytes, |view| {
-                        wire_format::packet_id_from_wire(view).is_ok_and(|id| id == ack_id)
+                        wire_format::packet_id_from_wire_unchecked(view).is_ok_and(|id| id == ack_id)
                     })
                     .unwrap_or(false),
                 }
@@ -8113,7 +8116,7 @@ impl Router {
                     ),
             ),
             RouterItem::Packed(bytes) => {
-                let frame = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+                let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
                 let env = &frame.envelope;
                 // Hop ACKs carry the original data type. Their validated
                 // control header, not that type's bulk priority, releases credit.
@@ -8443,7 +8446,7 @@ impl Router {
                 Ok((eps, pkt.data_type()))
             }
             RouterItem::Packed(bytes) => {
-                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?;
                 let mut eps: Vec<DataEndpoint> = env.endpoints().collect();
                 crate::small_sort::sort(&mut eps);
                 eps.dedup();
@@ -8457,13 +8460,13 @@ impl Router {
             && wire_format::scheduling_type(bytes).is_some_and(|ty| {
                 !is_internal_control_type(ty) && self.is_managed_variable_type(ty)
             });
-        wire_format::unpack_packet_with_role(bytes, managed)
+        wire_format::unpack_packet_with_role_unchecked(bytes, managed)
     }
 
     fn item_data_type(data: &RouterItem) -> TelemetryResult<DataType> {
         match data {
             RouterItem::Packet(pkt) => Ok(pkt.data_type()),
-            RouterItem::Packed(bytes) => Ok(wire_format::peek_routing_envelope(bytes.as_ref())?.ty),
+            RouterItem::Packed(bytes) => Ok(wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?.ty),
         }
     }
 
@@ -8608,13 +8611,13 @@ impl Router {
         bytes: crate::SharedBytes,
         reliable_override: Option<Option<wire_format::ReliableHeader>>,
     ) -> TelemetryResult<crate::SharedBytes> {
-        // Both peeks verify the CRC and parse the same canonical routing and
-        // reliable header. Only sealing needs owned endpoint/target arrays.
-        let routing = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+        // Both peeks parse the same admitted routing and reliable header.
+        // Only sealing needs owned endpoint/target arrays.
+        let routing = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
         if routing.ack_only() || self.e2e_seal_config_for_type(routing.envelope.ty).is_none() {
             return Ok(bytes);
         }
-        let frame = wire_format::peek_frame_info(bytes.as_ref())?;
+        let frame = wire_format::peek_frame_info_unchecked(bytes.as_ref())?;
         let reliable = reliable_override.unwrap_or(frame.reliable);
         let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
         self.pack_packet_for_contract(
@@ -8639,7 +8642,7 @@ impl Router {
         match data {
             RouterItem::Packet(packet) => Ok(!packet.wire_target_senders().is_empty()),
             RouterItem::Packed(bytes) => {
-                let frame = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+                let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
                 Ok(frame.reliable.is_some() || frame.envelope.target_senders().len() != 0)
             }
         }
@@ -8655,7 +8658,7 @@ impl Router {
                 pkt.wire_target_senders(),
             )),
             RouterItem::Packed(bytes) => {
-                Ok(wire_format::peek_routing_envelope(bytes.as_ref())?.target_sender_set())
+                Ok(wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?.target_sender_set())
             }
         }
     }
@@ -8667,7 +8670,7 @@ impl Router {
                 Ok(pkt.wire_target_senders().iter().any(|v| *v != local_hash))
             }
             RouterItem::Packed(bytes) => {
-                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?;
                 Ok(env.target_senders().any(|target| target != local_hash))
             }
         }
@@ -8679,7 +8682,7 @@ impl Router {
             RouterItem::Packet(pkt) => Ok(pkt.wire_target_senders().is_empty()
                 || pkt.wire_target_senders().contains(&local_hash)),
             RouterItem::Packed(bytes) => {
-                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?;
                 Ok(env.target_senders().len() == 0
                     || env.target_senders().any(|target| target == local_hash))
             }
@@ -8703,7 +8706,7 @@ impl Router {
                     .contains(&Self::sender_hash(self.sender_arc().as_ref()))
             }
             RouterItem::Packed(bytes) => {
-                let env = wire_format::peek_routing_envelope(bytes)?;
+                let env = wire_format::peek_routing_envelope_unchecked(bytes)?;
                 if env.target_senders().len() == 0 || is_internal_control_type(env.ty) {
                     return Ok(false);
                 }
@@ -8729,7 +8732,7 @@ impl Router {
         let has_targets = match &data {
             RouterItem::Packet(pkt) => !pkt.wire_target_senders().is_empty(),
             RouterItem::Packed(bytes) => {
-                wire_format::peek_routing_envelope(bytes)?
+                wire_format::peek_routing_envelope_unchecked(bytes)?
                     .target_senders()
                     .len()
                     != 0
@@ -8748,12 +8751,12 @@ impl Router {
         };
         let reliable = match &data {
             RouterItem::Packet(_) => None,
-            RouterItem::Packed(bytes) => wire_format::peek_frame_info(bytes.as_ref())?.reliable,
+            RouterItem::Packed(bytes) => wire_format::peek_frame_info_unchecked(bytes.as_ref())?.reliable,
         };
         let shape = match &data {
             RouterItem::Packet(pkt) => pkt.wire_shape(),
             RouterItem::Packed(bytes) => {
-                wire_format::peek_routing_envelope(bytes.as_ref())?.wire_shape
+                wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?.wire_shape
             }
         };
         let upstream_id = Self::get_hash(&data);
@@ -8820,7 +8823,7 @@ impl Router {
         // alias and frozen reader cohort distinguish downstream receipts;
         // changing the nonce here would defeat deduplication around cycles.
         let forwarded = self.pack_packet_for_contract(&pkt, reliable, shape, &targets)?;
-        let downstream_id = wire_format::packet_id_from_wire(forwarded.as_ref())?;
+        let downstream_id = wire_format::packet_id_from_wire_unchecked(forwarded.as_ref())?;
         let forwarded = RouterItem::Packed(forwarded);
         #[cfg(feature = "discovery")]
         let already_pending = self
@@ -8913,7 +8916,7 @@ impl Router {
             RouterItem::Packed(bytes) => {
                 // Preserve an existing frozen cohort. A locally queued plain
                 // packed frame needs the same contract as a Packet source.
-                if wire_format::peek_routing_envelope(&bytes)?
+                if wire_format::peek_routing_envelope_unchecked(&bytes)?
                     .target_senders()
                     .len()
                     != 0
@@ -12420,7 +12423,7 @@ impl Router {
             let bytes=stream.sent.get(&seq).ok_or(TelemetryError::HandlerError("fixture schema history absent"))?.bytes.clone();
             (seq,bytes)
         };
-        let frame=wire_format::peek_frame_info(retained.1.as_ref())?;
+        let frame=wire_format::peek_frame_info_unchecked(retained.1.as_ref())?;
         if frame.envelope.ty!=DataType::DiscoverySchema || frame.envelope.timestamp_ms!=at ||
             !frame.reliable.is_some_and(|h|h.seq==retained.0 && h.seq>0 && h.flags==0) {
             return Err(TelemetryError::HandlerError("fixture schema is not sequenced original"));
@@ -12606,7 +12609,7 @@ impl Router {
         let (ty, addressed) = match &data {
             RouterItem::Packet(pkt) => (pkt.data_type(), !pkt.wire_target_senders().is_empty()),
             RouterItem::Packed(bytes) => {
-                let env = wire_format::peek_routing_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?;
                 (env.ty, env.target_senders().len() != 0)
             }
         };
@@ -12659,7 +12662,7 @@ impl Router {
         }
 
         if let RouterItem::Packed(bytes) = &data {
-            wire_format::peek_routing_frame_info(bytes.as_ref())?;
+            wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
         }
         let priority = self.item_service_priority(&data)?;
 
@@ -13143,7 +13146,7 @@ impl Router {
             // Shared buses cannot retain one coherent dictionary across
             // independent producers. Do not build owned templates or wrap
             // canonical bytes when no dictionary can be used.
-            let frame = wire_format::peek_routing_frame_info(raw.as_ref())?;
+            let frame = wire_format::peek_routing_frame_info_unchecked(raw.as_ref())?;
             let without_dictionary = opts.max_side_transport_templates == 0 || {
                 let st = self.state.lock();
                 self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms())
@@ -13427,12 +13430,12 @@ impl Router {
         side: RouterSideId,
         bytes: &'a [u8],
     ) -> Option<wire_format::RoutingFrameInfo<'a>> {
-        let frame = wire_format::peek_routing_frame_info(bytes).ok()?;
+        let frame = wire_format::peek_routing_frame_info_unchecked(bytes).ok()?;
         self.refresh_peer_liveness(side, frame.envelope.source_address);
         #[cfg(feature = "compression")]
         if frame.envelope.ty == crate::DataType::DiscoveryAddress
             && let Ok(Some((_, payload))) =
-                wire_format::peek_plain_discovery_payload(bytes, crate::DataType::DiscoveryAddress)
+                wire_format::peek_plain_discovery_payload_unchecked(bytes, crate::DataType::DiscoveryAddress)
         {
             self.note_payload_codec_address(side, payload, false);
         }
@@ -13480,7 +13483,7 @@ impl Router {
         bytes: &[u8],
     ) -> TelemetryResult<bool> {
         let Some((address, payload)) =
-            wire_format::peek_plain_discovery_payload(bytes, crate::DataType::DiscoveryTopology)?
+            wire_format::peek_plain_discovery_payload_unchecked(bytes, crate::DataType::DiscoveryTopology)?
         else {
             return Ok(false);
         };
@@ -13520,7 +13523,7 @@ impl Router {
         bytes: &[u8],
     ) -> TelemetryResult<bool> {
         let Some((address, payload)) =
-            wire_format::peek_plain_discovery_payload(bytes, crate::DataType::DiscoverySchema)?
+            wire_format::peek_plain_discovery_payload_unchecked(bytes, crate::DataType::DiscoverySchema)?
         else {
             return Ok(false);
         };
@@ -13657,7 +13660,7 @@ impl Router {
         let frame = match view {
             Some(frame) => frame,
             None => {
-                parsed = wire_format::peek_routing_frame_info(bytes)?;
+                parsed = wire_format::peek_routing_frame_info_unchecked(bytes)?;
                 &parsed
             }
         };
@@ -13808,8 +13811,8 @@ impl Router {
         self.admit_received_frame_with_view(side, bytes, None)
     }
 
-    // Reuse only the view validated in this ingress call. Queue dispatch still
-    // rechecks bytes and current route/schema state independently.
+    // Reuse only the view parsed in this ingress call. Queue dispatch still
+    // re-parses the admitted bytes and current route/schema state.
     fn admit_received_frame_with_view(
         &self,
         side: RouterSideId,
@@ -13861,7 +13864,7 @@ impl Router {
                         }
 
                         let protected = *protected.get_or_insert_with(|| {
-                            wire_format::peek_routing_frame_info(bytes)
+                            wire_format::peek_routing_frame_info_unchecked(bytes)
                                 .ok()
                                 .is_some_and(|frame| {
                                     managed
@@ -13904,7 +13907,8 @@ impl Router {
         bytes: &[u8],
     ) -> TelemetryResult<bool> {
         // Ordinary telemetry pays one bounded type peek, not a parse for each
-        // discovery subtype. The selected consumer still checks CRC and shape.
+        // discovery subtype. Side ingress verified the CRC; the selected
+        // consumer checks shape.
         let result = match wire_format::scheduling_type(bytes) {
             #[cfg(not(feature = "std"))]
             Some(crate::DataType::DiscoverySchema) => self.consume_known_packed_schema(side, bytes),
@@ -13912,7 +13916,7 @@ impl Router {
                 self.consume_known_packed_topology(side, bytes)
             }
             Some(crate::DataType::DiscoveryAddress) => {
-                match wire_format::peek_plain_discovery_payload(
+                match wire_format::peek_plain_discovery_payload_unchecked(
                     bytes,
                     crate::DataType::DiscoveryAddress,
                 ) {
@@ -13929,21 +13933,40 @@ impl Router {
         };
         if result.is_err() {
             // Preserve the existing header-level liveness behavior on rejected
-            // payloads. A failed CRC still cannot refresh a peer. Valid known
-            // discovery avoids this second verification on the normal path.
+            // payloads. A failed CRC never gets here: ingress rejects it first.
             let _ = self.refresh_ingress_peer_liveness(side, bytes);
         }
         result
     }
 
+    #[cfg(any(test, feature = "discovery"))]
     fn decode_side_transport_frame(
         &self,
         side: RouterSideId,
         bytes: &[u8],
     ) -> TelemetryResult<Option<crate::SharedBytes>> {
+        self.decode_side_transport_frame_inner(side, bytes, false)
+    }
+
+    /// Side ingress. This is where a received frame's CRC is checked, once:
+    /// a canonical frame (bare, or the body of a FULL side frame) is verified
+    /// before anything reads it, unless `crc_verified` says the caller just
+    /// rebuilt it from a verified container. Compact frames are rebuilt here,
+    /// with a fresh CRC, from a verified wrapper and template, and a
+    /// reassembled chunk transfer re-enters as a bare frame. Nothing later
+    /// re-hashes the admitted bytes.
+    fn decode_side_transport_frame_inner(
+        &self,
+        side: RouterSideId,
+        bytes: &[u8],
+        crc_verified: bool,
+    ) -> TelemetryResult<Option<crate::SharedBytes>> {
         // Reclaim abandoned transfers before admission, even when new work is refused.
         self.expire_side_chunks();
         let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
+            if !crc_verified {
+                wire_format::verify_frame_crc(bytes)?;
+            }
             #[cfg(feature = "discovery")]
             if self.consume_known_packed_discovery(side, bytes)? {
                 return Ok(None);
@@ -13985,6 +14008,7 @@ impl Router {
                 } else {
                     None
                 };
+                wire_format::verify_frame_crc(&body[off..])?;
                 #[cfg(feature = "discovery")]
                 if self.consume_known_packed_discovery(side, &body[off..])? {
                     return Ok(None);
@@ -14216,7 +14240,8 @@ impl Router {
                     }
                 };
                 match assembled {
-                    Some(frame) => self.decode_side_transport_frame(side, frame.as_ref()),
+                    // The reassembled frame is verified as it re-enters.
+                    Some(frame) => self.decode_side_transport_frame_inner(side, frame.as_ref(), false),
                     None => Ok(None),
                 }
             }
@@ -14540,7 +14565,7 @@ impl Router {
 
         match data {
             RouterItem::Packed(bytes) => {
-                let frame = wire_format::peek_routing_frame_info(bytes.as_ref())?;
+                let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
                 if is_reliable_type(frame.envelope.ty)
                     && let Some(hdr) = frame.reliable
                 {
@@ -18525,7 +18550,7 @@ impl Router {
         match item {
             RouterItem::Packet(pkt) => pkt.packet_id(),
             RouterItem::Packed(bytes) => {
-                match wire_format::packet_id_from_wire(bytes.as_ref()) {
+                match wire_format::packet_id_from_wire_unchecked(bytes.as_ref()) {
                     Ok(id) => id,
                     Err(_e) => {
                         // Fallback: if bytes are malformed (or compression feature mismatch),
@@ -19790,6 +19815,7 @@ impl Router {
     /// Enqueue packed bytes for RX processing as locally-originated input.
     #[inline]
     pub fn rx_packed_queue(&self, bytes: &[u8]) -> TelemetryResult<()> {
+        wire_format::verify_frame_crc(bytes)?;
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = self.item_service_priority(&data)?;
@@ -19808,6 +19834,7 @@ impl Router {
     /// currently mutating the ISR RX queue.
     #[inline]
     pub fn rx_packed_queue_isr(&self, bytes: &[u8]) -> TelemetryResult<()> {
+        wire_format::verify_frame_crc(bytes)?;
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
@@ -19896,11 +19923,13 @@ impl Router {
     #[cfg(feature = "compact-bundle")]
     #[inline(never)]
     fn rx_compact_bundle(&self, bytes: &[u8], side: RouterSideId, queued: bool) -> TelemetryResult<()> {
+        // Each canonical frame is rebuilt, with a fresh CRC, from the verified
+        // bundle; it needs no second check.
         crate::wire_bundle::unpack_bundle(bytes, &mut |frame| {
             let _ = if queued {
-                self.rx_packed_queue_from_side(frame, side)
+                self.rx_packed_queue_from_side_frame(frame, side, true)
             } else {
-                self.rx_packed_from_side(frame, side)
+                self.rx_packed_from_side_frame(frame, side, true)
             };
             Ok(())
         })?;
@@ -19914,12 +19943,21 @@ impl Router {
         bytes: &[u8],
         side: RouterSideId,
     ) -> TelemetryResult<()> {
+        self.rx_packed_queue_from_side_frame(bytes, side, false)
+    }
+
+    fn rx_packed_queue_from_side_frame(
+        &self,
+        bytes: &[u8],
+        side: RouterSideId,
+        crc_verified: bool,
+    ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
-        if crate::wire_bundle::is_bundle(bytes) {
+        if !crc_verified && crate::wire_bundle::is_bundle(bytes) {
             return self.rx_compact_bundle(bytes, side, true);
         }
-        let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
+        let Some(decoded) = self.decode_side_transport_frame_inner(side, bytes, crc_verified)? else {
             return Ok(());
         };
         let data = RouterItem::Packed(decoded);
@@ -19946,6 +19984,7 @@ impl Router {
         side: RouterSideId,
     ) -> TelemetryResult<()> {
         self.ensure_side_ingress_enabled(side)?;
+        wire_format::verify_frame_crc(bytes)?;
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let priority = Self::router_item_priority(&data)?;
@@ -20474,12 +20513,13 @@ impl Router {
     /// any remotely-forwardable endpoints, the router will rebroadcast the packet ONCE, excluding
     /// the ingress side.
     fn rx_item(&self, item: &RouterRxItem, called_from_queue: bool) -> TelemetryResult<()> {
-        // Reuse this CRC-validated borrowed envelope for accounting and
-        // role/return-route checks in this invocation. Dispatch still rechecks
-        // current routing metadata; no validation result survives queueing.
+        // Reuse this borrowed envelope for accounting and role/return-route
+        // checks in this invocation. Dispatch still re-parses current routing
+        // metadata; only the CRC, verified once at ingress on immutable bytes,
+        // survives queueing.
         let mut _local_admission_guard = None;
         let packed_frame = match &item.data {
-            RouterItem::Packed(bytes) => Some(wire_format::peek_routing_frame_info(bytes.as_ref())),
+            RouterItem::Packed(bytes) => Some(wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())),
             RouterItem::Packet(_) => None,
         };
         if crate::memory_admission::supports_work_kinds()
@@ -20536,7 +20576,7 @@ impl Router {
                     if let Some(env) = packed_routing.as_ref()
                         && (is_reliable_type(env.ty) || env.target_senders().len() != 0)
                         && !is_internal_control_type(env.ty)
-                        && let Ok(packet_id) = wire_format::packet_id_from_wire(bytes.as_ref())
+                        && let Ok(packet_id) = wire_format::packet_id_from_wire_unchecked(bytes.as_ref())
                     {
                         match self.begin_reliable_local_admission(src, packet_id)? {
                             Some(guard) => _local_admission_guard = Some(guard),
@@ -20925,7 +20965,7 @@ impl Router {
                                 .as_ref()
                                 .map(|guard| guard.packet_id)
                                 .unwrap_or_else(|| {
-                                    wire_format::packet_id_from_wire(bytes.as_ref())
+                                    wire_format::packet_id_from_wire_unchecked(bytes.as_ref())
                                         .unwrap_or_else(|_| pkt.packet_id())
                                 });
                             self.queue_admitted_end_to_end_ack(
@@ -21169,7 +21209,7 @@ impl Router {
                 // Pure best-effort transit needs routing metadata, not an owned
                 // sender string or endpoint array. Commands, local handlers,
                 // managed variables and internal protocols retain their normal path.
-                let routing = wire_format::peek_routing_envelope(bytes.as_ref())?;
+                let routing = wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?;
                 if !is_internal_control_type(routing.ty)
                     && !routing.is_reliable
                     && routing.target_senders().len() == 0
@@ -21184,7 +21224,7 @@ impl Router {
                     return self.relay_send(item.data.clone(), item.src, called_from_queue);
                 }
 
-                let env = wire_format::peek_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_envelope_unchecked(bytes.as_ref())?;
 
                 if matches!(
                     env.ty,
@@ -21210,7 +21250,7 @@ impl Router {
                     if self.item_targets_local_sender(&item.data)? {
                         self.dispatch_p2p_packet(&pkt)?;
                         if item.src.is_some() {
-                            let packet_id = wire_format::packet_id_from_wire(bytes.as_ref())
+                            let packet_id = wire_format::packet_id_from_wire_unchecked(bytes.as_ref())
                                 .unwrap_or_else(|_| pkt.packet_id());
                             self.queue_end_to_end_reliable_ack_for_packet_id(
                                 packet_id,
@@ -21340,7 +21380,7 @@ impl Router {
                     let packet_id = if let Some(guard) = admission {
                         guard.packet_id
                     } else {
-                        wire_format::packet_id_from_wire(bytes.as_ref()).or_else(|_| {
+                        wire_format::packet_id_from_wire_unchecked(bytes.as_ref()).or_else(|_| {
                             pkt_opt
                                 .as_ref()
                                 .map(Packet::packet_id)
@@ -21443,7 +21483,7 @@ impl Router {
                 }
             }
             RouterItem::Packed(bytes) => {
-                let env = wire_format::peek_envelope(bytes.as_ref())?;
+                let env = wire_format::peek_envelope_unchecked(bytes.as_ref())?;
                 if is_internal_control_type(env.ty) {
                     return Ok(());
                 }
@@ -21819,7 +21859,7 @@ impl Router {
                                 let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                             }
                             RouterItem::Packed(bytes) => {
-                                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                                if let Ok(env) = wire_format::peek_envelope_unchecked(bytes.as_ref()) {
                                     let _ = self.handle_callback_error_from_env(
                                         &env,
                                         None,
@@ -21951,7 +21991,7 @@ impl Router {
                             let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                         }
                         RouterItem::Packed(bytes) => {
-                            if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                            if let Ok(env) = wire_format::peek_envelope_unchecked(bytes.as_ref()) {
                                 let _ = self.handle_callback_error_from_env(
                                     &env,
                                     None,
@@ -22025,7 +22065,7 @@ impl Router {
                                 let _ = self.handle_callback_error(pkt, None, e, called_from_queue);
                             }
                             RouterItem::Packed(bytes) => {
-                                if let Ok(env) = wire_format::peek_envelope(bytes.as_ref()) {
+                                if let Ok(env) = wire_format::peek_envelope_unchecked(bytes.as_ref()) {
                                     let _ = self.handle_callback_error_from_env(
                                         &env,
                                         None,
@@ -22098,6 +22138,7 @@ impl Router {
         if self.side_tx_active() {
             return self.rx_packed_queue(bytes);
         }
+        wire_format::verify_frame_crc(bytes)?;
         crate::memory_admission::check_receive(bytes)?;
         let data = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(bytes)));
         let item = RouterRxItem {
@@ -22151,15 +22192,24 @@ impl Router {
     /// instead of being processed re-entrantly.
     #[inline]
     pub fn rx_packed_from_side(&self, bytes: &[u8], side: RouterSideId) -> TelemetryResult<()> {
+        self.rx_packed_from_side_frame(bytes, side, false)
+    }
+
+    fn rx_packed_from_side_frame(
+        &self,
+        bytes: &[u8],
+        side: RouterSideId,
+        crc_verified: bool,
+    ) -> TelemetryResult<()> {
         if self.side_tx_active() {
-            return self.rx_packed_queue_from_side(bytes, side);
+            return self.rx_packed_queue_from_side_frame(bytes, side, crc_verified);
         }
         self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
-        if crate::wire_bundle::is_bundle(bytes) {
+        if !crc_verified && crate::wire_bundle::is_bundle(bytes) {
             return self.rx_compact_bundle(bytes, side, false);
         }
-        let Some(decoded) = self.decode_side_transport_frame(side, bytes)? else {
+        let Some(decoded) = self.decode_side_transport_frame_inner(side, bytes, crc_verified)? else {
             return Ok(());
         };
         let data = RouterItem::Packed(decoded);
@@ -22241,6 +22291,7 @@ impl Router {
     #[inline]
     pub fn tx_packed(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
+        wire_format::verify_frame_crc(&pkt)?;
         #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
@@ -22303,6 +22354,7 @@ impl Router {
     #[inline]
     pub fn tx_packed_queue(&self, data: Arc<[u8]>) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
+        wire_format::verify_frame_crc(&data)?;
         self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(
             crate::shared_bytes::convert(data),
         )))
@@ -22933,7 +22985,7 @@ mod queued_schema_identity_tests {
             254
         );
         assert!(
-            !wire_format::peek_routing_frame_info(&raw)
+            !wire_format::peek_routing_frame_info_unchecked(&raw)
                 .unwrap()
                 .envelope
                 .is_reliable
@@ -24016,8 +24068,8 @@ impl Router {
             cursor=Some(seq);
             // CRC/identity/parser and optional arena inspection are OUTSIDE Core.
             let candidate = crate::shared_bytes::with_slice(&bytes,|wire| {
-                let envelope = wire_format::peek_envelope(wire)?;
-                if envelope.ty != ty || wire_format::packet_id_from_wire(wire)? != packet_id {
+                let envelope = wire_format::peek_envelope_unchecked(wire)?;
+                if envelope.ty != ty || wire_format::packet_id_from_wire_unchecked(wire)? != packet_id {
                     return Ok::<_,TelemetryError>(None);
                 }
                 Ok(Some(envelope.sender))

@@ -146,15 +146,12 @@ fn hop_reliability_and_corrupt_frames_are_not_silently_consumed() {
     let last = corrupt.len() - 1;
     corrupt[last] ^= 1;
     assert!(wire_format::peek_routing_frame_info(&corrupt).is_err());
-    // Canonical ingress defers malformed application CRC rejection to normal
-    // dispatch. The optimization must not consume it as a valid overheard frame.
-    assert_eq!(
-        node.decode_side_transport_frame(a, &corrupt)
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        corrupt
-    );
+    // Canonical ingress rejects a bad CRC before anything reads the frame.
+    // The optimization must not consume it as a valid overheard frame.
+    assert!(matches!(
+        node.decode_side_transport_frame(a, &corrupt),
+        Err(TelemetryError::Unpack("crc32 mismatch"))
+    ));
 }
 
 #[test]

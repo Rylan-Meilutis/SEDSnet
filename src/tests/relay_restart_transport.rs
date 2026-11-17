@@ -9,9 +9,15 @@ fn relay_chunk_identity_and_loss_are_bounded() {
         |_| Ok(()),
         RelaySideOptions::default().with_template_transport(),
     );
-    // Relay full frames include a leading one-byte template ID.
-    let a = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[1; 181]);
-    let b = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &[2; 181]);
+    // Relay full frames include a leading one-byte template ID, then a real
+    // frame: a reassembled FULL body is CRC-checked as it enters.
+    let body = |fill| {
+        let mut out = vec![fill];
+        out.extend_from_slice(&crate::tests::canonical_frame_with_payload(160, fill));
+        out
+    };
+    let a = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body(1));
+    let b = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body(2));
     let first = relay
         .split_side_transport_frame(side, a.clone(), 128)
         .unwrap()
@@ -36,7 +42,12 @@ fn relay_chunk_identity_and_loss_are_bounded() {
     for frame in second {
         decoded = relay.decode_side_transport_frame(side, &frame).unwrap();
     }
-    assert_eq!(decoded.unwrap().as_ref(), &[2; 180]);
+    let b_frame = body(2);
+    let packet = |bytes: &[u8]| {
+        let p = crate::wire_format::unpack_packet(bytes).unwrap();
+        (p.data_type(), p.payload().to_vec())
+    };
+    assert_eq!(packet(decoded.unwrap().as_ref()), packet(&b_frame[1..]));
     for i in 0..1000u32 {
         let mut data = vec![0; 180];
         data[..4].copy_from_slice(&i.to_le_bytes());

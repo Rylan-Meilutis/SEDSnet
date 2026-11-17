@@ -320,7 +320,7 @@ impl PackedWriteLease {
 }
 fn canonical(bytes: &[u8]) -> bool {
     bytes.first().is_some_and(|flags| flags & 0x11 == 0)
-        && wire_format::peek_routing_frame_info(bytes).is_ok_and(|f| {
+        && wire_format::peek_routing_frame_info_unchecked(bytes).is_ok_and(|f| {
             f.reliable.is_some_and(|h| {
                 h.flags == wire_format::RELIABLE_FLAG_UNSEQUENCED && h.seq == 0 && h.ack == 0
             }) && f.envelope.wire_shape.is_some()
@@ -328,7 +328,7 @@ fn canonical(bytes: &[u8]) -> bool {
         })
 }
 fn same_contract(id: u64, data: &RouterItem, bytes: &[u8]) -> bool {
-    let Ok(retry) = wire_format::unpack_packet(bytes) else {
+    let Ok(retry) = wire_format::unpack_packet_with_role_unchecked(bytes, false) else {
         return false;
     };
     let same = |original: &Packet| {
@@ -351,7 +351,8 @@ fn same_contract(id: u64, data: &RouterItem, bytes: &[u8]) -> bool {
     match data {
         RouterItem::Packet(original) => same(original),
         RouterItem::Packed(original) => {
-            wire_format::unpack_packet(original.as_ref()).is_ok_and(|packet| same(&packet))
+            wire_format::unpack_packet_with_role_unchecked(original.as_ref(), false)
+                .is_ok_and(|packet| same(&packet))
         }
     }
 }

@@ -565,7 +565,9 @@ fn exchange_words(data: &RouterItem) -> Option<(DataType, u32, u64, u64)> {
             if !matches!(ty, DataType::TimeSyncRequest | DataType::TimeSyncResponse) {
                 return None;
             }
-            owned = crate::shared_bytes::with_slice(bytes, wire_format::unpack_packet)
+            owned = crate::shared_bytes::with_slice(bytes, |raw| {
+                wire_format::unpack_packet_with_role_unchecked(raw, false)
+            })
                 .ok()?
                 .ok()?;
             &owned
