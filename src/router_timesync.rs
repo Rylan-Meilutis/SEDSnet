@@ -78,8 +78,15 @@ pub(super) struct EpochState {
     pub(super) epoch: u16,
     /// Newest epoch seen on any received packet.
     pub(super) newest_seen: u16,
+    /// Monotonic ns at which this node first heard of an epoch newer than its
+    /// own (cleared once it reaches it): bounds the age of newer-epoch stamps.
+    newer_since_ns: Option<u64>,
     /// Newest epoch carried by requests this node served (its followers).
     subtree: u16,
+    /// This node served a request carrying its own current epoch: followers
+    /// share its time base (a leader that has never been followed in its
+    /// epoch, e.g. a restarted station, may join the network's instead).
+    followed: bool,
     links: [EpochLink; EPOCH_LINKS],
     links_head: u8,
     last_step: Option<StepRecord>,
@@ -100,7 +107,9 @@ impl EpochState {
         Self {
             epoch: shared.load(core::sync::atomic::Ordering::Acquire),
             newest_seen: 0,
+            newer_since_ns: None,
             subtree: 0,
+            followed: false,
             links: [EpochLink::default(); EPOCH_LINKS],
             links_head: 0,
             last_step: None,
@@ -118,6 +127,22 @@ impl EpochState {
         self.epoch.max(self.subtree)
     }
 
+    /// Notes an epoch heard from the network (`true` when it is newer than
+    /// every epoch heard before).
+    pub(super) fn see(&mut self, epoch: u16, now_ns: u64) -> bool {
+        if epoch > self.epoch && self.newer_since_ns.is_none() {
+            self.newer_since_ns = Some(now_ns);
+        }
+        let newer = epoch > self.newest_seen;
+        self.newest_seen = self.newest_seen.max(epoch);
+        newer
+    }
+
+    /// Milliseconds since this node first heard of an epoch newer than its own.
+    fn newer_since_ms(&self, now_ns: u64) -> u64 {
+        self.newer_since_ns.map_or(0, |at| now_ns.saturating_sub(at) / 1_000_000)
+    }
+
     fn record(&mut self, to: u16, delta_ns: i64, reason: TimeSyncStepReason, now_ns: u64) {
         let from = self.epoch;
         if to != from {
@@ -126,8 +151,12 @@ impl EpochState {
             self.links[head] = EpochLink { from, to, delta_ns };
             self.links_head = ((head + 1) % EPOCH_LINKS) as u8;
             self.epoch = to;
+            self.followed = false;
             self.newest_seen = self.newest_seen.max(to);
             self.shared.store(to, core::sync::atomic::Ordering::Release);
+            if self.newest_seen <= to {
+                self.newer_since_ns = None;
+            }
         }
         self.steps = self.steps.saturating_add(1);
         self.last_step = Some(StepRecord { delta_ns, reason, from_epoch: from, to_epoch: to, at_mono_ns: now_ns });
@@ -1192,30 +1221,65 @@ impl Router {
     /// the follower's time base is the network's. When the follower's stamp
     /// disagrees with this clock by more than the step threshold the bases
     /// differ, and a still newer epoch names this node's base.
+    ///
+    /// `fresh_stamp` marks a time sync request, whose stamp is taken as it is
+    /// sent: only such a stamp may serve as the network's time. While steps
+    /// are inhibited ([`Router::set_timesync_steps_allowed`]) a leader that
+    /// disagrees with a fresh, plausible (UTC) request stamp joins the
+    /// network's time base instead of making every follower step to its own:
+    /// the network stays continuous (a station restarted in flight), and the
+    /// leader's local sources then correct it under the usual policy (slewed
+    /// while inhibited, stepped once steps are allowed again). Any other packet
+    /// in a newer epoch is adopted only when its stamp agrees with this clock.
     pub(super) fn timesync_leader_note_request_epoch_locked(
         st: &mut TimeSyncRuntime,
         req_epoch: u16,
         req_stamp_ms: u64,
         now_ns: u64,
+        fresh_stamp: bool,
     ) {
+        st.epoch.see(req_epoch, now_ns);
         if req_epoch <= st.epoch.epoch {
+            if fresh_stamp && req_epoch == st.epoch.epoch {
+                st.epoch.followed = true;
+            }
             return;
         }
         let threshold_ms = Self::timesync_step_threshold_ns(st) / 1_000_000;
-        let agrees = st
-            .disciplined_clock
-            .read_unix_ms(now_ns)
-            .is_some_and(|now_ms| now_ms.abs_diff(req_stamp_ms) <= threshold_ms);
-        let to = if agrees { req_epoch } else { req_epoch.saturating_add(1) };
-        st.epoch.newest_seen = st.epoch.newest_seen.max(req_epoch);
-        Self::timesync_epoch_changed_locked(st, to, 0, TimeSyncStepReason::Renamed, now_ns);
+        let current = st.disciplined_clock.read_unix_ms(now_ns);
+        let agrees = current.is_some_and(|now_ms| now_ms.abs_diff(req_stamp_ms) <= threshold_ms);
+        if agrees {
+            Self::timesync_epoch_changed_locked(st, req_epoch, 0, TimeSyncStepReason::Renamed, now_ns);
+            return;
+        }
+        if !fresh_stamp {
+            // A data packet's stamp may have waited in queues: never act on
+            // a disagreement it shows. The next request settles it.
+            return;
+        }
+        // Only a leader no follower shares a base with yet joins: one that is
+        // followed is the reference, and a follower in a newer epoch on
+        // another base (one that named a divergence) steps back onto it.
+        if !st.epoch.steps_allowed && !st.epoch.followed && req_stamp_ms >= TIMESYNC_UTC_FLOOR_MS {
+            let target_ns = (i128::from(req_stamp_ms) * 1_000_000).min(i128::from(i64::MAX)) as i64;
+            let delta = current.map_or(0, |c| target_ns.saturating_sub((i128::from(c) * 1_000_000) as i64));
+            let rate = st.disciplined_clock.rate_ppb();
+            st.disciplined_clock.discipline_ns(now_ns, target_ns, rate, true);
+            st.clock_anchored = true;
+            Self::timesync_epoch_changed_locked(st, req_epoch, delta, TimeSyncStepReason::Joined, now_ns);
+            st.v2.restart_acquisition();
+            return;
+        }
+        // A different base: a still newer epoch names this node's, and the
+        // followers step onto it.
+        Self::timesync_epoch_changed_locked(st, req_epoch.saturating_add(1), 0, TimeSyncStepReason::Renamed, now_ns);
     }
 
     /// A relay serving a request that carries a newer epoch passes it upstream
     /// in its own requests.
-    pub(super) fn timesync_note_subtree_epoch_locked(st: &mut TimeSyncRuntime, req_epoch: u16) {
+    pub(super) fn timesync_note_subtree_epoch_locked(st: &mut TimeSyncRuntime, req_epoch: u16, now_ns: u64) {
         st.epoch.subtree = st.epoch.subtree.max(req_epoch);
-        st.epoch.newest_seen = st.epoch.newest_seen.max(req_epoch);
+        st.epoch.see(req_epoch, now_ns);
         if req_epoch > st.epoch.epoch {
             st.next_request_mono_ms = 0;
         }
@@ -1239,18 +1303,47 @@ impl Router {
 
     /// Notes the epoch of any received packet: a newer one means this node's
     /// time base is behind the network's, so it asks its source at once.
-    pub(super) fn timesync_note_rx_epoch(&self, epoch: u16) {
+    ///
+    /// A leading node (a restarted station, epoch 0) adopts a newer epoch
+    /// whose stamp agrees with its clock at once, so its own writes order
+    /// after everything the network already holds from the first packet it
+    /// hears rather than from the first request it serves.
+    pub(super) fn timesync_note_rx_epoch(&self, epoch: u16, timestamp_ms: u64) {
         if epoch == 0 || epoch <= self.timesync_epoch.load(core::sync::atomic::Ordering::Acquire) {
             return;
         }
         let Some(runtime) = self.timesync.as_ref() else {
             return;
         };
+        let now_ms = self.monotonic_now_ms();
+        let now_ns = self.monotonic_now_ns();
         let mut st = runtime.lock();
-        if epoch > st.epoch.newest_seen {
-            st.epoch.newest_seen = epoch;
+        if st.epoch.see(epoch, now_ns) {
             st.next_request_mono_ms = 0;
         }
+        if st.cfg.is_some() && !Self::timesync_following_remote_locked(&st, now_ms, now_ns) {
+            Self::timesync_leader_note_request_epoch_locked(&mut st, epoch, timestamp_ms, now_ns, false);
+        }
+    }
+
+    /// Raises this node's network time-base epoch to at least `min_epoch`
+    /// without changing its clock, e.g. at boot from an epoch persisted with
+    /// an ordering mark (a replay floor stored as `(epoch, timestamp)`).
+    ///
+    /// A follower raised above its source holds until the source adopts the
+    /// epoch from its requests (or names a newer one when the clocks disagree),
+    /// so the network's epoch never falls below an epoch any node remembers,
+    /// even after every node restarted. Returns the epoch after the call.
+    pub fn raise_network_time_epoch(&self, min_epoch: u16) -> u16 {
+        let Some(runtime) = self.timesync.as_ref() else {
+            return 0;
+        };
+        let now_ns = self.monotonic_now_ns();
+        let mut st = runtime.lock();
+        if min_epoch > st.epoch.epoch {
+            Self::timesync_epoch_changed_locked(&mut st, min_epoch, 0, TimeSyncStepReason::Raised, now_ns);
+        }
+        st.epoch.epoch
     }
 
     /// Current network time-base epoch (0 before any step was seen).
@@ -1286,9 +1379,11 @@ impl Router {
         let Some(now_ms) = self.network_time_ms() else {
             return NetworkStampAge::NoTime;
         };
+        let now_ns = self.monotonic_now_ns();
         let st = runtime.lock();
         if epoch > st.epoch.epoch {
-            return NetworkStampAge::NewerEpoch;
+            let since_ms = if epoch > st.epoch.newest_seen { 0 } else { st.epoch.newer_since_ms(now_ns) };
+            return NetworkStampAge::NewerEpoch { since_ms };
         }
         match st.epoch.translate(epoch) {
             Some(delta_ns) => {
@@ -1297,6 +1392,18 @@ impl Router {
             }
             None => NetworkStampAge::OlderEpoch,
         }
+    }
+
+    /// Whether a `(time_epoch, timestamp)` stamp is inside a validity window
+    /// of this node's network time: at most `max_age_ms` old and at most
+    /// `max_ahead_ms` ahead, judged by [`Router::network_stamp_age_ms`] and
+    /// [`NetworkStampAge::is_fresh`]. This is the check for command-validity
+    /// windows: it never compares a stamp with this node's clock across a
+    /// step, accepts a command stamped in a newer epoch only while this node
+    /// is still re-anchoring onto it, and refuses stamps from before steps it
+    /// no longer remembers, and everything while it has no network time.
+    pub fn network_stamp_is_fresh(&self, epoch: u16, timestamp_ms: u64, max_age_ms: u64, max_ahead_ms: u64) -> bool {
+        self.network_stamp_age_ms(epoch, timestamp_ms).is_fresh(max_age_ms, max_ahead_ms)
     }
 
     /// Allows or inhibits steps of this node's clock by local time sources

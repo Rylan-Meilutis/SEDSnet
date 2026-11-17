@@ -2261,8 +2261,9 @@ pub extern "C" fn seds_router_get_network_time_ms_with_epoch(
 /// Age of a `(time_epoch, timestamp_ms)` stamp against this node's network
 /// time, translated across the steps it remembers. `out_kind`: 0 the age in
 /// `out_age_ms` is valid (negative: in the future), 1 the stamp is from a
-/// newer epoch than this node's clock (it is re-anchoring), 2 the stamp is
-/// from an older epoch it cannot translate (stale), 3 no network time.
+/// newer epoch than this node's clock (it is re-anchoring; `out_age_ms` is
+/// how long ago it first heard of a newer epoch), 2 the stamp is from an
+/// older epoch it cannot translate (stale), 3 no network time.
 #[cfg(feature = "timesync")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_network_stamp_age_ms(
@@ -2277,13 +2278,56 @@ pub extern "C" fn seds_router_network_stamp_age_ms(
     }
     let (kind, age) = match unsafe { &(*r).inner }.network_stamp_age_ms(time_epoch, timestamp_ms) {
         crate::timesync::NetworkStampAge::Age(age) => (0, age),
-        crate::timesync::NetworkStampAge::NewerEpoch => (1, 0),
+        crate::timesync::NetworkStampAge::NewerEpoch { since_ms } => (1, since_ms.min(i64::MAX as u64) as i64),
         crate::timesync::NetworkStampAge::OlderEpoch => (2, 0),
         crate::timesync::NetworkStampAge::NoTime => (3, 0),
     };
     unsafe {
         *out_kind = kind;
         *out_age_ms = age;
+    }
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Command-validity window check: `*out_fresh` is 1 when the stamp is at
+/// most `max_age_ms` old and at most `max_ahead_ms` in the future on this
+/// node's network time, judged across remembered steps (a newer-epoch stamp
+/// passes while this node has known of that epoch for at most `max_age_ms`;
+/// an untranslatable older epoch, or no network time, never passes).
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_network_stamp_fresh(
+    r: *mut SedsRouter,
+    time_epoch: u16,
+    timestamp_ms: u64,
+    max_age_ms: u64,
+    max_ahead_ms: u64,
+    out_fresh: *mut bool,
+) -> i32 {
+    if r.is_null() || out_fresh.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let fresh = unsafe { &(*r).inner }.network_stamp_is_fresh(time_epoch, timestamp_ms, max_age_ms, max_ahead_ms);
+    unsafe {
+        *out_fresh = fresh;
+    }
+    status_from_result_code(SedsResult::SedsOk)
+}
+
+/// Raises this node's network time-base epoch to at least `min_epoch` without
+/// changing its clock (restore an epoch persisted with an ordering mark at
+/// boot). `out_epoch` (may be NULL) receives the epoch after the call.
+#[cfg(feature = "timesync")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_raise_time_epoch(r: *mut SedsRouter, min_epoch: u16, out_epoch: *mut u16) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let epoch = unsafe { &(*r).inner }.raise_network_time_epoch(min_epoch);
+    if !out_epoch.is_null() {
+        unsafe {
+            *out_epoch = epoch;
+        }
     }
     status_from_result_code(SedsResult::SedsOk)
 }

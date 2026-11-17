@@ -15686,17 +15686,16 @@ impl Router {
                             .and_then(|tracker| tracker.leader(now_mono_ms, has_usable_time));
                         // A follower in a newer epoch: the leader adopts it,
                         // a relay passes it upstream.
-                        if pkt.time_epoch() > st.epoch.epoch {
-                            if matches!(leader, Some(TimeSyncLeader::Local { .. })) {
-                                Self::timesync_leader_note_request_epoch_locked(
-                                    &mut st,
-                                    pkt.time_epoch(),
-                                    pkt.timestamp(),
-                                    now_mono_ns,
-                                );
-                            } else {
-                                Self::timesync_note_subtree_epoch_locked(&mut st, pkt.time_epoch());
-                            }
+                        if matches!(leader, Some(TimeSyncLeader::Local { .. })) {
+                            Self::timesync_leader_note_request_epoch_locked(
+                                &mut st,
+                                pkt.time_epoch(),
+                                pkt.timestamp(),
+                                now_mono_ns,
+                                true,
+                            );
+                        } else if pkt.time_epoch() > st.epoch.epoch {
+                            Self::timesync_note_subtree_epoch_locked(&mut st, pkt.time_epoch(), now_mono_ns);
                         }
                         let status =
                             Self::timesync_status_locked(&mut st, leader.as_ref(), now_mono_ns);
@@ -20486,10 +20485,10 @@ impl Router {
             // A packet from a newer time-base epoch: re-anchor promptly.
             #[cfg(feature = "timesync")]
             match &item.data {
-                RouterItem::Packet(pkt) => self.timesync_note_rx_epoch(pkt.time_epoch()),
+                RouterItem::Packet(pkt) => self.timesync_note_rx_epoch(pkt.time_epoch(), pkt.timestamp()),
                 RouterItem::Packed(_) => {
                     if let Some(env) = packed_routing.as_ref() {
-                        self.timesync_note_rx_epoch(env.time_epoch);
+                        self.timesync_note_rx_epoch(env.time_epoch, env.timestamp_ms);
                     }
                 }
             }

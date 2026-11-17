@@ -517,7 +517,7 @@ fn stamp_age_translates_across_remembered_steps() {
             NetworkStampAge::Age(age) => assert!(age.abs() <= 20, "{}: {age}", net.names[n]),
             other => panic!("{other:?}"),
         }
-        assert_eq!(net.nodes[n].network_stamp_age_ms(epoch + 1, now), NetworkStampAge::NewerEpoch);
+        assert!(matches!(net.nodes[n].network_stamp_age_ms(epoch + 1, now), NetworkStampAge::NewerEpoch { .. }));
     }
     // Five more steps: the first is no longer remembered.
     for _ in 0..5 {

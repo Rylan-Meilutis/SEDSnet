@@ -2195,15 +2195,34 @@ impl PyRouter {
 
     /// Age of a (time_epoch, timestamp_ms) stamp against this node's network
     /// time, translated across remembered steps: `("age", ms)`, or
-    /// `("newer_epoch", None)`, `("older_epoch", None)`, `("no_time", None)`.
+    /// `("newer_epoch", since_ms)` (ms since this node first heard of a newer
+    /// epoch), `("older_epoch", None)`, `("no_time", None)`.
     #[cfg(feature = "timesync")]
     fn network_stamp_age_ms(&self, time_epoch: u16, timestamp_ms: u64) -> (&'static str, Option<i64>) {
         match self.inner.as_ref().network_stamp_age_ms(time_epoch, timestamp_ms) {
             crate::timesync::NetworkStampAge::Age(age) => ("age", Some(age)),
-            crate::timesync::NetworkStampAge::NewerEpoch => ("newer_epoch", None),
+            crate::timesync::NetworkStampAge::NewerEpoch { since_ms } => {
+                ("newer_epoch", Some(since_ms.min(i64::MAX as u64) as i64))
+            }
             crate::timesync::NetworkStampAge::OlderEpoch => ("older_epoch", None),
             crate::timesync::NetworkStampAge::NoTime => ("no_time", None),
         }
+    }
+
+    /// Command-validity window: the stamp is at most `max_age_ms` old and at
+    /// most `max_ahead_ms` ahead of this node's network time, across steps.
+    #[cfg(feature = "timesync")]
+    fn network_stamp_is_fresh(&self, time_epoch: u16, timestamp_ms: u64, max_age_ms: u64, max_ahead_ms: u64) -> bool {
+        self.inner
+            .as_ref()
+            .network_stamp_is_fresh(time_epoch, timestamp_ms, max_age_ms, max_ahead_ms)
+    }
+
+    /// Raise this node's time-base epoch to at least `min_epoch` (no clock
+    /// change); returns the epoch after the call.
+    #[cfg(feature = "timesync")]
+    fn raise_network_time_epoch(&self, min_epoch: u16) -> u16 {
+        self.inner.as_ref().raise_network_time_epoch(min_epoch)
     }
 
     /// Allow or inhibit steps of this node's clock by local time sources.

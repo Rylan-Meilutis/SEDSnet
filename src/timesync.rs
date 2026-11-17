@@ -791,6 +791,13 @@ pub enum TimeSyncStepReason {
     /// The epoch number advanced without a time change: a follower carried a
     /// newer epoch, which this leading node adopted.
     Renamed = 7,
+    /// A leading node whose steps are inhibited heard a follower in a newer
+    /// epoch on another time base (a station restarted in flight): it joined
+    /// the network's time base instead of making the network step to its own.
+    Joined = 8,
+    /// [`crate::router::Router::raise_network_time_epoch`] advanced the epoch
+    /// (a persisted epoch restored at boot); no time change.
+    Raised = 9,
 }
 
 impl TimeSyncStepReason {
@@ -809,6 +816,8 @@ impl TimeSyncStepReason {
             Self::Resync => "resync",
             Self::Diverged => "diverged",
             Self::Renamed => "renamed",
+            Self::Joined => "joined",
+            Self::Raised => "raised",
         }
     }
 }
@@ -836,14 +845,49 @@ pub enum NetworkStampAge {
     /// current time base, ms (negative: the stamp is in the future).
     Age(i64),
     /// The stamp is from a newer epoch than this node's clock: this node has
-    /// not re-anchored yet (it is doing so); its clock cannot judge the stamp.
-    NewerEpoch,
+    /// not re-anchored yet (it is doing so, normally within one exchange); its
+    /// clock cannot translate the stamp. `since_ms` is how long ago this node
+    /// first heard of an epoch newer than its own (0 when this stamp is the
+    /// first): a stamp from that epoch was taken after the network entered
+    /// it, so its age is about `since_ms` at most (plus its transit).
+    NewerEpoch {
+        /// Milliseconds since this node first heard of a newer epoch.
+        since_ms: u64,
+    },
     /// The stamp is from an older epoch this node cannot translate: it was
     /// taken before a step that is no longer remembered, or by a node whose
     /// time base was never adopted. Treat it as stale.
     OlderEpoch,
     /// This node has no network time.
     NoTime,
+}
+
+impl NetworkStampAge {
+    /// Freshness verdict for a validity window: the stamp is at most
+    /// `max_age_ms` old and at most `max_ahead_ms` in the future. A stamp
+    /// from a newer epoch than this node's clock passes while this node has
+    /// known of that epoch for at most `max_age_ms` (it is re-anchoring and
+    /// the stamp cannot be older than the epoch); an untranslatable older
+    /// epoch, and no network time, never pass.
+    pub fn is_fresh(self, max_age_ms: u64, max_ahead_ms: u64) -> bool {
+        match self {
+            Self::Age(age) => {
+                age >= -(max_ahead_ms.min(i64::MAX as u64) as i64) && age <= max_age_ms.min(i64::MAX as u64) as i64
+            }
+            Self::NewerEpoch { since_ms } => since_ms <= max_age_ms,
+            Self::OlderEpoch | Self::NoTime => false,
+        }
+    }
+}
+
+/// Orders two `(time_epoch, timestamp_ms)` stamps of one network: epoch
+/// first, then timestamp. Every node's epoch only grows and a node never steps
+/// back inside an epoch, so this orders one sender's stamps across steps in
+/// either direction, and stamps of different senders that share the
+/// network's epochs.
+#[inline]
+pub fn compare_network_stamps(a: (u16, u64), b: (u16, u64)) -> core::cmp::Ordering {
+    a.cmp(&b)
 }
 
 impl TimeSyncStatus {
