@@ -1,6 +1,6 @@
 # Changelogs
 
-## Version 6.0.0 (2026-11-17)
+## Version 6.0.0 highlights
 
 - Breaking wire change (once network time has been stepped): frames carry their network time-base epoch in the wire contract; update the whole stack. Frames from a network that never stepped are unchanged.
 - Large clock corrections step instead of slew (above `step_threshold_ms`, default 1 s; inhibitable by the application with `set_timesync_steps_allowed`); smaller ones slew at `reference_slew_ppm` (20 ppm), which followers track. A 4 h step reaches every node, through relays and lossy radio, within 50 ms in under a second and within 2 ms in seconds.

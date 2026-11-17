@@ -196,6 +196,14 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 6.0.0 highlights
+
+- Breaking wire change (once network time has been stepped): frames carry their network time-base epoch in the wire contract; update the whole stack. Frames from a network that never stepped are unchanged.
+- Large clock corrections step instead of slew (above `step_threshold_ms`, default 1 s; inhibitable by the application with `set_timesync_steps_allowed`); smaller ones slew at `reference_slew_ppm` (20 ppm), which followers track. A 4 h step reaches every node, through relays and lossy radio, within 50 ms in under a second and within 2 ms in seconds.
+- Epochs order one sender's packets across steps: managed network variables accept writes made after a step back and refuse late pre-step copies; `network_stamp_age_ms` judges command freshness across steps.
+- Time sync status reports epoch, holding, steps and the last step (size, reason, age) in Rust, C and Python.
+- `network_stamp_is_fresh` is the command-validity-window check across steps; `raise_network_time_epoch` restores a persisted epoch at boot; a leader restarted with steps inhibited joins the network's time base instead of stepping it.
+
 ### Version 5.0.0 highlights
 
 - Breaking time sync wire change (4.x and 5.x nodes do not keep time together; update the whole stack): NTP interleaved exchange in the existing request/response words, transport transmit/receive stamps, and a least-squares phase/frequency discipline with holdover. No frame grows.
