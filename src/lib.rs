@@ -800,7 +800,7 @@ pub(crate) fn scheduler_priority(ty: DataType) -> u8 {
 /// Return the end-to-end cryptography policy for a data type.
 #[inline]
 pub fn message_e2e_encryption_policy(ty: DataType) -> E2eEncryptionPolicy {
-    get_message_meta(ty).e2e_encryption
+    config::message_e2e_policy(ty)
 }
 
 // ---- Convenience multiplication helpers ----

@@ -119,6 +119,20 @@ fn allocate_initial_ring<T>(mut capacity: usize, item_bytes: usize) -> VecDeque<
     ring
 }
 
+impl BoundedDeque<u64> {
+    /// `contains` for an ID window: four comparisons per step, so the scan
+    /// also stays short where the compiler does not unroll or vectorize.
+    pub(crate) fn contains_id(&self, id: u64) -> bool {
+        let (front, back) = self.q.as_slices();
+        [front, back].into_iter().any(|ids| {
+            let (chunks, rest) = ids.as_chunks::<4>();
+            chunks.iter().any(|chunk| {
+                (chunk[0] == id) | (chunk[1] == id) | (chunk[2] == id) | (chunk[3] == id)
+            }) || rest.contains(&id)
+        })
+    }
+}
+
 impl<T: ByteCost> BoundedDeque<T> {
     fn prepare_push_fifo(&mut self, cost: usize) -> TelemetryResult<()> {
         if self.q.capacity() == 0 {

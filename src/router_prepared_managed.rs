@@ -269,7 +269,7 @@ impl Router {
             (
                 local.managed_registration_epoch,
                 local.managed_cache_epoch,
-                local.managed_variable_types.clone(),
+                local.managed_variable_types.snapshot(),
                 local.managed_variable_latest.clone(),
             )
         };
@@ -419,10 +419,9 @@ impl Router {
             };
         }
         let local = st.local_services.as_mut().expect("checked local services");
-        core::mem::swap(
-            &mut local.managed_variable_types,
-            &mut prepared.replacement_types,
-        );
+        local
+            .managed_variable_types
+            .swap_set(&mut prepared.replacement_types);
         core::mem::swap(
             &mut local.managed_variable_latest,
             &mut prepared.replacement_latest,

@@ -1950,22 +1950,97 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 pub(crate) fn message_delivery_meta(data_type: DataType) -> (ReliableMode, u8) {
     #[cfg(feature = "std")]
     {
-        #[cfg(test)]
-        seed_test_schema();
-        registry()
-            .lock()
-            .expect("schema registry poisoned")
-            .types
-            .iter()
-            .find(|(id, _)| *id == data_type)
-            .map(|(_, meta)| (meta.reliable, meta.priority))
-            .unwrap_or((ReliableMode::None, 0))
+        let meta = delivery_meta_cache::get(data_type);
+        (meta.reliable, meta.priority)
     }
     #[cfg(not(feature = "std"))]
     {
         embedded_type_definition(data_type)
             .map(|def| (def.reliable, def.priority))
             .unwrap_or((ReliableMode::None, 0))
+    }
+}
+
+/// A type's end-to-end cryptography policy (`PreferOff` when unknown).
+pub(crate) fn message_e2e_policy(data_type: DataType) -> E2eEncryptionPolicy {
+    #[cfg(feature = "std")]
+    {
+        delivery_meta_cache::get(data_type).e2e_encryption
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        get_message_meta(data_type).e2e_encryption
+    }
+}
+
+/// The per-frame scheduling fields of a type, cached per thread and schema
+/// generation. A forwarded frame asks for them about ten times, and each
+/// uncached answer locked the registry and scanned its type list.
+#[cfg(feature = "std")]
+mod delivery_meta_cache {
+    use super::{DataType, E2eEncryptionPolicy, ReliableMode, registry, schema_generation};
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct DeliveryMeta {
+        pub(super) reliable: ReliableMode,
+        pub(super) priority: u8,
+        pub(super) e2e_encryption: E2eEncryptionPolicy,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Slot {
+        id: u32,
+        generation: u32,
+        meta: Option<DeliveryMeta>,
+    }
+
+    const SLOTS: usize = 16;
+    const EMPTY: Slot = Slot { id: 0, generation: 0, meta: None };
+
+    std::thread_local! {
+        static CACHE: Cell<[Slot; SLOTS]> = const { Cell::new([EMPTY; SLOTS]) };
+    }
+
+    pub(super) fn get(data_type: DataType) -> DeliveryMeta {
+        #[cfg(test)]
+        super::seed_test_schema();
+        // Read before the registry: a change after this read retires the entry.
+        let generation = schema_generation();
+        let index = data_type.0 as usize % SLOTS;
+        let cached = CACHE
+            .try_with(|cache| {
+                let slot = cache.get()[index];
+                slot.meta
+                    .filter(|_| slot.id == data_type.0 && slot.generation == generation)
+            })
+            .ok()
+            .flatten();
+        if let Some(meta) = cached {
+            return meta;
+        }
+        let meta = registry()
+            .lock()
+            .expect("schema registry poisoned")
+            .types
+            .iter()
+            .find(|(id, _)| *id == data_type)
+            .map(|(_, meta)| DeliveryMeta {
+                reliable: meta.reliable,
+                priority: meta.priority,
+                e2e_encryption: meta.e2e_encryption,
+            })
+            .unwrap_or(DeliveryMeta {
+                reliable: ReliableMode::None,
+                priority: 0,
+                e2e_encryption: E2eEncryptionPolicy::PreferOff,
+            });
+        let _ = CACHE.try_with(|cache| {
+            let mut slots = cache.get();
+            slots[index] = Slot { id: data_type.0, generation, meta: Some(meta) };
+            cache.set(slots);
+        });
+        meta
     }
 }
 

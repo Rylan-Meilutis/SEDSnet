@@ -325,6 +325,49 @@ pub(crate) fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Bytes a side wrapper adds around its body: magic, kind and CRC.
+pub(crate) const SIDE_TRANSPORT_WRAP_BYTES: usize =
+    SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES;
+
+/// The variable header of a side body, built on the stack: a flags byte and
+/// at most six ULEB128 fields.
+pub(crate) struct SideHeaderBytes {
+    bytes: [u8; 64],
+    pub(crate) len: usize,
+}
+
+impl Default for SideHeaderBytes {
+    fn default() -> Self {
+        Self { bytes: [0; 64], len: 0 }
+    }
+}
+
+impl SideHeaderBytes {
+    #[inline(always)]
+    pub(crate) fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+    /// Same encoding as `write_uleb128_local`.
+    #[inline(always)]
+    pub(crate) fn uleb128(&mut self, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            self.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> crate::SharedBytes {
     wrap_side_transport_frame_parts(kind, &[body])
 }
@@ -333,25 +376,44 @@ pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> crate::SharedB
 // chunk header stay on the stack instead of copying its payload into a Vec.
 pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> crate::SharedBytes {
     let header = [b'S', b'D', b'T', kind];
-    let mut hasher = Crc32Hasher::new();
-    hasher.update(&header);
-    for part in parts {
-        hasher.update(part);
+    let mut all: [&[u8]; 8] = [&[]; 8];
+    if parts.len() < all.len() {
+        all[0] = &header;
+        all[1..=parts.len()].copy_from_slice(parts);
+        return crate::shared_bytes::convert(frame_with_crc_from_parts(&all[..=parts.len()]));
     }
-    let crc = hasher.finalize().to_le_bytes();
+    let mut joined = alloc::vec::Vec::with_capacity(1 + parts.len());
+    joined.push(&header[..]);
+    joined.extend_from_slice(parts);
+    crate::shared_bytes::convert(frame_with_crc_from_parts(&joined))
+}
+
+/// One allocation holding `parts` back to back, followed by the little-endian
+/// CRC-32 of all of them.
+pub(crate) fn frame_with_crc_from_parts(parts: &[&[u8]]) -> Arc<[u8]> {
     let body_len: usize = parts.iter().map(|part| part.len()).sum();
-    let mut frame = Arc::<[u8]>::new_uninit_slice(header.len() + body_len + crc.len());
+    let mut frame = Arc::<[u8]>::new_uninit_slice(body_len + wire_format::CRC32_BYTES);
     let bytes = Arc::get_mut(&mut frame).expect("new frame is exclusively owned");
-    for (slot, value) in bytes.iter_mut().zip(
-        header
-            .iter()
-            .chain(parts.iter().flat_map(|part| part.iter()))
-            .chain(&crc),
-    ) {
-        slot.write(*value);
+    let mut off = 0;
+    for part in parts {
+        let dst = &mut bytes[off..off + part.len()];
+        // SAFETY: `dst` and `part` have the same length and cannot overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(part.as_ptr(), dst.as_mut_ptr().cast::<u8>(), part.len());
+        }
+        off += part.len();
     }
-    // SAFETY: header, all body segments and CRC fill the entire allocation.
-    unsafe { crate::shared_bytes::convert(frame.assume_init()) }
+    // One CRC pass over the assembled body rather than one per part.
+    // SAFETY: the first `body_len` bytes were all written above.
+    let body = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), body_len) };
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(body);
+    let crc = hasher.finalize().to_le_bytes();
+    for (slot, byte) in bytes[body_len..].iter_mut().zip(crc) {
+        slot.write(byte);
+    }
+    // SAFETY: the parts and the CRC fill the entire allocation.
+    unsafe { frame.assume_init() }
 }
 
 pub(crate) fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
@@ -562,6 +624,24 @@ pub(crate) fn reconstruct_side_compact_frame(
         None
     };
     let payload = &body[off..];
+    if template.reliable_flags.is_none() {
+        // Without a reliable header every field is a byte string or a
+        // ULEB128: write the canonical frame straight into its allocation.
+        let mut fields = SideHeaderBytes::default();
+        fields.uleb128(data_size);
+        fields.uleb128(timestamp);
+        if let Some(nonce) = nonce {
+            fields.uleb128(nonce);
+        }
+        let frame = frame_with_crc_from_parts(&[
+            &[flags],
+            template.prefix(),
+            fields.as_slice(),
+            template.between(),
+            payload,
+        ]);
+        return Ok((crate::shared_bytes::convert(frame), timestamp));
+    }
     let mut raw = Vec::with_capacity(
         1 + template.prefix().len() + template.between().len() + payload.len() + 32,
     );

@@ -1803,7 +1803,23 @@ impl Iterator for RoutingEndpointIter<'_> {
     }
 }
 
+/// Words of the fixed endpoint bitmap.
+#[cfg(feature = "discovery")]
+pub(crate) const ENDPOINT_BITMAP_WORDS: usize = EP_BITMAP_BYTES / 8;
+
 impl RoutingEnvelope<'_> {
+    /// The endpoint set as its fixed bitmap, when the bitmap alone carries it
+    /// (no endpoint list and no schema default): equal bitmaps, equal sets.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn endpoint_bitmap(&self) -> Option<&[u64; ENDPOINT_BITMAP_WORDS]> {
+        (self.endpoint_list.is_none() && self.schema_endpoints.is_none()).then_some(&self.bitmap)
+    }
+    /// The encoded endpoint list, when the frame carries one: equal bytes
+    /// decode to equal endpoint sets.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn endpoint_list_bytes(&self) -> Option<&[u8]> {
+        self.endpoint_list
+    }
     pub fn endpoints(&self) -> RoutingEndpointIter<'_> {
         RoutingEndpointIter {
             envelope: self,

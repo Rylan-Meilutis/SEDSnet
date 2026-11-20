@@ -121,6 +121,10 @@ where
         RouterMutex::new(self.lock().clone())
     }
 }
+/// The guard `RouterMutex::lock` returns.
+#[cfg(feature = "std")]
+pub type RouterMutexGuard<'a, T> = std::sync::MutexGuard<'a, T>;
+
 #[cfg(feature = "std")]
 impl<T> RouterMutex<T> {
     /// Create a new `RouterMutex` wrapping the given value.
