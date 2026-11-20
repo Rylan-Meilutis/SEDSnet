@@ -834,6 +834,15 @@ impl<T: ByteCost> BoundedDeque<T> {
         F: FnMut(&T) -> u8,
         G: FnMut(&VecDeque<T>, &T) -> bool,
     {
+        // A lone eligible item with no turn owed: the general selection picks
+        // it, resets the burst and owes no turn (nothing ranks above it).
+        if self.fair_owed_flags == 0
+            && self.q.len() == 1
+            && eligible(&self.q, &self.q[0])
+        {
+            *priority_burst = 0;
+            return Some((0, false));
+        }
         if self.fair_owed_flags & PRIORITY_TURN_PENDING != 0
             && self.fair_owed_flags & PRIORITY_TURN_ACTIVE == 0
         {

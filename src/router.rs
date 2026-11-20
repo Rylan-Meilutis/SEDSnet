@@ -3223,6 +3223,8 @@ struct RoutePlanFingerprint {
     sides: u32,
     overrides: u32,
     typed_overrides: u32,
+    /// Whether this router is one of a frame's owners depends on its name.
+    sender: u64,
 }
 
 /// The frame facts a cacheable route plan is keyed by: an untargeted best
@@ -3234,7 +3236,13 @@ struct RoutePlanKey {
     ty: u32,
     exclude: Option<RouterSideId>,
     endpoints: RoutePlanEndpoints,
+    /// The frozen owner contract, if any (at most `ROUTE_PLAN_KEY_TARGETS`).
+    targets: [u64; ROUTE_PLAN_KEY_TARGETS],
+    target_count: u8,
 }
+
+#[cfg(feature = "discovery")]
+const ROUTE_PLAN_KEY_TARGETS: usize = 4;
 
 /// A frame's endpoint set: its fixed bitmap, or else its sorted distinct
 /// endpoints. One set in two forms only misses the cache.
@@ -3484,7 +3492,11 @@ struct RouterInner {
     reliable_return_routes: OrdMap<u64, ReliableReturnRouteState>,
     local_admission_sequence: u64,
     reliable_return_route_order: VecDeque<u64>,
-    forwarded_receipts: Option<Box<ForwardedReceiptCache>>,
+    forwarded_receipts: Tracked<Option<Box<ForwardedReceiptCache>>>,
+    /// `Router::sender_hash` of the current sender, kept with the core state
+    /// so route plans can depend on it.
+    #[cfg(feature = "discovery")]
+    local_sender_hash: u64,
     end_to_end_reliable_tx: OrdMap<u64, Box<EndToEndReliableSent>>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
@@ -6096,15 +6108,18 @@ impl Router {
 
     #[cfg(test)]
     fn pop_next_queued_control_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
-        self.pop_next_queued_control_rx_item_or_timeouts(None, &mut false)
+        self.pop_next_queued_control_rx_item_or_timeouts(None, None, &mut false)
     }
 
     /// Take the next queued control item (receipts; discovery with local
     /// services). With `timeouts_at`, when there is none, also serve the
     /// pass's reliable timeouts under the same lock if nothing is pending
     /// (see `process_queue_pass_timeouts`), setting `timeouts_done`.
+    /// `expire_at`: first expire abandoned chunk transfers at that time,
+    /// under the same lock (`expire_side_chunks`).
     fn pop_next_queued_control_rx_item_or_timeouts(
         &self,
+        expire_at: Option<u64>,
         timeouts_at: Option<u64>,
         timeouts_done: &mut bool,
     ) -> TelemetryResult<Option<RouterRxItem>> {
@@ -6114,11 +6129,19 @@ impl Router {
                 .iter()
                 .position(|item| self.queued_rx_item_is_control(item));
             if let Some(idx) = idx {
-                return Ok(isr_rx.remove_pos(idx));
+                let item = isr_rx.remove_pos(idx);
+                drop(isr_rx);
+                if let Some(now) = expire_at {
+                    Self::expire_side_chunks_locked(&mut self.state.lock(), now);
+                }
+                return Ok(item);
             }
         }
 
         let mut st = self.state.lock();
+        if let Some(now) = expire_at {
+            Self::expire_side_chunks_locked(&mut st, now);
+        }
         // The queue is in descending priority order and control items are in
         // the network-control band or above: a lower head means none exists.
         let control_band = crate::transport_priority(DataType::ManagedVariableValue)
@@ -6211,7 +6234,7 @@ impl Router {
         start: u64,
         timeout_ms: u32,
     ) -> TelemetryResult<bool> {
-        self.drain_queued_control_rx_or_timeouts(start, timeout_ms, None, &mut false)
+        self.drain_queued_control_rx_or_timeouts(start, timeout_ms, None, None, &mut false)
     }
 
     /// `drain_queued_control_rx_before_tx`; with `timeouts_at`, a pass that
@@ -6221,13 +6244,16 @@ impl Router {
         &self,
         start: u64,
         timeout_ms: u32,
+        mut expire_at: Option<u64>,
         timeouts_at: Option<u64>,
         timeouts_done: &mut bool,
     ) -> TelemetryResult<bool> {
         let mut did_any = false;
-        while let Some(item) =
-            self.pop_next_queued_control_rx_item_or_timeouts(timeouts_at.filter(|_| !did_any), timeouts_done)?
-        {
+        while let Some(item) = self.pop_next_queued_control_rx_item_or_timeouts(
+            expire_at.take(),
+            timeouts_at.filter(|_| !did_any),
+            timeouts_done,
+        )? {
             self.process_rx_queue_item(item)?;
             did_any = true;
             // Receipts precede retry exhaustion; discovery precedes routing.
@@ -6653,6 +6679,10 @@ impl Router {
         st.address_book.insert(local.hostname.to_string(), record);
         st.local_address = local.clone();
         *self.sender.lock() = local.hostname.clone();
+        #[cfg(feature = "discovery")]
+        {
+            st.local_sender_hash = Self::sender_hash(local.hostname.as_ref());
+        }
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(st, self.clock.now_ms());
         Ok(AddressChange {
@@ -10065,19 +10095,27 @@ impl Router {
         self.remote_side_plan_with_selection(data, exclude, true)
     }
 
-    /// The cache key for a plain transit frame, or `None` when its plan may
-    /// depend on more than the frame's type, endpoints and ingress side.
+    /// The cache key of a frame's route plan, with the packet ID whose
+    /// receipt state the plan of a reliable type depends on; `None` when the
+    /// plan may depend on more than the frame's type, endpoints, owner
+    /// contract and ingress side (see `remote_side_plan_with_selection`).
     #[cfg(feature = "discovery")]
-    fn route_plan_key(data: &RouterItem, exclude: Option<RouterSideId>) -> Option<RoutePlanKey> {
+    fn route_plan_key(
+        data: &RouterItem,
+        exclude: Option<RouterSideId>,
+    ) -> Option<(RoutePlanKey, Option<u64>)> {
         let RouterItem::Packed(bytes) = data else {
             return None;
         };
-        // Frames with a reliable header (0x02) are not plain transit.
-        if bytes.first().is_none_or(|flags| flags & 0x02 != 0) {
-            return None;
-        }
-        let env = wire_format::peek_routing_envelope_unchecked(bytes.as_ref()).ok()?;
-        Self::route_plan_key_for(&env, exclude)
+        let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref()).ok()?;
+        let key = Self::route_plan_key_for(&frame.envelope, exclude)?;
+        // Reliable plans skip owners that already acknowledged this packet.
+        let receipt = if is_reliable_type(frame.envelope.ty) {
+            Some(wire_format::framed_packet_id(bytes.as_ref(), &frame)?)
+        } else {
+            None
+        };
+        Some((key, receipt))
     }
 
     #[cfg(feature = "discovery")]
@@ -10085,11 +10123,12 @@ impl Router {
         env: &wire_format::RoutingEnvelope<'_>,
         exclude: Option<RouterSideId>,
     ) -> Option<RoutePlanKey> {
-        if is_internal_control_type(env.ty)
-            || is_reliable_type(env.ty)
-            || env.target_senders().len() != 0
-        {
+        if is_internal_control_type(env.ty) || env.target_senders().len() > ROUTE_PLAN_KEY_TARGETS {
             return None;
+        }
+        let mut targets = [0u64; ROUTE_PLAN_KEY_TARGETS];
+        for (slot, target) in targets.iter_mut().zip(env.target_senders()) {
+            *slot = target;
         }
         let endpoints = if let Some(bitmap) = env.endpoint_bitmap() {
             RoutePlanEndpoints::Bitmap(*bitmap)
@@ -10116,6 +10155,8 @@ impl Router {
             ty: env.ty.as_u32(),
             exclude,
             endpoints,
+            targets,
+            target_count: env.target_senders().len() as u8,
         })
     }
 
@@ -10127,7 +10168,19 @@ impl Router {
             sides: st.sides.generation(),
             overrides: st.route_overrides.generation(),
             typed_overrides: st.typed_route_overrides.generation(),
+            sender: st.local_sender_hash,
         }
+    }
+
+    /// Whether a reliable packet's plan is free of receipt filtering: no
+    /// owner behind this router has acknowledged it yet.
+    #[cfg(feature = "discovery")]
+    fn receipts_unfiltered(st: &RouterInner, receipt: Option<u64>) -> bool {
+        receipt.is_none_or(|packet_id| {
+            st.forwarded_receipts
+                .as_ref()
+                .is_none_or(|cache| !cache.destinations.contains_key(&packet_id))
+        })
     }
 
     /// Serve a plain transit frame's plan from `route_plans` under a held
@@ -10136,9 +10189,10 @@ impl Router {
     fn cached_route_plan_locked(
         st: &RouterInner,
         key: &RoutePlanKey,
+        receipt: Option<u64>,
         now_ms: u64,
     ) -> Option<Option<RouterSideId>> {
-        if st.is_managed_variable(key.ty) {
+        if st.is_managed_variable(key.ty) || !Self::receipts_unfiltered(st, receipt) {
             return None;
         }
         st.route_plans
@@ -10161,27 +10215,31 @@ impl Router {
         select_routes: bool,
     ) -> TelemetryResult<RemoteSidePlan> {
         #[cfg(feature = "discovery")]
-        if let Some(key) = Self::route_plan_key(data, exclude) {
+        if let Some((key, receipt)) = Self::route_plan_key(data, exclude) {
             let now_ms = self.clock.now_ms();
             let fingerprint = {
                 let st = self.state.lock();
-                if let Some(side) = Self::cached_route_plan_locked(&st, &key, now_ms) {
+                if let Some(side) = Self::cached_route_plan_locked(&st, &key, receipt, now_ms) {
                     drop(st);
                     #[cfg(test)]
                     self.verify_cached_route_plan(data, exclude, select_routes, side);
                     return Ok(RemoteSidePlan::Target(side.into_iter().collect()));
                 }
-                (!st.is_managed_variable(key.ty)).then(|| Self::route_plan_fingerprint(&st))
+                (!st.is_managed_variable(key.ty) && Self::receipts_unfiltered(&st, receipt))
+                    .then(|| (Self::route_plan_fingerprint(&st), st.forwarded_receipts.generation()))
             };
             let pure = core::cell::Cell::new(true);
             let plan = self.remote_side_plan_uncached(data, exclude, select_routes, &pure)?;
             let RemoteSidePlan::Target(sides) = &plan;
-            if let Some(fingerprint) = fingerprint
+            if let Some((fingerprint, receipts)) = fingerprint
                 && pure.get()
                 && sides.len() <= 1
             {
                 let mut st = self.state.lock();
-                if Self::route_plan_fingerprint(&st) == fingerprint {
+                // Receipt state unchanged too: the plan saw no receipt filter.
+                if Self::route_plan_fingerprint(&st) == fingerprint
+                    && st.forwarded_receipts.generation() == receipts
+                {
                     let valid_until_ms = st.discovery_routes.liveness_deadline(now_ms);
                     st.route_plans.insert(RoutePlanEntry {
                         key,
@@ -10205,10 +10263,10 @@ impl Router {
         exclude: Option<RouterSideId>,
     ) -> TelemetryResult<(PlannedSides, crate::lock::RouterMutexGuard<'_, RouterInner>)> {
         #[cfg(feature = "discovery")]
-        if let Some(key) = Self::route_plan_key(data, exclude) {
+        if let Some((key, receipt)) = Self::route_plan_key(data, exclude) {
             let now_ms = self.clock.now_ms();
             let st = self.state.lock();
-            if let Some(side) = Self::cached_route_plan_locked(&st, &key, now_ms) {
+            if let Some(side) = Self::cached_route_plan_locked(&st, &key, receipt, now_ms) {
                 #[cfg(test)]
                 let st = {
                     drop(st);
@@ -17346,6 +17404,8 @@ impl Router {
             address_by_value.insert(address, hostname.to_string());
         }
         let managed_filter = Arc::new(AtomicU32::new(0));
+        #[cfg(feature = "discovery")]
+        let local_sender_hash = Self::sender_hash(hostname.as_ref());
         Self {
             #[cfg(feature = "std")]
             retry_trackers: RouterMutex::new(Vec::new()),
@@ -17424,7 +17484,9 @@ impl Router {
                 reliable_return_routes: Default::default(),
                 local_admission_sequence: 0,
                 reliable_return_route_order: VecDeque::new(),
-                forwarded_receipts: None,
+                forwarded_receipts: Default::default(),
+                #[cfg(feature = "discovery")]
+                local_sender_hash,
                 end_to_end_reliable_tx: Default::default(),
                 end_to_end_reliable_tx_order: VecDeque::new(),
                 total_handler_failures: 0,
@@ -17950,6 +18012,10 @@ impl Router {
         if !self.cfg.role.local_services() {
             // A transparent relay renames its protocol sender without claiming
             // a local application address or changing accepted wire owners.
+            #[cfg(feature = "discovery")]
+            {
+                self.state.lock().local_sender_hash = Self::sender_hash(hostname.as_ref());
+            }
             *self.sender.lock() = hostname;
             return;
         }
@@ -20638,7 +20704,6 @@ impl Router {
     }
 
     fn process_all_queues_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
-        self.expire_side_chunks();
         // Share the deadline between directions. Splitting a 1 ms budget in
         // half rounded TX down to zero and serviced only one transmit item,
         // even when the remainder of the pass was idle. One TX/RX pair is
@@ -20649,6 +20714,9 @@ impl Router {
         // until work that can run callbacks (received items) intervenes; the
         // pass's own deadline checks still read the clock.
         let mut pass_now = Some(start);
+        // Abandoned chunk transfers expire first, under the first control
+        // check's lock.
+        let mut expire_at = Some(start);
         loop {
             // Without std, a pass with no control item serves its idle timeouts
             // under the control check's lock, at the pass's clock reading.
@@ -20659,6 +20727,7 @@ impl Router {
                 self.drain_queued_control_rx_or_timeouts(
                     start,
                     timeout_ms,
+                    expire_at.take(),
                     prologue_now,
                     &mut timeouts_done,
                 ),
@@ -22712,7 +22781,7 @@ impl Router {
         let cached = if duplicate {
             None
         } else {
-            plan_key.and_then(|(key, now_ms)| Self::cached_route_plan_locked(&st, &key, now_ms))
+            plan_key.and_then(|(key, now_ms)| Self::cached_route_plan_locked(&st, &key, None, now_ms))
         };
         #[cfg(not(feature = "discovery"))]
         let cached: Option<Option<RouterSideId>> = None;

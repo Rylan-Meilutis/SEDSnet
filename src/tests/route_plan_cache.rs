@@ -228,3 +228,30 @@ fn cached_route_plans_follow_expiry_revival_policy_and_topology() {
     let _ = bulk_type("ROUTE_PLAN_CACHE_LATE_TYPE");
     assert_eq!(net.forward(ty, 3), 3);
 }
+
+#[test]
+fn cached_route_plans_serve_reliable_types_and_follow_sender_renames() {
+    let net = Net::new();
+    let ty = DataType::try_named("ROUTE_PLAN_CACHE_RELIABLE").unwrap_or_else(|| {
+        register_data_type_with_description(
+            "ROUTE_PLAN_CACHE_RELIABLE",
+            "cached plan reliable traffic",
+            MessageElement::Static(2, MessageDataType::Float32, MessageClass::Data),
+            &[DataEndpoint::named(SINK)],
+            ReliableMode::Unordered,
+            20,
+        )
+        .unwrap()
+    });
+    // Reliable types are keyed too (their receipt state checked per packet);
+    // every served plan is re-derived and must match.
+    let verified = route_plan_test_counter::verified();
+    assert_eq!(net.forward(ty, 10), 10);
+    assert!(route_plan_test_counter::verified() > verified, "reliable plans were not cached");
+
+    // Renaming the relay retires plans that depend on its own name.
+    net.relay.set_sender("PLAN_RELAY_RENAMED");
+    net.announce();
+    assert_eq!(net.forward(ty, 5), 5);
+    assert_eq!(net.forward(bulk_type("ROUTE_PLAN_CACHE_BULK"), 5), 5);
+}

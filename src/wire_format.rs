@@ -2195,13 +2195,19 @@ fn read_routing_envelope_uncached<'a>(
 /// a reliable header, payload compression or encryption. `None` otherwise
 /// (and for malformed bounds): use `packet_id_from_wire_unchecked`.
 pub(crate) fn plain_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
+    if frame.envelope.is_reliable || frame.envelope.has_reliable_header {
+        return None;
+    }
+    packet_id_with_payload_at(buf, frame)
+}
+
+/// The packet ID from a parsed routing frame whose payload starts at its
+/// `payload_offset`; `None` for compressed or encrypted payloads.
+fn packet_id_with_payload_at(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
     let data = admitted_data(buf).ok()?;
     let env = &frame.envelope;
     // Encrypted payloads (flag 0x10, rejected without cryptography) excluded.
-    if data.first()? & (FLAG_COMPRESSED_PAYLOAD | 0x10) != 0
-        || env.is_reliable
-        || env.has_reliable_header
-    {
+    if data.first()? & (FLAG_COMPRESSED_PAYLOAD | 0x10) != 0 {
         return None;
     }
     // The two prelude fields the routing envelope does not keep.
@@ -2218,6 +2224,16 @@ pub(crate) fn plain_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Optio
     let start = frame.payload_offset;
     let payload = data.get(start..start.checked_add(dsz)?)?;
     Some(packet_identity_hash(env, nonce, dsz, payload))
+}
+
+/// `plain_packet_id` for a frame that may carry a reliable header (not an
+/// ACK-only one), as `packet_id_from_wire_unchecked` computes it.
+#[cfg(feature = "discovery")]
+pub(crate) fn framed_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
+    if frame.ack_only() {
+        return None;
+    }
+    packet_id_with_payload_at(buf, frame)
 }
 
 /// The packet ID hash: exactly as `Packet::packet_id()` computes it.

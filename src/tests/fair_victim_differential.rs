@@ -173,7 +173,8 @@ fn tagged_victim_selection_matches_on_the_spot_classification() {
             };
             if matches!(op, Op::Schema) {
                 // Advances the schema generation: every tag is reclassified.
-                let _ = data_type(&format!("FAIR_DIFF_LATE_{seed}_{step}"), ReliableMode::None, 10);
+                // (Without growing the shared registry other tests use.)
+                crate::config::note_derived_schema_change();
             }
             let tagged_result = apply(&mut tagged.state.lock(), &op);
             fair_tag_test_switch::set_disabled(true);
