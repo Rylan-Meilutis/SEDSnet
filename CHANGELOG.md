@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 6.0.3
 
-Queue dispatch performance. Not yet released.
+Queue dispatch performance release.
 
 - **Unroutable packets no longer spin the queue.** An accepted reliable packet
   whose destination had no route (for example, the only path to its endpoint
@@ -91,8 +91,11 @@ Queue dispatch performance. Not yet released.
 - Changing the urgent scheduling table now advances the schema generation.
 - New internal schema generation counter: every runtime schema change advances
   it, and caches derived from schema lookups compare it before reusing a result.
-- Embedded code size grows by about 18.5 KB in all (thumbv7em,
-  `opt-level = "z"`, board features); static RAM is unchanged. Heap: a small
+- Embedded code size: the SEDSnet object grows by about 18.5 KB (thumbv7em,
+  `opt-level = "z"`, LTO). Measured in linked Cortex-M firmware it adds about
+  10.4 KB of flash over 6.0.2, or about 17.7 KB with `fair-admission`; a
+  firmware built at `opt-level = 3` shrank by about 2.3 KB. Static RAM is
+  unchanged. Heap: a small
   route plan cache in the router state, one pointer per bounded queue, and
   the victim lane only while a queue is saturated.
 - No wire, schema or public API change.
