@@ -1,5 +1,105 @@
 # Changelog
 
+## 6.0.3
+
+Queue dispatch performance release.
+
+- **Unroutable packets no longer spin the queue.** An accepted reliable packet
+  whose destination had no route (for example, the only path to its endpoint
+  was down) was put back with a 1 ms retry and re-dispatched in full on every
+  pass. Once the pass itself took longer than 1 ms, the retry was always due,
+  so every `drain_queues_with_timeout` / `periodic` call spent its whole budget
+  re-dispatching it. A node holding 16 such packets spent about 41,000
+  instructions per millisecond idle (host count, embedded features); it now
+  spends about 1,100. Such packets are now parked:
+  - Any routing change (a route learned or expired, a side added or removed,
+    route policy changed) makes them eligible at once, so a new route is used
+    on the next queue call.
+  - As a fallback they are re-checked on a doubling schedule, 1 ms up to
+    256 ms.
+  - Expiry is unchanged: a re-check never passes the delivery lifetime, so a
+    parked packet expires on time. Parked packets keep their queue memory
+    charge and priority. Routable traffic is not held behind them.
+- **Fewer instructions per forwarded frame.** Measured with the new
+  `dispatch_instructions` bench (a relay forwarding a small frame between two
+  template links, discovery and time sync on, x86-64 user-space instruction
+  counts):
+
+  | Profile | Frame | 6.0.2 | Now |
+  |---|---|---|---|
+  | embedded features | best effort | 32,100 | 13,000 |
+  | embedded features | reliable | 56,000 | 28,000 |
+  | embedded features, `opt-level = "z"` | best effort | 44,500 | 17,600 |
+  | std | best effort | 39,900 | 15,800 |
+  | std | reliable | 69,400 | 35,200 |
+
+  Core locks per forwarded best-effort frame (embedded) went from 49 to 19
+  and clock reads from 24 to 9; for a reliable frame 58 to 37 locks and 28 to
+  14 clock reads.
+
+  - The routing envelope of a frame was parsed about 20 times on its way
+    through the router. Parses are now memoized on the exact header bytes and
+    the schema generation, so a frame is parsed about twice. Without `std` the
+    memo is one shared try-locked table, allocated on first use (about 300
+    bytes of heap).
+  - Embedded schema type lookups walked the whole runtime overlay list, twice,
+    about ten times per frame. Resolved definitions are now cached per schema
+    generation (about 100 bytes of heap, allocated on first use).
+  - The queue budget's charge for discovered routes was recomputed over every
+    route and announcer on each admission. It is now cached and invalidated by
+    any change to the routes.
+  - A queue pass whose work empties both queues ends instead of running one more
+    idle pass.
+  - A plain transit frame (best effort, no owner contract, nothing local to
+    deliver) takes a direct path through receive and transmit: one parse,
+    no intermediate packet, and the transmit side's admission, statistics and
+    encoding each under one lock. Results are identical to the general path
+    (differential test).
+  - Route plans are cached per frame type, endpoints, owner contract and
+    ingress side, and dropped on any change to routes (including expiry by
+    time), sides, route policy, schema or this router's name. Plans using
+    weighted or adaptive selection, managed variables and reliable packets
+    that an owner behind this router already acknowledged are never cached.
+    Under test every cached plan is re-derived and compared.
+  - A queue pass reads the clock once for its timeout and transmit decisions,
+    and its idle checks share locks.
+  - Side frame encoding reads the clock once, extracts the link template
+    once and builds the frame without temporary allocations.
+  - The managed-variable check before routing is a lock-free filter.
+- **Bounded cost when the queue budget is full.** Each admission into a full
+  shared queue budget used to choose its victim by re-parsing every queued
+  frame about three times, so a saturated relay spent 240,000 (embedded) to
+  340,000 (`opt-level = "z"`) instructions per received frame and its
+  forwarding rate collapsed once frames arrived faster than it could drain
+  them. Queued items now keep a cached fairness class (classified once per
+  schema generation, held in a lane allocated only while a full queue needs a
+  victim and freed when the queue empties, 16 bytes per queued item), and each
+  queue keeps a running summary of a single owner's bulk, so a saturated
+  admission usually needs no scan. Victim choice is unchanged (differential
+  test against classifying every item on the spot).
+
+  | Profile | Saturated admission, 6.0.2 | Now |
+  |---|---|---|
+  | embedded features | 238,400 | 5,400 |
+  | embedded features, `opt-level = "z"` | 339,500 | 7,800 |
+  | std | 35,500 | 6,500 |
+
+  The bench's sustained-overload scenario (100 million instructions per
+  second, paced clock) at 4,000 offered frames/s: 6.0.2 forwarded 68 (std)
+  and 77 (`opt-level = "z"`) frames/s, now 3,998. At 8,000 offered it now
+  forwards 2,100-4,600 frames/s (before 10-30).
+- Changing the urgent scheduling table now advances the schema generation.
+- New internal schema generation counter: every runtime schema change advances
+  it, and caches derived from schema lookups compare it before reusing a result.
+- Embedded code size: the SEDSnet object grows by about 18.5 KB (thumbv7em,
+  `opt-level = "z"`, LTO). Measured in linked Cortex-M firmware it adds about
+  10.4 KB of flash over 6.0.2, or about 17.7 KB with `fair-admission`; a
+  firmware built at `opt-level = 3` shrank by about 2.3 KB. Static RAM is
+  unchanged. Heap: a small
+  route plan cache in the router state, one pointer per bounded queue, and
+  the victim lane only while a queue is saturated.
+- No wire, schema or public API change.
+
 ## 6.0.2
 
 Discovery recovery and embedded size release.

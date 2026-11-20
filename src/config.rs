@@ -1414,9 +1414,68 @@ pub(crate) fn ordinary_schema_guard() -> Option<PreparedSchemaGuard> {
     Some(PreparedSchemaGuard(REGISTRY.get()?.lock().expect("schema registry poisoned")))
 }
 
+/// Schema generation: changes whenever the runtime schema may have changed.
+/// Caches derived from schema lookups compare it before reusing a result.
+static SCHEMA_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// Current schema generation. Read it *before* deriving anything from the
+/// schema, and tag the derived value with it.
+#[inline]
+pub(crate) fn schema_generation() -> u32 {
+    SCHEMA_GENERATION.load(Ordering::Acquire)
+}
+
+#[inline]
+fn bump_schema_generation() {
+    SCHEMA_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Policy outside the registry that schema-derived values depend on (the
+/// urgent scheduling table) changed: advance the generation as a schema
+/// change would.
+pub(crate) fn note_derived_schema_change() {
+    bump_schema_generation();
+}
+
+/// The std registry lock. Any mutable access through its guard advances the
+/// schema generation, so no mutation path can leave a derived cache current.
 #[cfg(feature = "std")]
-fn registry() -> &'static std::sync::Mutex<Registry> {
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(Registry::new()))
+struct RegistryLock(&'static std::sync::Mutex<Registry>);
+
+#[cfg(feature = "std")]
+struct RegistryGuard(std::sync::MutexGuard<'static, Registry>);
+
+#[cfg(feature = "std")]
+impl RegistryLock {
+    fn lock(&self) -> std::sync::LockResult<RegistryGuard> {
+        self.0
+            .lock()
+            .map(RegistryGuard)
+            .map_err(|poisoned| std::sync::PoisonError::new(RegistryGuard(poisoned.into_inner())))
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::ops::Deref for RegistryGuard {
+    type Target = Registry;
+    fn deref(&self) -> &Registry {
+        &self.0
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::ops::DerefMut for RegistryGuard {
+    fn deref_mut(&mut self) -> &mut Registry {
+        // The lock is held: readers that derive from the schema block on it,
+        // so advancing before the mutation cannot tag a stale result as new.
+        bump_schema_generation();
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "std")]
+fn registry() -> RegistryLock {
+    RegistryLock(REGISTRY.get_or_init(|| std::sync::Mutex::new(Registry::new())))
 }
 
 #[cfg(all(
@@ -1840,14 +1899,28 @@ pub fn schema_fingerprint() -> u64 {
 
 #[cfg(feature = "std")]
 pub fn schema_bytes_used() -> usize {
+    // Queue admission asks on every push: answer from the last computation
+    // while the schema generation is unchanged (read before the registry).
+    static CACHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+    let generation = schema_generation();
+    let cached = CACHED.load(Ordering::Acquire);
+    if cached != u64::MAX && (cached >> 32) as u32 == generation {
+        return (cached & u64::from(u32::MAX)) as usize;
+    }
     // A memory query must not initialize/allocate the hosted registry. Until
     // the first schema operation, no registry heap storage is retained.
-    REGISTRY.get().map_or(0, |registry| {
+    let bytes = REGISTRY.get().map_or(0, |registry| {
         registry
             .lock()
             .expect("schema registry poisoned")
             .schema_byte_cost()
-    })
+    });
+    if let Ok(small) = u32::try_from(bytes)
+        && small != u32::MAX
+    {
+        CACHED.store((u64::from(generation) << 32) | u64::from(small), Ordering::Release);
+    }
+    bytes
 }
 
 #[cfg(feature = "std")]
@@ -1898,23 +1971,97 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 pub(crate) fn message_delivery_meta(data_type: DataType) -> (ReliableMode, u8) {
     #[cfg(feature = "std")]
     {
+        let meta = delivery_meta_cache::get(data_type);
+        (meta.reliable, meta.priority)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        embedded_type_definition(data_type)
+            .map(|def| (def.reliable, def.priority))
+            .unwrap_or((ReliableMode::None, 0))
+    }
+}
+
+/// A type's end-to-end cryptography policy (`PreferOff` when unknown).
+pub(crate) fn message_e2e_policy(data_type: DataType) -> E2eEncryptionPolicy {
+    #[cfg(feature = "std")]
+    {
+        delivery_meta_cache::get(data_type).e2e_encryption
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        get_message_meta(data_type).e2e_encryption
+    }
+}
+
+/// The per-frame scheduling fields of a type, cached per thread and schema
+/// generation. A forwarded frame asks for them about ten times, and each
+/// uncached answer locked the registry and scanned its type list.
+#[cfg(feature = "std")]
+mod delivery_meta_cache {
+    use super::{DataType, E2eEncryptionPolicy, ReliableMode, registry, schema_generation};
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct DeliveryMeta {
+        pub(super) reliable: ReliableMode,
+        pub(super) priority: u8,
+        pub(super) e2e_encryption: E2eEncryptionPolicy,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Slot {
+        id: u32,
+        generation: u32,
+        meta: Option<DeliveryMeta>,
+    }
+
+    const SLOTS: usize = 16;
+    const EMPTY: Slot = Slot { id: 0, generation: 0, meta: None };
+
+    std::thread_local! {
+        static CACHE: Cell<[Slot; SLOTS]> = const { Cell::new([EMPTY; SLOTS]) };
+    }
+
+    pub(super) fn get(data_type: DataType) -> DeliveryMeta {
         #[cfg(test)]
-        seed_test_schema();
-        registry()
+        super::seed_test_schema();
+        // Read before the registry: a change after this read retires the entry.
+        let generation = schema_generation();
+        let index = data_type.0 as usize % SLOTS;
+        let cached = CACHE
+            .try_with(|cache| {
+                let slot = cache.get()[index];
+                slot.meta
+                    .filter(|_| slot.id == data_type.0 && slot.generation == generation)
+            })
+            .ok()
+            .flatten();
+        if let Some(meta) = cached {
+            return meta;
+        }
+        let meta = registry()
             .lock()
             .expect("schema registry poisoned")
             .types
             .iter()
             .find(|(id, _)| *id == data_type)
-            .map(|(_, meta)| (meta.reliable, meta.priority))
-            .unwrap_or((ReliableMode::None, 0))
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        embedded_overlay_type(data_type)
-            .or_else(|| compiled_type_definition(data_type))
-            .map(|def| (def.reliable, def.priority))
-            .unwrap_or((ReliableMode::None, 0))
+            .map(|(_, meta)| DeliveryMeta {
+                reliable: meta.reliable,
+                priority: meta.priority,
+                e2e_encryption: meta.e2e_encryption,
+            })
+            .unwrap_or(DeliveryMeta {
+                reliable: ReliableMode::None,
+                priority: 0,
+                e2e_encryption: E2eEncryptionPolicy::PreferOff,
+            });
+        let _ = CACHE.try_with(|cache| {
+            let mut slots = cache.get();
+            slots[index] = Slot { id: data_type.0, generation, meta: Some(meta) };
+            cache.set(slots);
+        });
+        meta
     }
 }
 
@@ -2897,6 +3044,94 @@ fn embedded_overlay_endpoint(id: DataEndpoint) -> Option<EndpointDefinition> {
     None
 }
 
+/// Effective definition of `id`: the runtime overlay first, then flash.
+///
+/// Every lookup used to walk the whole overlay list (twice, for visibility),
+/// and a forwarded frame looks types up about ten times. A node that learned
+/// many peer types through discovery paid that on every frame. Resolved
+/// definitions are now cached per schema generation. Both overlay nodes and
+/// flash definitions are immutable and `'static`, so a cached pointer stays
+/// valid; any overlay change advances the generation and retires the cache.
+#[cfg(not(feature = "std"))]
+fn embedded_type_definition(id: DataType) -> Option<&'static DataTypeDefinition> {
+    let generation = schema_generation();
+    if let Some(hit) = embedded_type_cache::lookup(id, generation) {
+        return Some(hit);
+    }
+    let found = embedded_overlay_type(id).or_else(|| compiled_type_definition(id));
+    if let Some(definition) = found {
+        embedded_type_cache::store(id, generation, definition);
+    }
+    found
+}
+
+#[cfg(not(feature = "std"))]
+mod embedded_type_cache {
+    use super::{DataType, DataTypeDefinition};
+    use alloc::vec::Vec;
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const SLOTS: usize = 8;
+
+    #[derive(Clone, Copy)]
+    struct Slot {
+        generation: u32,
+        definition: Option<&'static DataTypeDefinition>,
+    }
+
+    // Heap-allocated on first use; taken with a try-lock. A busy cache (an
+    // interrupt preempting a holder) or a failed allocation falls back to the
+    // uncached lookup. Targets without compare-and-swap never cache.
+    struct Shared {
+        busy: AtomicBool,
+        slots: UnsafeCell<Vec<Slot>>,
+    }
+    // SAFETY: `slots` is only accessed while `busy` is held.
+    unsafe impl Sync for Shared {}
+
+    static SHARED: Shared = Shared {
+        busy: AtomicBool::new(false),
+        slots: UnsafeCell::new(Vec::new()),
+    };
+
+    #[cfg(target_has_atomic = "8")]
+    fn with<R>(f: impl FnOnce(&mut [Slot]) -> R) -> Option<R> {
+        SHARED
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        // SAFETY: the try-lock above grants exclusive access.
+        let slots = unsafe { &mut *SHARED.slots.get() };
+        if slots.is_empty() && slots.try_reserve_exact(SLOTS).is_ok() {
+            slots.resize(SLOTS, Slot { generation: 0, definition: None });
+        }
+        let result = (!slots.is_empty()).then(|| f(slots));
+        SHARED.busy.store(false, Ordering::Release);
+        result
+    }
+
+    #[cfg(not(target_has_atomic = "8"))]
+    fn with<R>(_f: impl FnOnce(&mut [Slot]) -> R) -> Option<R> {
+        None
+    }
+
+    pub(super) fn lookup(id: DataType, generation: u32) -> Option<&'static DataTypeDefinition> {
+        with(|slots| {
+            let slot = slots[id.0 as usize % SLOTS];
+            slot.definition
+                .filter(|def| slot.generation == generation && def.id == id)
+        })
+        .flatten()
+    }
+
+    pub(super) fn store(id: DataType, generation: u32, definition: &'static DataTypeDefinition) {
+        let _ = with(|slots| {
+            slots[id.0 as usize % SLOTS] = Slot { generation, definition: Some(definition) };
+        });
+    }
+}
+
 #[cfg(not(feature = "std"))]
 fn embedded_overlay_type(id: DataType) -> Option<&'static DataTypeDefinition> {
     let mut node = EMBEDDED_TYPE_HEAD.load(Ordering::Acquire);
@@ -3275,6 +3510,8 @@ fn push_embedded_endpoint(def: OwnedEndpointDefinition) {
         next: EMBEDDED_ENDPOINT_HEAD.load(Ordering::Relaxed),
     });
     EMBEDDED_ENDPOINT_HEAD.store(Box::into_raw(node), Ordering::Release);
+    // After publication: a reader that sees the new generation sees the node.
+    bump_schema_generation();
 }
 
 #[cfg(not(feature = "std"))]
@@ -3284,6 +3521,7 @@ fn push_embedded_type(def: OwnedDataTypeDefinition) {
         next: EMBEDDED_TYPE_HEAD.load(Ordering::Relaxed),
     });
     EMBEDDED_TYPE_HEAD.store(Box::into_raw(node), Ordering::Release);
+    bump_schema_generation();
 }
 
 #[cfg(not(feature = "std"))]
@@ -3481,7 +3719,7 @@ pub fn endpoint_exists(ep: DataEndpoint) -> bool {
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_exists(ty: DataType) -> bool {
-    embedded_overlay_type(ty).is_some() || compiled_type_definition(ty).is_some()
+    embedded_type_definition(ty).is_some()
 }
 
 #[cfg(not(feature = "std"))]
@@ -3493,9 +3731,7 @@ pub fn endpoint_definition(ep: DataEndpoint) -> Option<OwnedEndpointDefinition> 
 
 #[cfg(not(feature = "std"))]
 pub fn data_type_definition(ty: DataType) -> Option<OwnedDataTypeDefinition> {
-    embedded_overlay_type(ty)
-        .or_else(|| compiled_type_definition(ty))
-        .map(|def| own_embedded_type(*def))
+    embedded_type_definition(ty).map(|def| own_embedded_type(*def))
 }
 
 #[cfg(not(feature = "std"))]
@@ -3548,8 +3784,7 @@ pub fn get_endpoint_meta(endpoint_type: DataEndpoint) -> EndpointMeta {
 #[cfg(not(feature = "std"))]
 #[inline(never)]
 pub(crate) fn try_get_message_meta(data_type: DataType) -> Option<MessageMeta> {
-    embedded_overlay_type(data_type)
-        .or_else(|| compiled_type_definition(data_type))
+    embedded_type_definition(data_type)
         .map(|def| MessageMeta {
             name: def.name,
             description: def.description,

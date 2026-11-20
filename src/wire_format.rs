@@ -1726,8 +1726,9 @@ pub(crate) fn peek_envelope_unchecked(buf: &[u8]) -> TelemetryResult<TelemetryEn
 }
 
 /// Validated routing metadata without owned strings or heap-backed arrays.
-/// The fixed bitmap is normalized against the current schema on every parse;
-/// nothing is cached across schema updates or packet lifetimes.
+/// The fixed bitmap is normalized against the current schema. A parsed
+/// envelope may be reused by [`envelope_memo`] for byte-identical headers,
+/// but never across a schema generation.
 #[derive(Clone, Debug)]
 pub(crate) struct RoutingEnvelope<'a> {
     pub ty: DataType,
@@ -1802,7 +1803,23 @@ impl Iterator for RoutingEndpointIter<'_> {
     }
 }
 
+/// Words of the fixed endpoint bitmap.
+#[cfg(feature = "discovery")]
+pub(crate) const ENDPOINT_BITMAP_WORDS: usize = EP_BITMAP_BYTES / 8;
+
 impl RoutingEnvelope<'_> {
+    /// The endpoint set as its fixed bitmap, when the bitmap alone carries it
+    /// (no endpoint list and no schema default): equal bitmaps, equal sets.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn endpoint_bitmap(&self) -> Option<&[u64; ENDPOINT_BITMAP_WORDS]> {
+        (self.endpoint_list.is_none() && self.schema_endpoints.is_none()).then_some(&self.bitmap)
+    }
+    /// The encoded endpoint list, when the frame carries one: equal bytes
+    /// decode to equal endpoint sets.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn endpoint_list_bytes(&self) -> Option<&[u8]> {
+        self.endpoint_list
+    }
     pub fn endpoints(&self) -> RoutingEndpointIter<'_> {
         RoutingEndpointIter {
             envelope: self,
@@ -1834,7 +1851,233 @@ impl RoutingEnvelope<'_> {
     }
 }
 
+/// Parse the routing envelope at the reader's position.
+///
+/// One forwarded frame used to be parsed about twenty times on its way
+/// through the router (scheduling, dedupe, routing, encoding). A frame-start
+/// parse is now served from [`envelope_memo`] when the same header bytes were
+/// parsed under the current schema generation.
 fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingEnvelope<'a>> {
+    if r.off != 0 {
+        return read_routing_envelope_uncached(r);
+    }
+    let generation = crate::config::schema_generation();
+    if let Some((envelope, consumed)) = envelope_memo::lookup(r.buf, generation) {
+        r.off = consumed;
+        return Ok(envelope);
+    }
+    let envelope = read_routing_envelope_uncached(r)?;
+    envelope_memo::store(r.buf, r.off, &envelope, generation);
+    Ok(envelope)
+}
+
+/// Small cache of parsed routing envelopes, keyed by the exact header bytes.
+///
+/// The parse reads only the header prefix and the schema, so two buffers with
+/// the same prefix under the same schema generation parse identically; the
+/// key is the content, not the buffer's identity, and needs no invalidation
+/// when buffers are freed or reused. Borrowed views are kept as offsets and
+/// rebuilt over the caller's buffer. Headers longer than the key capacity, and
+/// ACK-only frames (whose validation reads past the envelope), are not cached.
+mod envelope_memo {
+    use super::{DataEndpoint, EP_BITMAP_BYTES, MessageElement, RoutingEnvelope};
+    #[cfg(feature = "std")]
+    use alloc::sync::Arc;
+
+    const KEY_BYTES: usize = 40;
+    const SLOTS: usize = 2;
+
+    #[derive(Clone)]
+    struct Entry {
+        generation: u32,
+        consumed: u8,
+        key: [u8; KEY_BYTES],
+        ty: crate::config::DataType,
+        bitmap: [u64; EP_BITMAP_BYTES / 8],
+        endpoint_list: Option<(u8, u8)>,
+        #[cfg(feature = "std")]
+        schema_endpoints: Option<Arc<[DataEndpoint]>>,
+        #[cfg(not(feature = "std"))]
+        schema_endpoints: Option<&'static [DataEndpoint]>,
+        source_address: u32,
+        timestamp_ms: u64,
+        time_epoch: u16,
+        wire_shape: Option<MessageElement>,
+        is_reliable: bool,
+        payload_is_empty: bool,
+        targets: (u8, u8),
+        has_reliable_header: bool,
+    }
+
+    #[derive(Default)]
+    struct Memo {
+        slots: [Option<Entry>; SLOTS],
+        next: usize,
+    }
+
+    impl Memo {
+        fn lookup<'a>(&self, buf: &'a [u8], generation: u32) -> Option<(RoutingEnvelope<'a>, usize)> {
+            let entry = self.slots.iter().flatten().find(|entry| {
+                let consumed = usize::from(entry.consumed);
+                entry.generation == generation
+                    && buf.len() >= consumed
+                    && buf[..consumed] == entry.key[..consumed]
+            })?;
+            let view = |(start, len): (u8, u8)| &buf[usize::from(start)..][..usize::from(len)];
+            Some((
+                RoutingEnvelope {
+                    ty: entry.ty,
+                    bitmap: entry.bitmap,
+                    endpoint_list: entry.endpoint_list.map(view),
+                    #[cfg(feature = "std")]
+                    schema_endpoints: entry.schema_endpoints.clone(),
+                    #[cfg(not(feature = "std"))]
+                    schema_endpoints: entry.schema_endpoints,
+                    source_address: entry.source_address,
+                    timestamp_ms: entry.timestamp_ms,
+                    time_epoch: entry.time_epoch,
+                    wire_shape: entry.wire_shape,
+                    is_reliable: entry.is_reliable,
+                    payload_is_empty: entry.payload_is_empty,
+                    targets: view(entry.targets),
+                    has_reliable_header: entry.has_reliable_header,
+                },
+                usize::from(entry.consumed),
+            ))
+        }
+
+        fn store(&mut self, buf: &[u8], consumed: usize, envelope: &RoutingEnvelope<'_>, generation: u32) {
+            if consumed > KEY_BYTES || buf.get(1).is_none_or(|&nep| nep == 0) {
+                return;
+            }
+            // Borrowed views always point into `buf[..consumed]`.
+            let span = |part: &[u8]| -> Option<(u8, u8)> {
+                if part.is_empty() {
+                    return Some((0, 0));
+                }
+                let start = (part.as_ptr() as usize).checked_sub(buf.as_ptr() as usize)?;
+                (start + part.len() <= consumed).then_some((start as u8, part.len() as u8))
+            };
+            let endpoint_list = match envelope.endpoint_list {
+                Some(list) => match span(list) {
+                    Some(span) => Some(span),
+                    None => return,
+                },
+                None => None,
+            };
+            let Some(targets) = span(envelope.targets) else {
+                return;
+            };
+            let mut key = [0u8; KEY_BYTES];
+            key[..consumed].copy_from_slice(&buf[..consumed]);
+            self.slots[self.next] = Some(Entry {
+                generation,
+                consumed: consumed as u8,
+                key,
+                ty: envelope.ty,
+                bitmap: envelope.bitmap,
+                endpoint_list,
+                #[cfg(feature = "std")]
+                schema_endpoints: envelope.schema_endpoints.clone(),
+                #[cfg(not(feature = "std"))]
+                schema_endpoints: envelope.schema_endpoints,
+                source_address: envelope.source_address,
+                timestamp_ms: envelope.timestamp_ms,
+                time_epoch: envelope.time_epoch,
+                wire_shape: envelope.wire_shape,
+                is_reliable: envelope.is_reliable,
+                payload_is_empty: envelope.payload_is_empty,
+                targets,
+                has_reliable_header: envelope.has_reliable_header,
+            });
+            self.next = (self.next + 1) % SLOTS;
+        }
+    }
+
+    #[cfg(feature = "std")]
+    std::thread_local! {
+        static MEMO: core::cell::RefCell<Memo> = core::cell::RefCell::new(Memo::default());
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn lookup(buf: &[u8], generation: u32) -> Option<(RoutingEnvelope<'_>, usize)> {
+        MEMO.try_with(|memo| memo.try_borrow().ok()?.lookup(buf, generation))
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn store(buf: &[u8], consumed: usize, envelope: &RoutingEnvelope<'_>, generation: u32) {
+        let _ = MEMO.try_with(|memo| {
+            if let Ok(mut memo) = memo.try_borrow_mut() {
+                memo.store(buf, consumed, envelope, generation);
+            }
+        });
+    }
+
+    // Without std there is no thread-local storage. One shared memo is taken
+    // with a try-lock; a parse that finds it busy (another thread, or an
+    // interrupt preempting a holder) simply parses without it.
+    #[cfg(all(not(feature = "std"), target_has_atomic = "8"))]
+    mod shared {
+        use super::Memo;
+        use alloc::vec::Vec;
+        use core::cell::UnsafeCell;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        // Heap-allocated on first use (a few hundred bytes), so images with
+        // no spare static RAM do not pay for it in .bss. If that allocation
+        // fails the memo stays disabled and every parse is a plain parse.
+        struct Shared {
+            busy: AtomicBool,
+            memo: UnsafeCell<Vec<Memo>>,
+        }
+        // SAFETY: `memo` is only accessed while `busy` is held.
+        unsafe impl Sync for Shared {}
+
+        static SHARED: Shared = Shared {
+            busy: AtomicBool::new(false),
+            memo: UnsafeCell::new(Vec::new()),
+        };
+
+        pub(super) fn with<R>(f: impl FnOnce(&mut Memo) -> R) -> Option<R> {
+            SHARED
+                .busy
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .ok()?;
+            // SAFETY: the try-lock above grants exclusive access.
+            let memo = unsafe { &mut *SHARED.memo.get() };
+            if memo.is_empty() && memo.try_reserve_exact(1).is_ok() {
+                memo.push(Memo::default());
+            }
+            let result = memo.first_mut().map(f);
+            SHARED.busy.store(false, Ordering::Release);
+            result
+        }
+    }
+
+    #[cfg(all(not(feature = "std"), target_has_atomic = "8"))]
+    pub(super) fn lookup(buf: &[u8], generation: u32) -> Option<(RoutingEnvelope<'_>, usize)> {
+        shared::with(|memo| memo.lookup(buf, generation)).flatten()
+    }
+
+    #[cfg(all(not(feature = "std"), target_has_atomic = "8"))]
+    pub(super) fn store(buf: &[u8], consumed: usize, envelope: &RoutingEnvelope<'_>, generation: u32) {
+        let _ = shared::with(|memo| memo.store(buf, consumed, envelope, generation));
+    }
+
+    #[cfg(all(not(feature = "std"), not(target_has_atomic = "8")))]
+    pub(super) fn lookup(_buf: &[u8], _generation: u32) -> Option<(RoutingEnvelope<'_>, usize)> {
+        None
+    }
+
+    #[cfg(all(not(feature = "std"), not(target_has_atomic = "8")))]
+    pub(super) fn store(_buf: &[u8], _consumed: usize, _envelope: &RoutingEnvelope<'_>, _generation: u32) {}
+}
+
+fn read_routing_envelope_uncached<'a>(
+    r: &mut ByteReader<'a>,
+) -> TelemetryResult<RoutingEnvelope<'a>> {
     let flags = r.read_bytes(1)?[0];
     let nep = r.read_bytes(1)?[0] as usize;
     let ty_v = read_uleb128(r)?;
@@ -1947,6 +2190,79 @@ fn read_routing_envelope<'a>(r: &mut ByteReader<'a>) -> TelemetryResult<RoutingE
     })
 }
 
+/// The packet ID of an admitted frame whose routing frame is parsed, as
+/// `packet_id_from_wire_unchecked` computes it, for the common frame without
+/// a reliable header, payload compression or encryption. `None` otherwise
+/// (and for malformed bounds): use `packet_id_from_wire_unchecked`.
+pub(crate) fn plain_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
+    if frame.envelope.is_reliable || frame.envelope.has_reliable_header {
+        return None;
+    }
+    packet_id_with_payload_at(buf, frame)
+}
+
+/// The packet ID from a parsed routing frame whose payload starts at its
+/// `payload_offset`; `None` for compressed or encrypted payloads.
+fn packet_id_with_payload_at(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
+    let data = admitted_data(buf).ok()?;
+    let env = &frame.envelope;
+    // Encrypted payloads (flag 0x10, rejected without cryptography) excluded.
+    if data.first()? & (FLAG_COMPRESSED_PAYLOAD | 0x10) != 0 {
+        return None;
+    }
+    // The two prelude fields the routing envelope does not keep.
+    let mut r = ByteReader::new(data);
+    let flags = r.read_bytes(2).ok()?[0];
+    read_uleb128(&mut r).ok()?;
+    let dsz = usize::try_from(read_uleb128(&mut r).ok()?).ok()?;
+    read_uleb128(&mut r).ok()?;
+    let nonce = if flags & FLAG_PACKET_NONCE != 0 {
+        u16::try_from(read_uleb128(&mut r).ok()?).ok()?
+    } else {
+        0
+    };
+    let start = frame.payload_offset;
+    let payload = data.get(start..start.checked_add(dsz)?)?;
+    Some(packet_identity_hash(env, nonce, dsz, payload))
+}
+
+/// `plain_packet_id` for a frame that may carry a reliable header (not an
+/// ACK-only one), as `packet_id_from_wire_unchecked` computes it.
+#[cfg(feature = "discovery")]
+pub(crate) fn framed_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
+    if frame.ack_only() {
+        return None;
+    }
+    packet_id_with_payload_at(buf, frame)
+}
+
+/// The packet ID hash: exactly as `Packet::packet_id()` computes it.
+fn packet_identity_hash(envelope: &RoutingEnvelope<'_>, nonce: u16, dsz: usize, payload: &[u8]) -> u64 {
+    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    // Compact source address.
+    h = hash_bytes_u64(h, &envelope.source_address.to_le_bytes());
+
+    // Stable numeric identity is independent of when schema names are learned.
+    h = hash_bytes_u64(h, &envelope.ty.0.to_le_bytes());
+
+    // Endpoints as string bytes, in ascending discriminant order.
+    for ep in envelope.endpoints() {
+        h = hash_bytes_u64(h, &ep.0.to_le_bytes());
+    }
+
+    // Timestamp + data_size as bytes
+    h = hash_bytes_u64(h, &envelope.timestamp_ms.to_le_bytes());
+    h = hash_bytes_u64(h, &nonce.to_le_bytes());
+    h = hash_bytes_u64(h, &(dsz as u64).to_le_bytes());
+    if envelope.time_epoch != 0 {
+        h = hash_bytes_u64(h, &envelope.time_epoch.to_le_bytes());
+    }
+
+    // Payload bytes (logical payload)
+    hash_bytes_u64(h, payload)
+}
+
 /// Read only the bounded type prefix for queue scheduling. This is deliberately
 /// not frame validation: ingress verifies the CRC and dispatch the envelope.
 /// Scanning an RX queue must not checksum every retained payload on each pass.
@@ -2052,6 +2368,8 @@ pub(crate) struct RoutingFrameInfo<'a> {
     pub envelope: RoutingEnvelope<'a>,
     pub reliable: Option<ReliableHeader>,
     pub empty_payload: bool,
+    /// Where the payload starts (after the envelope and any reliable header).
+    payload_offset: usize,
 }
 impl RoutingFrameInfo<'_> {
     pub fn ack_only(&self) -> bool {
@@ -2140,11 +2458,13 @@ pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<Routin
     }
     let meta =
         crate::config::try_get_message_meta(envelope.ty).ok_or(TelemetryError::InvalidType)?;
+    let payload_offset = reader.off;
     Packet::validate_payload_against_element(meta.element, reader.read_bytes(size)?)?;
     Ok(RoutingFrameInfo {
         envelope,
         reliable: None,
         empty_payload: size == 0,
+        payload_offset,
     })
 }
 
@@ -2178,6 +2498,7 @@ fn routing_frame_info(data: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
         envelope,
         reliable,
         empty_payload,
+        payload_offset: reader.off,
     })
 }
 
@@ -2557,30 +2878,8 @@ fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
     };
 
     // ---- hash exactly like Packet::packet_id() ----
-    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
-
-    // Compact source address.
-    h = hash_bytes_u64(h, &source_address.to_le_bytes());
-
-    // Stable numeric identity is independent of when schema names are learned.
-    h = hash_bytes_u64(h, &ty.0.to_le_bytes());
-
-    // Endpoints as string bytes, in ascending discriminant order.
-    for ep in envelope.endpoints() {
-        h = hash_bytes_u64(h, &ep.0.to_le_bytes());
-    }
-
-    // Timestamp + data_size as bytes
-    h = hash_bytes_u64(h, &ts_v.to_le_bytes());
-    h = hash_bytes_u64(h, &nonce.to_le_bytes());
-    h = hash_bytes_u64(h, &(dsz as u64).to_le_bytes());
-    if envelope.time_epoch != 0 {
-        h = hash_bytes_u64(h, &envelope.time_epoch.to_le_bytes());
-    }
-
-    // Payload bytes (logical payload)
-    h = hash_bytes_u64(h, payload_bytes);
-    Ok(h)
+    debug_assert_eq!((source_address, ty, ts_v), (envelope.source_address, envelope.ty, envelope.timestamp_ms));
+    Ok(packet_identity_hash(&envelope, nonce, dsz, payload_bytes))
 }
 
 mod payload_compression {
@@ -2669,6 +2968,109 @@ mod payload_compression {
         Err(TelemetryError::Unpack(
             "compressed payloads not supported (compression feature disabled)",
         ))
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod envelope_memo_tests {
+    use super::*;
+    use crate::config::{
+        register_data_type_id_with_description, register_endpoint_with_description,
+        remove_data_type,
+    };
+
+
+    fn endpoint(name: &str) -> DataEndpoint {
+        DataEndpoint::try_named(name).unwrap_or_else(|| {
+            register_endpoint_with_description(name, "memo test endpoint", false).unwrap()
+        })
+    }
+
+    fn owned(bytes: &[u8]) -> TelemetryEnvelope {
+        peek_routing_envelope_unchecked(bytes).unwrap().into_owned()
+    }
+
+    /// Repeated parses of one header are served by the memo, and match an
+    /// uncached parse field for field, over any buffer holding those bytes.
+    #[test]
+    fn memoized_envelopes_match_uncached_parses() {
+        crate::tests::ensure_common_test_schema();
+        let pkt = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[1.0, 2.0, 3.0],
+            &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
+            1_234,
+        )
+        .unwrap();
+        let first = pack_packet(&pkt);
+        let copy: Vec<u8> = first.to_vec();
+        let uncached = {
+            let data = admitted_data(&first).unwrap();
+            read_routing_envelope_uncached(&mut ByteReader::new(data)).unwrap().into_owned()
+        };
+        assert_eq!(owned(&first), uncached);
+        assert_eq!(owned(&first), uncached, "second parse is a memo hit");
+        assert_eq!(owned(&copy), uncached, "content, not buffer identity, is the key");
+        let info = peek_routing_frame_info_unchecked(&copy).unwrap();
+        assert_eq!(info.envelope.into_owned(), uncached);
+        assert_eq!(packet_id_from_wire(&copy).unwrap(), pkt.packet_id());
+        // A different header (timestamp) is a different key.
+        let later = pack_packet(
+            &Packet::from_f32_slice(
+                DataType::named("GPS_DATA"),
+                &[1.0, 2.0, 3.0],
+                &[DataEndpoint::named("SD_CARD"), DataEndpoint::named("RADIO")],
+                1_235,
+            )
+            .unwrap(),
+        );
+        assert_eq!(owned(&later).timestamp_ms, 1_235);
+        assert_eq!(owned(&first).timestamp_ms, 1_234);
+    }
+
+    /// Any schema change retires memoized envelopes, even for byte-identical
+    /// frames: parse results depend on schema lookups (schema-derived
+    /// endpoints, bitmap validation).
+    #[test]
+    fn schema_changes_retire_memoized_envelopes() {
+        crate::tests::ensure_common_test_schema();
+        let pkt = Packet::from_f32_slice(
+            DataType::named("GPS_DATA"),
+            &[4.0, 5.0, 6.0],
+            &[DataEndpoint::named("SD_CARD")],
+            9_876,
+        )
+        .unwrap();
+        let bytes = pack_packet(&pkt);
+        let data = admitted_data(&bytes).unwrap();
+        // Tests in other threads may change the schema concurrently; retry
+        // until a parse and its lookup share one generation.
+        let before = (0..1000)
+            .find_map(|_| {
+                let _ = owned(&bytes);
+                let generation = crate::config::schema_generation();
+                envelope_memo::lookup(data, generation).map(|_| generation)
+            })
+            .expect("parse was memoized");
+        let id = DataType(0x7a11);
+        let _ = remove_data_type(id);
+        register_data_type_id_with_description(
+            id,
+            "MEMO_TEST_TYPE",
+            "memo test type",
+            MessageElement::Static(1, crate::MessageDataType::UInt8, crate::MessageClass::Data),
+            &[endpoint("MEMO_TEST_ENDPOINT")],
+            crate::ReliableMode::None,
+            1,
+        )
+        .unwrap();
+        let after = crate::config::schema_generation();
+        assert!(after.wrapping_sub(before) >= 1, "registration advances the schema generation");
+        assert!(envelope_memo::lookup(data, after).is_none(), "a stale entry was reused");
+        assert_eq!(owned(&bytes).timestamp_ms, 9_876);
+        let removed = crate::config::schema_generation();
+        assert!(remove_data_type(id).unwrap());
+        assert_ne!(crate::config::schema_generation(), removed, "removal advances it too");
     }
 }
 

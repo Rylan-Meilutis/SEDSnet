@@ -15,6 +15,8 @@ pub(crate) fn packed_owner(bytes: &[u8], priority: u8) -> Option<u32> {
     if priority >= 200 {
         return None;
     }
+    // Queued items are classified once (see `queue::ItemTag`), usually right
+    // after the receive path parsed the same header: use the envelope memo.
     let frame = wire_format::peek_routing_frame_info_unchecked(bytes).ok()?;
     eligible(
         frame.envelope.ty,
@@ -59,7 +61,7 @@ fn eligible(ty: DataType, priority: u8, reliable: bool, frozen: bool) -> bool {
         && !reliable
         && !frozen
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Load {
     sender: u32,
     bytes: usize,
@@ -70,6 +72,19 @@ pub(crate) struct Loads {
     len: usize,
     overflow: bool,
 }
+/// Equal recorded peers, in order (test comparisons only).
+#[cfg(test)]
+impl PartialEq for Loads {
+    fn eq(&self, other: &Self) -> bool {
+        self.overflow == other.overflow && self.peers[..self.len] == other.peers[..other.len]
+    }
+}
+
+impl Default for Loads {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Loads {
     pub fn new() -> Self {
         Self {
@@ -79,6 +94,10 @@ impl Loads {
         }
     }
     pub fn record(&mut self, sender: u32, bytes: usize) {
+        self.record_run(sender, bytes, 1);
+    }
+    /// `count` consecutive `record(sender, _)` calls totalling `bytes`.
+    pub fn record_run(&mut self, sender: u32, bytes: usize, count: usize) {
         let slot = if let Some(index) = self.peers[..self.len]
             .iter()
             .position(|p| p.sender == sender)
@@ -95,7 +114,7 @@ impl Loads {
         };
         let peer = &mut self.peers[slot];
         peer.bytes = peer.bytes.saturating_add(bytes);
-        peer.count += 1;
+        peer.count += count;
     }
     /// Queue limits must shed the dominant sender even when that sender is
     /// the producer of the new frame. Otherwise its newest frame repeatedly

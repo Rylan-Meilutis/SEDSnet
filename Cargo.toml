@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "6.0.2"
+version = "6.0.3"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -100,6 +100,10 @@ harness = false
 
 [[bench]]
 name = "route_selection_paths"
+harness = false
+
+[[bench]]
+name = "dispatch_instructions"
 harness = false
 
 [dependencies]

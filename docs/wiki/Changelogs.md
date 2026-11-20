@@ -1,5 +1,29 @@
 # Changelogs
 
+## Version 6.0.3 highlights
+
+- Unroutable reliable packets no longer spin the queue. A packet whose
+  destination had no route was retried every 1 ms with a full dispatch, so a
+  node holding a few of them spent its whole queue budget idle (about 41,000
+  instructions per ms for 16 packets, now about 1,100). They are now parked
+  until any routing change, with a fallback re-check doubling from 1 ms to
+  256 ms; expiry, memory charge and priority are unchanged.
+- About 2.5x fewer instructions per forwarded frame (embedded features,
+  `opt-level = "z"`: 44,500 to 17,600 best effort; reliable 82,200 to
+  41,100): routing envelopes memoized per header and schema generation, a
+  direct path for plain transit frames, cached route plans, one clock read per
+  queue pass, fewer locks (49 to 19 per best-effort frame) and allocation-free
+  side encoding. Results are identical to the general path (differential
+  tests).
+- Bounded cost when the queue budget is full: choosing a victim no longer
+  re-parses every queued frame, so a saturated admission costs about 7,800
+  instructions instead of 340,000 (`opt-level = "z"`) and forwarding no longer
+  collapses under overload. Victim choice is unchanged.
+- New `dispatch_instructions` bench for per-frame instruction counts.
+- Linked Cortex-M flash grows by about 10.4 KB over 6.0.2 (about 17.7 KB with
+  `fair-admission`); static RAM is unchanged.
+- No wire, schema or API change; 6.0.3 interoperates with 6.0.0-6.0.2.
+
 ## Version 6.0.2 highlights
 
 - Missing-schema recovery backs off a peer whose discovery catalog this node's

@@ -40,6 +40,19 @@ mod schema_response_admission_tests;
 #[path = "tests/accepted_route_ownership.rs"]
 mod accepted_route_ownership;
 
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/unroutable_backoff.rs"]
+mod unroutable_backoff;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/plain_transit_differential.rs"]
+mod plain_transit_differential;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/route_plan_cache.rs"]
+mod route_plan_cache;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/fair_victim_differential.rs"]
+mod fair_victim_differential;
+
 #[cfg(all(test, feature = "std"))]
 #[path = "tests/independent_side_tx_router.rs"]
 mod independent_side_tx;
@@ -79,11 +92,14 @@ mod replay_ownership_tests;
 use crate::side_transport::{
     SIDE_TRANSPORT_FLAG_PACKET_NONCE, SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT,
     SIDE_TRANSPORT_KIND_COMPACT_DELTA, SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP,
-    SIDE_TRANSPORT_KIND_FULL, SideChunkAssembly, SideCompactTimestampMode, SideHeaderTemplate,
+    SIDE_TRANSPORT_KIND_FULL, SIDE_TRANSPORT_WRAP_BYTES, SideChunkAssembly, SideCompactTimestampMode,
+    SideHeaderBytes, SideHeaderTemplate,
     SideTransportFrames, extract_side_header_template, extract_side_header_template_view,
     parse_side_transport_wrapper, read_uleb128_local, reconstruct_side_compact_frame,
-    wrap_side_transport_frame, write_uleb128_local,
+    wrap_side_transport_frame, wrap_side_transport_frame_parts,
 };
+#[cfg(test)]
+use crate::side_transport::write_uleb128_local;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
@@ -1182,6 +1198,10 @@ struct TxWork {
 /// Priorities still determine normal ordering; this only services the oldest
 /// lowest-priority item after a bounded high-priority burst.
 const MAX_PRIORITY_BURST: u8 = 8;
+/// Longest fallback re-check interval for a parked unroutable original.
+/// Routing changes wake parked originals at once; this bounds the delay if
+/// a change arrives through a path that does not signal it.
+pub(crate) const UNROUTABLE_RECHECK_MAX_MS: u64 = 256;
 
 /// ByteCost implementation for TxQueued.
 // Compare against the complete ownership metadata before the cached bit was
@@ -2799,6 +2819,77 @@ fn fallback_stdout(_msg: &str) {
 // -------------------- Router --------------------
 
 /// Internal mutable state of the Router, protected by `RouterMutex`.
+/// The managed-variable type registry, published as a 32-bit membership
+/// filter that `Router::is_managed_variable_type` reads without the core
+/// lock. A clear bit proves the type is not managed; a set bit (a member or
+/// a hash collision) falls back to the locked lookup. Every change goes
+/// through these methods, which republish the filter while the lock is held.
+#[derive(Debug)]
+struct ManagedTypes {
+    set: OrdSet<u32>,
+    filter: Arc<AtomicU32>,
+}
+
+impl Clone for ManagedTypes {
+    // A copy is a snapshot: it must never publish over the live filter.
+    fn clone(&self) -> Self {
+        Self {
+            set: self.set.clone(),
+            filter: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl ManagedTypes {
+    #[inline]
+    fn filter_bit(ty: u32) -> u32 {
+        1 << (ty.wrapping_mul(0x9E37_79B9) >> 27)
+    }
+    fn new(filter: Arc<AtomicU32>) -> Self {
+        filter.store(0, Ordering::Release);
+        Self { set: OrdSet::new(), filter }
+    }
+    fn publish(&self) {
+        let bits = self.set.iter().fold(0, |bits, ty| bits | Self::filter_bit(*ty));
+        self.filter.store(bits, Ordering::Release);
+    }
+    fn insert(&mut self, ty: u32) -> bool {
+        let inserted = self.set.insert(ty);
+        self.publish();
+        inserted
+    }
+    fn remove(&mut self, ty: &u32) -> bool {
+        let removed = self.set.remove(ty);
+        self.publish();
+        removed
+    }
+    #[inline]
+    fn contains(&self, ty: &u32) -> bool {
+        self.set.contains(ty)
+    }
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+    #[cfg(feature = "discovery")]
+    fn iter(&self) -> impl Iterator<Item = &u32> + '_ {
+        self.set.iter()
+    }
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.set.clear();
+        self.publish();
+    }
+    #[cfg(feature = "std")]
+    fn snapshot(&self) -> OrdSet<u32> {
+        self.set.clone()
+    }
+    #[cfg(feature = "std")]
+    fn swap_set(&mut self, other: &mut OrdSet<u32>) {
+        core::mem::swap(&mut self.set, other);
+        self.publish();
+    }
+}
+
 /// Holds the RX/TX queues and the recent-RX de-duplication set.
 #[derive(Debug, Clone)]
 /// Application services are allocated only for participating router roles.
@@ -2810,7 +2901,7 @@ struct LocalServicesState {
     managed_cache_epoch: u64,
     #[cfg(all(feature="std",feature="discovery"))]
     managed_registration_dirty: bool,
-    managed_variable_types: OrdSet<u32>,
+    managed_variable_types: ManagedTypes,
     managed_variable_permissions: OrdMap<u32, NetworkVariablePermissions>,
     managed_variable_latest: OrdMap<u32, Box<ManagedVariableCacheEntry>>,
     network_variable_update_handlers: OrdMap<u32, Vec<NetworkVariableUpdateHandler>>,
@@ -2848,8 +2939,76 @@ const FORWARDED_RECEIPT_REPLAY_MAX: u8 = 4;
 const FORWARDED_RECEIPT_REPLAY_OWNERS: usize = 4;
 
 // A send leaf borrows proof of the existing side gate; it never re-enters it.
+/// Test-only switch that makes victim selection on this thread classify
+/// every queued item on the spot, for differential tests of the tagged
+/// selection.
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod fair_tag_test_switch {
+    use core::cell::Cell;
+    std::thread_local! {
+        static DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn disabled() -> bool {
+        DISABLED.with(Cell::get)
+    }
+    #[cfg(feature = "discovery")]
+    pub(crate) fn set_disabled(disabled: bool) {
+        DISABLED.with(|cell| cell.set(disabled));
+    }
+}
+
+/// Counts cached route plans that tests re-derived and confirmed.
+#[cfg(all(test, feature = "discovery"))]
+pub(crate) mod route_plan_test_counter {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static VERIFIED: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) fn note_verified() {
+        VERIFIED.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn verified() -> usize {
+        VERIFIED.load(Ordering::Relaxed)
+    }
+}
+
+/// Test-only switch that sends plain transit down the general receive path,
+/// for differential tests of `Router::try_plain_transit`.
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod plain_transit_test_switch {
+    use core::cell::Cell;
+    std::thread_local! {
+        static DISABLED: Cell<bool> = const { Cell::new(false) };
+        static TAKEN: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
+    }
+    pub(crate) fn disabled() -> bool {
+        DISABLED.with(Cell::get)
+    }
+    /// Count a frame that took a plain transit path (0: receive, 1: send).
+    pub(crate) fn note_taken(path: usize) {
+        TAKEN.with(|taken| {
+            let mut counts = taken.get();
+            counts[path] += 1;
+            taken.set(counts);
+        });
+    }
+    /// Frames that took the plain receive and send paths on this thread.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn taken() -> [usize; 2] {
+        TAKEN.with(Cell::get)
+    }
+    #[cfg(feature = "discovery")]
+    pub(crate) fn set_disabled(disabled: bool) {
+        DISABLED.with(|cell| cell.set(disabled));
+    }
+}
+
+// The side's options and handler are read with the side check, under the
+// same lock: the send leaf reads them before any callback runs, so a later
+// re-read could only observe a change made after this admission.
 struct SideTxAdmission<'a> {
     side: RouterSideId,
+    opts: RouterSideOptions,
+    handler: RouterTxHandlerFn,
     #[cfg(feature = "std")]
     _guard: crate::lock::ActiveSideTxGuard<'a>,
     #[cfg(not(feature = "std"))]
@@ -2860,6 +3019,422 @@ struct SideTxAdmission<'a> {
 #[cfg(feature = "std")]
 const EXHAUSTED_RECENT: usize = 8;
 
+/// Both queues' bulk summaries at one threshold, with their victim
+/// candidates: (receive, transmit).
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+type QueueSummaries = [(crate::queue::BulkSummary, Option<(usize, u8)>); 2];
+
+/// The bulk loads of both queues from their summaries: the receive queue's
+/// owner first, as a scan in queue order would record them.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+fn summary_loads(summaries: &QueueSummaries) -> crate::admission_fairness::Loads {
+    let mut loads = crate::admission_fairness::Loads::new();
+    for (summary, _) in summaries {
+        if let Some(owner) = summary.owner {
+            loads.record_run(owner, summary.bytes, summary.count);
+        }
+    }
+    loads
+}
+
+/// `bulk_victim`'s candidates for `owner` from the summaries.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+fn summary_victim_scan(owner: u32, summaries: &QueueSummaries) -> BulkVictimScan {
+    let mut scan = BulkVictimScan::default();
+    for (queue, (summary, best)) in summaries.iter().enumerate() {
+        if summary.owner != Some(owner) {
+            continue;
+        }
+        scan.any[queue] = *best;
+        scan.count += summary.count;
+        let stream = (summary.stream != u64::MAX).then_some(summary.stream as u32);
+        match scan.first_stream {
+            None => scan.first_stream = Some(stream),
+            Some(first) => scan.one_stream &= first == stream,
+        }
+        scan.one_stream &= summary.uniform;
+    }
+    scan
+}
+
+/// `bulk_loads_scan` over the tag lanes (`runs`: the receive queue's two
+/// contiguous tag runs, then the transmit queue's): the loads (consecutive
+/// items of one owner recorded as one run; `Loads` keeps first-occurrence
+/// order, so the result is unchanged) and each queue's bulk summary, `None`
+/// for a queue holding several owners' bulk.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+#[inline(never)]
+fn scan_bulk_loads(
+    runs: [&[crate::queue::ItemTag]; 4],
+    priority: u8,
+) -> (crate::admission_fairness::Loads, [Option<crate::queue::BulkSummary>; 2]) {
+    let mut loads = crate::admission_fairness::Loads::new();
+    let (mut run_owner, mut run_bytes, mut run_count) = (0u32, 0usize, 0usize);
+    let mut summaries = [Some(crate::queue::BulkSummary::empty(priority)); 2];
+    for (run, tags) in runs.into_iter().enumerate() {
+        let base = if run % 2 == 0 { 0 } else { runs[run - 1].len() };
+        let summary = &mut summaries[run / 2];
+        for (offset, tag) in tags.iter().enumerate() {
+            let (owner, _, cost, item_priority, has_owner, _) = tag.raw();
+            if item_priority > priority || !has_owner {
+                continue;
+            }
+            if let Some(current) = summary.as_mut()
+                && !current.add(base + offset, *tag)
+            {
+                *summary = None;
+            }
+            if owner == run_owner && run_count != 0 {
+                run_bytes = run_bytes.saturating_add(cost as usize);
+                run_count += 1;
+                continue;
+            }
+            if run_count != 0 {
+                loads.record_run(run_owner, run_bytes, run_count);
+            }
+            (run_owner, run_bytes, run_count) = (owner, cost as usize, 1);
+        }
+    }
+    if run_count != 0 {
+        loads.record_run(run_owner, run_bytes, run_count);
+    }
+    (loads, summaries)
+}
+
+/// Per-queue candidates of one owner's bulk victim scan: the lowest-priority,
+/// oldest item over all of the owner's streams, and whether every one of
+/// its items carries the same stream (the usual case), which then makes the
+/// candidates of that stream the same.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+struct BulkVictimScan {
+    any: [Option<(usize, u8)>; 2],
+    first_stream: Option<Option<u32>>,
+    one_stream: bool,
+    count: usize,
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl Default for BulkVictimScan {
+    fn default() -> Self {
+        Self { any: [None, None], first_stream: None, one_stream: true, count: 0 }
+    }
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl BulkVictimScan {
+    #[inline]
+    fn better(slot: &mut Option<(usize, u8)>, index: usize, priority: u8) {
+        // Items arrive in queue order: only a strictly lower priority wins.
+        if slot.is_none_or(|(_, best)| priority < best) {
+            *slot = Some((index, priority));
+        }
+    }
+
+    #[inline]
+    fn note(&mut self, queue: usize, stream: Option<u32>, priority: u8, index: usize) {
+        Self::better(&mut self.any[queue], index, priority);
+        if self.count == 0 {
+            self.first_stream = Some(stream);
+            self.one_stream = true;
+        } else if self.one_stream && self.first_stream != Some(stream) {
+            self.one_stream = false;
+        }
+        self.count += 1;
+    }
+
+    /// Candidates for the selected stream when they are known from the scan.
+    fn positions(&self, stream: Option<u32>) -> Option<[Option<(usize, u8)>; 2]> {
+        match stream {
+            None => Some(self.any),
+            Some(ty) if self.one_stream && self.first_stream == Some(Some(ty)) => Some(self.any),
+            Some(_) => None,
+        }
+    }
+}
+
+/// Routing state whose every mutable access advances a generation. A cached
+/// route plan records the generations it was computed from, so no mutation
+/// path, present or future, can leave a stale plan current.
+#[derive(Default)]
+struct Tracked<T> {
+    value: T,
+    generation: u32,
+}
+
+impl<T> Tracked<T> {
+    #[cfg(feature = "discovery")]
+    #[inline]
+    fn generation(&self) -> u32 {
+        self.generation
+    }
+}
+
+impl<T> Deref for Tracked<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for Tracked<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        self.generation = self.generation.wrapping_add(1);
+        &mut self.value
+    }
+}
+
+/// A queued send's payload-codec reservation (none without compression).
+#[cfg(feature = "compression")]
+type SideReservation<'a> = Option<crate::payload_codec::QueueReservation<'a, RouterInner>>;
+#[cfg(not(feature = "compression"))]
+type SideReservation<'a> = ();
+
+/// A route plan's sides; a cached plan needs no allocation.
+enum PlannedSides {
+    #[cfg(feature = "discovery")]
+    One(Option<RouterSideId>),
+    Many(Vec<RouterSideId>),
+}
+
+impl PlannedSides {
+    fn as_slice(&self) -> &[RouterSideId] {
+        match self {
+            #[cfg(feature = "discovery")]
+            Self::One(side) => side.as_slice(),
+            Self::Many(sides) => sides,
+        }
+    }
+}
+
+/// Route permissions by (source side, destination side).
+type RouteOverrides = RouterMap<(Option<RouterSideId>, RouterSideId), bool>;
+/// Route permissions by (source side, data type, destination side).
+type TypedRouteOverrides = RouterMap<(Option<RouterSideId>, u32, RouterSideId), bool>;
+
+/// Everything a cacheable route plan depends on besides the frame and the
+/// clock: the schema, discovered routes, sides and route policies.
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RoutePlanFingerprint {
+    schema: u32,
+    routes: u32,
+    sides: u32,
+    overrides: u32,
+    typed_overrides: u32,
+    /// Whether this router is one of a frame's owners depends on its name.
+    sender: u64,
+}
+
+/// The frame facts a cacheable route plan is keyed by: an untargeted best
+/// effort application frame with at most `ROUTE_PLAN_KEY_ENDPOINTS` distinct
+/// endpoints.
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RoutePlanKey {
+    ty: u32,
+    exclude: Option<RouterSideId>,
+    endpoints: RoutePlanEndpoints,
+    /// The frozen owner contract, if any (at most `ROUTE_PLAN_KEY_TARGETS`).
+    targets: [u64; ROUTE_PLAN_KEY_TARGETS],
+    target_count: u8,
+}
+
+#[cfg(feature = "discovery")]
+const ROUTE_PLAN_KEY_TARGETS: usize = 4;
+
+/// A frame's endpoint set: its fixed bitmap, or else its sorted distinct
+/// endpoints. One set in two forms only misses the cache.
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RoutePlanEndpoints {
+    Bitmap([u64; wire_format::ENDPOINT_BITMAP_WORDS]),
+    Encoded([u8; ROUTE_PLAN_KEY_LIST_BYTES], u8),
+    List([u32; ROUTE_PLAN_KEY_ENDPOINTS], u8),
+}
+
+#[cfg(feature = "discovery")]
+const ROUTE_PLAN_KEY_LIST_BYTES: usize = 16;
+
+#[cfg(feature = "discovery")]
+const ROUTE_PLAN_KEY_ENDPOINTS: usize = 4;
+#[cfg(feature = "discovery")]
+const ROUTE_PLAN_SLOTS: usize = 4;
+
+#[cfg(feature = "discovery")]
+#[derive(Clone, Copy)]
+struct RoutePlanEntry {
+    key: RoutePlanKey,
+    fingerprint: RoutePlanFingerprint,
+    /// The plan holds while `built_ms <= now <= valid_until_ms`: no route or
+    /// announcer that was live when it was built can have expired, and none
+    /// that had expired can have been revived (that advances `routes`).
+    built_ms: u64,
+    valid_until_ms: u64,
+    side: Option<RouterSideId>,
+}
+
+/// Recent route plans for plain transit. Only a plan whose route selection
+/// had at most one candidate is kept, so serving it again skips no cursor,
+/// weight, or adaptive-statistics update. See
+/// `Router::remote_side_plan_with_selection`.
+#[cfg(feature = "discovery")]
+#[derive(Default)]
+struct RoutePlanCache {
+    entries: [Option<RoutePlanEntry>; ROUTE_PLAN_SLOTS],
+    next: u8,
+}
+
+#[cfg(feature = "discovery")]
+impl RoutePlanCache {
+    fn lookup(
+        &self,
+        key: &RoutePlanKey,
+        fingerprint: RoutePlanFingerprint,
+        now_ms: u64,
+    ) -> Option<Option<RouterSideId>> {
+        self.entries.iter().flatten().find_map(|entry| {
+            (entry.key == *key
+                && entry.fingerprint == fingerprint
+                && entry.built_ms <= now_ms
+                && now_ms <= entry.valid_until_ms)
+                .then_some(entry.side)
+        })
+    }
+
+    fn insert(&mut self, entry: RoutePlanEntry) {
+        let slot = self
+            .entries
+            .iter()
+            .position(|existing| existing.is_some_and(|existing| existing.key == entry.key))
+            .unwrap_or(usize::from(self.next));
+        self.entries[slot] = Some(entry);
+        if slot == usize::from(self.next) {
+            self.next = ((slot + 1) % ROUTE_PLAN_SLOTS) as u8;
+        }
+    }
+}
+
+/// Discovered routes per side, with their memory charge cached.
+///
+/// The shared queue budget charges discovery state, and the charge was
+/// recomputed by walking every route, announcer and topology board on each
+/// admission: three times per forwarded frame, growing with network size.
+/// Any mutable access invalidates the cached charge. The only exception is
+/// [`DiscoveryRoutes::touch`], for liveness timestamps, which cannot change
+/// it.
+#[cfg(feature = "discovery")]
+#[derive(Default)]
+struct DiscoveryRoutes {
+    map: RouterMap<RouterSideId, DiscoverySideState>,
+    cost: core::cell::Cell<Option<usize>>,
+    /// Advanced by every mutable access except a liveness refresh of a peer
+    /// that was still live (see `touch`). Cached route plans compare it.
+    generation: u32,
+}
+
+#[cfg(feature = "discovery")]
+impl core::ops::Deref for DiscoveryRoutes {
+    type Target = RouterMap<RouterSideId, DiscoverySideState>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl core::ops::DerefMut for DiscoveryRoutes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cost.set(None);
+        self.generation = self.generation.wrapping_add(1);
+        &mut self.map
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl<'a> IntoIterator for &'a DiscoveryRoutes {
+    type Item = <&'a RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::Item;
+    type IntoIter = <&'a RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl<'a> IntoIterator for &'a mut DiscoveryRoutes {
+    type Item = <&'a mut RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::Item;
+    type IntoIter = <&'a mut RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.cost.set(None);
+        self.generation = self.generation.wrapping_add(1);
+        self.map.iter_mut()
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl DiscoveryRoutes {
+    fn byte_cost(&self) -> usize {
+        if let Some(cost) = self.cost.get() {
+            return cost;
+        }
+        let cost = self
+            .map
+            .iter()
+            .map(|(side, route)| RouterInner::discovery_route_byte_cost(*side, route))
+            .fold(0usize, usize::saturating_add);
+        self.cost.set(Some(cost));
+        cost
+    }
+
+    /// A refresh brought back a route or announcer that had already expired:
+    /// plans computed without it are stale.
+    fn note_revival(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The latest time at which every route and announcer that is live at
+    /// `now_ms` is certainly still live. Expired ones stay expired until a
+    /// mutation or a revival, both of which advance the generation.
+    fn liveness_deadline(&self, now_ms: u64) -> u64 {
+        let expiry = |last_seen_ms: u64| last_seen_ms.saturating_add(DISCOVERY_ROUTE_TTL_MS);
+        let mut deadline = u64::MAX;
+        for route in self.map.values() {
+            let route_expiry = expiry(route.last_seen_ms);
+            if route_expiry >= now_ms {
+                deadline = deadline.min(route_expiry);
+            }
+            for sender in route.announcers.values() {
+                let sender_expiry = expiry(sender.last_seen_ms);
+                if sender_expiry >= now_ms {
+                    deadline = deadline.min(sender_expiry);
+                }
+            }
+        }
+        deadline
+    }
+
+    /// Update liveness timestamps on one side's route without retiring the
+    /// cached charge. `update` must not change anything the charge counts
+    /// (collections, names); debug builds verify that.
+    fn touch<R>(
+        &mut self,
+        side: RouterSideId,
+        update: impl FnOnce(&mut DiscoverySideState) -> R,
+    ) -> Option<R> {
+        let route = self.map.get_mut(&side)?;
+        #[cfg(debug_assertions)]
+        let before = RouterInner::discovery_route_byte_cost(side, route);
+        let result = update(route);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            before,
+            RouterInner::discovery_route_byte_cost(side, route),
+            "DiscoveryRoutes::touch changed the memory charge"
+        );
+        Some(result)
+    }
+}
+
 struct RouterInner {
     #[cfg(feature = "std")]
     p2p_revision: u64,
@@ -2867,9 +3442,9 @@ struct RouterInner {
     #[cfg(feature = "compression")]
     codec_reserved_bytes: usize,
     memory: RuntimeMemoryConfig,
-    sides: Vec<Option<RouterSide>>,
-    route_overrides: RouterMap<(Option<RouterSideId>, RouterSideId), bool>,
-    typed_route_overrides: RouterMap<(Option<RouterSideId>, u32, RouterSideId), bool>,
+    sides: Tracked<Vec<Option<RouterSide>>>,
+    route_overrides: Tracked<RouteOverrides>,
+    typed_route_overrides: Tracked<TypedRouteOverrides>,
     route_weights: RouterMap<(Option<RouterSideId>, RouterSideId), u32>,
     route_priorities: RouterMap<(Option<RouterSideId>, RouterSideId), u32>,
     source_route_modes: RouterMap<Option<RouterSideId>, RouteSelectionMode>,
@@ -2889,6 +3464,8 @@ struct RouterInner {
     active_queued_types: [(u32, u32); ACTIVE_QUEUED_TYPE_SLOTS],
     tx_priority_burst: u8,
     tx_policy_flags: u8,
+    /// Some accepted original is parked because no side could reach it.
+    unroutable_parked: bool,
     #[cfg(feature = "latest-value-egress")]
     latest_turn_phase: u8,
     #[cfg(feature = "latest-value-egress")]
@@ -2915,7 +3492,11 @@ struct RouterInner {
     reliable_return_routes: OrdMap<u64, ReliableReturnRouteState>,
     local_admission_sequence: u64,
     reliable_return_route_order: VecDeque<u64>,
-    forwarded_receipts: Option<Box<ForwardedReceiptCache>>,
+    forwarded_receipts: Tracked<Option<Box<ForwardedReceiptCache>>>,
+    /// `Router::sender_hash` of the current sender, kept with the core state
+    /// so route plans can depend on it.
+    #[cfg(feature = "discovery")]
+    local_sender_hash: u64,
     end_to_end_reliable_tx: OrdMap<u64, Box<EndToEndReliableSent>>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
     total_handler_failures: u64,
@@ -2924,7 +3505,9 @@ struct RouterInner {
     #[cfg(feature = "std")]
     exhausted_recent: VecDeque<crate::diagnostics::ExhaustedReliable>,
     #[cfg(feature = "discovery")]
-    discovery_routes: RouterMap<RouterSideId, DiscoverySideState>,
+    discovery_routes: DiscoveryRoutes,
+    #[cfg(feature = "discovery")]
+    route_plans: RoutePlanCache,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
     #[cfg(feature = "discovery")]
@@ -3210,6 +3793,28 @@ impl RouterInner {
     }
 
     #[inline(never)]
+    /// Routing state changed: make every parked unroutable original eligible
+    /// now, so a newly learned route or side is used immediately.
+    fn wake_unroutable_parked(&mut self) {
+        if !core::mem::take(&mut self.unroutable_parked) {
+            return;
+        }
+        for index in 0..self.transmit_queue.len() {
+            let parked = self.transmit_queue.get(index).is_some_and(|item| {
+                matches!(
+                    item.delivery_state,
+                    QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
+                ) && item.retry_after_ms > 1
+            });
+            if parked {
+                // Deferred rows keep a non-zero `deferred_since_ms`; a retry
+                // deadline of 1 is always due and stays distinct from 0.
+                self.transmit_queue
+                    .update_metadata(index, |item| item.retry_after_ms = 1);
+            }
+        }
+    }
+
     fn refresh_retry_hint(&mut self) {
         let pending = self.transmit_queue.iter().any(|item| {
             matches!(
@@ -3308,8 +3913,164 @@ impl RouterInner {
             _ => None,
         }
     }
+    /// The fairness class of a queued receive item: its bulk owner and, for
+    /// an owned item, its stream.
     #[cfg(any(feature = "std", feature = "fair-admission"))]
-    fn bulk_loads(&self, priority: u8) -> crate::admission_fairness::Loads {
+    fn rx_fair_tag(item: &RouterRxItem) -> crate::queue::ItemTag {
+        let owner = Self::fair_bulk_owner(&item.data, item.priority);
+        crate::queue::ItemTag::new(
+            owner,
+            owner.and_then(|_| Self::bulk_stream(&item.data)),
+            item.priority,
+            item.byte_cost(),
+        )
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn tx_fair_tag(item: &TxQueued) -> crate::queue::ItemTag {
+        let owner = Self::tx_bulk_owner(item);
+        crate::queue::ItemTag::new(
+            owner,
+            owner.and_then(|_| Self::tx_bulk_stream(item)),
+            item.priority,
+            item.byte_cost(),
+        )
+    }
+
+    /// Classify both queues' items for victim selection, each item once per
+    /// schema generation (classes depend only on the item and the schema).
+    /// `false`: a tag lane is unavailable and callers classify directly.
+    ///
+    /// Lanes are allocated only for queue-budget saturation (`allocate`);
+    /// reclamation under heap pressure uses existing lanes or classifies
+    /// directly, so it never takes heap for itself.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn tag_fair_queues(&mut self, allocate: bool) -> bool {
+        let generation = crate::config::schema_generation();
+        self.received_queue.tag_items(generation, allocate, Self::rx_fair_tag)
+            && self.transmit_queue.tag_items(generation, allocate, Self::tx_fair_tag)
+    }
+
+    /// Byte load per bulk owner over items at or below `priority`.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads(&mut self, priority: u8) -> crate::admission_fairness::Loads {
+        self.bulk_loads_with(priority, true)
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads_with(&mut self, priority: u8, allocate: bool) -> crate::admission_fairness::Loads {
+        #[cfg(all(test, feature = "std"))]
+        if fair_tag_test_switch::disabled() {
+            return self.bulk_loads_untagged(priority);
+        }
+        if !self.tag_fair_queues(allocate) {
+            return self.bulk_loads_untagged(priority);
+        }
+        let mut loads = crate::admission_fairness::Loads::new();
+        let (rx_front, rx_back) = self.received_queue.tags();
+        let (tx_front, tx_back) = self.transmit_queue.tags();
+        for tag in [rx_front, rx_back, tx_front, tx_back].into_iter().flatten() {
+            if tag.priority() <= priority
+                && let Some(owner) = tag.owner()
+            {
+                loads.record(owner, tag.cost());
+            }
+        }
+        loads
+    }
+
+    /// `bulk_loads`, plus both queues' bulk summaries when each holds at most
+    /// one owner's bulk (`None` otherwise). The summaries are kept current
+    /// across queue changes, so a saturated queue is scanned only when one
+    /// becomes unknown (see `BoundedDeque::summary`).
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads_scan(
+        &mut self,
+        priority: u8,
+    ) -> (crate::admission_fairness::Loads, Option<QueueSummaries>) {
+        #[cfg(all(test, feature = "std"))]
+        if fair_tag_test_switch::disabled() {
+            return (self.bulk_loads_untagged(priority), None);
+        }
+        if !self.tag_fair_queues(true) {
+            return (self.bulk_loads_untagged(priority), None);
+        }
+        if let Some(rx) = self.received_queue.summary(priority)
+            && let Some(tx) = self.transmit_queue.summary(priority)
+        {
+            let summaries = [rx, tx];
+            #[cfg(test)]
+            {
+                // Tests check the kept summaries against a fresh scan.
+                let (rx_front, rx_back) = self.received_queue.tags();
+                let (tx_front, tx_back) = self.transmit_queue.tags();
+                let (loads, scanned) =
+                    scan_bulk_loads([rx_front, rx_back, tx_front, tx_back], priority);
+                assert!(loads == summary_loads(&summaries), "kept bulk loads are stale");
+                for (queue, (summary, best)) in summaries.iter().enumerate() {
+                    let fresh = scanned[queue].expect("kept summary of one owner");
+                    assert_eq!(
+                        (summary.owner, summary.count, summary.bytes),
+                        (fresh.owner, fresh.count, fresh.bytes),
+                        "kept bulk summary is stale"
+                    );
+                    let mut fresh = fresh;
+                    assert_eq!(Some(*best), fresh.best(core::iter::empty()), "kept victim is stale");
+                    assert!(!summary.uniform || fresh.uniform, "kept stream is stale");
+                }
+            }
+            return (summary_loads(&summaries), Some(summaries));
+        }
+        let (rx_front, rx_back) = self.received_queue.tags();
+        let (tx_front, tx_back) = self.transmit_queue.tags();
+        let (loads, [rx, tx]) = scan_bulk_loads([rx_front, rx_back, tx_front, tx_back], priority);
+        self.received_queue.set_summary(rx);
+        self.transmit_queue.set_summary(tx);
+        let summaries = match (rx, tx) {
+            (Some(mut rx), Some(mut tx)) => {
+                let rx_best = rx.best(core::iter::empty()).flatten();
+                let tx_best = tx.best(core::iter::empty()).flatten();
+                Some([(rx, rx_best), (tx, tx_best)])
+            }
+            _ => None,
+        };
+        (loads, summaries)
+    }
+
+    /// The stream `bulk_victim` would select for a sole owner whose items all
+    /// carry one stream (or none): its stream loads then have at most one
+    /// entry. `None` when the owner has several streams.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn single_owner_stream(
+        scan: &BulkVictimScan,
+        incoming_stream: Option<u32>,
+    ) -> Option<Option<u32>> {
+        if !scan.one_stream {
+            return None;
+        }
+        Some(match scan.first_stream.flatten() {
+            // `Loads::queue_victim`: a repeated stream, else the incoming one.
+            Some(stream) if scan.count > 1 || incoming_stream == Some(stream) => Some(stream),
+            _ => None,
+        })
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn remove_bulk_victim(&mut self, selected: Option<(RouterQueueKind, usize)>) -> bool {
+        match selected {
+            Some((RouterQueueKind::Received, index)) => {
+                self.received_queue.remove_pos(index).is_some()
+            }
+            Some((RouterQueueKind::Transmit, index)) => {
+                self.transmit_queue.remove_pos(index).is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// `bulk_loads`, classifying every item on the spot.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads_untagged(&self, priority: u8) -> crate::admission_fairness::Loads {
         let mut loads = crate::admission_fairness::Loads::new();
         for item in self.received_queue.iter() {
             if item.priority <= priority
@@ -3328,8 +4089,9 @@ impl RouterInner {
         loads
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
-    fn competing_bulk_owner(&self, incoming: u32, priority: u8) -> Option<u32> {
-        self.bulk_loads(priority).dominant_other(incoming)
+    /// Heap-pressure reclamation: see `tag_fair_queues`.
+    fn competing_bulk_owner(&mut self, incoming: u32, priority: u8) -> Option<u32> {
+        self.bulk_loads_with(priority, false).dominant_other(incoming)
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn reclaim_bulk_from(
@@ -3338,6 +4100,112 @@ impl RouterInner {
         priority: u8,
         incoming_stream: Option<u32>,
     ) -> bool {
+        self.reclaim_bulk_from_with(owner, priority, incoming_stream, true)
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn reclaim_bulk_from_with(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+        allocate: bool,
+    ) -> bool {
+        let selected = self.bulk_victim_with(owner, priority, incoming_stream, allocate);
+        self.remove_bulk_victim(selected)
+    }
+
+    /// The item `owner` yields: within its most repeated stream (else the
+    /// incoming stream's previous value, else any), its lowest priority and
+    /// then oldest item, receive queue first on a priority tie.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn bulk_victim(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+    ) -> Option<(RouterQueueKind, usize)> {
+        self.bulk_victim_with(owner, priority, incoming_stream, true)
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_victim_with(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+        allocate: bool,
+    ) -> Option<(RouterQueueKind, usize)> {
+        #[cfg(all(test, feature = "std"))]
+        if fair_tag_test_switch::disabled() {
+            return self.bulk_victim_untagged(owner, priority, incoming_stream);
+        }
+        if !self.tag_fair_queues(allocate) {
+            return self.bulk_victim_untagged(owner, priority, incoming_stream);
+        }
+        // One pass records each stream's load and, per queue, the position
+        // of its lowest-priority, oldest item (and the same over all streams
+        // for when no stream yields).
+        let mut streams = crate::admission_fairness::Loads::new();
+        let mut best = BulkVictimScan::default();
+        for (queue, (front, back)) in
+            [self.received_queue.tags(), self.transmit_queue.tags()].into_iter().enumerate()
+        {
+            for (index, tag) in front.iter().chain(back).enumerate() {
+                if tag.priority() > priority || tag.owner() != Some(owner) {
+                    continue;
+                }
+                let stream = tag.stream();
+                if let Some(ty) = stream {
+                    streams.record(ty, tag.cost());
+                }
+                best.note(queue, stream, tag.priority(), index);
+            }
+        }
+        let stream = streams.queue_victim(incoming_stream);
+        let [rx, tx] = best.positions(stream).unwrap_or_else(|| {
+            // Several streams: a second pass over the selected one.
+            let mut found = [None, None];
+            for (queue, (front, back)) in
+                [self.received_queue.tags(), self.transmit_queue.tags()].into_iter().enumerate()
+            {
+                for (index, tag) in front.iter().chain(back).enumerate() {
+                    if tag.priority() <= priority
+                        && tag.owner() == Some(owner)
+                        && stream.is_none_or(|ty| tag.stream() == Some(ty))
+                    {
+                        BulkVictimScan::better(&mut found[queue], index, tag.priority());
+                    }
+                }
+            }
+            found
+        });
+        Self::pick_bulk_victim(rx, tx)
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn pick_bulk_victim(
+        rx: Option<(usize, u8)>,
+        tx: Option<(usize, u8)>,
+    ) -> Option<(RouterQueueKind, usize)> {
+        match (rx, tx) {
+            (Some((index, rp)), Some((_, tp))) if rp <= tp => {
+                Some((RouterQueueKind::Received, index))
+            }
+            (Some((index, _)), None) => Some((RouterQueueKind::Received, index)),
+            (_, Some((index, _))) => Some((RouterQueueKind::Transmit, index)),
+            _ => None,
+        }
+    }
+
+    /// `bulk_victim`, classifying every item on the spot.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_victim_untagged(
+        &self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+    ) -> Option<(RouterQueueKind, usize)> {
         let mut streams = crate::admission_fairness::Loads::new();
         for item in self.received_queue.iter() {
             if item.priority <= priority
@@ -3378,14 +4246,7 @@ impl RouterInner {
             })
             .min_by_key(|(index, item)| (item.priority, *index))
             .map(|(index, item)| (index, item.priority));
-        match (rx, tx) {
-            (Some((index, rp)), Some((_, tp))) if rp <= tp => {
-                self.received_queue.remove_pos(index).is_some()
-            }
-            (Some((index, _)), None) => self.received_queue.remove_pos(index).is_some(),
-            (_, Some((index, _))) => self.transmit_queue.remove_pos(index).is_some(),
-            _ => false,
-        }
+        Self::pick_bulk_victim(rx, tx)
     }
 
     #[cfg(feature = "discovery")]
@@ -3463,10 +4324,7 @@ impl RouterInner {
 
     #[cfg(feature = "discovery")]
     fn discovery_bytes_used(&self) -> usize {
-        self.discovery_routes
-            .iter()
-            .map(|(side, route)| Self::discovery_route_byte_cost(*side, route))
-            .sum()
+        self.discovery_routes.byte_cost()
     }
 
     #[inline]
@@ -3888,6 +4746,39 @@ impl RouterInner {
         incoming_priority: u8,
         _incoming: Option<&RouterItem>,
     ) -> TelemetryResult<()> {
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        return self.make_shared_queue_room_classified(
+            incoming_cost,
+            incoming_priority,
+            _incoming,
+            None,
+        );
+        #[cfg(not(any(feature = "std", feature = "fair-admission")))]
+        self.make_shared_queue_room_inner(incoming_cost, incoming_priority, _incoming)
+    }
+
+    /// `make_shared_queue_room` with the incoming item's bulk owner
+    /// (`fair_bulk_owner`) when the caller already has it.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn make_shared_queue_room_classified(
+        &mut self,
+        incoming_cost: usize,
+        incoming_priority: u8,
+        _incoming: Option<&RouterItem>,
+        incoming_owner: Option<Option<u32>>,
+    ) -> TelemetryResult<()> {
+        self.make_shared_queue_room_inner(incoming_cost, incoming_priority, _incoming, incoming_owner)
+    }
+
+    fn make_shared_queue_room_inner(
+        &mut self,
+        incoming_cost: usize,
+        incoming_priority: u8,
+        _incoming: Option<&RouterItem>,
+        #[cfg(any(feature = "std", feature = "fair-admission"))] incoming_owner: Option<
+            Option<u32>,
+        >,
+    ) -> TelemetryResult<()> {
         if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
                 "Item exceeds maximum shared queue budget",
@@ -3896,6 +4787,8 @@ impl RouterInner {
 
         #[cfg(any(feature = "std", feature = "fair-admission"))]
         let mut fair_victim = None;
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let mut incoming_class = None;
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
@@ -3921,21 +4814,39 @@ impl RouterInner {
             }
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             {
-                let incoming =
-                    _incoming.and_then(|data| Self::fair_bulk_owner(data, incoming_priority));
-                let victim = *fair_victim.get_or_insert_with(|| {
-                    self.bulk_loads(incoming_priority.min(199))
-                        .queue_victim(incoming)
+                // The incoming item's class cannot change during this call.
+                let incoming = *incoming_class.get_or_insert_with(|| {
+                    incoming_owner.unwrap_or_else(|| {
+                        _incoming.and_then(|data| Self::fair_bulk_owner(data, incoming_priority))
+                    })
                 });
-                if let Some(victim) = victim
-                    && self.reclaim_bulk_from(
-                        victim,
-                        incoming_priority.min(199),
-                        (incoming == Some(victim))
-                            .then(|| _incoming.and_then(Self::bulk_stream))
-                            .flatten(),
-                    )
-                {
+                let mut scan = None;
+                let victim = *fair_victim.get_or_insert_with(|| {
+                    let (loads, single) = self.bulk_loads_scan(incoming_priority.min(199));
+                    scan = single;
+                    loads.queue_victim(incoming)
+                });
+                let incoming_stream = (incoming == victim && victim.is_some())
+                    .then(|| _incoming.and_then(Self::bulk_stream))
+                    .flatten();
+                // The summaries describe the unchanged queues: with one
+                // owner's bulk per queue they already name the victim.
+                let scanned = scan
+                    .zip(victim)
+                    .map(|(summaries, owner)| summary_victim_scan(owner, &summaries))
+                    .and_then(|scan| {
+                        Self::single_owner_stream(&scan, incoming_stream)
+                            .and_then(|stream| scan.positions(stream))
+                    })
+                    .map(|[rx, tx]| Self::pick_bulk_victim(rx, tx));
+                let reclaimed = match (victim, scanned) {
+                    (Some(_), Some(selected)) => self.remove_bulk_victim(selected),
+                    (Some(victim), None) => {
+                        self.reclaim_bulk_from(victim, incoming_priority.min(199), incoming_stream)
+                    }
+                    (None, _) => false,
+                };
+                if reclaimed {
                     continue;
                 }
                 if incoming.is_some() {
@@ -4071,9 +4982,28 @@ impl RouterInner {
     }
 
     fn push_received(&mut self, item: RouterRxItem) -> TelemetryResult<()> {
+        // During a saturation episode the item is classified once, here: the
+        // class serves this admission's victim choice and becomes its tag.
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let hint = self
+            .received_queue
+            .tagging()
+            .then(|| (crate::config::schema_generation(), Self::rx_fair_tag(&item)));
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        self.make_shared_queue_room_classified(
+            item.byte_cost(),
+            item.priority,
+            Some(&item.data),
+            hint.map(|(_, tag)| tag.owner()),
+        )?;
+        #[cfg(not(any(feature = "std", feature = "fair-admission")))]
         self.make_shared_queue_room(item.byte_cost(), item.priority, Some(&item.data))?;
         #[cfg(any(feature = "std", feature = "fair-admission"))]
-        {
+        if let Some((generation, tag)) = hint {
+            self.received_queue.set_tag_hint(generation, tag);
+        }
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let result = {
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             let mut fair_victim = None;
             self.received_queue.push_back_prioritized_select(
@@ -4094,6 +5024,11 @@ impl RouterInner {
                 },
                 core::mem::drop,
             )
+        };
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        {
+            self.received_queue.clear_tag_hint();
+            result
         }
         #[cfg(not(any(feature = "std", feature = "fair-admission")))]
         {
@@ -4102,7 +5037,18 @@ impl RouterInner {
         }
     }
 
-    fn push_transmit(&mut self, mut item: TxQueued) -> TelemetryResult<()> {
+    fn push_transmit(&mut self, item: TxQueued) -> TelemetryResult<()> {
+        self.push_transmit_classified(item, None)
+    }
+
+    /// `push_transmit` for an item whose `classify_transmit_disposable`
+    /// result the caller already derived from the same frame.
+    fn push_transmit_classified(
+        &mut self,
+        mut item: TxQueued,
+        disposable: Option<bool>,
+    ) -> TelemetryResult<()> {
+        debug_assert!(disposable.is_none_or(|d| d == Self::classify_transmit_disposable(&item)));
         let child = item.disposable & TX_E2E_CHILD != 0;
         #[cfg(feature = "latest-value-egress")]
         let turn_flags = if !child
@@ -4179,7 +5125,7 @@ impl RouterInner {
             item.disposable = if item.delivery_state != QueuedDelivery::Untracked {
                 0
             } else {
-                u8::from(Self::classify_transmit_disposable(&item))
+                u8::from(disposable.unwrap_or_else(|| Self::classify_transmit_disposable(&item)))
             };
         }
         #[cfg(feature = "latest-value-egress")]
@@ -4193,7 +5139,7 @@ impl RouterInner {
             } else if item.delivery_state != QueuedDelivery::Untracked {
                 0
             } else {
-                u8::from(Self::classify_transmit_disposable(&item))
+                u8::from(disposable.unwrap_or_else(|| Self::classify_transmit_disposable(&item)))
                     | (item.disposable & TX_LATEST_PENDING)
             };
             item.disposable |= turn_flags;
@@ -4468,6 +5414,10 @@ impl IsrRxQueue {
     #[inline]
     fn pop_front(&self) -> TelemetryResult<Option<RouterRxItem>> {
         let mut g = self.try_lock()?;
+        // Usually empty: skip moving an empty result through the queue.
+        if g.is_empty() {
+            return Ok(None);
+        }
         Ok(g.pop_front())
     }
 
@@ -4482,6 +5432,19 @@ impl IsrRxQueue {
     fn snapshot(&self) -> Option<(usize, usize)> {
         let g = self.try_lock().ok()?;
         Some((g.len(), g.bytes_used()))
+    }
+}
+
+/// Test-only count of queued transmit items handed to dispatch on this thread.
+#[cfg(test)]
+pub(crate) mod test_dispatch_counter {
+    use core::cell::Cell;
+    std::thread_local!(static COUNT: Cell<u64> = const { Cell::new(0) });
+    pub(crate) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+    pub(crate) fn take() -> u64 {
+        COUNT.with(|count| count.replace(0))
     }
 }
 
@@ -4502,6 +5465,8 @@ pub struct Router {
     #[cfg(feature = "std")]
     active_queued_tx: core::sync::atomic::AtomicUsize,
     clock: Arc<dyn Clock + Send + Sync>,
+    /// Lock-free view of the managed-variable registry (see `ManagedTypes`).
+    managed_filter: Arc<AtomicU32>,
     #[cfg(feature = "timesync")]
     timesync: Option<Box<RouterMutex<TimeSyncRuntime>>>,
     /// Side and transmit-mark slot of a time sync frame being handed to a
@@ -4768,26 +5733,47 @@ impl Router {
             .ok_or(TelemetryError::HandlerError("router: invalid side id"))
     }
 
-    fn note_side_tx_success(
+    /// A completed side handoff: the adaptive-route throughput sample and the
+    /// success statistics, under one lock and one clock read.
+    fn note_side_tx_complete(
         &self,
         side: RouterSideId,
         ty: DataType,
         bytes: usize,
         relayed: bool,
         attempts: usize,
+        started_ms: u64,
     ) {
+        let ended_ms = self.clock.now_ms();
         let mut st = self.state.lock();
+        Self::record_side_tx_sample_locked(&mut st, side, bytes, started_ms, ended_ms);
+        self.note_side_tx_success_locked(&mut st, side, ty, bytes, relayed, attempts, ended_ms);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn note_side_tx_success_locked(
+        &self,
+        st: &mut RouterInner,
+        side: RouterSideId,
+        ty: DataType,
+        bytes: usize,
+        relayed: bool,
+        attempts: usize,
+        now_ms: u64,
+    ) {
+        #[cfg(not(feature = "discovery"))]
+        let _ = now_ms;
         #[cfg(feature = "discovery")]
         if ty == crate::DataType::DiscoveryAnnounce
             && !relayed
             && let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
         {
-            throttle.last_liveness_tx_ms = self.clock.now_ms();
+            throttle.last_liveness_tx_ms = now_ms;
         }
         #[cfg(all(feature = "discovery", feature = "timesync"))]
         if Self::is_timesync_type(ty) {
-            let now = self.clock.now_ms();
-            if Self::side_is_slow_control_link_locked(&st, side, now) {
+            let now = now_ms;
+            if Self::side_is_slow_control_link_locked(st, side, now) {
                 st.timesync_side_throttle
                     .entry(side)
                     .or_default()
@@ -4975,6 +5961,9 @@ impl Router {
     }
 
     fn is_managed_variable_type(&self, ty: DataType) -> bool {
+        if self.managed_filter.load(Ordering::Acquire) & ManagedTypes::filter_bit(ty.as_u32()) == 0 {
+            return false;
+        }
         let st = self.state.lock();
         st.is_managed_variable(ty.as_u32())
     }
@@ -5117,26 +6106,83 @@ impl Router {
         }
     }
 
+    #[cfg(test)]
     fn pop_next_queued_control_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
+        self.pop_next_queued_control_rx_item_or_timeouts(None, None, &mut false)
+    }
+
+    /// Take the next queued control item (receipts; discovery with local
+    /// services). With `timeouts_at`, when there is none, also serve the
+    /// pass's reliable timeouts under the same lock if nothing is pending
+    /// (see `process_queue_pass_timeouts`), setting `timeouts_done`.
+    /// `expire_at`: first expire abandoned chunk transfers at that time,
+    /// under the same lock (`expire_side_chunks`).
+    fn pop_next_queued_control_rx_item_or_timeouts(
+        &self,
+        expire_at: Option<u64>,
+        timeouts_at: Option<u64>,
+        timeouts_done: &mut bool,
+    ) -> TelemetryResult<Option<RouterRxItem>> {
         if let Some(queue) = self.isr_rx_queue.as_ref() {
             let mut isr_rx = queue.try_lock()?;
             let idx = isr_rx
                 .iter()
                 .position(|item| self.queued_rx_item_is_control(item));
             if let Some(idx) = idx {
-                return Ok(isr_rx.remove_pos(idx));
+                let item = isr_rx.remove_pos(idx);
+                drop(isr_rx);
+                if let Some(now) = expire_at {
+                    Self::expire_side_chunks_locked(&mut self.state.lock(), now);
+                }
+                return Ok(item);
             }
         }
 
         let mut st = self.state.lock();
-        let idx = st
-            .received_queue
-            .iter()
-            .position(|item| self.queued_rx_item_is_control(item));
+        if let Some(now) = expire_at {
+            Self::expire_side_chunks_locked(&mut st, now);
+        }
+        // The queue is in descending priority order and control items are in
+        // the network-control band or above: a lower head means none exists.
+        let control_band = crate::transport_priority(DataType::ManagedVariableValue)
+            .min(crate::transport_priority(DataType::ReliableAck));
+        let idx = if st.received_queue.iter().next().is_none_or(|head| head.priority < control_band) {
+            debug_assert!(!st.received_queue.iter().any(|item| self.queued_rx_item_is_control(item)));
+            None
+        } else {
+            st.received_queue
+                .iter()
+                .position(|item| self.queued_rx_item_is_control(item))
+        };
         if let Some(idx) = idx {
             return Ok(st.received_queue.remove_pos(idx));
         }
+        if let Some(now) = timeouts_at {
+            *timeouts_done = self.idle_pass_timeouts_locked(&mut st, now)?;
+        }
         Ok(None)
+    }
+
+    /// The pass's reliable timeout service when nothing is pending: only
+    /// discovery route pruning remains. `false`: something is pending; run
+    /// `process_queue_pass_timeouts`. Hosted builds also collect leased-write
+    /// progress first, so they always take the full service.
+    fn idle_pass_timeouts_locked(&self, st: &mut RouterInner, now: u64) -> TelemetryResult<bool> {
+        if cfg!(feature = "std")
+            || !st.reliable_tx.is_empty()
+            || !st.end_to_end_reliable_tx.is_empty()
+        {
+            return Ok(false);
+        }
+        #[cfg(feature = "discovery")]
+        if Self::prune_discovery_routes_locked(st, now) {
+            Self::note_discovery_topology_change_locked(st, now);
+            crate::memory_admission::allow_drain(
+                self.reconcile_end_to_end_reliable_destinations_locked(st),
+            )?;
+        }
+        let _ = now;
+        Ok(true)
     }
 
     fn queued_rx_item_is_control(&self, item: &RouterRxItem) -> bool {
@@ -5188,8 +6234,26 @@ impl Router {
         start: u64,
         timeout_ms: u32,
     ) -> TelemetryResult<bool> {
+        self.drain_queued_control_rx_or_timeouts(start, timeout_ms, None, None, &mut false)
+    }
+
+    /// `drain_queued_control_rx_before_tx`; with `timeouts_at`, a pass that
+    /// finds no control item at all serves its idle reliable timeouts under
+    /// the same lock (`timeouts_done`).
+    fn drain_queued_control_rx_or_timeouts(
+        &self,
+        start: u64,
+        timeout_ms: u32,
+        mut expire_at: Option<u64>,
+        timeouts_at: Option<u64>,
+        timeouts_done: &mut bool,
+    ) -> TelemetryResult<bool> {
         let mut did_any = false;
-        while let Some(item) = self.pop_next_queued_control_rx_item()? {
+        while let Some(item) = self.pop_next_queued_control_rx_item_or_timeouts(
+            expire_at.take(),
+            timeouts_at.filter(|_| !did_any),
+            timeouts_done,
+        )? {
             self.process_rx_queue_item(item)?;
             did_any = true;
             // Receipts precede retry exhaustion; discovery precedes routing.
@@ -5342,10 +6406,20 @@ impl Router {
         started_ms: u64,
         ended_ms: u64,
     ) {
+        let mut st = self.state.lock();
+        Self::record_side_tx_sample_locked(&mut st, side, bytes, started_ms, ended_ms);
+    }
+
+    fn record_side_tx_sample_locked(
+        st: &mut RouterInner,
+        side: RouterSideId,
+        bytes: usize,
+        started_ms: u64,
+        ended_ms: u64,
+    ) {
         let sample_ms = ended_ms.saturating_sub(started_ms).max(1);
         let sample_bps = ((bytes as u128).saturating_mul(1000) / u128::from(sample_ms))
             .min(u128::from(u64::MAX)) as u64;
-        let mut st = self.state.lock();
         st.adaptive_route_stats
             .entry(side)
             .or_default()
@@ -5605,6 +6679,10 @@ impl Router {
         st.address_book.insert(local.hostname.to_string(), record);
         st.local_address = local.clone();
         *self.sender.lock() = local.hostname.clone();
+        #[cfg(feature = "discovery")]
+        {
+            st.local_sender_hash = Self::sender_hash(local.hostname.as_ref());
+        }
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(st, self.clock.now_ms());
         Ok(AddressChange {
@@ -8121,28 +9199,37 @@ impl Router {
             ),
             RouterItem::Packed(bytes) => {
                 let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref())?;
-                let env = &frame.envelope;
-                // Hop ACKs carry the original data type. Their validated
-                // control header, not that type's bulk priority, releases credit.
-                if bytes.len() <= 128 && frame.ack_only() {
-                    return Ok((
-                        env.ty,
-                        crate::transport_priority(crate::DataType::ReliableAck),
-                    ));
-                }
-                let control = bytes.len() <= 128
-                    && bytes.first().is_some_and(|flags| flags & 0x11 == 0)
-                    && env.endpoints().take(4).count() <= 3
-                    && crate::small_frozen_control(
-                        env.ty,
-                        env.target_senders().len(),
-                        env.wire_shape,
-                    );
-                (env.ty, control)
+                return Ok(Self::packed_type_priority(bytes.as_ref(), &frame));
             }
         };
         let priority = crate::scheduler_priority(ty);
         Ok((ty, if control { priority.max(254) } else { priority }))
+    }
+
+    /// `item_type_priority` for packed bytes whose routing frame is parsed.
+    fn packed_type_priority(
+        bytes: &[u8],
+        frame: &wire_format::RoutingFrameInfo<'_>,
+    ) -> (DataType, u8) {
+        let env = &frame.envelope;
+        // Hop ACKs carry the original data type. Their validated
+        // control header, not that type's bulk priority, releases credit.
+        if bytes.len() <= 128 && frame.ack_only() {
+            return (
+                env.ty,
+                crate::transport_priority(crate::DataType::ReliableAck),
+            );
+        }
+        let control = bytes.len() <= 128
+            && bytes.first().is_some_and(|flags| flags & 0x11 == 0)
+            && env.endpoints().take(4).count() <= 3
+            && crate::small_frozen_control(
+                env.ty,
+                env.target_senders().len(),
+                env.wire_shape,
+            );
+        let priority = crate::scheduler_priority(env.ty);
+        (env.ty, if control { priority.max(254) } else { priority })
     }
 
     fn router_item_priority(data: &RouterItem) -> TelemetryResult<u8> {
@@ -8377,8 +9464,7 @@ impl Router {
         let Some(data) = self.clear_intermediate_hop_targets(data, true)? else {
             return Ok(());
         };
-        let plan = self.remote_side_plan(&data, exclude)?;
-        let mut st = self.state.lock();
+        let (plan, mut st) = self.remote_side_plan_locked(&data, exclude)?;
         let ty = Self::item_data_type(&data)?;
         let priority = if st.is_managed_variable(ty.as_u32()) {
             crate::transport_priority(DataType::ManagedVariableValue)
@@ -8386,8 +9472,7 @@ impl Router {
             Self::router_item_priority(&data)?
         };
 
-        let RemoteSidePlan::Target(sides) = plan;
-        for idx in sides {
+        for &idx in plan.as_slice() {
             st.push_transmit(TxQueued {
                 disposable: TX_FRESH,
                 item: RouterTxItem::ToSide {
@@ -9010,8 +10095,118 @@ impl Router {
         self.remote_side_plan_with_selection(data, exclude, true)
     }
 
+    /// The cache key of a frame's route plan, with the packet ID whose
+    /// receipt state the plan of a reliable type depends on; `None` when the
+    /// plan may depend on more than the frame's type, endpoints, owner
+    /// contract and ingress side (see `remote_side_plan_with_selection`).
+    #[cfg(feature = "discovery")]
+    fn route_plan_key(
+        data: &RouterItem,
+        exclude: Option<RouterSideId>,
+    ) -> Option<(RoutePlanKey, Option<u64>)> {
+        let RouterItem::Packed(bytes) = data else {
+            return None;
+        };
+        let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref()).ok()?;
+        let key = Self::route_plan_key_for(&frame.envelope, exclude)?;
+        // Reliable plans skip owners that already acknowledged this packet.
+        let receipt = if is_reliable_type(frame.envelope.ty) {
+            Some(wire_format::framed_packet_id(bytes.as_ref(), &frame)?)
+        } else {
+            None
+        };
+        Some((key, receipt))
+    }
+
+    #[cfg(feature = "discovery")]
+    fn route_plan_key_for(
+        env: &wire_format::RoutingEnvelope<'_>,
+        exclude: Option<RouterSideId>,
+    ) -> Option<RoutePlanKey> {
+        if is_internal_control_type(env.ty) || env.target_senders().len() > ROUTE_PLAN_KEY_TARGETS {
+            return None;
+        }
+        let mut targets = [0u64; ROUTE_PLAN_KEY_TARGETS];
+        for (slot, target) in targets.iter_mut().zip(env.target_senders()) {
+            *slot = target;
+        }
+        let endpoints = if let Some(bitmap) = env.endpoint_bitmap() {
+            RoutePlanEndpoints::Bitmap(*bitmap)
+        } else if let Some(list) = env
+            .endpoint_list_bytes()
+            .filter(|list| list.len() <= ROUTE_PLAN_KEY_LIST_BYTES)
+        {
+            let mut encoded = [0u8; ROUTE_PLAN_KEY_LIST_BYTES];
+            encoded[..list.len()].copy_from_slice(list);
+            RoutePlanEndpoints::Encoded(encoded, list.len() as u8)
+        } else {
+            let mut endpoints = [0u32; ROUTE_PLAN_KEY_ENDPOINTS];
+            let mut count = 0usize;
+            for ep in env.endpoints() {
+                if !endpoints[..count].contains(&ep.as_u32()) {
+                    *endpoints.get_mut(count)? = ep.as_u32();
+                    count += 1;
+                }
+            }
+            endpoints[..count].sort_unstable();
+            RoutePlanEndpoints::List(endpoints, count as u8)
+        };
+        Some(RoutePlanKey {
+            ty: env.ty.as_u32(),
+            exclude,
+            endpoints,
+            targets,
+            target_count: env.target_senders().len() as u8,
+        })
+    }
+
+    #[cfg(feature = "discovery")]
+    fn route_plan_fingerprint(st: &RouterInner) -> RoutePlanFingerprint {
+        RoutePlanFingerprint {
+            schema: crate::config::schema_generation(),
+            routes: st.discovery_routes.generation,
+            sides: st.sides.generation(),
+            overrides: st.route_overrides.generation(),
+            typed_overrides: st.typed_route_overrides.generation(),
+            sender: st.local_sender_hash,
+        }
+    }
+
+    /// Whether a reliable packet's plan is free of receipt filtering: no
+    /// owner behind this router has acknowledged it yet.
+    #[cfg(feature = "discovery")]
+    fn receipts_unfiltered(st: &RouterInner, receipt: Option<u64>) -> bool {
+        receipt.is_none_or(|packet_id| {
+            st.forwarded_receipts
+                .as_ref()
+                .is_none_or(|cache| !cache.destinations.contains_key(&packet_id))
+        })
+    }
+
+    /// Serve a plain transit frame's plan from `route_plans` under a held
+    /// lock. Managed variables keep their per-call owner checks.
+    #[cfg(feature = "discovery")]
+    fn cached_route_plan_locked(
+        st: &RouterInner,
+        key: &RoutePlanKey,
+        receipt: Option<u64>,
+        now_ms: u64,
+    ) -> Option<Option<RouterSideId>> {
+        if st.is_managed_variable(key.ty) || !Self::receipts_unfiltered(st, receipt) {
+            return None;
+        }
+        st.route_plans
+            .lookup(key, Self::route_plan_fingerprint(st), now_ms)
+    }
+
     // Reachability is a query, not a transmission: it must not spend clock
     // allowances or advance weighted/adaptive cursors before actual dispatch.
+    //
+    // Plain transit (an untargeted best-effort application frame) reuses a
+    // plan computed under the same schema, routes, sides and route policies,
+    // within the time its live routes are certain to stay live. Only plans
+    // whose selection had at most one candidate are cached, so a cached
+    // answer never skips a weighted or adaptive selection step.
     #[inline(never)]
     fn remote_side_plan_with_selection(
         &self,
@@ -9020,8 +10215,108 @@ impl Router {
         select_routes: bool,
     ) -> TelemetryResult<RemoteSidePlan> {
         #[cfg(feature = "discovery")]
+        if let Some((key, receipt)) = Self::route_plan_key(data, exclude) {
+            let now_ms = self.clock.now_ms();
+            let fingerprint = {
+                let st = self.state.lock();
+                if let Some(side) = Self::cached_route_plan_locked(&st, &key, receipt, now_ms) {
+                    drop(st);
+                    #[cfg(test)]
+                    self.verify_cached_route_plan(data, exclude, select_routes, side);
+                    return Ok(RemoteSidePlan::Target(side.into_iter().collect()));
+                }
+                (!st.is_managed_variable(key.ty) && Self::receipts_unfiltered(&st, receipt))
+                    .then(|| (Self::route_plan_fingerprint(&st), st.forwarded_receipts.generation()))
+            };
+            let pure = core::cell::Cell::new(true);
+            let plan = self.remote_side_plan_uncached(data, exclude, select_routes, &pure)?;
+            let RemoteSidePlan::Target(sides) = &plan;
+            if let Some((fingerprint, receipts)) = fingerprint
+                && pure.get()
+                && sides.len() <= 1
+            {
+                let mut st = self.state.lock();
+                // Receipt state unchanged too: the plan saw no receipt filter.
+                if Self::route_plan_fingerprint(&st) == fingerprint
+                    && st.forwarded_receipts.generation() == receipts
+                {
+                    let valid_until_ms = st.discovery_routes.liveness_deadline(now_ms);
+                    st.route_plans.insert(RoutePlanEntry {
+                        key,
+                        fingerprint,
+                        built_ms: now_ms,
+                        valid_until_ms,
+                        side: sides.first().copied(),
+                    });
+                }
+            }
+            return Ok(plan);
+        }
+        self.remote_side_plan_uncached(data, exclude, select_routes, &core::cell::Cell::new(true))
+    }
+
+    /// `remote_side_plan`, returning with the core lock held. A cached plan
+    /// is served under the same lock acquisition as the caller's next step.
+    fn remote_side_plan_locked(
+        &self,
+        data: &RouterItem,
+        exclude: Option<RouterSideId>,
+    ) -> TelemetryResult<(PlannedSides, crate::lock::RouterMutexGuard<'_, RouterInner>)> {
+        #[cfg(feature = "discovery")]
+        if let Some((key, receipt)) = Self::route_plan_key(data, exclude) {
+            let now_ms = self.clock.now_ms();
+            let st = self.state.lock();
+            if let Some(side) = Self::cached_route_plan_locked(&st, &key, receipt, now_ms) {
+                #[cfg(test)]
+                let st = {
+                    drop(st);
+                    self.verify_cached_route_plan(data, exclude, true, side);
+                    self.state.lock()
+                };
+                return Ok((PlannedSides::One(side), st));
+            }
+        }
+        let RemoteSidePlan::Target(sides) = self.remote_side_plan(data, exclude)?;
+        Ok((PlannedSides::Many(sides), self.state.lock()))
+    }
+
+    /// Tests recompute every cached plan the full way and require the same
+    /// answer: the existing suite then exercises the cache's invalidation.
+    #[cfg(all(test, feature = "discovery"))]
+    fn verify_cached_route_plan(
+        &self,
+        data: &RouterItem,
+        exclude: Option<RouterSideId>,
+        select_routes: bool,
+        cached: Option<RouterSideId>,
+    ) {
+        route_plan_test_counter::note_verified();
+        let pure = core::cell::Cell::new(true);
+        let RemoteSidePlan::Target(sides) = self
+            .remote_side_plan_uncached(data, exclude, select_routes, &pure)
+            .expect("cached route plan has a full plan");
+        assert!(pure.get(), "cached route plan required a selection step");
+        assert_eq!(
+            sides.first().copied(),
+            cached,
+            "cached route plan differs from the full plan"
+        );
+        assert!(sides.len() <= 1, "cached route plan lost a side");
+    }
+
+    fn remote_side_plan_uncached(
+        &self,
+        data: &RouterItem,
+        exclude: Option<RouterSideId>,
+        select_routes: bool,
+        pure: &core::cell::Cell<bool>,
+    ) -> TelemetryResult<RemoteSidePlan> {
+        #[cfg(feature = "discovery")]
         let (eps, ty) = self.item_route_info(data)?;
         let select_sides = |state: &mut RouterInner, sides: Vec<RouterSideId>, origin| {
+            if sides.len() > 1 {
+                pure.set(false);
+            }
             #[cfg(feature = "discovery")]
             let sides = self.filter_end_to_end_satisfied_sides_locked(state, data, sides, &eps, ty);
             if select_routes {
@@ -9222,6 +10517,7 @@ impl Router {
                     && !Self::has_explicit_route_policy_locked(&st, exclude, ty)
                     && !st.source_route_modes.contains_key(&exclude)
                 {
+                    pure.set(false);
                     if !select_routes {
                         return Ok(RemoteSidePlan::Target(vec![matches[0].side]));
                     }
@@ -9244,6 +10540,9 @@ impl Router {
             }
 
             if !matches.is_empty() {
+                if matches.len() > 1 {
+                    pure.set(false);
+                }
                 if !select_routes {
                     // Only existence is queried. Shortest-path and side-policy
                     // validation already ran; do not select a weighted path.
@@ -9423,6 +10722,7 @@ impl Router {
 
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RouterInner, now_ms: u64) {
+        st.wake_unroutable_parked();
         #[cfg(feature = "std")]
         st.invalidate_prepared_p2p();
         st.discovery_cadence.on_topology_change(now_ms);
@@ -9639,13 +10939,28 @@ impl Router {
         }
         st.discovery_routes
             .retain(|_, route| !route.announcers.is_empty());
-        Ok(st.discovery_routes != before)
+        Ok(*st.discovery_routes != before)
     }
 
     #[cfg(feature = "discovery")]
     fn prune_discovery_routes_locked(st: &mut RouterInner, now_ms: u64) -> bool {
         // Polling runs at the firmware service rate, not the advertisement
         // rate. Never clone the topology just to discover nothing expired.
+        // A read-only check first keeps the cached memory charge of the
+        // routes (see `DiscoveryRoutes`) when nothing would be pruned.
+        let sender_expired =
+            |sender: &DiscoverySenderState| now_ms.saturating_sub(sender.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS;
+        let request_expired = |request: &ManagedVariableSubscription| {
+            !(now_ms >= request.last_seen_ms && now_ms - request.last_seen_ms <= DISCOVERY_ROUTE_TTL_MS)
+        };
+        let prunable = st.discovery_routes.iter().any(|(_, route)| {
+            route.announcers.iter().any(|(_, sender)| sender_expired(sender))
+                || route.requested_network_variables.iter().any(request_expired)
+                || (route.announcers.is_empty() && route.requested_network_variables.is_empty())
+        });
+        if !prunable {
+            return false;
+        }
         let mut changed = false;
         st.discovery_routes.retain(|_, route| {
             let before_peers = route.announcers.len();
@@ -12352,8 +13667,7 @@ impl Router {
                         admitted,
                     );
                 result?;
-                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
-                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                self.note_side_tx_complete(side, ty, sent_bytes, relayed, attempts_total, started_ms);
                 return Ok(());
             }
             RouterTxHandlerFn::Packet(f) => {
@@ -12364,8 +13678,7 @@ impl Router {
         match result {
             Ok((_, attempts)) => {
                 *admitted = true;
-                self.record_side_tx_sample(side, bytes.len(), started_ms, self.clock.now_ms());
-                self.note_side_tx_success(side, ty, bytes.len(), relayed, attempts);
+                self.note_side_tx_complete(side, ty, bytes.len(), relayed, attempts, started_ms);
                 Ok(())
             }
             Err((err, attempts)) => {
@@ -12646,17 +13959,16 @@ impl Router {
         let announcer_bootstrap = discovery::is_announcer_bootstrap_type(ty) || discovery::is_periodic_discovery_request_type(ty);
         #[cfg(not(feature = "discovery"))]
         let announcer_bootstrap = false;
-        let (handler, opts, hop_reliable_enabled) = {
-            let st = self.state.lock();
-            let side_ref = Self::side_ref(&st, side)?;
-            let opts = side_ref.opts.clone();
-            let hop_reliable_enabled = opts.reliable_enabled
-                && !announcer_bootstrap
-                && !end_to_end_ordered
-                && self.cfg.reliable_enabled()
-                && !self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms());
-            (side_ref.tx_handler.clone(), opts, hop_reliable_enabled)
-        };
+        let handler = admission.handler.clone();
+        let opts = admission.opts.clone();
+        let hop_reliable_enabled = opts.reliable_enabled
+            && !announcer_bootstrap
+            && !end_to_end_ordered
+            && self.cfg.reliable_enabled()
+            && {
+                let st = self.state.lock();
+                !self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms())
+            };
 
         #[cfg(all(test, feature = "std", feature = "discovery"))]
         managed_order_side_gate_causal::observe(self,"hop_decision",|| serde_json::json!({"side":side,"data":managed_order_side_gate_causal::data_meta(&data),"addressed":addressed,"end_to_end_ordered":end_to_end_ordered,"hop_reliable":hop_reliable_enabled}));
@@ -12803,8 +14115,7 @@ impl Router {
         let completion = self.complete_hop_offer(side,ty,seq,&bytes,&result,false);
         match result {
             Ok(()) => {
-                self.record_side_tx_sample(side,sent_bytes,started_ms,self.clock.now_ms());
-                self.note_side_tx_success(side,ty,sent_bytes,relayed,attempts_total);
+                self.note_side_tx_complete(side, ty, sent_bytes, relayed, attempts_total, started_ms);
                 completion
             }
             // Success here means the SDK retained the exact owner. The caller
@@ -13055,8 +14366,18 @@ impl Router {
         side: RouterSideId,
         raw: crate::SharedBytes,
     ) -> TelemetryResult<crate::SharedBytes> {
+        self.payload_for_transport_side_at(side, raw, self.clock.now_ms())
+    }
+
+    #[cfg(feature = "compression")]
+    fn payload_for_transport_side_at(
+        &self,
+        side: RouterSideId,
+        raw: crate::SharedBytes,
+        now_ms: u64,
+    ) -> TelemetryResult<crate::SharedBytes> {
         #[cfg(not(feature = "discovery"))]
-        let _ = side;
+        let _ = (side, now_ms);
         let (allowed, budget) = {
             #[cfg(feature = "discovery")]
             let mut st = self.state.lock();
@@ -13075,7 +14396,7 @@ impl Router {
                     transport.tx_chunk_progress = None;
                     transport.refresh_transmit_header_templates();
                 }
-                transport.payload_codec.allowed(self.clock.now_ms())
+                transport.payload_codec.allowed(now_ms)
             };
             #[cfg(not(feature = "discovery"))]
             let allowed = false;
@@ -13134,14 +14455,37 @@ impl Router {
         Ok(Some(reservation))
     }
 
+    /// Encode one canonical frame for a side: payload codec, then either the
+    /// canonical frame, a full template frame or a compact frame, split into
+    /// chunks when the side's frame limit requires it.
+    ///
+    /// One clock read serves the whole encode, and the dictionary decision,
+    /// template bookkeeping and (unless the frame must be split) statistics
+    /// share one core lock. The template is extracted once, and the frame is
+    /// written straight into its final allocation.
     fn encode_side_transport_frames(
         &self,
         side: RouterSideId,
         opts: RouterSideOptions,
         raw: crate::SharedBytes,
     ) -> TelemetryResult<SideTransportFrames> {
+        self.encode_side_transport_frames_known(side, opts, raw, None)
+    }
+
+    /// `encode_side_transport_frames` for a frame whose need for a lossless
+    /// (dictionary-free) encoding the caller already knows: reliability,
+    /// a receipt contract or a reliable control type.
+    fn encode_side_transport_frames_known(
+        &self,
+        side: RouterSideId,
+        opts: RouterSideOptions,
+        raw: crate::SharedBytes,
+        known_reliable: Option<bool>,
+    ) -> TelemetryResult<SideTransportFrames> {
+        #[cfg(any(feature = "compression", feature = "discovery"))]
+        let now_ms = self.clock.now_ms();
         #[cfg(feature = "compression")]
-        let raw = self.payload_for_transport_side(side, raw)?;
+        let raw = self.payload_for_transport_side_at(side, raw, now_ms)?;
         if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
             return Ok(SideTransportFrames::single(raw));
         }
@@ -13169,259 +14513,293 @@ impl Router {
             return Ok(SideTransportFrames::single(raw));
         }
 
-        if opts.header_template_enabled {
-            // Shared buses cannot retain one coherent dictionary across
-            // independent producers. Do not build owned templates or wrap
-            // canonical bytes when no dictionary can be used.
-            let frame = wire_format::peek_routing_frame_info_unchecked(raw.as_ref())?;
-            let without_dictionary = opts.max_side_transport_templates == 0 || {
-                let st = self.state.lock();
-                self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms())
-            };
-            let reliable = is_reliable_type(frame.envelope.ty)
-                || frame.reliable.is_some()
-                // Managed-variable delivery freezes destination owners even
-                // when the application schema itself is best effort. Its
-                // end-to-end receipt must not depend on a lossy dictionary
-                // bootstrap, and transports must be able to prioritize it
-                // independently of queued schema/template frames.
-                || frame.envelope.target_senders().len() != 0
-                || matches!(
-                    frame.envelope.ty,
-                    crate::DataType::ReliableAck
-                        | crate::DataType::ReliablePartialAck
-                        | crate::DataType::ReliablePacketRequest
-                );
-            if without_dictionary || reliable {
-                let mut st = self.state.lock();
-                if without_dictionary {
-                    let removed = st
-                        .side_transport
-                        .get_mut(&side)
-                        .ok_or(TelemetryError::BadArg)?
-                        .trim_tx_templates_to(0);
-                    for _ in 0..removed {
-                        st.side_runtime_stats
-                            .entry(side)
-                            .or_default()
-                            .note_side_transport_template_eviction();
-                    }
-                }
-                st.side_runtime_stats
-                    .entry(side)
-                    .or_default()
-                    .note_side_transport_full(raw_len, raw_len);
-                return Ok(SideTransportFrames::single(raw));
-            }
+        if !opts.header_template_enabled {
+            let wrapped = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref());
+            return self.finish_side_transport_frames(side, &opts, wrapped, raw_len, None);
         }
 
-        if opts.header_template_enabled && crate::memory_admission::supports_work_kinds() {
-            let (template, ..) = extract_side_header_template_view(raw.as_ref())?;
-            let cached = self
-                .state
-                .lock()
-                .side_transport
-                .get(&side)
-                .is_some_and(|transport| {
-                    transport.tx_template_ids.contains_key(&template.hash)
-                        && transport.tx_templates.contains_key(&template.hash)
-                });
-            if !cached
-                && matches!(
-                    crate::memory_admission::check_receive(raw.as_ref()),
-                    Err(TelemetryError::Io("memory pressure"))
-                )
+        let reliable = match known_reliable {
+            Some(reliable) => reliable,
+            None => {
+                let frame = wire_format::peek_routing_frame_info_unchecked(raw.as_ref())?;
+                is_reliable_type(frame.envelope.ty)
+                    || frame.reliable.is_some()
+                    // Managed-variable delivery freezes destination owners even
+                    // when the application schema itself is best effort. Its
+                    // end-to-end receipt must not depend on a lossy dictionary
+                    // bootstrap, and transports must be able to prioritize it
+                    // independently of queued schema/template frames.
+                    || frame.envelope.target_senders().len() != 0
+                    || matches!(
+                        frame.envelope.ty,
+                        crate::DataType::ReliableAck
+                            | crate::DataType::ReliablePartialAck
+                            | crate::DataType::ReliablePacketRequest
+                    )
+            }
+        };
+        // Parsed once; only a frame that will use the dictionary needs it.
+        let extracted = (!reliable).then(|| extract_side_header_template_view(raw.as_ref()));
+
+        let mut st = self.state.lock();
+        // Shared buses cannot retain one coherent dictionary across
+        // independent producers. Do not build owned templates or wrap
+        // canonical bytes when no dictionary can be used.
+        let without_dictionary = opts.max_side_transport_templates == 0 || {
+            #[cfg(feature = "discovery")]
             {
-                // Compression is optional. Retain the canonical shared frame
-                // instead of allocating a dictionary entry under pressure.
-                // Oversized frames returned through the normal chunker above.
-                self.state
-                    .lock()
-                    .side_runtime_stats
-                    .entry(side)
-                    .or_default()
-                    .note_side_transport_full(raw_len, raw_len);
-                return Ok(SideTransportFrames::single(raw));
+                self.side_has_multiple_announcers_locked(&st, side, now_ms)
             }
-        }
-
-        let mut compact_payload_len = None;
-        let mut used_compact = false;
-        let used_timestamp_delta = false;
-        let omitted_timestamp = false;
-        let wrapped = if opts.header_template_enabled {
-            let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
-                extract_side_header_template_view(raw.as_ref())?;
-            // Reliable and frozen-owner packets already returned above.
-            // Classify once per encode rather than repeating a schema lookup.
-            let (template_id, use_compact, _previous_timestamp) = {
-                let mut st = self.state.lock();
-                /* Keep the sender's compact dictionary within the smallest
-                 * capacity advertised by a live peer on this side. Template
-                 * IDs otherwise outlive entries on a smaller receiver and
-                 * later compact values are silently undecodable. */
-                #[cfg(feature = "discovery")]
-                let mut effective_template_limit = opts.max_side_transport_templates;
-                #[cfg(not(feature = "discovery"))]
-                let effective_template_limit = opts.max_side_transport_templates;
-                #[cfg(feature = "discovery")]
-                {
-                    if let Some(route) = st.discovery_routes.get(&side) {
-                        let active_peers = route
-                            .announcers
-                            .values()
-                            .filter(|sender| {
-                                self.clock.now_ms().saturating_sub(sender.last_seen_ms)
-                                    <= DISCOVERY_ROUTE_TTL_MS
-                            })
-                            .count();
-                        /* Compact template state is intentionally side-local.
-                         * On a shared bus, independent producers cannot divide
-                         * a receiver's bounded dictionary between themselves,
-                         * so their compact frames can evict one another. Keep
-                         * compression for point-to-point links and
-                         * automatically use self-describing full frames once
-                         * discovery proves a side is multi-producer. */
-                        if active_peers > 1 {
-                            effective_template_limit = 0;
-                        } else {
-                            effective_template_limit = route
-                                .announcers
-                                .values()
-                                .filter_map(|sender| sender.link_capabilities)
-                                .filter(|caps| {
-                                    caps.flags & discovery::LINK_CAPABILITY_HEADER_TEMPLATES != 0
-                                        && caps.max_side_transport_templates > 0
-                                })
-                                .map(|caps| caps.max_side_transport_templates as usize)
-                                .fold(effective_template_limit, core::cmp::min);
-                        }
-                    }
-                }
-                let trimmed = st
+            #[cfg(not(feature = "discovery"))]
+            {
+                self.side_has_multiple_announcers_locked(&st, side, 0)
+            }
+        };
+        if without_dictionary || reliable {
+            if without_dictionary {
+                let removed = st
                     .side_transport
                     .get_mut(&side)
                     .ok_or(TelemetryError::BadArg)?
-                    .trim_tx_templates_to(effective_template_limit);
-                for _ in 0..trimmed {
+                    .trim_tx_templates_to(0);
+                for _ in 0..removed {
                     st.side_runtime_stats
                         .entry(side)
                         .or_default()
                         .note_side_transport_template_eviction();
                 }
-                let side_state = st
-                    .side_transport
-                    .get_mut(&side)
-                    .ok_or(TelemetryError::BadArg)?;
-                if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
-                    let previous = side_state.tx_last_timestamps.get(&id).copied();
-                    /* A full refresh makes compact transport self-healing when
-                     * the receiver missed the original template frame. */
-                    const FULL_REFRESH_AFTER_COMPACT_FRAMES: u8 = 8;
-                    let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
-                    // Discovery must bootstrap even when a receiver lost its dictionary.
-                    #[cfg(feature = "discovery")]
-                    let discovery_refresh = discovery::is_discovery_type(_ty);
-                    #[cfg(not(feature = "discovery"))]
-                    let discovery_refresh = false;
-                    let use_compact =
-                        *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES && !discovery_refresh;
-                    if use_compact {
-                        *compact_uses = compact_uses.saturating_add(1);
-                    } else {
-                        *compact_uses = 0;
-                    }
-                    (id, use_compact, previous)
-                } else {
-                    /* Sequential template IDs collide when multiple routers
-                     * transmit on one physical bus. The template hash covers
-                     * the source address and immutable header fields, making
-                     * this ID producer-stable without adding bytes to compact
-                     * frames. */
-                    let template_id = ((template.hash >> 32) as u32 ^ template.hash as u32).max(1);
-                    let evicted = side_state.insert_tx_template(
-                        template.into_owned(),
-                        template_id,
-                        effective_template_limit,
-                    );
-                    if evicted {
-                        st.side_runtime_stats
-                            .entry(side)
-                            .or_default()
-                            .note_side_transport_template_eviction();
-                    }
-                    if let Some(side_state) = st.side_transport.get_mut(&side)
-                        && effective_template_limit > 0
-                    {
-                        side_state.tx_last_timestamps.insert(template_id, timestamp);
-                    }
-                    (template_id, false, None)
-                }
-            };
-            if use_compact {
-                used_compact = true;
-                compact_payload_len = Some(payload.len());
-                // A previous transmitted frame is not a confirmed receive base.
-                // Absolute timestamps preserve identity after loss or reordering.
-                let timestamp_field = Some(timestamp);
-                let mut body = Vec::with_capacity(payload.len() + 32);
-                body.push(flags);
-                write_uleb128_local(u64::from(template_id), &mut body);
-                write_uleb128_local(data_size, &mut body);
-                if let Some(timestamp_field) = timestamp_field {
-                    write_uleb128_local(timestamp_field, &mut body);
-                }
-                if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-                    write_uleb128_local(u64::from(nonce), &mut body);
-                }
-                if let Some((seq, ack)) = reliable_seq_ack {
-                    write_uleb128_local(u64::from(seq), &mut body);
-                    write_uleb128_local(u64::from(ack), &mut body);
-                }
-                body.extend_from_slice(payload);
-                {
-                    let mut st = self.state.lock();
-                    if let Some(side_state) = st.side_transport.get_mut(&side) {
-                        side_state.tx_last_timestamps.insert(template_id, timestamp);
-                    }
-                }
-                let kind = if omitted_timestamp {
-                    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
-                } else if used_timestamp_delta {
-                    SIDE_TRANSPORT_KIND_COMPACT_DELTA
-                } else {
-                    SIDE_TRANSPORT_KIND_COMPACT
-                };
-                wrap_side_transport_frame(kind, &body)
-            } else {
-                let mut body = Vec::with_capacity(raw.len() + 4);
-                write_uleb128_local(u64::from(template_id), &mut body);
-                body.extend_from_slice(raw.as_ref());
-                wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body)
             }
-        } else {
-            wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref())
-        };
+            st.side_runtime_stats
+                .entry(side)
+                .or_default()
+                .note_side_transport_full(raw_len, raw_len);
+            return Ok(SideTransportFrames::single(raw));
+        }
+        let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
+            extracted.expect("dictionary frames are extracted")?;
 
+        if crate::memory_admission::supports_work_kinds() {
+            let cached = st.side_transport.get(&side).is_some_and(|transport| {
+                transport.tx_template_ids.contains_key(&template.hash)
+                    && transport.tx_templates.contains_key(&template.hash)
+            });
+            if !cached {
+                // The probe is application code: never call it under the lock.
+                drop(st);
+                if matches!(
+                    crate::memory_admission::check_receive(raw.as_ref()),
+                    Err(TelemetryError::Io("memory pressure"))
+                ) {
+                    // Compression is optional. Retain the canonical shared frame
+                    // instead of allocating a dictionary entry under pressure.
+                    // Oversized frames returned through the normal chunker above.
+                    self.state
+                        .lock()
+                        .side_runtime_stats
+                        .entry(side)
+                        .or_default()
+                        .note_side_transport_full(raw_len, raw_len);
+                    return Ok(SideTransportFrames::single(raw));
+                }
+                st = self.state.lock();
+            }
+        }
+
+        // Reliable and frozen-owner packets already returned above.
+        // Classify once per encode rather than repeating a schema lookup.
+        /* Keep the sender's compact dictionary within the smallest
+         * capacity advertised by a live peer on this side. Template
+         * IDs otherwise outlive entries on a smaller receiver and
+         * later compact values are silently undecodable. */
+        #[cfg(feature = "discovery")]
+        let mut effective_template_limit = opts.max_side_transport_templates;
+        #[cfg(not(feature = "discovery"))]
+        let effective_template_limit = opts.max_side_transport_templates;
+        #[cfg(feature = "discovery")]
+        {
+            if let Some(route) = st.discovery_routes.get(&side) {
+                let active_peers = route
+                    .announcers
+                    .values()
+                    .filter(|sender| {
+                        now_ms.saturating_sub(sender.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
+                    })
+                    .count();
+                /* Compact template state is intentionally side-local.
+                 * On a shared bus, independent producers cannot divide
+                 * a receiver's bounded dictionary between themselves,
+                 * so their compact frames can evict one another. Keep
+                 * compression for point-to-point links and
+                 * automatically use self-describing full frames once
+                 * discovery proves a side is multi-producer. */
+                if active_peers > 1 {
+                    effective_template_limit = 0;
+                } else {
+                    effective_template_limit = route
+                        .announcers
+                        .values()
+                        .filter_map(|sender| sender.link_capabilities)
+                        .filter(|caps| {
+                            caps.flags & discovery::LINK_CAPABILITY_HEADER_TEMPLATES != 0
+                                && caps.max_side_transport_templates > 0
+                        })
+                        .map(|caps| caps.max_side_transport_templates as usize)
+                        .fold(effective_template_limit, core::cmp::min);
+                }
+            }
+        }
+        let trimmed = st
+            .side_transport
+            .get_mut(&side)
+            .ok_or(TelemetryError::BadArg)?
+            .trim_tx_templates_to(effective_template_limit);
+        for _ in 0..trimmed {
+            st.side_runtime_stats
+                .entry(side)
+                .or_default()
+                .note_side_transport_template_eviction();
+        }
+        let side_state = st
+            .side_transport
+            .get_mut(&side)
+            .ok_or(TelemetryError::BadArg)?;
+        let (template_id, use_compact) =
+            if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
+                /* A full refresh makes compact transport self-healing when
+                 * the receiver missed the original template frame. */
+                const FULL_REFRESH_AFTER_COMPACT_FRAMES: u8 = 8;
+                let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
+                // Discovery must bootstrap even when a receiver lost its dictionary.
+                #[cfg(feature = "discovery")]
+                let discovery_refresh = discovery::is_discovery_type(_ty);
+                #[cfg(not(feature = "discovery"))]
+                let discovery_refresh = false;
+                let use_compact =
+                    *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES && !discovery_refresh;
+                if use_compact {
+                    *compact_uses = compact_uses.saturating_add(1);
+                    // A previous transmitted frame is not a confirmed receive
+                    // base: compact frames carry absolute timestamps.
+                    side_state.tx_last_timestamps.insert(id, timestamp);
+                } else {
+                    *compact_uses = 0;
+                }
+                (id, use_compact)
+            } else {
+                /* Sequential template IDs collide when multiple routers
+                 * transmit on one physical bus. The template hash covers
+                 * the source address and immutable header fields, making
+                 * this ID producer-stable without adding bytes to compact
+                 * frames. */
+                let template_id = ((template.hash >> 32) as u32 ^ template.hash as u32).max(1);
+                let evicted = side_state.insert_tx_template(
+                    template.into_owned(),
+                    template_id,
+                    effective_template_limit,
+                );
+                if evicted {
+                    st.side_runtime_stats
+                        .entry(side)
+                        .or_default()
+                        .note_side_transport_template_eviction();
+                }
+                if let Some(side_state) = st.side_transport.get_mut(&side)
+                    && effective_template_limit > 0
+                {
+                    side_state.tx_last_timestamps.insert(template_id, timestamp);
+                }
+                (template_id, false)
+            };
+
+        // The variable header fields precede the payload (compact) or the
+        // canonical frame (full) in the side body.
+        let mut header = SideHeaderBytes::default();
+        let tail: &[u8] = if use_compact {
+            header.push(flags);
+            header.uleb128(u64::from(template_id));
+            header.uleb128(data_size);
+            header.uleb128(timestamp);
+            if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
+                header.uleb128(u64::from(nonce));
+            }
+            if let Some((seq, ack)) = reliable_seq_ack {
+                header.uleb128(u64::from(seq));
+                header.uleb128(u64::from(ack));
+            }
+            payload
+        } else {
+            header.uleb128(u64::from(template_id));
+            raw.as_ref()
+        };
+        let wrapped_len = SIDE_TRANSPORT_WRAP_BYTES + header.len + tail.len();
+        let compact_payload_len = use_compact.then_some(payload.len());
+        let kind = if use_compact {
+            SIDE_TRANSPORT_KIND_COMPACT
+        } else {
+            SIDE_TRANSPORT_KIND_FULL
+        };
+        if opts.max_frame_bytes != 0 && wrapped_len > opts.max_frame_bytes {
+            drop(st);
+            let wrapped = wrap_side_transport_frame_parts(kind, &[header.as_slice(), tail]);
+            return self.finish_side_transport_frames(side, &opts, wrapped, raw_len, compact_payload_len);
+        }
+        // One frame: its statistics are known before it is written.
+        Self::note_side_transport_frames_locked(
+            &mut st,
+            side,
+            &opts,
+            raw_len,
+            wrapped_len,
+            1,
+            compact_payload_len,
+        );
+        drop(st);
+        Ok(SideTransportFrames::single(wrap_side_transport_frame_parts(
+            kind,
+            &[header.as_slice(), tail],
+        )))
+    }
+
+    /// Split a wrapped side frame when needed and record its statistics.
+    fn finish_side_transport_frames(
+        &self,
+        side: RouterSideId,
+        opts: &RouterSideOptions,
+        wrapped: crate::SharedBytes,
+        raw_len: usize,
+        compact_payload_len: Option<usize>,
+    ) -> TelemetryResult<SideTransportFrames> {
         let frames = if opts.max_frame_bytes != 0 && wrapped.len() > opts.max_frame_bytes {
             self.split_side_transport_frame(side, wrapped, opts.max_frame_bytes)
         } else {
             Ok(SideTransportFrames::single(wrapped))
         }?;
-        let wire_len = frames.wire_len();
         let mut st = self.state.lock();
+        Self::note_side_transport_frames_locked(
+            &mut st,
+            side,
+            opts,
+            raw_len,
+            frames.wire_len(),
+            frames.len(),
+            compact_payload_len,
+        );
+        Ok(frames)
+    }
+
+    fn note_side_transport_frames_locked(
+        st: &mut RouterInner,
+        side: RouterSideId,
+        opts: &RouterSideOptions,
+        raw_len: usize,
+        wire_len: usize,
+        frame_count: usize,
+        compact_payload_len: Option<usize>,
+    ) {
         let stats = st.side_runtime_stats.entry(side).or_default();
-        if used_compact {
-            let overhead = compact_payload_len
-                .map(|payload_len| wire_len.saturating_sub(payload_len))
-                .unwrap_or(wire_len);
-            stats.note_side_transport_compact(
-                raw_len,
-                wire_len,
-                overhead,
-                used_timestamp_delta,
-                omitted_timestamp,
-            );
+        if let Some(payload_len) = compact_payload_len {
+            let overhead = wire_len.saturating_sub(payload_len);
+            stats.note_side_transport_compact(raw_len, wire_len, overhead, false, false);
             if opts.compact_header_target_bytes != 0 && overhead > opts.compact_header_target_bytes
             {
                 stats.note_side_transport_compact_target_miss();
@@ -13429,15 +14807,18 @@ impl Router {
         } else {
             stats.note_side_transport_full(raw_len, wire_len);
         }
-        if frames.len() > 1 {
-            stats.note_side_transport_chunks(frames.len());
+        if frame_count > 1 {
+            stats.note_side_transport_chunks(frame_count);
         }
-        Ok(frames)
     }
 
     fn expire_side_chunks(&self) {
         let now = self.clock.now_ms();
         let mut st = self.state.lock();
+        Self::expire_side_chunks_locked(&mut st, now);
+    }
+
+    fn expire_side_chunks_locked(st: &mut RouterInner, now: u64) {
         for side in st.side_transport.values_mut() {
             let side = side.as_mut();
             #[cfg(all(feature = "compression", feature = "discovery"))]
@@ -13474,30 +14855,45 @@ impl Router {
     fn refresh_peer_liveness(&self, side: RouterSideId, address: u32) {
         let now = self.clock.now_ms();
         let mut st = self.state.lock();
+        Self::refresh_peer_liveness_locked(&mut st, side, address, now);
+    }
+
+    #[cfg(feature = "discovery")]
+    fn refresh_peer_liveness_locked(st: &mut RouterInner, side: RouterSideId, address: u32, now: u64) {
         #[cfg(feature = "compression")]
         if let Some(transport) = st.side_transport.get_mut(&side) {
             transport
                 .payload_codec
                 .observe(address, now, DISCOVERY_ROUTE_TTL_MS);
         }
-        let Some(route) = st.discovery_routes.get_mut(&side) else {
-            return;
+        // A refresh that revives an expired peer or route (or moves a stamp
+        // backwards) changes which routes count as live: retire cached plans.
+        let changes_liveness = |last_seen_ms: u64| {
+            now < last_seen_ms || now - last_seen_ms > DISCOVERY_ROUTE_TTL_MS
         };
-        let mut found = None;
-        for (name, peer) in &mut route.announcers {
-            if peer.advertised_address == Some(address) || sender_address_u32(name) == address {
-                // Ambiguous numeric identities must be resolved by discovery.
-                if found.is_some() {
-                    return;
+        let revived = st.discovery_routes.touch(side, |route| {
+            let mut found = None;
+            for (name, peer) in &mut route.announcers {
+                if peer.advertised_address == Some(address) || sender_address_u32(name) == address {
+                    // Ambiguous numeric identities must be resolved by discovery.
+                    if found.is_some() {
+                        return false;
+                    }
+                    found = Some(peer);
                 }
-                found = Some(peer);
             }
+            let Some(peer) = found else {
+                return false;
+            };
+            let revived = changes_liveness(peer.last_seen_ms)
+                || (route.last_seen_ms < now && changes_liveness(route.last_seen_ms));
+            peer.last_seen_ms = now;
+            route.last_seen_ms = route.last_seen_ms.max(now);
+            revived
+        });
+        if revived == Some(true) {
+            st.discovery_routes.note_revival();
         }
-        let Some(peer) = found else {
-            return;
-        };
-        peer.last_seen_ms = now;
-        route.last_seen_ms = route.last_seen_ms.max(now);
     }
 
     /// Consume only an exact unsequenced topology retry on its ingress link.
@@ -13832,7 +15228,7 @@ impl Router {
             *victim = Some((owner, priority));
             (owner, priority)
         };
-        st.reclaim_bulk_from(owner, priority, None)
+        st.reclaim_bulk_from_with(owner, priority, None, false)
     }
     fn admit_received_frame(&self, side: RouterSideId, bytes: &[u8]) -> TelemetryResult<()> {
         self.admit_received_frame_with_view(side, bytes, None)
@@ -13988,9 +15384,79 @@ impl Router {
         bytes: &[u8],
         crc_verified: bool,
     ) -> TelemetryResult<Option<crate::SharedBytes>> {
+        self.decode_side_transport_frame_with(side, bytes, crc_verified, false, None)
+    }
+
+    /// `decode_side_transport_frame_inner`, optionally doing the side's
+    /// ingress check (`ensure_side_ingress_enabled`) under its first lock,
+    /// and optionally handing a compact frame's timestamp record to the
+    /// caller (`pending_timestamp`), who must apply it on every outcome with
+    /// `note_rx_timestamp_locked`, under its own next lock.
+    fn decode_side_transport_frame_with(
+        &self,
+        side: RouterSideId,
+        bytes: &[u8],
+        crc_verified: bool,
+        check_ingress: bool,
+        pending_timestamp: Option<&mut Option<(u32, u64)>>,
+    ) -> TelemetryResult<Option<crate::SharedBytes>> {
         // Reclaim abandoned transfers before admission, even when new work is refused.
-        self.expire_side_chunks();
-        let Some((kind, body)) = parse_side_transport_wrapper(bytes)? else {
+        let now_ms = self.clock.now_ms();
+        let wrapper = parse_side_transport_wrapper(bytes);
+        // A compact frame's template lookup and its peer's liveness refresh
+        // share the expiry's lock and clock reading.
+        let compact_template = match &wrapper {
+            Ok(Some((
+                kind @ (SIDE_TRANSPORT_KIND_COMPACT
+                | SIDE_TRANSPORT_KIND_COMPACT_DELTA
+                | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP),
+                body,
+            ))) if !body.is_empty() => {
+                let mut off = 1usize;
+                let template_id = read_uleb128_local(body, &mut off).and_then(|id| {
+                    u32::try_from(id)
+                        .map_err(|_| TelemetryError::Unpack("side template id too large"))
+                });
+                Some((*kind, off, template_id))
+            }
+            _ => None,
+        };
+        let mut st = self.state.lock();
+        if check_ingress && !Self::side_ref(&st, side)?.opts.ingress_enabled {
+            return Err(TelemetryError::HandlerError(
+                "router: ingress disabled for side id",
+            ));
+        }
+        Self::expire_side_chunks_locked(&mut st, now_ms);
+        let compact = match compact_template {
+            Some((kind, off, template_id)) => {
+                let template_id = template_id?;
+                let state = st.side_transport.get(&side);
+                let template = state
+                    .and_then(|state| state.rx_templates_by_id.get(&template_id))
+                    .cloned();
+                let timestamp_base = if matches!(
+                    kind,
+                    SIDE_TRANSPORT_KIND_COMPACT_DELTA | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
+                ) {
+                    state
+                        .and_then(|state| state.rx_last_timestamps.get(&template_id))
+                        .copied()
+                } else {
+                    None
+                };
+                // The wrapper CRC and known template identify this peer even
+                // if payload allocation is refused. No payload copy is needed.
+                #[cfg(feature = "discovery")]
+                if let Some(address) = template.as_ref().and_then(|template| template.source_address()) {
+                    Self::refresh_peer_liveness_locked(&mut st, side, address, now_ms);
+                }
+                Some((off, template_id, template, timestamp_base))
+            }
+            None => None,
+        };
+        drop(st);
+        let Some((kind, body)) = wrapper? else {
             if !crc_verified {
                 wire_format::verify_frame_crc(bytes)?;
             }
@@ -14076,30 +15542,8 @@ impl Router {
             SIDE_TRANSPORT_KIND_COMPACT
             | SIDE_TRANSPORT_KIND_COMPACT_DELTA
             | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
-                if body.is_empty() {
+                let Some((off, template_id, template, timestamp_base)) = compact else {
                     return Err(TelemetryError::Unpack("short side compact frame"));
-                }
-                let mut off = 1usize;
-                let template_id = u32::try_from(read_uleb128_local(body, &mut off)?)
-                    .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
-                let (template, timestamp_base) = {
-                    let st = self.state.lock();
-                    let state = st.side_transport.get(&side);
-                    let template = state
-                        .and_then(|state| state.rx_templates_by_id.get(&template_id))
-                        .cloned();
-                    let timestamp_base = if matches!(
-                        kind,
-                        SIDE_TRANSPORT_KIND_COMPACT_DELTA
-                            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
-                    ) {
-                        state
-                            .and_then(|state| state.rx_last_timestamps.get(&template_id))
-                            .copied()
-                    } else {
-                        None
-                    };
-                    (template, timestamp_base)
                 };
                 /* A full template frame can be lost on a datagram/radio side.
                  * Drop this compact frame without tearing down the transport;
@@ -14110,12 +15554,6 @@ impl Router {
                     }
                     return Ok(None);
                 };
-                // The wrapper CRC and known template identify this peer even
-                // if payload allocation is refused. No payload copy is needed.
-                #[cfg(feature = "discovery")]
-                if let Some(address) = template.source_address() {
-                    self.refresh_peer_liveness(side, address);
-                }
                 let reconstructed_bound = body
                     .len()
                     .saturating_add(template.prefix().len())
@@ -14124,9 +15562,15 @@ impl Router {
                 // Wrapper CRC and the retained full template are validated
                 // before compact reconstruction. Preserve the same control
                 // priority as canonical ingress while reclaiming only bulk.
-                let protected = template.data_type().is_some_and(|ty| {
-                    message_priority(ty) >= 200 || self.is_managed_variable_type(ty)
-                });
+                // Only memory pressure needs the class; decided once, when asked.
+                let mut protected = None::<bool>;
+                let mut is_protected = || {
+                    *protected.get_or_insert_with(|| {
+                        template.data_type().is_some_and(|ty| {
+                            message_priority(ty) >= 200 || self.is_managed_variable_type(ty)
+                        })
+                    })
+                };
                 let ack = template.is_ack();
                 #[cfg(any(feature = "std", feature = "fair-admission"))]
                 let mut fair_incoming = None;
@@ -14137,7 +15581,7 @@ impl Router {
                         reconstructed_bound,
                         ack,
                     ) {
-                        Err(TelemetryError::Io("memory pressure")) if protected => {
+                        Err(TelemetryError::Io("memory pressure")) if is_protected() => {
                             let mut st = self.state.lock();
                             let reclaimed = st
                                 .lower_priority_shared_queue(199)
@@ -14179,11 +15623,13 @@ impl Router {
                     timestamp_mode,
                     timestamp_base,
                 )?;
-                {
-                    let mut st = self.state.lock();
-                    if let Some(side_state) = st.side_transport.get_mut(&side) {
-                        side_state.rx_last_timestamps.insert(template_id, timestamp);
-                    }
+                match pending_timestamp {
+                    Some(pending) => *pending = Some((template_id, timestamp)),
+                    None => Self::note_rx_timestamp_locked(
+                        &mut self.state.lock(),
+                        side,
+                        Some((template_id, timestamp)),
+                    ),
                 }
                 // Byte reconstruction is not decoder/forwarding admission.
                 // Check the canonical frame before queueing, and recheck at
@@ -14419,20 +15865,20 @@ impl Router {
         service: EgressService,
     ) -> TelemetryResult<()> {
         let side = admission.side;
-        let opts = {
-            let st = self.state.lock();
-            Self::side_ref(&st, side)?.opts.clone()
-        };
+        let opts = admission.opts.clone();
         let started_ms = self.clock.now_ms();
         // Type and priority share one CRC-validated envelope in this call.
         let (ty, priority) = self.item_service_type_priority(data)?;
+        // Only time sync frames are throttled per side; others skip the lock.
         #[cfg(all(feature = "discovery", feature = "timesync"))]
-        if !Self::timesync_allowed_for_side_locked(
-            &self.state.lock(),
-            side,
-            ty,
-            self.clock.now_ms(),
-        ) {
+        if Self::is_timesync_type(ty)
+            && !Self::timesync_allowed_for_side_locked(
+                &self.state.lock(),
+                side,
+                ty,
+                self.clock.now_ms(),
+            )
+        {
             return Ok(());
         }
         #[cfg(feature = "timesync")]
@@ -14469,8 +15915,7 @@ impl Router {
                         PackedFrameOffer { ty, priority, service }, admitted,
                     );
                 result?;
-                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
-                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                self.note_side_tx_complete(side, ty, sent_bytes, relayed, attempts_total, started_ms);
                 return Ok(());
             }
             (RouterTxHandlerFn::Packet(f), RouterItem::Packet(pkt)) => {
@@ -14563,8 +16008,7 @@ impl Router {
                             stats.note_side_transport_chunks(chunks);
                         }
                     }
-                    self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
-                    self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                    self.note_side_tx_complete(side, ty, sent_bytes, relayed, attempts_total, started_ms);
                     return Ok(());
                 }
                 let owned = self.pack_packet_for_router(pkt, None)?;
@@ -14575,8 +16019,7 @@ impl Router {
                         PackedFrameOffer { ty, priority, service }, admitted,
                     );
                 result?;
-                self.record_side_tx_sample(side, sent_bytes, started_ms, self.clock.now_ms());
-                self.note_side_tx_success(side, ty, sent_bytes, relayed, attempts_total);
+                self.note_side_tx_complete(side, ty, sent_bytes, relayed, attempts_total, started_ms);
                 return Ok(());
             }
             (RouterTxHandlerFn::Packet(f), RouterItem::Packed(bytes)) => {
@@ -14588,8 +16031,7 @@ impl Router {
             Ok((_, attempts)) => {
                 *admitted = true;
                 if let Ok(bytes) = Self::router_item_wire_len(data) {
-                    self.record_side_tx_sample(side, bytes, started_ms, self.clock.now_ms());
-                    self.note_side_tx_success(side, ty, bytes, relayed, attempts);
+                    self.note_side_tx_complete(side, ty, bytes, relayed, attempts, started_ms);
                 }
                 Ok(())
             }
@@ -14685,8 +16127,12 @@ impl Router {
         self.state.lock().exhausted_recent.drain(..).collect()
     }
 
+    #[cfg(test)]
     fn process_reliable_timeouts(&self) -> TelemetryResult<()> {
-        let now = self.clock.now_ms();
+        self.process_reliable_timeouts_at(self.clock.now_ms())
+    }
+
+    fn process_reliable_timeouts_at(&self, now: u64) -> TelemetryResult<()> {
         let mut requeue: Vec<(RouterSideId, DataType, u32)> = Vec::new();
         let mut failed_ordered = false;
 
@@ -14765,18 +16211,65 @@ impl Router {
         Ok(())
     }
 
+    #[cfg(test)]
     fn process_end_to_end_reliable_timeouts(&self) -> TelemetryResult<()> {
         let now = self.clock.now_ms();
-        let mut requeue = Vec::new();
-        let mut failed_ordered_types = OrdSet::new();
-        #[cfg(feature = "discovery")]
-        let mut silenced: Vec<u64> = Vec::new();
         // Leased transports report physical drain: a copy's retry interval
         // starts when it actually left, and a copy still held by the writer
         // covers its packet for up to two intervals (a writer that never
         // drains or discards cannot stall the retries forever).
         #[cfg(feature = "std")]
-        let (drained, held) = self.retry_write_progress();
+        let progress = self.retry_write_progress();
+        self.process_end_to_end_reliable_timeouts_at(
+            now,
+            #[cfg(feature = "std")]
+            progress,
+        )
+    }
+
+    /// One queue pass's reliable timeout service: the hop timeouts, then the
+    /// end-to-end timeouts (with discovery route pruning), both at `now`.
+    /// With nothing pending in either, the pass needs only the pruning step,
+    /// done under one lock instead of the three both services take.
+    fn process_queue_pass_timeouts(&self, now: u64) -> TelemetryResult<()> {
+        #[cfg(feature = "std")]
+        let progress = self.retry_write_progress();
+        {
+            #[cfg_attr(not(feature = "discovery"), allow(unused_mut))]
+            let mut st = self.state.lock();
+            if st.reliable_tx.is_empty() && st.end_to_end_reliable_tx.is_empty() {
+                // No hop history: the hop service returns at once. No pending
+                // delivery: drained-write progress matches nothing and no
+                // ordered successor can be released; only pruning remains.
+                #[cfg(feature = "discovery")]
+                if Self::prune_discovery_routes_locked(&mut st, now) {
+                    Self::note_discovery_topology_change_locked(&mut st, now);
+                    crate::memory_admission::allow_drain(
+                        self.reconcile_end_to_end_reliable_destinations_locked(&mut st),
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+        crate::memory_admission::allow_drain(self.process_reliable_timeouts_at(now))?;
+        crate::memory_admission::allow_drain(self.process_end_to_end_reliable_timeouts_at(
+            now,
+            #[cfg(feature = "std")]
+            progress,
+        ))
+    }
+
+    fn process_end_to_end_reliable_timeouts_at(
+        &self,
+        now: u64,
+        #[cfg(feature = "std")] progress: (Vec<(u64, u64)>, Vec<u64>),
+    ) -> TelemetryResult<()> {
+        let mut requeue = Vec::new();
+        let mut failed_ordered_types = OrdSet::new();
+        #[cfg(feature = "discovery")]
+        let mut silenced: Vec<u64> = Vec::new();
+        #[cfg(feature = "std")]
+        let (drained, held) = progress;
 
         {
             let mut st = self.state.lock();
@@ -15910,6 +17403,9 @@ impl Router {
         if local_services_enabled {
             address_by_value.insert(address, hostname.to_string());
         }
+        let managed_filter = Arc::new(AtomicU32::new(0));
+        #[cfg(feature = "discovery")]
+        let local_sender_hash = Self::sender_hash(hostname.as_ref());
         Self {
             #[cfg(feature = "std")]
             retry_trackers: RouterMutex::new(Vec::new()),
@@ -15921,7 +17417,7 @@ impl Router {
                 #[cfg(feature = "compression")]
                 codec_reserved_bytes: 0,
                 memory,
-                sides: Vec::new(),
+                sides: Default::default(),
                 route_overrides: Default::default(),
                 typed_route_overrides: Default::default(),
                 route_weights: Default::default(),
@@ -15939,7 +17435,7 @@ impl Router {
                         managed_cache_epoch:0,
                         #[cfg(all(feature="std",feature="discovery"))]
                         managed_registration_dirty:false,
-                        managed_variable_types: OrdSet::new(),
+                        managed_variable_types: ManagedTypes::new(managed_filter.clone()),
                         managed_variable_permissions: Default::default(),
                         managed_variable_latest: Default::default(),
                         network_variable_update_handlers: Default::default(),
@@ -15966,6 +17462,7 @@ impl Router {
                 active_queued_types: [(0, 0); ACTIVE_QUEUED_TYPE_SLOTS],
                 tx_priority_burst: 0,
                 tx_policy_flags: 0,
+                unroutable_parked: false,
                 #[cfg(feature = "latest-value-egress")]
                 latest_turn_phase: 0,
                 #[cfg(feature = "latest-value-egress")]
@@ -15987,7 +17484,9 @@ impl Router {
                 reliable_return_routes: Default::default(),
                 local_admission_sequence: 0,
                 reliable_return_route_order: VecDeque::new(),
-                forwarded_receipts: None,
+                forwarded_receipts: Default::default(),
+                #[cfg(feature = "discovery")]
+                local_sender_hash,
                 end_to_end_reliable_tx: Default::default(),
                 end_to_end_reliable_tx_order: VecDeque::new(),
                 total_handler_failures: 0,
@@ -15997,6 +17496,8 @@ impl Router {
                 exhausted_recent: VecDeque::new(),
                 #[cfg(feature = "discovery")]
                 discovery_routes: Default::default(),
+                #[cfg(feature = "discovery")]
+                route_plans: Default::default(),
                 #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
                 #[cfg(feature = "discovery")]
@@ -16024,6 +17525,7 @@ impl Router {
             #[cfg(feature = "std")]
             active_queued_tx: core::sync::atomic::AtomicUsize::new(0),
             clock: Arc::from(clock),
+            managed_filter,
             #[cfg(feature = "timesync")]
             timesync: local_services_enabled.then(|| {
                 Box::new(RouterMutex::new(TimeSyncRuntime::new(timesync_cfg, timesync_epoch.clone())))
@@ -16510,6 +18012,10 @@ impl Router {
         if !self.cfg.role.local_services() {
             // A transparent relay renames its protocol sender without claiming
             // a local application address or changing accepted wire owners.
+            #[cfg(feature = "discovery")]
+            {
+                self.state.lock().local_sender_hash = Self::sender_hash(hostname.as_ref());
+            }
             *self.sender.lock() = hostname;
             return;
         }
@@ -16650,6 +18156,8 @@ impl Router {
             .insert(id, Box::<SideTransportState>::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        #[cfg(not(feature = "discovery"))]
+        st.wake_unroutable_parked();
         id
     }
 
@@ -16691,6 +18199,8 @@ impl Router {
             .insert(id, Box::<SideTransportState>::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        #[cfg(not(feature = "discovery"))]
+        st.wake_unroutable_parked();
         id
     }
 
@@ -16741,6 +18251,8 @@ impl Router {
             .insert(id, Box::<SideTransportState>::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        #[cfg(not(feature = "discovery"))]
+        st.wake_unroutable_parked();
         id
     }
 
@@ -18297,6 +19809,18 @@ impl Router {
         !state.received_queue.is_empty() || !state.transmit_queue.is_empty()
     }
 
+    fn queues_empty(&self) -> bool {
+        if self
+            .isr_rx_queue
+            .as_ref()
+            .is_some_and(|queue| queue.try_lock().map_or(true, |queue| !queue.is_empty()))
+        {
+            return false;
+        }
+        let state = self.state.lock();
+        state.received_queue.is_empty() && state.transmit_queue.is_empty()
+    }
+
     /// Allocation-free queue accounting for a caller-owned diagnostic buffer.
     /// Version, RX/TX counts, independently summed costs, front type/priority/
     /// wait, ACK/schema counts, minimum priority, reliable pending count/bytes,
@@ -18698,7 +20222,7 @@ impl Router {
                 st.e2e_rx_seen.pop_front();
             }
         }
-        if st.recent_rx.contains(&id)
+        if st.recent_rx.contains_id(id)
             || st
                 .reliable_return_routes
                 .get(&id)
@@ -19074,8 +20598,7 @@ impl Router {
             // Complete one RX/TX pair even after a cooperative RX overrun.
             // Defer timeout cancellation until queued receipts are serviced.
             if !control_budget_used {
-                crate::memory_admission::allow_drain(self.process_reliable_timeouts())?;
-                crate::memory_admission::allow_drain(self.process_end_to_end_reliable_timeouts())?;
+                self.process_queue_pass_timeouts(self.clock.now_ms())?;
             }
 
             let pkt_opt = {
@@ -19181,33 +20704,53 @@ impl Router {
     }
 
     fn process_all_queues_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
-        self.expire_side_chunks();
         // Share the deadline between directions. Splitting a 1 ms budget in
         // half rounded TX down to zero and serviced only one transmit item,
         // even when the remainder of the pass was idle. One TX/RX pair is
         // atomic for fairness; a slow handler may overrun the deadline.
         let receive_first = !self.cfg.role.local_services();
         let start = self.clock.now_ms();
+        // One clock reading serves a pass's timeout and transmit decisions
+        // until work that can run callbacks (received items) intervenes; the
+        // pass's own deadline checks still read the clock.
+        let mut pass_now = Some(start);
+        // Abandoned chunk transfers expire first, under the first control
+        // check's lock.
+        let mut expire_at = Some(start);
         loop {
+            // Without std, a pass with no control item serves its idle timeouts
+            // under the control check's lock, at the pass's clock reading.
+            let prologue_now = (!cfg!(feature = "std"))
+                .then(|| pass_now.take().unwrap_or_else(|| self.clock.now_ms()));
+            let mut timeouts_done = false;
             let received_control = crate::memory_admission::allow_drain(
-                self.drain_queued_control_rx_before_tx(start, timeout_ms),
+                self.drain_queued_control_rx_or_timeouts(
+                    start,
+                    timeout_ms,
+                    expire_at.take(),
+                    prologue_now,
+                    &mut timeouts_done,
+                ),
             )?;
+            let mut now = match prologue_now.or_else(|| pass_now.take()) {
+                Some(now) if !received_control => now,
+                _ => self.clock.now_ms(),
+            };
             let mut did_any = received_control;
             let control_budget_used = received_control
                 && timeout_ms != 0
-                && self.clock.now_ms().wrapping_sub(start) >= u64::from(timeout_ms);
-            if !control_budget_used {
-                crate::memory_admission::allow_drain(self.process_reliable_timeouts())?;
-                crate::memory_admission::allow_drain(self.process_end_to_end_reliable_timeouts())?;
+                && now.wrapping_sub(start) >= u64::from(timeout_ms);
+            if !control_budget_used && !timeouts_done {
+                self.process_queue_pass_timeouts(now)?;
             }
 
-            if receive_first && !control_budget_used {
-                did_any |= self.process_one_queued_rx()?;
+            if receive_first && !control_budget_used && self.process_one_queued_rx()? {
+                did_any = true;
+                now = self.clock.now_ms();
             }
 
             if let Some(pkt) = {
                 let mut st = self.state.lock();
-                let now = self.clock.now_ms();
                 // Complete one fair TX even after RX uses the deadline.
                 // Priority burst limits still prefer and protect queued ACKs.
                 #[cfg(feature = "std")]
@@ -19238,10 +20781,21 @@ impl Router {
             if !receive_first {
                 did_any |= self.process_one_queued_rx()?;
             }
-            if !did_any
-                || (timeout_ms != 0
-                    && self.clock.now_ms().wrapping_sub(start) >= u64::from(timeout_ms))
-            {
+            if !did_any {
+                break;
+            }
+            if timeout_ms != 0 {
+                let now = self.clock.now_ms();
+                if now.wrapping_sub(start) >= u64::from(timeout_ms) {
+                    break;
+                }
+                pass_now = Some(now);
+            }
+            // Work emptied both queues: another pass would only repeat this
+            // pass's timeout and control checks at the same time and find
+            // nothing. With one frame per call that idle pass was a third of
+            // the fixed per-call cost.
+            if self.queues_empty() {
                 break;
             }
         }
@@ -19406,6 +20960,8 @@ impl Router {
     // Initial synchronous sends retain their legacy reporting/error contract;
     // queue workers alone may turn an already accepted refusal into deferral.
     fn dispatch_queued_item_with_origin(&self, work: TxWork, called_from_queue: bool) -> TelemetryResult<()> {
+        #[cfg(test)]
+        test_dispatch_counter::bump();
         #[cfg(all(test, feature = "std", feature = "discovery"))]
         managed_order_side_gate_causal::observe(self,"dispatch_queued",|| serde_json::json!({"item":managed_order_side_gate_causal::item_meta(&work.queued.item),"delivery":format!("{:?}",work.queued.delivery_state),"claim":work.claim.map(|c|(c.token,c.ordered,c.side_retry))}));
         let owed_turn = work.owed_turn;
@@ -19644,6 +21200,24 @@ impl Router {
     }
 
     fn defer_accepted_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
+        self.defer_accepted_original_with(context, false)
+    }
+
+    /// Park an accepted original that no side can reach. Re-dispatching it
+    /// every millisecond burned the whole queue budget while a destination
+    /// stayed unreachable. It now waits until routing state changes (see
+    /// `RouterInner::wake_unroutable_parked`), with a doubling, bounded
+    /// re-check as a fallback. The re-check never passes the delivery
+    /// lifetime, so expiry still fires on time.
+    fn park_unroutable_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
+        self.defer_accepted_original_with(context, true)
+    }
+
+    fn defer_accepted_original_with(
+        &self,
+        context: &mut DispatchContext,
+        unroutable: bool,
+    ) -> TelemetryResult<()> {
         context.mark_refused();
         let Some(claim) = context.claim else {
             return Err(TelemetryError::Io("reliable owner unavailable"));
@@ -19655,6 +21229,16 @@ impl Router {
                 "accepted reliable clock exhausted",
             ));
         };
+        let since = context.since.unwrap_or(now);
+        let retry_after_ms = if unroutable {
+            let lifetime = runtime_reliable_retransmit_ms()
+                .saturating_mul(u64::from(runtime_reliable_max_retries()) + 1);
+            let waited = now.saturating_sub(since);
+            let recheck = now.saturating_add(waited.clamp(1, UNROUTABLE_RECHECK_MAX_MS));
+            recheck.min(since.saturating_add(lifetime)).max(retry_after_ms)
+        } else {
+            retry_after_ms
+        };
         let mut st = self.state.lock();
         let Some(index) = st.claim_index(claim.token) else {
             return Ok(());
@@ -19665,10 +21249,11 @@ impl Router {
             } else {
                 QueuedDelivery::DeferredUnordered
             };
-            item.deferred_since_ms = context.since.unwrap_or(now);
+            item.deferred_since_ms = since;
             item.retry_after_ms = retry_after_ms;
         });
         st.tx_policy_flags |= 1;
+        st.unroutable_parked |= unroutable;
         Ok(())
     }
 
@@ -19810,25 +21395,35 @@ impl Router {
     }
 
     fn admit_side_tx(&self, side: RouterSideId) -> TelemetryResult<SideTxAdmission<'_>> {
-        {
+        #[cfg(feature = "std")]
+        let (opts, handler, gate) = {
             let state = self.state.lock();
-            Self::side_ref(&state, side)?;
-        }
-        let guard = self.try_enter_side_tx(side)
-            .ok_or(TelemetryError::Io("side tx busy"))?;
-        Ok(SideTxAdmission { side, _guard: guard })
+            let side_ref = Self::side_ref(&state, side)?;
+            let gate = state.side_transport.get(&side).map(|t| t.tx_callback_gate.clone());
+            (side_ref.opts.clone(), side_ref.tx_handler.clone(), gate)
+        };
+        #[cfg(not(feature = "std"))]
+        let (opts, handler) = {
+            let state = self.state.lock();
+            let side_ref = Self::side_ref(&state, side)?;
+            (side_ref.opts.clone(), side_ref.tx_handler.clone())
+        };
+        #[cfg(feature = "std")]
+        let guard = gate.and_then(|gate| self.try_enter_side_tx_gate(side, gate));
+        #[cfg(not(feature = "std"))]
+        let guard = self.try_enter_side_tx(side);
+        let guard = guard.ok_or(TelemetryError::Io("side tx busy"))?;
+        Ok(SideTxAdmission { side, opts, handler, _guard: guard })
     }
 
     #[cfg(feature = "std")]
     #[inline]
-    fn try_enter_side_tx(&self, side: usize) -> Option<crate::lock::ActiveSideTxGuard<'_>> {
-        let gate = self
-            .state
-            .lock()
-            .side_transport
-            .get(&side)?
-            .tx_callback_gate
-            .clone();
+    fn try_enter_side_tx_gate(
+        &self,
+        side: usize,
+        gate: Arc<crate::lock::ReentryGate>,
+    ) -> Option<crate::lock::ActiveSideTxGuard<'_>> {
+        let _ = side;
         let result = self.side_tx_activity.try_enter(gate);
         #[cfg(all(test, feature = "std", feature = "discovery"))]
         managed_order_side_gate_causal::observe(self, "side_gate", || serde_json::json!({"side":side,"entered":result.is_some()}));
@@ -19999,25 +21594,58 @@ impl Router {
         side: RouterSideId,
         crc_verified: bool,
     ) -> TelemetryResult<()> {
-        self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
         if !crc_verified && crate::wire_bundle::is_bundle(bytes) {
+            self.ensure_side_ingress_enabled(side)?;
             return self.rx_compact_bundle(bytes, side, true);
         }
-        let Some(decoded) = self.decode_side_transport_frame_inner(side, bytes, crc_verified)? else {
-            return Ok(());
+        // The ingress check rides on the decoder's first lock, and a compact
+        // frame's timestamp record on the enqueue's lock.
+        let mut pending = None;
+        let decoded = self.decode_side_transport_frame_with(
+            side,
+            bytes,
+            crc_verified,
+            true,
+            Some(&mut pending),
+        );
+        let data = match decoded {
+            Ok(Some(decoded)) => RouterItem::Packed(decoded),
+            other => {
+                Self::note_rx_timestamp_locked(&mut self.state.lock(), side, pending);
+                return other.map(|_| ());
+            }
         };
-        let data = RouterItem::Packed(decoded);
-        let priority = self.item_service_priority(&data)?;
+        let priority = match self.item_service_priority(&data) {
+            Ok(priority) => priority,
+            Err(error) => {
+                Self::note_rx_timestamp_locked(&mut self.state.lock(), side, pending);
+                return Err(error);
+            }
+        };
         #[cfg(feature = "timesync")]
         self.timesync_note_rx(&data, self.monotonic_now_ns());
         let mut st = self.state.lock();
+        Self::note_rx_timestamp_locked(&mut st, side, pending);
         st.push_received(RouterRxItem {
             src: Some(side),
             data,
             priority,
         })?;
         Ok(())
+    }
+
+    /// Record a compact frame's timestamp for its template (if any).
+    fn note_rx_timestamp_locked(
+        st: &mut RouterInner,
+        side: RouterSideId,
+        record: Option<(u32, u64)>,
+    ) {
+        if let Some((template_id, timestamp)) = record
+            && let Some(side_state) = st.side_transport.get_mut(&side)
+        {
+            side_state.rx_last_timestamps.insert(template_id, timestamp);
+        }
     }
 
     /// ISR-safe, non-blocking enqueue of packed bytes with source side.
@@ -20578,6 +22206,13 @@ impl Router {
                 packed_frame.as_ref().and_then(|frame| frame.as_ref().ok()),
             )?;
         }
+        if called_from_queue
+            && let (Some(src), RouterItem::Packed(bytes), Some(Ok(frame))) =
+                (item.src, &item.data, packed_frame.as_ref())
+            && self.try_plain_transit(item, src, bytes, frame)?
+        {
+            return Ok(());
+        }
         let packed_routing = packed_frame
             .as_ref()
             .and_then(|frame| frame.as_ref().ok())
@@ -21065,6 +22700,130 @@ impl Router {
         }
 
         Ok(())
+    }
+
+    /// Whether a queued, received frame is plain transit: a best-effort
+    /// application frame with no receipt contract, no managed variable and
+    /// no local handler, which this router only forwards.
+    fn is_plain_transit(&self, frame: &wire_format::RoutingFrameInfo<'_>) -> bool {
+        let env = &frame.envelope;
+        !crate::memory_admission::supports_work_kinds()
+            && !is_internal_control_type(env.ty)
+            && !env.is_reliable
+            && frame.reliable.is_none()
+            && env.target_senders().len() == 0
+            && !is_reliable_type(env.ty)
+            && !self.is_managed_variable_type(env.ty)
+            && !env.endpoints().any(|ep| {
+                self.endpoint_has_packet_handler(ep) || self.endpoint_has_packed_handler(ep)
+            })
+    }
+
+    /// Forward plain transit (see `is_plain_transit`) without the general
+    /// receive path's per-step locking. Returns `false`, having changed
+    /// nothing, when the frame is not plain transit.
+    ///
+    /// The general path's work for such a frame reduces to: the ingress
+    /// check, the receive statistics, the time sync epoch note, duplicate
+    /// suppression and queueing one transmission per planned side. Here the
+    /// state changes keep that order under one core lock; the epoch note
+    /// touches only time sync state and follows it. A cached route plan is
+    /// used in place; without one the general transit enqueue plans it.
+    fn try_plain_transit(
+        &self,
+        item: &RouterRxItem,
+        src: RouterSideId,
+        bytes: &crate::SharedBytes,
+        frame: &wire_format::RoutingFrameInfo<'_>,
+    ) -> TelemetryResult<bool> {
+        #[cfg(all(test, feature = "std"))]
+        if plain_transit_test_switch::disabled() {
+            return Ok(false);
+        }
+        if !self.is_plain_transit(frame) {
+            return Ok(false);
+        }
+        #[cfg(all(test, feature = "std"))]
+        plain_transit_test_switch::note_taken(0);
+        let env = &frame.envelope;
+        let ty = env.ty;
+        let id = wire_format::plain_packet_id(bytes.as_ref(), frame)
+            .unwrap_or_else(|| Self::get_hash(&item.data));
+        debug_assert_eq!(id, Self::get_hash(&item.data));
+        #[cfg(feature = "discovery")]
+        let plan_key = Self::route_plan_key_for(env, Some(src)).map(|key| (key, self.clock.now_ms()));
+        let note_epoch = || {
+            #[cfg(feature = "timesync")]
+            self.timesync_note_rx_epoch(env.time_epoch, env.timestamp_ms);
+        };
+        let mut st = self.state.lock();
+        let side_ref = Self::side_ref(&st, src)?;
+        if !side_ref.opts.ingress_enabled {
+            return Err(TelemetryError::HandlerError(
+                "router: ingress disabled for side id",
+            ));
+        }
+        st.side_runtime_stats
+            .entry(src)
+            .or_default()
+            .note_rx(ty, bytes.len(), true);
+        let duplicate = st.recent_rx.contains_id(id)
+            || st
+                .reliable_return_routes
+                .get(&id)
+                .is_some_and(|route| route.delivery_completed);
+        if !duplicate && let Err(error) = st.push_recent_rx(id) {
+            drop(st);
+            note_epoch();
+            return Err(error);
+        }
+        #[cfg(feature = "discovery")]
+        let cached = if duplicate {
+            None
+        } else {
+            plan_key.and_then(|(key, now_ms)| Self::cached_route_plan_locked(&st, &key, None, now_ms))
+        };
+        #[cfg(not(feature = "discovery"))]
+        let cached: Option<Option<RouterSideId>> = None;
+        let queued = match cached {
+            Some(side) => {
+                let priority = if st.is_managed_variable(ty.as_u32()) {
+                    crate::transport_priority(DataType::ManagedVariableValue)
+                } else {
+                    Self::packed_type_priority(bytes.as_ref(), frame).1
+                };
+                // Plain transit is always disposable bulk.
+                side.map_or(Ok(()), |dst| {
+                    st.push_transmit_classified(TxQueued {
+                        disposable: TX_FRESH,
+                        item: RouterTxItem::ToSide {
+                            src: Some(src),
+                            dst,
+                            data: item.data.clone(),
+                        },
+                        ignore_local: true,
+                        priority,
+                        delivery_state: QueuedDelivery::Untracked,
+                        accepted_type: 0,
+                        deferred_since_ms: 0,
+                        retry_after_ms: 0,
+                    }, Some(true))
+                })
+            }
+            None => Ok(()),
+        };
+        drop(st);
+        note_epoch();
+        #[cfg(all(test, feature = "discovery"))]
+        if let (Some(side), Some((key, _))) = (cached, plan_key) {
+            let _ = key;
+            self.verify_cached_route_plan(&item.data, Some(src), true, side);
+        }
+        if duplicate || cached.is_some() {
+            return queued.map(|()| true);
+        }
+        self.enqueue_to_sides(item.data.clone(), Some(src), true)?;
+        Ok(true)
     }
 
     fn dispatch_rx_data(
@@ -21614,6 +23373,252 @@ impl Router {
         )
     }
 
+    /// The routing facts of a queued frame that can take the plain transit
+    /// send (`send_plain_to_side`): a best-effort application frame with no
+    /// receipt contract and no payload-codec preparation pending.
+    fn plain_side_frame<'a>(
+        &self,
+        bytes: &'a crate::SharedBytes,
+    ) -> Option<wire_format::RoutingFrameInfo<'a>> {
+        #[cfg(all(test, feature = "std"))]
+        if plain_transit_test_switch::disabled() {
+            return None;
+        }
+        // A pending codec preparation (0x01 without 0x10) or a reliable header
+        // (0x02) rules plain transit out without parsing.
+        if bytes.first().is_some_and(|flags| flags & 0x11 == 1 || flags & 0x02 != 0) {
+            return None;
+        }
+        let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref()).ok()?;
+        let env = &frame.envelope;
+        let plain = !is_internal_control_type(env.ty)
+            && !is_reliable_type(env.ty)
+            && frame.reliable.is_none()
+            && env.target_senders().len() == 0;
+        #[cfg(all(test, feature = "std"))]
+        if plain {
+            plain_transit_test_switch::note_taken(1);
+        }
+        plain.then_some(frame)
+    }
+
+    /// The queued send of plain transit (see `plain_side_frame`) toward one
+    /// side, equivalent to the general path for such a frame: the e2e policy
+    /// check, the route and time sync check, side admission, then the side
+    /// handler. Hop reliability, receipt contracts, schema responses and
+    /// codec reservations cannot apply, so their bookkeeping is skipped and
+    /// the frame is parsed once. `None`: the side is not allowed.
+    #[allow(clippy::too_many_arguments)]
+    fn send_plain_to_side(
+        &self,
+        src: Option<RouterSideId>,
+        dst: RouterSideId,
+        data: &RouterItem,
+        bytes: &crate::SharedBytes,
+        frame: &wire_format::RoutingFrameInfo<'_>,
+        admitted: &mut bool,
+        service: EgressService,
+    ) -> TelemetryResult<Option<TelemetryResult<()>>> {
+        let ty = frame.envelope.ty;
+        // `ensure_e2e_policy_supported_for_type`, keeping the sealing decision.
+        let require_e2e = self.should_require_e2e_for_type(ty);
+        let crypto_supported = require_e2e && self.e2e_crypto_supported();
+        if require_e2e && !crypto_supported {
+            return Err(TelemetryError::BadArg);
+        }
+        // Route permission and the side snapshot share one lock.
+        #[cfg(feature = "std")]
+        let (opts, handler, gate) = {
+            let st = self.state.lock();
+            if !self.route_allowed_locked(&st, src, Some(ty), dst) {
+                return Ok(None);
+            }
+            let side_ref = Self::side_ref(&st, dst)?;
+            let gate = st.side_transport.get(&dst).map(|t| t.tx_callback_gate.clone());
+            (side_ref.opts.clone(), side_ref.tx_handler.clone(), gate)
+        };
+        #[cfg(not(feature = "std"))]
+        let (opts, handler) = {
+            let st = self.state.lock();
+            if !self.route_allowed_locked(&st, src, Some(ty), dst) {
+                return Ok(None);
+            }
+            let side_ref = Self::side_ref(&st, dst)?;
+            (side_ref.opts.clone(), side_ref.tx_handler.clone())
+        };
+        #[cfg(feature = "std")]
+        let guard = gate.and_then(|gate| self.try_enter_side_tx_gate(dst, gate));
+        #[cfg(not(feature = "std"))]
+        let guard = self.try_enter_side_tx(dst);
+        let Some(guard) = guard else {
+            return Ok(Some(Err(TelemetryError::Io("side tx busy"))));
+        };
+        let admission = SideTxAdmission { side: dst, opts, handler, _guard: guard };
+        let relayed = src.is_some();
+        let packed = matches!(
+            admission.handler,
+            RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)
+        );
+        if !packed {
+            let handler = admission.handler.clone();
+            return Ok(Some(self.call_side_tx_handler_admitted_with_service(
+                &admission, &handler, data, relayed, admitted, service,
+            )));
+        }
+        Ok(Some(self.call_plain_side_handler(
+            &admission,
+            bytes,
+            frame,
+            crypto_supported,
+            relayed,
+            admitted,
+            service,
+        )))
+    }
+
+    /// `call_side_tx_handler_admitted_with_service` for plain transit to a
+    /// packed side handler.
+    #[allow(clippy::too_many_arguments)]
+    fn call_plain_side_handler(
+        &self,
+        admission: &SideTxAdmission<'_>,
+        bytes: &crate::SharedBytes,
+        frame: &wire_format::RoutingFrameInfo<'_>,
+        seal: bool,
+        relayed: bool,
+        admitted: &mut bool,
+        service: EgressService,
+    ) -> TelemetryResult<()> {
+        let side = admission.side;
+        let started_ms = self.clock.now_ms();
+        let (ty, priority) = Self::packed_type_priority(bytes.as_ref(), frame);
+        let priority = if self.is_managed_variable_type(ty) {
+            crate::transport_priority(DataType::ManagedVariableValue)
+        } else {
+            priority
+        };
+        // `prepare_packed_for_remote`: plain frames are sealed only when the
+        // type requires it and cryptography is available.
+        #[cfg(feature = "cryptography")]
+        let send_bytes = if seal {
+            self.prepare_packed_for_remote(bytes.clone(), None)?
+        } else {
+            bytes.clone()
+        };
+        #[cfg(not(feature = "cryptography"))]
+        let send_bytes = {
+            let _ = seal;
+            bytes.clone()
+        };
+        let frames =
+            self.encode_side_transport_frames_known(side, admission.opts.clone(), send_bytes, Some(false))?;
+        let PackedFrameOutcome { result, attempts_total, sent_bytes } = self.offer_packed_side_frames(
+            admission,
+            &admission.handler,
+            frames,
+            PackedFrameOffer { ty, priority, service },
+            admitted,
+        );
+        result?;
+        self.note_side_tx_complete(side, ty, sent_bytes, relayed, attempts_total, started_ms);
+        Ok(())
+    }
+
+    /// The general queued send toward one side. `None`: nothing to send
+    /// (the route or time sync policy refuses this side).
+    #[allow(clippy::too_many_arguments)]
+    fn send_general_to_side(
+        &self,
+        src: Option<RouterSideId>,
+        dst: RouterSideId,
+        data: &mut RouterItem,
+        ignore_local: bool,
+        called_from_queue: bool,
+        context: &mut DispatchContext,
+        egress_service: EgressService,
+    ) -> TelemetryResult<Option<(TelemetryResult<()>, SideReservation<'_>)>> {
+        #[cfg(not(feature = "compression"))]
+        let reservation = ();
+        let ty = Self::item_data_type(data)?;
+        self.ensure_e2e_policy_supported_for_type(ty)?;
+        if let RouterItem::Packet(pkt) = &*data
+            && !is_internal_control_type(pkt.data_type())
+        {
+            self.remember_managed_variable_packet(pkt, src.is_none())?;
+        }
+        if !ignore_local {
+            if self.is_duplicate_pkt(data)? {
+                return Ok(None);
+            }
+            let suppress_local = is_internal_control_type(ty);
+            if !suppress_local {
+                self.dispatch_local_for_item(data, called_from_queue)?;
+            }
+        }
+        let allowed = {
+            let st = self.state.lock();
+            let ty = Some(ty);
+            let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
+            #[cfg(all(feature = "discovery", feature = "timesync"))]
+            let timesync_allowed = ty
+                .map(|ty| {
+                    !Self::is_timesync_type(ty)
+                        || Self::timesync_allowed_for_side_locked(
+                            &st,
+                            dst,
+                            ty,
+                            self.clock.now_ms(),
+                        )
+                })
+                .unwrap_or(true);
+            #[cfg(not(all(feature = "discovery", feature = "timesync")))]
+            let timesync_allowed = true;
+            route_allowed && timesync_allowed
+        };
+        if !allowed {
+            #[cfg(feature = "discovery")]
+            if ty == DataType::DiscoverySchema {
+                RouterInner::schema_response_owner_lost(
+                    &mut self.state.lock().discovery_side_throttle,
+                    Some((dst, Self::get_hash(data))),
+                );
+            }
+            return Ok(None);
+        }
+        #[cfg(feature = "compression")]
+        let (send_result, reservation) =
+            if let Some(claim) = context.claim.filter(|claim| claim.side_retry) {
+                let send_result = self.admit_side_tx(dst).and_then(|admission| {
+                    self.prepare_e2e_child_for_send(claim, dst, data)?;
+                    self.send_reliable_to_admitted_side_with_service(
+                        &admission,
+                        data.clone(),
+                        src.is_some(),
+                        &mut context.admitted,
+                        egress_service,
+                    )
+                });
+                (send_result, None)
+            } else {
+                self.send_queued_to_side_with_service(
+                    dst,
+                    data,
+                    src.is_some(),
+                    &mut context.admitted,
+                    egress_service,
+                )
+            };
+        #[cfg(not(feature = "compression"))]
+        let send_result = self.send_reliable_to_side_with_service(
+            dst,
+            data.clone(),
+            src.is_some(),
+            &mut context.admitted,
+            egress_service,
+        );
+        Ok(Some((send_result, reservation)))
+    }
+
     fn tx_item_impl_with_retry(
         &self,
         item: RouterTxItem,
@@ -21757,7 +23762,7 @@ impl Router {
                         // Permit retry of the same packet after discovery heals.
                         self.remove_pkt_id(&data);
                         if called_from_queue {
-                            return self.defer_accepted_original(context);
+                            return self.park_unroutable_original(context);
                         }
                         return Err(TelemetryError::Io("no discovered route"));
                     }
@@ -21923,84 +23928,45 @@ impl Router {
             RouterTxItem::ToSide { src, dst, data } => {
 
                 let egress_service = context.egress_service();
-                #[cfg(feature = "compression")]
                 let mut data = data;
-                let ty = Self::item_data_type(&data)?;
-                self.ensure_e2e_policy_supported_for_type(ty)?;
-                if let RouterItem::Packet(pkt) = &data
-                    && !is_internal_control_type(pkt.data_type())
+                // Plain transit toward one side: routing facts parsed once.
+                let plain = if ignore_local
+                    && context.claim.is_none()
+                    && let RouterItem::Packed(bytes) = &data
                 {
-                    self.remember_managed_variable_packet(pkt, src.is_none())?;
-                }
-                if !ignore_local {
-                    if self.is_duplicate_pkt(&data)? {
-                        return Ok(());
-                    }
-                    let suppress_local = is_internal_control_type(ty);
-                    if !suppress_local {
-                        self.dispatch_local_for_item(&data, called_from_queue)?;
-                    }
-                }
-                let allowed = {
-                    let st = self.state.lock();
-                    let ty = Some(ty);
-                    let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
-                    #[cfg(all(feature = "discovery", feature = "timesync"))]
-                    let timesync_allowed = ty
-                        .map(|ty| {
-                            Self::timesync_allowed_for_side_locked(
-                                &st,
-                                dst,
-                                ty,
-                                self.clock.now_ms(),
-                            )
-                        })
-                        .unwrap_or(true);
-                    #[cfg(not(all(feature = "discovery", feature = "timesync")))]
-                    let timesync_allowed = true;
-                    route_allowed && timesync_allowed
+                    self.plain_side_frame(bytes).map(|frame| (bytes.clone(), frame))
+                } else {
+                    None
                 };
-                if !allowed {
-                    #[cfg(feature = "discovery")]
-                    if ty == DataType::DiscoverySchema {
-                        RouterInner::schema_response_owner_lost(
-                            &mut self.state.lock().discovery_side_throttle,
-                            Some((dst, Self::get_hash(&data))),
-                        );
-                    }
+                let sent = if let Some((bytes, frame)) = plain {
+                    self.send_plain_to_side(
+                        src,
+                        dst,
+                        &data,
+                        &bytes,
+                        &frame,
+                        &mut context.admitted,
+                        egress_service,
+                    )?
+                    .map(|send_result| (send_result, Default::default()))
+                } else {
+                    self.send_general_to_side(
+                        src,
+                        dst,
+                        &mut data,
+                        ignore_local,
+                        called_from_queue,
+                        context,
+                        egress_service,
+                    )?
+                };
+                let Some((send_result, reservation)) = sent else {
                     return Ok(());
-                }
+                };
                 #[cfg(feature = "compression")]
-                let (send_result, mut reservation) =
-                    if let Some(claim) = context.claim.filter(|claim| claim.side_retry) {
-                        let send_result = self.admit_side_tx(dst).and_then(|admission| {
-                            self.prepare_e2e_child_for_send(claim, dst, &mut data)?;
-                            self.send_reliable_to_admitted_side_with_service(
-                                &admission,
-                                data.clone(),
-                                src.is_some(),
-                                &mut context.admitted,
-                                egress_service,
-                            )
-                        });
-                        (send_result, None)
-                    } else {
-                        self.send_queued_to_side_with_service(
-                            dst,
-                            &mut data,
-                            src.is_some(),
-                            &mut context.admitted,
-                            egress_service,
-                        )
-                    };
+                let mut reservation = reservation;
                 #[cfg(not(feature = "compression"))]
-                let send_result = self.send_reliable_to_side_with_service(
-                    dst,
-                    data.clone(),
-                    src.is_some(),
-                    &mut context.admitted,
-                    egress_service,
-                );
+                let () = reservation;
                 if let Err(e) = send_result {
                     if Self::is_transient_tx_error(&e) {
                         context.mark_refused();
@@ -24239,3 +26205,4 @@ pub use targeted_packet::{
     FrozenRecipient, FrozenTargetPacket, PrepareTargetedPacketError,
     PrepareTargetedPacketErrorKind, MAX_PREPARED_TARGET_RECIPIENTS,
 };
+
