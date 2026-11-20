@@ -13,6 +13,11 @@
 //! (`perf_event_open`, no kernel work counted). Elsewhere, or when the
 //! counter is unavailable, wall-clock time is reported instead.
 //!
+//! The sustained-overload scenario gives the relay a fixed instruction
+//! budget per millisecond (its clock advances with the instructions it
+//! executes) and offers frames faster than it can forward them; it reports
+//! the forwarded frame rate. It needs the instruction counter.
+//!
 //! Run: `cargo bench --bench dispatch_instructions --features <features>`.
 //! Set `SEDSNET_BENCH_FRAMES` to change the number of measured frames.
 
@@ -27,7 +32,7 @@ use sedsnet::router::{
     Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions, SideTransportProfile,
 };
 use sedsnet::{MessageClass, MessageDataType, MessageElement, ReliableMode};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Builds without `std` (the embedded profile) lock through these C hooks.
@@ -84,7 +89,13 @@ mod counter {
             let fd = unsafe { syscall(SYS_PERF_EVENT_OPEN, attr.as_ptr(), 0i32, -1i32, -1i32, 0u64) };
             (fd >= 0).then_some(Self(fd as c_int))
         }
-        fn value(&self) -> u64 {
+        /// A counter that is counting from now on.
+        pub fn running() -> Option<Self> {
+            let counter = Self::open()?;
+            unsafe { ioctl(counter.0, PERF_EVENT_IOC_ENABLE, 0) };
+            Some(counter)
+        }
+        pub fn value(&self) -> u64 {
             let mut buf = [0u8; 8];
             let n = unsafe { read(self.0, buf.as_mut_ptr().cast(), 8) };
             assert_eq!(n, 8, "perf counter read");
@@ -107,6 +118,12 @@ mod counter {
     impl Instructions {
         pub fn open() -> Option<Self> {
             None
+        }
+        pub fn running() -> Option<Self> {
+            None
+        }
+        pub fn value(&self) -> u64 {
+            0
         }
         pub fn start(&self) -> u64 {
             0
@@ -216,11 +233,33 @@ fn link_options(max_frame_bytes: usize, templates: usize) -> RouterSideOptions {
 // Clock reads are counted: on a board each one is an application callback.
 static CLOCK_READS: AtomicU64 = AtomicU64::new(0);
 
+/// Instruction-paced time for the overload scenario: while set, every clock
+/// reads `base_ms + executed instructions / instructions_per_ms`.
+struct PacedClock {
+    counter: counter::Instructions,
+    start: u64,
+    base_ms: u64,
+    per_ms: u64,
+}
+
+static PACED: Mutex<Option<PacedClock>> = Mutex::new(None);
+// Keeps the unpaced clock (every other scenario) free of the mutex.
+static PACING: AtomicBool = AtomicBool::new(false);
+
+fn paced_now() -> Option<u64> {
+    if !PACING.load(Ordering::Relaxed) {
+        return None;
+    }
+    let paced = PACED.lock().unwrap();
+    let paced = paced.as_ref()?;
+    Some(paced.base_ms + (paced.counter.value() - paced.start) / paced.per_ms)
+}
+
 fn clock(now: &Arc<AtomicU64>) -> Box<dyn Clock + Send + Sync> {
     let now = now.clone();
     Box::new(move || {
         CLOCK_READS.fetch_add(1, Ordering::Relaxed);
-        now.load(Ordering::Relaxed)
+        paced_now().unwrap_or_else(|| now.load(Ordering::Relaxed))
     })
 }
 
@@ -543,6 +582,56 @@ fn unroutable_idle(meter: &Meter, parked: usize, ms: u64) -> (u64, u64) {
     (total, ms)
 }
 
+/// Sustained overload: the relay may execute `per_ms` instructions per
+/// millisecond and is offered `offered_per_s` frames per second for
+/// `seconds`. Each pass admits the frames that arrived by now, then services
+/// the queues for at most one millisecond. Returns frames forwarded per
+/// second, or `None` without the instruction counter.
+fn overload(per_ms: u64, offered_per_s: u64, seconds: u64) -> Option<u64> {
+    let net = Network::new();
+    // Frames encoded ahead of time, so only the relay's work is paced.
+    let total = (offered_per_s * seconds) as usize;
+    let mut frames = Vec::with_capacity(total);
+    for index in 0..total as u64 {
+        net.now.fetch_add(1, Ordering::Relaxed);
+        if index % 500 == 0 {
+            net.maintain();
+        }
+        net.upstream.tx(net.sample(SAMPLE_TYPE, index)).unwrap();
+        frames.extend(Network::take(&net.to_relay_from_up));
+    }
+    // The first frames of a template are full; later ones compact. Replay
+    // from a point where the relay's dictionary is current.
+    net.maintain();
+    Network::take(&net.to_down);
+    let base_ms = net.now.load(Ordering::Relaxed);
+    let counter = counter::Instructions::running()?;
+    let start = counter.value();
+    *PACED.lock().unwrap() = Some(PacedClock { counter, start, base_ms, per_ms });
+    PACING.store(true, Ordering::Relaxed);
+    let end_ms = base_ms + seconds * 1000;
+    let mut next = 0usize;
+    let mut forwarded = 0u64;
+    loop {
+        let now = paced_now().unwrap();
+        if now >= end_ms {
+            break;
+        }
+        let due = (((now - base_ms) * offered_per_s) / 1000) as usize;
+        while next < due.min(frames.len()) {
+            let _ = net.relay.rx_packed_queue_from_side(&frames[next], net.relay_in);
+            next += 1;
+        }
+        let _ = net.relay.drain_queues_with_timeout(1);
+        forwarded += Network::take(&net.to_down).len() as u64;
+        Network::take(&net.to_up);
+        Network::take(&net.to_aux);
+    }
+    PACING.store(false, Ordering::Relaxed);
+    *PACED.lock().unwrap() = None;
+    Some(forwarded / seconds)
+}
+
 fn main() {
     // Ignore criterion/libtest arguments such as `--bench`.
     let frames: u64 = std::env::var("SEDSNET_BENCH_FRAMES")
@@ -578,4 +667,13 @@ fn main() {
         "unroutable idle: 16 parked reliable packets, {unit}/ms of queue service = {}",
         total / ms
     );
+    // Example budget: 100 million instructions per second, a fast MCU.
+    let per_ms = 100_000;
+    for offered in [1_000, 2_000, 4_000, 8_000, 16_000] {
+        if let Some(rate) = overload(per_ms, offered, 2) {
+            println!(
+                "overload: {per_ms} instructions/ms, offered {offered} frames/s, forwarded {rate} frames/s"
+            );
+        }
+    }
 }

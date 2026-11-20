@@ -49,6 +49,9 @@ mod plain_transit_differential;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/route_plan_cache.rs"]
 mod route_plan_cache;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/fair_victim_differential.rs"]
+mod fair_victim_differential;
 
 #[cfg(all(test, feature = "std"))]
 #[path = "tests/independent_side_tx_router.rs"]
@@ -2936,6 +2939,24 @@ const FORWARDED_RECEIPT_REPLAY_MAX: u8 = 4;
 const FORWARDED_RECEIPT_REPLAY_OWNERS: usize = 4;
 
 // A send leaf borrows proof of the existing side gate; it never re-enters it.
+/// Test-only switch that makes victim selection on this thread classify
+/// every queued item on the spot, for differential tests of the tagged
+/// selection.
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod fair_tag_test_switch {
+    use core::cell::Cell;
+    std::thread_local! {
+        static DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn disabled() -> bool {
+        DISABLED.with(Cell::get)
+    }
+    #[cfg(feature = "discovery")]
+    pub(crate) fn set_disabled(disabled: bool) {
+        DISABLED.with(|cell| cell.set(disabled));
+    }
+}
+
 /// Counts cached route plans that tests re-derived and confirmed.
 #[cfg(all(test, feature = "discovery"))]
 pub(crate) mod route_plan_test_counter {
@@ -2997,6 +3018,139 @@ struct SideTxAdmission<'a> {
 /// Reliable deliveries given up kept for `take_exhausted_reliable` (std).
 #[cfg(feature = "std")]
 const EXHAUSTED_RECENT: usize = 8;
+
+/// Both queues' bulk summaries at one threshold, with their victim
+/// candidates: (receive, transmit).
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+type QueueSummaries = [(crate::queue::BulkSummary, Option<(usize, u8)>); 2];
+
+/// The bulk loads of both queues from their summaries: the receive queue's
+/// owner first, as a scan in queue order would record them.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+fn summary_loads(summaries: &QueueSummaries) -> crate::admission_fairness::Loads {
+    let mut loads = crate::admission_fairness::Loads::new();
+    for (summary, _) in summaries {
+        if let Some(owner) = summary.owner {
+            loads.record_run(owner, summary.bytes, summary.count);
+        }
+    }
+    loads
+}
+
+/// `bulk_victim`'s candidates for `owner` from the summaries.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+fn summary_victim_scan(owner: u32, summaries: &QueueSummaries) -> BulkVictimScan {
+    let mut scan = BulkVictimScan::default();
+    for (queue, (summary, best)) in summaries.iter().enumerate() {
+        if summary.owner != Some(owner) {
+            continue;
+        }
+        scan.any[queue] = *best;
+        scan.count += summary.count;
+        let stream = (summary.stream != u64::MAX).then_some(summary.stream as u32);
+        match scan.first_stream {
+            None => scan.first_stream = Some(stream),
+            Some(first) => scan.one_stream &= first == stream,
+        }
+        scan.one_stream &= summary.uniform;
+    }
+    scan
+}
+
+/// `bulk_loads_scan` over the tag lanes (`runs`: the receive queue's two
+/// contiguous tag runs, then the transmit queue's): the loads (consecutive
+/// items of one owner recorded as one run; `Loads` keeps first-occurrence
+/// order, so the result is unchanged) and each queue's bulk summary, `None`
+/// for a queue holding several owners' bulk.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+#[inline(never)]
+fn scan_bulk_loads(
+    runs: [&[crate::queue::ItemTag]; 4],
+    priority: u8,
+) -> (crate::admission_fairness::Loads, [Option<crate::queue::BulkSummary>; 2]) {
+    let mut loads = crate::admission_fairness::Loads::new();
+    let (mut run_owner, mut run_bytes, mut run_count) = (0u32, 0usize, 0usize);
+    let mut summaries = [Some(crate::queue::BulkSummary::empty(priority)); 2];
+    for (run, tags) in runs.into_iter().enumerate() {
+        let base = if run % 2 == 0 { 0 } else { runs[run - 1].len() };
+        let summary = &mut summaries[run / 2];
+        for (offset, tag) in tags.iter().enumerate() {
+            let (owner, _, cost, item_priority, has_owner, _) = tag.raw();
+            if item_priority > priority || !has_owner {
+                continue;
+            }
+            if let Some(current) = summary.as_mut()
+                && !current.add(base + offset, *tag)
+            {
+                *summary = None;
+            }
+            if owner == run_owner && run_count != 0 {
+                run_bytes = run_bytes.saturating_add(cost as usize);
+                run_count += 1;
+                continue;
+            }
+            if run_count != 0 {
+                loads.record_run(run_owner, run_bytes, run_count);
+            }
+            (run_owner, run_bytes, run_count) = (owner, cost as usize, 1);
+        }
+    }
+    if run_count != 0 {
+        loads.record_run(run_owner, run_bytes, run_count);
+    }
+    (loads, summaries)
+}
+
+/// Per-queue candidates of one owner's bulk victim scan: the lowest-priority,
+/// oldest item over all of the owner's streams, and whether every one of
+/// its items carries the same stream (the usual case), which then makes the
+/// candidates of that stream the same.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+struct BulkVictimScan {
+    any: [Option<(usize, u8)>; 2],
+    first_stream: Option<Option<u32>>,
+    one_stream: bool,
+    count: usize,
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl Default for BulkVictimScan {
+    fn default() -> Self {
+        Self { any: [None, None], first_stream: None, one_stream: true, count: 0 }
+    }
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl BulkVictimScan {
+    #[inline]
+    fn better(slot: &mut Option<(usize, u8)>, index: usize, priority: u8) {
+        // Items arrive in queue order: only a strictly lower priority wins.
+        if slot.is_none_or(|(_, best)| priority < best) {
+            *slot = Some((index, priority));
+        }
+    }
+
+    #[inline]
+    fn note(&mut self, queue: usize, stream: Option<u32>, priority: u8, index: usize) {
+        Self::better(&mut self.any[queue], index, priority);
+        if self.count == 0 {
+            self.first_stream = Some(stream);
+            self.one_stream = true;
+        } else if self.one_stream && self.first_stream != Some(stream) {
+            self.one_stream = false;
+        }
+        self.count += 1;
+    }
+
+    /// Candidates for the selected stream when they are known from the scan.
+    fn positions(&self, stream: Option<u32>) -> Option<[Option<(usize, u8)>; 2]> {
+        match stream {
+            None => Some(self.any),
+            Some(ty) if self.one_stream && self.first_stream == Some(Some(ty)) => Some(self.any),
+            Some(_) => None,
+        }
+    }
+}
 
 /// Routing state whose every mutable access advances a generation. A cached
 /// route plan records the generations it was computed from, so no mutation
@@ -3747,8 +3901,164 @@ impl RouterInner {
             _ => None,
         }
     }
+    /// The fairness class of a queued receive item: its bulk owner and, for
+    /// an owned item, its stream.
     #[cfg(any(feature = "std", feature = "fair-admission"))]
-    fn bulk_loads(&self, priority: u8) -> crate::admission_fairness::Loads {
+    fn rx_fair_tag(item: &RouterRxItem) -> crate::queue::ItemTag {
+        let owner = Self::fair_bulk_owner(&item.data, item.priority);
+        crate::queue::ItemTag::new(
+            owner,
+            owner.and_then(|_| Self::bulk_stream(&item.data)),
+            item.priority,
+            item.byte_cost(),
+        )
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn tx_fair_tag(item: &TxQueued) -> crate::queue::ItemTag {
+        let owner = Self::tx_bulk_owner(item);
+        crate::queue::ItemTag::new(
+            owner,
+            owner.and_then(|_| Self::tx_bulk_stream(item)),
+            item.priority,
+            item.byte_cost(),
+        )
+    }
+
+    /// Classify both queues' items for victim selection, each item once per
+    /// schema generation (classes depend only on the item and the schema).
+    /// `false`: a tag lane is unavailable and callers classify directly.
+    ///
+    /// Lanes are allocated only for queue-budget saturation (`allocate`);
+    /// reclamation under heap pressure uses existing lanes or classifies
+    /// directly, so it never takes heap for itself.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn tag_fair_queues(&mut self, allocate: bool) -> bool {
+        let generation = crate::config::schema_generation();
+        self.received_queue.tag_items(generation, allocate, Self::rx_fair_tag)
+            && self.transmit_queue.tag_items(generation, allocate, Self::tx_fair_tag)
+    }
+
+    /// Byte load per bulk owner over items at or below `priority`.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads(&mut self, priority: u8) -> crate::admission_fairness::Loads {
+        self.bulk_loads_with(priority, true)
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads_with(&mut self, priority: u8, allocate: bool) -> crate::admission_fairness::Loads {
+        #[cfg(all(test, feature = "std"))]
+        if fair_tag_test_switch::disabled() {
+            return self.bulk_loads_untagged(priority);
+        }
+        if !self.tag_fair_queues(allocate) {
+            return self.bulk_loads_untagged(priority);
+        }
+        let mut loads = crate::admission_fairness::Loads::new();
+        let (rx_front, rx_back) = self.received_queue.tags();
+        let (tx_front, tx_back) = self.transmit_queue.tags();
+        for tag in [rx_front, rx_back, tx_front, tx_back].into_iter().flatten() {
+            if tag.priority() <= priority
+                && let Some(owner) = tag.owner()
+            {
+                loads.record(owner, tag.cost());
+            }
+        }
+        loads
+    }
+
+    /// `bulk_loads`, plus both queues' bulk summaries when each holds at most
+    /// one owner's bulk (`None` otherwise). The summaries are kept current
+    /// across queue changes, so a saturated queue is scanned only when one
+    /// becomes unknown (see `BoundedDeque::summary`).
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads_scan(
+        &mut self,
+        priority: u8,
+    ) -> (crate::admission_fairness::Loads, Option<QueueSummaries>) {
+        #[cfg(all(test, feature = "std"))]
+        if fair_tag_test_switch::disabled() {
+            return (self.bulk_loads_untagged(priority), None);
+        }
+        if !self.tag_fair_queues(true) {
+            return (self.bulk_loads_untagged(priority), None);
+        }
+        if let Some(rx) = self.received_queue.summary(priority)
+            && let Some(tx) = self.transmit_queue.summary(priority)
+        {
+            let summaries = [rx, tx];
+            #[cfg(test)]
+            {
+                // Tests check the kept summaries against a fresh scan.
+                let (rx_front, rx_back) = self.received_queue.tags();
+                let (tx_front, tx_back) = self.transmit_queue.tags();
+                let (loads, scanned) =
+                    scan_bulk_loads([rx_front, rx_back, tx_front, tx_back], priority);
+                assert!(loads == summary_loads(&summaries), "kept bulk loads are stale");
+                for (queue, (summary, best)) in summaries.iter().enumerate() {
+                    let fresh = scanned[queue].expect("kept summary of one owner");
+                    assert_eq!(
+                        (summary.owner, summary.count, summary.bytes),
+                        (fresh.owner, fresh.count, fresh.bytes),
+                        "kept bulk summary is stale"
+                    );
+                    let mut fresh = fresh;
+                    assert_eq!(Some(*best), fresh.best(core::iter::empty()), "kept victim is stale");
+                    assert!(!summary.uniform || fresh.uniform, "kept stream is stale");
+                }
+            }
+            return (summary_loads(&summaries), Some(summaries));
+        }
+        let (rx_front, rx_back) = self.received_queue.tags();
+        let (tx_front, tx_back) = self.transmit_queue.tags();
+        let (loads, [rx, tx]) = scan_bulk_loads([rx_front, rx_back, tx_front, tx_back], priority);
+        self.received_queue.set_summary(rx);
+        self.transmit_queue.set_summary(tx);
+        let summaries = match (rx, tx) {
+            (Some(mut rx), Some(mut tx)) => {
+                let rx_best = rx.best(core::iter::empty()).flatten();
+                let tx_best = tx.best(core::iter::empty()).flatten();
+                Some([(rx, rx_best), (tx, tx_best)])
+            }
+            _ => None,
+        };
+        (loads, summaries)
+    }
+
+    /// The stream `bulk_victim` would select for a sole owner whose items all
+    /// carry one stream (or none): its stream loads then have at most one
+    /// entry. `None` when the owner has several streams.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn single_owner_stream(
+        scan: &BulkVictimScan,
+        incoming_stream: Option<u32>,
+    ) -> Option<Option<u32>> {
+        if !scan.one_stream {
+            return None;
+        }
+        Some(match scan.first_stream.flatten() {
+            // `Loads::queue_victim`: a repeated stream, else the incoming one.
+            Some(stream) if scan.count > 1 || incoming_stream == Some(stream) => Some(stream),
+            _ => None,
+        })
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn remove_bulk_victim(&mut self, selected: Option<(RouterQueueKind, usize)>) -> bool {
+        match selected {
+            Some((RouterQueueKind::Received, index)) => {
+                self.received_queue.remove_pos(index).is_some()
+            }
+            Some((RouterQueueKind::Transmit, index)) => {
+                self.transmit_queue.remove_pos(index).is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// `bulk_loads`, classifying every item on the spot.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_loads_untagged(&self, priority: u8) -> crate::admission_fairness::Loads {
         let mut loads = crate::admission_fairness::Loads::new();
         for item in self.received_queue.iter() {
             if item.priority <= priority
@@ -3767,8 +4077,9 @@ impl RouterInner {
         loads
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
-    fn competing_bulk_owner(&self, incoming: u32, priority: u8) -> Option<u32> {
-        self.bulk_loads(priority).dominant_other(incoming)
+    /// Heap-pressure reclamation: see `tag_fair_queues`.
+    fn competing_bulk_owner(&mut self, incoming: u32, priority: u8) -> Option<u32> {
+        self.bulk_loads_with(priority, false).dominant_other(incoming)
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn reclaim_bulk_from(
@@ -3777,6 +4088,112 @@ impl RouterInner {
         priority: u8,
         incoming_stream: Option<u32>,
     ) -> bool {
+        self.reclaim_bulk_from_with(owner, priority, incoming_stream, true)
+    }
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn reclaim_bulk_from_with(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+        allocate: bool,
+    ) -> bool {
+        let selected = self.bulk_victim_with(owner, priority, incoming_stream, allocate);
+        self.remove_bulk_victim(selected)
+    }
+
+    /// The item `owner` yields: within its most repeated stream (else the
+    /// incoming stream's previous value, else any), its lowest priority and
+    /// then oldest item, receive queue first on a priority tie.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn bulk_victim(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+    ) -> Option<(RouterQueueKind, usize)> {
+        self.bulk_victim_with(owner, priority, incoming_stream, true)
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_victim_with(
+        &mut self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+        allocate: bool,
+    ) -> Option<(RouterQueueKind, usize)> {
+        #[cfg(all(test, feature = "std"))]
+        if fair_tag_test_switch::disabled() {
+            return self.bulk_victim_untagged(owner, priority, incoming_stream);
+        }
+        if !self.tag_fair_queues(allocate) {
+            return self.bulk_victim_untagged(owner, priority, incoming_stream);
+        }
+        // One pass records each stream's load and, per queue, the position
+        // of its lowest-priority, oldest item (and the same over all streams
+        // for when no stream yields).
+        let mut streams = crate::admission_fairness::Loads::new();
+        let mut best = BulkVictimScan::default();
+        for (queue, (front, back)) in
+            [self.received_queue.tags(), self.transmit_queue.tags()].into_iter().enumerate()
+        {
+            for (index, tag) in front.iter().chain(back).enumerate() {
+                if tag.priority() > priority || tag.owner() != Some(owner) {
+                    continue;
+                }
+                let stream = tag.stream();
+                if let Some(ty) = stream {
+                    streams.record(ty, tag.cost());
+                }
+                best.note(queue, stream, tag.priority(), index);
+            }
+        }
+        let stream = streams.queue_victim(incoming_stream);
+        let [rx, tx] = best.positions(stream).unwrap_or_else(|| {
+            // Several streams: a second pass over the selected one.
+            let mut found = [None, None];
+            for (queue, (front, back)) in
+                [self.received_queue.tags(), self.transmit_queue.tags()].into_iter().enumerate()
+            {
+                for (index, tag) in front.iter().chain(back).enumerate() {
+                    if tag.priority() <= priority
+                        && tag.owner() == Some(owner)
+                        && stream.is_none_or(|ty| tag.stream() == Some(ty))
+                    {
+                        BulkVictimScan::better(&mut found[queue], index, tag.priority());
+                    }
+                }
+            }
+            found
+        });
+        Self::pick_bulk_victim(rx, tx)
+    }
+
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn pick_bulk_victim(
+        rx: Option<(usize, u8)>,
+        tx: Option<(usize, u8)>,
+    ) -> Option<(RouterQueueKind, usize)> {
+        match (rx, tx) {
+            (Some((index, rp)), Some((_, tp))) if rp <= tp => {
+                Some((RouterQueueKind::Received, index))
+            }
+            (Some((index, _)), None) => Some((RouterQueueKind::Received, index)),
+            (_, Some((index, _))) => Some((RouterQueueKind::Transmit, index)),
+            _ => None,
+        }
+    }
+
+    /// `bulk_victim`, classifying every item on the spot.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn bulk_victim_untagged(
+        &self,
+        owner: u32,
+        priority: u8,
+        incoming_stream: Option<u32>,
+    ) -> Option<(RouterQueueKind, usize)> {
         let mut streams = crate::admission_fairness::Loads::new();
         for item in self.received_queue.iter() {
             if item.priority <= priority
@@ -3817,14 +4234,7 @@ impl RouterInner {
             })
             .min_by_key(|(index, item)| (item.priority, *index))
             .map(|(index, item)| (index, item.priority));
-        match (rx, tx) {
-            (Some((index, rp)), Some((_, tp))) if rp <= tp => {
-                self.received_queue.remove_pos(index).is_some()
-            }
-            (Some((index, _)), None) => self.received_queue.remove_pos(index).is_some(),
-            (_, Some((index, _))) => self.transmit_queue.remove_pos(index).is_some(),
-            _ => false,
-        }
+        Self::pick_bulk_victim(rx, tx)
     }
 
     #[cfg(feature = "discovery")]
@@ -4324,6 +4734,39 @@ impl RouterInner {
         incoming_priority: u8,
         _incoming: Option<&RouterItem>,
     ) -> TelemetryResult<()> {
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        return self.make_shared_queue_room_classified(
+            incoming_cost,
+            incoming_priority,
+            _incoming,
+            None,
+        );
+        #[cfg(not(any(feature = "std", feature = "fair-admission")))]
+        self.make_shared_queue_room_inner(incoming_cost, incoming_priority, _incoming)
+    }
+
+    /// `make_shared_queue_room` with the incoming item's bulk owner
+    /// (`fair_bulk_owner`) when the caller already has it.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    fn make_shared_queue_room_classified(
+        &mut self,
+        incoming_cost: usize,
+        incoming_priority: u8,
+        _incoming: Option<&RouterItem>,
+        incoming_owner: Option<Option<u32>>,
+    ) -> TelemetryResult<()> {
+        self.make_shared_queue_room_inner(incoming_cost, incoming_priority, _incoming, incoming_owner)
+    }
+
+    fn make_shared_queue_room_inner(
+        &mut self,
+        incoming_cost: usize,
+        incoming_priority: u8,
+        _incoming: Option<&RouterItem>,
+        #[cfg(any(feature = "std", feature = "fair-admission"))] incoming_owner: Option<
+            Option<u32>,
+        >,
+    ) -> TelemetryResult<()> {
         if incoming_cost > self.memory.max_queue_budget {
             return Err(TelemetryError::PacketTooLarge(
                 "Item exceeds maximum shared queue budget",
@@ -4332,6 +4775,8 @@ impl RouterInner {
 
         #[cfg(any(feature = "std", feature = "fair-admission"))]
         let mut fair_victim = None;
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let mut incoming_class = None;
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
@@ -4357,21 +4802,39 @@ impl RouterInner {
             }
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             {
-                let incoming =
-                    _incoming.and_then(|data| Self::fair_bulk_owner(data, incoming_priority));
-                let victim = *fair_victim.get_or_insert_with(|| {
-                    self.bulk_loads(incoming_priority.min(199))
-                        .queue_victim(incoming)
+                // The incoming item's class cannot change during this call.
+                let incoming = *incoming_class.get_or_insert_with(|| {
+                    incoming_owner.unwrap_or_else(|| {
+                        _incoming.and_then(|data| Self::fair_bulk_owner(data, incoming_priority))
+                    })
                 });
-                if let Some(victim) = victim
-                    && self.reclaim_bulk_from(
-                        victim,
-                        incoming_priority.min(199),
-                        (incoming == Some(victim))
-                            .then(|| _incoming.and_then(Self::bulk_stream))
-                            .flatten(),
-                    )
-                {
+                let mut scan = None;
+                let victim = *fair_victim.get_or_insert_with(|| {
+                    let (loads, single) = self.bulk_loads_scan(incoming_priority.min(199));
+                    scan = single;
+                    loads.queue_victim(incoming)
+                });
+                let incoming_stream = (incoming == victim && victim.is_some())
+                    .then(|| _incoming.and_then(Self::bulk_stream))
+                    .flatten();
+                // The summaries describe the unchanged queues: with one
+                // owner's bulk per queue they already name the victim.
+                let scanned = scan
+                    .zip(victim)
+                    .map(|(summaries, owner)| summary_victim_scan(owner, &summaries))
+                    .and_then(|scan| {
+                        Self::single_owner_stream(&scan, incoming_stream)
+                            .and_then(|stream| scan.positions(stream))
+                    })
+                    .map(|[rx, tx]| Self::pick_bulk_victim(rx, tx));
+                let reclaimed = match (victim, scanned) {
+                    (Some(_), Some(selected)) => self.remove_bulk_victim(selected),
+                    (Some(victim), None) => {
+                        self.reclaim_bulk_from(victim, incoming_priority.min(199), incoming_stream)
+                    }
+                    (None, _) => false,
+                };
+                if reclaimed {
                     continue;
                 }
                 if incoming.is_some() {
@@ -4507,9 +4970,28 @@ impl RouterInner {
     }
 
     fn push_received(&mut self, item: RouterRxItem) -> TelemetryResult<()> {
+        // During a saturation episode the item is classified once, here: the
+        // class serves this admission's victim choice and becomes its tag.
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let hint = self
+            .received_queue
+            .tagging()
+            .then(|| (crate::config::schema_generation(), Self::rx_fair_tag(&item)));
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        self.make_shared_queue_room_classified(
+            item.byte_cost(),
+            item.priority,
+            Some(&item.data),
+            hint.map(|(_, tag)| tag.owner()),
+        )?;
+        #[cfg(not(any(feature = "std", feature = "fair-admission")))]
         self.make_shared_queue_room(item.byte_cost(), item.priority, Some(&item.data))?;
         #[cfg(any(feature = "std", feature = "fair-admission"))]
-        {
+        if let Some((generation, tag)) = hint {
+            self.received_queue.set_tag_hint(generation, tag);
+        }
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        let result = {
             #[cfg(any(feature = "std", feature = "fair-admission"))]
             let mut fair_victim = None;
             self.received_queue.push_back_prioritized_select(
@@ -4530,6 +5012,11 @@ impl RouterInner {
                 },
                 core::mem::drop,
             )
+        };
+        #[cfg(any(feature = "std", feature = "fair-admission"))]
+        {
+            self.received_queue.clear_tag_hint();
+            result
         }
         #[cfg(not(any(feature = "std", feature = "fair-admission")))]
         {
@@ -14614,7 +15101,7 @@ impl Router {
             *victim = Some((owner, priority));
             (owner, priority)
         };
-        st.reclaim_bulk_from(owner, priority, None)
+        st.reclaim_bulk_from_with(owner, priority, None, false)
     }
     fn admit_received_frame(&self, side: RouterSideId, bytes: &[u8]) -> TelemetryResult<()> {
         self.admit_received_frame_with_view(side, bytes, None)
@@ -25510,3 +25997,4 @@ pub use targeted_packet::{
     FrozenRecipient, FrozenTargetPacket, PrepareTargetedPacketError,
     PrepareTargetedPacketErrorKind, MAX_PREPARED_TARGET_RECIPIENTS,
 };
+

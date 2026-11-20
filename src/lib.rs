@@ -708,18 +708,29 @@ pub fn set_type_scheduling_class(ty: DataType, class: i8) -> bool {
     use core::sync::atomic::Ordering;
     let key = ty.0.wrapping_add(1);
     if class >= 0 {
+        let mut changed = false;
         for slot in &URGENT_TYPES {
-            let _ = slot.compare_exchange(key, 0, Ordering::AcqRel, Ordering::Acquire);
+            changed |= slot
+                .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        }
+        if changed {
+            // Scheduling priorities derive from this table: retire caches.
+            config::note_derived_schema_change();
         }
         return true;
     }
     if type_is_urgent(ty) {
         return true;
     }
-    URGENT_TYPES.iter().any(|slot| {
+    let added = URGENT_TYPES.iter().any(|slot| {
         slot.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-    })
+    });
+    if added {
+        config::note_derived_schema_change();
+    }
+    added
 }
 
 /// `true` when the application placed `ty` in the urgent band.

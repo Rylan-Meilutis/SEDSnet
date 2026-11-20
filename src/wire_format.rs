@@ -2405,26 +2405,9 @@ pub(crate) fn peek_routing_frame_info_unchecked(
     routing_frame_info(admitted_data(buf)?)
 }
 
-/// [`peek_routing_frame_info_unchecked`] that bypasses the envelope memo.
-/// For scans over many distinct queued frames (victim selection), where the
-/// memo would only thrash and add its lookup and store to every parse.
-#[cfg(any(feature = "std", feature = "fair-admission"))]
-pub(crate) fn peek_routing_frame_info_unchecked_unmemoized(
-    buf: &[u8],
-) -> TelemetryResult<RoutingFrameInfo<'_>> {
-    routing_frame_info_with(admitted_data(buf)?, read_routing_envelope_uncached)
-}
-
 fn routing_frame_info(data: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
-    routing_frame_info_with(data, read_routing_envelope)
-}
-
-fn routing_frame_info_with<'a>(
-    data: &'a [u8],
-    read_envelope: fn(&mut ByteReader<'a>) -> TelemetryResult<RoutingEnvelope<'a>>,
-) -> TelemetryResult<RoutingFrameInfo<'a>> {
     let mut reader = ByteReader::new(data);
-    let envelope = read_envelope(&mut reader)?;
+    let envelope = read_routing_envelope(&mut reader)?;
     let reliable = if envelope.is_reliable || envelope.has_reliable_header {
         Some(read_reliable_header_encoded(
             &mut reader,

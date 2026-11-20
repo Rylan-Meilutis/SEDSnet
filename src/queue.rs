@@ -1,4 +1,6 @@
 use crate::{TelemetryError, TelemetryResult};
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -63,13 +65,243 @@ pub struct BoundedDeque<T> {
     // Deferred router fairness lives in existing queue padding, not entries.
     fair_owed_priority: u8,
     fair_owed_flags: u8,
+    // Arbitration tags, allocated only while a full queue needs a victim.
+    #[cfg(any(feature = "std", feature = "fair-admission"))]
+    lane: Option<Box<TagLane>>,
 }
 
-// Hint bytes occupy the old queue padding on hosted and ARM targets.
+// Hint bytes occupy the old queue padding on hosted and ARM targets; the
+// optional tag lane adds one pointer where fair admission is built.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+const _: () = assert!(
+    core::mem::size_of::<BoundedDeque<u8>>()
+        == core::mem::size_of::<(VecDeque<u8>, usize, usize, usize, usize, usize, bool, u8, usize)>()
+);
+#[cfg(not(any(feature = "std", feature = "fair-admission")))]
 const _: () = assert!(
     core::mem::size_of::<BoundedDeque<u8>>()
         == core::mem::size_of::<(VecDeque<u8>, usize, usize, usize, usize, usize, bool, u8)>()
 );
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+/// A queued item's arbitration class, as computed by the queue's owner:
+/// an optional owner and, for owned items, an optional stream, with the
+/// item's priority and byte cost so arbitration scans only the tags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ItemTag {
+    owner: u32,
+    stream: u32,
+    cost: u32,
+    priority: u8,
+    flags: u8,
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl ItemTag {
+    const TAGGED: u8 = 1;
+    const OWNER: u8 = 2;
+    const STREAM: u8 = 4;
+
+    pub(crate) fn new(owner: Option<u32>, stream: Option<u32>, priority: u8, cost: usize) -> Self {
+        Self {
+            owner: owner.unwrap_or(0),
+            stream: stream.unwrap_or(0),
+            // Queue costs are bounded by the queue budget; saturate anyway.
+            cost: u32::try_from(cost).unwrap_or(u32::MAX),
+            priority,
+            flags: Self::TAGGED
+                | if owner.is_some() { Self::OWNER } else { 0 }
+                | if stream.is_some() { Self::STREAM } else { 0 },
+        }
+    }
+    /// The packed form for tight scans: `owner` and `stream` are meaningful
+    /// only under the `has_owner` / `has_stream` flags.
+    #[inline(always)]
+    pub(crate) fn raw(&self) -> (u32, u32, u32, u8, bool, bool) {
+        (
+            self.owner,
+            self.stream,
+            self.cost,
+            self.priority,
+            self.flags & Self::OWNER != 0,
+            self.flags & Self::STREAM != 0,
+        )
+    }
+    #[inline]
+    pub(crate) fn priority(self) -> u8 {
+        self.priority
+    }
+    #[inline]
+    pub(crate) fn cost(self) -> usize {
+        self.cost as usize
+    }
+    #[inline]
+    pub(crate) fn owner(self) -> Option<u32> {
+        (self.flags & Self::OWNER != 0).then_some(self.owner)
+    }
+    #[inline]
+    pub(crate) fn stream(self) -> Option<u32> {
+        (self.flags & Self::STREAM != 0).then_some(self.stream)
+    }
+    #[inline]
+    fn is_tagged(self) -> bool {
+        self.flags & Self::TAGGED != 0
+    }
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+/// One queue's owned items at or below a priority threshold, kept current
+/// across every queue change while all of them have one owner. With it, the
+/// bulk loads and the victim of a saturated queue need no scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BulkSummary {
+    pub(crate) threshold: u8,
+    /// `None`: no owned item at or below the threshold.
+    pub(crate) owner: Option<u32>,
+    pub(crate) count: usize,
+    pub(crate) bytes: usize,
+    /// The first item of the lowest priority among them: (index, priority).
+    best: Option<(usize, u8)>,
+    /// After that item left: look from this index for the next item of the
+    /// same priority before trusting `best` again.
+    resume: Option<(usize, u8)>,
+    /// The first item's stream (`u64::MAX`: none), and whether all share it.
+    pub(crate) stream: u64,
+    pub(crate) uniform: bool,
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl BulkSummary {
+    const NO_STREAM: u64 = u64::MAX;
+
+    pub(crate) fn empty(threshold: u8) -> Self {
+        Self {
+            threshold,
+            owner: None,
+            count: 0,
+            bytes: 0,
+            best: None,
+            resume: None,
+            stream: Self::NO_STREAM,
+            uniform: true,
+        }
+    }
+
+    fn counts(&self, tag: ItemTag) -> bool {
+        tag.priority <= self.threshold && tag.owner().is_some()
+    }
+
+    /// Record an owned item at `index` (in queue order during a scan, or a
+    /// newly added one). `false`: a second owner; the summary is unusable.
+    #[must_use]
+    pub(crate) fn add(&mut self, index: usize, tag: ItemTag) -> bool {
+        if let Some((best, _)) = self.best.as_mut()
+            && index <= *best
+        {
+            *best += 1;
+        }
+        if let Some((resume, _)) = self.resume.as_mut()
+            && index < *resume
+        {
+            *resume += 1;
+        }
+        if !self.counts(tag) {
+            return true;
+        }
+        let owner = tag.owner;
+        let stream = tag.stream().map_or(Self::NO_STREAM, u64::from);
+        match self.owner {
+            Some(current) if current != owner => return false,
+            Some(_) => self.uniform &= stream == self.stream,
+            None => {
+                self.owner = Some(owner);
+                self.stream = stream;
+                self.uniform = true;
+            }
+        }
+        self.count += 1;
+        self.bytes = self.bytes.saturating_add(tag.cost());
+        let priority = tag.priority;
+        match (self.best, self.resume) {
+            // Earlier than every remaining candidate of its priority, or lower.
+            (Some((best, lowest)), _) if priority < lowest || (priority == lowest && index < best) => {
+                self.best = Some((index, priority));
+            }
+            (None, Some((resume, lowest))) if priority < lowest || (priority == lowest && index < resume) => {
+                self.best = Some((index, priority));
+                self.resume = None;
+            }
+            (None, None) if self.count == 1 => self.best = Some((index, priority)),
+            _ => {}
+        }
+        true
+    }
+
+    /// Account for removing `tag` at `index`.
+    fn remove(&mut self, index: usize, tag: ItemTag) {
+        if self.counts(tag) && self.owner == Some(tag.owner) {
+            self.count -= 1;
+            self.bytes = self.bytes.saturating_sub(tag.cost());
+            if self.count == 0 {
+                *self = Self::empty(self.threshold);
+                return;
+            }
+        }
+        match self.best {
+            Some((best, lowest)) if best == index => {
+                self.best = None;
+                self.resume = Some((index, lowest));
+            }
+            Some((best, lowest)) if index < best => self.best = Some((best - 1, lowest)),
+            _ => {}
+        }
+        if let Some((resume, _)) = self.resume.as_mut()
+            && index < *resume
+        {
+            *resume -= 1;
+        }
+    }
+
+    /// The victim candidate: the first item of the lowest priority. Resolves
+    /// a pending search over `tags` (queue order); `None` when it is unknown
+    /// and the caller must rescan.
+    pub(crate) fn best<'a>(
+        &mut self,
+        mut tags: impl Iterator<Item = &'a ItemTag>,
+    ) -> Option<Option<(usize, u8)>> {
+        if self.count == 0 {
+            return Some(None);
+        }
+        if let Some(best) = self.best {
+            return Some(Some(best));
+        }
+        let (resume, lowest) = self.resume?;
+        let owner = self.owner?;
+        let found = tags
+            .by_ref()
+            .skip(resume)
+            .position(|tag| self.counts(*tag) && tag.owner == owner && tag.priority == lowest)?;
+        self.best = Some((resume + found, lowest));
+        self.resume = None;
+        Some(self.best)
+    }
+}
+
+/// One `ItemTag` per queued item, kept in step with every queue mutation.
+/// An item enters untagged and is classified at most once per generation;
+/// replacing or updating an item clears its tag. The lane is freed when the
+/// queue empties, so its memory is held only through a saturation episode.
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+#[derive(Clone, Debug)]
+struct TagLane {
+    tags: VecDeque<ItemTag>,
+    generation: u32,
+    summary: Option<BulkSummary>,
+    // Untagged entries: classification visits the lane only while some exist.
+    untagged: usize,
+    // The tag of the item about to be added, when its owner already has it.
+    hint: Option<ItemTag>,
+}
 
 #[cfg(feature = "compact-packet-store")]
 impl<T: Clone> Clone for BoundedDeque<T> {
@@ -87,6 +319,8 @@ impl<T: Clone> Clone for BoundedDeque<T> {
             fair_priority_cursor: self.fair_priority_cursor,
             fair_owed_priority: self.fair_owed_priority,
             fair_owed_flags: self.fair_owed_flags,
+            #[cfg(any(feature = "std", feature = "fair-admission"))]
+            lane: self.lane.clone(),
         }
     }
 }
@@ -117,6 +351,200 @@ fn allocate_initial_ring<T>(mut capacity: usize, item_bytes: usize) -> VecDeque<
         capacity /= 2;
     }
     ring
+}
+
+#[cfg(any(feature = "std", feature = "fair-admission"))]
+impl<T: ByteCost> BoundedDeque<T> {
+    // ---- tag lane bookkeeping (no-ops while no lane is allocated) ----
+
+    #[inline]
+    fn lane_added(&mut self, index: usize) {
+        let Some(lane) = self.lane.as_mut() else { return };
+        let len = lane.tags.len();
+        let grows = len == lane.tags.capacity();
+        let room = !grows
+            || (crate::memory_admission::check(
+                (len + 1).saturating_mul(2 * size_of::<ItemTag>()),
+                (len + 1).saturating_mul(2 * size_of::<ItemTag>()),
+            )
+            .is_ok()
+                && lane.tags.try_reserve(1).is_ok());
+        if room {
+            match lane.hint.take() {
+                Some(tag) => {
+                    lane.tags.insert(index, tag);
+                    if let Some(summary) = lane.summary.as_mut()
+                        && !summary.add(index, tag)
+                    {
+                        lane.summary = None;
+                    }
+                }
+                None => {
+                    lane.tags.insert(index, ItemTag::default());
+                    lane.untagged += 1;
+                    // An unclassified item: the summary cannot know its class.
+                    lane.summary = None;
+                }
+            }
+        } else {
+            self.lane = None;
+        }
+    }
+
+    /// Whether arbitration tags are being kept (a saturation episode).
+    pub(crate) fn tagging(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// Offer the tag of the next item to be added, computed under schema
+    /// `generation` by the same classifier `tag_items` uses. Clear it with
+    /// `clear_tag_hint` whether or not the item was added.
+    pub(crate) fn set_tag_hint(&mut self, generation: u32, tag: ItemTag) {
+        if let Some(lane) = self.lane.as_mut()
+            && lane.generation == generation
+        {
+            lane.hint = Some(tag);
+        }
+    }
+
+    pub(crate) fn clear_tag_hint(&mut self) {
+        if let Some(lane) = self.lane.as_mut() {
+            lane.hint = None;
+        }
+    }
+
+    #[inline]
+    fn lane_cleared(&mut self) {
+        self.lane = None;
+    }
+
+    #[inline]
+    fn lane_removed(&mut self, index: usize) {
+        if let Some(lane) = self.lane.as_mut() {
+            if let Some(tag) = lane.tags.remove(index) {
+                if !tag.is_tagged() {
+                    lane.untagged -= 1;
+                    lane.summary = None;
+                } else if let Some(summary) = lane.summary.as_mut() {
+                    summary.remove(index, tag);
+                }
+            }
+            if self.q.is_empty() {
+                self.lane = None;
+            }
+        }
+    }
+
+    #[inline]
+    fn lane_changed(&mut self, index: usize) {
+        if let Some(lane) = self.lane.as_mut()
+            && let Some(tag) = lane.tags.get_mut(index)
+            && tag.is_tagged()
+        {
+            *tag = ItemTag::default();
+            lane.untagged += 1;
+            lane.summary = None;
+        }
+    }
+
+    /// Classify every untagged item (all of them after a generation change).
+    /// `false`: there is no lane and `allocate` is false, or none could be
+    /// allocated; the caller classifies directly.
+    pub(crate) fn tag_items<C>(&mut self, generation: u32, allocate: bool, mut classify: C) -> bool
+    where
+        C: FnMut(&T) -> ItemTag,
+    {
+        if self.lane.is_none() {
+            if !allocate {
+                return false;
+            }
+            let len = self.q.len();
+            let bytes = len
+                .saturating_mul(size_of::<ItemTag>())
+                .saturating_add(size_of::<TagLane>() + 16);
+            if crate::memory_admission::check(bytes, bytes).is_err() {
+                return false;
+            }
+            let mut tags = VecDeque::new();
+            if tags.try_reserve_exact(len).is_err() {
+                return false;
+            }
+            tags.resize(len, ItemTag::default());
+            self.lane = Some(Box::new(TagLane {
+                tags,
+                generation,
+                summary: None,
+                untagged: len,
+                hint: None,
+            }));
+        }
+        let lane = self.lane.as_mut().expect("lane allocated above");
+        debug_assert_eq!(lane.tags.len(), self.q.len());
+        lane.hint = None;
+        if lane.generation != generation {
+            lane.tags.iter_mut().for_each(|tag| *tag = ItemTag::default());
+            lane.generation = generation;
+            lane.untagged = lane.tags.len();
+            lane.summary = None;
+        }
+        // New entries are usually the newest: look from the back, and stop
+        // once none is left untagged.
+        for (item, tag) in self.q.iter().zip(lane.tags.iter_mut()).rev() {
+            if lane.untagged == 0 {
+                break;
+            }
+            if !tag.is_tagged() {
+                *tag = classify(item);
+                debug_assert!(tag.is_tagged());
+                lane.untagged -= 1;
+            }
+        }
+        true
+    }
+
+    /// The queue's current bulk summary for `threshold`, with its victim
+    /// candidate resolved, after `tag_items` succeeded. `None`: unknown (no
+    /// summary, another threshold, several owners); rescan and `set_summary`.
+    pub(crate) fn summary(&mut self, threshold: u8) -> Option<(BulkSummary, Option<(usize, u8)>)> {
+        let lane = self.lane.as_mut()?;
+        let summary = lane.summary.as_mut().filter(|summary| summary.threshold == threshold)?;
+        match summary.best(lane.tags.iter()) {
+            Some(best) => Some((*summary, best)),
+            None => {
+                lane.summary = None;
+                None
+            }
+        }
+    }
+
+    /// Install a summary built by scanning the current tags.
+    pub(crate) fn set_summary(&mut self, summary: Option<BulkSummary>) {
+        if let Some(lane) = self.lane.as_mut() {
+            lane.summary = summary;
+        }
+    }
+
+    /// The tags, in queue order (two contiguous runs), after `tag_items`
+    /// succeeded.
+    pub(crate) fn tags(&self) -> (&[ItemTag], &[ItemTag]) {
+        let lane = self.lane.as_ref().expect("tag_items succeeded");
+        debug_assert_eq!(lane.tags.len(), self.q.len());
+        lane.tags.as_slices()
+    }
+
+}
+
+/// Without fair admission no queue keeps arbitration tags.
+#[cfg(not(any(feature = "std", feature = "fair-admission")))]
+impl<T: ByteCost> BoundedDeque<T> {
+    #[inline(always)]
+    fn lane_added(&mut self, _index: usize) {}
+    #[inline(always)]
+    fn lane_removed(&mut self, _index: usize) {}
+    #[inline(always)]
+    fn lane_changed(&mut self, _index: usize) {}
+    #[inline(always)]
+    fn lane_cleared(&mut self) {}
 }
 
 impl BoundedDeque<u64> {
@@ -203,6 +631,8 @@ impl<T: ByteCost> BoundedDeque<T> {
             fair_priority_cursor: u8::MAX,
             fair_owed_priority: 0,
             fair_owed_flags: 0,
+            #[cfg(any(feature = "std", feature = "fair-admission"))]
+            lane: None,
         }
     }
 
@@ -239,6 +669,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     #[inline]
     pub fn clear(&mut self) {
         self.q.clear();
+        self.lane_cleared();
         self.cur_bytes = 0;
         self.fair_priority_cursor = u8::MAX;
         // Invalidate the debt, but keep an active owner reserved until its
@@ -277,6 +708,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     /// Pop from front, updating byte count.
     pub fn pop_front(&mut self) -> Option<T> {
         let v = self.q.pop_front()?;
+        self.lane_removed(0);
         self.cur_bytes = self.cur_bytes.saturating_sub(v.byte_cost());
         Some(v)
     }
@@ -366,6 +798,7 @@ impl<T: ByteCost> BoundedDeque<T> {
             update(item);
             #[cfg(debug_assertions)]
             debug_assert_eq!(before, item.byte_cost());
+            self.lane_changed(index);
         }
     }
 
@@ -583,6 +1016,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         update(item);
         debug_assert_eq!(item.byte_cost(), new_cost);
         self.cur_bytes = used;
+        self.lane_changed(index);
         Ok(())
     }
 
@@ -594,6 +1028,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     #[allow(dead_code)]
     pub fn pop_back(&mut self) -> Option<T> {
         let v = self.q.pop_back()?;
+        self.lane_removed(self.q.len());
         self.cur_bytes = self.cur_bytes.saturating_sub(v.byte_cost());
         Some(v)
     }
@@ -619,6 +1054,7 @@ impl<T: ByteCost> BoundedDeque<T> {
     /// Remove item at position, updating byte count.
     pub fn remove_pos(&mut self, idx: usize) -> Option<T> {
         let v = self.q.remove(idx)?;
+        self.lane_removed(idx);
         self.cur_bytes = self.cur_bytes.saturating_sub(v.byte_cost());
         Some(v)
     }
@@ -765,6 +1201,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         let old = self.q.get(index).expect("checked retained owner").byte_cost();
         self.cur_bytes = self.cur_bytes.checked_sub(old).unwrap().checked_add(cost).unwrap();
         self.q[index] = item;
+        self.lane_changed(index);
     }
 
     /// Caller keeps the same exclusive owner between preflight and replacement.
@@ -796,6 +1233,7 @@ impl<T: ByteCost> BoundedDeque<T> {
 
         // The growth/eviction pass has already made a slot available.
         self.q.push_back(v);
+        self.lane_added(self.q.len() - 1);
         self.cur_bytes = self.cur_bytes.saturating_add(cost);
         Ok(())
     }
@@ -885,12 +1323,14 @@ impl<T: ByteCost> BoundedDeque<T> {
             .is_none_or(|tail| priority_of(tail) >= new_priority)
         {
             self.q.push_back(v);
+            self.lane_added(self.q.len() - 1);
         } else if self
             .q
             .front()
             .is_some_and(|head| priority_of(head) < new_priority)
         {
             self.q.push_front(v);
+            self.lane_added(0);
         } else {
             // Keep equal-priority FIFO order while locating a band boundary
             // in logarithmic work, including a wrapped backing ring.
@@ -898,6 +1338,7 @@ impl<T: ByteCost> BoundedDeque<T> {
                 .q
                 .partition_point(|existing| priority_of(existing) >= new_priority);
             self.q.insert(index, v);
+            self.lane_added(index);
         }
         self.cur_bytes = self.cur_bytes.saturating_add(cost);
     }
@@ -1365,10 +1806,12 @@ mod tests {
             }
         }
         assert_eq!(seen, alloc::vec![1, 2]);
-        // The cursor occupies existing tail padding on the supported layouts.
+        // The cursor occupies existing tail padding on the supported layouts;
+        // the optional arbitration tag lane adds one pointer.
         assert_eq!(
             core::mem::size_of::<BoundedDeque<Item>>(),
-            10 * core::mem::size_of::<usize>()
+            if cfg!(any(feature = "std", feature = "fair-admission")) { 11 } else { 10 }
+                * core::mem::size_of::<usize>()
         );
     }
 

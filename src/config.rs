@@ -1430,6 +1430,13 @@ fn bump_schema_generation() {
     SCHEMA_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Policy outside the registry that schema-derived values depend on (the
+/// urgent scheduling table) changed: advance the generation as a schema
+/// change would.
+pub(crate) fn note_derived_schema_change() {
+    bump_schema_generation();
+}
+
 /// The std registry lock. Any mutable access through its guard advances the
 /// schema generation, so no mutation path can leave a derived cache current.
 #[cfg(feature = "std")]
