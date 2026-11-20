@@ -25,12 +25,17 @@ Queue dispatch performance. Not yet released.
   template links, discovery and time sync on, x86-64 user-space instruction
   counts):
 
-  | Profile | Frame | Before | After |
+  | Profile | Frame | 6.0.2 | Now |
   |---|---|---|---|
-  | embedded features | best effort | 32,100 | 21,700 |
-  | embedded features | reliable | 56,000 | 33,300 |
-  | std | best effort | 39,900 | 30,600 |
-  | std | reliable | 69,400 | 48,500 |
+  | embedded features | best effort | 32,100 | 13,000 |
+  | embedded features | reliable | 56,000 | 28,000 |
+  | embedded features, `opt-level = "z"` | best effort | 44,500 | 17,600 |
+  | std | best effort | 39,900 | 15,800 |
+  | std | reliable | 69,400 | 35,200 |
+
+  Core locks per forwarded best-effort frame (embedded) went from 49 to 19
+  and clock reads from 24 to 9; for a reliable frame 58 to 37 locks and 28 to
+  14 clock reads.
 
   - The routing envelope of a frame was parsed about 20 times on its way
     through the router. Parses are now memoized on the exact header bytes and
@@ -45,11 +50,51 @@ Queue dispatch performance. Not yet released.
     any change to the routes.
   - A queue pass whose work empties both queues ends instead of running one more
     idle pass.
-  - Victim selection under a full queue budget no longer goes through the
-    envelope memo, which would only thrash there.
+  - A plain transit frame (best effort, no owner contract, nothing local to
+    deliver) takes a direct path through receive and transmit: one parse,
+    no intermediate packet, and the transmit side's admission, statistics and
+    encoding each under one lock. Results are identical to the general path
+    (differential test).
+  - Route plans are cached per frame type, endpoints, owner contract and
+    ingress side, and dropped on any change to routes (including expiry by
+    time), sides, route policy, schema or this router's name. Plans using
+    weighted or adaptive selection, managed variables and reliable packets
+    that an owner behind this router already acknowledged are never cached.
+    Under test every cached plan is re-derived and compared.
+  - A queue pass reads the clock once for its timeout and transmit decisions,
+    and its idle checks share locks.
+  - Side frame encoding reads the clock once, extracts the link template
+    once and builds the frame without temporary allocations.
+  - The managed-variable check before routing is a lock-free filter.
+- **Bounded cost when the queue budget is full.** Each admission into a full
+  shared queue budget used to choose its victim by re-parsing every queued
+  frame about three times, so a saturated relay spent 240,000 (embedded) to
+  340,000 (`opt-level = "z"`) instructions per received frame and its
+  forwarding rate collapsed once frames arrived faster than it could drain
+  them. Queued items now keep a cached fairness class (classified once per
+  schema generation, held in a lane allocated only while a full queue needs a
+  victim and freed when the queue empties, 16 bytes per queued item), and each
+  queue keeps a running summary of a single owner's bulk, so a saturated
+  admission usually needs no scan. Victim choice is unchanged (differential
+  test against classifying every item on the spot).
+
+  | Profile | Saturated admission, 6.0.2 | Now |
+  |---|---|---|
+  | embedded features | 238,400 | 5,400 |
+  | embedded features, `opt-level = "z"` | 339,500 | 7,800 |
+  | std | 35,500 | 6,500 |
+
+  The bench's sustained-overload scenario (100 million instructions per
+  second, paced clock) at 4,000 offered frames/s: 6.0.2 forwarded 68 (std)
+  and 77 (`opt-level = "z"`) frames/s, now 3,998. At 8,000 offered it now
+  forwards 2,100-4,600 frames/s (before 10-30).
+- Changing the urgent scheduling table now advances the schema generation.
 - New internal schema generation counter: every runtime schema change advances
   it, and caches derived from schema lookups compare it before reusing a result.
-- Embedded code size grows by about 2 KB (thumbv7em, `opt-level = "z"`).
+- Embedded code size grows by about 18.5 KB in all (thumbv7em,
+  `opt-level = "z"`, board features); static RAM is unchanged. Heap: a small
+  route plan cache in the router state, one pointer per bounded queue, and
+  the victim lane only while a queue is saturated.
 - No wire, schema or public API change.
 
 ## 6.0.2
