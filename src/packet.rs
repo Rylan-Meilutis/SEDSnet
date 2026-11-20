@@ -174,11 +174,20 @@ const fn element_width(dt: MessageDataType) -> usize {
 pub fn hash_bytes_u64(mut h: u64, bytes: &[u8]) -> u64 {
     // Arbitrary odd constant (not FNV, but good enough for dedupe).
     const PRIME: u64 = 0x9E37_79B1;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
+    #[inline(always)]
+    fn step(h: u64, b: u8) -> u64 {
+        let h = (h ^ b as u64).wrapping_mul(PRIME);
         // a tiny extra mix
-        h ^= h >> 27;
+        h ^ (h >> 27)
+    }
+    // Four bytes per iteration: the same byte-serial hash with a quarter of
+    // the loop overhead where the compiler does not unroll (opt-level z).
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    for chunk in chunks {
+        h = step(step(step(step(h, chunk[0]), chunk[1]), chunk[2]), chunk[3]);
+    }
+    for &b in rest {
+        h = step(h, b);
     }
     h
 }

@@ -1053,6 +1053,10 @@ impl<T: ByteCost> BoundedDeque<T> {
 
     /// Remove item at position, updating byte count.
     pub fn remove_pos(&mut self, idx: usize) -> Option<T> {
+        if idx == 0 {
+            // The usual case (FIFO service): no general removal needed.
+            return self.pop_front();
+        }
         let v = self.q.remove(idx)?;
         self.lane_removed(idx);
         self.cur_bytes = self.cur_bytes.saturating_sub(v.byte_cost());

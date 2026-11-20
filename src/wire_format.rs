@@ -2190,6 +2190,63 @@ fn read_routing_envelope_uncached<'a>(
     })
 }
 
+/// The packet ID of an admitted frame whose routing frame is parsed, as
+/// `packet_id_from_wire_unchecked` computes it, for the common frame without
+/// a reliable header, payload compression or encryption. `None` otherwise
+/// (and for malformed bounds): use `packet_id_from_wire_unchecked`.
+pub(crate) fn plain_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
+    let data = admitted_data(buf).ok()?;
+    let env = &frame.envelope;
+    // Encrypted payloads (flag 0x10, rejected without cryptography) excluded.
+    if data.first()? & (FLAG_COMPRESSED_PAYLOAD | 0x10) != 0
+        || env.is_reliable
+        || env.has_reliable_header
+    {
+        return None;
+    }
+    // The two prelude fields the routing envelope does not keep.
+    let mut r = ByteReader::new(data);
+    let flags = r.read_bytes(2).ok()?[0];
+    read_uleb128(&mut r).ok()?;
+    let dsz = usize::try_from(read_uleb128(&mut r).ok()?).ok()?;
+    read_uleb128(&mut r).ok()?;
+    let nonce = if flags & FLAG_PACKET_NONCE != 0 {
+        u16::try_from(read_uleb128(&mut r).ok()?).ok()?
+    } else {
+        0
+    };
+    let start = frame.payload_offset;
+    let payload = data.get(start..start.checked_add(dsz)?)?;
+    Some(packet_identity_hash(env, nonce, dsz, payload))
+}
+
+/// The packet ID hash: exactly as `Packet::packet_id()` computes it.
+fn packet_identity_hash(envelope: &RoutingEnvelope<'_>, nonce: u16, dsz: usize, payload: &[u8]) -> u64 {
+    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    // Compact source address.
+    h = hash_bytes_u64(h, &envelope.source_address.to_le_bytes());
+
+    // Stable numeric identity is independent of when schema names are learned.
+    h = hash_bytes_u64(h, &envelope.ty.0.to_le_bytes());
+
+    // Endpoints as string bytes, in ascending discriminant order.
+    for ep in envelope.endpoints() {
+        h = hash_bytes_u64(h, &ep.0.to_le_bytes());
+    }
+
+    // Timestamp + data_size as bytes
+    h = hash_bytes_u64(h, &envelope.timestamp_ms.to_le_bytes());
+    h = hash_bytes_u64(h, &nonce.to_le_bytes());
+    h = hash_bytes_u64(h, &(dsz as u64).to_le_bytes());
+    if envelope.time_epoch != 0 {
+        h = hash_bytes_u64(h, &envelope.time_epoch.to_le_bytes());
+    }
+
+    // Payload bytes (logical payload)
+    hash_bytes_u64(h, payload)
+}
+
 /// Read only the bounded type prefix for queue scheduling. This is deliberately
 /// not frame validation: ingress verifies the CRC and dispatch the envelope.
 /// Scanning an RX queue must not checksum every retained payload on each pass.
@@ -2295,6 +2352,8 @@ pub(crate) struct RoutingFrameInfo<'a> {
     pub envelope: RoutingEnvelope<'a>,
     pub reliable: Option<ReliableHeader>,
     pub empty_payload: bool,
+    /// Where the payload starts (after the envelope and any reliable header).
+    payload_offset: usize,
 }
 impl RoutingFrameInfo<'_> {
     pub fn ack_only(&self) -> bool {
@@ -2383,11 +2442,13 @@ pub(crate) fn peek_latest_plain_frame_info(buf: &[u8]) -> TelemetryResult<Routin
     }
     let meta =
         crate::config::try_get_message_meta(envelope.ty).ok_or(TelemetryError::InvalidType)?;
+    let payload_offset = reader.off;
     Packet::validate_payload_against_element(meta.element, reader.read_bytes(size)?)?;
     Ok(RoutingFrameInfo {
         envelope,
         reliable: None,
         empty_payload: size == 0,
+        payload_offset,
     })
 }
 
@@ -2421,6 +2482,7 @@ fn routing_frame_info(data: &[u8]) -> TelemetryResult<RoutingFrameInfo<'_>> {
         envelope,
         reliable,
         empty_payload,
+        payload_offset: reader.off,
     })
 }
 
@@ -2800,30 +2862,8 @@ fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
     };
 
     // ---- hash exactly like Packet::packet_id() ----
-    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
-
-    // Compact source address.
-    h = hash_bytes_u64(h, &source_address.to_le_bytes());
-
-    // Stable numeric identity is independent of when schema names are learned.
-    h = hash_bytes_u64(h, &ty.0.to_le_bytes());
-
-    // Endpoints as string bytes, in ascending discriminant order.
-    for ep in envelope.endpoints() {
-        h = hash_bytes_u64(h, &ep.0.to_le_bytes());
-    }
-
-    // Timestamp + data_size as bytes
-    h = hash_bytes_u64(h, &ts_v.to_le_bytes());
-    h = hash_bytes_u64(h, &nonce.to_le_bytes());
-    h = hash_bytes_u64(h, &(dsz as u64).to_le_bytes());
-    if envelope.time_epoch != 0 {
-        h = hash_bytes_u64(h, &envelope.time_epoch.to_le_bytes());
-    }
-
-    // Payload bytes (logical payload)
-    h = hash_bytes_u64(h, payload_bytes);
-    Ok(h)
+    debug_assert_eq!((source_address, ty, ts_v), (envelope.source_address, envelope.ty, envelope.timestamp_ms));
+    Ok(packet_identity_hash(&envelope, nonce, dsz, payload_bytes))
 }
 
 mod payload_compression {

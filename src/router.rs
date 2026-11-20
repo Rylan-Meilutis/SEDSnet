@@ -5402,6 +5402,10 @@ impl IsrRxQueue {
     #[inline]
     fn pop_front(&self) -> TelemetryResult<Option<RouterRxItem>> {
         let mut g = self.try_lock()?;
+        // Usually empty: skip moving an empty result through the queue.
+        if g.is_empty() {
+            return Ok(None);
+        }
         Ok(g.pop_front())
     }
 
@@ -6090,7 +6094,20 @@ impl Router {
         }
     }
 
+    #[cfg(test)]
     fn pop_next_queued_control_rx_item(&self) -> TelemetryResult<Option<RouterRxItem>> {
+        self.pop_next_queued_control_rx_item_or_timeouts(None, &mut false)
+    }
+
+    /// Take the next queued control item (receipts; discovery with local
+    /// services). With `timeouts_at`, when there is none, also serve the
+    /// pass's reliable timeouts under the same lock if nothing is pending
+    /// (see `process_queue_pass_timeouts`), setting `timeouts_done`.
+    fn pop_next_queued_control_rx_item_or_timeouts(
+        &self,
+        timeouts_at: Option<u64>,
+        timeouts_done: &mut bool,
+    ) -> TelemetryResult<Option<RouterRxItem>> {
         if let Some(queue) = self.isr_rx_queue.as_ref() {
             let mut isr_rx = queue.try_lock()?;
             let idx = isr_rx
@@ -6102,14 +6119,47 @@ impl Router {
         }
 
         let mut st = self.state.lock();
-        let idx = st
-            .received_queue
-            .iter()
-            .position(|item| self.queued_rx_item_is_control(item));
+        // The queue is in descending priority order and control items are in
+        // the network-control band or above: a lower head means none exists.
+        let control_band = crate::transport_priority(DataType::ManagedVariableValue)
+            .min(crate::transport_priority(DataType::ReliableAck));
+        let idx = if st.received_queue.iter().next().is_none_or(|head| head.priority < control_band) {
+            debug_assert!(!st.received_queue.iter().any(|item| self.queued_rx_item_is_control(item)));
+            None
+        } else {
+            st.received_queue
+                .iter()
+                .position(|item| self.queued_rx_item_is_control(item))
+        };
         if let Some(idx) = idx {
             return Ok(st.received_queue.remove_pos(idx));
         }
+        if let Some(now) = timeouts_at {
+            *timeouts_done = self.idle_pass_timeouts_locked(&mut st, now)?;
+        }
         Ok(None)
+    }
+
+    /// The pass's reliable timeout service when nothing is pending: only
+    /// discovery route pruning remains. `false`: something is pending; run
+    /// `process_queue_pass_timeouts`. Hosted builds also collect leased-write
+    /// progress first, so they always take the full service.
+    fn idle_pass_timeouts_locked(&self, st: &mut RouterInner, now: u64) -> TelemetryResult<bool> {
+        if cfg!(feature = "std")
+            || !st.reliable_tx.is_empty()
+            || !st.end_to_end_reliable_tx.is_empty()
+        {
+            return Ok(false);
+        }
+        #[cfg(feature = "discovery")]
+        if Self::prune_discovery_routes_locked(st, now) {
+            Self::note_discovery_topology_change_locked(st, now);
+            crate::memory_admission::allow_drain(
+                self.reconcile_end_to_end_reliable_destinations_locked(st),
+            )?;
+        }
+        let _ = now;
+        Ok(true)
     }
 
     fn queued_rx_item_is_control(&self, item: &RouterRxItem) -> bool {
@@ -6161,8 +6211,23 @@ impl Router {
         start: u64,
         timeout_ms: u32,
     ) -> TelemetryResult<bool> {
+        self.drain_queued_control_rx_or_timeouts(start, timeout_ms, None, &mut false)
+    }
+
+    /// `drain_queued_control_rx_before_tx`; with `timeouts_at`, a pass that
+    /// finds no control item at all serves its idle reliable timeouts under
+    /// the same lock (`timeouts_done`).
+    fn drain_queued_control_rx_or_timeouts(
+        &self,
+        start: u64,
+        timeout_ms: u32,
+        timeouts_at: Option<u64>,
+        timeouts_done: &mut bool,
+    ) -> TelemetryResult<bool> {
         let mut did_any = false;
-        while let Some(item) = self.pop_next_queued_control_rx_item()? {
+        while let Some(item) =
+            self.pop_next_queued_control_rx_item_or_timeouts(timeouts_at.filter(|_| !did_any), timeouts_done)?
+        {
             self.process_rx_queue_item(item)?;
             did_any = true;
             // Receipts precede retry exhaustion; discovery precedes routing.
@@ -10007,6 +10072,10 @@ impl Router {
         let RouterItem::Packed(bytes) = data else {
             return None;
         };
+        // Frames with a reliable header (0x02) are not plain transit.
+        if bytes.first().is_none_or(|flags| flags & 0x02 != 0) {
+            return None;
+        }
         let env = wire_format::peek_routing_envelope_unchecked(bytes.as_ref()).ok()?;
         Self::route_plan_key_for(&env, exclude)
     }
@@ -15257,6 +15326,22 @@ impl Router {
         bytes: &[u8],
         crc_verified: bool,
     ) -> TelemetryResult<Option<crate::SharedBytes>> {
+        self.decode_side_transport_frame_with(side, bytes, crc_verified, false, None)
+    }
+
+    /// `decode_side_transport_frame_inner`, optionally doing the side's
+    /// ingress check (`ensure_side_ingress_enabled`) under its first lock,
+    /// and optionally handing a compact frame's timestamp record to the
+    /// caller (`pending_timestamp`), who must apply it on every outcome with
+    /// `note_rx_timestamp_locked`, under its own next lock.
+    fn decode_side_transport_frame_with(
+        &self,
+        side: RouterSideId,
+        bytes: &[u8],
+        crc_verified: bool,
+        check_ingress: bool,
+        pending_timestamp: Option<&mut Option<(u32, u64)>>,
+    ) -> TelemetryResult<Option<crate::SharedBytes>> {
         // Reclaim abandoned transfers before admission, even when new work is refused.
         let now_ms = self.clock.now_ms();
         let wrapper = parse_side_transport_wrapper(bytes);
@@ -15279,6 +15364,11 @@ impl Router {
             _ => None,
         };
         let mut st = self.state.lock();
+        if check_ingress && !Self::side_ref(&st, side)?.opts.ingress_enabled {
+            return Err(TelemetryError::HandlerError(
+                "router: ingress disabled for side id",
+            ));
+        }
         Self::expire_side_chunks_locked(&mut st, now_ms);
         let compact = match compact_template {
             Some((kind, off, template_id)) => {
@@ -15475,11 +15565,13 @@ impl Router {
                     timestamp_mode,
                     timestamp_base,
                 )?;
-                {
-                    let mut st = self.state.lock();
-                    if let Some(side_state) = st.side_transport.get_mut(&side) {
-                        side_state.rx_last_timestamps.insert(template_id, timestamp);
-                    }
+                match pending_timestamp {
+                    Some(pending) => *pending = Some((template_id, timestamp)),
+                    None => Self::note_rx_timestamp_locked(
+                        &mut self.state.lock(),
+                        side,
+                        Some((template_id, timestamp)),
+                    ),
                 }
                 // Byte reconstruction is not decoder/forwarding admission.
                 // Check the canonical frame before queueing, and recheck at
@@ -20558,10 +20650,20 @@ impl Router {
         // pass's own deadline checks still read the clock.
         let mut pass_now = Some(start);
         loop {
+            // Without std, a pass with no control item serves its idle timeouts
+            // under the control check's lock, at the pass's clock reading.
+            let prologue_now = (!cfg!(feature = "std"))
+                .then(|| pass_now.take().unwrap_or_else(|| self.clock.now_ms()));
+            let mut timeouts_done = false;
             let received_control = crate::memory_admission::allow_drain(
-                self.drain_queued_control_rx_before_tx(start, timeout_ms),
+                self.drain_queued_control_rx_or_timeouts(
+                    start,
+                    timeout_ms,
+                    prologue_now,
+                    &mut timeouts_done,
+                ),
             )?;
-            let mut now = match pass_now.take() {
+            let mut now = match prologue_now.or_else(|| pass_now.take()) {
                 Some(now) if !received_control => now,
                 _ => self.clock.now_ms(),
             };
@@ -20569,7 +20671,7 @@ impl Router {
             let control_budget_used = received_control
                 && timeout_ms != 0
                 && now.wrapping_sub(start) >= u64::from(timeout_ms);
-            if !control_budget_used {
+            if !control_budget_used && !timeouts_done {
                 self.process_queue_pass_timeouts(now)?;
             }
 
@@ -21423,25 +21525,58 @@ impl Router {
         side: RouterSideId,
         crc_verified: bool,
     ) -> TelemetryResult<()> {
-        self.ensure_side_ingress_enabled(side)?;
         #[cfg(feature = "compact-bundle")]
         if !crc_verified && crate::wire_bundle::is_bundle(bytes) {
+            self.ensure_side_ingress_enabled(side)?;
             return self.rx_compact_bundle(bytes, side, true);
         }
-        let Some(decoded) = self.decode_side_transport_frame_inner(side, bytes, crc_verified)? else {
-            return Ok(());
+        // The ingress check rides on the decoder's first lock, and a compact
+        // frame's timestamp record on the enqueue's lock.
+        let mut pending = None;
+        let decoded = self.decode_side_transport_frame_with(
+            side,
+            bytes,
+            crc_verified,
+            true,
+            Some(&mut pending),
+        );
+        let data = match decoded {
+            Ok(Some(decoded)) => RouterItem::Packed(decoded),
+            other => {
+                Self::note_rx_timestamp_locked(&mut self.state.lock(), side, pending);
+                return other.map(|_| ());
+            }
         };
-        let data = RouterItem::Packed(decoded);
-        let priority = self.item_service_priority(&data)?;
+        let priority = match self.item_service_priority(&data) {
+            Ok(priority) => priority,
+            Err(error) => {
+                Self::note_rx_timestamp_locked(&mut self.state.lock(), side, pending);
+                return Err(error);
+            }
+        };
         #[cfg(feature = "timesync")]
         self.timesync_note_rx(&data, self.monotonic_now_ns());
         let mut st = self.state.lock();
+        Self::note_rx_timestamp_locked(&mut st, side, pending);
         st.push_received(RouterRxItem {
             src: Some(side),
             data,
             priority,
         })?;
         Ok(())
+    }
+
+    /// Record a compact frame's timestamp for its template (if any).
+    fn note_rx_timestamp_locked(
+        st: &mut RouterInner,
+        side: RouterSideId,
+        record: Option<(u32, u64)>,
+    ) {
+        if let Some((template_id, timestamp)) = record
+            && let Some(side_state) = st.side_transport.get_mut(&side)
+        {
+            side_state.rx_last_timestamps.insert(template_id, timestamp);
+        }
     }
 
     /// ISR-safe, non-blocking enqueue of packed bytes with source side.
@@ -22543,7 +22678,9 @@ impl Router {
         plain_transit_test_switch::note_taken(0);
         let env = &frame.envelope;
         let ty = env.ty;
-        let id = Self::get_hash(&item.data);
+        let id = wire_format::plain_packet_id(bytes.as_ref(), frame)
+            .unwrap_or_else(|| Self::get_hash(&item.data));
+        debug_assert_eq!(id, Self::get_hash(&item.data));
         #[cfg(feature = "discovery")]
         let plan_key = Self::route_plan_key_for(env, Some(src)).map(|key| (key, self.clock.now_ms()));
         let note_epoch = || {
@@ -23178,7 +23315,9 @@ impl Router {
         if plain_transit_test_switch::disabled() {
             return None;
         }
-        if bytes.first().is_some_and(|flags| flags & 0x11 == 1) {
+        // A pending codec preparation (0x01 without 0x10) or a reliable header
+        // (0x02) rules plain transit out without parsing.
+        if bytes.first().is_some_and(|flags| flags & 0x11 == 1 || flags & 0x02 != 0) {
             return None;
         }
         let frame = wire_format::peek_routing_frame_info_unchecked(bytes.as_ref()).ok()?;

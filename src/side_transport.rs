@@ -14,6 +14,8 @@ pub(crate) const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
 pub(crate) const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
 pub(crate) const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
 pub(crate) const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
+/// The canonical frame flag announcing a reliable header (`wire_format`).
+pub(crate) const SIDE_TRANSPORT_FLAG_RELIABLE_HEADER: u8 = 0x02;
 pub(crate) const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
 pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
 pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT: u8 = 0x80;
@@ -523,7 +525,13 @@ pub(crate) fn extract_side_header_template_view(
         }
         off += contract_len;
     }
-    let reliable_span = wire_format::reliable_header_span(bytes)?;
+    // Without the reliable-header flag or a wire contract (which may announce
+    // one) there is no reliable header: skip re-parsing the prelude for it.
+    let reliable_span = if flags & (SIDE_TRANSPORT_FLAG_RELIABLE_HEADER | SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) == 0 {
+        None
+    } else {
+        wire_format::reliable_header_span(bytes)?
+    };
     let (reliable_flags, reliable_seq_ack, reliable_compact, payload_off) =
         if let Some((rel_off, rel_len, hdr)) = reliable_span {
             if data.len() < rel_off + rel_len {

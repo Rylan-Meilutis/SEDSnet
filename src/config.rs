@@ -1899,14 +1899,28 @@ pub fn schema_fingerprint() -> u64 {
 
 #[cfg(feature = "std")]
 pub fn schema_bytes_used() -> usize {
+    // Queue admission asks on every push: answer from the last computation
+    // while the schema generation is unchanged (read before the registry).
+    static CACHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+    let generation = schema_generation();
+    let cached = CACHED.load(Ordering::Acquire);
+    if cached != u64::MAX && (cached >> 32) as u32 == generation {
+        return (cached & u64::from(u32::MAX)) as usize;
+    }
     // A memory query must not initialize/allocate the hosted registry. Until
     // the first schema operation, no registry heap storage is retained.
-    REGISTRY.get().map_or(0, |registry| {
+    let bytes = REGISTRY.get().map_or(0, |registry| {
         registry
             .lock()
             .expect("schema registry poisoned")
             .schema_byte_cost()
-    })
+    });
+    if let Ok(small) = u32::try_from(bytes)
+        && small != u32::MAX
+    {
+        CACHED.store((u64::from(generation) << 32) | u64::from(small), Ordering::Release);
+    }
+    bytes
 }
 
 #[cfg(feature = "std")]
