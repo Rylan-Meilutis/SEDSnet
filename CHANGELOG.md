@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Queue dispatch fixes. Not yet released.
+
+- **Unroutable packets no longer spin the queue.** An accepted reliable packet
+  whose destination had no route (for example, the only path to its endpoint
+  was down) was put back with a 1 ms retry and re-dispatched in full on every
+  pass. Once the pass itself took longer than 1 ms, the retry was always due,
+  so every `drain_queues_with_timeout` / `periodic` call spent its whole budget
+  re-dispatching it. A node holding 16 such packets spent about 41,000
+  instructions per millisecond idle (host count, embedded features); it now
+  spends about 1,100. Such packets are now parked:
+  - Any routing change (a route learned or expired, a side added or removed,
+    route policy changed) makes them eligible at once, so a new route is used
+    on the next queue call.
+  - As a fallback they are re-checked on a doubling schedule, 1 ms up to
+    256 ms.
+  - Expiry is unchanged: a re-check never passes the delivery lifetime, so a
+    parked packet expires on time. Parked packets keep their queue memory
+    charge and priority. Routable traffic is not held behind them.
+- No wire, schema or public API change.
+
 ## 6.0.2
 
 Discovery recovery and embedded size release.

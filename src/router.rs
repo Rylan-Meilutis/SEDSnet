@@ -40,6 +40,10 @@ mod schema_response_admission_tests;
 #[path = "tests/accepted_route_ownership.rs"]
 mod accepted_route_ownership;
 
+#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/unroutable_backoff.rs"]
+mod unroutable_backoff;
+
 #[cfg(all(test, feature = "std"))]
 #[path = "tests/independent_side_tx_router.rs"]
 mod independent_side_tx;
@@ -1182,6 +1186,10 @@ struct TxWork {
 /// Priorities still determine normal ordering; this only services the oldest
 /// lowest-priority item after a bounded high-priority burst.
 const MAX_PRIORITY_BURST: u8 = 8;
+/// Longest fallback re-check interval for a parked unroutable original.
+/// Routing changes wake parked originals at once; this bounds the delay if
+/// a change arrives through a path that does not signal it.
+pub(crate) const UNROUTABLE_RECHECK_MAX_MS: u64 = 256;
 
 /// ByteCost implementation for TxQueued.
 // Compare against the complete ownership metadata before the cached bit was
@@ -2889,6 +2897,8 @@ struct RouterInner {
     active_queued_types: [(u32, u32); ACTIVE_QUEUED_TYPE_SLOTS],
     tx_priority_burst: u8,
     tx_policy_flags: u8,
+    /// Some accepted original is parked because no side could reach it.
+    unroutable_parked: bool,
     #[cfg(feature = "latest-value-egress")]
     latest_turn_phase: u8,
     #[cfg(feature = "latest-value-egress")]
@@ -3210,6 +3220,28 @@ impl RouterInner {
     }
 
     #[inline(never)]
+    /// Routing state changed: make every parked unroutable original eligible
+    /// now, so a newly learned route or side is used immediately.
+    fn wake_unroutable_parked(&mut self) {
+        if !core::mem::take(&mut self.unroutable_parked) {
+            return;
+        }
+        for index in 0..self.transmit_queue.len() {
+            let parked = self.transmit_queue.get(index).is_some_and(|item| {
+                matches!(
+                    item.delivery_state,
+                    QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
+                ) && item.retry_after_ms > 1
+            });
+            if parked {
+                // Deferred rows keep a non-zero `deferred_since_ms`; a retry
+                // deadline of 1 is always due and stays distinct from 0.
+                self.transmit_queue
+                    .update_metadata(index, |item| item.retry_after_ms = 1);
+            }
+        }
+    }
+
     fn refresh_retry_hint(&mut self) {
         let pending = self.transmit_queue.iter().any(|item| {
             matches!(
@@ -4482,6 +4514,19 @@ impl IsrRxQueue {
     fn snapshot(&self) -> Option<(usize, usize)> {
         let g = self.try_lock().ok()?;
         Some((g.len(), g.bytes_used()))
+    }
+}
+
+/// Test-only count of queued transmit items handed to dispatch on this thread.
+#[cfg(test)]
+pub(crate) mod test_dispatch_counter {
+    use core::cell::Cell;
+    std::thread_local!(static COUNT: Cell<u64> = const { Cell::new(0) });
+    pub(crate) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+    pub(crate) fn take() -> u64 {
+        COUNT.with(|count| count.replace(0))
     }
 }
 
@@ -9423,6 +9468,7 @@ impl Router {
 
     #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RouterInner, now_ms: u64) {
+        st.wake_unroutable_parked();
         #[cfg(feature = "std")]
         st.invalidate_prepared_p2p();
         st.discovery_cadence.on_topology_change(now_ms);
@@ -15966,6 +16012,7 @@ impl Router {
                 active_queued_types: [(0, 0); ACTIVE_QUEUED_TYPE_SLOTS],
                 tx_priority_burst: 0,
                 tx_policy_flags: 0,
+                unroutable_parked: false,
                 #[cfg(feature = "latest-value-egress")]
                 latest_turn_phase: 0,
                 #[cfg(feature = "latest-value-egress")]
@@ -16650,6 +16697,8 @@ impl Router {
             .insert(id, Box::<SideTransportState>::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        #[cfg(not(feature = "discovery"))]
+        st.wake_unroutable_parked();
         id
     }
 
@@ -16691,6 +16740,8 @@ impl Router {
             .insert(id, Box::<SideTransportState>::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        #[cfg(not(feature = "discovery"))]
+        st.wake_unroutable_parked();
         id
     }
 
@@ -16741,6 +16792,8 @@ impl Router {
             .insert(id, Box::<SideTransportState>::default());
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
+        #[cfg(not(feature = "discovery"))]
+        st.wake_unroutable_parked();
         id
     }
 
@@ -19406,6 +19459,8 @@ impl Router {
     // Initial synchronous sends retain their legacy reporting/error contract;
     // queue workers alone may turn an already accepted refusal into deferral.
     fn dispatch_queued_item_with_origin(&self, work: TxWork, called_from_queue: bool) -> TelemetryResult<()> {
+        #[cfg(test)]
+        test_dispatch_counter::bump();
         #[cfg(all(test, feature = "std", feature = "discovery"))]
         managed_order_side_gate_causal::observe(self,"dispatch_queued",|| serde_json::json!({"item":managed_order_side_gate_causal::item_meta(&work.queued.item),"delivery":format!("{:?}",work.queued.delivery_state),"claim":work.claim.map(|c|(c.token,c.ordered,c.side_retry))}));
         let owed_turn = work.owed_turn;
@@ -19644,6 +19699,24 @@ impl Router {
     }
 
     fn defer_accepted_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
+        self.defer_accepted_original_with(context, false)
+    }
+
+    /// Park an accepted original that no side can reach. Re-dispatching it
+    /// every millisecond burned the whole queue budget while a destination
+    /// stayed unreachable. It now waits until routing state changes (see
+    /// `RouterInner::wake_unroutable_parked`), with a doubling, bounded
+    /// re-check as a fallback. The re-check never passes the delivery
+    /// lifetime, so expiry still fires on time.
+    fn park_unroutable_original(&self, context: &mut DispatchContext) -> TelemetryResult<()> {
+        self.defer_accepted_original_with(context, true)
+    }
+
+    fn defer_accepted_original_with(
+        &self,
+        context: &mut DispatchContext,
+        unroutable: bool,
+    ) -> TelemetryResult<()> {
         context.mark_refused();
         let Some(claim) = context.claim else {
             return Err(TelemetryError::Io("reliable owner unavailable"));
@@ -19655,6 +19728,16 @@ impl Router {
                 "accepted reliable clock exhausted",
             ));
         };
+        let since = context.since.unwrap_or(now);
+        let retry_after_ms = if unroutable {
+            let lifetime = runtime_reliable_retransmit_ms()
+                .saturating_mul(u64::from(runtime_reliable_max_retries()) + 1);
+            let waited = now.saturating_sub(since);
+            let recheck = now.saturating_add(waited.clamp(1, UNROUTABLE_RECHECK_MAX_MS));
+            recheck.min(since.saturating_add(lifetime)).max(retry_after_ms)
+        } else {
+            retry_after_ms
+        };
         let mut st = self.state.lock();
         let Some(index) = st.claim_index(claim.token) else {
             return Ok(());
@@ -19665,10 +19748,11 @@ impl Router {
             } else {
                 QueuedDelivery::DeferredUnordered
             };
-            item.deferred_since_ms = context.since.unwrap_or(now);
+            item.deferred_since_ms = since;
             item.retry_after_ms = retry_after_ms;
         });
         st.tx_policy_flags |= 1;
+        st.unroutable_parked |= unroutable;
         Ok(())
     }
 
@@ -21757,7 +21841,7 @@ impl Router {
                         // Permit retry of the same packet after discovery heals.
                         self.remove_pkt_id(&data);
                         if called_from_queue {
-                            return self.defer_accepted_original(context);
+                            return self.park_unroutable_original(context);
                         }
                         return Err(TelemetryError::Io("no discovered route"));
                     }
