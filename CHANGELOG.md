@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Queue dispatch fixes. Not yet released.
+Queue dispatch performance. Not yet released.
 
 - **Unroutable packets no longer spin the queue.** An accepted reliable packet
   whose destination had no route (for example, the only path to its endpoint
@@ -20,6 +20,36 @@ Queue dispatch fixes. Not yet released.
   - Expiry is unchanged: a re-check never passes the delivery lifetime, so a
     parked packet expires on time. Parked packets keep their queue memory
     charge and priority. Routable traffic is not held behind them.
+- **Fewer instructions per forwarded frame.** Measured with the new
+  `dispatch_instructions` bench (a relay forwarding a small frame between two
+  template links, discovery and time sync on, x86-64 user-space instruction
+  counts):
+
+  | Profile | Frame | Before | After |
+  |---|---|---|---|
+  | embedded features | best effort | 32,100 | 21,700 |
+  | embedded features | reliable | 56,000 | 33,300 |
+  | std | best effort | 39,900 | 30,600 |
+  | std | reliable | 69,400 | 48,500 |
+
+  - The routing envelope of a frame was parsed about 20 times on its way
+    through the router. Parses are now memoized on the exact header bytes and
+    the schema generation, so a frame is parsed about twice. Without `std` the
+    memo is one shared try-locked table, allocated on first use (about 300
+    bytes of heap).
+  - Embedded schema type lookups walked the whole runtime overlay list, twice,
+    about ten times per frame. Resolved definitions are now cached per schema
+    generation (about 100 bytes of heap, allocated on first use).
+  - The queue budget's charge for discovered routes was recomputed over every
+    route and announcer on each admission. It is now cached and invalidated by
+    any change to the routes.
+  - A queue pass whose work empties both queues ends instead of running one more
+    idle pass.
+  - Victim selection under a full queue budget no longer goes through the
+    envelope memo, which would only thrash there.
+- New internal schema generation counter: every runtime schema change advances
+  it, and caches derived from schema lookups compare it before reusing a result.
+- Embedded code size grows by about 2 KB (thumbv7em, `opt-level = "z"`).
 - No wire, schema or public API change.
 
 ## 6.0.2

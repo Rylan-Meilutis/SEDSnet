@@ -15,7 +15,8 @@ pub(crate) fn packed_owner(bytes: &[u8], priority: u8) -> Option<u32> {
     if priority >= 200 {
         return None;
     }
-    let frame = wire_format::peek_routing_frame_info_unchecked(bytes).ok()?;
+    // Victim selection classifies every queued frame; skip the envelope memo.
+    let frame = wire_format::peek_routing_frame_info_unchecked_unmemoized(bytes).ok()?;
     eligible(
         frame.envelope.ty,
         priority,

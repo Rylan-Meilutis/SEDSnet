@@ -276,3 +276,31 @@ fn parked_packets_keep_priority_order_once_routable() {
     assert!(order[first_high + 4..].iter().all(|ty| *ty == low), "{order:?}");
 }
 
+/// The cached memory charge of discovered routes must always equal a fresh
+/// recomputation: after learning, refreshing, liveness updates and expiry.
+#[test]
+fn cached_discovery_route_charge_tracks_every_change() {
+    let h = harness();
+    let check = |h: &Harness| {
+        let st = h.router.state.lock();
+        let fresh = st
+            .discovery_routes
+            .iter()
+            .map(|(side, route)| crate::router::RouterInner::discovery_route_byte_cost(*side, route))
+            .fold(0usize, usize::saturating_add);
+        assert_eq!(st.discovery_routes.byte_cost(), fresh);
+        st.discovery_routes.len()
+    };
+    assert_eq!(check(&h), 0);
+    announce_owner(&h, SIDE_B, "RADIO");
+    assert_eq!(check(&h), 1);
+    announce_owner(&h, SIDE_A, "SD_CARD");
+    assert_eq!(check(&h), 2);
+    // Ordinary traffic from a known peer refreshes liveness only.
+    idle_for(&h, 10);
+    assert_eq!(check(&h), 2);
+    // Expiry prunes both routes.
+    h.now.fetch_add(crate::discovery::DISCOVERY_ROUTE_TTL_MS + 1, Ordering::Relaxed);
+    let _ = h.router.periodic(0);
+    assert_eq!(check(&h), 0);
+}

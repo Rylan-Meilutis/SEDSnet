@@ -2868,6 +2868,93 @@ struct SideTxAdmission<'a> {
 #[cfg(feature = "std")]
 const EXHAUSTED_RECENT: usize = 8;
 
+/// Discovered routes per side, with their memory charge cached.
+///
+/// The shared queue budget charges discovery state, and the charge was
+/// recomputed by walking every route, announcer and topology board on each
+/// admission: three times per forwarded frame, growing with network size.
+/// Any mutable access invalidates the cached charge. The only exception is
+/// [`DiscoveryRoutes::touch`], for liveness timestamps, which cannot change
+/// it.
+#[cfg(feature = "discovery")]
+#[derive(Default)]
+struct DiscoveryRoutes {
+    map: RouterMap<RouterSideId, DiscoverySideState>,
+    cost: core::cell::Cell<Option<usize>>,
+}
+
+#[cfg(feature = "discovery")]
+impl core::ops::Deref for DiscoveryRoutes {
+    type Target = RouterMap<RouterSideId, DiscoverySideState>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl core::ops::DerefMut for DiscoveryRoutes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cost.set(None);
+        &mut self.map
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl<'a> IntoIterator for &'a DiscoveryRoutes {
+    type Item = <&'a RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::Item;
+    type IntoIter = <&'a RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl<'a> IntoIterator for &'a mut DiscoveryRoutes {
+    type Item = <&'a mut RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::Item;
+    type IntoIter = <&'a mut RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.cost.set(None);
+        self.map.iter_mut()
+    }
+}
+
+#[cfg(feature = "discovery")]
+impl DiscoveryRoutes {
+    fn byte_cost(&self) -> usize {
+        if let Some(cost) = self.cost.get() {
+            return cost;
+        }
+        let cost = self
+            .map
+            .iter()
+            .map(|(side, route)| RouterInner::discovery_route_byte_cost(*side, route))
+            .fold(0usize, usize::saturating_add);
+        self.cost.set(Some(cost));
+        cost
+    }
+
+    /// Update liveness timestamps on one side's route without retiring the
+    /// cached charge. `update` must not change anything the charge counts
+    /// (collections, names); debug builds verify that.
+    fn touch<R>(
+        &mut self,
+        side: RouterSideId,
+        update: impl FnOnce(&mut DiscoverySideState) -> R,
+    ) -> Option<R> {
+        let route = self.map.get_mut(&side)?;
+        #[cfg(debug_assertions)]
+        let before = RouterInner::discovery_route_byte_cost(side, route);
+        let result = update(route);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            before,
+            RouterInner::discovery_route_byte_cost(side, route),
+            "DiscoveryRoutes::touch changed the memory charge"
+        );
+        Some(result)
+    }
+}
+
 struct RouterInner {
     #[cfg(feature = "std")]
     p2p_revision: u64,
@@ -2934,7 +3021,7 @@ struct RouterInner {
     #[cfg(feature = "std")]
     exhausted_recent: VecDeque<crate::diagnostics::ExhaustedReliable>,
     #[cfg(feature = "discovery")]
-    discovery_routes: RouterMap<RouterSideId, DiscoverySideState>,
+    discovery_routes: DiscoveryRoutes,
     #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
     #[cfg(feature = "discovery")]
@@ -3495,10 +3582,7 @@ impl RouterInner {
 
     #[cfg(feature = "discovery")]
     fn discovery_bytes_used(&self) -> usize {
-        self.discovery_routes
-            .iter()
-            .map(|(side, route)| Self::discovery_route_byte_cost(*side, route))
-            .sum()
+        self.discovery_routes.byte_cost()
     }
 
     #[inline]
@@ -9685,13 +9769,28 @@ impl Router {
         }
         st.discovery_routes
             .retain(|_, route| !route.announcers.is_empty());
-        Ok(st.discovery_routes != before)
+        Ok(*st.discovery_routes != before)
     }
 
     #[cfg(feature = "discovery")]
     fn prune_discovery_routes_locked(st: &mut RouterInner, now_ms: u64) -> bool {
         // Polling runs at the firmware service rate, not the advertisement
         // rate. Never clone the topology just to discover nothing expired.
+        // A read-only check first keeps the cached memory charge of the
+        // routes (see `DiscoveryRoutes`) when nothing would be pruned.
+        let sender_expired =
+            |sender: &DiscoverySenderState| now_ms.saturating_sub(sender.last_seen_ms) > DISCOVERY_ROUTE_TTL_MS;
+        let request_expired = |request: &ManagedVariableSubscription| {
+            !(now_ms >= request.last_seen_ms && now_ms - request.last_seen_ms <= DISCOVERY_ROUTE_TTL_MS)
+        };
+        let prunable = st.discovery_routes.iter().any(|(_, route)| {
+            route.announcers.iter().any(|(_, sender)| sender_expired(sender))
+                || route.requested_network_variables.iter().any(request_expired)
+                || (route.announcers.is_empty() && route.requested_network_variables.is_empty())
+        });
+        if !prunable {
+            return false;
+        }
         let mut changed = false;
         st.discovery_routes.retain(|_, route| {
             let before_peers = route.announcers.len();
@@ -13526,24 +13625,23 @@ impl Router {
                 .payload_codec
                 .observe(address, now, DISCOVERY_ROUTE_TTL_MS);
         }
-        let Some(route) = st.discovery_routes.get_mut(&side) else {
-            return;
-        };
-        let mut found = None;
-        for (name, peer) in &mut route.announcers {
-            if peer.advertised_address == Some(address) || sender_address_u32(name) == address {
-                // Ambiguous numeric identities must be resolved by discovery.
-                if found.is_some() {
-                    return;
+        st.discovery_routes.touch(side, |route| {
+            let mut found = None;
+            for (name, peer) in &mut route.announcers {
+                if peer.advertised_address == Some(address) || sender_address_u32(name) == address {
+                    // Ambiguous numeric identities must be resolved by discovery.
+                    if found.is_some() {
+                        return;
+                    }
+                    found = Some(peer);
                 }
-                found = Some(peer);
             }
-        }
-        let Some(peer) = found else {
-            return;
-        };
-        peer.last_seen_ms = now;
-        route.last_seen_ms = route.last_seen_ms.max(now);
+            let Some(peer) = found else {
+                return;
+            };
+            peer.last_seen_ms = now;
+            route.last_seen_ms = route.last_seen_ms.max(now);
+        });
     }
 
     /// Consume only an exact unsequenced topology retry on its ingress link.
@@ -18350,6 +18448,18 @@ impl Router {
         !state.received_queue.is_empty() || !state.transmit_queue.is_empty()
     }
 
+    fn queues_empty(&self) -> bool {
+        if self
+            .isr_rx_queue
+            .as_ref()
+            .is_some_and(|queue| queue.try_lock().map_or(true, |queue| !queue.is_empty()))
+        {
+            return false;
+        }
+        let state = self.state.lock();
+        state.received_queue.is_empty() && state.transmit_queue.is_empty()
+    }
+
     /// Allocation-free queue accounting for a caller-owned diagnostic buffer.
     /// Version, RX/TX counts, independently summed costs, front type/priority/
     /// wait, ACK/schema counts, minimum priority, reliable pending count/bytes,
@@ -19295,6 +19405,13 @@ impl Router {
                 || (timeout_ms != 0
                     && self.clock.now_ms().wrapping_sub(start) >= u64::from(timeout_ms))
             {
+                break;
+            }
+            // Work emptied both queues: another pass would only repeat this
+            // pass's timeout and control checks at the same time and find
+            // nothing. With one frame per call that idle pass was a third of
+            // the fixed per-call cost.
+            if self.queues_empty() {
                 break;
             }
         }

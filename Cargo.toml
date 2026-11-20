@@ -102,6 +102,10 @@ harness = false
 name = "route_selection_paths"
 harness = false
 
+[[bench]]
+name = "dispatch_instructions"
+harness = false
+
 [dependencies]
 sedsnet_macros = { version = "2.2.0", path = "sedsnet_macros" }
 crc32fast = { version = "1.5.2", default-features = false }

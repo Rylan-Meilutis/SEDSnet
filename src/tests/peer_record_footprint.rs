@@ -322,7 +322,7 @@ fn leave_snapshot_record_refusal_preserves_every_route() {
         router.learn_discovery_packet(&leave, Some(side), false),
         Err(TelemetryError::Io("memory pressure"))
     ));
-    assert_eq!(router.state.lock().discovery_routes, before);
+    assert_eq!(*router.state.lock().discovery_routes, before);
     fail_record(0);
     router
         .learn_discovery_packet(&leave, Some(side), false)
