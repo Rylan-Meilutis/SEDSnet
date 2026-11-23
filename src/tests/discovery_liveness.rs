@@ -29,8 +29,8 @@ fn lost_chunk_cannot_poison_later_frames_from_same_router() {
         .unwrap()
         .collect::<Vec<_>>();
     assert_ne!(
-        &a[0][4..8],
-        &b[0][4..8],
+        &a[0][4..6],
+        &b[0][4..6],
         "different packets need different transfer IDs"
     );
     assert!(

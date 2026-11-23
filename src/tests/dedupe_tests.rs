@@ -541,22 +541,19 @@ fn chunk_transfer_ids_do_not_collide_across_bus_producers() {
             .unwrap();
         let captured = frames.lock().unwrap().clone();
         assert!(captured.len() > 1);
-        let application_transfer_id =
-            u32::from_le_bytes(captured.last().unwrap()[4..8].try_into().unwrap());
+        let chunk = |frame: &[u8]| crate::side_transport::test_parse_chunk_frame(frame).map(|c| c.0);
+        let application_transfer_id = chunk(captured.last().unwrap()).unwrap();
         captured
             .into_iter()
             .filter(|frame| {
-                frame.starts_with(b"SDT\x03")
-                    && u32::from_le_bytes(frame[4..8].try_into().unwrap())
-                        == application_transfer_id
+                chunk(frame) == Some(application_transfer_id)
             })
             .collect::<Vec<_>>()
     };
     let a = capture("PRODUCER_A", 0x11);
     let b = capture("PRODUCER_B", 0x77);
     let transfer_id = |frame: &[u8]| {
-        assert_eq!(&frame[..4], b"SDT\x03");
-        u32::from_le_bytes(frame[4..8].try_into().unwrap())
+        crate::side_transport::test_parse_chunk_frame(frame).unwrap().0
     };
     assert_ne!(transfer_id(&a[0]), transfer_id(&b[0]));
     for index in 0..a.len().max(b.len()) {

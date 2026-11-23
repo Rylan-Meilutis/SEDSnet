@@ -1,6 +1,8 @@
 //! Incomplete foreign catalogs must share admission with queued work.
 //! All definitions are caller-owned; no application identifiers enter the SDK.
 #![cfg(all(feature = "std", feature = "discovery"))]
+#[path = "support/side_chunk.rs"]
+mod side_chunk;
 
 use sedsnet::{
     E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement, ReliableMode,
@@ -89,13 +91,7 @@ fn catalog(prefix: &str) -> (Vec<u8>, DataType) {
     (wire_format::pack_packet(&packet).to_vec(), marker)
 }
 fn fragment(id: u32, index: usize, parts: &[&[u8]]) -> Vec<u8> {
-    let mut bytes = b"SDT\x03".to_vec();
-    bytes.extend_from_slice(&id.to_le_bytes());
-    bytes.extend_from_slice(&(index as u16).to_le_bytes());
-    bytes.extend_from_slice(&(parts.len() as u16).to_le_bytes());
-    bytes.extend_from_slice(parts[index]);
-    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-    bytes
+    side_chunk::chunk_frame(id, index as u16, parts.len() as u16, parts[index])
 }
 
 #[test]

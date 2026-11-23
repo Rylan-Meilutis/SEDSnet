@@ -115,7 +115,7 @@ impl Router {
         stream: crate::SharedBytes,
         budget: usize,
     ) -> TelemetryResult<RouterItem> {
-        let outer = Self::encode_p2p_payload(
+        let outer = Self::encode_p2p_stream_message(
             &local.hostname,
             local.address,
             ports.0,

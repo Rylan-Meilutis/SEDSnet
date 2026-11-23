@@ -30,8 +30,8 @@ fn relay_chunk_identity_and_loss_are_bounded() {
         .split_side_transport_frame(side, b, 128)
         .unwrap()
         .collect::<Vec<_>>();
-    assert_eq!(&first[0][4..8], &repeat[0][4..8]);
-    assert_ne!(&first[0][4..8], &second[0][4..8]);
+    assert_eq!(&first[0][4..6], &repeat[0][4..6]);
+    assert_ne!(&first[0][4..6], &second[0][4..6]);
     assert!(
         relay
             .decode_side_transport_frame(side, &first[0])

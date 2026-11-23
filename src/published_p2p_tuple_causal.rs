@@ -195,7 +195,7 @@ fn run_binding_control(case: &str) {
                 .and_then(|p| {
                     let message = Router::decode_p2p_payload(p.payload()).ok()?;
                     Some(
-                        Router::decode_p2p_stream_payload(message.payload)
+                        Router::decode_p2p_stream_payload(&message)
                             .ok()??
                             .flags
                             & P2P_STREAM_DATA
@@ -349,8 +349,11 @@ fn run_binding_control(case: &str) {
     }
     let frame =
         Router::encode_p2p_stream_payload(flags, source, destination, 1, b"probe-origin").unwrap();
+    // A forged stream frame travels through the stream framing; plain P2P
+    // sends can never be taken for stream frames.
+    let entry = m.nodes[actor].resolve_hostname(target).unwrap();
     m.nodes[actor]
-        .send_p2p_to_hostname(target, dst_port, src_port, frame.as_ref())
+        .send_p2p_stream_to_entry(entry, dst_port, src_port, frame.as_ref())
         .unwrap();
     m.pump();
     let server = m.server.lock().unwrap().clone();

@@ -136,13 +136,10 @@ impl SideFramePeeker {
                 })
             }
             SIDE_TRANSPORT_KIND_CHUNK if complete => {
-                if body.len() < 8 {
-                    return None;
-                }
-                let transfer = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                let index = u16::from_le_bytes([body[4], body[5]]);
+                let (transfer, index, _total, header_len) =
+                    crate::side_transport::parse_chunk_header(body).ok()?;
                 if index == 0 {
-                    let payload = &body[8..];
+                    let payload = &body[header_len..];
                     let inner = if payload.starts_with(SIDE_TRANSPORT_MAGIC) && payload.len() > 4 {
                         self.peek_body(payload[3], &payload[4..], false)?
                     } else {

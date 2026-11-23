@@ -676,7 +676,7 @@ fn prepared_p2p_rejected_peer_controls_do_not_revoke_prepared_owner() {
         let before = snapshot(receiver);
         let frame = Router::encode_p2p_stream_payload(flags, c, id, 1, b"mismatched-peer").unwrap();
         mesh.nodes[2]
-            .send_p2p_to_hostname("SERVICE_B", 90, 91, frame.as_ref())
+            .send_p2p_stream_to_hostname("SERVICE_B", 90, 91, frame.as_ref())
             .unwrap();
         mesh.pump();
         let after = snapshot(receiver);
@@ -728,7 +728,7 @@ fn prepared_p2p_invalid_synack_is_inert_but_identical_valid_retry_is_progress() 
             Router::encode_p2p_stream_payload(P2P_STREAM_SYN | P2P_STREAM_ACK, source, id, 0, &[])
                 .unwrap();
         mesh.nodes[sender]
-            .send_p2p_to_hostname("CLIENT_A", dst_port, src_port, frame.as_ref())
+            .send_p2p_stream_to_hostname("CLIENT_A", dst_port, src_port, frame.as_ref())
             .unwrap();
         mesh.pump();
         let after = snapshot(receiver);
@@ -742,7 +742,7 @@ fn prepared_p2p_invalid_synack_is_inert_but_identical_valid_retry_is_progress() 
         Router::encode_p2p_stream_payload(P2P_STREAM_SYN | P2P_STREAM_ACK, peer, id, 0, &[])
             .unwrap();
     mesh.nodes[1]
-        .send_p2p_to_hostname("CLIENT_A", 91, 90, frame.as_ref())
+        .send_p2p_stream_to_hostname("CLIENT_A", 91, 90, frame.as_ref())
         .unwrap();
     mesh.pump();
     assert!(snapshot(receiver).0 > before.0);
@@ -795,7 +795,7 @@ fn prepared_p2p_inconsistent_packet_name_and_address_never_touch_session() {
             Router::encode_p2p_stream_payload(P2P_STREAM_DATA, a, id, 1, b"mismatched-metadata")
                 .unwrap();
         let outer =
-            Router::encode_p2p_payload("CLIENT_A", address, 91, 90, stream.as_ref()).unwrap();
+            Router::encode_p2p_stream_message("CLIENT_A", address, 91, 90, stream.as_ref()).unwrap();
         let packet = Packet::new(
             DataType::P2pMessage,
             &[DataEndpoint::Discovery],
@@ -849,7 +849,7 @@ fn prepared_p2p_zero_source_synack_cannot_establish_unknown_peer() {
     let frame =
         Router::encode_p2p_stream_payload(P2P_STREAM_SYN | P2P_STREAM_ACK, 0, id, 0, &[]).unwrap();
     mesh.nodes[1]
-        .send_p2p_to_hostname("CLIENT_A", 91, 90, frame.as_ref())
+        .send_p2p_stream_to_hostname("CLIENT_A", 91, 90, frame.as_ref())
         .unwrap();
     let pending = { std::mem::take(&mut *mesh.wire.lock().unwrap()) };
     let mut held = Vec::new();
@@ -860,7 +860,7 @@ fn prepared_p2p_zero_source_synack_cannot_establish_unknown_peer() {
             .filter(|p| p.data_type() == DataType::P2pMessage)
             .and_then(|p| {
                 let message = Router::decode_p2p_payload(p.payload()).ok()?;
-                let frame = Router::decode_p2p_stream_payload(message.payload).ok()??;
+                let frame = Router::decode_p2p_stream_payload(&message).ok()??;
                 Some(
                     frame.flags == (P2P_STREAM_SYN | P2P_STREAM_ACK) && frame.source_stream_id == 0,
                 )

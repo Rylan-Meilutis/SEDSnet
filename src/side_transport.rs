@@ -20,8 +20,120 @@ pub(crate) const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
 pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
 pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT: u8 = 0x80;
 pub(crate) const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
-pub(crate) const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize =
-    3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
+/// Chunk bytes besides the ULEB128 position: magic, kind, a 16-bit transfer
+/// id and the CRC32.
+pub(crate) const SIDE_TRANSPORT_CHUNK_FIXED_BYTES: usize = 3 + 1 + 2 + wire_format::CRC32_BYTES;
+/// Smallest chunk overhead (a one-byte position, up to 15 chunks).
+pub(crate) const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = SIDE_TRANSPORT_CHUNK_FIXED_BYTES + 1;
+
+#[inline]
+fn chunk_triangle(n: u64) -> u64 {
+    n * (n + 1) / 2
+}
+
+/// One ULEB128 value names both a chunk's index and the transfer's chunk
+/// count: `total * (total - 1) / 2 + index`. Up to 15 chunks fit one byte;
+/// below 23171 chunks the value is never longer than two separate ULEB128
+/// fields would be.
+#[inline]
+pub(crate) fn chunk_position(index: u16, total: u16) -> u64 {
+    chunk_triangle(u64::from(total) - 1) + u64::from(index)
+}
+
+/// Inverse of [`chunk_position`]: `(index, total)`, or `None` when the value
+/// names more than 65535 chunks.
+pub(crate) fn decode_chunk_position(position: u64) -> Option<(u16, u16)> {
+    // Largest n with T(n) <= position, n + 1 being the chunk count.
+    let (mut lo, mut hi) = (0u64, u64::from(u16::MAX) - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if chunk_triangle(mid) <= position {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let index = position - chunk_triangle(lo);
+    let total = lo + 1;
+    (index < total).then_some((index as u16, total as u16))
+}
+
+/// `(transfer id, index, total, header bytes)` of a chunk body (the side
+/// wrapper's magic, kind and CRC already removed).
+pub(crate) fn parse_chunk_header(body: &[u8]) -> TelemetryResult<(u32, u16, u16, usize)> {
+    const SHORT: TelemetryError = TelemetryError::Unpack("short side chunk frame");
+    if body.len() < 3 {
+        return Err(SHORT);
+    }
+    let transfer = u32::from(u16::from_le_bytes([body[0], body[1]]));
+    let mut off = 2;
+    let position = read_uleb128_local(body, &mut off).map_err(|_| SHORT)?;
+    let (index, total) = decode_chunk_position(position)
+        .ok_or(TelemetryError::Unpack("invalid side chunk index"))?;
+    Ok((transfer, index, total, off))
+}
+
+/// Payload bytes per chunk and chunk count for a `len`-byte frame split into
+/// frames of at most `max_frame_bytes`.
+pub(crate) fn chunk_layout(len: usize, max_frame_bytes: usize) -> TelemetryResult<(usize, u16)> {
+    for position_bytes in 1..=5 {
+        let overhead = SIDE_TRANSPORT_CHUNK_FIXED_BYTES + position_bytes;
+        if max_frame_bytes <= overhead {
+            return Err(TelemetryError::BadArg);
+        }
+        let budget = max_frame_bytes - overhead;
+        let total = u16::try_from(len.div_ceil(budget).max(1))
+            .map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        if uleb128_len(chunk_position(total - 1, total)) <= position_bytes {
+            return Ok((budget, total));
+        }
+    }
+    Err(TelemetryError::PacketTooLarge("too many chunks"))
+}
+
+/// Bytes the chunk headers of a `total`-chunk transfer add on the wire.
+pub(crate) fn chunk_wire_overhead(total: u16) -> usize {
+    (0..total)
+        .map(|index| SIDE_TRANSPORT_CHUNK_FIXED_BYTES + uleb128_len(chunk_position(index, total)))
+        .sum()
+}
+
+#[inline]
+fn uleb128_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// A kind `0x03` chunk frame (tests build fragments by hand).
+#[cfg(test)]
+pub(crate) fn test_chunk_frame(transfer: u32, index: u16, total: u16, payload: &[u8]) -> Vec<u8> {
+    let mut body = (transfer as u16).to_le_bytes().to_vec();
+    write_uleb128_local(chunk_position(index, total), &mut body);
+    body.extend_from_slice(payload);
+    wrap_side_transport_frame(SIDE_TRANSPORT_KIND_CHUNK, &body).to_vec()
+}
+
+/// `(transfer, index, total, payload)` of a kind `0x03` chunk frame.
+#[cfg(test)]
+pub(crate) fn test_parse_chunk_frame(frame: &[u8]) -> Option<(u32, u16, u16, &[u8])> {
+    if !frame.starts_with(b"SDT\x03") || frame.len() < 8 {
+        return None;
+    }
+    let body = &frame[4..frame.len() - wire_format::CRC32_BYTES];
+    let (transfer, index, total, header) = parse_chunk_header(body).ok()?;
+    Some((transfer, index, total, &body[header..]))
+}
+
+/// The 16-bit transfer id of a chunked frame: a stable content id, including
+/// the sender, never zero.
+fn chunk_transfer_id(hash: u64) -> [u8; 2] {
+    let folded = (hash >> 48) ^ (hash >> 32) ^ (hash >> 16) ^ hash;
+    (folded as u16).max(1).to_le_bytes()
+}
 pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BITS: usize =
     (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
 pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
@@ -32,7 +144,7 @@ pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMA
 pub(crate) struct SideTransportFrames {
     frame: crate::SharedBytes,
     payload_budget: usize,
-    transfer_id: u32,
+    transfer_id: [u8; 2],
     index: usize,
     total: usize,
 }
@@ -41,7 +153,7 @@ impl SideTransportFrames {
         Self {
             frame,
             payload_budget: 0,
-            transfer_id: 0,
+            transfer_id: [0; 2],
             index: 0,
             total: 1,
         }
@@ -51,22 +163,16 @@ impl SideTransportFrames {
         max_frame_bytes: usize,
         sender: &[u8],
     ) -> TelemetryResult<Self> {
-        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
-            return Err(TelemetryError::BadArg);
-        }
-        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
-        let total = frame.len().div_ceil(payload_budget);
-        u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let (payload_budget, total) = chunk_layout(frame.len(), max_frame_bytes)?;
         // Stable content ID, including sender; CRC(frame || CRC) is constant.
         let seed = hash_bytes_u64(0x517C_C1B7_2722_0A95, sender);
-        let hash = hash_bytes_u64(seed, &frame);
-        let transfer_id = ((hash >> 32) as u32 ^ hash as u32).max(1);
+        let transfer_id = chunk_transfer_id(hash_bytes_u64(seed, &frame));
         Ok(Self {
             frame,
             payload_budget,
             transfer_id,
             index: 0,
-            total,
+            total: usize::from(total),
         })
     }
     pub(crate) fn bootstraps_template(&self) -> bool {
@@ -113,7 +219,11 @@ impl SideTransportFrames {
             let remaining = self.frame.len() - self.index * self.payload_budget;
             let bytes = remaining
                 .min(self.payload_budget)
-                .saturating_add(SIDE_TRANSPORT_CHUNK_OVERHEAD);
+                .saturating_add(SIDE_TRANSPORT_CHUNK_FIXED_BYTES)
+                .saturating_add(uleb128_len(chunk_position(
+                    self.index as u16,
+                    self.total as u16,
+                )));
             return crate::memory_admission::check(
                 bytes.saturating_add(256),
                 bytes.saturating_add(32),
@@ -127,7 +237,7 @@ impl SideTransportFrames {
             + if self.payload_budget == 0 {
                 0
             } else {
-                self.total * SIDE_TRANSPORT_CHUNK_OVERHEAD
+                chunk_wire_overhead(self.total as u16)
             }
     }
 }
@@ -144,14 +254,11 @@ impl Iterator for SideTransportFrames {
         }
         let start = index * self.payload_budget;
         let end = (start + self.payload_budget).min(self.frame.len());
+        let mut position = SideHeaderBytes::default();
+        position.uleb128(chunk_position(index as u16, self.total as u16));
         Some(wrap_side_transport_frame_parts(
             SIDE_TRANSPORT_KIND_CHUNK,
-            &[
-                &self.transfer_id.to_le_bytes(),
-                &(index as u16).to_le_bytes(),
-                &(self.total as u16).to_le_bytes(),
-                &self.frame[start..end],
-            ],
+            &[&self.transfer_id, position.as_slice(), &self.frame[start..end]],
         ))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -877,29 +984,27 @@ pub(crate) fn send_packet_chunks(
         let crc = crc.finalize().to_le_bytes();
         let parts = [header, payload, &crc];
         let len = header.len() + payload.len() + crc.len();
-        let budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
-        let total = len.div_ceil(budget);
-        let total_u16 =
-            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let (budget, total_u16) = chunk_layout(len, max_frame_bytes)?;
+        let total = usize::from(total_u16);
         let mut hash = hash_bytes_u64(0x517C_C1B7_2722_0A95, sender);
         for part in parts {
             hash = hash_bytes_u64(hash, part);
         }
-        let transfer = ((hash >> 32) as u32 ^ hash as u32).max(1).to_le_bytes();
+        let transfer = chunk_transfer_id(hash);
         if *next_chunk > total {
             return Err(TelemetryError::BadArg);
         }
         for index in *next_chunk..total {
             let start = index * budget;
             let end = (start + budget).min(len);
-            let index_bytes = (index as u16).to_le_bytes();
-            let total_bytes = total_u16.to_le_bytes();
-            let mut slices: [&[u8]; 6] = [&transfer, &index_bytes, &total_bytes, &[], &[], &[]];
+            let mut position = SideHeaderBytes::default();
+            position.uleb128(chunk_position(index as u16, total_u16));
+            let mut slices: [&[u8]; 5] = [&transfer, position.as_slice(), &[], &[], &[]];
             let mut offset = 0;
             for (i, part) in parts.iter().enumerate() {
                 let low = start.saturating_sub(offset).min(part.len());
                 let high = end.saturating_sub(offset).min(part.len());
-                slices[i + 3] = &part[low..high];
+                slices[i + 2] = &part[low..high];
                 offset += part.len();
             }
             crate::memory_admission::check(
@@ -910,7 +1015,7 @@ pub(crate) fn send_packet_chunks(
             send(&chunk)?;
             *next_chunk = index + 1;
         }
-        Ok((len, len + total * SIDE_TRANSPORT_CHUNK_OVERHEAD, total))
+        Ok((len, len + chunk_wire_overhead(total_u16), total))
     })
 }
 
@@ -983,6 +1088,32 @@ mod streamed_chunk_tests {
             expected.iter().map(|b| b.as_ref()).collect::<Vec<_>>()
         );
         assert_eq!(next, expected.len());
+    }
+
+    #[test]
+    fn chunk_position_round_trips_and_stays_as_short_as_two_fields() {
+        let uleb = |v: u64| uleb128_len(v);
+        for total in (1u16..=300).chain([1000, 16384, 40000, u16::MAX]) {
+            for index in (0..total).filter(|i| *i < 4 || u32::from(*i) + 4 > u32::from(total) || i % 97 == 0) {
+                let position = chunk_position(index, total);
+                assert_eq!(decode_chunk_position(position), Some((index, total)));
+                // At most one byte longer than separate fields, and never
+                // longer below 23171 chunks.
+                let separate = uleb(index.into()) + uleb(total.into());
+                assert!(uleb(position) <= separate + usize::from(total > 23170));
+            }
+        }
+        assert_eq!(uleb(chunk_position(14, 15)), 1);
+        assert_eq!(decode_chunk_position(chunk_position(u16::MAX - 1, u16::MAX) + 1), None);
+        // Every chunk fits the frame, including multi-byte positions.
+        for (len, max) in [(1, 12), (3000, 1024), (2000, 64), (100_000, 64), (1053, 192)] {
+            let (budget, total) = chunk_layout(len, max).unwrap();
+            let longest = SIDE_TRANSPORT_CHUNK_FIXED_BYTES + uleb(chunk_position(total - 1, total));
+            assert!(budget + longest <= max, "{len} {max}");
+            assert_eq!(usize::from(total), len.div_ceil(budget));
+        }
+        assert_eq!(chunk_layout(1053, 192).unwrap(), (181, 6));
+        assert!(chunk_layout(10, SIDE_TRANSPORT_CHUNK_OVERHEAD).is_err());
     }
 
     #[test]

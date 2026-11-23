@@ -604,7 +604,8 @@ fn write_reliable_header(h: ReliableHeader, out: &mut Vec<u8>) {
 
 #[inline]
 fn reliable_compact_size(h: ReliableHeader) -> usize {
-    let seq_present = (h.flags & RELIABLE_FLAG_ACK_ONLY) == 0 || h.seq != 0;
+    // A zero sequence (unsequenced wrappers, ACK-only frames) is implied.
+    let seq_present = h.seq != 0;
     let ack_present = h.ack != 0 || (h.flags & RELIABLE_FLAG_ACK_ONLY) != 0;
     1 + if seq_present {
         uleb128_size(h.seq as u64)
@@ -637,7 +638,7 @@ pub(crate) fn write_reliable_header_encoded(h: ReliableHeader, compact: bool, ou
         return;
     }
 
-    let seq_present = (h.flags & RELIABLE_FLAG_ACK_ONLY) == 0 || h.seq != 0;
+    let seq_present = h.seq != 0;
     let ack_present = h.ack != 0 || (h.flags & RELIABLE_FLAG_ACK_ONLY) != 0;
     let mut wire_flags = h.flags & RELIABLE_PUBLIC_FLAGS_MASK;
     if seq_present {
@@ -1301,13 +1302,16 @@ fn packet_endpoint_bitmap_present(
 ) -> bool {
     let carries_wire_contract = shape.is_some() || !target_senders.is_empty();
     let endpoints_are_schema_default = endpoints_match_schema(pkt.data_type(), pkt.endpoints());
-    // Reliability controls have a protocol-defined endpoint on every peer;
-    // their receipt contract does not require a second, 32-byte copy of it.
+    // Reliability controls and P2P messages have a protocol-defined endpoint
+    // on every peer; their delivery contract does not require a copy of it.
     // Runtime application types retain explicit endpoints with a frozen
     // contract, since their schemas may differ during discovery/rejoin.
     let fixed_control_endpoints = matches!(
         pkt.data_type(),
-        DataType::ReliableAck | DataType::ReliablePartialAck | DataType::ReliablePacketRequest
+        DataType::ReliableAck
+            | DataType::ReliablePartialAck
+            | DataType::ReliablePacketRequest
+            | DataType::P2pMessage
     );
     // Application catalogs may be complementary or still converging. A short
     // explicit list preserves this packet's actual destinations in that case.

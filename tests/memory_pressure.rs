@@ -1,4 +1,6 @@
 #![cfg(all(feature = "std", feature = "discovery"))]
+#[path = "support/side_chunk.rs"]
+mod side_chunk;
 use sedsnet::config::{register_data_type_with_description, register_endpoint_with_description};
 use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, Router, RouterConfig};
@@ -2918,12 +2920,7 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
     .unwrap();
     let control = Packet::from_f32_slice(control_ty, &[1.0], &[ep], 0).unwrap();
     // Same framing and 40-fragment transfer size as the captured gateway rejects.
-    let mut fragment = b"SDT\x03".to_vec();
-    fragment.extend_from_slice(&1234u32.to_le_bytes());
-    fragment.extend_from_slice(&38u16.to_le_bytes());
-    fragment.extend_from_slice(&40u16.to_le_bytes());
-    fragment.extend_from_slice(&[7u8; 94]);
-    fragment.extend_from_slice(&crc32fast::hash(&fragment).to_le_bytes());
+    let mut fragment = side_chunk::chunk_frame(1234, 38, 40, &[7u8; 94]);
     for use_relay in [false, true] {
         sedsnet::memory_admission::set_probe(None);
         ALLOW.store(true, Ordering::Relaxed);
@@ -2971,10 +2968,7 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
         sedsnet::memory_admission::set_probe_v2(Some(retry_chunk_after_reclaim));
         // No reclaimable work: a different fragment is still refused. The
         // accepted assembly is preserved for retry; no relaxed allocation guard.
-        fragment[8..10].copy_from_slice(&39u16.to_le_bytes());
-        let n = fragment.len();
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(1234, 39, 40, &[7u8; 94]);
         let rejected = if use_relay {
             relay.rx_packed_from_side(li, &fragment)
         } else {
@@ -2989,9 +2983,7 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
             1,
             "protected controls must not be evicted to retry the allocation"
         );
-        fragment[8..10].copy_from_slice(&38u16.to_le_bytes());
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(1234, 38, 40, &[7u8; 94]);
     }
 }
 
@@ -3096,13 +3088,7 @@ fn fragmented_known_topology_recovers_without_two_full_working_copies() {
         .chunks(94)
         .enumerate()
         .map(|(index, bytes)| {
-            let mut out = b"SDT\x03".to_vec();
-            out.extend_from_slice(&8765u32.to_le_bytes());
-            out.extend_from_slice(&(index as u16).to_le_bytes());
-            out.extend_from_slice(&(wire.len().div_ceil(94) as u16).to_le_bytes());
-            out.extend_from_slice(bytes);
-            out.extend_from_slice(&crc32fast::hash(&out).to_le_bytes());
-            out
+            side_chunk::chunk_frame(8765, index as u16, wire.len().div_ceil(94) as u16, bytes)
         })
         .collect::<Vec<_>>();
     for use_relay in [false, true] {
@@ -3231,12 +3217,7 @@ fn duplicate_fragment_retries_cannot_keep_stalled_transfers_alive() {
     use std::sync::atomic::AtomicU64;
     let _lock = TEST_LOCK.lock().unwrap();
     let _reset = Reset;
-    let mut fragment = b"SDT\x03".to_vec();
-    fragment.extend_from_slice(&4321u32.to_le_bytes());
-    fragment.extend_from_slice(&0u16.to_le_bytes());
-    fragment.extend_from_slice(&2u16.to_le_bytes());
-    fragment.extend_from_slice(&[5u8; 94]);
-    fragment.extend_from_slice(&crc32fast::hash(&fragment).to_le_bytes());
+    let fragment = side_chunk::chunk_frame(4321, 0, 2, &[5u8; 94]);
     for use_relay in [false, true] {
         sedsnet::memory_admission::set_probe(None);
         ALLOW.store(true, Ordering::Relaxed);
@@ -3475,12 +3456,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
         let ri = router.add_side_packed("can", |_| Ok(()));
         let relay = Relay::new(Box::new(|| 0));
         let li = relay.add_side_packed("can", |_| Ok(()));
-        let mut fragment = b"SDT\x03".to_vec();
-        fragment.extend_from_slice(&12345u32.to_le_bytes());
-        fragment.extend_from_slice(&0u16.to_le_bytes());
-        fragment.extend_from_slice(&65u16.to_le_bytes());
-        fragment.extend_from_slice(&[7u8; 94]);
-        fragment.extend_from_slice(&[0u8; 4]);
+        let mut fragment;
         for index in 0..64u16 {
             // Alternating ends exercises out-of-order B-tree node splits.
             let index = if index % 2 == 0 {
@@ -3488,10 +3464,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
             } else {
                 63 - index / 2
             };
-            fragment[8..10].copy_from_slice(&index.to_le_bytes());
-            let n = fragment.len();
-            let crc = crc32fast::hash(&fragment[..n - 4]);
-            fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+            fragment = side_chunk::chunk_frame(12345, index, 65, &[7u8; 94]);
             LIVE_ALLOCATION_DELTA.with(|v| v.set(Some(0)));
             PEAK_ALLOCATION_DELTA.with(|v| v.set(0));
             MAX_ALLOCATION.with(|v| v.set(Some(0)));
@@ -3519,10 +3492,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
             }
         }
         // Exceeding the bounded tree requires the original full guard too.
-        fragment[8..10].copy_from_slice(&64u16.to_le_bytes());
-        let n = fragment.len();
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(12345, 64, 65, &[7u8; 94]);
         let result = if use_relay {
             relay.rx_packed_from_side(li, &fragment)
         } else {
@@ -3530,10 +3500,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
         };
         assert!(matches!(result, Err(TelemetryError::Io("memory pressure"))));
         // A new transfer still needs the full initial allocation guard.
-        fragment[4..8].copy_from_slice(&54321u32.to_le_bytes());
-        let n = fragment.len();
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(54321, 64, 65, &[7u8; 94]);
         let result = if use_relay {
             relay.rx_packed_from_side(li, &fragment)
         } else {

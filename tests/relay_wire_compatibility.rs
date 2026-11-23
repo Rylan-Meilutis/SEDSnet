@@ -1,5 +1,7 @@
 //! Public-API compatibility with the last standalone Relay implementation.
 #![cfg(all(feature = "std", feature = "discovery"))]
+#[path = "support/side_chunk.rs"]
+mod side_chunk;
 use sedsnet::{
     MessageClass, MessageDataType, MessageElement, ReliableMode,
     config::{self, DataEndpoint, DataType},
@@ -42,8 +44,8 @@ fn normalize_link_identifiers(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
             }
             match wire[3] {
                 3 => {
-                    assert!(wire.len() >= 16);
-                    wire[4..8].fill(0);
+                    assert!(wire.len() >= 11);
+                    wire[4..6].fill(0);
                 }
                 1 | 2 => {
                     // Template IDs are local dictionary keys. Version-independent
@@ -185,8 +187,11 @@ fn public_relay_preserves_legacy_wire_and_canonical_identity() {
             .iter()
             .map(|p| serde_json::from_value(p["wirebytes"].clone()).unwrap())
             .collect();
-        let old_frames: Vec<Vec<u8>> =
+        let legacy_frames: Vec<Vec<u8>> =
             serde_json::from_value(scenario["old_tx_frames"].clone()).unwrap();
+        // Chunk headers changed on the wire; everything else is frozen.
+        let old_frames =
+            side_chunk::rechunk_legacy(&legacy_frames, options(name).max_frame_bytes);
         let receiver = node("NEW_RECEIVER");
         let input = receiver.add_side_packed_with_options("wire", |_| Ok(()), options(name));
         let canonical = Arc::new(Mutex::new(Vec::new()));

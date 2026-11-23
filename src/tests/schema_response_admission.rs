@@ -367,11 +367,12 @@ fn schema_response_partial_fragments_survive_bursts_and_refresh_only_at_start() 
     assert!(complete);
     let received = frames.lock();
     assert!(received.len() > 1);
-    let transfer_id = &received[0][4..8];
+    let parse = crate::side_transport::test_parse_chunk_frame;
+    let transfer_id = parse(&received[0]).unwrap().0;
     for (index, frame) in received.iter().enumerate() {
-        assert_eq!(&frame[..4], b"SDT\x03");
-        assert_eq!(&frame[4..8], transfer_id);
-        assert_eq!(u16::from_le_bytes([frame[8], frame[9]]) as usize, index);
+        let (transfer, chunk_index, _, _) = parse(frame).unwrap();
+        assert_eq!(transfer, transfer_id);
+        assert_eq!(usize::from(chunk_index), index);
     }
     drop(received);
     // The production queue retains this exact owner through partial IO.
@@ -724,8 +725,9 @@ fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
             .collect();
         assert!(chunks.len() > 1);
         for (index, chunk) in chunks.iter().enumerate() {
-            assert_eq!(&chunk[4..8], &chunks[0][4..8]);
-            assert_eq!(u16::from_le_bytes([chunk[8], chunk[9]]) as usize, index);
+            let parse = crate::side_transport::test_parse_chunk_frame;
+            assert_eq!(parse(chunk).unwrap().0, parse(chunks[0]).unwrap().0);
+            assert_eq!(usize::from(parse(chunk).unwrap().1), index);
         }
     }
 }
@@ -844,8 +846,9 @@ fn refused_ordinary_turn_survives_until_admission_during_partial_schema() {
         .collect();
     assert!(chunks.len() > 1);
     for (index, chunk) in chunks.iter().enumerate() {
-        assert_eq!(&chunk[4..8], &chunks[0][4..8]);
-        assert_eq!(u16::from_le_bytes([chunk[8], chunk[9]]) as usize, index);
+        let parse = crate::side_transport::test_parse_chunk_frame;
+        assert_eq!(parse(chunk).unwrap().0, parse(chunks[0]).unwrap().0);
+        assert_eq!(usize::from(parse(chunk).unwrap().1), index);
     }
 }
 

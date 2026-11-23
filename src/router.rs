@@ -96,10 +96,8 @@ use crate::side_transport::{
     SideHeaderBytes, SideHeaderTemplate,
     SideTransportFrames, extract_side_header_template, extract_side_header_template_view,
     parse_side_transport_wrapper, read_uleb128_local, reconstruct_side_compact_frame,
-    wrap_side_transport_frame, wrap_side_transport_frame_parts,
+    wrap_side_transport_frame, wrap_side_transport_frame_parts, write_uleb128_local,
 };
-#[cfg(test)]
-use crate::side_transport::write_uleb128_local;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
@@ -2191,8 +2189,12 @@ pub type NodeAddress = u32;
 pub type P2pPort = u16;
 pub type P2pStreamId = u32;
 
-const P2P_STREAM_MAGIC: [u8; 4] = *b"SDSP";
-const P2P_STREAM_VERSION: u8 = 1;
+/// First byte of a P2P message: format version 2 in bits 6..7. Bit 5 marks a
+/// stream frame, whose flags occupy bits 0..4.
+const P2P_MESSAGE_TAG: u8 = 0x80;
+const P2P_MESSAGE_VERSION_MASK: u8 = 0xC0;
+const P2P_MESSAGE_STREAM: u8 = 0x20;
+const P2P_STREAM_FLAGS_MASK: u8 = 0x1F;
 const P2P_STREAM_SYN: u8 = 0x01;
 const P2P_STREAM_ACK: u8 = 0x02;
 const P2P_STREAM_FIN: u8 = 0x04;
@@ -2295,6 +2297,8 @@ struct P2pDecoded<'a> {
     source_address: NodeAddress,
     source_port: P2pPort,
     destination_port: P2pPort,
+    /// Stream flags when the message is a stream frame.
+    stream_flags: Option<u8>,
     payload: &'a [u8],
 }
 
@@ -6935,6 +6939,48 @@ impl Router {
         sender != self.sender_arc().as_ref() && !Self::is_end_to_end_ack_sender(sender)
     }
 
+    /// P2P message (format version 2):
+    /// `tag | ULEB dst port | ULEB src port | src address u32 LE |
+    /// ULEB hostname length | hostname | body`. The body runs to the end of
+    /// the packet payload. `stream_section` (from
+    /// [`Self::encode_p2p_stream_payload`]) makes it a stream frame: its flags
+    /// byte joins the tag and its fields follow the hostname.
+    fn encode_p2p_message(
+        src_hostname: &str,
+        src_address: NodeAddress,
+        src_port: P2pPort,
+        dst_port: P2pPort,
+        payload: &[u8],
+        stream_section: bool,
+    ) -> TelemetryResult<crate::SharedBytes> {
+        let (tag, body) = if stream_section {
+            let (&flags, rest) = payload
+                .split_first()
+                .ok_or(TelemetryError::Pack("p2p stream frame empty"))?;
+            if flags & !P2P_STREAM_FLAGS_MASK != 0 {
+                return Err(TelemetryError::Pack("p2p stream flags"));
+            }
+            (P2P_MESSAGE_TAG | P2P_MESSAGE_STREAM | flags, rest)
+        } else {
+            (P2P_MESSAGE_TAG, payload)
+        };
+        let mut out = Vec::with_capacity(
+            14usize
+                .saturating_add(src_hostname.len())
+                .saturating_add(body.len()),
+        );
+        out.push(tag);
+        write_uleb128_local(u64::from(dst_port), &mut out);
+        write_uleb128_local(u64::from(src_port), &mut out);
+        out.extend_from_slice(&src_address.to_le_bytes());
+        write_uleb128_local(src_hostname.len() as u64, &mut out);
+        out.extend_from_slice(src_hostname.as_bytes());
+        out.extend_from_slice(body);
+        Ok(out.into())
+    }
+
+    /// A plain (non-stream) P2P message.
+    #[cfg(test)]
     fn encode_p2p_payload(
         src_hostname: &str,
         src_address: NodeAddress,
@@ -6942,58 +6988,67 @@ impl Router {
         dst_port: P2pPort,
         payload: &[u8],
     ) -> TelemetryResult<crate::SharedBytes> {
-        let host_len = u16::try_from(src_hostname.len())
-            .map_err(|_| TelemetryError::Pack("p2p hostname too long"))?;
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| TelemetryError::Pack("p2p payload too long"))?;
-        let mut out = Vec::with_capacity(
-            15usize
-                .saturating_add(src_hostname.len())
-                .saturating_add(payload.len()),
-        );
-        out.push(1);
-        out.extend_from_slice(&dst_port.to_le_bytes());
-        out.extend_from_slice(&src_port.to_le_bytes());
-        out.extend_from_slice(&src_address.to_le_bytes());
-        out.extend_from_slice(&host_len.to_le_bytes());
-        out.extend_from_slice(&payload_len.to_le_bytes());
-        out.extend_from_slice(src_hostname.as_bytes());
-        out.extend_from_slice(payload);
-        Ok(out.into())
+        Self::encode_p2p_message(src_hostname, src_address, src_port, dst_port, payload, false)
+    }
+
+    /// A P2P stream frame carrying `section` from
+    /// [`Self::encode_p2p_stream_payload`].
+    #[cfg(any(test, feature = "std"))]
+    fn encode_p2p_stream_message(
+        src_hostname: &str,
+        src_address: NodeAddress,
+        src_port: P2pPort,
+        dst_port: P2pPort,
+        section: &[u8],
+    ) -> TelemetryResult<crate::SharedBytes> {
+        Self::encode_p2p_message(src_hostname, src_address, src_port, dst_port, section, true)
     }
 
     fn decode_p2p_payload(payload: &[u8]) -> TelemetryResult<P2pDecoded<'_>> {
-        if payload.len() < 15 {
-            return Err(TelemetryError::Unpack("p2p frame short"));
-        }
-        if payload[0] != 1 {
+        const SHORT: TelemetryError = TelemetryError::Unpack("p2p frame short");
+        let (&tag, _) = payload.split_first().ok_or(SHORT)?;
+        if tag & P2P_MESSAGE_VERSION_MASK != P2P_MESSAGE_TAG {
             return Err(TelemetryError::Unpack("p2p frame version"));
         }
-        let destination_port =
-            u16::from_le_bytes(payload[1..3].try_into().expect("2-byte dst port"));
-        let source_port = u16::from_le_bytes(payload[3..5].try_into().expect("2-byte src port"));
-        let source_address = u32::from_le_bytes(payload[5..9].try_into().expect("4-byte address"));
-        let host_len =
-            u16::from_le_bytes(payload[9..11].try_into().expect("2-byte host len")) as usize;
-        let body_len =
-            u32::from_le_bytes(payload[11..15].try_into().expect("4-byte body len")) as usize;
-        let host_start = 15usize;
-        let host_end = host_start.saturating_add(host_len);
-        let body_end = host_end.saturating_add(body_len);
-        if host_end > payload.len() || body_end != payload.len() {
-            return Err(TelemetryError::Unpack("p2p frame length"));
-        }
-        let source_hostname = core::str::from_utf8(&payload[host_start..host_end])
+        let stream_flags = if tag & P2P_MESSAGE_STREAM != 0 {
+            Some(tag & P2P_STREAM_FLAGS_MASK)
+        } else if tag & P2P_STREAM_FLAGS_MASK != 0 {
+            return Err(TelemetryError::Unpack("p2p frame version"));
+        } else {
+            None
+        };
+        let mut off = 1usize;
+        let port = |off: &mut usize| -> TelemetryResult<P2pPort> {
+            P2pPort::try_from(read_uleb128_local(payload, off).map_err(|_| SHORT)?)
+                .map_err(|_| TelemetryError::Unpack("p2p port"))
+        };
+        let destination_port = port(&mut off)?;
+        let source_port = port(&mut off)?;
+        let address = payload.get(off..off + 4).ok_or(SHORT)?;
+        let source_address = u32::from_le_bytes(address.try_into().expect("4-byte address"));
+        off += 4;
+        let host_len = usize::try_from(read_uleb128_local(payload, &mut off).map_err(|_| SHORT)?)
+            .map_err(|_| TelemetryError::Unpack("p2p frame length"))?;
+        let host_end = off
+            .checked_add(host_len)
+            .filter(|&end| end <= payload.len())
+            .ok_or(TelemetryError::Unpack("p2p frame length"))?;
+        let source_hostname = core::str::from_utf8(&payload[off..host_end])
             .map_err(|_| TelemetryError::Unpack("p2p hostname utf8"))?;
         Ok(P2pDecoded {
             source_hostname,
             source_address,
             source_port,
             destination_port,
-            payload: &payload[host_end..body_end],
+            stream_flags,
+            payload: &payload[host_end..],
         })
     }
 
+    /// The stream section a P2P stream frame carries:
+    /// `flags | ULEB src stream id | ULEB dst stream id | ULEB sequence | body`.
+    /// [`Self::encode_p2p_stream_message`] moves `flags` into the message tag;
+    /// the body runs to the end of the packet payload.
     fn encode_p2p_stream_payload(
         flags: u8,
         source_stream_id: P2pStreamId,
@@ -7001,48 +7056,42 @@ impl Router {
         sequence: u32,
         payload: &[u8],
     ) -> TelemetryResult<crate::SharedBytes> {
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| TelemetryError::Pack("p2p stream payload too long"))?;
-        let mut out = Vec::with_capacity(22usize.saturating_add(payload.len()));
-        out.extend_from_slice(&P2P_STREAM_MAGIC);
-        out.push(P2P_STREAM_VERSION);
+        if flags & !P2P_STREAM_FLAGS_MASK != 0 {
+            return Err(TelemetryError::Pack("p2p stream flags"));
+        }
+        let mut out = Vec::with_capacity(16usize.saturating_add(payload.len()));
         out.push(flags);
-        out.extend_from_slice(&source_stream_id.to_le_bytes());
-        out.extend_from_slice(&destination_stream_id.to_le_bytes());
-        out.extend_from_slice(&sequence.to_le_bytes());
-        out.extend_from_slice(&payload_len.to_le_bytes());
+        write_uleb128_local(u64::from(source_stream_id), &mut out);
+        write_uleb128_local(u64::from(destination_stream_id), &mut out);
+        write_uleb128_local(u64::from(sequence), &mut out);
         out.extend_from_slice(payload);
         Ok(out.into())
     }
 
-    fn decode_p2p_stream_payload(payload: &[u8]) -> TelemetryResult<Option<P2pStreamDecoded<'_>>> {
-        if !payload.starts_with(&P2P_STREAM_MAGIC) {
+    fn decode_p2p_stream_payload<'a>(
+        message: &P2pDecoded<'a>,
+    ) -> TelemetryResult<Option<P2pStreamDecoded<'a>>> {
+        let Some(flags) = message.stream_flags else {
             return Ok(None);
-        }
-        if payload.len() < 22 {
-            return Err(TelemetryError::Unpack("p2p stream frame short"));
-        }
-        if payload[4] != P2P_STREAM_VERSION {
-            return Err(TelemetryError::Unpack("p2p stream frame version"));
-        }
-        let flags = payload[5];
-        let source_stream_id =
-            u32::from_le_bytes(payload[6..10].try_into().expect("stream source id"));
-        let destination_stream_id =
-            u32::from_le_bytes(payload[10..14].try_into().expect("stream destination id"));
-        let sequence = u32::from_le_bytes(payload[14..18].try_into().expect("stream sequence"));
-        let body_len =
-            u32::from_le_bytes(payload[18..22].try_into().expect("stream body len")) as usize;
-        let body_end = 22usize.saturating_add(body_len);
-        if body_end != payload.len() {
-            return Err(TelemetryError::Unpack("p2p stream frame length"));
-        }
+        };
+        let payload = message.payload;
+        let mut off = 0usize;
+        let mut field = || -> TelemetryResult<u32> {
+            u32::try_from(
+                read_uleb128_local(payload, &mut off)
+                    .map_err(|_| TelemetryError::Unpack("p2p stream frame short"))?,
+            )
+            .map_err(|_| TelemetryError::Unpack("p2p stream frame field"))
+        };
+        let source_stream_id = field()?;
+        let destination_stream_id = field()?;
+        let sequence = field()?;
         Ok(Some(P2pStreamDecoded {
             flags,
             source_stream_id,
             destination_stream_id,
             sequence,
-            payload: &payload[22..],
+            payload: &payload[off..],
         }))
     }
 
@@ -7084,7 +7133,7 @@ impl Router {
             return Ok(());
         }
         let decoded = Self::decode_p2p_payload(pkt.payload())?;
-        if let Some(stream) = Self::decode_p2p_stream_payload(decoded.payload)? {
+        if let Some(stream) = Self::decode_p2p_stream_payload(&decoded)? {
             // Routing attribution consistency only, never authentication. A
             // compact alias must resolve through the existing unique matcher.
             if !self.sender_matches_hostname(pkt.sender(), decoded.source_hostname) {
@@ -7341,7 +7390,7 @@ impl Router {
             }
         }
         if let Some((dst, dst_port, src_port, payload)) = reply {
-            self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+            self.send_p2p_stream_to_entry(dst, dst_port, src_port, &payload)?;
         }
         for pending in events {
             for handler in pending.handlers {
@@ -15640,15 +15689,9 @@ impl Router {
                 Ok(Some(frame))
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
-                if body.len() < 8 {
-                    return Err(TelemetryError::Unpack("short side chunk frame"));
-                }
-                let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                let index = u16::from_le_bytes([body[4], body[5]]);
-                let total = u16::from_le_bytes([body[6], body[7]]);
-                if total == 0 || index >= total {
-                    return Err(TelemetryError::Unpack("invalid side chunk index"));
-                }
+                let (transfer_id, index, total, header_len) =
+                    crate::side_transport::parse_chunk_header(body)?;
+                let payload = &body[header_len..];
                 let assembled = {
                     let mut st = self.state.lock();
                     let now_ms = self.clock.now_ms();
@@ -15656,7 +15699,7 @@ impl Router {
                     // sender from its first chunk (this one or the retained one).
                     #[cfg(feature = "discovery")]
                     let refused_schema = if index == 0 {
-                        wire_format::chunked_schema_source(&body[8..])
+                        wire_format::chunked_schema_source(payload)
                     } else {
                         st.side_transport
                             .get(&side)
@@ -15665,7 +15708,7 @@ impl Router {
                             .and_then(wire_format::chunked_schema_source)
                     };
                     let room =
-                        st.make_side_chunk_room(side, transfer_id, index, total, body.len() - 8);
+                        st.make_side_chunk_room(side, transfer_id, index, total, payload.len());
                     #[cfg(feature = "discovery")]
                     if let (Err(TelemetryError::PacketTooLarge(_)), Some(address)) =
                         (&room, refused_schema)
@@ -15718,7 +15761,7 @@ impl Router {
                     let entry = side_state.rx_chunks.entry(transfer_id).or_default();
                     entry.total = total;
                     let added =
-                        entry.insert_with(index, now_ms, || Arc::<[u8]>::from(&body[8..]))?;
+                        entry.insert_with(index, now_ms, || Arc::<[u8]>::from(payload))?;
                     side_state.rx_chunk_bytes = side_state.rx_chunk_bytes.saturating_add(added);
                     if entry.received_len() == usize::from(total) {
                         let entry = side_state
@@ -17817,16 +17860,52 @@ impl Router {
         src_port: P2pPort,
         payload: &[u8],
     ) -> TelemetryResult<()> {
+        self.send_p2p_message_to_entry(dst, dst_port, src_port, payload, false)
+    }
+
+    /// Send a stream section from [`Self::encode_p2p_stream_payload`].
+    fn send_p2p_stream_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        section: &[u8],
+    ) -> TelemetryResult<()> {
+        self.send_p2p_message_to_entry(dst, dst_port, src_port, section, true)
+    }
+
+    /// Send a raw stream section to a hostname (tests forge stream frames).
+    #[cfg(test)]
+    fn send_p2p_stream_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        section: &[u8],
+    ) -> TelemetryResult<()> {
+        let dst = self.resolve_hostname(hostname).ok_or(TelemetryError::BadArg)?;
+        self.send_p2p_stream_to_entry(dst, dst_port, src_port, section)
+    }
+
+    fn send_p2p_message_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+        stream_section: bool,
+    ) -> TelemetryResult<()> {
         if dst_port == 0 {
             return Err(TelemetryError::BadArg);
         }
         let local = self.state.lock().local_address.clone();
-        let payload = Self::encode_p2p_payload(
+        let payload = Self::encode_p2p_message(
             local.hostname.as_ref(),
             local.address,
             src_port,
             dst_port,
             payload,
+            stream_section,
         )?;
         let pkt = Packet::new(
             DataType::P2pMessage,
@@ -17907,7 +17986,7 @@ impl Router {
             stream_id
         };
         let payload = Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
-        self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+        self.send_p2p_stream_to_entry(dst, dst_port, src_port, &payload)?;
         Ok(stream_id)
     }
 
@@ -17980,11 +18059,11 @@ impl Router {
         if refresh_syn {
             let syn_payload =
                 Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
-            self.send_p2p_to_entry(dst.clone(), dst_port, src_port, &syn_payload)?;
+            self.send_p2p_stream_to_entry(dst.clone(), dst_port, src_port, &syn_payload)?;
         }
         let stream_payload =
             Self::encode_p2p_stream_payload(flags, stream_id, peer_stream_id, seq, payload)?;
-        self.send_p2p_to_entry(dst, dst_port, src_port, &stream_payload)?;
+        self.send_p2p_stream_to_entry(dst, dst_port, src_port, &stream_payload)?;
         if flags & (P2P_STREAM_FIN | P2P_STREAM_RST) != 0 {
             let mut state = self.state.lock();
             #[cfg(feature = "std")]
@@ -24698,16 +24777,13 @@ mod queued_schema_identity_tests {
             received.len() > 1,
             "fixture must exercise fragmentation, not a compressed single frame"
         );
-        let first = &received[0];
-        assert_eq!(&first[..4], &[83, 68, 84, 3]);
-        assert_eq!(
-            u16::from_le_bytes([first[10], first[11]]) as usize,
-            received.len()
-        );
-        let transfer_id = &first[4..8];
+        let parse = crate::side_transport::test_parse_chunk_frame;
+        let (transfer_id, _, total, _) = parse(&received[0]).unwrap();
+        assert_eq!(usize::from(total), received.len());
         for (index, frame) in received.iter().enumerate() {
-            assert_eq!(&frame[4..8], transfer_id);
-            assert_eq!(u16::from_le_bytes([frame[8], frame[9]]) as usize, index);
+            let (transfer, chunk_index, _, _) = parse(frame).unwrap();
+            assert_eq!(transfer, transfer_id);
+            assert_eq!(usize::from(chunk_index), index);
         }
     }
     #[test]

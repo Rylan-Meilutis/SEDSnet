@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+Smaller framing for bulk P2P streams over constrained links. **Breaking wire
+change:** every node on a network must run this release (P2P messages,
+side-transport chunks and the compact reliable header changed; older peers
+reject or misread the new frames). Public Rust, C and Python APIs are
+unchanged.
+
+- **Compact P2P message and stream framing.** The P2P message header is now a
+  tag byte (format version 2; a stream bit and the stream flags), ULEB128
+  ports and hostname length, the 4-byte source address and the hostname. The
+  body runs to the end of the packet payload, so neither layer repeats a
+  length. Stream frames are marked by the tag instead of an in-band `SDSP`
+  magic (a plain datagram can no longer be taken for a stream frame) and carry
+  ULEB128 stream ids and sequence with no separate magic, version, flags or
+  length. A stream data frame's P2P header shrinks from 37 bytes plus the
+  hostname to about 14 bytes plus the hostname (one port below 16384, one
+  ephemeral port, small stream ids, sequence below 128).
+- **P2P envelopes omit their endpoint list.** Like the reliability controls,
+  `P2pMessage` has a protocol-defined endpoint, so frames carrying a target
+  contract no longer repeat it (2 bytes).
+- **Compact reliable header omits a zero sequence.** Unsequenced end-to-end
+  wrappers on hops without hop reliability are one byte instead of two.
+- **Smaller side-transport chunks.** Kind `0x03` chunks keep the `SDT` magic,
+  kind byte and per-chunk CRC32, but carry a 16-bit transfer id and one
+  ULEB128 position encoding both index and total
+  (`total * (total - 1) / 2 + index`): 11 bytes per chunk instead of 16 for
+  transfers of up to 15 chunks, and no more than separate index and total
+  fields would cost below 23171 chunks.
+  Reassembly bounds, budgets and integrity checks are unchanged; a transfer-id
+  collision can only fail the reassembled frame's CRC32.
+- **Measured** with the new `tests/p2p_stream_radio_overhead.rs` harness (leaf
+  -> two-sided bridge -> station; 64-byte CAN-style frames, 192-byte radio
+  frames, `ipv6_like` profile, no hop reliability, 4-byte link header per
+  radio frame), bytes on air per stream message down the radio:
+
+  | Body | Before | Now | Radio frames |
+  |---|---|---|---|
+  | 512 B | 666.7 B | 620.7 B | 4 -> 4 |
+  | 1000 B | 1214.8 B | 1138.8 B | 7 -> 6 |
+  | 2000 B | 2315.0 B | 2229.0 B | 12 -> 12 |
+
+  Per radio frame the side-transport plus link overhead drops from 20 to 15
+  bytes; per message the P2P headers drop from 41 to 18 bytes (4-character
+  hostname) and the envelope by 3 bytes. The end-to-end ACK returned per
+  message is unchanged (about 51 bytes on air).
+
 ## 6.0.3
 
 Queue dispatch performance release.

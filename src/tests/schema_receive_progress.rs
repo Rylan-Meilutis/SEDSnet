@@ -54,12 +54,22 @@ fn fixture() -> serde_json::Value {
     serde_json::from_str(include_str!("fixtures/schema-progress-20261027.json")).unwrap()
 }
 fn frame(v: &serde_json::Value) -> Vec<u8> {
-    v["bytes"]
+    let legacy: Vec<u8> = v["bytes"]
         .as_array()
         .unwrap()
         .iter()
         .map(|b| b.as_u64().unwrap() as u8)
-        .collect()
+        .collect();
+    // Captured with the former chunk header (transfer u32, index u16, total
+    // u16); re-wrap the same fragment in the current chunk header.
+    assert!(legacy.starts_with(b"SDT\x03"));
+    let body = &legacy[4..legacy.len() - 4];
+    crate::side_transport::test_chunk_frame(
+        u32::from_le_bytes(body[0..4].try_into().unwrap()),
+        u16::from_le_bytes([body[4], body[5]]),
+        u16::from_le_bytes([body[6], body[7]]),
+        &body[8..],
+    )
 }
 #[test]
 fn captured_same_peer_progress_defers_redundant_schema_request_until_complete() {
@@ -303,8 +313,7 @@ fn progressive_catalog_closed_loop_avoids_a_second_full_response() {
         .unwrap()
         .iter()
         .flat_map(|v| {
-            let b = frame(v);
-            b[12..b.len() - 4].to_vec()
+            crate::side_transport::test_parse_chunk_frame(&frame(v)).unwrap().3.to_vec()
         })
         .collect();
     let initial = wire_format::unpack_packet(&canonical).unwrap();

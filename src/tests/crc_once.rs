@@ -239,15 +239,7 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
             .iter()
             .enumerate()
             .map(|(index, part)| {
-                let mut body = 0x0BAD_F00Du32.to_le_bytes().to_vec();
-                body.extend_from_slice(&(index as u16).to_le_bytes());
-                body.extend_from_slice(&2u16.to_le_bytes());
-                body.extend_from_slice(part);
-                crate::side_transport::wrap_side_transport_frame(
-                    crate::side_transport::SIDE_TRANSPORT_KIND_CHUNK,
-                    &body,
-                )
-                .to_vec()
+                crate::side_transport::test_chunk_frame(0x0BAD_F00D, index as u16, 2, part)
             })
             .collect()
     };

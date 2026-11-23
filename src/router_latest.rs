@@ -1995,6 +1995,7 @@ mod tests {
         let mut saw_partial_marker = false;
         let mut schema_frames_during_large = 0;
         let mut catalog_frames_before_large = 0;
+        let mut schema_transfer = None;
         for ms in 1..=64 {
             now.store(ms, Ordering::SeqCst);
             allowance.store(1, Ordering::SeqCst);
@@ -2013,8 +2014,16 @@ mod tests {
                 saw_partial_marker |= marked == 1;
             }
             for raw in core::mem::take(&mut *output.lock().unwrap()) {
-                let schema_chunk = raw.starts_with(b"SDT\x03")
-                    && u32::from_le_bytes(raw[4..8].try_into().unwrap()) == 3937645761;
+                // The captured catalog's transfer, learned from its first chunk.
+                if let Some((transfer, 0, _, prefix)) =
+                    crate::side_transport::test_parse_chunk_frame(&raw)
+                    && wire_format::peek_frame_info_inner(prefix)
+                        .is_ok_and(|info| info.envelope.ty == DataType::DiscoverySchema)
+                {
+                    schema_transfer = Some(transfer);
+                }
+                let schema_chunk = crate::side_transport::test_parse_chunk_frame(&raw)
+                    .is_some_and(|chunk| Some(chunk.0) == schema_transfer);
                 if schema_chunk && !original_received {
                     if saw_partial_marker && ms > 1 {
                         schema_frames_during_large += 1;
@@ -2347,7 +2356,7 @@ mod tests {
             .iter()
             .map(|raw| {
                 assert!(raw.starts_with(b"SDT\x03"));
-                u32::from_le_bytes(raw[4..8].try_into().unwrap())
+                crate::side_transport::test_parse_chunk_frame(raw).unwrap().0
             })
             .collect();
         assert_eq!(
@@ -2565,7 +2574,7 @@ mod tests {
             .iter()
             .map(|raw| {
                 assert!(raw.starts_with(b"SDT\x03"));
-                u32::from_le_bytes(raw[4..8].try_into().unwrap())
+                crate::side_transport::test_parse_chunk_frame(raw).unwrap().0
             })
             .collect();
         assert!(
@@ -2801,7 +2810,7 @@ mod tests {
             .iter()
             .map(|raw| {
                 assert!(raw.starts_with(b"SDT\x03"));
-                u32::from_le_bytes(raw[4..8].try_into().unwrap())
+                crate::side_transport::test_parse_chunk_frame(raw).unwrap().0
             })
             .collect();
         assert_eq!(
@@ -2871,7 +2880,7 @@ mod tests {
             let result = router.dispatch_tx_queue_with_timeout(1);
             for frame in core::mem::take(&mut *accepted.lock().unwrap()) {
                 if frame.starts_with(b"SDT\x03") {
-                    let transfer = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+                    let transfer = crate::side_transport::test_parse_chunk_frame(&frame).unwrap().0;
                     if transfers.contains(&transfer) {
                         assert!(
                             !fresh_started || original_received,
@@ -3216,7 +3225,7 @@ mod tests {
         assert_eq!(prefixes.len(), 3);
         let catalog_transfers: std::collections::BTreeSet<_> = prefixes
             .iter()
-            .map(|raw| u32::from_le_bytes(raw[4..8].try_into().unwrap()))
+            .map(|raw| crate::side_transport::test_parse_chunk_frame(raw).unwrap().0)
             .collect();
         assert_eq!(catalog_transfers.len(), 3);
         router.set_latest_value_side(Some(side)).unwrap();
@@ -3257,7 +3266,7 @@ mod tests {
             router.dispatch_tx_queue_with_timeout(1).unwrap();
             for raw in core::mem::take(&mut *accepted.lock().unwrap()) {
                 if raw.starts_with(b"SDT\x03") {
-                    let transfer = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+                    let transfer = crate::side_transport::test_parse_chunk_frame(&raw).unwrap().0;
                     if !catalog_transfers.contains(&transfer) {
                         first_transfer = Some(transfer);
                     }
@@ -3308,7 +3317,7 @@ mod tests {
         for _ in 0..5000 {
             for raw in core::mem::take(&mut pending_frames) {
                 if raw.starts_with(b"SDT\x03") {
-                    let transfer = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+                    let transfer = crate::side_transport::test_parse_chunk_frame(&raw).unwrap().0;
                     let is_fresh = if control_first {
                         !catalog_transfers.contains(&transfer) && transfer != first_transfer
                     } else {

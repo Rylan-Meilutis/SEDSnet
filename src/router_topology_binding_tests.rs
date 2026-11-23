@@ -65,7 +65,7 @@ impl Fixture {
         let (sender, name, address) = identity;
         let stream = Router::encode_p2p_stream_payload(flags, ids.0, ids.1, 0, body).unwrap();
         let outer =
-            Router::encode_p2p_payload(name, address, ports.0, ports.1, stream.as_ref()).unwrap();
+            Router::encode_p2p_stream_message(name, address, ports.0, ports.1, stream.as_ref()).unwrap();
         let packet = Packet::new(
             DataType::P2pMessage,
             &[DataEndpoint::Discovery],
@@ -276,3 +276,31 @@ fn topology_binding_compact_alias_accepts_only_current_unique_topology_name() {
     );
     assert_eq!(f.session(id), (77, true, 7, true));
 }
+
+#[test]
+fn compact_p2p_framing_round_trips_and_keeps_streams_apart_from_datagrams() {
+    let plain = Router::encode_p2p_payload("NODE", 0xDEAD_BEEF, 49152, 4000, b"SDSP\x01data").unwrap();
+    assert_eq!(plain.len(), 1 + 2 + 3 + 4 + 1 + 4 + 9);
+    let decoded = Router::decode_p2p_payload(plain.as_ref()).unwrap();
+    assert_eq!(
+        (decoded.source_hostname, decoded.source_address, decoded.source_port, decoded.destination_port),
+        ("NODE", 0xDEAD_BEEF, 49152, 4000)
+    );
+    assert_eq!(decoded.payload, b"SDSP\x01data");
+    assert!(Router::decode_p2p_stream_payload(&decoded).unwrap().is_none());
+    let section = Router::encode_p2p_stream_payload(P2P_STREAM_DATA, 3, 7, 300, b"body").unwrap();
+    let message = Router::encode_p2p_stream_message("NODE", 1, 49152, 4000, section.as_ref()).unwrap();
+    // tag, ports 2+3, address 4, hostname 1+4, ids 1+1, sequence 2, body 4.
+    assert_eq!(message.len(), 1 + 5 + 4 + 5 + 4 + 4);
+    let decoded = Router::decode_p2p_payload(message.as_ref()).unwrap();
+    let stream = Router::decode_p2p_stream_payload(&decoded).unwrap().unwrap();
+    assert_eq!(
+        (stream.flags, stream.source_stream_id, stream.destination_stream_id, stream.sequence, stream.payload),
+        (P2P_STREAM_DATA, 3, 7, 300, &b"body"[..])
+    );
+    // Version 1 tags, stray flag bits and truncation are rejected.
+    for bad in [&[1u8, 0, 0][..], &[0x81, 1, 1, 0, 0, 0, 0, 0][..], &message.as_ref()[..7]] {
+        assert!(Router::decode_p2p_payload(bad).is_err());
+    }
+}
+

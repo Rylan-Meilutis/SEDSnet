@@ -212,6 +212,9 @@ When top-level flag `0x40` is set, the reliable header is the compact form:
 The compact form is used only when it is smaller than the fixed form. Normal reliable data frames
 with small sequence numbers and no piggyback ACK encode as `REL_WIRE_FLAGS + VARINT(seq)`.
 ACK-only reliable frames with small ACK values encode as `REL_WIRE_FLAGS + VARINT(ack)`.
+A zero sequence is never written (bit2 clear; the decoder reads an absent field as zero), so an
+unsequenced wrapper, which end-to-end reliable traffic carries on hops without hop reliability, is
+the single byte `REL_WIRE_FLAGS`.
 
 Reliable control traffic now primarily uses built-in internal packet types such as:
 
@@ -270,6 +273,30 @@ same side-local template id compaction when `max_frame_bytes` is non-zero. When 
 frame is too large, the sender emits kind `0x03` chunks whose individual callback payloads do not
 exceed the configured maximum. The receiver reassembles those chunks into the original
 side-transport frame and then resumes normal packet processing.
+
+### Chunk frames (kind `0x03`)
+
+```text
+[magic: "SDT"]
+[kind: 0x03]
+[transfer id: u16 LE]             // stable content id of the chunked frame, never zero
+[position: ULEB128]               // total * (total - 1) / 2 + index
+[chunk bytes]
+[CRC32: u32 LE]                   // checksum of magic + kind + body
+```
+
+One ULEB128 position names both the chunk index and the chunk count: `total` is the largest `t`
+with `t * (t - 1) / 2 <= position`, and `index = position - total * (total - 1) / 2`. Up to 15
+chunks the position is one byte, so a chunk costs 11 bytes of overhead (it was 16: a 32-bit
+transfer id and fixed 16-bit index and total). Below 23171 chunks the position is never longer than
+two separate ULEB128 fields would be; a transfer has at most 65535 chunks. The sender sizes chunk bodies for
+the longest position of the transfer, so no chunk exceeds `max_frame_bytes`.
+
+Integrity is unchanged: every chunk carries its CRC32, and the reassembled frame is a complete
+canonical (or side-transport) frame that is verified by its own CRC32 when it re-enters. Two
+in-flight transfers on one side that share a 16-bit id, or a chunk whose total disagrees with its
+transfer's, can only make that reassembly fail its check and be dropped (end-to-end reliability
+resends it); the per-side reassembly bound and receive budget are unchanged.
 
 ## Compact Side Profiles
 

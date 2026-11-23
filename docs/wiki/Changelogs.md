@@ -1,5 +1,15 @@
 # Changelogs
 
+## Unreleased highlights
+
+- Breaking wire change for bulk P2P streams on constrained links: a compact P2P
+  message/stream header (tag byte, ULEB128 ports, stream ids and sequence, no
+  repeated lengths or `SDSP` magic), P2P envelopes without an endpoint list, a
+  one-byte unsequenced reliable header, and 11-byte side-transport chunk
+  headers (16-bit transfer id, one ULEB128 position) instead of 16. A 1000-byte
+  stream message now takes 6 radio frames and 1139 bytes on a 192-byte-frame
+  link instead of 7 and 1215. Every node must update together.
+
 ## Version 6.0.3 highlights
 
 - Unroutable reliable packets no longer spin the queue. A packet whose

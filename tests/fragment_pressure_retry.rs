@@ -1,4 +1,6 @@
 #![cfg(all(feature = "std", feature = "discovery"))]
+#[path = "support/side_chunk.rs"]
+mod side_chunk;
 use sedsnet::{
     MessageClass, MessageDataType, MessageElement, ReliableMode,
     config::{self, DataEndpoint, DataType},
@@ -67,27 +69,21 @@ fn baseline(ep: DataEndpoint) -> Packet {
 fn check_fragments(frames: &[Vec<u8>], packet: &Packet) {
     assert!(frames.len() > 2, "test must exercise fragmented transfer");
     let mut bytes = Vec::new();
+    let first = side_chunk::parse_chunk(&frames[0]).unwrap();
     for (i, frame) in frames.iter().enumerate() {
-        assert_eq!(&frame[..4], b"SDT\x03");
+        let (transfer, index, total, payload) = side_chunk::parse_chunk(frame).unwrap();
         assert_eq!(
-            u16::from_le_bytes([frame[8], frame[9]]) as usize,
+            usize::from(index),
             i,
             "accepted fragments were retransmitted or skipped"
         );
-        assert_eq!(
-            u16::from_le_bytes([frame[10], frame[11]]) as usize,
-            frames.len()
-        );
-        assert_eq!(
-            &frame[4..8],
-            &frames[0][4..8],
-            "transfer identity changed while deferred"
-        );
+        assert_eq!(usize::from(total), frames.len());
+        assert_eq!(transfer, first.0, "transfer identity changed while deferred");
         assert_eq!(
             crc32fast::hash(&frame[..frame.len() - 4]),
             u32::from_le_bytes(frame[frame.len() - 4..].try_into().unwrap())
         );
-        bytes.extend_from_slice(&frame[12..frame.len() - 4]);
+        bytes.extend_from_slice(payload);
     }
     let decoded = sedsnet::wire_format::unpack_packet(&bytes).unwrap();
     assert_eq!(decoded.data_type(), packet.data_type());
