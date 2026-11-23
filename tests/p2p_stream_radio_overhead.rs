@@ -195,12 +195,13 @@ fn uleb(buf: &[u8], off: &mut usize) -> u64 {
     }
 }
 
-/// Parse one side-transport chunk: (transfer, index, total, header bytes, body).
+/// Parse one side-transport chunk (kind 0x61, CRC32 trailer):
+/// (transfer, index, total, header bytes, body).
 fn parse_chunk(frame: &[u8]) -> Option<(u32, usize, usize, usize, &[u8])> {
-    if !frame.starts_with(b"SDT") || frame.get(3) != Some(&0x03) {
+    if frame.first() != Some(&0x61) {
         return None;
     }
-    let body = &frame[4..frame.len() - 4];
+    let body = &frame[1..frame.len() - 4];
 
     // Transfer id u16 LE, then one ULEB128 position naming index and total:
     // total * (total - 1) / 2 + index.
@@ -212,7 +213,7 @@ fn parse_chunk(frame: &[u8]) -> Option<(u32, usize, usize, usize, &[u8])> {
         total += 1;
     }
     let index = position - total * (total - 1) / 2;
-    Some((transfer, index, total, 4 + off + 4, &body[off..]))
+    Some((transfer, index, total, 1 + off + 4, &body[off..]))
 }
 
 fn tally(frames: &[Vec<u8>]) -> Tally {

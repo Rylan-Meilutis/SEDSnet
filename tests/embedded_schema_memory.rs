@@ -199,8 +199,11 @@ fn embedded_schema_encodes_directly_into_one_large_allocation() {
             ..Default::default()
         },
     );
-    let mut full = b"SDT\x01\x01".to_vec();
-    full.extend_from_slice(&raw);
+    // FULL frame: kind, template id 1 generation 0 (ULEB128 of 1 << 3),
+    // base delta 0, the canonical frame without its CRC, then a CRC32 of
+    // the whole FULL frame.
+    let mut full = vec![0x60, 1 << 3, 0];
+    full.extend_from_slice(&raw[..raw.len() - 4]);
     full.extend_from_slice(&crc32fast::hash(&full).to_le_bytes());
     let mut corrupt = raw.to_vec();
     *corrupt.last_mut().unwrap() ^= 1;

@@ -88,7 +88,7 @@ fn model_profile(period: u64, latest_enabled: bool, data_start: u64) -> serde_js
     let (side,_tracker)=router.add_side_packed_leased_with_priority_and_options("radio",move|lease,priority|{
         if !enabled.load(Ordering::SeqCst){return Err(TelemetryError::Io("side tx busy"));}
         let raw=lease.bytes();let length=raw.len();let at=time.load(Ordering::SeqCst);
-        let control=priority>=200&&priority!=254&&!raw.starts_with(b"SDT")&&!wire_format::peek_frame_info(raw).is_ok_and(|p|crate::discovery::is_discovery_type(p.envelope.ty));
+        let control=priority>=200&&priority!=254&&!crate::side_transport::side_frame_kind(raw).is_some()&&!wire_format::peek_frame_info(raw).is_ok_and(|p|crate::discovery::is_discovery_type(p.envelope.ty));
         let mut p=pipe.lock().unwrap();let allowed=if control{p.control+length<=2048}else{p.ordinary+length<=256};
         let ordinary=p.ordinary;let controls=p.control;
         p.callback_events.push(serde_json::json!({"at_ms":at,"identity":identity(raw),"length":length,"priority":priority,"accepted":allowed,"pending_ordinary":ordinary,"pending_control":controls}));

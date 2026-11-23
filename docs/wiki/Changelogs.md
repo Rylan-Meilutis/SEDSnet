@@ -1,14 +1,28 @@
 # Changelogs
 
-## Unreleased highlights
+## Version 7.0.0 highlights
 
-- Breaking wire change for bulk P2P streams on constrained links: a compact P2P
-  message/stream header (tag byte, ULEB128 ports, stream ids and sequence, no
-  repeated lengths or `SDSP` magic), P2P envelopes without an endpoint list, a
-  one-byte unsequenced reliable header, and 11-byte side-transport chunk
-  headers (16-bit transfer id, one ULEB128 position) instead of 16. A 1000-byte
-  stream message now takes 6 radio frames and 1139 bytes on a 192-byte-frame
-  link instead of 7 and 1215. Every node must update together.
+- Breaking wire change (every node updates together): wire format 7 shrinks
+  headers for all traffic. Canonical telemetry `f32 x3` frames 42 to 37 bytes,
+  a hop-sequenced reliable command 36 to 29; on a point-to-point templated
+  UART/radio link telemetry costs 22.3 bytes per packet instead of 37.8; a
+  compact-bundle record 15 bytes instead of 18.75, so one 691-byte radio turn
+  carries 44 telemetry packets instead of 35 (30 instead of 18 as templated
+  frames).
+- Canonical frame: no endpoint count byte or bitmap, logical size only for
+  compressed or sealed payloads, a one-byte time-base epoch field, an
+  always-compact reliable header, static header first, and no nonce for
+  packets with a fresh timestamp (a sequenced one otherwise).
+- Side transports: no `SDT` magic (first-byte kinds), small template ids with
+  a generation, timestamp deltas from a template base, 8-byte chunk headers,
+  and a CRC32 of all its own bytes ending every frame so any hop can check it.
+  Templates are used only on point-to-point sides (one discovered hop-local
+  peer, or `SideOptions::point_to_point`).
+- Compact bundles: `BundleWriter` fills a bundle to a byte budget in priority
+  order, optional per-record CRCs, v7 record elision; C
+  `seds_compact_bundle_pack_budget` and `seds_frame_priority`.
+- P2P stream framing (41 to 18 bytes per message) and other 6.x stream work.
+- `tools/wire_v6_to_v7.py` re-encodes captured SEDSnet 6 frames.
 
 ## Version 6.0.3 highlights
 

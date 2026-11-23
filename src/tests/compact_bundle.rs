@@ -98,7 +98,7 @@ fn mixed_frames() -> Vec<Vec<u8>> {
 fn round_trip_rebuilds_every_canonical_frame_byte_for_byte() {
     let frames = mixed_frames();
     assert!(frames.iter().any(|f| f[0] & 0x01 != 0), "fixture needs a compressed frame");
-    assert!(frames.iter().any(|f| f[0] & 0x80 != 0), "fixture needs an endpoint list");
+    assert!(frames.iter().any(|f| f[0] & 0x60 == 0x40), "fixture needs an endpoint list");
     for f in &frames {
         assert!(frame_bundleable(f));
     }
@@ -126,7 +126,7 @@ fn bundling_shrinks_a_telemetry_train() {
     let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
     let legacy: usize = frames.iter().map(|f| f.len() + 4).sum(); // + UART header each
     let bundled = pack_bundle(&refs).unwrap().len() + 4;
-    assert!(bundled * 10 < legacy * 7, "bundle {bundled} vs legacy {legacy}");
+    assert!(bundled * 4 < legacy * 3, "bundle {bundled} vs legacy {legacy}");
     // Per record after the first: len, flags, elide, ts delta, nonce delta, payload.
     let one = pack_bundle(&refs[..1]).unwrap().len();
     let two = pack_bundle(&refs[..2]).unwrap().len();
@@ -140,8 +140,7 @@ fn side_wrapped_sealed_and_damaged_frames_stay_standalone() {
     damaged[4] ^= 0x40;
     assert!(!frame_bundleable(&damaged));
     assert!(pack_bundle(&[&damaged]).is_err());
-    let mut sdt = b"SDT\x01".to_vec();
-    sdt.extend_from_slice(&frame);
+    let sdt = crate::side_transport::encode_full_frame(&frame, 1, 0, 0);
     assert!(!frame_bundleable(&sdt));
     let mut sealed = frame.clone();
     sealed[0] |= 0x10;
@@ -319,7 +318,7 @@ fn a_different_node_table_drops_the_bundle() {
 type Frames = Arc<Mutex<Vec<Vec<u8>>>>;
 
 fn opts(bundle: bool) -> RouterSideOptions {
-    let mut o = RouterSideOptions::default().with_small_packet_transport(1024);
+    let mut o = RouterSideOptions::default().with_small_packet_transport(1024).with_point_to_point();
     o.compact_bundle = bundle;
     o
 }
@@ -397,7 +396,7 @@ fn a_bundle_side_hands_its_writer_canonical_frames() {
         let frames = out.lock().unwrap().clone();
         assert_eq!(frames.len(), 4);
         assert_eq!(frames.iter().all(|f| frame_bundleable(f)), bundle);
-        assert_eq!(frames.iter().any(|f| f.starts_with(b"SDT")), !bundle);
+        assert_eq!(frames.iter().any(|f| crate::side_transport::side_frame_kind(f).is_some()), !bundle);
     }
     let (tx, side, _) = sender_node(false);
     tx.set_side_compact_bundle(side, true).unwrap();

@@ -28,7 +28,7 @@ This caused the C++ implementation to be rewritten to keep feature parity with t
 After about of month of this, we decided that we were no longer going to use the C++ version, and thus the project was
 archived and is no longer being maintained.
 With the Rust version being the sole implementation, we have continued to improve it and add new features like python
-bindings, packet compression, and a bitmap for endpoints to further reduce packet size.
+bindings, packet compression, and compact headers, header templates and bundles to further reduce packet size.
 This library is now being used in multiple projects including embedded code on the rocket and on the rust based ground
 station. SEDSnet is now capable of acting as a new network, passing telemetry data to endpoints across hardware
 and software networks (uart, can ethernet, etc.) and across differing platforms and protocols (tcp, udp, etc.).
@@ -179,7 +179,7 @@ cryptography while the application supplies a C provider, Rust provider, OS/hard
 When topology or schema changes are propagating, packets already on the wire now carry a compact frozen delivery and
 decode contract. New packets immediately use the latest schema-default endpoint view, while in-flight packets continue to
 route only to their original intended holders and remain decodable against the shape they were packed with. The
-contract is encoded compactly with bitmap-oriented metadata and sender hashes so header growth stays small.
+contract is encoded compactly with packed shape metadata and sender hashes so header growth stays small.
 
 Packed packets use compact varint fields, schema-derived endpoints, a compact source address instead of a repeated
 sender hostname, and optional per-side header templates. Hostnames and endpoint holders are learned through discovery
@@ -195,6 +195,30 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 ---
 
 ## Recent changelog milestones
+
+### Version 7.0.0 highlights
+
+- Breaking wire change (every node updates together): wire format 7 shrinks
+  headers for all traffic. Canonical telemetry `f32 x3` frames 42 to 37 bytes,
+  a hop-sequenced reliable command 36 to 29; on a point-to-point templated
+  UART/radio link telemetry costs 22.3 bytes per packet instead of 37.8; a
+  compact-bundle record 15 bytes instead of 18.75, so one 691-byte radio turn
+  carries 44 telemetry packets instead of 35 (30 instead of 18 as templated
+  frames).
+- Canonical frame: no endpoint count byte or bitmap, logical size only for
+  compressed or sealed payloads, a one-byte time-base epoch field, an
+  always-compact reliable header, static header first, and no nonce for
+  packets with a fresh timestamp (a sequenced one otherwise).
+- Side transports: no `SDT` magic (first-byte kinds), small template ids with
+  a generation, timestamp deltas from a template base, 8-byte chunk headers,
+  and a CRC32 of all its own bytes ending every frame so any hop can check it.
+  Templates are used only on point-to-point sides (one discovered hop-local
+  peer, or `SideOptions::point_to_point`).
+- Compact bundles: `BundleWriter` fills a bundle to a byte budget in priority
+  order, optional per-record CRCs, v7 record elision; C
+  `seds_compact_bundle_pack_budget` and `seds_frame_priority`.
+- P2P stream framing (41 to 18 bytes per message) and other 6.x stream work.
+- `tools/wire_v6_to_v7.py` re-encodes captured SEDSnet 6 frames.
 
 ### Version 6.0.3 highlights
 

@@ -393,7 +393,7 @@ fn untemplated_test_node() -> Relay {
 }
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 fn untemplated_test_options() -> RelaySideOptions {
-    RelaySideOptions::default().with_small_packet_transport(64)
+    RelaySideOptions::default().with_small_packet_transport(64).with_point_to_point()
 }
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 #[allow(clippy::duplicate_mod)]

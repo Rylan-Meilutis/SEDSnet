@@ -137,7 +137,7 @@ pub(crate) fn check_receive_with_role(bytes: &[u8], managed: bool) -> TelemetryR
                 frame.envelope.wire_shape,
             ) || protected_control_shape(
                 frame.envelope.ty,
-                bytes.get(1).copied().unwrap_or(u8::MAX) as usize,
+                frame.envelope.endpoints().count(),
                 frame.envelope.target_senders().len(),
                 frame.envelope.wire_shape,
                 frame.reliable.is_some(),

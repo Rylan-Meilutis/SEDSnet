@@ -33,9 +33,17 @@ const EPOCH_MS_THRESHOLD: u64 = 1_000_000_000_000; // clearly not an uptime coun
 /// Default starting capacity for human-readable strings.
 const DEFAULT_STRING_CAPACITY: usize = 96;
 
-/// Process-local packet nonce generator used to keep same-timestamp packets
+/// Process-local packet nonce sequence used to keep same-timestamp packets
 /// distinct for recent-ID dedupe even when their logical payload matches.
 static PACKET_NONCE_COUNTER: AtomicU32 = AtomicU32::new(0xA5C3_1F27);
+/// Newest timestamp a packet of this process was created with, in two
+/// 32-bit halves (no 64-bit atomics needed). Bit 31 of the high half is a
+/// try-lock: timestamps stay below 2^63 ms.
+static NEWEST_TS_HI: AtomicU32 = AtomicU32::new(0);
+static NEWEST_TS_LO: AtomicU32 = AtomicU32::new(0);
+const NEWEST_TS_LOCK: u32 = 1 << 31;
+/// Largest sequenced nonce: 1..=16383 fits two ULEB128 bytes.
+const MAX_SEQUENCED_NONCE: u32 = 16_383;
 
 /// Test only: restart the packet nonce sequence from `seed`, so a test can
 /// replay a scenario under the nonce sequences other test orders produce.
@@ -44,13 +52,36 @@ pub(crate) fn seed_packet_nonce(seed: u32) {
     PACKET_NONCE_COUNTER.store(seed, Ordering::Relaxed);
 }
 
+/// A nonzero nonce from the process sequence: consecutive values differ, so
+/// two packets get the same one only 16383 packets apart.
 #[inline]
 pub(crate) fn next_packet_nonce() -> u16 {
-    let mut x = PACKET_NONCE_COUNTER.fetch_add(0x9E37_79B9, Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    (x as u16) | 1
+    let x = PACKET_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    (x % MAX_SEQUENCED_NONCE + 1) as u16
+}
+
+/// The nonce of a new packet stamped `timestamp`: none (0, not carried on the
+/// wire) when the timestamp is newer than every packet this process made
+/// before, whose identity its timestamp alone already keeps apart; otherwise
+/// (the same millisecond, or an older stamp) the next sequenced nonce.
+#[inline]
+pub(crate) fn next_packet_nonce_for(timestamp: u64) -> u16 {
+    let hi = NEWEST_TS_HI.fetch_or(NEWEST_TS_LOCK, Ordering::Acquire);
+    if hi & NEWEST_TS_LOCK != 0 {
+        // Another context holds the newest stamp: a sequenced nonce is
+        // always safe.
+        return next_packet_nonce();
+    }
+    let newest = (u64::from(hi) << 32) | u64::from(NEWEST_TS_LO.load(Ordering::Relaxed));
+    let fresh = timestamp > newest && timestamp >> 63 == 0;
+    let hi = if fresh {
+        NEWEST_TS_LO.store(timestamp as u32, Ordering::Relaxed);
+        (timestamp >> 32) as u32
+    } else {
+        hi
+    };
+    NEWEST_TS_HI.store(hi, Ordering::Release);
+    if fresh { 0 } else { next_packet_nonce() }
 }
 
 // ============================================================================
@@ -458,7 +489,7 @@ impl Packet {
             endpoints,
             sender,
             timestamp,
-            next_packet_nonce(),
+            next_packet_nonce_for(timestamp),
             payload,
         )
     }
@@ -477,7 +508,7 @@ impl Packet {
             endpoints,
             sender,
             timestamp,
-            next_packet_nonce(),
+            next_packet_nonce_for(timestamp),
             payload,
             None,
             None,

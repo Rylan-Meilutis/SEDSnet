@@ -86,7 +86,9 @@ refresh behavior. If router delivery does not recover:
 - Verify both peers use compatible side-transport profiles. Router discovery negotiates the
   effective sender dictionary down to the smallest advertised peer limit; if the peer has not been
   discovered yet, initial frames remain full and do not depend on a compact template.
-- Check that full `SDT` frames are allowed by the underlying transport and frame-size configuration.
+- Check that FULL template frames (first byte `0x60`) are allowed by the underlying transport and frame-size configuration.
+- Templates are used only with exactly one live hop-local discovery peer on the side, or a side
+  declared point to point; a shared bus always carries canonical frames.
 - Inspect per-side runtime stats for full/compact counts, active TX/RX templates, and evictions.
 - Use the `canonical` profile while diagnosing a link that persistently drops template refreshes.
 

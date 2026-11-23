@@ -190,7 +190,7 @@ fn compact_report_pressure(ep: sedsnet::config::DataEndpoint, ty: sedsnet::confi
             output.lock().unwrap().push(bytes.to_vec());
             Ok(())
         },
-        RouterSideOptions::default().with_small_packet_transport(128),
+        RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point(),
     );
     sender.tx(packet("VALVE_COMPACT", 0, 0.0)).unwrap();
     sender.tx(packet("VALVE_COMPACT", 12, 3.0)).unwrap();
@@ -198,8 +198,8 @@ fn compact_report_pressure(ep: sedsnet::config::DataEndpoint, ty: sedsnet::confi
     assert_eq!(frames.len(), 2);
     let compact = frames.pop().unwrap();
     let full = frames.pop().unwrap();
-    assert!(full.starts_with(b"SDT\x01"));
-    assert!(compact.starts_with(b"SDT\x02"));
+    assert_eq!(full[0], 0x60, "FULL template frame");
+    assert_eq!(compact[0] & 0xFC, 0x70, "COMPACT frame");
     let incoming = sedsnet::wire_format::pack_packet(&packet("VALVE_COMPACT", 12, 3.0));
     let wires: Vec<_> = (0..10)
         .map(|i| sedsnet::wire_format::pack_packet(&packet("DAQ_COMPACT", i + 1, 1.0)))
@@ -217,7 +217,7 @@ fn compact_report_pressure(ep: sedsnet::config::DataEndpoint, ty: sedsnet::confi
     let side = router.add_side_packed_with_options(
         "can",
         |_| Ok(()),
-        RouterSideOptions::default().with_small_packet_transport(128),
+        RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point(),
     );
     router.rx_packed_from_side(&full, side).unwrap();
     seen.lock().unwrap().clear();
@@ -251,7 +251,7 @@ fn compact_report_pressure(ep: sedsnet::config::DataEndpoint, ty: sedsnet::confi
     let input = relay.add_side_packed_with_options(
         "can",
         |_| Ok(()),
-        RelaySideOptions::default().with_small_packet_transport(128),
+        RelaySideOptions::default().with_small_packet_transport(128).with_point_to_point(),
     );
     let output_side = relay.add_side_packet("pico", move |p| {
         if p.data_type() == ty {

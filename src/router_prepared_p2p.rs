@@ -128,7 +128,7 @@ impl Router {
             Arc::from([DataEndpoint::Discovery]),
             local.hostname.clone(),
             timestamp,
-            crate::packet::next_packet_nonce(),
+            crate::packet::next_packet_nonce_for(timestamp),
             crate::config::StandardSmallPayload::from_arc(crate::shared_bytes::convert(outer)),
             Some(meta.element),
             Some(Arc::from([target])),

@@ -22,6 +22,7 @@ fn legacy_side_configuration_names_are_interchangeable_without_translation() {
         compact_timestamp_omission_types: CompactTimestampOmissionPolicy::none(),
         side_transport_profile: SideTransportProfile::Ipv6Like,
         compact_bundle: false,
+        point_to_point: true,
     };
     let mut router: RouterSideOptions = relay;
     router.egress_enabled = false;

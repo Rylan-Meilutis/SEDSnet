@@ -1038,6 +1038,10 @@ int32_t seds_router_has_queued_work(SedsRouter *r);
 int32_t seds_router_set_latest_value_side(SedsRouter *r, int32_t side);
 int32_t seds_relay_set_latest_value_side(SedsRelay *r, int32_t side);
 #endif
+/* Declare a side point to point (exactly one peer). Header templates are then
+ * used before discovery has heard the peer; otherwise only once discovery
+ * shows exactly one live hop-local peer on the side. */
+int32_t seds_router_set_side_point_to_point(SedsRouter *r, uint32_t side_id, bool enabled);
 /* Compact bundles. Every node on a bundle side runs a bundle-capable build
  * (no negotiation). The writer packs canonical frames it already holds, in
  * its priority order, and keeps urgent frames (Abort, turn-bypass traffic)
@@ -1058,6 +1062,18 @@ int32_t seds_compact_bundle_frame_ok(const uint8_t *frame, size_t len);
 int32_t seds_compact_bundle_pack(const uint8_t *base, const uint16_t *offsets,
                                  const uint16_t *lengths, size_t count,
                                  uint8_t *out, size_t cap);
+/* Pack frames in order into one bundle of at most `budget` bytes, stopping
+ * at the first frame that does not fit; *packed receives how many frames it
+ * holds. record_crc: every record carries its own CRC32 (a damaged record is
+ * dropped alone) instead of one CRC32 for the bundle. Returns the bundle
+ * length, 0 when not even the first frame fits, or a negative status. */
+int32_t seds_compact_bundle_pack_budget(const uint8_t *base, const uint16_t *offsets,
+                                        const uint16_t *lengths, size_t count,
+                                        size_t budget, bool record_crc,
+                                        uint8_t *out, size_t cap, size_t *packed);
+/* Transport priority of a canonical frame (higher is more urgent), for
+ * ordering waiting frames before bundling; negative when not canonical. */
+int32_t seds_frame_priority(const uint8_t *frame, size_t len);
 #endif
 /* Allocation-free versioned queue accounting; required word count is16. */
 int32_t seds_router_copy_queue_counters(SedsRouter *r, uint32_t *words, size_t capacity);

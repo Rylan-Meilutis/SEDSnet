@@ -476,7 +476,7 @@ fn partial_sdt_history_resumes_once_with_one_parent_owned_slot() {
     let side = router.add_side_packed_with_options(
         "radio",
         move |raw| {
-            if raw.starts_with(b"SDT") && raw[3] == SIDE_TRANSPORT_KIND_CHUNK {
+            if raw.first() == Some(&SIDE_TRANSPORT_KIND_CHUNK) {
                 counted.fetch_add(1, Ordering::SeqCst);
                 if allowance
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |x| x.checked_sub(1))
@@ -521,7 +521,7 @@ fn partial_sdt_history_resumes_once_with_one_parent_owned_slot() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|w| w.starts_with(b"SDT") && w[3] == SIDE_TRANSPORT_KIND_CHUNK)
+            .filter(|w| w.first() == Some(&SIDE_TRANSPORT_KIND_CHUNK))
             .count(),
         1
     );

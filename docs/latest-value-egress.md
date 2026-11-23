@@ -50,7 +50,7 @@ a rebooted or reset source may wait for its older pending owner to dispatch.
 There is no per-flow map, retained cache, extra queue capacity, or larger budget.
 Existing fairness and admission rules still apply to distinct flows.
 
-Coalescing occurs on canonical samples before this egress encodes SDT templates,
+Coalescing occurs on canonical samples before this egress encodes side-transport templates,
 compression history or chunks. Selection for dispatch permanently removes the
 replaceable marker. Even a refused first callback may have advanced encoded
 history; refusal never grants permission to discard that owner. Fresh latest-value

@@ -21,7 +21,7 @@ fn a_peeker_classifies_every_frame_a_small_packet_side_emits() {
     let out = frames.clone();
     let router = Router::new_with_clock(RouterConfig::new([]).with_sender("RRLS"), Box::new(|| 1000));
     router.add_side_packed_with_options("radio", move |b| { out.lock().unwrap().push(b.to_vec()); Ok(()) },
-        RouterSideOptions::default().with_small_packet_transport(192));
+        RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point());
     let mut expected = Vec::new();
     for i in 0..4u8 {
         router.announce_leave().unwrap();

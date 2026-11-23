@@ -1,7 +1,5 @@
 //! Public-API compatibility with the last standalone Relay implementation.
 #![cfg(all(feature = "std", feature = "discovery"))]
-#[path = "support/side_chunk.rs"]
-mod side_chunk;
 use sedsnet::{
     MessageClass, MessageDataType, MessageElement, ReliableMode,
     config::{self, DataEndpoint, DataType},
@@ -26,8 +24,12 @@ fn options(name: &str) -> RelaySideOptions {
             header_template_enabled: false,
             ..Default::default()
         },
-        "template" => RelaySideOptions::default().with_template_transport(),
-        "small_packet110" => RelaySideOptions::default().with_small_packet_transport(110),
+        "template" => RelaySideOptions::default()
+            .with_template_transport()
+            .with_point_to_point(),
+        "small_packet110" => RelaySideOptions::default()
+            .with_small_packet_transport(110)
+            .with_point_to_point(),
         _ => panic!("unrecognized frozen legacy fixture"),
     }
 }
@@ -39,18 +41,21 @@ fn normalize_link_identifiers(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
         .iter()
         .map(|frame| {
             let mut wire = frame.clone();
-            if !wire.starts_with(b"SDT") {
+            let kind = wire[0];
+            if kind & 0x60 != 0x60 {
                 return wire;
             }
-            match wire[3] {
-                3 => {
-                    assert!(wire.len() >= 11);
-                    wire[4..6].fill(0);
+            match kind {
+                // Chunk: transfer ids are content hashes of the sender's frame.
+                0x61 => {
+                    assert!(wire.len() >= 8);
+                    wire[1..3].fill(0);
                 }
-                1 | 2 => {
-                    // Template IDs are local dictionary keys. Version-independent
-                    // byte identity is proved after COMPLETE CRC-checked decoding.
-                    let start = if wire[3] == 1 { 4 } else { 5 };
+                // FULL and COMPACT: template ids are local dictionary keys.
+                // Version-independent byte identity is proved after COMPLETE
+                // CRC-checked decoding.
+                0x60 | 0x70..=0x73 => {
+                    let start = 1;
                     let mut end = start;
                     loop {
                         let byte = wire[end];
@@ -187,11 +192,12 @@ fn public_relay_preserves_legacy_wire_and_canonical_identity() {
             .iter()
             .map(|p| serde_json::from_value(p["wirebytes"].clone()).unwrap())
             .collect();
-        let legacy_frames: Vec<Vec<u8>> =
+        // Frames a SEDSnet 7 transmitter produced for these packets
+        // (regenerate with SEDSNET_RELAY_INTEROP_REGENERATE=1 and
+        // SEDSNET_RELAY_INTEROP_OUTPUT=<path> after an intended wire change).
+        let old_frames: Vec<Vec<u8>> =
             serde_json::from_value(scenario["old_tx_frames"].clone()).unwrap();
-        // Chunk headers changed on the wire; everything else is frozen.
-        let old_frames =
-            side_chunk::rechunk_legacy(&legacy_frames, options(name).max_frame_bytes);
+        let regenerate = std::env::var_os("SEDSNET_RELAY_INTEROP_REGENERATE").is_some();
         let receiver = node("NEW_RECEIVER");
         let input = receiver.add_side_packed_with_options("wire", |_| Ok(()), options(name));
         let canonical = Arc::new(Mutex::new(Vec::new()));
@@ -206,15 +212,17 @@ fn public_relay_preserves_legacy_wire_and_canonical_identity() {
             Ok(())
         });
         receiver.clear_queues();
-        for bytes in &old_frames {
+        for bytes in old_frames.iter().filter(|_| !regenerate) {
             receiver.rx_packed_from_side(input, bytes).unwrap();
             receiver.drain_queues_with_timeout(0).unwrap();
         }
-        assert_eq!(
-            *canonical.lock().unwrap(),
-            expected,
-            "old TX -> new RX {name}: exact canonical bytes/identity/timestamp"
-        );
+        if !regenerate {
+            assert_eq!(
+                *canonical.lock().unwrap(),
+                expected,
+                "recorded TX -> RX {name}: exact canonical bytes/identity/timestamp"
+            );
+        }
         let transmitter = node("NEW_BRIDGE");
         let source = transmitter.add_side_packet("source", |_| Ok(()));
         let frames = Arc::new(Mutex::new(Vec::new()));
@@ -238,11 +246,13 @@ fn public_relay_preserves_legacy_wire_and_canonical_identity() {
             expected,
             "new TX -> complete receiver {name}: canonical byte identity and CRC"
         );
-        assert_eq!(
-            normalize_link_identifiers(&frames.lock().unwrap()),
-            normalize_link_identifiers(&old_frames),
-            "{name}: old/new wire shapes differ beyond internal link identifiers"
-        );
+        if !regenerate {
+            assert_eq!(
+                normalize_link_identifiers(&frames.lock().unwrap()),
+                normalize_link_identifiers(&old_frames),
+                "{name}: recorded/new wire shapes differ beyond internal link identifiers"
+            );
+        }
         new_transmissions.push(json!({"name": name, "frames": *frames.lock().unwrap(), "expected_canonical_packets": expected}));
     }
     assert_public_replay_statistics_partition_one_shared_queue();

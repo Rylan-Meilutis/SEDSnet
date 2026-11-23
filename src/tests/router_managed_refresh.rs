@@ -129,7 +129,7 @@ impl Fixture {
             })
             .unwrap();
         }
-        let opts = RouterSideOptions::default().with_small_packet_transport(192);
+        let opts = RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point();
         let priorities = Arc::new(Mutex::new(Vec::new()));
         let mut links = Vec::new();
         let mut adjacent = Vec::new();
@@ -149,10 +149,10 @@ impl Fixture {
                         to: right,
                         priority,
                         len: bytes.len(),
-                        sdt: bytes.starts_with(b"SDT"),
+                        sdt: crate::side_transport::side_frame_kind(bytes).is_some(),
                     });
                     if busy.load(Ordering::Relaxed)
-                        && (bytes.starts_with(b"SDT")
+                        && (crate::side_transport::side_frame_kind(bytes).is_some()
                             || sedsnet::wire_format::peek_envelope(bytes).is_ok_and(|e| e.ty == ty))
                     {
                         return Err(sedsnet::TelemetryError::Io("side tx busy"));
@@ -173,10 +173,10 @@ impl Fixture {
                         to: left,
                         priority,
                         len: bytes.len(),
-                        sdt: bytes.starts_with(b"SDT"),
+                        sdt: crate::side_transport::side_frame_kind(bytes).is_some(),
                     });
                     if busy.load(Ordering::Relaxed)
-                        && (bytes.starts_with(b"SDT")
+                        && (crate::side_transport::side_frame_kind(bytes).is_some()
                             || sedsnet::wire_format::peek_envelope(bytes).is_ok_and(|e| e.ty == ty))
                     {
                         return Err(sedsnet::TelemetryError::Io("side tx busy"));
@@ -866,7 +866,7 @@ fn generic_managed_refresh_cycle_is_bounded_and_keeps_warm_observers() {
 }
 
 fn add_warm_link(f: &mut Fixture, left: usize, right: usize) {
-    let opts = RouterSideOptions::default().with_small_packet_transport(192);
+    let opts = RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point();
     let a: Wire = Arc::default();
     let b: Wire = Arc::default();
     let out = a.clone();

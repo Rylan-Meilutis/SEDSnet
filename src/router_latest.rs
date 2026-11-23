@@ -834,7 +834,7 @@ mod tests {
         router.dispatch_tx_queue_with_timeout(0).unwrap();
         assert_eq!(accepted.lock().unwrap().len(), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(accepted.lock().unwrap()[0][3], SIDE_TRANSPORT_KIND_CHUNK);
+        assert_eq!(accepted.lock().unwrap()[0][0], SIDE_TRANSPORT_KIND_CHUNK);
         assert!(
             !router
                 .state
@@ -931,8 +931,7 @@ mod tests {
         let side = router.add_side_packed_with_options(
             "radio",
             move |raw| {
-                if raw.starts_with(crate::side_transport::SIDE_TRANSPORT_MAGIC)
-                    && raw.get(3) == Some(&SIDE_TRANSPORT_KIND_CHUNK)
+                if raw.first() == Some(&SIDE_TRANSPORT_KIND_CHUNK)
                     && credit
                         .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_err()
@@ -1428,7 +1427,10 @@ mod tests {
         };
         let mut raw = wire_format::pack_packet(&p).to_vec();
         raw.truncate(raw.len() - 4);
-        raw.push(99); // valid CRC, mismatched declared payload length
+        // Valid CRC, malformed header: both endpoint-encoding bits set never
+        // occurs in a canonical frame (a v7 frame has no declared payload
+        // length to mismatch).
+        raw[0] |= 0x60;
         let crc = crc32fast::hash(&raw);
         raw.extend_from_slice(&crc.to_le_bytes());
         let invalid = RouterItem::Packed(crate::shared_bytes::convert(Arc::<[u8]>::from(raw)));
@@ -2355,7 +2357,7 @@ mod tests {
         let transfers: std::collections::BTreeSet<_> = first_frames
             .iter()
             .map(|raw| {
-                assert!(raw.starts_with(b"SDT\x03"));
+                assert!(raw.first() == Some(&0x61));
                 crate::side_transport::test_parse_chunk_frame(raw).unwrap().0
             })
             .collect();
@@ -2573,7 +2575,7 @@ mod tests {
         let transfers: std::collections::BTreeSet<_> = first_frames
             .iter()
             .map(|raw| {
-                assert!(raw.starts_with(b"SDT\x03"));
+                assert!(raw.first() == Some(&0x61));
                 crate::side_transport::test_parse_chunk_frame(raw).unwrap().0
             })
             .collect();
@@ -2809,7 +2811,7 @@ mod tests {
         let transfers: std::collections::BTreeSet<_> = first_frames
             .iter()
             .map(|raw| {
-                assert!(raw.starts_with(b"SDT\x03"));
+                assert!(raw.first() == Some(&0x61));
                 crate::side_transport::test_parse_chunk_frame(raw).unwrap().0
             })
             .collect();
@@ -2879,7 +2881,7 @@ mod tests {
             let at = now.load(Ordering::SeqCst);
             let result = router.dispatch_tx_queue_with_timeout(1);
             for frame in core::mem::take(&mut *accepted.lock().unwrap()) {
-                if frame.starts_with(b"SDT\x03") {
+                if frame.first() == Some(&0x61) {
                     let transfer = crate::side_transport::test_parse_chunk_frame(&frame).unwrap().0;
                     if transfers.contains(&transfer) {
                         assert!(
@@ -3265,7 +3267,7 @@ mod tests {
             allowance.store(80, Ordering::SeqCst);
             router.dispatch_tx_queue_with_timeout(1).unwrap();
             for raw in core::mem::take(&mut *accepted.lock().unwrap()) {
-                if raw.starts_with(b"SDT\x03") {
+                if raw.first() == Some(&0x61) {
                     let transfer = crate::side_transport::test_parse_chunk_frame(&raw).unwrap().0;
                     if !catalog_transfers.contains(&transfer) {
                         first_transfer = Some(transfer);
@@ -3316,7 +3318,7 @@ mod tests {
         let mut saw_blocked_control_owner = false;
         for _ in 0..5000 {
             for raw in core::mem::take(&mut pending_frames) {
-                if raw.starts_with(b"SDT\x03") {
+                if raw.first() == Some(&0x61) {
                     let transfer = crate::side_transport::test_parse_chunk_frame(&raw).unwrap().0;
                     let is_fresh = if control_first {
                         !catalog_transfers.contains(&transfer) && transfer != first_transfer

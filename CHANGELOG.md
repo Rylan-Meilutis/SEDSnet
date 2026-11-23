@@ -1,51 +1,201 @@
 # Changelog
 
-## Unreleased
+## 7.0.0
 
-Smaller framing for bulk P2P streams over constrained links. **Breaking wire
-change:** every node on a network must run this release (P2P messages,
-side-transport chunks and the compact reliable header changed; older peers
-reject or misread the new frames). Public Rust, C and Python APIs are
-unchanged.
+Wire format 7: smaller headers for every kind of traffic. **Breaking wire
+change:** every node on a network must run 7.0.0 (canonical frames, side
+transports, compact bundles, P2P messages and the E2E nonce changed; older
+peers reject or misread the new frames). Captured SEDSnet 6 frames can be
+re-encoded with `tools/wire_v6_to_v7.py` (same packet IDs).
 
-- **Compact P2P message and stream framing.** The P2P message header is now a
-  tag byte (format version 2; a stream bit and the stream flags), ULEB128
-  ports and hostname length, the 4-byte source address and the hostname. The
-  body runs to the end of the packet payload, so neither layer repeats a
-  length. Stream frames are marked by the tag instead of an in-band `SDSP`
-  magic (a plain datagram can no longer be taken for a stream frame) and carry
+Measured with the new `tests/wire_overhead_report.rs` (generic schema-hashed
+type and endpoint IDs, network-time timestamps, time-base epoch 1), bytes on
+the wire per packet:
+
+| Packet | 6.0.3 | 7.0.0 |
+|---|---|---|
+| telemetry `f32 x3`, canonical (shared CAN bus) | 42 | 37 |
+| reliable command `u8 x2`, hop sequence 42 | 36 | 29 |
+| reliable command `u8 x2`, end-to-end (unsequenced) | 36 | 28 |
+| hop ACK | 24 | 23 |
+| time sync announce / request | 39 | 36 |
+| time sync response | 55 | 52 |
+| discovery topology announce (mean, two-node link) | 64.4 | 60.4 |
+| discovery address (mean) | 90.4 | 85.0 |
+| telemetry `f32 x3` on a point-to-point templated link (UART/radio, FULL refreshes included) | 37.8 | 22.3 |
+| telemetry `f32 x3` in a compact bundle, each record after the first | 18.75 | 15.0 |
+
+Per frame: a COMPACT template frame costs 8-9 bytes besides its payload
+(about 24 in 6.0.3: `SDT` magic, kind, flags, a five-byte template id, size,
+absolute timestamp, nonce and CRC); a FULL frame adds 3 bytes to the canonical
+frame (9 plus a five-byte id); a chunk adds 8 bytes (16 in 6.0.3, 11 in the
+unreleased 6.x stream work). On the RF 691-byte / 200 ms radio turn budget,
+telemetry `f32 x3` fits 30 packets per turn as templated frames (18 in
+6.0.3) and 44 in one compact bundle per turn (35 in 6.0.3; 35 with per-record
+CRCs), 220 packets/s. Bulk P2P stream messages over a 192-byte-frame radio
+(`tests/p2p_stream_radio_overhead.rs`): 1000 B messages take 1117 bytes on air
+in 6 frames (1214.8 in 7 frames in 6.0.3), 2000 B take 2189 (2315).
+
+### Canonical frame
+
+- **Static header first, per-packet fields after.** Type, source address,
+  time-base epoch, endpoints and contract (equal for every packet of one
+  stream), then timestamp, logical size, nonce and reliable header. Templates
+  and bundles replace or elide the static part as a whole.
+- **No endpoint count byte.** A schema-default frame carries no count; one
+  explicit endpoint is one ULEB128 ID; a counted list carries a ULEB128 count.
+  The 32-byte endpoint bitmap encoding is removed.
+- **Logical size only when needed.** Written only for compressed or sealed
+  payloads; otherwise the payload length is the size.
+- **Time-base epoch is a flagged header field** (one byte below 128) instead
+  of an epoch-only contract (two bytes). A contract is now carried only for an
+  inline shape or frozen targets.
+- **Reliable header is always compact** (flags byte plus ULEB128 sequence/ACK
+  when nonzero); the "compact reliable header" frame flag is gone. Unknown
+  reliable or contract flag bits are rejected.
+- **No nonce for fresh timestamps.** A packet created with a timestamp newer
+  than every earlier packet of the process carries no nonce; a packet stamped
+  in the same millisecond, or with an older stamp, takes the next value of a
+  process-wide sequence 1..=16383 (at most two bytes; equal only 16383 packets
+  apart). SEDSnet 6 gave every packet a pseudo-random 16-bit nonce (three
+  bytes) and could repeat one for two packets in the same millisecond. Time
+  sync keeps its own nonce counter.
+- **E2E AEAD nonce** now folds in the source address (type XOR rotated source,
+  48-bit timestamp, packet nonce), so senders that share a group key never
+  depend on random nonces to stay apart. Sealed frames are not compatible with
+  6.x.
+- The first byte of a canonical frame never has both endpoint-encoding bits
+  (`0x60`) set; those values identify side-transport frames. First bytes
+  `0xE0..=0xFF` are never used by SEDSnet (reserved for link layers).
+
+### Side transports (UART, radio, CAN)
+
+- **No `SDT` magic.** Side-transport kinds are first-byte values: FULL `0x60`,
+  CHUNK `0x61`, BUNDLE `0x62/0x63/0x66/0x67`, COMPACT `0x70..=0x73` (the low
+  bits carry the compressed and nonce flags, so the flags byte is gone).
+- **Every frame ends in a CRC32 of all its own bytes** (canonical, FULL,
+  COMPACT, CHUNK, BUNDLE), so any hop, including a relay or link layer that
+  keeps no SEDSnet state, can check it alone; a link layer needs no CRC of its
+  own.
+- **Small template ids with generations.** Template ids are the lowest free id
+  (one byte with the generation for up to 15 templates; 6.0.3 used a five-byte
+  hash). A 3-bit generation beside the id changes whenever a FULL frame
+  redefines an id or moves its base timestamp, so a receiver holding a stale
+  template drops compact frames until the next FULL frame instead of misreading
+  them.
+- **Timestamp deltas.** A COMPACT frame carries its timestamp as a zigzag
+  delta (usually two bytes) from its template's base timestamp, which only a
+  FULL frame sets and which moves (with a forced FULL frame) only when a delta
+  would exceed about 17 minutes.
+- **Templates need a point-to-point side.** Template ids are side-local, so a
+  router uses templates only while discovery shows exactly one live hop-local
+  peer on the side, or the side is declared point to point
+  (`SideOptions::point_to_point`, `with_point_to_point()`,
+  `Router::set_side_point_to_point`, C `seds_router_set_side_point_to_point`).
+  Shared buses carry canonical frames (as in 6.x once discovery saw a second
+  peer; now also before discovery has heard anyone).
+- Sides without templates send bare canonical frames instead of FULL wrappers.
+- Chunk frames: kind, 16-bit transfer id, one ULEB128 position and the chunk's
+  CRC32 (8 bytes).
+- Frames with a reliable header never use templates (unchanged), and the
+  timestamp-delta and unchanged-timestamp compact kinds of 6.x are gone (the
+  omission options are accepted and ignored).
+
+### Compact bundles
+
+- Records follow the v7 frame: an elide byte can drop the flags, type, source,
+  and the whole epoch/endpoint/contract group when equal to the previous
+  record; a train of one stream costs a length byte, the elide byte, a one- or
+  two-byte timestamp delta and the payload per packet.
+- **`BundleWriter`**: fills one bundle up to a caller-given byte budget (a link
+  MTU or a radio turn) from frames pushed in priority order;
+  `wire_bundle::frame_priority(frame)` gives a frame's transport priority. C:
+  `seds_compact_bundle_pack_budget(...)`, `seds_frame_priority(...)`.
+- **Per-record CRC option** (`BUNDLE_MARKER_RECORD_CRC`): every record also
+  carries its canonical CRC32, so a transport that delivers damaged frames
+  still gets the intact records. A bundle always ends in its own CRC32.
+- A record (or delivered frame) the receiver refuses no longer stops the rest
+  of the bundle.
+- The node-table check is 16 bits (was 8).
+
+### P2P streams
+
+- **Compact P2P message and stream framing.** The P2P message header is a tag
+  byte (format version 2; a stream bit and the stream flags), ULEB128 ports and
+  hostname length, the 4-byte source address and the hostname. The body runs to
+  the end of the packet payload, so neither layer repeats a length. Stream
+  frames are marked by the tag instead of an in-band `SDSP` magic and carry
   ULEB128 stream ids and sequence with no separate magic, version, flags or
-  length. A stream data frame's P2P header shrinks from 37 bytes plus the
-  hostname to about 14 bytes plus the hostname (one port below 16384, one
-  ephemeral port, small stream ids, sequence below 128).
+  length: 41 to 18 bytes per message (4-character hostname).
 - **P2P envelopes omit their endpoint list.** Like the reliability controls,
   `P2pMessage` has a protocol-defined endpoint, so frames carrying a target
-  contract no longer repeat it (2 bytes).
+  contract no longer repeat it.
 - **Compact reliable header omits a zero sequence.** Unsequenced end-to-end
-  wrappers on hops without hop reliability are one byte instead of two.
-- **Smaller side-transport chunks.** Kind `0x03` chunks keep the `SDT` magic,
-  kind byte and per-chunk CRC32, but carry a 16-bit transfer id and one
-  ULEB128 position encoding both index and total
-  (`total * (total - 1) / 2 + index`): 11 bytes per chunk instead of 16 for
-  transfers of up to 15 chunks, and no more than separate index and total
-  fields would cost below 23171 chunks.
-  Reassembly bounds, budgets and integrity checks are unchanged; a transfer-id
-  collision can only fail the reassembled frame's CRC32.
-- **Measured** with the new `tests/p2p_stream_radio_overhead.rs` harness (leaf
-  -> two-sided bridge -> station; 64-byte CAN-style frames, 192-byte radio
-  frames, `ipv6_like` profile, no hop reliability, 4-byte link header per
-  radio frame), bytes on air per stream message down the radio:
+  wrappers on hops without hop reliability are one byte.
 
-  | Body | Before | Now | Radio frames |
-  |---|---|---|---|
-  | 512 B | 666.7 B | 620.7 B | 4 -> 4 |
-  | 1000 B | 1214.8 B | 1138.8 B | 7 -> 6 |
-  | 2000 B | 2315.0 B | 2229.0 B | 12 -> 12 |
+### Robustness
 
-  Per radio frame the side-transport plus link overhead drops from 20 to 15
-  bytes; per message the P2P headers drop from 41 to 18 bytes (4-character
-  hostname) and the envelope by 3 bytes. The end-to-end ACK returned per
-  message is unchanged (about 51 bytes on air).
+Unchanged guarantees, rechecked under test: one CRC32 check per frame per hop
+(every frame kind; a damaged compact frame is rejected before it may reclaim
+memory or refresh liveness), loss and reboot recovery of template dictionaries
+(periodic FULL refresh, generations, unknown templates dropped without a
+transport error), schema-change recovery, reliable delivery, priority and
+fairness classification (now independent of the removed count byte), and the
+bounded-cost queue work of 6.0.3. Time sync is unchanged: over 280 seeded
+radio-sim runs the honesty statistics under injected stamp bias are identical
+to 6.0.3, and so is the convergence-time distribution after hours-long station
+steps (two hard-coded simulation seeds that sat at the edge were replaced or
+narrowed; see the test comments).
+
+### API changes
+
+- New `SideOptions::point_to_point` field (struct literals need it or
+  `..Default::default()`), `SideOptions::with_point_to_point()`,
+  `Router::set_side_point_to_point`, C `seds_router_set_side_point_to_point`.
+- New `wire_bundle::BundleWriter`, `wire_bundle::frame_priority`,
+  `wire_bundle::BUNDLE_MARKER_RECORD_CRC`; C `seds_compact_bundle_pack_budget`,
+  `seds_frame_priority`. `BUNDLE_MARKER`/`BUNDLE_MARKER_TABLE` changed value
+  (`0x62`/`0x63`).
+- `wire_format::header_size_bytes` now counts the flags byte and the type,
+  source, epoch, timestamp and nonce fields (no endpoint count byte; the size
+  field is counted by `packet_wire_size` when present).
+  `RELIABLE_HEADER_BYTES` remains as the size of the former fixed form.
+- `wire_format::rewrite_reliable_header` refuses a rewrite that changes the
+  header's encoded size (always the compact form now); use the owned rewrite.
+- New `side_peek` classifiers for code that must recognise side-transport
+  frames without the former `SDT` magic: `is_side_transport_frame`,
+  `is_side_transport_chunk`, `is_side_full_frame`, `is_side_compact_frame`,
+  `side_chunk` (CRC checked) and `side_chunk_unchecked` (for frames the node
+  built itself), `side_full_frame`, `side_full_frame_prefix`,
+  `side_template_id`, and the `SideChunk` view.
+- No other public Rust, C or Python signature changed.
+
+### Tools
+
+- `tools/wire_v6_to_v7.py` re-encodes SEDSnet 6 canonical frames and chunk
+  transfers in the 7.0.0 layout (same packet IDs); the captured fixtures in
+  the test suite were re-encoded with it.
+
+### Embedded size
+
+Linked Release firmware (each board's `origin/dev` firmware image, Cortex-M,
+GCC `-Os`, the board's own SEDSnet features) against 6.0.3 and 7.0.0:
+
+| Image | Flash 6.0.3 | Flash 7.0.0 | Change | Static RAM 6.0.3 | 7.0.0 |
+|---|---|---|---|---|---|
+| FC flight | 450,284 | 445,908 | -4,376 | 261,352 | 261,352 |
+| FC ground test | 446,896 | 442,516 | -4,380 | 264,460 | 264,460 |
+| VB | 440,504 | 436,152 | -4,352 | 114,216 | 114,216 |
+| AB | 434,316 | 430,124 | -4,192 | 107,036 | 107,036 |
+| DAQ | 919,112 | 911,096 | -8,016 | 779,648 | 779,648 |
+| GB | 435,136 | 430,848 | -4,288 | 114,296 | 114,296 |
+| RF | 446,936 | 442,656 | -4,280 | 113,908 | 113,908 |
+| PB | 399,500 | 395,336 | -4,164 | 110,496 | 110,496 |
+
+Static RAM is unchanged on every image (16 bytes move from `.data` to
+`.bss`): the nonce state is two 32-bit words and the routing-envelope memo's
+static shrank to a pointer. Heap: one byte-sized generation per template id
+per side.
 
 ## 6.0.3
 

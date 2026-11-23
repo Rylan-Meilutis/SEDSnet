@@ -226,12 +226,13 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
     let good = frame("BATTERY_STATUS", "VB", 4000);
     let bad = corrupt(&good);
     assert!(wire_format::peek_frame_info(&bad).is_err());
-    // A valid side wrapper (its own CRC is fine) around a corrupted frame.
-    let full = crate::side_transport::wrap_side_transport_frame(
-        crate::side_transport::SIDE_TRANSPORT_KIND_FULL,
-        &bad,
-    )
-    .to_vec();
+    // A FULL frame whose canonical part is damaged in transit (its CRC32
+    // covers the whole frame; a sender only wraps admitted frames).
+    let full = {
+        let mut full = crate::side_transport::encode_full_frame(&good, 1, 0, 0).to_vec();
+        full[5] ^= 0x40;
+        full
+    };
     // A corrupted frame split across two valid chunk wrappers.
     let chunks: Vec<Vec<u8>> = {
         let half = bad.len() / 2;
@@ -244,10 +245,7 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
             .collect()
     };
     let bundle = corrupt(&crate::wire_bundle::pack_bundle(&[&good, &good]).unwrap());
-    let wrapper = corrupt(&crate::side_transport::wrap_side_transport_frame(
-        crate::side_transport::SIDE_TRANSPORT_KIND_FULL,
-        &good,
-    ));
+    let wrapper = corrupt(&crate::side_transport::encode_full_frame(&good, 1, 0, 0));
 
     type Ingress = fn(&Node, &[u8]) -> TelemetryResult<()>;
     let paths: [(&str, &[u8], Ingress); 15] = [
@@ -288,10 +286,7 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
         let n = bridge(false, true);
         let intact: Vec<u8> = match path {
             "side FULL" | "side FULL queued" | "side wrapper" => {
-                crate::side_transport::wrap_side_transport_frame(
-                    crate::side_transport::SIDE_TRANSPORT_KIND_FULL,
-                    &good,
-                )
+                crate::side_transport::encode_full_frame(&good, 1, 0, 0)
                 .to_vec()
             }
             "bundle" | "bundle queued" => crate::wire_bundle::pack_bundle(&[&good]).unwrap(),

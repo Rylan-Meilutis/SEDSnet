@@ -60,16 +60,9 @@ fn frame(v: &serde_json::Value) -> Vec<u8> {
         .iter()
         .map(|b| b.as_u64().unwrap() as u8)
         .collect();
-    // Captured with the former chunk header (transfer u32, index u16, total
-    // u16); re-wrap the same fragment in the current chunk header.
-    assert!(legacy.starts_with(b"SDT\x03"));
-    let body = &legacy[4..legacy.len() - 4];
-    crate::side_transport::test_chunk_frame(
-        u32::from_le_bytes(body[0..4].try_into().unwrap()),
-        u16::from_le_bytes([body[4], body[5]]),
-        u16::from_le_bytes([body[6], body[7]]),
-        &body[8..],
-    )
+    // Captured from a SEDSnet 6 station and re-encoded (tools/wire_v6_to_v7.py).
+    assert_eq!(legacy.first(), Some(&crate::side_transport::SIDE_TRANSPORT_KIND_CHUNK));
+    legacy
 }
 #[test]
 fn captured_same_peer_progress_defers_redundant_schema_request_until_complete() {
@@ -384,7 +377,7 @@ fn progressive_catalog_closed_loop_avoids_a_second_full_response() {
         producer.drain_queues_with_timeout(0).unwrap();
         let frames = core::mem::take(&mut *emitted.lock());
         for bytes in frames {
-            if bytes.starts_with(b"SDT\x03") {
+            if bytes.first() == Some(&0x61) {
                 schema_wire_bytes += bytes.len();
             }
             if let Some(canonical) = receiver.decode_side_transport_frame(side, &bytes).unwrap() {
