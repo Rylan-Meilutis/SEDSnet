@@ -160,6 +160,11 @@ Waiting messages use the existing bounded end-to-end pending window. A full
 window returns an error instead of evicting unacknowledged data. Retry exhaustion
 fails the ordered stream's queued tail and returns an error from queue/periodic
 processing, rather than releasing later transitions past the unconfirmed gap.
+A segment proxy (a bridge that acknowledged the publisher when it accepted the
+frame for owners behind it) cannot hand that error back, so there the gap is
+kept per owner: the owners that missed the exhausted frame are retired from the
+queued frames of that stream, which continue in order to the owners that
+confirmed it.
 Topology disappearance is not treated as an ACK. Pending traffic is in RAM and
 does not survive source restart; this is not a durable transaction protocol or
 a guarantee of physical actuator completion. Applications must still report
@@ -195,6 +200,19 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 ---
 
 ## Recent changelog milestones
+
+### Version 7.0.1 highlights
+
+- Patch release, no wire, API or C ABI change: mixed 7.0.0/7.0.1 networks work.
+- A relay that has already acknowledged an Ordered stream upstream no longer
+  drops the stream's later frames for every owner when one owner misses all
+  retries of an earlier frame; only the silent owner is retired from them.
+  Bursts of managed-variable writes relayed onto a bus with one silent board
+  now reach every other board, in order.
+- Router transmission gives other sides a turn once one side's refusals run
+  long, so a refused backlog on one link no longer starves another link on
+  a slow or loaded CPU. Unchanged while refusals are cheap.
+- Release workflow and test-suite fixes.
 
 ### Version 7.0.0 highlights
 

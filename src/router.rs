@@ -44,6 +44,9 @@ mod accepted_route_ownership;
 #[path = "tests/unroutable_backoff.rs"]
 mod unroutable_backoff;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/side_busy_skip.rs"]
+mod side_busy_skip;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/plain_transit_differential.rs"]
 mod plain_transit_differential;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
@@ -112,6 +115,9 @@ mod silent_station_sim;
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 #[path = "tests/proxy_upstream_receipt.rs"]
 mod proxy_upstream_receipt;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/relay_managed_burst.rs"]
+mod relay_managed_burst;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/side_peek.rs"]
 mod side_peek_tests;
@@ -1194,6 +1200,109 @@ struct TxWork {
     owed_turn: bool,
     #[cfg(feature = "latest-value-egress")]
     service: EgressService,
+}
+
+/// Sides that refused work in the current TX pass, each with the highest
+/// queued priority it refused. A refused frame stays queued for its side (as
+/// a side retry or child), and the next pick is that side's next frame
+/// again. Normally that is right: a refusal costs microseconds, every frame
+/// the side has is offered within the millisecond, and a frame it has room
+/// for (by size, class or reserve) goes even behind refused ones. On a slow
+/// CPU each refusal can cost most of a millisecond, and a busy side's
+/// backlog, offered frame by frame, used the pass's whole time budget:
+/// frames for idle sides queued behind it waited for seconds.
+///
+/// So once a side's refusals have run for over a millisecond, the other
+/// sides get a turn: one pick passes over work bound for a refusing side at
+/// or below the priority it refused. Refusals during that turn add to the
+/// record (two busy sides cannot hand the turn back and forth); once a pick
+/// goes through without one, or nothing else can go, the record is cleared
+/// and the refusing sides are offered their frames again. A turn is one
+/// pick, so a steady stream of other work cannot hold a refusing side's
+/// frames back for longer, and it is outside the priority rotation. While
+/// refusals are cheap nothing changes; when they are slow, other sides get
+/// a pick about every millisecond.
+/// Order within a side and ordered delivery are unchanged. Pass-local:
+/// nothing is retained.
+#[derive(Clone, Copy, Default)]
+struct PassBusySides {
+    entries: [(u16, u8); PASS_BUSY_SIDES],
+    len: u8,
+    /// Priority of the work dispatched since the last pop, if any.
+    last_priority: Option<u8>,
+    /// The last pick passed over the recorded sides (their turn is owed).
+    passed_over: bool,
+    /// Router time of the first refusal in the current record.
+    since_ms: u64,
+}
+const PASS_BUSY_SIDES: usize = 8;
+
+impl PassBusySides {
+    /// Under the pop's lock: attribute handler failures since the previous
+    /// pop to the work dispatched in between. Failures from before the pass's
+    /// first pop are stale and only cleared. Past the table's capacity a
+    /// refusing side is not recorded (it keeps its old turn).
+    fn take_failures(&mut self, st: &mut RouterInner, now_ms: u64) {
+        let mut failed = core::mem::take(&mut st.tx_failed_sides);
+        let Some(priority) = self.last_priority.take() else {
+            return;
+        };
+        let passed_over = core::mem::take(&mut self.passed_over);
+        if failed == 0 {
+            // The other sides had their turn: the refusing sides go again.
+            if passed_over {
+                self.clear();
+            }
+            return;
+        }
+        if self.len == 0 {
+            self.since_ms = now_ms;
+        }
+        while failed != 0 {
+            let side = failed.trailing_zeros() as u16;
+            failed &= failed - 1;
+            let len = usize::from(self.len);
+            if let Some(entry) = self.entries[..len].iter_mut().find(|(s, _)| *s == side) {
+                entry.1 = entry.1.max(priority);
+            } else if len < PASS_BUSY_SIDES {
+                self.entries[len] = (side, priority);
+                self.len += 1;
+            }
+        }
+    }
+
+    fn dispatched(&mut self, work: &TxWork) {
+        self.last_priority = Some(work.queued.priority);
+    }
+
+    /// The recorded refusals have run for over a millisecond (two clock
+    /// ticks, so cheap refusals that happen to straddle one tick do not
+    /// count): the other sides are owed a turn.
+    fn due(&self, now_ms: u64) -> bool {
+        self.len != 0 && now_ms >= self.since_ms.saturating_add(2)
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Queued work whose side is known and refused at or above its priority
+    /// in this pass.
+    fn passes_over(&self, item: &TxQueued) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let dst = match &item.item {
+            RouterTxItem::ToSide { dst, .. } | RouterTxItem::ReliableReplay { dst, .. } => *dst,
+            RouterTxItem::Broadcast(_) | RouterTxItem::EndToEndReplay { .. } => return false,
+        };
+        let Ok(dst) = u16::try_from(dst) else {
+            return false;
+        };
+        self.entries[..usize::from(self.len)]
+            .iter()
+            .any(|(side, refused)| *side == dst && item.priority <= *refused)
+    }
 }
 
 /// Do not allow a continuously replenished stream of control traffic to keep
@@ -3474,6 +3583,9 @@ struct RouterInner {
     tx_policy_flags: u8,
     /// Some accepted original is parked because no side could reach it.
     unroutable_parked: bool,
+    /// Sides (bit per id below 64) whose handler failed a frame since a TX
+    /// pass last looked; see `PassBusySides`.
+    tx_failed_sides: u64,
     #[cfg(feature = "latest-value-egress")]
     latest_turn_phase: u8,
     #[cfg(feature = "latest-value-egress")]
@@ -5796,6 +5908,9 @@ impl Router {
 
     fn note_side_tx_failure(&self, side: RouterSideId, ty: DataType, attempts: usize) {
         let mut st = self.state.lock();
+        if side < 64 {
+            st.tx_failed_sides |= 1 << side;
+        }
         st.total_handler_failures = st.total_handler_failures.saturating_add(1);
         st.total_handler_retries = st.total_handler_retries.saturating_add(attempts as u64);
         let entry = st.side_runtime_stats.entry(side).or_default();
@@ -16331,6 +16446,9 @@ impl Router {
     ) -> TelemetryResult<()> {
         let mut requeue = Vec::new();
         let mut failed_ordered_types = OrdSet::new();
+        // Ordered types whose exhausted head was a segment proxy's cohort,
+        // with the owners that missed it (see below).
+        let mut proxy_gaps: Vec<(u32, Vec<u64>)> = Vec::new();
         #[cfg(feature = "discovery")]
         let mut silenced: Vec<u64> = Vec::new();
         #[cfg(feature = "std")]
@@ -16365,6 +16483,7 @@ impl Router {
                 transmit_queue,
                 end_to_end_reliable_tx,
                 reliable_exhausted,
+                reliable_return_routes,
                 #[cfg(feature = "std")]
                 exhausted_recent,
                 ..
@@ -16410,7 +16529,29 @@ impl Router {
                         return true;
                     }
                     if let Some(ty) = sent.ordered_type {
-                        failed_ordered_types.insert(ty);
+                        // A segment proxy acknowledged this frame upstream when
+                        // it accepted the cohort, so its publisher never learns
+                        // of this exhaustion and cannot re-send. Failing the
+                        // queued tail here would silently drop every later
+                        // frame of the stream for the owners that did confirm
+                        // this one. The gap belongs only to the owners that
+                        // missed it: they are retired from the tail below,
+                        // the others receive it in order.
+                        #[cfg(feature = "discovery")]
+                        let proxied = reliable_return_routes
+                            .get(&packet_id)
+                            .is_some_and(|route| route.upstream_contract.is_some());
+                        #[cfg(not(feature = "discovery"))]
+                        let proxied = {
+                            let _ = &reliable_return_routes;
+                            false
+                        };
+                        if proxied {
+                            let owners = sent.pending_destinations.keys().copied().collect();
+                            proxy_gaps.push((ty, owners));
+                        } else {
+                            failed_ordered_types.insert(ty);
+                        }
                     }
                     #[cfg(feature = "std")]
                     let ty = sent.pending_type;
@@ -16439,6 +16580,13 @@ impl Router {
                     .ordered_type
                     .is_some_and(|ty| failed_ordered_types.contains(&ty))
             });
+            // A proxy's tail continues for the owners that confirmed the
+            // exhausted frame; never past the gap for those that missed it.
+            proxy_gaps.retain(|(ty, _)| !failed_ordered_types.contains(ty));
+            #[cfg(feature = "discovery")]
+            if !proxy_gaps.is_empty() {
+                Self::retire_ordered_gap_owners_locked(&mut st, &proxy_gaps);
+            }
         }
 
         #[cfg(feature = "discovery")]
@@ -17528,6 +17676,7 @@ impl Router {
                 tx_priority_burst: 0,
                 tx_policy_flags: 0,
                 unroutable_parked: false,
+                tx_failed_sides: 0,
                 #[cfg(feature = "latest-value-egress")]
                 latest_turn_phase: 0,
                 #[cfg(feature = "latest-value-egress")]
@@ -18898,6 +19047,41 @@ impl Router {
         }
         drop(st);
         self.retire_owners_from_pending(&owners, false)
+    }
+
+    /// After a segment proxy's Ordered frame exhausted: remove the owners that
+    /// missed it from the later frames of the same stream it still holds, and
+    /// drop a frame owed to those owners alone. The remaining frames are
+    /// released in order by `release_ordered_successors`.
+    #[cfg(feature = "discovery")]
+    fn retire_ordered_gap_owners_locked(st: &mut RouterInner, gaps: &[(u32, Vec<u64>)]) {
+        let RouterInner { end_to_end_reliable_tx, reliable_exhausted, .. } = st;
+        end_to_end_reliable_tx.retain(|_, sent| {
+            let Some(owners) = sent
+                .ordered_type
+                .and_then(|ty| gaps.iter().find(|(gap_ty, _)| *gap_ty == ty))
+                .map(|(_, owners)| owners)
+            else {
+                return true;
+            };
+            let before = sent.pending_destinations.len();
+            for owner in owners {
+                sent.pending_destinations.remove(owner);
+            }
+            let removed = (before - sent.pending_destinations.len()) as u64;
+            if removed == 0 {
+                return true;
+            }
+            let c = &mut *reliable_exhausted;
+            c.silent_owner_retired_ordered = c.silent_owner_retired_ordered.saturating_add(removed);
+            if !sent.pending_destinations.is_empty() {
+                return true;
+            }
+            if Self::frozen_owner_count(&sent.data) as u64 > removed {
+                c.silent_owner_completed_ordered = c.silent_owner_completed_ordered.saturating_add(1);
+            }
+            false
+        });
     }
 
     /// Retires `owners` from every pending end-to-end frame: a frame then
@@ -20513,11 +20697,21 @@ impl Router {
         st.tx_policy_flags &= !1;
     }
 
-    #[inline(never)]
+    #[cfg(test)]
     fn pop_transmit_queue_locked(
         st: &mut RouterInner,
         now_ms: u64,
         control_only: bool,
+    ) -> Option<TxWork> {
+        Self::pop_transmit_queue_skipping(st, now_ms, control_only, &mut PassBusySides::default())
+    }
+
+    #[inline(never)]
+    fn pop_transmit_queue_skipping(
+        st: &mut RouterInner,
+        now_ms: u64,
+        control_only: bool,
+        busy: &mut PassBusySides,
     ) -> Option<TxWork> {
         let slow = st.tx_policy_flags & 1 != 0;
         let mut next_token = st.ordered_claim_seq.wrapping_add(1).max(1);
@@ -20536,41 +20730,70 @@ impl Router {
         let latest_frame = latest_side
             .and_then(|side| st.sides.get(side)?.as_ref())
             .map_or(0, |side| side.opts.max_frame_bytes);
-        let (selected, owed_turn) = st.transmit_queue.select_front_fair_deferred(
+        // After a refusal, work for other sides goes first; when nothing else
+        // can go, the refusing sides are offered their frames again.
+        let passing_over = core::cell::Cell::new(busy.due(now_ms));
+        let mut eligible = |_queue: &VecDeque<TxQueued>, item: &TxQueued| {
+            !matches!(
+                item.delivery_state,
+                QueuedDelivery::ClaimedOrdered
+                    | QueuedDelivery::ClaimedUnordered
+                    | QueuedDelivery::OrderedTail
+                    | QueuedDelivery::ClaimedLocalOrderedSide
+                    | QueuedDelivery::ClaimedAnchoredLocalOrderedSide
+            ) && item.retry_after_ms <= now_ms
+                && (!control_only || item.priority >= 200)
+                && !(passing_over.get() && busy.passes_over(item))
+                && {
+                    #[cfg(feature = "latest-value-egress")]
+                    {
+                        let turn_ready = latest_turn.is_none_or(|index| {
+                            !latest::managed_turn_item(item, latest_side, latest_frame)
+                                || _queue
+                                    .get(index)
+                                    .is_some_and(|chosen| core::ptr::eq(chosen, item))
+                        });
+                        turn_ready
+                            && !(item.disposable & TX_LATEST_PENDING != 0
+                                && matches!(&item.item,
+                        RouterTxItem::ToSide { dst, .. } if latest_blocked == Some(*dst)))
+                    }
+                    #[cfg(not(feature = "latest-value-egress"))]
+                    {
+                        true
+                    }
+                }
+        };
+        // A pick that passes over refusing sides is an extra turn for the
+        // others, outside the priority rotation: it neither spends nor resets
+        // the bounded turn lower bands are owed (on the refusing side too).
+        let fair_before = (st.tx_priority_burst, st.transmit_queue.fair_state());
+        let mut selection = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
             |item| item.priority,
-            |_queue, item| {
-                !matches!(
-                    item.delivery_state,
-                    QueuedDelivery::ClaimedOrdered
-                        | QueuedDelivery::ClaimedUnordered
-                        | QueuedDelivery::OrderedTail
-                        | QueuedDelivery::ClaimedLocalOrderedSide
-                        | QueuedDelivery::ClaimedAnchoredLocalOrderedSide
-                ) && item.retry_after_ms <= now_ms
-                    && (!control_only || item.priority >= 200)
-                    && {
-                        #[cfg(feature = "latest-value-egress")]
-                        {
-                            let turn_ready = latest_turn.is_none_or(|index| {
-                                !latest::managed_turn_item(item, latest_side, latest_frame)
-                                    || _queue
-                                        .get(index)
-                                        .is_some_and(|chosen| core::ptr::eq(chosen, item))
-                            });
-                            turn_ready
-                                && !(item.disposable & TX_LATEST_PENDING != 0
-                                    && matches!(&item.item,
-                            RouterTxItem::ToSide { dst, .. } if latest_blocked == Some(*dst)))
-                        }
-                        #[cfg(not(feature = "latest-value-egress"))]
-                        {
-                            true
-                        }
-                    }
-            },
-        )?;
+            &mut eligible,
+        );
+        if passing_over.get()
+            && let Some((_, owed_turn)) = selection.as_mut()
+        {
+            st.tx_priority_burst = fair_before.0;
+            st.transmit_queue.restore_fair_state(fair_before.1);
+            *owed_turn = false;
+        }
+        if selection.is_none() && passing_over.get() {
+            passing_over.set(false);
+            selection = st.transmit_queue.select_front_fair_deferred(
+                &mut st.tx_priority_burst,
+                MAX_PRIORITY_BURST,
+                |item| item.priority,
+                &mut eligible,
+            );
+            busy.clear();
+        } else {
+            busy.passed_over = passing_over.get();
+        }
+        let (selected, owed_turn) = selection?;
         #[cfg(feature = "latest-value-egress")]
         if latest_turn == Some(selected) {
             if let Some(next) = st.latest_service_seq.checked_add(1) {
@@ -20702,6 +20925,7 @@ impl Router {
     fn process_tx_queue_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
         self.expire_side_chunks();
         let start = self.clock.now_ms();
+        let mut busy = PassBusySides::default();
         loop {
             let received_control = crate::memory_admission::allow_drain(
                 self.drain_queued_control_rx_before_tx(start, timeout_ms),
@@ -20717,6 +20941,8 @@ impl Router {
 
             let pkt_opt = {
                 let mut st = self.state.lock();
+                let pick_now = self.clock.now_ms();
+                busy.take_failures(&mut st, pick_now);
                 #[cfg(feature = "std")]
                 let work = if self
                     .active_queued_tx
@@ -20725,10 +20951,11 @@ impl Router {
                 {
                     None // Leave ownership queued; never wrap the active total.
                 } else {
-                    Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false)
+                    Self::pop_transmit_queue_skipping(&mut st, pick_now, false, &mut busy)
                 };
                 #[cfg(not(feature = "std"))]
-                let work = Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false);
+                let work =
+                    Self::pop_transmit_queue_skipping(&mut st, pick_now, false, &mut busy);
                 #[cfg(feature = "std")]
                 let work = self.track_queued_tx(&mut st, work);
                 work
@@ -20736,6 +20963,7 @@ impl Router {
             let Some(pkt) = pkt_opt else { break };
             #[cfg(feature = "std")]
             let (pkt, _activity) = pkt;
+            busy.dispatched(&pkt);
             self.dispatch_queued_item(pkt)?;
             if timeout_ms != 0 && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
                 break;
@@ -20831,6 +21059,7 @@ impl Router {
         // Abandoned chunk transfers expire first, under the first control
         // check's lock.
         let mut expire_at = Some(start);
+        let mut busy = PassBusySides::default();
         loop {
             // Without std, a pass with no control item serves its idle timeouts
             // under the control check's lock, at the pass's clock reading.
@@ -20865,6 +21094,7 @@ impl Router {
 
             if let Some(pkt) = {
                 let mut st = self.state.lock();
+                busy.take_failures(&mut st, now);
                 // Complete one fair TX even after RX uses the deadline.
                 // Priority burst limits still prefer and protect queued ACKs.
                 #[cfg(feature = "std")]
@@ -20875,16 +21105,17 @@ impl Router {
                 {
                     None // Leave ownership queued; never wrap the active total.
                 } else {
-                    Self::pop_transmit_queue_locked(&mut st, now, false)
+                    Self::pop_transmit_queue_skipping(&mut st, now, false, &mut busy)
                 };
                 #[cfg(not(feature = "std"))]
-                let work = Self::pop_transmit_queue_locked(&mut st, now, false);
+                let work = Self::pop_transmit_queue_skipping(&mut st, now, false, &mut busy);
                 #[cfg(feature = "std")]
                 let work = self.track_queued_tx(&mut st, work);
                 work
             } {
                 #[cfg(feature = "std")]
                 let (pkt, _activity) = pkt;
+                busy.dispatched(&pkt);
                 self.dispatch_queued_item(pkt)?;
                 did_any = true;
             }

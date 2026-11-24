@@ -98,6 +98,9 @@ const RF: usize = 1;
 type Side = (usize, RouterSideId, bool, Arc<Mutex<Vec<Vec<u8>>>>);
 
 struct Net {
+    /// Discovery traffic shares the radio's air time and carries the whole
+    /// registry; keep it what it is when the case runs alone.
+    _schema: crate::tests::CommonSchemaOnly,
     now: Arc<AtomicU64>,
     nodes: Vec<Router>,
     /// (node, side) of every side; outbox per side.
@@ -123,6 +126,7 @@ fn cfg(source: bool, request_ms: u64, announce_ms: u64) -> TimeSyncConfig {
 
 impl Net {
     fn new(link: RadioLink, seed: u64) -> Self {
+        let schema = crate::tests::common_test_schema_only();
         let now = Arc::new(AtomicU64::new(5_000_000_000));
         let nodes: Vec<Router> = NODES
             .iter()
@@ -136,7 +140,7 @@ impl Net {
                 )
             })
             .collect();
-        let mut net = Self { now, nodes, sides: Vec::new(), flight: Vec::new(), rng: Rng(seed | 1), link };
+        let mut net = Self { _schema: schema, now, nodes, sides: Vec::new(), flight: Vec::new(), rng: Rng(seed | 1), link };
         net.add_side(GS, true); // 0: GS radio
         net.add_side(RF, true); // 1: RF radio
         net.add_side(RF, false); // 2: RF CAN

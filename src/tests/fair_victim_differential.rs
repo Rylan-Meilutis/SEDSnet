@@ -149,6 +149,9 @@ fn queues(st: &RouterInner) -> (Vec<RouterRxItem>, Vec<TxQueued>) {
 
 #[test]
 fn tagged_victim_selection_matches_on_the_spot_classification() {
+    // The routers' small budget is shared with schema-derived state; keep the
+    // registry what it is when the case runs alone.
+    let _schema = crate::tests::common_test_schema_only();
     let types = [
         (data_type("FAIR_DIFF_BULK", ReliableMode::None, 20), 20),
         (data_type("FAIR_DIFF_BULK_HIGH", ReliableMode::None, 60), 60),

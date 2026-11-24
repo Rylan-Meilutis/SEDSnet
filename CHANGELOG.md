@@ -1,5 +1,57 @@
 # Changelog
 
+## 7.0.1
+
+Patch release: no wire, API or C ABI change; 7.0.0 and 7.0.1 nodes
+interoperate.
+
+### Fixed
+
+- Router transmission no longer lets one side's refusals starve another
+  side. A side handler that refuses a frame (budget, rate limit, a full link)
+  left the frame at the head of the queue to be offered again a millisecond
+  later; on a slow or loaded CPU each pass's time budget went entirely to
+  re-offering those refused frames, so frames for another side behind them
+  (for example an umbilical command behind a refused radio backlog) were not
+  sent for seconds. Now, once a side's refusals in a pass run longer than
+  two clock ticks, the router gives the other sides a turn: one pick that
+  passes over the refusing sides' work at or below the refused priority.
+  A refusal during the turn extends it and a successful pick ends it; when
+  nothing else can go, the refusing side is offered its frames again as
+  before. While refusals are cheap the behaviour is unchanged: every frame
+  is still offered within the millisecond, higher-priority work is never
+  held back by a lower-priority refusal, and order within a side, the
+  priority burst and ordered delivery are unchanged. The turn sits outside
+  the priority rotation and does not spend or reset the turn owed to lower
+  bands.
+
+- A segment proxy (a router that accepted an Ordered end-to-end frame for
+  owners behind another side and acknowledged it upstream) no longer drops
+  the later frames of that stream when one owner misses every retry of an
+  earlier one. Before, the exhausted frame failed its queued tail, as it
+  does at the publisher, but the publisher had already been told the
+  frames were delivered and never re-sent them: a burst of managed-variable
+  writes relayed onto a bus behind one silent or busy owner reached the
+  other owners only in part (writes spaced closer than the proxy's retry
+  window: 1, 3, 5, 7 of eight writes 1 s apart; only the first of eight
+  100 ms apart). Now the owners that missed the exhausted frame are retired
+  from the proxy's queued frames of that stream and the rest are delivered,
+  in order, to the owners that confirmed it. The exhaustion is still counted
+  (`end_to_end_ordered`), the retired owners in
+  `silent_owner_retired_ordered`. The publisher's own Ordered streams are
+  unchanged: an exhausted frame still fails its tail and reports
+  `ordered end-to-end delivery exhausted retries`.
+
+### Changed
+
+- Release workflow: the crates.io step reads every published version from
+  the sparse index (falling back to `cargo search`) and treats Cargo's
+  "already exists on crates.io index" as already published, so a tag pushed
+  after a manual publish no longer fails; Linux i686 wheels build in
+  manylinux_2_28 (the manylinux2014 i686 image's CentOS 7 mirrors are gone).
+- Tests: fixtures whose behaviour depends on the schema size run against the
+  common test schema only, so the full suite passes in any order.
+
 ## 7.0.0
 
 Wire format 7: smaller headers for every kind of traffic. **Breaking wire

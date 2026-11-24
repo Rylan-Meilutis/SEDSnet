@@ -138,6 +138,7 @@ pub(super) fn after_tail_guard(
 }
 struct Fixture {
     _case: std::sync::MutexGuard<'static, ()>,
+    _schema: crate::tests::CommonSchemaOnly,
     writer: Arc<Router>,
     peer: Arc<Router>,
     third: Option<Arc<Router>>,
@@ -165,7 +166,9 @@ impl Fixture {
     }
     fn with_bus_profile(shared: bool, three: bool, hop: bool) -> Self {
         let case = CASE.lock().unwrap_or_else(|poison| poison.into_inner());
-        crate::tests::ensure_common_test_schema();
+        // The bounded setup capture holds discovery catalogs of the whole
+        // registry; keep it what it is when the case runs alone.
+        let schema = crate::tests::common_test_schema_only();
         let ep = crate::config::register_endpoint("ORDER_AUDIT_ENDPOINT", false).unwrap();
         let ty = crate::config::register_data_type_with_description(
             "ORDER_AUDIT_VALUE",
@@ -268,6 +271,7 @@ impl Fixture {
         if let Some(third)=&third {third.announce_discovery().unwrap();}
         let mut f = Self {
             _case: case,
+            _schema: schema,
             writer,
             peer,
             third,

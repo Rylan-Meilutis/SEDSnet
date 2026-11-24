@@ -22,6 +22,7 @@ pub(super) fn observe_ack_old(
 }
 struct Fixture {
     _case: std::sync::MutexGuard<'static, ()>,
+    _schema: crate::tests::CommonSchemaOnly,
     nodes: Vec<Arc<Router>>,
     clock: Arc<AtomicU64>,
     rows: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -37,7 +38,8 @@ impl Fixture {
     fn new(count: usize, drop_until: u64) -> Self {
         let guard = CASE.lock().unwrap_or_else(|e| e.into_inner());
         ACK_OLD.lock().unwrap().clear();
-        crate::tests::ensure_common_test_schema();
+        // Discovery catalogs carry the whole registry; keep it what it is alone.
+        let schema = crate::tests::common_test_schema_only();
         let ep = crate::config::register_endpoint("BOOTSTRAP_AUDIT_EP", false).unwrap();
         let ty = crate::config::register_data_type_with_description(
             "BOOTSTRAP_AUDIT_VALUE",
@@ -109,6 +111,7 @@ impl Fixture {
         }
         let mut f = Self {
             _case: guard,
+            _schema: schema,
             nodes,
             clock,
             rows,

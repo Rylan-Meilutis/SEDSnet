@@ -138,8 +138,9 @@ pub struct ReliableRuntimeStats {
 }
 
 /// Reliable deliveries given up after the last retry, by path and mode. An
-/// Ordered one also fails the stream's queued tail (not counted here); an
-/// Unordered one is dropped alone.
+/// Ordered one also fails the stream's queued tail (not counted here), except
+/// at a segment proxy, where the tail continues for the owners that confirmed
+/// it; an Unordered one is dropped alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReliableExhaustionCounts {
     pub end_to_end_ordered: u64,
@@ -147,8 +148,10 @@ pub struct ReliableExhaustionCounts {
     pub hop_ordered: u64,
     pub hop_unordered: u64,
     /// Owners retired from end-to-end frames after missing every retry of one
-    /// (a silent station), counted per frame, by the frame's mode. Only
-    /// Unordered frames retire owners; the Ordered counts stay 0.
+    /// (a silent station), counted per frame, by the frame's mode. Unordered
+    /// frames retire owners at any router; Ordered ones only at a segment
+    /// proxy, from the queued frames behind its exhausted one (the publisher
+    /// was acknowledged and cannot re-send).
     pub silent_owner_retired_ordered: u64,
     pub silent_owner_retired_unordered: u64,
     /// End-to-end frames completed only because a silent owner was retired

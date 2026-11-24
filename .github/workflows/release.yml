@@ -80,11 +80,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64
-          - aarch64
-          - armv7
-          - i686
+        include:
+          - target: x86_64
+            manylinux: "2014"
+          - target: aarch64
+            manylinux: "2014"
+          - target: armv7
+            manylinux: "2014"
+          # The manylinux2014 i686 image is native CentOS 7, whose yum mirrors
+          # are gone; the other targets build in maintained cross images.
+          - target: i686
+            manylinux: "2_28"
     steps:
       - uses: actions/checkout@v4
 
@@ -93,7 +99,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --compatibility pypi
-          manylinux: "2014"
+          manylinux: ${{ matrix.manylinux }}
           sccache: "true"
 
       - name: Upload wheel artifacts
