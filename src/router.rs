@@ -44,6 +44,9 @@ mod accepted_route_ownership;
 #[path = "tests/unroutable_backoff.rs"]
 mod unroutable_backoff;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
+#[path = "tests/side_busy_skip.rs"]
+mod side_busy_skip;
+#[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/plain_transit_differential.rs"]
 mod plain_transit_differential;
 #[cfg(all(test, feature = "std", feature = "discovery"))]
@@ -1197,6 +1200,82 @@ struct TxWork {
     owed_turn: bool,
     #[cfg(feature = "latest-value-egress")]
     service: EgressService,
+}
+
+/// Sides that refused work earlier in the current TX pass, each with the
+/// highest queued priority it refused. A refused frame stays queued for its
+/// side (as a side retry or child), and the next pick used to be that side's
+/// next frame again: on a slow CPU the pass's time budget went to one busy
+/// side's backlog, offered frame by frame, and frames for idle sides queued
+/// behind it waited for seconds. Now, after a refusal, work for other sides
+/// goes first: work bound for a side that refused at or above its priority
+/// is passed over while anything else can go. When nothing else can, the
+/// table is cleared and the busy sides are offered their frames again as
+/// before (a side may take one frame while refusing another), so no side
+/// loses offers it could use, higher-priority work is never held back by a
+/// lower-priority refusal, and order within a side and ordered delivery are
+/// unchanged. Pass-local: nothing is retained.
+#[derive(Clone, Copy, Default)]
+struct PassBusySides {
+    entries: [(u16, u8); PASS_BUSY_SIDES],
+    len: u8,
+    /// Priority of the work dispatched since the last pop, if any.
+    last_priority: Option<u8>,
+}
+const PASS_BUSY_SIDES: usize = 8;
+
+impl PassBusySides {
+    /// Under the pop's lock: attribute handler failures since the previous
+    /// pop to the work dispatched in between. Failures from before the pass's
+    /// first pop are stale and only cleared. Past the table's capacity a
+    /// refusing side is not recorded (it keeps its old turn).
+    fn take_failures(&mut self, st: &mut RouterInner) {
+        let mut failed = core::mem::take(&mut st.tx_failed_sides);
+        let Some(priority) = self.last_priority.take() else {
+            return;
+        };
+        while failed != 0 {
+            let side = failed.trailing_zeros() as u16;
+            failed &= failed - 1;
+            let len = usize::from(self.len);
+            if let Some(entry) = self.entries[..len].iter_mut().find(|(s, _)| *s == side) {
+                entry.1 = entry.1.max(priority);
+            } else if len < PASS_BUSY_SIDES {
+                self.entries[len] = (side, priority);
+                self.len += 1;
+            }
+        }
+    }
+
+    fn dispatched(&mut self, work: &TxWork) {
+        self.last_priority = Some(work.queued.priority);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Queued work whose side is known and refused at or above its priority
+    /// in this pass.
+    fn passes_over(&self, item: &TxQueued) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let dst = match &item.item {
+            RouterTxItem::ToSide { dst, .. } | RouterTxItem::ReliableReplay { dst, .. } => *dst,
+            RouterTxItem::Broadcast(_) | RouterTxItem::EndToEndReplay { .. } => return false,
+        };
+        let Ok(dst) = u16::try_from(dst) else {
+            return false;
+        };
+        self.entries[..usize::from(self.len)]
+            .iter()
+            .any(|(side, refused)| *side == dst && item.priority <= *refused)
+    }
 }
 
 /// Do not allow a continuously replenished stream of control traffic to keep
@@ -3477,6 +3556,9 @@ struct RouterInner {
     tx_policy_flags: u8,
     /// Some accepted original is parked because no side could reach it.
     unroutable_parked: bool,
+    /// Sides (bit per id below 64) whose handler failed a frame since a TX
+    /// pass last looked; see `PassBusySides`.
+    tx_failed_sides: u64,
     #[cfg(feature = "latest-value-egress")]
     latest_turn_phase: u8,
     #[cfg(feature = "latest-value-egress")]
@@ -5799,6 +5881,9 @@ impl Router {
 
     fn note_side_tx_failure(&self, side: RouterSideId, ty: DataType, attempts: usize) {
         let mut st = self.state.lock();
+        if side < 64 {
+            st.tx_failed_sides |= 1 << side;
+        }
         st.total_handler_failures = st.total_handler_failures.saturating_add(1);
         st.total_handler_retries = st.total_handler_retries.saturating_add(attempts as u64);
         let entry = st.side_runtime_stats.entry(side).or_default();
@@ -17564,6 +17649,7 @@ impl Router {
                 tx_priority_burst: 0,
                 tx_policy_flags: 0,
                 unroutable_parked: false,
+                tx_failed_sides: 0,
                 #[cfg(feature = "latest-value-egress")]
                 latest_turn_phase: 0,
                 #[cfg(feature = "latest-value-egress")]
@@ -20584,11 +20670,21 @@ impl Router {
         st.tx_policy_flags &= !1;
     }
 
-    #[inline(never)]
+    #[cfg(test)]
     fn pop_transmit_queue_locked(
         st: &mut RouterInner,
         now_ms: u64,
         control_only: bool,
+    ) -> Option<TxWork> {
+        Self::pop_transmit_queue_skipping(st, now_ms, control_only, &mut PassBusySides::default())
+    }
+
+    #[inline(never)]
+    fn pop_transmit_queue_skipping(
+        st: &mut RouterInner,
+        now_ms: u64,
+        control_only: bool,
+        busy: &mut PassBusySides,
     ) -> Option<TxWork> {
         let slow = st.tx_policy_flags & 1 != 0;
         let mut next_token = st.ordered_claim_seq.wrapping_add(1).max(1);
@@ -20607,41 +20703,57 @@ impl Router {
         let latest_frame = latest_side
             .and_then(|side| st.sides.get(side)?.as_ref())
             .map_or(0, |side| side.opts.max_frame_bytes);
-        let (selected, owed_turn) = st.transmit_queue.select_front_fair_deferred(
+        // After a refusal, work for other sides goes first; when nothing else
+        // can go, the refusing sides are offered their frames again.
+        let passing_over = core::cell::Cell::new(!busy.is_empty());
+        let mut eligible = |_queue: &VecDeque<TxQueued>, item: &TxQueued| {
+            !matches!(
+                item.delivery_state,
+                QueuedDelivery::ClaimedOrdered
+                    | QueuedDelivery::ClaimedUnordered
+                    | QueuedDelivery::OrderedTail
+                    | QueuedDelivery::ClaimedLocalOrderedSide
+                    | QueuedDelivery::ClaimedAnchoredLocalOrderedSide
+            ) && item.retry_after_ms <= now_ms
+                && (!control_only || item.priority >= 200)
+                && !(passing_over.get() && busy.passes_over(item))
+                && {
+                    #[cfg(feature = "latest-value-egress")]
+                    {
+                        let turn_ready = latest_turn.is_none_or(|index| {
+                            !latest::managed_turn_item(item, latest_side, latest_frame)
+                                || _queue
+                                    .get(index)
+                                    .is_some_and(|chosen| core::ptr::eq(chosen, item))
+                        });
+                        turn_ready
+                            && !(item.disposable & TX_LATEST_PENDING != 0
+                                && matches!(&item.item,
+                        RouterTxItem::ToSide { dst, .. } if latest_blocked == Some(*dst)))
+                    }
+                    #[cfg(not(feature = "latest-value-egress"))]
+                    {
+                        true
+                    }
+                }
+        };
+        let mut selection = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
             |item| item.priority,
-            |_queue, item| {
-                !matches!(
-                    item.delivery_state,
-                    QueuedDelivery::ClaimedOrdered
-                        | QueuedDelivery::ClaimedUnordered
-                        | QueuedDelivery::OrderedTail
-                        | QueuedDelivery::ClaimedLocalOrderedSide
-                        | QueuedDelivery::ClaimedAnchoredLocalOrderedSide
-                ) && item.retry_after_ms <= now_ms
-                    && (!control_only || item.priority >= 200)
-                    && {
-                        #[cfg(feature = "latest-value-egress")]
-                        {
-                            let turn_ready = latest_turn.is_none_or(|index| {
-                                !latest::managed_turn_item(item, latest_side, latest_frame)
-                                    || _queue
-                                        .get(index)
-                                        .is_some_and(|chosen| core::ptr::eq(chosen, item))
-                            });
-                            turn_ready
-                                && !(item.disposable & TX_LATEST_PENDING != 0
-                                    && matches!(&item.item,
-                            RouterTxItem::ToSide { dst, .. } if latest_blocked == Some(*dst)))
-                        }
-                        #[cfg(not(feature = "latest-value-egress"))]
-                        {
-                            true
-                        }
-                    }
-            },
-        )?;
+            &mut eligible,
+        );
+        if selection.is_none() && passing_over.get() {
+            passing_over.set(false);
+            selection = st.transmit_queue.select_front_fair_deferred(
+                &mut st.tx_priority_burst,
+                MAX_PRIORITY_BURST,
+                |item| item.priority,
+                &mut eligible,
+            );
+            busy.clear();
+        }
+        let (selected, owed_turn) = selection?;
         #[cfg(feature = "latest-value-egress")]
         if latest_turn == Some(selected) {
             if let Some(next) = st.latest_service_seq.checked_add(1) {
@@ -20773,6 +20885,7 @@ impl Router {
     fn process_tx_queue_with_timeout_impl(&self, timeout_ms: u32) -> TelemetryResult<()> {
         self.expire_side_chunks();
         let start = self.clock.now_ms();
+        let mut busy = PassBusySides::default();
         loop {
             let received_control = crate::memory_admission::allow_drain(
                 self.drain_queued_control_rx_before_tx(start, timeout_ms),
@@ -20788,6 +20901,7 @@ impl Router {
 
             let pkt_opt = {
                 let mut st = self.state.lock();
+                busy.take_failures(&mut st);
                 #[cfg(feature = "std")]
                 let work = if self
                     .active_queued_tx
@@ -20796,10 +20910,11 @@ impl Router {
                 {
                     None // Leave ownership queued; never wrap the active total.
                 } else {
-                    Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false)
+                    Self::pop_transmit_queue_skipping(&mut st, self.clock.now_ms(), false, &mut busy)
                 };
                 #[cfg(not(feature = "std"))]
-                let work = Self::pop_transmit_queue_locked(&mut st, self.clock.now_ms(), false);
+                let work =
+                    Self::pop_transmit_queue_skipping(&mut st, self.clock.now_ms(), false, &mut busy);
                 #[cfg(feature = "std")]
                 let work = self.track_queued_tx(&mut st, work);
                 work
@@ -20807,6 +20922,7 @@ impl Router {
             let Some(pkt) = pkt_opt else { break };
             #[cfg(feature = "std")]
             let (pkt, _activity) = pkt;
+            busy.dispatched(&pkt);
             self.dispatch_queued_item(pkt)?;
             if timeout_ms != 0 && self.clock.now_ms().wrapping_sub(start) >= timeout_ms as u64 {
                 break;
@@ -20902,6 +21018,7 @@ impl Router {
         // Abandoned chunk transfers expire first, under the first control
         // check's lock.
         let mut expire_at = Some(start);
+        let mut busy = PassBusySides::default();
         loop {
             // Without std, a pass with no control item serves its idle timeouts
             // under the control check's lock, at the pass's clock reading.
@@ -20936,6 +21053,7 @@ impl Router {
 
             if let Some(pkt) = {
                 let mut st = self.state.lock();
+                busy.take_failures(&mut st);
                 // Complete one fair TX even after RX uses the deadline.
                 // Priority burst limits still prefer and protect queued ACKs.
                 #[cfg(feature = "std")]
@@ -20946,16 +21064,17 @@ impl Router {
                 {
                     None // Leave ownership queued; never wrap the active total.
                 } else {
-                    Self::pop_transmit_queue_locked(&mut st, now, false)
+                    Self::pop_transmit_queue_skipping(&mut st, now, false, &mut busy)
                 };
                 #[cfg(not(feature = "std"))]
-                let work = Self::pop_transmit_queue_locked(&mut st, now, false);
+                let work = Self::pop_transmit_queue_skipping(&mut st, now, false, &mut busy);
                 #[cfg(feature = "std")]
                 let work = self.track_queued_tx(&mut st, work);
                 work
             } {
                 #[cfg(feature = "std")]
                 let (pkt, _activity) = pkt;
+                busy.dispatched(&pkt);
                 self.dispatch_queued_item(pkt)?;
                 did_any = true;
             }
