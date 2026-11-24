@@ -897,6 +897,18 @@ impl<T: ByteCost> BoundedDeque<T> {
         Some((index, false))
     }
 
+    /// The fairness rotation state (cursor, owed band, owed flags), so a
+    /// selection that must not count as a service turn can be undone.
+    pub(crate) fn fair_state(&self) -> (u8, u8, u8) {
+        (self.fair_priority_cursor, self.fair_owed_priority, self.fair_owed_flags)
+    }
+
+    pub(crate) fn restore_fair_state(&mut self, (cursor, owed_priority, owed_flags): (u8, u8, u8)) {
+        self.fair_priority_cursor = cursor;
+        self.fair_owed_priority = owed_priority;
+        self.fair_owed_flags = owed_flags;
+    }
+
     pub(crate) fn cancel_deferred_turn(&mut self) {
         self.fair_owed_flags &= PRIORITY_TURN_ACTIVE;
     }

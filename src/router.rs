@@ -1202,25 +1202,38 @@ struct TxWork {
     service: EgressService,
 }
 
-/// Sides that refused work earlier in the current TX pass, each with the
-/// highest queued priority it refused. A refused frame stays queued for its
-/// side (as a side retry or child), and the next pick used to be that side's
-/// next frame again: on a slow CPU the pass's time budget went to one busy
-/// side's backlog, offered frame by frame, and frames for idle sides queued
-/// behind it waited for seconds. Now, after a refusal, work for other sides
-/// goes first: work bound for a side that refused at or above its priority
-/// is passed over while anything else can go. When nothing else can, the
-/// table is cleared and the busy sides are offered their frames again as
-/// before (a side may take one frame while refusing another), so no side
-/// loses offers it could use, higher-priority work is never held back by a
-/// lower-priority refusal, and order within a side and ordered delivery are
-/// unchanged. Pass-local: nothing is retained.
+/// Sides that refused work in the current TX pass, each with the highest
+/// queued priority it refused. A refused frame stays queued for its side (as
+/// a side retry or child), and the next pick is that side's next frame
+/// again. Normally that is right: a refusal costs microseconds, every frame
+/// the side has is offered within the millisecond, and a frame it has room
+/// for (by size, class or reserve) goes even behind refused ones. On a slow
+/// CPU each refusal can cost most of a millisecond, and a busy side's
+/// backlog, offered frame by frame, used the pass's whole time budget:
+/// frames for idle sides queued behind it waited for seconds.
+///
+/// So once a side's refusals have run for over a millisecond, the other
+/// sides get a turn: one pick passes over work bound for a refusing side at
+/// or below the priority it refused. Refusals during that turn add to the
+/// record (two busy sides cannot hand the turn back and forth); once a pick
+/// goes through without one, or nothing else can go, the record is cleared
+/// and the refusing sides are offered their frames again. A turn is one
+/// pick, so a steady stream of other work cannot hold a refusing side's
+/// frames back for longer, and it is outside the priority rotation. While
+/// refusals are cheap nothing changes; when they are slow, other sides get
+/// a pick about every millisecond.
+/// Order within a side and ordered delivery are unchanged. Pass-local:
+/// nothing is retained.
 #[derive(Clone, Copy, Default)]
 struct PassBusySides {
     entries: [(u16, u8); PASS_BUSY_SIDES],
     len: u8,
     /// Priority of the work dispatched since the last pop, if any.
     last_priority: Option<u8>,
+    /// The last pick passed over the recorded sides (their turn is owed).
+    passed_over: bool,
+    /// Router time of the first refusal in the current record.
+    since_ms: u64,
 }
 const PASS_BUSY_SIDES: usize = 8;
 
@@ -1229,11 +1242,22 @@ impl PassBusySides {
     /// pop to the work dispatched in between. Failures from before the pass's
     /// first pop are stale and only cleared. Past the table's capacity a
     /// refusing side is not recorded (it keeps its old turn).
-    fn take_failures(&mut self, st: &mut RouterInner) {
+    fn take_failures(&mut self, st: &mut RouterInner, now_ms: u64) {
         let mut failed = core::mem::take(&mut st.tx_failed_sides);
         let Some(priority) = self.last_priority.take() else {
             return;
         };
+        let passed_over = core::mem::take(&mut self.passed_over);
+        if failed == 0 {
+            // The other sides had their turn: the refusing sides go again.
+            if passed_over {
+                self.clear();
+            }
+            return;
+        }
+        if self.len == 0 {
+            self.since_ms = now_ms;
+        }
         while failed != 0 {
             let side = failed.trailing_zeros() as u16;
             failed &= failed - 1;
@@ -1251,8 +1275,11 @@ impl PassBusySides {
         self.last_priority = Some(work.queued.priority);
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
+    /// The recorded refusals have run for over a millisecond (two clock
+    /// ticks, so cheap refusals that happen to straddle one tick do not
+    /// count): the other sides are owed a turn.
+    fn due(&self, now_ms: u64) -> bool {
+        self.len != 0 && now_ms >= self.since_ms.saturating_add(2)
     }
 
     fn clear(&mut self) {
@@ -20705,7 +20732,7 @@ impl Router {
             .map_or(0, |side| side.opts.max_frame_bytes);
         // After a refusal, work for other sides goes first; when nothing else
         // can go, the refusing sides are offered their frames again.
-        let passing_over = core::cell::Cell::new(!busy.is_empty());
+        let passing_over = core::cell::Cell::new(busy.due(now_ms));
         let mut eligible = |_queue: &VecDeque<TxQueued>, item: &TxQueued| {
             !matches!(
                 item.delivery_state,
@@ -20737,12 +20764,23 @@ impl Router {
                     }
                 }
         };
+        // A pick that passes over refusing sides is an extra turn for the
+        // others, outside the priority rotation: it neither spends nor resets
+        // the bounded turn lower bands are owed (on the refusing side too).
+        let fair_before = (st.tx_priority_burst, st.transmit_queue.fair_state());
         let mut selection = st.transmit_queue.select_front_fair_deferred(
             &mut st.tx_priority_burst,
             MAX_PRIORITY_BURST,
             |item| item.priority,
             &mut eligible,
         );
+        if passing_over.get()
+            && let Some((_, owed_turn)) = selection.as_mut()
+        {
+            st.tx_priority_burst = fair_before.0;
+            st.transmit_queue.restore_fair_state(fair_before.1);
+            *owed_turn = false;
+        }
         if selection.is_none() && passing_over.get() {
             passing_over.set(false);
             selection = st.transmit_queue.select_front_fair_deferred(
@@ -20752,6 +20790,8 @@ impl Router {
                 &mut eligible,
             );
             busy.clear();
+        } else {
+            busy.passed_over = passing_over.get();
         }
         let (selected, owed_turn) = selection?;
         #[cfg(feature = "latest-value-egress")]
@@ -20901,7 +20941,8 @@ impl Router {
 
             let pkt_opt = {
                 let mut st = self.state.lock();
-                busy.take_failures(&mut st);
+                let pick_now = self.clock.now_ms();
+                busy.take_failures(&mut st, pick_now);
                 #[cfg(feature = "std")]
                 let work = if self
                     .active_queued_tx
@@ -20910,11 +20951,11 @@ impl Router {
                 {
                     None // Leave ownership queued; never wrap the active total.
                 } else {
-                    Self::pop_transmit_queue_skipping(&mut st, self.clock.now_ms(), false, &mut busy)
+                    Self::pop_transmit_queue_skipping(&mut st, pick_now, false, &mut busy)
                 };
                 #[cfg(not(feature = "std"))]
                 let work =
-                    Self::pop_transmit_queue_skipping(&mut st, self.clock.now_ms(), false, &mut busy);
+                    Self::pop_transmit_queue_skipping(&mut st, pick_now, false, &mut busy);
                 #[cfg(feature = "std")]
                 let work = self.track_queued_tx(&mut st, work);
                 work
@@ -21053,7 +21094,7 @@ impl Router {
 
             if let Some(pkt) = {
                 let mut st = self.state.lock();
-                busy.take_failures(&mut st);
+                busy.take_failures(&mut st, now);
                 // Complete one fair TX even after RX uses the deadline.
                 // Priority burst limits still prefer and protect queued ACKs.
                 #[cfg(feature = "std")]
