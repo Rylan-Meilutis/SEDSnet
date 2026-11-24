@@ -1,5 +1,12 @@
 # Changelogs
 
+## Version 7.0.2 highlights
+
+- Patch release, no code or wire change: holds zstd-sys below 2.2 (zstd 1.6)
+  so builds with `zstd-lean`, the embedded boards' configuration, compile
+  again; zstd-sys 2.2.0 was published on 2026-11-24.
+- Release workflow: wheels without sccache; i686 wheel cross-linked with zig.
+
 ## Version 7.0.1 highlights
 
 - Patch release, no wire, API or C ABI change: mixed 7.0.0/7.0.1 networks work.

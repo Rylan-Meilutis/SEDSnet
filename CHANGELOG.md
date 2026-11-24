@@ -1,5 +1,27 @@
 # Changelog
 
+## 7.0.2
+
+Patch release: no code, wire, API or C ABI change.
+
+### Fixed
+
+- Builds with the `compression`/`zstd-lean` features compile again.
+  zstd-sys 2.2.0 (bundling zstd 1.6.0) was published on 2026-11-24 and
+  zstd-safe 8.4 requires it; zstd-safe 8.3 also resolves to it. The
+  `zstd-lean` stubs are verified against the zstd 1.5.7 internals they
+  replace and refuse other versions at compile time, so every fresh build
+  with `zstd-lean` (the embedded boards' configuration) failed. zstd-sys is
+  now held below 2.2 and zstd-safe below 8.4 until the stubs are re-checked
+  against zstd 1.6.
+
+### Changed
+
+- Release workflow: wheels build without sccache (a cache-service outage
+  aborted a wheel build), and the Linux i686 wheel is cross-linked with zig
+  on the runner instead of inside the manylinux_2_28 i686 container, whose
+  package mirror could not be reached.
+
 ## 7.0.1
 
 Patch release: no wire, API or C ABI change; 7.0.0 and 7.0.1 nodes

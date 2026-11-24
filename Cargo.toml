@@ -1,6 +1,6 @@
 [package]
 name = "SEDSnet"
-version = "7.0.1"
+version = "7.0.2"
 edition = "2024"
 build = "build.rs"
 authors = ["Rylan Meilutis <rylan@rylanswebsite.com>"]
@@ -21,7 +21,7 @@ default = ["std", "compression", "timesync", "discovery", "cryptography", "compa
 std = ["serde", "serde/std", "serde_json", "serde_json/std"]
 embedded = ["compression", "timesync", "discovery", "cryptography", "serde", "serde_json", "serde_json/alloc"]
 python = ["std", "pyo3/extension-module", "pyo3/abi3-py39", "compression", "timesync", "discovery", "cryptography", "compact-bundle"]
-compression = ["zstd-safe"]
+compression = ["zstd-safe", "dep:zstd-sys"]
 # Opt-in flash reduction: drop zstd's long-distance matcher and target-block-size
 # compressor, which SEDSnet never enables. Frames are unchanged. See src/zstd_lean.rs.
 zstd-lean = ["compression"]
@@ -112,7 +112,11 @@ crc32fast = { version = "1.5.2", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1.0.154", default-features = false, optional = true }
 pyo3 = { version = "0.30.1", optional = true, features = ["auto-initialize", "extension-module", "multiple-pymethods"] }
-zstd-safe = { version = "8.1.0", optional = true, default-features = false }
+# zstd-sys 2.0-2.1 bundle zstd 1.5.7, the release src/zstd_lean.rs is verified against. zstd-sys 2.2
+# (zstd 1.6.0, through zstd-safe 8.4) fails that check, and zstd-safe 8.3 alone still resolves to it, so
+# both are held here. Widen only after re-checking the stubs.
+zstd-safe = { version = ">=8.1.0, <8.4.0", optional = true, default-features = false }
+zstd-sys = { version = ">=2.0.0, <2.2.0", optional = true, default-features = false }
 
 [build-dependencies]
 serde_json = "1.0.154"
