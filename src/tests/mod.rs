@@ -47,6 +47,48 @@ pub(crate) fn ensure_common_test_schema() {
     });
 }
 
+/// The schema registry is process-wide and only grows: every test that
+/// registers its own types leaves them behind. A fixture whose frames carry
+/// the schema (discovery catalogs, schema responses) or whose budgets scale
+/// with it therefore behaves differently in the full serial run than alone
+/// (bigger catalog frames, longer radio turns). This guard keeps only the
+/// common test schema while it lives and puts every removed definition back
+/// (same IDs) when dropped, so later tests that cached a type still find it.
+pub(crate) struct CommonSchemaOnly {
+    saved: crate::config::OwnedRuntimeSchemaSnapshot,
+}
+
+pub(crate) fn common_test_schema_only() -> CommonSchemaOnly {
+    ensure_common_test_schema();
+    let fixture = crate::config::schema_snapshot_from_json_bytes(include_bytes!(
+        "../../tests/fixtures/legacy-test-schema.json"
+    ))
+    .unwrap();
+    let saved = crate::config::export_schema();
+    for ty in &saved.types {
+        if !fixture.types.iter().any(|f| f.id == ty.id) {
+            // Internal types refuse removal and stay, as in every run.
+            let _ = crate::config::remove_data_type(ty.id);
+        }
+    }
+    for ep in &saved.endpoints {
+        if !fixture.endpoints.iter().any(|f| f.id == ep.id) {
+            let _ = crate::config::remove_endpoint(ep.id);
+        }
+    }
+    CommonSchemaOnly { saved }
+}
+
+impl Drop for CommonSchemaOnly {
+    fn drop(&mut self) {
+        let saved = core::mem::replace(
+            &mut self.saved,
+            crate::config::OwnedRuntimeSchemaSnapshot { endpoints: Vec::new(), types: Vec::new() },
+        );
+        let _ = crate::config::merge_owned_schema_snapshot(saved);
+    }
+}
+
 /// Compute a valid test payload length for a given [`DataType`], respecting the
 /// schema’s static/dynamic element counts and element widths.
 ///
