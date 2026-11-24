@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A segment proxy (a router that accepted an Ordered end-to-end frame for
+  owners behind another side and acknowledged it upstream) no longer drops
+  the later frames of that stream when one owner misses every retry of an
+  earlier one. Before, the exhausted frame failed its queued tail, as it
+  does at the publisher, but the publisher had already been told the
+  frames were delivered and never re-sent them: a burst of managed-variable
+  writes relayed onto a bus behind one silent or busy owner reached the
+  other owners only in part (writes spaced closer than the proxy's retry
+  window: 1, 3, 5, 7 of eight writes 1 s apart; only the first of eight
+  100 ms apart). Now the owners that missed the exhausted frame are retired
+  from the proxy's queued frames of that stream and the rest are delivered,
+  in order, to the owners that confirmed it. The exhaustion is still counted
+  (`end_to_end_ordered`), the retired owners in
+  `silent_owner_retired_ordered`. The publisher's own Ordered streams are
+  unchanged: an exhausted frame still fails its tail and reports
+  `ordered end-to-end delivery exhausted retries`.
+
 ## 7.0.0
 
 Wire format 7: smaller headers for every kind of traffic. **Breaking wire

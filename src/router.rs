@@ -112,6 +112,9 @@ mod silent_station_sim;
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 #[path = "tests/proxy_upstream_receipt.rs"]
 mod proxy_upstream_receipt;
+#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[path = "tests/relay_managed_burst.rs"]
+mod relay_managed_burst;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/side_peek.rs"]
 mod side_peek_tests;
@@ -16331,6 +16334,9 @@ impl Router {
     ) -> TelemetryResult<()> {
         let mut requeue = Vec::new();
         let mut failed_ordered_types = OrdSet::new();
+        // Ordered types whose exhausted head was a segment proxy's cohort,
+        // with the owners that missed it (see below).
+        let mut proxy_gaps: Vec<(u32, Vec<u64>)> = Vec::new();
         #[cfg(feature = "discovery")]
         let mut silenced: Vec<u64> = Vec::new();
         #[cfg(feature = "std")]
@@ -16365,6 +16371,7 @@ impl Router {
                 transmit_queue,
                 end_to_end_reliable_tx,
                 reliable_exhausted,
+                reliable_return_routes,
                 #[cfg(feature = "std")]
                 exhausted_recent,
                 ..
@@ -16410,7 +16417,29 @@ impl Router {
                         return true;
                     }
                     if let Some(ty) = sent.ordered_type {
-                        failed_ordered_types.insert(ty);
+                        // A segment proxy acknowledged this frame upstream when
+                        // it accepted the cohort, so its publisher never learns
+                        // of this exhaustion and cannot re-send. Failing the
+                        // queued tail here would silently drop every later
+                        // frame of the stream for the owners that did confirm
+                        // this one. The gap belongs only to the owners that
+                        // missed it: they are retired from the tail below,
+                        // the others receive it in order.
+                        #[cfg(feature = "discovery")]
+                        let proxied = reliable_return_routes
+                            .get(&packet_id)
+                            .is_some_and(|route| route.upstream_contract.is_some());
+                        #[cfg(not(feature = "discovery"))]
+                        let proxied = {
+                            let _ = &reliable_return_routes;
+                            false
+                        };
+                        if proxied {
+                            let owners = sent.pending_destinations.keys().copied().collect();
+                            proxy_gaps.push((ty, owners));
+                        } else {
+                            failed_ordered_types.insert(ty);
+                        }
                     }
                     #[cfg(feature = "std")]
                     let ty = sent.pending_type;
@@ -16439,6 +16468,13 @@ impl Router {
                     .ordered_type
                     .is_some_and(|ty| failed_ordered_types.contains(&ty))
             });
+            // A proxy's tail continues for the owners that confirmed the
+            // exhausted frame; never past the gap for those that missed it.
+            proxy_gaps.retain(|(ty, _)| !failed_ordered_types.contains(ty));
+            #[cfg(feature = "discovery")]
+            if !proxy_gaps.is_empty() {
+                Self::retire_ordered_gap_owners_locked(&mut st, &proxy_gaps);
+            }
         }
 
         #[cfg(feature = "discovery")]
@@ -18907,6 +18943,41 @@ impl Router {
     /// one else still owes it, and retries out its own span. Returns the
     /// number of frames retired from.
     #[cfg(feature = "discovery")]
+    /// After a segment proxy's Ordered frame exhausted: remove the owners that
+    /// missed it from the later frames of the same stream it still holds, and
+    /// drop a frame owed to those owners alone. The remaining frames are
+    /// released in order by `release_ordered_successors`.
+    #[cfg(feature = "discovery")]
+    fn retire_ordered_gap_owners_locked(st: &mut RouterInner, gaps: &[(u32, Vec<u64>)]) {
+        let RouterInner { end_to_end_reliable_tx, reliable_exhausted, .. } = st;
+        end_to_end_reliable_tx.retain(|_, sent| {
+            let Some(owners) = sent
+                .ordered_type
+                .and_then(|ty| gaps.iter().find(|(gap_ty, _)| *gap_ty == ty))
+                .map(|(_, owners)| owners)
+            else {
+                return true;
+            };
+            let before = sent.pending_destinations.len();
+            for owner in owners {
+                sent.pending_destinations.remove(owner);
+            }
+            let removed = (before - sent.pending_destinations.len()) as u64;
+            if removed == 0 {
+                return true;
+            }
+            let c = &mut *reliable_exhausted;
+            c.silent_owner_retired_ordered = c.silent_owner_retired_ordered.saturating_add(removed);
+            if !sent.pending_destinations.is_empty() {
+                return true;
+            }
+            if Self::frozen_owner_count(&sent.data) as u64 > removed {
+                c.silent_owner_completed_ordered = c.silent_owner_completed_ordered.saturating_add(1);
+            }
+            false
+        });
+    }
+
     fn retire_owners_from_pending(&self, owners: &[u64], silent: bool) -> TelemetryResult<usize> {
         let mut st = self.state.lock();
         let mut retired = 0;
