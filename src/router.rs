@@ -18936,13 +18936,6 @@ impl Router {
         self.retire_owners_from_pending(&owners, false)
     }
 
-    /// Retires `owners` from every pending end-to-end frame: a frame then
-    /// completes once its remaining owners acknowledge it, and one owed to no
-    /// one else completes now. An ABORT or urgent frame is never completed
-    /// this way (as with complete_reliable): it keeps such an owner while no
-    /// one else still owes it, and retries out its own span. Returns the
-    /// number of frames retired from.
-    #[cfg(feature = "discovery")]
     /// After a segment proxy's Ordered frame exhausted: remove the owners that
     /// missed it from the later frames of the same stream it still holds, and
     /// drop a frame owed to those owners alone. The remaining frames are
@@ -18978,6 +18971,13 @@ impl Router {
         });
     }
 
+    /// Retires `owners` from every pending end-to-end frame: a frame then
+    /// completes once its remaining owners acknowledge it, and one owed to no
+    /// one else completes now. An ABORT or urgent frame is never completed
+    /// this way (as with complete_reliable): it keeps such an owner while no
+    /// one else still owes it, and retries out its own span. Returns the
+    /// number of frames retired from.
+    #[cfg(feature = "discovery")]
     fn retire_owners_from_pending(&self, owners: &[u64], silent: bool) -> TelemetryResult<usize> {
         let mut st = self.state.lock();
         let mut retired = 0;
