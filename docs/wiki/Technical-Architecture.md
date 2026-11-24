@@ -7,7 +7,7 @@ look the way they do. It assumes no prior knowledge of the codebase.
 
 - **Runtime schema**: endpoints, message types, and payload layouts live in a runtime registry that can be seeded,
   queried, exported, and synced between nodes.
-- **Compact on-the-wire representation**: a small header, endpoint bitmaps, and optional compression minimize bandwidth.
+- **Compact on-the-wire representation**: a small varint header, side-local header templates, compact bundles and optional compression minimize bandwidth.
 - **Embedded-friendly**: no_std support, bounded queues, and stack/heap tradeoffs.
 - **Multi-language**: Rust, C, and Python expose the same runtime schema and packet APIs.
 - **Deterministic behavior**: validation and dedupe rules are consistent across languages.
@@ -108,15 +108,15 @@ Why this matters:
 
 ## Serialization and wire format
 
-The compact v2 wire format is implemented in
+The SEDSnet 7 wire format is implemented in
 src/wire_format.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/wire_format.rs)).
-A packet is encoded as a compact v2 frame with schema-derived endpoints or an explicit endpoint bitmap, optional wire contract, optional reliable header, payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
+A packet is encoded as a canonical frame: a static header (type, source, time epoch, schema-derived or explicit endpoint IDs, optional wire contract), per-packet fields (timestamp, logical size when compressed or sealed, nonce, optional reliable header), payload bytes, and a CRC32 trailer. See [Technical-Wire-Format](Technical-Wire-Format) for the exact field order.
 
 Design choices:
 
 - **ULEB128 varints** minimize size for small values.
 - **Schema-derived endpoints** omit endpoint bytes when a packet uses the data type's default endpoint set.
-- **Endpoint bitmap** represents custom endpoint sets; width is fixed from `MAX_VALUE_DATA_ENDPOINT`, not from the current runtime registry contents.
+- **Explicit endpoint IDs** represent custom endpoint sets: one ULEB128 ID, or a counted sorted list.
 - **Wire contract** carries inline payload shape and frozen destination-holder sender hashes so in-flight packets stay decodable and correctly targeted across topology/schema churn.
 - **Sender/payload compression** is applied independently only when it reduces the wire size.
 - **CRC32 trailer** validates the entire frame before normal decode.

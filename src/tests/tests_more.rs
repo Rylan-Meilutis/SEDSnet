@@ -131,14 +131,14 @@ fn schema_default_endpoints_omit_wire_bitmap_but_custom_endpoints_keep_it() {
     let default_wire = wire_format::pack_packet(&default_pkt);
     let subset_wire = wire_format::pack_packet(&subset_pkt);
     assert_ne!(
-        default_wire[0] & 0x80,
+        default_wire[0] & 0x60,
         0,
         "application destinations stay explicit during schema convergence"
     );
-    assert_ne!(
-        subset_wire[0] & 0x80,
-        0,
-        "sparse destinations use a compact list"
+    assert_eq!(
+        subset_wire[0] & 0x60,
+        0x20,
+        "a single destination is one ID without a count"
     );
     assert!(
         subset_wire.len() < default_wire.len(),
@@ -208,17 +208,9 @@ fn compact_reliable_header_roundtrips_and_shrinks_data_frames() {
         },
     );
 
-    assert_ne!(
-        compact[0] & 0x40,
-        0,
-        "small seq uses compact reliable header"
-    );
-    assert_eq!(
-        fixed[0] & 0x40,
-        0,
-        "large seq+ack keeps fixed reliable header"
-    );
-    assert!(compact.len() + 7 <= fixed.len());
+    // The reliable header is always compact: a flags byte and the ULEB128
+    // sequence and ACK when nonzero.
+    assert!(compact.len() + 9 <= fixed.len());
 
     let info = wire_format::peek_frame_info(&compact).unwrap();
     assert_eq!(
@@ -239,11 +231,6 @@ fn compact_reliable_header_roundtrips_and_shrinks_data_frames() {
 fn compact_reliable_ack_and_owned_rewrite_roundtrip() {
     let (ty, ep) = ensure_compact_reliable_test_type();
     let ack = wire_format::pack_reliable_ack("DST", ty, 0, 3);
-    assert_ne!(
-        ack[0] & 0x40,
-        0,
-        "small ACK-only frame uses compact reliable header"
-    );
     let ack_info = wire_format::peek_frame_info(&ack).unwrap();
     assert_eq!(
         ack_info.reliable,
@@ -266,7 +253,6 @@ fn compact_reliable_ack_and_owned_rewrite_roundtrip() {
     let rewritten = wire_format::rewrite_reliable_header_owned(&fixed, 0, 4, 0)
         .unwrap()
         .expect("reliable header present");
-    assert_ne!(rewritten[0] & 0x40, 0);
     assert!(rewritten.len() < fixed.len());
     assert_eq!(
         wire_format::peek_frame_info(&rewritten).unwrap().reliable,

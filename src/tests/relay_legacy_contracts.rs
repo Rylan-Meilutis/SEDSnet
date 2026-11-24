@@ -349,16 +349,13 @@ mod queued_schema_identity_tests {
             received.len() > 1,
             "fixture must exercise fragmentation, not a compressed single frame"
         );
-        let first = &received[0];
-        assert_eq!(&first[..4], &[83, 68, 84, 3]);
-        assert_eq!(
-            u16::from_le_bytes([first[10], first[11]]) as usize,
-            received.len()
-        );
-        let transfer_id = &first[4..8];
+        let parse = crate::side_transport::test_parse_chunk_frame;
+        let (transfer_id, _, total, _) = parse(&received[0]).unwrap();
+        assert_eq!(usize::from(total), received.len());
         for (index, frame) in received.iter().enumerate() {
-            assert_eq!(&frame[4..8], transfer_id);
-            assert_eq!(u16::from_le_bytes([frame[8], frame[9]]) as usize, index);
+            let (transfer, chunk_index, _, _) = parse(frame).unwrap();
+            assert_eq!(transfer, transfer_id);
+            assert_eq!(usize::from(chunk_index), index);
         }
     }
     #[test]
@@ -396,7 +393,7 @@ fn untemplated_test_node() -> Relay {
 }
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 fn untemplated_test_options() -> RelaySideOptions {
-    RelaySideOptions::default().with_small_packet_transport(64)
+    RelaySideOptions::default().with_small_packet_transport(64).with_point_to_point()
 }
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 #[allow(clippy::duplicate_mod)]

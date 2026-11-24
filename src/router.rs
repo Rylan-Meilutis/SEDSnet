@@ -90,16 +90,13 @@ use crate::config::runtime_reliable_max_end_to_end_pending;
 #[path = "tests/replay_ownership_router.rs"]
 mod replay_ownership_tests;
 use crate::side_transport::{
-    SIDE_TRANSPORT_FLAG_PACKET_NONCE, SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT,
-    SIDE_TRANSPORT_KIND_COMPACT_DELTA, SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP,
-    SIDE_TRANSPORT_KIND_FULL, SIDE_TRANSPORT_WRAP_BYTES, SideChunkAssembly, SideCompactTimestampMode,
-    SideHeaderBytes, SideHeaderTemplate,
-    SideTransportFrames, extract_side_header_template, extract_side_header_template_view,
-    parse_side_transport_wrapper, read_uleb128_local, reconstruct_side_compact_frame,
-    wrap_side_transport_frame, wrap_side_transport_frame_parts,
+    SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT, SIDE_TRANSPORT_KIND_FULL,
+    SideChunkAssembly, SideHeaderTemplate, SideTransportFrames, extract_side_header_template,
+    extract_side_header_template_view, parse_side_transport_wrapper, read_uleb128_local,
+    reconstruct_side_compact_frame, write_uleb128_local,
 };
 #[cfg(test)]
-use crate::side_transport::write_uleb128_local;
+use crate::side_transport::wrap_side_transport_frame;
 #[cfg(all(test, feature = "discovery"))]
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
@@ -733,10 +730,16 @@ struct SideTransportState {
     payload_codec_choice: u64,
     tx_template_ids: RouterMap<u64, u32>,
     tx_templates: OrdMap<u64, SideHeaderTemplate>,
+    /// Base timestamp of each transmit template.
     tx_last_timestamps: RouterMap<u32, u64>,
+    /// Generation last used for each template id (kept across eviction, so a
+    /// reused id always starts a new generation).
+    tx_template_gens: RouterMap<u32, u8>,
     tx_compact_uses: RouterMap<u32, u8>,
     rx_templates: RouterMap<u64, u32>,
     rx_templates_by_id: OrdMap<u32, SideHeaderTemplate>,
+    /// Base timestamp and generation of each receive template
+    /// (`side_transport::pack_template_base`).
     rx_last_timestamps: RouterMap<u32, u64>,
     rx_chunks: OrdMap<u32, SideChunkAssembly>,
     rx_chunk_reclaims: u32,
@@ -2191,8 +2194,12 @@ pub type NodeAddress = u32;
 pub type P2pPort = u16;
 pub type P2pStreamId = u32;
 
-const P2P_STREAM_MAGIC: [u8; 4] = *b"SDSP";
-const P2P_STREAM_VERSION: u8 = 1;
+/// First byte of a P2P message: format version 2 in bits 6..7. Bit 5 marks a
+/// stream frame, whose flags occupy bits 0..4.
+const P2P_MESSAGE_TAG: u8 = 0x80;
+const P2P_MESSAGE_VERSION_MASK: u8 = 0xC0;
+const P2P_MESSAGE_STREAM: u8 = 0x20;
+const P2P_STREAM_FLAGS_MASK: u8 = 0x1F;
 const P2P_STREAM_SYN: u8 = 0x01;
 const P2P_STREAM_ACK: u8 = 0x02;
 const P2P_STREAM_FIN: u8 = 0x04;
@@ -2295,6 +2302,8 @@ struct P2pDecoded<'a> {
     source_address: NodeAddress,
     source_port: P2pPort,
     destination_port: P2pPort,
+    /// Stream flags when the message is a stream frame.
+    stream_flags: Option<u8>,
     payload: &'a [u8],
 }
 
@@ -3244,12 +3253,11 @@ struct RoutePlanKey {
 #[cfg(feature = "discovery")]
 const ROUTE_PLAN_KEY_TARGETS: usize = 4;
 
-/// A frame's endpoint set: its fixed bitmap, or else its sorted distinct
+/// A frame's endpoint set: its encoded ID list, or else its sorted distinct
 /// endpoints. One set in two forms only misses the cache.
 #[cfg(feature = "discovery")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RoutePlanEndpoints {
-    Bitmap([u64; wire_format::ENDPOINT_BITMAP_WORDS]),
     Encoded([u8; ROUTE_PLAN_KEY_LIST_BYTES], u8),
     List([u32; ROUTE_PLAN_KEY_ENDPOINTS], u8),
 }
@@ -6935,6 +6943,48 @@ impl Router {
         sender != self.sender_arc().as_ref() && !Self::is_end_to_end_ack_sender(sender)
     }
 
+    /// P2P message (format version 2):
+    /// `tag | ULEB dst port | ULEB src port | src address u32 LE |
+    /// ULEB hostname length | hostname | body`. The body runs to the end of
+    /// the packet payload. `stream_section` (from
+    /// [`Self::encode_p2p_stream_payload`]) makes it a stream frame: its flags
+    /// byte joins the tag and its fields follow the hostname.
+    fn encode_p2p_message(
+        src_hostname: &str,
+        src_address: NodeAddress,
+        src_port: P2pPort,
+        dst_port: P2pPort,
+        payload: &[u8],
+        stream_section: bool,
+    ) -> TelemetryResult<crate::SharedBytes> {
+        let (tag, body) = if stream_section {
+            let (&flags, rest) = payload
+                .split_first()
+                .ok_or(TelemetryError::Pack("p2p stream frame empty"))?;
+            if flags & !P2P_STREAM_FLAGS_MASK != 0 {
+                return Err(TelemetryError::Pack("p2p stream flags"));
+            }
+            (P2P_MESSAGE_TAG | P2P_MESSAGE_STREAM | flags, rest)
+        } else {
+            (P2P_MESSAGE_TAG, payload)
+        };
+        let mut out = Vec::with_capacity(
+            14usize
+                .saturating_add(src_hostname.len())
+                .saturating_add(body.len()),
+        );
+        out.push(tag);
+        write_uleb128_local(u64::from(dst_port), &mut out);
+        write_uleb128_local(u64::from(src_port), &mut out);
+        out.extend_from_slice(&src_address.to_le_bytes());
+        write_uleb128_local(src_hostname.len() as u64, &mut out);
+        out.extend_from_slice(src_hostname.as_bytes());
+        out.extend_from_slice(body);
+        Ok(out.into())
+    }
+
+    /// A plain (non-stream) P2P message.
+    #[cfg(test)]
     fn encode_p2p_payload(
         src_hostname: &str,
         src_address: NodeAddress,
@@ -6942,58 +6992,67 @@ impl Router {
         dst_port: P2pPort,
         payload: &[u8],
     ) -> TelemetryResult<crate::SharedBytes> {
-        let host_len = u16::try_from(src_hostname.len())
-            .map_err(|_| TelemetryError::Pack("p2p hostname too long"))?;
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| TelemetryError::Pack("p2p payload too long"))?;
-        let mut out = Vec::with_capacity(
-            15usize
-                .saturating_add(src_hostname.len())
-                .saturating_add(payload.len()),
-        );
-        out.push(1);
-        out.extend_from_slice(&dst_port.to_le_bytes());
-        out.extend_from_slice(&src_port.to_le_bytes());
-        out.extend_from_slice(&src_address.to_le_bytes());
-        out.extend_from_slice(&host_len.to_le_bytes());
-        out.extend_from_slice(&payload_len.to_le_bytes());
-        out.extend_from_slice(src_hostname.as_bytes());
-        out.extend_from_slice(payload);
-        Ok(out.into())
+        Self::encode_p2p_message(src_hostname, src_address, src_port, dst_port, payload, false)
+    }
+
+    /// A P2P stream frame carrying `section` from
+    /// [`Self::encode_p2p_stream_payload`].
+    #[cfg(any(test, feature = "std"))]
+    fn encode_p2p_stream_message(
+        src_hostname: &str,
+        src_address: NodeAddress,
+        src_port: P2pPort,
+        dst_port: P2pPort,
+        section: &[u8],
+    ) -> TelemetryResult<crate::SharedBytes> {
+        Self::encode_p2p_message(src_hostname, src_address, src_port, dst_port, section, true)
     }
 
     fn decode_p2p_payload(payload: &[u8]) -> TelemetryResult<P2pDecoded<'_>> {
-        if payload.len() < 15 {
-            return Err(TelemetryError::Unpack("p2p frame short"));
-        }
-        if payload[0] != 1 {
+        const SHORT: TelemetryError = TelemetryError::Unpack("p2p frame short");
+        let (&tag, _) = payload.split_first().ok_or(SHORT)?;
+        if tag & P2P_MESSAGE_VERSION_MASK != P2P_MESSAGE_TAG {
             return Err(TelemetryError::Unpack("p2p frame version"));
         }
-        let destination_port =
-            u16::from_le_bytes(payload[1..3].try_into().expect("2-byte dst port"));
-        let source_port = u16::from_le_bytes(payload[3..5].try_into().expect("2-byte src port"));
-        let source_address = u32::from_le_bytes(payload[5..9].try_into().expect("4-byte address"));
-        let host_len =
-            u16::from_le_bytes(payload[9..11].try_into().expect("2-byte host len")) as usize;
-        let body_len =
-            u32::from_le_bytes(payload[11..15].try_into().expect("4-byte body len")) as usize;
-        let host_start = 15usize;
-        let host_end = host_start.saturating_add(host_len);
-        let body_end = host_end.saturating_add(body_len);
-        if host_end > payload.len() || body_end != payload.len() {
-            return Err(TelemetryError::Unpack("p2p frame length"));
-        }
-        let source_hostname = core::str::from_utf8(&payload[host_start..host_end])
+        let stream_flags = if tag & P2P_MESSAGE_STREAM != 0 {
+            Some(tag & P2P_STREAM_FLAGS_MASK)
+        } else if tag & P2P_STREAM_FLAGS_MASK != 0 {
+            return Err(TelemetryError::Unpack("p2p frame version"));
+        } else {
+            None
+        };
+        let mut off = 1usize;
+        let port = |off: &mut usize| -> TelemetryResult<P2pPort> {
+            P2pPort::try_from(read_uleb128_local(payload, off).map_err(|_| SHORT)?)
+                .map_err(|_| TelemetryError::Unpack("p2p port"))
+        };
+        let destination_port = port(&mut off)?;
+        let source_port = port(&mut off)?;
+        let address = payload.get(off..off + 4).ok_or(SHORT)?;
+        let source_address = u32::from_le_bytes(address.try_into().expect("4-byte address"));
+        off += 4;
+        let host_len = usize::try_from(read_uleb128_local(payload, &mut off).map_err(|_| SHORT)?)
+            .map_err(|_| TelemetryError::Unpack("p2p frame length"))?;
+        let host_end = off
+            .checked_add(host_len)
+            .filter(|&end| end <= payload.len())
+            .ok_or(TelemetryError::Unpack("p2p frame length"))?;
+        let source_hostname = core::str::from_utf8(&payload[off..host_end])
             .map_err(|_| TelemetryError::Unpack("p2p hostname utf8"))?;
         Ok(P2pDecoded {
             source_hostname,
             source_address,
             source_port,
             destination_port,
-            payload: &payload[host_end..body_end],
+            stream_flags,
+            payload: &payload[host_end..],
         })
     }
 
+    /// The stream section a P2P stream frame carries:
+    /// `flags | ULEB src stream id | ULEB dst stream id | ULEB sequence | body`.
+    /// [`Self::encode_p2p_stream_message`] moves `flags` into the message tag;
+    /// the body runs to the end of the packet payload.
     fn encode_p2p_stream_payload(
         flags: u8,
         source_stream_id: P2pStreamId,
@@ -7001,48 +7060,42 @@ impl Router {
         sequence: u32,
         payload: &[u8],
     ) -> TelemetryResult<crate::SharedBytes> {
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| TelemetryError::Pack("p2p stream payload too long"))?;
-        let mut out = Vec::with_capacity(22usize.saturating_add(payload.len()));
-        out.extend_from_slice(&P2P_STREAM_MAGIC);
-        out.push(P2P_STREAM_VERSION);
+        if flags & !P2P_STREAM_FLAGS_MASK != 0 {
+            return Err(TelemetryError::Pack("p2p stream flags"));
+        }
+        let mut out = Vec::with_capacity(16usize.saturating_add(payload.len()));
         out.push(flags);
-        out.extend_from_slice(&source_stream_id.to_le_bytes());
-        out.extend_from_slice(&destination_stream_id.to_le_bytes());
-        out.extend_from_slice(&sequence.to_le_bytes());
-        out.extend_from_slice(&payload_len.to_le_bytes());
+        write_uleb128_local(u64::from(source_stream_id), &mut out);
+        write_uleb128_local(u64::from(destination_stream_id), &mut out);
+        write_uleb128_local(u64::from(sequence), &mut out);
         out.extend_from_slice(payload);
         Ok(out.into())
     }
 
-    fn decode_p2p_stream_payload(payload: &[u8]) -> TelemetryResult<Option<P2pStreamDecoded<'_>>> {
-        if !payload.starts_with(&P2P_STREAM_MAGIC) {
+    fn decode_p2p_stream_payload<'a>(
+        message: &P2pDecoded<'a>,
+    ) -> TelemetryResult<Option<P2pStreamDecoded<'a>>> {
+        let Some(flags) = message.stream_flags else {
             return Ok(None);
-        }
-        if payload.len() < 22 {
-            return Err(TelemetryError::Unpack("p2p stream frame short"));
-        }
-        if payload[4] != P2P_STREAM_VERSION {
-            return Err(TelemetryError::Unpack("p2p stream frame version"));
-        }
-        let flags = payload[5];
-        let source_stream_id =
-            u32::from_le_bytes(payload[6..10].try_into().expect("stream source id"));
-        let destination_stream_id =
-            u32::from_le_bytes(payload[10..14].try_into().expect("stream destination id"));
-        let sequence = u32::from_le_bytes(payload[14..18].try_into().expect("stream sequence"));
-        let body_len =
-            u32::from_le_bytes(payload[18..22].try_into().expect("stream body len")) as usize;
-        let body_end = 22usize.saturating_add(body_len);
-        if body_end != payload.len() {
-            return Err(TelemetryError::Unpack("p2p stream frame length"));
-        }
+        };
+        let payload = message.payload;
+        let mut off = 0usize;
+        let mut field = || -> TelemetryResult<u32> {
+            u32::try_from(
+                read_uleb128_local(payload, &mut off)
+                    .map_err(|_| TelemetryError::Unpack("p2p stream frame short"))?,
+            )
+            .map_err(|_| TelemetryError::Unpack("p2p stream frame field"))
+        };
+        let source_stream_id = field()?;
+        let destination_stream_id = field()?;
+        let sequence = field()?;
         Ok(Some(P2pStreamDecoded {
             flags,
             source_stream_id,
             destination_stream_id,
             sequence,
-            payload: &payload[22..],
+            payload: &payload[off..],
         }))
     }
 
@@ -7084,7 +7137,7 @@ impl Router {
             return Ok(());
         }
         let decoded = Self::decode_p2p_payload(pkt.payload())?;
-        if let Some(stream) = Self::decode_p2p_stream_payload(decoded.payload)? {
+        if let Some(stream) = Self::decode_p2p_stream_payload(&decoded)? {
             // Routing attribution consistency only, never authentication. A
             // compact alias must resolve through the existing unique matcher.
             if !self.sender_matches_hostname(pkt.sender(), decoded.source_hostname) {
@@ -7341,7 +7394,7 @@ impl Router {
             }
         }
         if let Some((dst, dst_port, src_port, payload)) = reply {
-            self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+            self.send_p2p_stream_to_entry(dst, dst_port, src_port, &payload)?;
         }
         for pending in events {
             for handler in pending.handlers {
@@ -10130,9 +10183,7 @@ impl Router {
         for (slot, target) in targets.iter_mut().zip(env.target_senders()) {
             *slot = target;
         }
-        let endpoints = if let Some(bitmap) = env.endpoint_bitmap() {
-            RoutePlanEndpoints::Bitmap(*bitmap)
-        } else if let Some(list) = env
+        let endpoints = if let Some(list) = env
             .endpoint_list_bytes()
             .filter(|list| list.len() <= ROUTE_PLAN_KEY_LIST_BYTES)
         {
@@ -14514,8 +14565,15 @@ impl Router {
         }
 
         if !opts.header_template_enabled {
-            let wrapped = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, raw.as_ref());
-            return self.finish_side_transport_frames(side, &opts, wrapped, raw_len, None);
+            // Canonical frames identify themselves by their first byte; a
+            // side without templates sends them bare.
+            self.state
+                .lock()
+                .side_runtime_stats
+                .entry(side)
+                .or_default()
+                .note_side_transport_full(raw_len, raw_len);
+            return Ok(SideTransportFrames::single(raw));
         }
 
         let reliable = match known_reliable {
@@ -14539,7 +14597,11 @@ impl Router {
             }
         };
         // Parsed once; only a frame that will use the dictionary needs it.
-        let extracted = (!reliable).then(|| extract_side_header_template_view(raw.as_ref()));
+        // Frames that carry a reliable header have no template.
+        let extracted = (!reliable)
+            .then(|| extract_side_header_template_view(raw.as_ref()).ok())
+            .flatten();
+        let reliable = reliable || extracted.is_none();
 
         let mut st = self.state.lock();
         // Shared buses cannot retain one coherent dictionary across
@@ -14575,8 +14637,10 @@ impl Router {
                 .note_side_transport_full(raw_len, raw_len);
             return Ok(SideTransportFrames::single(raw));
         }
-        let (template, _ty, flags, data_size, timestamp, nonce, reliable_seq_ack, payload) =
-            extracted.expect("dictionary frames are extracted")?;
+        let parts = extracted.expect("dictionary frames are extracted");
+        let template = parts.template;
+        let _ty = parts.ty;
+        let timestamp = parts.timestamp;
 
         if crate::memory_admission::supports_work_kinds() {
             let cached = st.side_transport.get(&side).is_some_and(|transport| {
@@ -14617,6 +14681,26 @@ impl Router {
         let effective_template_limit = opts.max_side_transport_templates;
         #[cfg(feature = "discovery")]
         {
+            /* Template ids are small and side-local, so a receiver cannot
+             * tell two producers' templates apart. Use templates only once
+             * discovery shows exactly one live hop-local peer on the side, or
+             * the application declared the side point to point; until then,
+             * and on shared buses, frames are self-describing. Discovery
+             * still overrides a declaration once it sees a second hop-local
+             * peer. Before that, a mistaken declaration (a second producer
+             * on the side) is guarded only by the 3-bit template generation,
+             * so declare only links that really have one producer. */
+            let hop_local_peers = st.discovery_routes.get(&side).map_or(0, |route| {
+                route
+                    .announcers
+                    .values()
+                    .filter(|sender| sender.has_live_hop_local_evidence(now_ms))
+                    .take(2)
+                    .count()
+            });
+            if hop_local_peers > 1 || (hop_local_peers == 0 && !opts.point_to_point) {
+                effective_template_limit = 0;
+            }
             if let Some(route) = st.discovery_routes.get(&side) {
                 let active_peers = route
                     .announcers
@@ -14659,39 +14743,64 @@ impl Router {
                 .or_default()
                 .note_side_transport_template_eviction();
         }
+        if effective_template_limit == 0 {
+            // No dictionary this side can share: the canonical frame.
+            st.side_runtime_stats
+                .entry(side)
+                .or_default()
+                .note_side_transport_full(raw_len, raw_len);
+            return Ok(SideTransportFrames::single(raw));
+        }
         let side_state = st
             .side_transport
             .get_mut(&side)
             .ok_or(TelemetryError::BadArg)?;
-        let (template_id, use_compact) =
+        let (template_id, base, use_compact) =
             if let Some(id) = side_state.tx_template_ids.get(&template.hash).copied() {
                 /* A full refresh makes compact transport self-healing when
                  * the receiver missed the original template frame. */
                 const FULL_REFRESH_AFTER_COMPACT_FRAMES: u8 = 8;
+                let mut base = side_state.tx_last_timestamps.get(&id).copied().unwrap_or(timestamp);
                 let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
                 // Discovery must bootstrap even when a receiver lost its dictionary.
                 #[cfg(feature = "discovery")]
                 let discovery_refresh = discovery::is_discovery_type(_ty);
                 #[cfg(not(feature = "discovery"))]
                 let discovery_refresh = false;
+                // Compact timestamps are deltas from the template's base,
+                // which only a FULL frame sets; a delta that no longer fits
+                // moves the base, in a new generation, with the next (now
+                // forced) FULL frame.
+                let in_range = crate::side_transport::zigzag(timestamp.wrapping_sub(base) as i64)
+                    <= crate::side_transport::SIDE_TRANSPORT_MAX_TS_DELTA;
                 let use_compact =
-                    *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES && !discovery_refresh;
+                    *compact_uses < FULL_REFRESH_AFTER_COMPACT_FRAMES && !discovery_refresh && in_range;
                 if use_compact {
                     *compact_uses = compact_uses.saturating_add(1);
-                    // A previous transmitted frame is not a confirmed receive
-                    // base: compact frames carry absolute timestamps.
-                    side_state.tx_last_timestamps.insert(id, timestamp);
                 } else {
                     *compact_uses = 0;
+                    if !in_range {
+                        base = timestamp;
+                        side_state.tx_last_timestamps.insert(id, base);
+                        let generation = side_state.tx_template_gens.entry(id).or_default();
+                        *generation = generation.wrapping_add(1) & crate::side_transport::TEMPLATE_GEN_MASK;
+                    }
                 }
-                (id, use_compact)
+                (id, base, use_compact)
             } else {
-                /* Sequential template IDs collide when multiple routers
-                 * transmit on one physical bus. The template hash covers
-                 * the source address and immutable header fields, making
-                 * this ID producer-stable without adding bytes to compact
-                 * frames. */
-                let template_id = ((template.hash >> 32) as u32 ^ template.hash as u32).max(1);
+                /* Template ids are small (one ULEB128 byte for up to 15
+                 * templates): the lowest id this side is not using. A
+                 * redefined id starts a new generation, so a receiver still
+                 * holding its previous template drops compact frames until
+                 * the new FULL frame arrives. A receiver that holds another
+                 * producer's template under the same id (a shared bus before
+                 * discovery shows it is shared) cannot be told apart, which
+                 * is why templates need a single peer (see above). */
+                let template_id = (1u32..)
+                    .find(|id| !side_state.tx_template_ids.values().any(|used| used == id))
+                    .expect("fewer templates than ids");
+                let generation = side_state.tx_template_gens.entry(template_id).or_insert(u8::MAX);
+                *generation = generation.wrapping_add(1) & crate::side_transport::TEMPLATE_GEN_MASK;
                 let evicted = side_state.insert_tx_template(
                     template.into_owned(),
                     template_id,
@@ -14708,40 +14817,33 @@ impl Router {
                 {
                     side_state.tx_last_timestamps.insert(template_id, timestamp);
                 }
-                (template_id, false)
+                (template_id, timestamp, false)
             };
+        let generation = st
+            .side_transport
+            .get(&side)
+            .and_then(|state| state.tx_template_gens.get(&template_id).copied())
+            .unwrap_or(0);
 
-        // The variable header fields precede the payload (compact) or the
-        // canonical frame (full) in the side body.
-        let mut header = SideHeaderBytes::default();
-        let tail: &[u8] = if use_compact {
-            header.push(flags);
-            header.uleb128(u64::from(template_id));
-            header.uleb128(data_size);
-            header.uleb128(timestamp);
-            if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-                header.uleb128(u64::from(nonce));
-            }
-            if let Some((seq, ack)) = reliable_seq_ack {
-                header.uleb128(u64::from(seq));
-                header.uleb128(u64::from(ack));
-            }
-            payload
+        let compact_payload_len = use_compact.then_some(parts.payload.len());
+        let frame = if use_compact {
+            let head = crate::side_transport::compact_frame_head(&parts, template_id, generation, base);
+            crate::shared_bytes::convert(crate::side_transport::frame_with_crc_from_parts(&[
+                head.as_slice(),
+                parts.payload,
+            ]))
         } else {
-            header.uleb128(u64::from(template_id));
-            raw.as_ref()
+            crate::side_transport::encode_full_frame(
+                raw.as_ref(),
+                template_id,
+                generation,
+                base.wrapping_sub(timestamp) as i64,
+            )
         };
-        let wrapped_len = SIDE_TRANSPORT_WRAP_BYTES + header.len + tail.len();
-        let compact_payload_len = use_compact.then_some(payload.len());
-        let kind = if use_compact {
-            SIDE_TRANSPORT_KIND_COMPACT
-        } else {
-            SIDE_TRANSPORT_KIND_FULL
-        };
+        let wrapped_len = frame.len();
         if opts.max_frame_bytes != 0 && wrapped_len > opts.max_frame_bytes {
             drop(st);
-            let wrapped = wrap_side_transport_frame_parts(kind, &[header.as_slice(), tail]);
-            return self.finish_side_transport_frames(side, &opts, wrapped, raw_len, compact_payload_len);
+            return self.finish_side_transport_frames(side, &opts, frame, raw_len, compact_payload_len);
         }
         // One frame: its statistics are known before it is written.
         Self::note_side_transport_frames_locked(
@@ -14754,10 +14856,7 @@ impl Router {
             compact_payload_len,
         );
         drop(st);
-        Ok(SideTransportFrames::single(wrap_side_transport_frame_parts(
-            kind,
-            &[header.as_slice(), tail],
-        )))
+        Ok(SideTransportFrames::single(frame))
     }
 
     /// Split a wrapped side frame when needed and record its statistics.
@@ -15127,7 +15226,9 @@ impl Router {
         let template_hash = if canonical_possible {
             None
         } else {
-            Some(extract_side_header_template_view(bytes)?.0.hash)
+            extract_side_header_template_view(bytes)
+                .ok()
+                .map(|parts| parts.template.hash)
         };
         let st = self.state.lock();
         let active: usize = st.sides.iter().filter(|entry| entry.is_some()).count();
@@ -15372,53 +15473,42 @@ impl Router {
     }
 
     /// Side ingress. This is where a received frame's CRC is checked, once:
-    /// a canonical frame (bare, or the body of a FULL side frame) is verified
+    /// a canonical frame (bare, or inside a FULL side frame) is verified
     /// before anything reads it, unless `crc_verified` says the caller just
-    /// rebuilt it from a verified container. Compact frames are rebuilt here,
-    /// with a fresh CRC, from a verified wrapper and template, and a
-    /// reassembled chunk transfer re-enters as a bare frame. Nothing later
-    /// re-hashes the admitted bytes.
+    /// rebuilt it from a verified container. FULL and COMPACT frames are
+    /// checked by their own CRC32 and rebuilt (with a fresh canonical CRC)
+    /// from their template, and a reassembled chunk transfer re-enters as a
+    /// whole frame. Nothing later re-hashes the admitted bytes.
     fn decode_side_transport_frame_inner(
         &self,
         side: RouterSideId,
         bytes: &[u8],
         crc_verified: bool,
     ) -> TelemetryResult<Option<crate::SharedBytes>> {
-        self.decode_side_transport_frame_with(side, bytes, crc_verified, false, None)
+        self.decode_side_transport_frame_with(side, bytes, crc_verified, false)
     }
 
     /// `decode_side_transport_frame_inner`, optionally doing the side's
-    /// ingress check (`ensure_side_ingress_enabled`) under its first lock,
-    /// and optionally handing a compact frame's timestamp record to the
-    /// caller (`pending_timestamp`), who must apply it on every outcome with
-    /// `note_rx_timestamp_locked`, under its own next lock.
+    /// ingress check (`ensure_side_ingress_enabled`) under its first lock.
     fn decode_side_transport_frame_with(
         &self,
         side: RouterSideId,
         bytes: &[u8],
         crc_verified: bool,
         check_ingress: bool,
-        pending_timestamp: Option<&mut Option<(u32, u64)>>,
     ) -> TelemetryResult<Option<crate::SharedBytes>> {
         // Reclaim abandoned transfers before admission, even when new work is refused.
         let now_ms = self.clock.now_ms();
         let wrapper = parse_side_transport_wrapper(bytes);
-        // A compact frame's template lookup and its peer's liveness refresh
-        // share the expiry's lock and clock reading.
+        // A compact frame's template lookup shares the expiry's lock and
+        // clock reading.
+        // A compact frame is checked (its own CRC32) before anything reads
+        // it; a damaged frame never evicts or refreshes anything.
         let compact_template = match &wrapper {
-            Ok(Some((
-                kind @ (SIDE_TRANSPORT_KIND_COMPACT
-                | SIDE_TRANSPORT_KIND_COMPACT_DELTA
-                | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP),
-                body,
-            ))) if !body.is_empty() => {
-                let mut off = 1usize;
-                let template_id = read_uleb128_local(body, &mut off).and_then(|id| {
-                    u32::try_from(id)
-                        .map_err(|_| TelemetryError::Unpack("side template id too large"))
-                });
-                Some((*kind, off, template_id))
-            }
+            Ok(Some((SIDE_TRANSPORT_KIND_COMPACT, _))) => Some(
+                crate::side_transport::check_frame_crc(bytes)
+                    .and_then(|()| crate::side_transport::template_id_and_gen(bytes)),
+            ),
             _ => None,
         };
         let mut st = self.state.lock();
@@ -15429,34 +15519,25 @@ impl Router {
         }
         Self::expire_side_chunks_locked(&mut st, now_ms);
         let compact = match compact_template {
-            Some((kind, off, template_id)) => {
-                let template_id = template_id?;
+            Some(found) => {
+                let (template_id, generation, off) = found?;
                 let state = st.side_transport.get(&side);
                 let template = state
                     .and_then(|state| state.rx_templates_by_id.get(&template_id))
                     .cloned();
-                let timestamp_base = if matches!(
-                    kind,
-                    SIDE_TRANSPORT_KIND_COMPACT_DELTA | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP
-                ) {
-                    state
-                        .and_then(|state| state.rx_last_timestamps.get(&template_id))
-                        .copied()
-                } else {
-                    None
-                };
-                // The wrapper CRC and known template identify this peer even
-                // if payload allocation is refused. No payload copy is needed.
-                #[cfg(feature = "discovery")]
-                if let Some(address) = template.as_ref().and_then(|template| template.source_address()) {
-                    Self::refresh_peer_liveness_locked(&mut st, side, address, now_ms);
-                }
-                Some((off, template_id, template, timestamp_base))
+                // Another generation of this id (a FULL frame redefined it
+                // or moved its base, and was lost here) is an unknown template.
+                let base = state
+                    .and_then(|state| state.rx_last_timestamps.get(&template_id))
+                    .map(|packed| crate::side_transport::unpack_template_base(*packed))
+                    .filter(|(_, known)| *known == generation)
+                    .map(|(base, _)| base);
+                Some((off, template.zip(base)))
             }
             None => None,
         };
         drop(st);
-        let Some((kind, body)) = wrapper? else {
+        let Some((kind, _)) = wrapper? else {
             if !crc_verified {
                 wire_format::verify_frame_crc(bytes)?;
             }
@@ -15484,6 +15565,12 @@ impl Router {
         };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
+                // One check covers the prefix and the canonical frame, whose
+                // own CRC32 is recovered exactly.
+                // Discovery and admission read the verified view in place;
+                // the canonical frame is built only once it is admitted.
+                let (template_id, generation, base_delta, view_bytes) =
+                    crate::side_transport::decode_full_frame_view(bytes)?;
                 let header_templates_enabled = self
                     .state
                     .lock()
@@ -15492,29 +15579,20 @@ impl Router {
                     .and_then(|entry| entry.as_ref())
                     .map(|side| side.opts.header_template_enabled)
                     .unwrap_or(false);
-                let mut off = 0usize;
-                let template_id = if header_templates_enabled {
-                    Some(
-                        u32::try_from(read_uleb128_local(body, &mut off)?)
-                            .map_err(|_| TelemetryError::Unpack("side template id too large"))?,
-                    )
-                } else {
-                    None
-                };
-                wire_format::verify_frame_crc(&body[off..])?;
                 #[cfg(feature = "discovery")]
-                if self.consume_known_packed_discovery(side, &body[off..])? {
+                if self.consume_known_packed_discovery(side, view_bytes)? {
                     return Ok(None);
                 }
                 #[cfg(feature = "discovery")]
-                let view = self.refresh_ingress_peer_liveness(side, &body[off..]);
+                let view = self.refresh_ingress_peer_liveness(side, view_bytes);
                 #[cfg(not(feature = "discovery"))]
                 let view = None;
-                self.admit_received_frame_with_view(side, &body[off..], view.as_ref())?;
-                let raw = Arc::<[u8]>::from(&body[off..]);
-                if let (Some(template_id), Ok((template, _, _, _, timestamp, _, _, _))) =
-                    (template_id, extract_side_header_template(raw.as_ref()))
+                self.admit_received_frame_with_view(side, view_bytes, view.as_ref())?;
+                let raw = crate::side_transport::canonical_from_full_view(view_bytes);
+                if header_templates_enabled
+                    && let Ok(extracted) = extract_side_header_template(raw.as_ref())
                 {
+                    let base = extracted.timestamp.wrapping_add(base_delta as u64);
                     let mut st = self.state.lock();
                     let max_templates = st
                         .sides
@@ -15523,10 +15601,16 @@ impl Router {
                         .map(|side| side.opts.max_side_transport_templates)
                         .unwrap_or(DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT);
                     let evicted = st.side_transport.get_mut(&side).is_some_and(|side_state| {
-                        let evicted =
-                            side_state.insert_rx_template(template_id, template, max_templates);
+                        let evicted = side_state.insert_rx_template(
+                            template_id,
+                            extracted.template,
+                            max_templates,
+                        );
                         if max_templates > 0 {
-                            side_state.rx_last_timestamps.insert(template_id, timestamp);
+                            side_state.rx_last_timestamps.insert(
+                                template_id,
+                                crate::side_transport::pack_template_base(base, generation),
+                            );
                         }
                         evicted
                     });
@@ -15539,29 +15623,26 @@ impl Router {
                 }
                 Ok(Some(crate::shared_bytes::convert(raw)))
             }
-            SIDE_TRANSPORT_KIND_COMPACT
-            | SIDE_TRANSPORT_KIND_COMPACT_DELTA
-            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
-                let Some((off, template_id, template, timestamp_base)) = compact else {
+            SIDE_TRANSPORT_KIND_COMPACT => {
+                let Some((off, template)) = compact else {
                     return Err(TelemetryError::Unpack("short side compact frame"));
                 };
                 /* A full template frame can be lost on a datagram/radio side.
                  * Drop this compact frame without tearing down the transport;
                  * the sender periodically emits a full refresh. */
-                let Some(template) = template else {
+                let Some((template, base)) = template else {
                     if !self.cfg.role.local_services() {
                         return Err(TelemetryError::Unpack("unknown side compact template"));
                     }
                     return Ok(None);
                 };
-                let reconstructed_bound = body
+                let reconstructed_bound = bytes
                     .len()
-                    .saturating_add(template.prefix().len())
-                    .saturating_add(template.between().len())
+                    .saturating_add(template.header().len())
                     .saturating_add(32);
-                // Wrapper CRC and the retained full template are validated
-                // before compact reconstruction. Preserve the same control
-                // priority as canonical ingress while reclaiming only bulk.
+                // The retained full template is validated before compact
+                // reconstruction. Preserve the same control priority as
+                // canonical ingress while reclaiming only bulk.
                 // Only memory pressure needs the class; decided once, when asked.
                 let mut protected = None::<bool>;
                 let mut is_protected = || {
@@ -15576,7 +15657,7 @@ impl Router {
                 let mut fair_incoming = None;
                 #[cfg(any(feature = "std", feature = "fair-admission"))]
                 let mut fair_victim = None;
-                loop {
+                let admitted: TelemetryResult<()> = loop {
                     match crate::memory_admission::check_compact_reconstruction(
                         reconstructed_bound,
                         ack,
@@ -15587,7 +15668,7 @@ impl Router {
                                 .lower_priority_shared_queue(199)
                                 .is_some_and(|queue| st.pop_shared_queue_item(queue));
                             if !reclaimed {
-                                return Err(TelemetryError::Io("memory pressure"));
+                                break Err(TelemetryError::Io("memory pressure"));
                             }
                         }
                         Err(TelemetryError::Io("memory pressure")) => {
@@ -15603,34 +15684,23 @@ impl Router {
                             {
                                 continue;
                             }
-                            return Err(TelemetryError::Io("memory pressure"));
+                            break Err(TelemetryError::Io("memory pressure"));
                         }
-                        result => {
-                            result?;
-                            break;
-                        }
+                        result => break result,
                     }
-                }
-                let timestamp_mode = match kind {
-                    SIDE_TRANSPORT_KIND_COMPACT_DELTA => SideCompactTimestampMode::Delta,
-                    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => SideCompactTimestampMode::Omitted,
-                    _ => SideCompactTimestampMode::Absolute,
                 };
-                let (frame, timestamp) = reconstruct_side_compact_frame(
-                    &template,
-                    body[0],
-                    &body[off..],
-                    timestamp_mode,
-                    timestamp_base,
-                )?;
-                match pending_timestamp {
-                    Some(pending) => *pending = Some((template_id, timestamp)),
-                    None => Self::note_rx_timestamp_locked(
-                        &mut self.state.lock(),
-                        side,
-                        Some((template_id, timestamp)),
-                    ),
+                // The frame was checked at ingress; a refused allocation still
+                // keeps its known peer alive.
+                let frame = admitted
+                    .and_then(|()| reconstruct_side_compact_frame(&template, bytes, off, base));
+                #[cfg(feature = "discovery")]
+                if !matches!(frame, Err(TelemetryError::Unpack(_)))
+                    && let Some(address) = template.source_address()
+                {
+                    let mut st = self.state.lock();
+                    Self::refresh_peer_liveness_locked(&mut st, side, address, now_ms);
                 }
+                let frame = frame?;
                 // Byte reconstruction is not decoder/forwarding admission.
                 // Check the canonical frame before queueing, and recheck at
                 // dispatch if routes, schemas or available memory have changed.
@@ -15640,15 +15710,10 @@ impl Router {
                 Ok(Some(frame))
             }
             SIDE_TRANSPORT_KIND_CHUNK => {
-                if body.len() < 8 {
-                    return Err(TelemetryError::Unpack("short side chunk frame"));
-                }
-                let transfer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                let index = u16::from_le_bytes([body[4], body[5]]);
-                let total = u16::from_le_bytes([body[6], body[7]]);
-                if total == 0 || index >= total {
-                    return Err(TelemetryError::Unpack("invalid side chunk index"));
-                }
+                let body = crate::side_transport::checked_chunk_body(bytes)?;
+                let (transfer_id, index, total, header_len) =
+                    crate::side_transport::parse_chunk_header(body)?;
+                let payload = &body[header_len..];
                 let assembled = {
                     let mut st = self.state.lock();
                     let now_ms = self.clock.now_ms();
@@ -15656,7 +15721,7 @@ impl Router {
                     // sender from its first chunk (this one or the retained one).
                     #[cfg(feature = "discovery")]
                     let refused_schema = if index == 0 {
-                        wire_format::chunked_schema_source(&body[8..])
+                        wire_format::chunked_schema_source(payload)
                     } else {
                         st.side_transport
                             .get(&side)
@@ -15665,7 +15730,7 @@ impl Router {
                             .and_then(wire_format::chunked_schema_source)
                     };
                     let room =
-                        st.make_side_chunk_room(side, transfer_id, index, total, body.len() - 8);
+                        st.make_side_chunk_room(side, transfer_id, index, total, payload.len());
                     #[cfg(feature = "discovery")]
                     if let (Err(TelemetryError::PacketTooLarge(_)), Some(address)) =
                         (&room, refused_schema)
@@ -15718,7 +15783,7 @@ impl Router {
                     let entry = side_state.rx_chunks.entry(transfer_id).or_default();
                     entry.total = total;
                     let added =
-                        entry.insert_with(index, now_ms, || Arc::<[u8]>::from(&body[8..]))?;
+                        entry.insert_with(index, now_ms, || Arc::<[u8]>::from(payload))?;
                     side_state.rx_chunk_bytes = side_state.rx_chunk_bytes.saturating_add(added);
                     if entry.received_len() == usize::from(total) {
                         let entry = side_state
@@ -17817,16 +17882,52 @@ impl Router {
         src_port: P2pPort,
         payload: &[u8],
     ) -> TelemetryResult<()> {
+        self.send_p2p_message_to_entry(dst, dst_port, src_port, payload, false)
+    }
+
+    /// Send a stream section from [`Self::encode_p2p_stream_payload`].
+    fn send_p2p_stream_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        section: &[u8],
+    ) -> TelemetryResult<()> {
+        self.send_p2p_message_to_entry(dst, dst_port, src_port, section, true)
+    }
+
+    /// Send a raw stream section to a hostname (tests forge stream frames).
+    #[cfg(test)]
+    fn send_p2p_stream_to_hostname(
+        &self,
+        hostname: &str,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        section: &[u8],
+    ) -> TelemetryResult<()> {
+        let dst = self.resolve_hostname(hostname).ok_or(TelemetryError::BadArg)?;
+        self.send_p2p_stream_to_entry(dst, dst_port, src_port, section)
+    }
+
+    fn send_p2p_message_to_entry(
+        &self,
+        dst: AddressBookEntry,
+        dst_port: P2pPort,
+        src_port: P2pPort,
+        payload: &[u8],
+        stream_section: bool,
+    ) -> TelemetryResult<()> {
         if dst_port == 0 {
             return Err(TelemetryError::BadArg);
         }
         let local = self.state.lock().local_address.clone();
-        let payload = Self::encode_p2p_payload(
+        let payload = Self::encode_p2p_message(
             local.hostname.as_ref(),
             local.address,
             src_port,
             dst_port,
             payload,
+            stream_section,
         )?;
         let pkt = Packet::new(
             DataType::P2pMessage,
@@ -17907,7 +18008,7 @@ impl Router {
             stream_id
         };
         let payload = Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
-        self.send_p2p_to_entry(dst, dst_port, src_port, &payload)?;
+        self.send_p2p_stream_to_entry(dst, dst_port, src_port, &payload)?;
         Ok(stream_id)
     }
 
@@ -17980,11 +18081,11 @@ impl Router {
         if refresh_syn {
             let syn_payload =
                 Self::encode_p2p_stream_payload(P2P_STREAM_SYN, stream_id, 0, 0, &[])?;
-            self.send_p2p_to_entry(dst.clone(), dst_port, src_port, &syn_payload)?;
+            self.send_p2p_stream_to_entry(dst.clone(), dst_port, src_port, &syn_payload)?;
         }
         let stream_payload =
             Self::encode_p2p_stream_payload(flags, stream_id, peer_stream_id, seq, payload)?;
-        self.send_p2p_to_entry(dst, dst_port, src_port, &stream_payload)?;
+        self.send_p2p_stream_to_entry(dst, dst_port, src_port, &stream_payload)?;
         if flags & (P2P_STREAM_FIN | P2P_STREAM_RST) != 0 {
             let mut state = self.state.lock();
             #[cfg(feature = "std")]
@@ -18430,6 +18531,19 @@ impl Router {
         }
         #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
+        Ok(())
+    }
+
+    /// Declare a registered side point to point (or not): see
+    /// [`crate::routing_config::SideOptions::point_to_point`].
+    pub fn set_side_point_to_point(&self, side: RouterSideId, enabled: bool) -> TelemetryResult<()> {
+        let mut st = self.state.lock();
+        let side_ref = st
+            .sides
+            .get_mut(side)
+            .and_then(|side| side.as_mut())
+            .ok_or(TelemetryError::BadArg)?;
+        side_ref.opts.point_to_point = enabled;
         Ok(())
     }
 
@@ -19938,7 +20052,7 @@ impl Router {
                     .values()
                     .chain(side.rx_templates_by_id.values())
             })
-            .map(|t| size_of::<SideHeaderTemplate>() + t.prefix().len() + t.between().len())
+            .map(|t| size_of::<SideHeaderTemplate>() + t.header().len())
             .sum::<usize>();
         let chunks = st
             .side_transport
@@ -21599,53 +21713,22 @@ impl Router {
             self.ensure_side_ingress_enabled(side)?;
             return self.rx_compact_bundle(bytes, side, true);
         }
-        // The ingress check rides on the decoder's first lock, and a compact
-        // frame's timestamp record on the enqueue's lock.
-        let mut pending = None;
-        let decoded = self.decode_side_transport_frame_with(
-            side,
-            bytes,
-            crc_verified,
-            true,
-            Some(&mut pending),
-        );
+        // The ingress check rides on the decoder's first lock.
+        let decoded = self.decode_side_transport_frame_with(side, bytes, crc_verified, true);
         let data = match decoded {
             Ok(Some(decoded)) => RouterItem::Packed(decoded),
-            other => {
-                Self::note_rx_timestamp_locked(&mut self.state.lock(), side, pending);
-                return other.map(|_| ());
-            }
+            other => return other.map(|_| ()),
         };
-        let priority = match self.item_service_priority(&data) {
-            Ok(priority) => priority,
-            Err(error) => {
-                Self::note_rx_timestamp_locked(&mut self.state.lock(), side, pending);
-                return Err(error);
-            }
-        };
+        let priority = self.item_service_priority(&data)?;
         #[cfg(feature = "timesync")]
         self.timesync_note_rx(&data, self.monotonic_now_ns());
         let mut st = self.state.lock();
-        Self::note_rx_timestamp_locked(&mut st, side, pending);
         st.push_received(RouterRxItem {
             src: Some(side),
             data,
             priority,
         })?;
         Ok(())
-    }
-
-    /// Record a compact frame's timestamp for its template (if any).
-    fn note_rx_timestamp_locked(
-        st: &mut RouterInner,
-        side: RouterSideId,
-        record: Option<(u32, u64)>,
-    ) {
-        if let Some((template_id, timestamp)) = record
-            && let Some(side_state) = st.side_transport.get_mut(&side)
-        {
-            side_state.rx_last_timestamps.insert(template_id, timestamp);
-        }
     }
 
     /// ISR-safe, non-blocking enqueue of packed bytes with source side.
@@ -24698,16 +24781,13 @@ mod queued_schema_identity_tests {
             received.len() > 1,
             "fixture must exercise fragmentation, not a compressed single frame"
         );
-        let first = &received[0];
-        assert_eq!(&first[..4], &[83, 68, 84, 3]);
-        assert_eq!(
-            u16::from_le_bytes([first[10], first[11]]) as usize,
-            received.len()
-        );
-        let transfer_id = &first[4..8];
+        let parse = crate::side_transport::test_parse_chunk_frame;
+        let (transfer_id, _, total, _) = parse(&received[0]).unwrap();
+        assert_eq!(usize::from(total), received.len());
         for (index, frame) in received.iter().enumerate() {
-            assert_eq!(&frame[4..8], transfer_id);
-            assert_eq!(u16::from_le_bytes([frame[8], frame[9]]) as usize, index);
+            let (transfer, chunk_index, _, _) = parse(frame).unwrap();
+            assert_eq!(transfer, transfer_id);
+            assert_eq!(usize::from(chunk_index), index);
         }
     }
     #[test]
@@ -24779,7 +24859,7 @@ mod queued_schema_identity_tests {
         .unwrap();
         let tx = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0u64));
         let rx = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0u64));
-        let opts = RouterSideOptions::default().with_small_packet_transport(0);
+        let opts = RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point();
         let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let packet = Packet::new(
@@ -24813,7 +24893,7 @@ mod queued_schema_identity_tests {
         let mut received = None;
         tx.send_side_frames_resumable(a, retry, |frame| {
             assert_eq!(
-                frame[3], SIDE_TRANSPORT_KIND_FULL,
+                frame[0], SIDE_TRANSPORT_KIND_FULL,
                 "retry requires the unaccepted dictionary bootstrap"
             );
             received = rx.decode_side_transport_frame(b, frame)?;
@@ -24826,7 +24906,7 @@ mod queued_schema_identity_tests {
             .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
             .unwrap();
         tx.send_side_frames_resumable(a, next, |frame| {
-            assert_eq!(frame[3], SIDE_TRANSPORT_KIND_COMPACT);
+            assert_eq!(frame[0] & 0xFC, SIDE_TRANSPORT_KIND_COMPACT);
             assert_eq!(
                 rx.decode_side_transport_frame(b, frame)?,
                 Some(crate::shared_bytes::convert(raw.clone()))
@@ -24918,11 +24998,12 @@ mod queued_schema_identity_tests {
         crate::tests::ensure_common_test_schema();
         // Captured after the actual gateway UART and Pico mailbox. The owner
         // hash is carried in the contract, because the ACK sender is numeric.
+        // (Re-encoded in the SEDSnet 7 layout by tools/wire_v6_to_v7.py.)
         let bytes = [
-            0x0c, 0x01, 0x01, 0x08, 0xd4, 0xe5, 0xea, 0xb6, 0xb7, 0x33, 0xff, 0x90, 0x02, 0xb4,
-            0xe6, 0xdd, 0x94, 0x07, 0x14, 0x03, 0x44, 0x02, 0x02, 0x06, 0x25, 0xd2, 0x59, 0x1b,
-            0xbb, 0xfc, 0xa7, 0x5f, 0x43, 0x92, 0x9e, 0x12, 0xbb, 0xfc, 0xa7, 0x26, 0xa2, 0xa0,
-            0xbe, 0x39, 0x65, 0xe2, 0xd8, 0x61, 0x68, 0x22, 0xfd,
+            0x0c, 0x01, 0xb4, 0xe6, 0xdd, 0x94, 0x07, 0x14, 0x03, 0x44, 0x02, 0x02, 0x06, 0x25,
+            0xd2, 0x59, 0x1b, 0xbb, 0xfc, 0xa7, 0x5f, 0x43, 0x92, 0x9e, 0x12, 0xbb, 0xfc, 0xa7,
+            0xd4, 0xe5, 0xea, 0xb6, 0xb7, 0x33, 0xff, 0x90, 0x02, 0x26, 0xa2, 0xa0, 0xbe, 0x39,
+            0x65, 0xe2, 0xd8, 0x31, 0xd8, 0x14, 0xfc,
         ];
         let ack = wire_format::unpack_packet(&bytes).unwrap();
         let owner = Router::sender_hash("GB");
@@ -25237,7 +25318,7 @@ fn untemplated_test_node() -> Router {
 }
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 fn untemplated_test_options() -> RouterSideOptions {
-    RouterSideOptions::default().with_small_packet_transport(64)
+    RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point()
 }
 #[cfg(all(test, feature = "discovery", feature = "std"))]
 #[allow(clippy::duplicate_mod)]

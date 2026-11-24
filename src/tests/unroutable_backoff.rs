@@ -44,6 +44,8 @@ struct Harness {
 /// A node with two links and no discovered routes: with more than one link,
 /// nothing addressed to a remote endpoint is routable.
 fn harness() -> Harness {
+    // Owners announce the shared test endpoints by name.
+    crate::tests::ensure_common_test_schema();
     let now = Arc::new(AtomicU64::new(1_000));
     let clock = now.clone();
     let router = Router::new_with_clock(

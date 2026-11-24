@@ -188,8 +188,8 @@ use canonical wire names; Rust aliases apply within their defining document.
 
 Application frames retain explicit destination lists, so a partial sender's
 one-destination packet is not reinterpreted as a receiver's larger merged list.
-Sparse lists use variable-length numeric IDs rather than a fixed 32-byte bitmap;
-dense legacy-range sets can still use the bitmap representation. Reliable-header
+Lists use variable-length numeric IDs (one ID without a count; SEDSnet 7 removed
+the former 32-byte bitmap representation). Reliable-header
 presence is carried in the frame. Receipt identity uses numeric wire identities
 and remains stable when missing names/definitions are subsequently learned.
 

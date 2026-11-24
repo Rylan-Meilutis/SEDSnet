@@ -27,7 +27,7 @@ fn decoder() -> (Router, RouterSideId, Arc<AtomicU64>) {
         RouterConfig::default().with_sender("TRACE_DECODER"),
         Box::new(move || clock.load(Ordering::Relaxed)),
     );
-    let mut options = RouterSideOptions::default().with_small_packet_transport(192);
+    let mut options = RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point();
     options.max_side_transport_templates = 64;
     let side = router.add_side_packed_with_options("trace", |_| Ok(()), options);
     (router, side, now)
@@ -71,16 +71,35 @@ fn advance_codec_clock(now: &AtomicU64, at_us: u64) -> u64 {
     now.store(next, Ordering::Relaxed);
     next
 }
-// RRv1 is an application envelope, not an SDK wire protocol. Diagnostic-only
+// RR v2 is an application envelope, not an SDK wire protocol. Diagnostic-only
 // implementation is checked against fixtures emitted by the actual GS source
-// encode/decode functions before each driver invocation.
+// encode/decode functions before each driver invocation. One marker byte in
+// 0xE0..=0xFF (never the first byte of a SEDSnet frame): the CRC form
+// `[0xE0 + kind] payload CRC32-LE(marker + payload)` for kinds 0..=16, or the
+// self-checked form `[S(kind)] payload` for kinds 1..=6 whose payload (a
+// SEDSnet frame) ends in the CRC32 of its own other bytes.
+const RR_SELF_CHECKED: [u8; 6] = [0xF3, 0xF5, 0xF6, 0xF9, 0xFA, 0xFC];
+fn self_verifying(payload: &[u8]) -> bool {
+    payload.len() >= 5 && {
+        let n = payload.len() - 4;
+        crc32fast::hash(&payload[..n]).to_le_bytes() == payload[n..]
+    }
+}
 fn relay_envelope(bytes: &[u8]) -> Option<(u8, &[u8])> {
-    if bytes.len() < 8 || bytes.len() > 4080 + 8 || &bytes[..3] != b"RR\x01" {
+    let marker = *bytes.first()?;
+    if bytes.len() > 4080 + 5 {
+        return None;
+    }
+    if let Some(index) = RR_SELF_CHECKED.iter().position(|&s| s == marker) {
+        let payload = &bytes[1..];
+        return self_verifying(payload).then_some((index as u8 + 1, payload));
+    }
+    if !(0xE0..=0xE0 + 16).contains(&marker) || bytes.len() < 5 {
         return None;
     }
     let end = bytes.len() - 4;
     (crc32fast::hash(&bytes[..end]) == u32::from_le_bytes(bytes[end..].try_into().ok()?))
-        .then_some((bytes[3], &bytes[4..end]))
+        .then_some((marker - 0xE0, &bytes[1..end]))
 }
 fn decode_stream(path: &Path, max_clock_backstep_us: u64) -> Value {
     let bytes = bounded_read(path, MAX_TRACE_BYTES);
@@ -140,7 +159,7 @@ fn decode_stream(path: &Path, max_clock_backstep_us: u64) -> Value {
         let end = offset + 4 + length;
         let body = &raw[offset + 4..end];
         let relay = relay_envelope(body);
-        if body.starts_with(b"RR") && relay.is_none() {
+        if body.first().is_some_and(|&b| b >= 0xE0) && relay.is_none() {
             offset += 1;
             continue;
         }
@@ -357,7 +376,7 @@ fn self_contained_trace_fixture() {
         )));
     fs::create_dir(&directory.0).unwrap();
     let tx = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-    let options = RouterSideOptions::default().with_small_packet_transport(64);
+    let options = RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point();
     let side = tx.add_side_packed_with_options("fixture", |_| Ok(()), options.clone());
     let packet = Packet::new(
         DataType::TelemetryError,
@@ -379,7 +398,7 @@ fn self_contained_trace_fixture() {
             )
             .unwrap();
         tx.send_side_frames_resumable(side, frames, |frame| {
-            kinds.push(frame[3]);
+            kinds.push(frame[0]);
             uart.extend_from_slice(&[0xa5, 0x5a]);
             uart.extend_from_slice(&u16::try_from(frame.len()).unwrap().to_le_bytes());
             uart.extend_from_slice(frame);
@@ -482,7 +501,7 @@ fn capture_argument_pair_selects_fixture_only_when_both_are_absent() {
 fn exact_side_codec_reconstructs_bootstrap_chunks_and_compact_followup() {
     crate::tests::ensure_common_test_schema();
     let tx = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-    let opts = RouterSideOptions::default().with_small_packet_transport(64);
+    let opts = RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point();
     let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     let (rx, b, _) = decoder();
     let packet = Packet::new(
@@ -505,7 +524,7 @@ fn exact_side_codec_reconstructs_bootstrap_chunks_and_compact_followup() {
             .unwrap();
         let mut decoded = None;
         tx.send_side_frames_resumable(a, frames, |wire| {
-            kinds.push(wire[3]);
+            kinds.push(wire[0]);
             if let Some(value) = rx.decode_side_transport_frame(b, wire)? {
                 decoded = Some(value);
             }

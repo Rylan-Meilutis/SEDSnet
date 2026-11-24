@@ -19,7 +19,7 @@ fn full_general_transport_does_not_hide_a_free_receipt_slot() {
     let received = receipt_at.clone();
     let frames = Arc::new(RouterMutex::new(Vec::new()));
     let capture = frames.clone();
-    let options = RouterSideOptions::default().with_small_packet_transport(128);
+    let options = RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point();
     let side = node.add_side_packed_with_priority_and_options(
         "finite-transport",
         move |bytes, priority| {
@@ -291,7 +291,7 @@ fn schema_response_partial_fragments_survive_bursts_and_refresh_only_at_start() 
             capture.lock().push(bytes.to_vec());
             Ok(())
         },
-        RouterSideOptions::default().with_small_packet_transport(128),
+        RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point(),
     );
     let request = discovery::build_discovery_schema_request("PEER", 1).unwrap();
     router
@@ -367,11 +367,12 @@ fn schema_response_partial_fragments_survive_bursts_and_refresh_only_at_start() 
     assert!(complete);
     let received = frames.lock();
     assert!(received.len() > 1);
-    let transfer_id = &received[0][4..8];
+    let parse = crate::side_transport::test_parse_chunk_frame;
+    let transfer_id = parse(&received[0]).unwrap().0;
     for (index, frame) in received.iter().enumerate() {
-        assert_eq!(&frame[..4], b"SDT\x03");
-        assert_eq!(&frame[4..8], transfer_id);
-        assert_eq!(u16::from_le_bytes([frame[8], frame[9]]) as usize, index);
+        let (transfer, chunk_index, _, _) = parse(frame).unwrap();
+        assert_eq!(transfer, transfer_id);
+        assert_eq!(usize::from(chunk_index), index);
     }
     drop(received);
     // The production queue retains this exact owner through partial IO.
@@ -455,7 +456,7 @@ fn coalesced_restarts_receive_full_headers_after_pending_dispatch() {
         RouterConfig::default().with_sender("DAQ"),
         Box::new(move || clock.load(Ordering::SeqCst)),
     ));
-    let opts = RouterSideOptions::default().with_small_packet_transport(0);
+    let opts = RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point();
     let callback_opts = opts.clone();
     let callback_app = application.clone();
     let side_index = Arc::new(AtomicUsize::new(usize::MAX));
@@ -489,7 +490,7 @@ fn coalesced_restarts_receive_full_headers_after_pending_dispatch() {
                     )
                     .unwrap()
                     .collect::<Vec<_>>();
-                assert_eq!(frames[0][3], SIDE_TRANSPORT_KIND_FULL);
+                assert_eq!(frames[0][0], SIDE_TRANSPORT_KIND_FULL);
                 callback_clock.store(2054, Ordering::SeqCst);
             }
             Ok(())
@@ -529,7 +530,7 @@ fn coalesced_restarts_receive_full_headers_after_pending_dispatch() {
         )
         .unwrap()
         .collect::<Vec<_>>();
-    assert_ne!(before[0][3], SIDE_TRANSPORT_KIND_FULL);
+    assert_ne!(before[0][0], SIDE_TRANSPORT_KIND_FULL);
     assert!(
         restarted
             .decode_side_transport_frame(rx_side, &before[0])
@@ -549,7 +550,7 @@ fn coalesced_restarts_receive_full_headers_after_pending_dispatch() {
         )
         .unwrap()
         .collect::<Vec<_>>();
-    assert_eq!(after[0][3], SIDE_TRANSPORT_KIND_FULL);
+    assert_eq!(after[0][0], SIDE_TRANSPORT_KIND_FULL);
     assert!(
         restarted
             .decode_side_transport_frame(rx_side, &after[0])
@@ -593,7 +594,7 @@ fn coalesced_restarts_receive_full_headers_after_pending_dispatch() {
         )
         .unwrap()
         .collect::<Vec<_>>();
-    assert_eq!(after[0][3], SIDE_TRANSPORT_KIND_FULL);
+    assert_eq!(after[0][0], SIDE_TRANSPORT_KIND_FULL);
     assert!(
         late.decode_side_transport_frame(late_side, &after[0])
             .unwrap()
@@ -636,14 +637,14 @@ fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
                 capture.lock().push(bytes.to_vec());
                 Ok(())
             },
-            RouterSideOptions::default().with_small_packet_transport(192),
+            RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point(),
         );
         let catalog = discovery::build_discovery_schema("GS", 0).unwrap();
         assert!(matches!(
             router.send_reliable_to_side(side, RouterItem::Packet(catalog.clone()), false),
             Err(TelemetryError::Io(_))
         ));
-        assert_eq!(&frames.lock()[0][..4], b"SDT\x03");
+        assert_eq!(frames.lock()[0][0], crate::side_transport::SIDE_TRANSPORT_KIND_CHUNK);
         router
             .tx_queue_item_with_flags(
                 RouterTxItem::ToSide {
@@ -720,12 +721,13 @@ fn refused_reliable_replay_keeps_priority_ahead_of_partial_schema() {
         let captured = frames.lock();
         let chunks: Vec<_> = captured
             .iter()
-            .filter(|bytes| bytes.starts_with(b"SDT\x03"))
+            .filter(|bytes| bytes.first() == Some(&0x61))
             .collect();
         assert!(chunks.len() > 1);
         for (index, chunk) in chunks.iter().enumerate() {
-            assert_eq!(&chunk[4..8], &chunks[0][4..8]);
-            assert_eq!(u16::from_le_bytes([chunk[8], chunk[9]]) as usize, index);
+            let parse = crate::side_transport::test_parse_chunk_frame;
+            assert_eq!(parse(chunk).unwrap().0, parse(chunks[0]).unwrap().0);
+            assert_eq!(usize::from(parse(chunk).unwrap().1), index);
         }
     }
 }
@@ -763,7 +765,7 @@ fn refused_ordinary_turn_survives_until_admission_during_partial_schema() {
             capture.lock().push(bytes.to_vec());
             Ok(())
         },
-        RouterSideOptions::default().with_small_packet_transport(192),
+        RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point(),
     );
     let catalog = discovery::build_discovery_schema("RF", 0).unwrap();
     assert!(matches!(
@@ -809,7 +811,7 @@ fn refused_ordinary_turn_survives_until_admission_during_partial_schema() {
     let decode_side = decoder.add_side_packed_with_options(
         "trace",
         |_| Ok(()),
-        RouterSideOptions::default().with_small_packet_transport(192),
+        RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point(),
     );
     let mut delivered = false;
     for frame in frames.lock().iter() {
@@ -840,12 +842,13 @@ fn refused_ordinary_turn_survives_until_admission_during_partial_schema() {
     let capture = frames.lock();
     let chunks: Vec<_> = capture
         .iter()
-        .filter(|bytes| bytes.starts_with(b"SDT\x03"))
+        .filter(|bytes| bytes.first() == Some(&0x61))
         .collect();
     assert!(chunks.len() > 1);
     for (index, chunk) in chunks.iter().enumerate() {
-        assert_eq!(&chunk[4..8], &chunks[0][4..8]);
-        assert_eq!(u16::from_le_bytes([chunk[8], chunk[9]]) as usize, index);
+        let parse = crate::side_transport::test_parse_chunk_frame;
+        assert_eq!(parse(chunk).unwrap().0, parse(chunks[0]).unwrap().0);
+        assert_eq!(usize::from(parse(chunk).unwrap().1), index);
     }
 }
 
@@ -1057,7 +1060,7 @@ fn one_partial_schema_request_completes_without_inventing_another_generation() {
                 capture.lock().push(bytes.to_vec());
                 Ok(())
             },
-            RouterSideOptions::default().with_small_packet_transport(192),
+            RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point(),
         );
         let request = discovery::build_discovery_schema_request("PEER", 1000).unwrap();
         node.learn_discovery_packet(&request, Some(side), true)
@@ -1111,7 +1114,7 @@ fn one_partial_schema_request_completes_without_inventing_another_generation() {
         let rx = decoder.add_side_packed_with_options(
             "trace",
             |_| Ok(()),
-            RouterSideOptions::default().with_small_packet_transport(192),
+            RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point(),
         );
         let mut catalogs = 0;
         for frame in frames.lock().iter() {
@@ -1262,12 +1265,12 @@ fn lost_partial_schema_owner_can_recover_after_clear_eviction_or_readmission_fai
                 allowance
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .map_err(|_| TelemetryError::Io("side tx busy"))?;
-                if bytes.starts_with(b"SDT\x03") {
+                if bytes.first() == Some(&0x61) {
                     seen.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(())
             },
-            RouterSideOptions::default().with_small_packet_transport(192),
+            RouterSideOptions::default().with_small_packet_transport(192).with_point_to_point(),
         );
         let request = discovery::build_discovery_schema_request("PEER", 1000).unwrap();
         node.learn_discovery_packet(&request, Some(side), true)

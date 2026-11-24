@@ -143,7 +143,7 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
     let rx = Router::new(RouterConfig::default());
     let opts = RouterSideOptions {
         max_side_transport_templates: 0,
-        ..RouterSideOptions::default().with_small_packet_transport(0)
+        ..RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point()
     };
     let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
@@ -205,7 +205,7 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
     ] {
         let tx = Router::new(RouterConfig::default());
         let rx = Router::new(RouterConfig::default());
-        let opts = RouterSideOptions::default().with_small_packet_transport(0);
+        let opts = RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point();
         let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let packet = Packet::new(
@@ -273,7 +273,7 @@ fn check_restarting_peer_header(schema_request: bool) {
         .unwrap()
     });
     let tx = Router::new_with_clock(RouterConfig::new([]).with_sender("GB"), Box::new(|| 100u64));
-    let opts = RouterSideOptions::default().with_small_packet_transport(0);
+    let opts = RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point();
     let side = tx.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
     let unrelated = tx.add_side_packed_with_options("radio", |_| Ok(()), opts.clone());
     let endpoint = DataEndpoint::named("RADIO");
@@ -402,7 +402,7 @@ fn discovery_refresh_survives_a_missed_transport_template() {
     crate::tests::ensure_common_test_schema();
     let tx = Router::new(RouterConfig::default());
     let rx = Router::new(RouterConfig::default());
-    let opts = RouterSideOptions::default().with_small_packet_transport(512);
+    let opts = RouterSideOptions::default().with_small_packet_transport(512).with_point_to_point();
     let tx_side = tx.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let rx_side = rx.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     for timestamp in [1000, 6000] {
@@ -431,7 +431,7 @@ fn compact_loss_must_not_change_packet_identity() {
     crate::tests::ensure_common_test_schema();
     let tx = Router::new_with_clock(RouterConfig::new([]).with_sender("VB"), Box::new(|| 0u64));
     let rx = Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), Box::new(|| 0u64));
-    let opts = RouterSideOptions::default().with_small_packet_transport(0);
+    let opts = RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point();
     let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     for (index, timestamp) in [10000, 10010, 10020].into_iter().enumerate() {
@@ -562,7 +562,7 @@ fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
         }
     }
     let rx = Router::new(RouterConfig::new([]));
-    let opts = RouterSideOptions::default().with_small_packet_transport(0);
+    let opts = RouterSideOptions::default().with_small_packet_transport(0).with_point_to_point();
     let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
     let packet = Packet::new(
         crate::DataType::ReliableAck,
@@ -577,20 +577,8 @@ fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
     let mut body = vec![1];
     body.extend_from_slice(&raw);
     let full = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body);
-    let (_, _, flags, size, timestamp, nonce, reliable, payload) =
-        extract_side_header_template(&raw).unwrap();
-    let mut body = vec![flags, 1];
-    write_uleb128_local(size, &mut body);
-    write_uleb128_local(timestamp, &mut body);
-    if flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
-        write_uleb128_local(u64::from(nonce), &mut body);
-    }
-    if let Some((seq, ack)) = reliable {
-        write_uleb128_local(u64::from(seq), &mut body);
-        write_uleb128_local(u64::from(ack), &mut body);
-    }
-    body.extend_from_slice(payload);
-    let compact = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body);
+    let timestamp = extract_side_header_template(&raw).unwrap().timestamp;
+    let compact = crate::side_transport::test_compact_frame(&raw, 1, timestamp);
     let ordinary = Packet::new(
         crate::DataType::DiscoverySchema,
         &[crate::DataEndpoint::Discovery],

@@ -24,12 +24,8 @@ fn data_packet(nonce: u16) -> Packet {
 
 /// The nonce of a canonical frame, read from its header.
 fn wire_nonce(frame: &[u8]) -> Option<u16> {
-    let flags = frame[0];
-    let mut off = 2;
-    for _ in 0..3 {
-        crate::side_transport::read_uleb128_local(frame, &mut off).ok()?;
-    }
-    (flags & 0x08 != 0).then(|| crate::side_transport::read_uleb128_local(frame, &mut off).ok().map(|n| n as u16))?
+    let header = crate::wire_format::parse_frame_header(&frame[..frame.len() - 4]).ok()?;
+    (header.flags & 0x08 != 0).then_some(header.nonce)
 }
 
 fn sealing_router() -> Router {

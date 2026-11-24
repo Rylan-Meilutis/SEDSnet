@@ -267,35 +267,47 @@ is selected by the outer packet's target-sender wire contract, which is learned 
 destination address or hostname is not repeated inside the P2P payload.
 
 ```text
-[version: u8]                     // current: 1
-[destination_port: u16 LE]
-[source_port: u16 LE]
+[tag: u8]                         // bits 6..7: format version, 0b10 (2)
+                                  // bit 5: stream frame; bits 0..4: stream flags
+[destination_port: ULEB128]
+[source_port: ULEB128]
 [source_address: u32 LE]
-[source_hostname_len: u16 LE]
-[payload_len: u32 LE]
+[source_hostname_len: ULEB128]
 [source_hostname_utf8: source_hostname_len]
-[payload: payload_len]
+[stream fields]                   // stream frames only, see below
+[payload]                         // runs to the end of the packet payload
 ```
+
+A plain message has tag `0x80`. The payload length is the remainder of the packet payload, whose
+size the canonical frame already carries, so it is not repeated. Ports and the hostname length are
+ULEB128 (a well-known port below 16384 costs two bytes, an ephemeral one three); the address stays
+four fixed bytes because assigned addresses are usually 32-bit hashes. Version 1 frames (tag `1`)
+are rejected.
 
 Routers dispatch normal decoded payloads to handlers registered with `bind_p2p_port(...)`. Senders
 can target by discovered hostname or by current node address. Hostname targeting survives address
 changes because the router resolves the current address book entry before sending.
 
-### P2P Stream Payload
+The `P2pMessage` envelope omits its explicit endpoint list (its endpoint is protocol-defined, like
+the reliability controls), so the frozen target contract carries the destination alone.
 
-If the P2P payload begins with `SDSP`, it is consumed by the stream/session layer instead of normal
-datagram handlers.
+### P2P Stream Frames
+
+A stream frame sets tag bit 5 and carries its flags in tag bits 0..4, so it is told apart from a
+plain message by the tag, never by its payload bytes: an application datagram can no longer be
+mistaken for a stream frame. After the hostname:
 
 ```text
-[magic: "SDSP"]
-[version: u8]                     // current: 1
-[flags: u8]
-[source_stream_id: u32 LE]
-[destination_stream_id: u32 LE]
-[sequence: u32 LE]
-[payload_len: u32 LE]
-[payload: payload_len]
+[source_stream_id: ULEB128]
+[destination_stream_id: ULEB128]
+[sequence: ULEB128]
+[payload]                         // runs to the end of the packet payload
 ```
+
+With small stream ids and sequences the whole P2P header of a data frame is
+`1 + 3 + 2 + 4 + 1 + hostname + 1 + 1 + 1..3` bytes: 16 to 18 bytes for a two-character hostname,
+down from 39 (15-byte message header, hostname, and a 22-byte `SDSP` stream header with its own
+magic, version and length).
 
 Stream flags:
 

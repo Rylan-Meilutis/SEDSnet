@@ -34,11 +34,10 @@ static ALLOCATOR: Allocator = Allocator;
 
 #[test]
 fn unknown_type_with_frozen_wire_shape_validates_without_fallback_allocations() {
-    // A self-describing v4 frame for a type absent from this node's registry.
+    // A self-describing frame (SEDSnet 7 layout) for a type absent from this node's registry.
     // Its frozen UInt8[8] shape must work while runtime schema is incomplete.
     const WIRE: &[u8] = &[
-        140, 1, 129, 128, 252, 255, 7, 8, 1, 1, 133, 184, 224, 176, 2, 202, 1, 12, 3, 66, 8, 1, 34,
-        17, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 249, 109, 220, 29,
+        44, 129, 128, 252, 255, 7, 133, 184, 224, 176, 2, 202, 1, 12, 3, 66, 8, 1, 34, 17, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 2, 3, 4, 5, 6, 7, 210, 46, 75, 230,
     ];
     let packet = sedsnet::wire_format::unpack_packet(WIRE).unwrap();
     assert_eq!(packet.payload(), &[0, 1, 2, 3, 4, 5, 6, 7]);

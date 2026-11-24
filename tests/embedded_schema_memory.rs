@@ -1,4 +1,6 @@
 #![cfg(all(not(feature = "std"), feature = "discovery"))]
+#[path = "support/side_chunk.rs"]
+mod side_chunk;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 struct Counter;
@@ -197,8 +199,11 @@ fn embedded_schema_encodes_directly_into_one_large_allocation() {
             ..Default::default()
         },
     );
-    let mut full = b"SDT\x01\x01".to_vec();
-    full.extend_from_slice(&raw);
+    // FULL frame: kind, template id 1 generation 0 (ULEB128 of 1 << 3),
+    // base delta 0, the canonical frame without its CRC, then a CRC32 of
+    // the whole FULL frame.
+    let mut full = vec![0x60, 1 << 3, 0];
+    full.extend_from_slice(&raw[..raw.len() - 4]);
     full.extend_from_slice(&crc32fast::hash(&full).to_le_bytes());
     let mut corrupt = raw.to_vec();
     *corrupt.last_mut().unwrap() ^= 1;
@@ -260,12 +265,7 @@ fn embedded_schema_encodes_directly_into_one_large_allocation() {
     );
     // Duplicate fragments must reuse their retained payload rather than copy
     // it into another allocation and immediately discard that copy.
-    let mut chunk = b"SDT\x03".to_vec();
-    chunk.extend_from_slice(&123u32.to_le_bytes());
-    chunk.extend_from_slice(&0u16.to_le_bytes());
-    chunk.extend_from_slice(&2u16.to_le_bytes());
-    chunk.extend_from_slice(&[0x5a; 128]);
-    chunk.extend_from_slice(&crc32fast::hash(&chunk).to_le_bytes());
+    let chunk = side_chunk::chunk_frame(123, 0, 2, &[0x5a; 128]);
     router.rx_packed_from_side(&chunk, router_side).unwrap();
     relay.rx_packed_from_side(relay_side, &chunk).unwrap();
     LARGE.with(|v| v.set(Some((128, 0))));

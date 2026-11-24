@@ -29,8 +29,8 @@ fn lost_chunk_cannot_poison_later_frames_from_same_router() {
         .unwrap()
         .collect::<Vec<_>>();
     assert_ne!(
-        &a[0][4..8],
-        &b[0][4..8],
+        &a[0][1..3],
+        &b[0][1..3],
         "different packets need different transfer IDs"
     );
     assert!(
@@ -620,7 +620,7 @@ fn chunked_schema_resumes_after_transport_backpressure() {
                     .push(Arc::<[u8]>::from(bytes));
                 Ok(())
             },
-            RouterSideOptions::default().with_small_packet_transport(128),
+            RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point(),
         );
         let packet = crate::packet::Packet::new(
             crate::DataType::DiscoverySchema,
@@ -1099,6 +1099,7 @@ fn compact_frames_refresh_live_peer_at_ingress_without_dispatch() {
     let source = Router::new_with_clock(RouterConfig::new([]).with_sender("LIVE"), Box::new(|| 0));
     let opts = RouterSideOptions {
         header_template_enabled: true,
+        point_to_point: true,
         max_frame_bytes: 0,
         ..Default::default()
     };

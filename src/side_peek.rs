@@ -11,9 +11,8 @@
 
 use crate::DataType;
 use crate::side_transport::{
-    SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT, SIDE_TRANSPORT_KIND_COMPACT_DELTA,
-    SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP, SIDE_TRANSPORT_KIND_FULL, SIDE_TRANSPORT_MAGIC,
-    parse_side_transport_wrapper, read_uleb128_local,
+    SIDE_TRANSPORT_KIND_CHUNK, SIDE_TRANSPORT_KIND_COMPACT, SIDE_TRANSPORT_KIND_FULL,
+    read_uleb128_local, side_frame_kind,
 };
 use crate::wire_format;
 use alloc::collections::VecDeque;
@@ -63,6 +62,87 @@ fn lookup<T: Copy>(list: &VecDeque<(u32, T)>, id: u32) -> Option<T> {
     list.iter().rev().find(|(known, _)| *known == id).map(|(_, value)| *value)
 }
 
+/// Whether `bytes` is a side-transport frame (FULL, COMPACT or CHUNK) rather
+/// than a canonical frame or a compact bundle. The first byte decides: no
+/// check of the rest is made.
+pub fn is_side_transport_frame(bytes: &[u8]) -> bool {
+    matches!(
+        side_frame_kind(bytes),
+        Some(SIDE_TRANSPORT_KIND_FULL | SIDE_TRANSPORT_KIND_COMPACT | SIDE_TRANSPORT_KIND_CHUNK)
+    )
+}
+
+/// Whether `bytes` is a side-transport chunk (a fragment of a larger frame).
+pub fn is_side_transport_chunk(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&SIDE_TRANSPORT_KIND_CHUNK)
+}
+
+/// One fragment of a chunked side frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SideChunk<'a> {
+    /// Transfer id shared by every chunk of the frame (16-bit content id).
+    pub transfer: u16,
+    pub index: u16,
+    pub total: u16,
+    /// The fragment's bytes of the chunked frame.
+    pub payload: &'a [u8],
+}
+
+/// A chunk frame's header and fragment, when `bytes` is a chunk whose CRC32
+/// is intact.
+pub fn side_chunk(bytes: &[u8]) -> Option<SideChunk<'_>> {
+    let body = crate::side_transport::checked_chunk_body(bytes).ok()?;
+    let (transfer, index, total, header) = crate::side_transport::parse_chunk_header(body).ok()?;
+    Some(SideChunk { transfer: transfer as u16, index, total, payload: &body[header..] })
+}
+
+/// A chunk frame's header and fragment without checking its CRC32 (for
+/// frames this node built itself): the fragment excludes the trailing CRC.
+pub fn side_chunk_unchecked(bytes: &[u8]) -> Option<SideChunk<'_>> {
+    if !is_side_transport_chunk(bytes) || bytes.len() < 1 + wire_format::CRC32_BYTES + 4 {
+        return None;
+    }
+    let body = &bytes[1..bytes.len() - wire_format::CRC32_BYTES];
+    let (transfer, index, total, header) = crate::side_transport::parse_chunk_header(body).ok()?;
+    Some(SideChunk { transfer: transfer as u16, index, total, payload: &body[header..] })
+}
+
+/// A FULL template frame's template id and the canonical frame it carries
+/// (with its own CRC32), when `bytes` is a FULL frame whose CRC32 is intact.
+pub fn side_full_frame(bytes: &[u8]) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    let (template, _, _, raw) = crate::side_transport::decode_full_frame(bytes).ok()?;
+    Some((template, raw.to_vec()))
+}
+
+/// The template id a FULL or COMPACT frame names (without checking its CRC).
+pub fn side_template_id(bytes: &[u8]) -> Option<u32> {
+    matches!(side_frame_kind(bytes), Some(SIDE_TRANSPORT_KIND_FULL | SIDE_TRANSPORT_KIND_COMPACT))
+        .then(|| crate::side_transport::template_id_and_gen(bytes).ok().map(|(id, _, _)| id))
+        .flatten()
+}
+
+/// The start of the canonical frame inside the first bytes of a FULL frame
+/// (for example a chunk's first fragment): `bytes` after the kind, template
+/// id and base delta.
+pub fn side_full_frame_prefix(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.first() != Some(&SIDE_TRANSPORT_KIND_FULL) {
+        return None;
+    }
+    let (_, _, mut off) = crate::side_transport::template_id_and_gen(bytes).ok()?;
+    read_uleb128_local(bytes, &mut off).ok()?;
+    bytes.get(off..)
+}
+
+/// Whether `bytes` is a FULL template frame (first byte).
+pub fn is_side_full_frame(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&SIDE_TRANSPORT_KIND_FULL)
+}
+
+/// Whether `bytes` is a COMPACT template frame (first byte).
+pub fn is_side_compact_frame(bytes: &[u8]) -> bool {
+    side_frame_kind(bytes) == Some(SIDE_TRANSPORT_KIND_COMPACT)
+}
+
 /// A frame's type without side state: canonical frames, side-transport FULL
 /// frames (templated or not) and a chunk's first fragment. A compact frame or
 /// a later fragment needs a [`SideFramePeeker`] that saw its template.
@@ -79,43 +159,43 @@ impl SideFramePeeker {
 
     /// Classify one frame the side emitted; None when it cannot be read.
     pub fn peek(&mut self, bytes: &[u8]) -> Option<SideFrameInfo> {
-        if !bytes.starts_with(SIDE_TRANSPORT_MAGIC) {
-            let info = wire_format::peek_frame_info_unchecked(bytes).ok()?;
+        self.peek_frame(bytes, true)
+    }
+
+    /// `complete`: `bytes` is a whole frame (its checks can be run), not the
+    /// first fragment of one.
+    fn peek_frame(&mut self, bytes: &[u8], complete: bool) -> Option<SideFrameInfo> {
+        let read = |raw: &[u8]| -> Option<wire_format::TelemetryFrameInfo> {
+            if complete {
+                wire_format::peek_frame_info(raw).ok()
+            } else {
+                wire_format::peek_frame_info_inner(raw).ok()
+            }
+        };
+        let Some(kind) = side_frame_kind(bytes) else {
+            let info = read(bytes)?;
             return Some(SideFrameInfo {
                 ty: info.envelope.ty,
                 kind: SideFrameKind::Canonical,
                 reliable_flags: info.reliable.map(|header| header.flags),
             });
-        }
-        let (kind, body) = parse_side_transport_wrapper(bytes).ok()??;
-        self.peek_body(kind, body, true)
-    }
-
-    fn peek_body(&mut self, kind: u8, body: &[u8], complete: bool) -> Option<SideFrameInfo> {
+        };
         match kind {
             SIDE_TRANSPORT_KIND_FULL => {
-                // A templated side prefixes the template ID. A complete frame
-                // is CRC-checked under both readings, so a peeker built for
-                // the wrong side kind still reads it; a fragment uses the
-                // configured reading.
-                let read = |off: usize| -> Option<wire_format::TelemetryFrameInfo> {
-                    let raw = body.get(off..)?;
-                    if complete { wire_format::peek_frame_info(raw).ok() } else { wire_format::peek_frame_info_inner(raw).ok() }
-                };
-                let mut prefixed = 0usize;
-                let template = read_uleb128_local(body, &mut prefixed).ok().and_then(|id| u32::try_from(id).ok());
-                let (template, info) = if self.header_templates || complete {
-                    match (template.and_then(|t| read(prefixed).map(|i| (Some(t), i))), self.header_templates) {
-                        (Some(found), true) => found,
-                        (found, _) => match read(0) {
-                            Some(info) => (None, info),
-                            None => found?,
-                        },
-                    }
+                // Kind, template id/generation and base delta precede the
+                // canonical data.
+                let (template, info) = if complete {
+                    let (template, _, _, raw) = crate::side_transport::decode_full_frame(bytes).ok()?;
+                    (template, wire_format::peek_frame_info(&raw).ok()?)
                 } else {
-                    (None, read(0)?)
+                    let (template, _, mut off) = crate::side_transport::template_id_and_gen(bytes).ok()?;
+                    read_uleb128_local(bytes, &mut off).ok()?;
+                    // A fragment ends mid-frame: no CRC to strip or check.
+                    let mut data = bytes.get(off..)?.to_vec();
+                    data.extend_from_slice(&[0; 4]);
+                    (template, wire_format::peek_frame_info_unchecked(&data).ok()?)
                 };
-                if let Some(template) = template {
+                if self.header_templates {
                     remember(&mut self.templates, template, info.envelope.ty);
                 }
                 Some(SideFrameInfo {
@@ -124,11 +204,8 @@ impl SideFramePeeker {
                     reliable_flags: info.reliable.map(|header| header.flags),
                 })
             }
-            SIDE_TRANSPORT_KIND_COMPACT
-            | SIDE_TRANSPORT_KIND_COMPACT_DELTA
-            | SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP => {
-                let mut off = 1usize;
-                let template = u32::try_from(read_uleb128_local(body, &mut off).ok()?).ok()?;
+            SIDE_TRANSPORT_KIND_COMPACT => {
+                let (template, _, _) = crate::side_transport::template_id_and_gen(bytes).ok()?;
                 Some(SideFrameInfo {
                     ty: lookup(&self.templates, template)?,
                     kind: SideFrameKind::Compact,
@@ -136,23 +213,11 @@ impl SideFramePeeker {
                 })
             }
             SIDE_TRANSPORT_KIND_CHUNK if complete => {
-                if body.len() < 8 {
-                    return None;
-                }
-                let transfer = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                let index = u16::from_le_bytes([body[4], body[5]]);
+                let body = crate::side_transport::checked_chunk_body(bytes).ok()?;
+                let (transfer, index, _total, header_len) =
+                    crate::side_transport::parse_chunk_header(body).ok()?;
                 if index == 0 {
-                    let payload = &body[8..];
-                    let inner = if payload.starts_with(SIDE_TRANSPORT_MAGIC) && payload.len() > 4 {
-                        self.peek_body(payload[3], &payload[4..], false)?
-                    } else {
-                        let info = wire_format::peek_frame_info_inner(payload).ok()?;
-                        SideFrameInfo {
-                            ty: info.envelope.ty,
-                            kind: SideFrameKind::Canonical,
-                            reliable_flags: info.reliable.map(|header| header.flags),
-                        }
-                    };
+                    let inner = self.peek_frame(&body[header_len..], false)?;
                     let info = SideFrameInfo { kind: SideFrameKind::Chunk, ..inner };
                     remember(&mut self.chunks, transfer, info);
                     Some(info)

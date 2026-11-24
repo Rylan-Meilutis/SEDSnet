@@ -255,7 +255,7 @@ fn packed_side_header_templates_reduce_followup_frame_size() {
     let receiver_c = receiver.clone();
 
     let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
-    sender.add_side_packed_small_packets(
+    let small_side = sender.add_side_packed_small_packets(
         "link",
         move |bytes: &[u8]| {
             frames_c.lock().unwrap().push(bytes.len());
@@ -267,11 +267,13 @@ fn packed_side_header_templates_reduce_followup_frame_size() {
         },
         0,
     );
+    sender.set_side_point_to_point(small_side, true).unwrap();
     let rx_side = receiver.add_side_packed_with_options(
         "link",
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             ..RouterSideOptions::default()
         },
     );
@@ -431,6 +433,7 @@ fn compact_templates_are_disabled_after_shared_bus_discovery() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 8,
             ..RouterSideOptions::default()
         },
@@ -541,22 +544,19 @@ fn chunk_transfer_ids_do_not_collide_across_bus_producers() {
             .unwrap();
         let captured = frames.lock().unwrap().clone();
         assert!(captured.len() > 1);
-        let application_transfer_id =
-            u32::from_le_bytes(captured.last().unwrap()[4..8].try_into().unwrap());
+        let chunk = |frame: &[u8]| crate::side_transport::test_parse_chunk_frame(frame).map(|c| c.0);
+        let application_transfer_id = chunk(captured.last().unwrap()).unwrap();
         captured
             .into_iter()
             .filter(|frame| {
-                frame.starts_with(b"SDT\x03")
-                    && u32::from_le_bytes(frame[4..8].try_into().unwrap())
-                        == application_transfer_id
+                chunk(frame) == Some(application_transfer_id)
             })
             .collect::<Vec<_>>()
     };
     let a = capture("PRODUCER_A", 0x11);
     let b = capture("PRODUCER_B", 0x77);
     let transfer_id = |frame: &[u8]| {
-        assert_eq!(&frame[..4], b"SDT\x03");
-        u32::from_le_bytes(frame[4..8].try_into().unwrap())
+        crate::side_transport::test_parse_chunk_frame(frame).unwrap().0
     };
     assert_ne!(transfer_id(&a[0]), transfer_id(&b[0]));
     for index in 0..a.len().max(b.len()) {
@@ -617,6 +617,7 @@ fn packed_side_header_templates_preserve_absolute_unchanged_timestamps() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
                 .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
@@ -627,6 +628,7 @@ fn packed_side_header_templates_preserve_absolute_unchanged_timestamps() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
                 .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
@@ -723,6 +725,7 @@ fn packed_side_timestamp_omission_policy_does_not_apply_to_other_types() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
                 .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
@@ -733,6 +736,7 @@ fn packed_side_timestamp_omission_policy_does_not_apply_to_other_types() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             compact_header_target_bytes: 20,
             ..RouterSideOptions::default()
                 .with_omitted_unchanged_compact_timestamps_for_type(best_effort_type())
@@ -796,6 +800,7 @@ fn packed_side_template_dictionary_is_bounded() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 1,
             ..RouterSideOptions::default()
         },
@@ -805,6 +810,7 @@ fn packed_side_template_dictionary_is_bounded() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 1,
             ..RouterSideOptions::default()
         },
@@ -876,6 +882,7 @@ fn bounded_side_template_dictionaries_remain_synchronized() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 2,
             ..RouterSideOptions::default()
         },
@@ -885,6 +892,7 @@ fn bounded_side_template_dictionaries_remain_synchronized() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 2,
             ..RouterSideOptions::default()
         },
@@ -964,6 +972,7 @@ fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 8,
             ..RouterSideOptions::default()
         },
@@ -973,6 +982,7 @@ fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 4,
             ..RouterSideOptions::default()
         },
@@ -1118,6 +1128,7 @@ fn compact_side_recovers_when_initial_full_template_is_lost() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 2,
             ..RouterSideOptions::default()
         },
@@ -1127,6 +1138,7 @@ fn compact_side_recovers_when_initial_full_template_is_lost() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_side_transport_templates: 2,
             ..RouterSideOptions::default()
         },
@@ -1214,6 +1226,7 @@ fn topology_change_resynchronizes_a_missing_compact_template_immediately() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             ..RouterSideOptions::default()
         },
     );
@@ -1223,6 +1236,7 @@ fn topology_change_resynchronizes_a_missing_compact_template_immediately() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             ..RouterSideOptions::default()
         },
     );
@@ -1300,6 +1314,7 @@ fn compact_header_target_misses_are_counted() {
         },
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             compact_header_target_bytes: 1,
             ..RouterSideOptions::default()
         },
@@ -1309,6 +1324,7 @@ fn compact_header_target_misses_are_counted() {
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             ..RouterSideOptions::default()
         },
     );
@@ -1361,7 +1377,7 @@ fn packed_side_chunking_reassembles_for_fixed_size_links() {
     let sender = Router::new_with_clock(RouterConfig::default(), zero_clock());
     let max_frame_bytes = 48usize;
 
-    sender.add_side_packed_small_packets(
+    let small_side = sender.add_side_packed_small_packets(
         "fixed-link",
         move |bytes: &[u8]| {
             chunk_count_c.fetch_add(1, Ordering::SeqCst);
@@ -1381,11 +1397,13 @@ fn packed_side_chunking_reassembles_for_fixed_size_links() {
         },
         max_frame_bytes,
     );
+    sender.set_side_point_to_point(small_side, true).unwrap();
     let rx_side = receiver.add_side_packed_with_options(
         "fixed-link",
         |_bytes| Ok(()),
         RouterSideOptions {
             header_template_enabled: true,
+            point_to_point: true,
             max_frame_bytes,
             ..RouterSideOptions::default()
         },

@@ -74,6 +74,16 @@ pub struct SideOptions {
     /// [`crate::wire_bundle::pack_bundle`]. Every node on the link must run a
     /// bundle-capable build: there is no negotiation and no legacy fallback.
     pub compact_bundle: bool,
+    /// The application states that this side reaches exactly one peer (a
+    /// point-to-point link). Header templates are then used before discovery
+    /// has heard that peer. Without it, a side uses templates only once
+    /// discovery shows exactly one live hop-local peer on it, because
+    /// side-local template ids cannot tell producers on a shared bus apart.
+    /// Discovery evidence of a second peer always disables templates.
+    /// Declaring a shared bus point to point is a configuration error: until
+    /// discovery hears the second producer, two producers' templates under
+    /// one id are told apart only by the 3-bit template generation.
+    pub point_to_point: bool,
 }
 
 impl Default for SideOptions {
@@ -91,6 +101,7 @@ impl Default for SideOptions {
             ingress_enabled: true,
             egress_enabled: true,
             compact_bundle: false,
+            point_to_point: false,
         }
     }
 }
@@ -123,6 +134,13 @@ impl SideOptions {
         self.header_template_enabled = true;
         self.compact_header_target_bytes = IPV6_LIKE_COMPACT_HEADER_TARGET_BYTES;
         self.side_transport_profile = SideTransportProfile::Ipv6Like;
+        self
+    }
+
+    /// Declare this side a point-to-point link (see [`Self::point_to_point`]).
+    #[inline]
+    pub fn with_point_to_point(mut self) -> Self {
+        self.point_to_point = true;
         self
     }
 

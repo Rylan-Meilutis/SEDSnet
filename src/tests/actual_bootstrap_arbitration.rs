@@ -46,8 +46,8 @@ struct Physical {
     physical_events: Vec<serde_json::Value>,
 }
 fn identity(raw: &[u8]) -> serde_json::Value {
-    if raw.starts_with(b"SDT\x03") && raw.len() >= 16 {
-        serde_json::json!({"transfer":u32::from_le_bytes(raw[4..8].try_into().unwrap()),"index":u16::from_le_bytes(raw[8..10].try_into().unwrap())})
+    if let Some((transfer, index, total, _)) = crate::side_transport::test_parse_chunk_frame(raw) {
+        serde_json::json!({"transfer":transfer,"index":index,"total":total})
     } else {
         match wire_format::peek_frame_info(raw) {
             Ok(p) => {
@@ -88,7 +88,7 @@ fn model_profile(period: u64, latest_enabled: bool, data_start: u64) -> serde_js
     let (side,_tracker)=router.add_side_packed_leased_with_priority_and_options("radio",move|lease,priority|{
         if !enabled.load(Ordering::SeqCst){return Err(TelemetryError::Io("side tx busy"));}
         let raw=lease.bytes();let length=raw.len();let at=time.load(Ordering::SeqCst);
-        let control=priority>=200&&priority!=254&&!raw.starts_with(b"SDT")&&!wire_format::peek_frame_info(raw).is_ok_and(|p|crate::discovery::is_discovery_type(p.envelope.ty));
+        let control=priority>=200&&priority!=254&&!crate::side_transport::side_frame_kind(raw).is_some()&&!wire_format::peek_frame_info(raw).is_ok_and(|p|crate::discovery::is_discovery_type(p.envelope.ty));
         let mut p=pipe.lock().unwrap();let allowed=if control{p.control+length<=2048}else{p.ordinary+length<=256};
         let ordinary=p.ordinary;let controls=p.control;
         p.callback_events.push(serde_json::json!({"at_ms":at,"identity":identity(raw),"length":length,"priority":priority,"accepted":allowed,"pending_ordinary":ordinary,"pending_control":controls}));
@@ -488,7 +488,9 @@ fn required_multicatalog_service_idle_credit_then_synchronous_five_hz() {
             .unwrap(),
         "idle-earned credits must preserve BOTH exact receiver owners"
     );
-    for transfer in [3937645761u64, 1223421448] {
+    let transfers = drained_transfers(&result);
+    assert_eq!(transfers.len(), 2, "both catalogs travel as chunked transfers");
+    for transfer in transfers.into_keys() {
         let frames: Vec<_> = result["physical_events"]
             .as_array()
             .unwrap()
@@ -505,6 +507,25 @@ fn required_multicatalog_service_idle_credit_then_synchronous_five_hz() {
             "idle-credit burst caused avoidable 2s canonical assembly expiry/reset"
         );
     }
+}
+
+/// Drained chunk indexes, in drain order, and the chunk count of every transfer.
+#[cfg(feature = "latest-value-egress")]
+fn drained_transfers(
+    result: &serde_json::Value,
+) -> std::collections::BTreeMap<u64, (Vec<u64>, u64)> {
+    let mut transfers = std::collections::BTreeMap::<u64, (Vec<u64>, u64)>::new();
+    for event in result["physical_events"].as_array().unwrap() {
+        let identity = &event["identity"];
+        if event["event"] == "drained"
+            && let Some(transfer) = identity["transfer"].as_u64()
+        {
+            let entry = transfers.entry(transfer).or_default();
+            entry.0.push(identity["index"].as_u64().unwrap());
+            entry.1 = identity["total"].as_u64().unwrap();
+        }
+    }
+    transfers
 }
 
 #[test]
@@ -526,16 +547,9 @@ fn required_multicatalog_idle_bulk_finishes_exactly_without_assembly_expiry() {
             .as_bool()
             .unwrap()
     );
-    for (transfer, count) in [(3937645761u64, 59u64), (1223421448, 60)] {
-        let indexes: Vec<_> = result["physical_events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|event| {
-                event["event"] == "drained" && event["identity"]["transfer"] == transfer
-            })
-            .map(|event| event["identity"]["index"].as_u64().unwrap())
-            .collect();
+    let transfers = drained_transfers(&result);
+    assert_eq!(transfers.len(), 2, "both catalogs travel as chunked transfers");
+    for (indexes, count) in transfers.into_values() {
         assert_eq!(
             indexes,
             (0..count).collect::<Vec<_>>(),

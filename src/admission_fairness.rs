@@ -32,7 +32,7 @@ pub(crate) fn incoming(bytes: &[u8]) -> Option<(u32, u8)> {
     let priority = crate::scheduler_priority(ty);
     packed_owner(bytes, priority).map(|owner| (owner, priority))
 }
-/// The full retained header and wrapper CRC have already been validated.
+/// The full retained header has already been validated.
 /// Classify before reconstruction allocates, using no new retained state.
 pub(crate) fn compact_incoming(
     template: &crate::side_transport::SideHeaderTemplate,
@@ -43,7 +43,7 @@ pub(crate) fn compact_incoming(
     if !eligible(
         ty,
         priority,
-        meta.reliable != crate::ReliableMode::None || template.reliable_flags.is_some(),
+        meta.reliable != crate::ReliableMode::None,
         template.has_target_contract(),
     ) {
         return None;
@@ -262,28 +262,31 @@ mod tests {
         assert!(packet_owner(&packet, 0).is_some());
         assert!(packed_owner(&wire_format::pack_packet(&packet), 0).is_some());
         assert!(packed_owner(&wire_format::pack_packet(&packet), 200).is_none());
-        let (template, ..) =
+        let template =
             crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&packet))
-                .unwrap();
+                .unwrap()
+                .template;
         assert_eq!(
             compact_incoming(&template),
             Some((wire_format::source_address_for_sender("SOURCE"), 0))
         );
-        // A time epoch rides in the contract but freezes no destination.
+        // A time epoch freezes no destination.
         let stepped = make(plain).with_time_epoch(3);
         assert!(packet_owner(&stepped, 0).is_some());
         assert!(packed_owner(&wire_format::pack_packet(&stepped), 0).is_some());
-        let (template, ..) =
+        let template =
             crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&stepped))
-                .unwrap();
+                .unwrap()
+                .template;
         assert!(compact_incoming(&template).is_some());
         let packet = make(reliable);
         assert!(packet_owner(&packet, 0).is_none());
         assert!(packed_owner(&wire_format::pack_packet(&packet), 0).is_none());
-        let (template, ..) =
+        // A reliable frame carries a reliable header: it never has a template.
+        assert!(
             crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&packet))
-                .unwrap();
-        assert!(compact_incoming(&template).is_none());
+                .is_err()
+        );
         let frozen = Packet::new_with_wire_contract(
             plain,
             &[ep],
@@ -297,9 +300,10 @@ mod tests {
         .unwrap();
         assert!(packet_owner(&frozen, 0).is_none());
         assert!(packed_owner(&wire_format::pack_packet(&frozen), 0).is_none());
-        let (template, ..) =
+        let template =
             crate::side_transport::extract_side_header_template(&wire_format::pack_packet(&frozen))
-                .unwrap();
+                .unwrap()
+                .template;
         assert!(compact_incoming(&template).is_none());
     }
     #[test]

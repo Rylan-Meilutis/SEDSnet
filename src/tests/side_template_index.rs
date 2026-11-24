@@ -4,10 +4,7 @@ fn template(hash: u64) -> SideHeaderTemplate {
     crate::side_transport::SideHeaderTemplateView {
         hash,
         base_flags: 0,
-        prefix: &[1u8, 2],
-        between: &[],
-        reliable_flags: None,
-        reliable_compact: false,
+        header: &[1u8, 2],
     }
     .into_owned()
 }

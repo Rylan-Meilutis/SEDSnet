@@ -54,8 +54,8 @@ fn fixture(suffix: &str) -> (DataEndpoint, DataType, DataType, Vec<u8>) {
     // Actual GS -> RF frame from bay-1792362672924079710. RF is a proxy,
     // not the buzzer owner. Schema priority is only16, but the frozen owner
     // contract and fixed one-byte shape qualify as bounded protected work.
-    let hex =
-        "ce01c597cd5001ea94888995341897d78ea20d849a967f0c0742010164422c5af1d8d68584000074c6aeba";
+    // (Re-encoded in the SEDSnet 7 layout by tools/wire_v6_to_v7.py.)
+    let hex = "2ec597cd5097d78ea20d849a967f0c0742010164422c5af1d8d685ea9488899534188000e01af179";
     let wire = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -181,7 +181,8 @@ fn relay_arena_proxy_reclaims_payloads_for_captured_control() {
 
 static DISPATCH_ADMISSIONS: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn refuse_third_control_admission_once(additional: usize, _: usize, _: u32) -> bool {
-    additional != 2177 || DISPATCH_ADMISSIONS.fetch_add(1, Ordering::SeqCst) != 2
+    // The protected estimate of the captured 40-byte frame.
+    additional != 2168 || DISPATCH_ADMISSIONS.fetch_add(1, Ordering::SeqCst) != 2
 }
 #[test]
 fn proxy_pressure_retry_within_replay_window_is_forwarded() {

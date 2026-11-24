@@ -54,12 +54,15 @@ fn fixture() -> serde_json::Value {
     serde_json::from_str(include_str!("fixtures/schema-progress-20261027.json")).unwrap()
 }
 fn frame(v: &serde_json::Value) -> Vec<u8> {
-    v["bytes"]
+    let legacy: Vec<u8> = v["bytes"]
         .as_array()
         .unwrap()
         .iter()
         .map(|b| b.as_u64().unwrap() as u8)
-        .collect()
+        .collect();
+    // Captured from a SEDSnet 6 station and re-encoded (tools/wire_v6_to_v7.py).
+    assert_eq!(legacy.first(), Some(&crate::side_transport::SIDE_TRANSPORT_KIND_CHUNK));
+    legacy
 }
 #[test]
 fn captured_same_peer_progress_defers_redundant_schema_request_until_complete() {
@@ -303,8 +306,7 @@ fn progressive_catalog_closed_loop_avoids_a_second_full_response() {
         .unwrap()
         .iter()
         .flat_map(|v| {
-            let b = frame(v);
-            b[12..b.len() - 4].to_vec()
+            crate::side_transport::test_parse_chunk_frame(&frame(v)).unwrap().3.to_vec()
         })
         .collect();
     let initial = wire_format::unpack_packet(&canonical).unwrap();
@@ -375,7 +377,7 @@ fn progressive_catalog_closed_loop_avoids_a_second_full_response() {
         producer.drain_queues_with_timeout(0).unwrap();
         let frames = core::mem::take(&mut *emitted.lock());
         for bytes in frames {
-            if bytes.starts_with(b"SDT\x03") {
+            if bytes.first() == Some(&0x61) {
                 schema_wire_bytes += bytes.len();
             }
             if let Some(canonical) = receiver.decode_side_transport_frame(side, &bytes).unwrap() {

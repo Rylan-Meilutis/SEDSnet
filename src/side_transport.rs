@@ -1,4 +1,27 @@
 //! Shared wire codec for router and relay side transports.
+//!
+//! A side frame is either a canonical frame or a side-transport frame. The
+//! first byte tells them apart: a canonical frame never has both
+//! endpoint-encoding bits (`0x60`) set in its flags byte, so every first byte
+//! with those bits set is a side-transport kind:
+//!
+//! ```text
+//! 0x60          FULL     template id+generation | base delta | canonical data | CRC32
+//! 0x61          CHUNK    transfer id u16 LE | position | chunk bytes | CRC32
+//! 0x62/63/66/67 BUNDLE   see `wire_bundle`
+//! 0x70..=0x73   COMPACT  template id+generation | ts delta | [size] | [nonce] | payload | CRC32
+//! ```
+//!
+//! Integrity: every frame a side emits ends in a CRC32 of all its own prior
+//! bytes, so any hop (including a relay that keeps no SEDSnet state) can
+//! check it, and SEDSnet checks it before using any byte. A COMPACT frame
+//! also names its template's generation (three bits beside the template id):
+//! a FULL frame that redefines an id, or moves its base timestamp, starts a
+//! new generation, so a receiver holding a stale template or base (a lost
+//! FULL frame) drops the compact frame instead of misreading it. A chunk's
+//! CRC32 covers the chunk, and the reassembled frame is checked again.
+//! First bytes `0xE0..=0xFF` are never used by SEDSnet (link layers may use
+//! them as their own markers).
 
 use crate::{DataType, TelemetryError, TelemetryResult, packet::hash_bytes_u64, wire_format};
 use crate::OrdMap;
@@ -6,25 +29,209 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::crc32::Crc32 as Crc32Hasher;
 
 const SIDE_TX_PROGRESS_TIMEOUT_MS: u64 = 2000;
-pub(crate) const SIDE_TRANSPORT_MAGIC: &[u8; 3] = b"SDT";
-pub(crate) const SIDE_TRANSPORT_KIND_FULL: u8 = 0x01;
-pub(crate) const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x02;
-pub(crate) const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x03;
-pub(crate) const SIDE_TRANSPORT_KIND_COMPACT_DELTA: u8 = 0x04;
-pub(crate) const SIDE_TRANSPORT_KIND_COMPACT_SAME_TIMESTAMP: u8 = 0x05;
+/// Template definition: a canonical frame plus its template id.
+pub(crate) const SIDE_TRANSPORT_KIND_FULL: u8 = 0x60;
+/// Fragment of a larger side frame.
+pub(crate) const SIDE_TRANSPORT_KIND_CHUNK: u8 = 0x61;
+/// Compact frame base value; bits 0x01 (compressed) and 0x02 (nonce) vary.
+pub(crate) const SIDE_TRANSPORT_KIND_COMPACT: u8 = 0x70;
+pub(crate) const SIDE_TRANSPORT_COMPACT_COMPRESSED: u8 = 0x01;
+pub(crate) const SIDE_TRANSPORT_COMPACT_NONCE: u8 = 0x02;
 pub(crate) const SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED: u8 = 0x01;
-pub(crate) const SIDE_TRANSPORT_FLAG_WIRE_CONTRACT: u8 = 0x04;
-/// The canonical frame flag announcing a reliable header (`wire_format`).
-pub(crate) const SIDE_TRANSPORT_FLAG_RELIABLE_HEADER: u8 = 0x02;
 pub(crate) const SIDE_TRANSPORT_FLAG_PACKET_NONCE: u8 = 0x08;
-pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT: u8 = 0x20;
-pub(crate) const SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT: u8 = 0x80;
-pub(crate) const SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER: u8 = 0x40;
-pub(crate) const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize =
-    3 + 1 + 4 + 2 + 2 + wire_format::CRC32_BYTES;
-pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BITS: usize =
-    (crate::MAX_VALUE_DATA_ENDPOINT as usize) + 1;
-pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMAP_BITS.div_ceil(8);
+/// Canonical flags carrying an explicit logical payload size.
+const SIDE_TRANSPORT_FLAGS_SIZED: u8 = 0x11;
+/// Chunk bytes besides the ULEB128 position: kind, a 16-bit transfer id and
+/// the chunk's CRC32.
+pub(crate) const SIDE_TRANSPORT_CHUNK_FIXED_BYTES: usize = 1 + 2 + wire_format::CRC32_BYTES;
+/// Smallest chunk overhead (a one-byte position, up to 15 chunks).
+pub(crate) const SIDE_TRANSPORT_CHUNK_OVERHEAD: usize = SIDE_TRANSPORT_CHUNK_FIXED_BYTES + 1;
+/// A template's base timestamp moves (with a FULL frame) once a compact
+/// delta would no longer fit three ULEB128 bytes (about 17 minutes).
+pub(crate) const SIDE_TRANSPORT_MAX_TS_DELTA: u64 = (1 << 21) - 1;
+/// Bits of the template generation beside the template id.
+pub(crate) const TEMPLATE_GEN_BITS: u32 = 3;
+pub(crate) const TEMPLATE_GEN_MASK: u8 = (1 << TEMPLATE_GEN_BITS) - 1;
+
+/// A template's base timestamp and generation, as the side state keeps them.
+#[inline]
+pub(crate) fn pack_template_base(base: u64, generation: u8) -> u64 {
+    (base << TEMPLATE_GEN_BITS) | u64::from(generation & TEMPLATE_GEN_MASK)
+}
+
+#[inline]
+pub(crate) fn unpack_template_base(packed: u64) -> (u64, u8) {
+    (packed >> TEMPLATE_GEN_BITS, (packed as u8) & TEMPLATE_GEN_MASK)
+}
+
+/// The kind of a side frame's first byte: a side-transport kind, or `None`
+/// for a canonical frame.
+#[inline]
+pub(crate) fn side_frame_kind(bytes: &[u8]) -> Option<u8> {
+    let first = *bytes.first()?;
+    if !wire_format::is_marker_byte(first) {
+        return None;
+    }
+    Some(if first & 0xFC == SIDE_TRANSPORT_KIND_COMPACT { SIDE_TRANSPORT_KIND_COMPACT } else { first })
+}
+
+#[inline]
+pub(crate) fn zigzag(delta: i64) -> u64 {
+    ((delta << 1) ^ (delta >> 63)) as u64
+}
+
+#[inline]
+pub(crate) fn unzigzag(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ -((value & 1) as i64)
+}
+
+#[inline]
+fn chunk_triangle(n: u64) -> u64 {
+    n * (n + 1) / 2
+}
+
+/// One ULEB128 value names both a chunk's index and the transfer's chunk
+/// count: `total * (total - 1) / 2 + index`. Up to 15 chunks fit one byte;
+/// below 23171 chunks the value is never longer than two separate ULEB128
+/// fields would be.
+#[inline]
+pub(crate) fn chunk_position(index: u16, total: u16) -> u64 {
+    chunk_triangle(u64::from(total) - 1) + u64::from(index)
+}
+
+/// Inverse of [`chunk_position`]: `(index, total)`, or `None` when the value
+/// names more than 65535 chunks.
+pub(crate) fn decode_chunk_position(position: u64) -> Option<(u16, u16)> {
+    // Largest n with T(n) <= position, n + 1 being the chunk count.
+    let (mut lo, mut hi) = (0u64, u64::from(u16::MAX) - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if chunk_triangle(mid) <= position {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let index = position - chunk_triangle(lo);
+    let total = lo + 1;
+    (index < total).then_some((index as u16, total as u16))
+}
+
+/// `(transfer id, index, total, header bytes)` of a chunk body (the kind
+/// byte and CRC32 already removed and checked).
+pub(crate) fn parse_chunk_header(body: &[u8]) -> TelemetryResult<(u32, u16, u16, usize)> {
+    const SHORT: TelemetryError = TelemetryError::Unpack("short side chunk frame");
+    if body.len() < 4 {
+        return Err(SHORT);
+    }
+    let transfer = u32::from(u16::from_le_bytes([body[0], body[1]]));
+    let mut off = 2;
+    let position = read_uleb128_local(body, &mut off).map_err(|_| SHORT)?;
+    let (index, total) = decode_chunk_position(position)
+        .ok_or(TelemetryError::Unpack("invalid side chunk index"))?;
+    if off == body.len() {
+        return Err(TelemetryError::Unpack("invalid side chunk index"));
+    }
+    Ok((transfer, index, total, off))
+}
+
+/// The body of a chunk frame (after its kind byte, before its CRC32), when
+/// its CRC32 is intact.
+pub(crate) fn checked_chunk_body(frame: &[u8]) -> TelemetryResult<&[u8]> {
+    if frame.first() != Some(&SIDE_TRANSPORT_KIND_CHUNK) || frame.len() < 1 + wire_format::CRC32_BYTES + 4 {
+        return Err(TelemetryError::Unpack("short side chunk frame"));
+    }
+    let data_len = frame.len() - wire_format::CRC32_BYTES;
+    if crc32_bytes(&frame[..data_len]).to_le_bytes() != frame[data_len..] {
+        return Err(TelemetryError::Unpack("side chunk crc32 mismatch"));
+    }
+    Ok(&frame[1..data_len])
+}
+
+/// Payload bytes per chunk and chunk count for a `len`-byte frame split into
+/// frames of at most `max_frame_bytes`.
+pub(crate) fn chunk_layout(len: usize, max_frame_bytes: usize) -> TelemetryResult<(usize, u16)> {
+    for position_bytes in 1..=5 {
+        let overhead = SIDE_TRANSPORT_CHUNK_FIXED_BYTES + position_bytes;
+        if max_frame_bytes <= overhead {
+            return Err(TelemetryError::BadArg);
+        }
+        let budget = max_frame_bytes - overhead;
+        let total = u16::try_from(len.div_ceil(budget).max(1))
+            .map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        if uleb128_len(chunk_position(total - 1, total)) <= position_bytes {
+            return Ok((budget, total));
+        }
+    }
+    Err(TelemetryError::PacketTooLarge("too many chunks"))
+}
+
+/// Bytes the chunk headers of a `total`-chunk transfer add on the wire.
+pub(crate) fn chunk_wire_overhead(total: u16) -> usize {
+    (0..total)
+        .map(|index| SIDE_TRANSPORT_CHUNK_FIXED_BYTES + uleb128_len(chunk_position(index, total)))
+        .sum()
+}
+
+#[inline]
+fn uleb128_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// A chunk frame (tests build fragments by hand).
+#[cfg(test)]
+pub(crate) fn test_chunk_frame(transfer: u32, index: u16, total: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![SIDE_TRANSPORT_KIND_CHUNK];
+    frame.extend_from_slice(&(transfer as u16).to_le_bytes());
+    write_uleb128_local(chunk_position(index, total), &mut frame);
+    frame.extend_from_slice(payload);
+    let crc = crc32_bytes(&frame);
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame
+}
+
+/// Tests that wrapped frames by hand: a whole canonical frame stays bare (a
+/// side without templates sends it so); otherwise the body is a one-byte
+/// template id followed by a frame, built as a FULL frame.
+#[cfg(test)]
+pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> crate::SharedBytes {
+    assert_eq!(kind, SIDE_TRANSPORT_KIND_FULL, "only FULL frames are built from a body");
+    if wire_format::verify_frame_crc(body).is_ok() && !wire_format::is_marker_byte(body[0]) {
+        return crate::shared_bytes::convert(Arc::<[u8]>::from(body));
+    }
+    encode_full_frame(&body[1..], u32::from(body[0]), 0, 0)
+}
+
+/// A COMPACT frame for canonical `raw` under template `id` with base `base`.
+#[cfg(test)]
+pub(crate) fn test_compact_frame(raw: &[u8], id: u32, base: u64) -> crate::SharedBytes {
+    let parts = extract_side_header_template_view(raw).expect("templated frame");
+    let head = compact_frame_head(&parts, id, 0, base);
+    crate::shared_bytes::convert(frame_with_crc_from_parts(&[head.as_slice(), parts.payload]))
+}
+
+/// `(transfer, index, total, payload)` of a chunk frame.
+#[cfg(test)]
+pub(crate) fn test_parse_chunk_frame(frame: &[u8]) -> Option<(u32, u16, u16, &[u8])> {
+    if frame.first() != Some(&SIDE_TRANSPORT_KIND_CHUNK) {
+        return None;
+    }
+    let body = &frame[1..frame.len() - wire_format::CRC32_BYTES];
+    let (transfer, index, total, header) = parse_chunk_header(body).ok()?;
+    Some((transfer, index, total, &body[header..]))
+}
+
+/// The 16-bit transfer id of a chunked frame: a stable content id, including
+/// the sender, never zero.
+fn chunk_transfer_id(hash: u64) -> [u8; 2] {
+    let folded = (hash >> 48) ^ (hash >> 32) ^ (hash >> 16) ^ hash;
+    (folded as u16).max(1).to_le_bytes()
+}
 
 /// An outgoing frame or lazily encoded chunks. Retains the source plus at most
 /// the current chunk instead of allocating every fragment before the first TX.
@@ -32,7 +239,7 @@ pub(crate) const SIDE_TRANSPORT_EP_BITMAP_BYTES: usize = SIDE_TRANSPORT_EP_BITMA
 pub(crate) struct SideTransportFrames {
     frame: crate::SharedBytes,
     payload_budget: usize,
-    transfer_id: u32,
+    transfer_id: [u8; 2],
     index: usize,
     total: usize,
 }
@@ -41,7 +248,7 @@ impl SideTransportFrames {
         Self {
             frame,
             payload_budget: 0,
-            transfer_id: 0,
+            transfer_id: [0; 2],
             index: 0,
             total: 1,
         }
@@ -51,32 +258,28 @@ impl SideTransportFrames {
         max_frame_bytes: usize,
         sender: &[u8],
     ) -> TelemetryResult<Self> {
-        if max_frame_bytes <= SIDE_TRANSPORT_CHUNK_OVERHEAD {
-            return Err(TelemetryError::BadArg);
-        }
-        let payload_budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
-        let total = frame.len().div_ceil(payload_budget);
-        u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let (payload_budget, total) = chunk_layout(frame.len(), max_frame_bytes)?;
         // Stable content ID, including sender; CRC(frame || CRC) is constant.
         let seed = hash_bytes_u64(0x517C_C1B7_2722_0A95, sender);
-        let hash = hash_bytes_u64(seed, &frame);
-        let transfer_id = ((hash >> 32) as u32 ^ hash as u32).max(1);
+        let transfer_id = chunk_transfer_id(hash_bytes_u64(seed, &frame));
         Ok(Self {
             frame,
             payload_budget,
             transfer_id,
             index: 0,
-            total,
+            total: usize::from(total),
         })
     }
     pub(crate) fn bootstraps_template(&self) -> bool {
-        self.frame.starts_with(SIDE_TRANSPORT_MAGIC)
-            && self.frame.get(3) == Some(&SIDE_TRANSPORT_KIND_FULL)
+        self.frame.first() == Some(&SIDE_TRANSPORT_KIND_FULL)
     }
-    // Canonical chunks do not mutate the side dictionary. Wrapped full or
-    // compact frames must retain their encoding-history serialization barrier.
+    // Canonical chunks do not mutate the side dictionary. Full or compact
+    // frames must retain their encoding-history serialization barrier.
     pub(crate) fn history_dependent(&self) -> bool {
-        self.frame.starts_with(SIDE_TRANSPORT_MAGIC)
+        matches!(
+            side_frame_kind(&self.frame),
+            Some(SIDE_TRANSPORT_KIND_FULL | SIDE_TRANSPORT_KIND_COMPACT)
+        )
     }
     pub(crate) fn progress_key(&self) -> u64 {
         hash_bytes_u64(
@@ -113,7 +316,11 @@ impl SideTransportFrames {
             let remaining = self.frame.len() - self.index * self.payload_budget;
             let bytes = remaining
                 .min(self.payload_budget)
-                .saturating_add(SIDE_TRANSPORT_CHUNK_OVERHEAD);
+                .saturating_add(SIDE_TRANSPORT_CHUNK_FIXED_BYTES)
+                .saturating_add(uleb128_len(chunk_position(
+                    self.index as u16,
+                    self.total as u16,
+                )));
             return crate::memory_admission::check(
                 bytes.saturating_add(256),
                 bytes.saturating_add(32),
@@ -127,7 +334,7 @@ impl SideTransportFrames {
             + if self.payload_budget == 0 {
                 0
             } else {
-                self.total * SIDE_TRANSPORT_CHUNK_OVERHEAD
+                chunk_wire_overhead(self.total as u16)
             }
     }
 }
@@ -144,15 +351,15 @@ impl Iterator for SideTransportFrames {
         }
         let start = index * self.payload_budget;
         let end = (start + self.payload_budget).min(self.frame.len());
-        Some(wrap_side_transport_frame_parts(
-            SIDE_TRANSPORT_KIND_CHUNK,
-            &[
-                &self.transfer_id.to_le_bytes(),
-                &(index as u16).to_le_bytes(),
-                &(self.total as u16).to_le_bytes(),
-                &self.frame[start..end],
-            ],
-        ))
+        let mut header = SideHeaderBytes::default();
+        header.push(SIDE_TRANSPORT_KIND_CHUNK);
+        header.push(self.transfer_id[0]);
+        header.push(self.transfer_id[1]);
+        header.uleb128(chunk_position(index as u16, self.total as u16));
+        Some(crate::shared_bytes::convert(frame_with_crc_from_parts(&[
+            header.as_slice(),
+            &self.frame[start..end],
+        ])))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.total - self.index;
@@ -164,21 +371,17 @@ impl ExactSizeIterator for SideTransportFrames {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SideHeaderTemplate {
     pub(crate) hash: u64,
+    /// Canonical flags without the per-packet bits (compressed, nonce).
     pub(crate) base_flags: u8,
     // Tiny immutable codec metadata never enters the movable packet arena.
-    // Keep both ranges in one shared allocation rather than two wide handles.
+    /// The canonical static header after the flags byte: type, source,
+    /// epoch, endpoints and contract.
     header: Arc<[u8]>,
-    prefix_len: usize,
-    pub(crate) reliable_flags: Option<u8>,
-    pub(crate) reliable_compact: bool,
 }
 
 impl SideHeaderTemplate {
-    pub(crate) fn prefix(&self) -> &[u8] {
-        &self.header[..self.prefix_len]
-    }
-    pub(crate) fn between(&self) -> &[u8] {
-        &self.header[self.prefix_len..]
+    pub(crate) fn header(&self) -> &[u8] {
+        &self.header
     }
 
     /// Sender identity belongs to the retained, validated full header. Reading
@@ -186,59 +389,37 @@ impl SideHeaderTemplate {
     #[cfg(any(feature = "discovery", feature = "std", feature = "fair-admission"))]
     pub(crate) fn source_address(&self) -> Option<u32> {
         let mut off = 0;
-        u32::try_from(read_uleb128_local(self.between(), &mut off).ok()?).ok()
+        read_uleb128_local(&self.header, &mut off).ok()?;
+        u32::try_from(read_uleb128_local(&self.header, &mut off).ok()?).ok()
     }
 
     /// The retained header froze explicit destination holders (contract
-    /// targets). A contract that only carries a shape or the time epoch does
-    /// not freeze delivery.
+    /// targets). A contract that only carries a shape does not freeze
+    /// delivery.
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     pub(crate) fn has_target_contract(&self) -> bool {
-        if self.base_flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT == 0 {
-            return false;
-        }
-        let between = self.between();
-        let mut off = 0;
-        let Ok(_source) = read_uleb128_local(between, &mut off) else {
-            return true;
-        };
-        if self.base_flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT != 0 {
-            off += SIDE_TRANSPORT_EP_BITMAP_BYTES;
-        } else if self.base_flags & SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT != 0 {
-            let nep = self.prefix().first().copied().unwrap_or(0);
-            for _ in 0..nep {
-                if read_uleb128_local(between, &mut off).is_err() {
-                    return true;
-                }
-            }
-        }
-        match read_uleb128_local(between, &mut off) {
-            Err(_) => return true,
-            // An epoch-only contract (zero length) freezes nothing.
-            Ok(0) => return false,
-            Ok(_) => {}
-        }
-        // Contract flag 0x01: explicit target hashes follow.
-        between.get(off).is_none_or(|flags| flags & 0x01 != 0)
+        let mut frame = Vec::with_capacity(1 + self.header.len() + 1);
+        frame.push(self.base_flags);
+        frame.extend_from_slice(&self.header);
+        frame.push(0); // timestamp
+        wire_format::parse_frame_header(&frame).map_or(true, |header| {
+            header
+                .contract
+                .and_then(|contract| contract.first())
+                .is_some_and(|flags| flags & 0x01 != 0)
+        })
     }
 
     pub(crate) fn data_type(&self) -> Option<DataType> {
-        // The retained prefix begins with endpoint count, then type ULEB128.
-        let mut off = 1;
-        let id = u32::try_from(read_uleb128_local(self.prefix(), &mut off).ok()?).ok()?;
+        let mut off = 0;
+        let id = u32::try_from(read_uleb128_local(&self.header, &mut off).ok()?).ok()?;
         DataType::try_from_u32(id)
     }
 
+    /// Templates never carry a reliable header; an ACK is known by its type.
     pub(crate) fn is_ack(&self) -> bool {
-        if self
-            .reliable_flags
-            .is_some_and(|flags| flags & wire_format::RELIABLE_FLAG_ACK_ONLY != 0)
-        {
-            return true;
-        }
-        // Prefix is endpoint count followed by the canonical type ULEB128.
-        let mut off = 1;
-        read_uleb128_local(self.prefix(), &mut off)
+        let mut off = 0;
+        read_uleb128_local(&self.header, &mut off)
             .ok()
             .is_some_and(|ty| {
                 ty == u64::from(DataType::ReliableAck.as_u32())
@@ -251,57 +432,35 @@ impl SideHeaderTemplate {
 pub(crate) struct SideHeaderTemplateView<'a> {
     pub(crate) hash: u64,
     pub(crate) base_flags: u8,
-    pub(crate) prefix: &'a [u8],
-    pub(crate) between: &'a [u8],
-    pub(crate) reliable_flags: Option<u8>,
-    pub(crate) reliable_compact: bool,
+    pub(crate) header: &'a [u8],
 }
 impl SideHeaderTemplateView<'_> {
     pub(crate) fn into_owned(self) -> SideHeaderTemplate {
         SideHeaderTemplate {
             hash: self.hash,
             base_flags: self.base_flags,
-            // The exact-size slice iterator builds the Arc directly; no
-            // concatenation buffer doubles peak header scratch storage.
-            header: self
-                .prefix
-                .iter()
-                .chain(self.between.iter())
-                .copied()
-                .collect(),
-            prefix_len: self.prefix.len(),
-            reliable_flags: self.reliable_flags,
-            reliable_compact: self.reliable_compact,
+            header: Arc::from(self.header),
         }
     }
 }
-type SideTemplateViewExtract<'a> = (
-    SideHeaderTemplateView<'a>,
-    DataType,
-    u8,
-    u64,
-    u64,
-    u16,
-    Option<(u32, u32)>,
-    &'a [u8],
-);
 
-type SideTemplateExtract<'a> = (
-    SideHeaderTemplate,
-    DataType,
-    u8,
-    u64,
-    u64,
-    u16,
-    Option<(u32, u32)>,
-    &'a [u8],
-);
+/// A canonical frame split into its template and per-packet fields.
+#[derive(Clone, Copy)]
+pub(crate) struct SideFrameParts<'a> {
+    pub(crate) template: SideHeaderTemplateView<'a>,
+    pub(crate) ty: DataType,
+    pub(crate) flags: u8,
+    pub(crate) timestamp: u64,
+    pub(crate) size: Option<usize>,
+    pub(crate) nonce: u16,
+    pub(crate) payload: &'a [u8],
+}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SideCompactTimestampMode {
-    Absolute,
-    Delta,
-    Omitted,
+pub(crate) struct SideFramePartsOwned<'a> {
+    pub(crate) template: SideHeaderTemplate,
+    pub(crate) timestamp: u64,
+    #[allow(dead_code)]
+    pub(crate) parts: SideFrameParts<'a>,
 }
 
 #[inline]
@@ -327,11 +486,7 @@ pub(crate) fn write_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// Bytes a side wrapper adds around its body: magic, kind and CRC.
-pub(crate) const SIDE_TRANSPORT_WRAP_BYTES: usize =
-    SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES;
-
-/// The variable header of a side body, built on the stack: a flags byte and
+/// The variable header of a side frame, built on the stack: a kind byte and
 /// at most six ULEB128 fields.
 pub(crate) struct SideHeaderBytes {
     bytes: [u8; 64],
@@ -370,26 +525,6 @@ impl SideHeaderBytes {
     }
 }
 
-pub(crate) fn wrap_side_transport_frame(kind: u8, body: &[u8]) -> crate::SharedBytes {
-    wrap_side_transport_frame_parts(kind, &[body])
-}
-
-// Write body segments directly into the final allocation. This also lets a
-// chunk header stay on the stack instead of copying its payload into a Vec.
-pub(crate) fn wrap_side_transport_frame_parts(kind: u8, parts: &[&[u8]]) -> crate::SharedBytes {
-    let header = [b'S', b'D', b'T', kind];
-    let mut all: [&[u8]; 8] = [&[]; 8];
-    if parts.len() < all.len() {
-        all[0] = &header;
-        all[1..=parts.len()].copy_from_slice(parts);
-        return crate::shared_bytes::convert(frame_with_crc_from_parts(&all[..=parts.len()]));
-    }
-    let mut joined = alloc::vec::Vec::with_capacity(1 + parts.len());
-    joined.push(&header[..]);
-    joined.extend_from_slice(parts);
-    crate::shared_bytes::convert(frame_with_crc_from_parts(&joined))
-}
-
 /// One allocation holding `parts` back to back, followed by the little-endian
 /// CRC-32 of all of them.
 pub(crate) fn frame_with_crc_from_parts(parts: &[&[u8]]) -> Arc<[u8]> {
@@ -418,269 +553,211 @@ pub(crate) fn frame_with_crc_from_parts(parts: &[&[u8]]) -> Arc<[u8]> {
     unsafe { frame.assume_init() }
 }
 
+/// A side-transport frame's kind and the bytes after its kind byte, or `None`
+/// for a canonical frame. Nothing is verified here: each kind carries its
+/// own check (see the module documentation).
 pub(crate) fn parse_side_transport_wrapper(bytes: &[u8]) -> TelemetryResult<Option<(u8, &[u8])>> {
-    if bytes.len() < SIDE_TRANSPORT_MAGIC.len() + 1 + wire_format::CRC32_BYTES {
-        return Ok(None);
+    match side_frame_kind(bytes) {
+        None => Ok(None),
+        Some(kind) => Ok(Some((kind, &bytes[1..]))),
     }
-    if &bytes[..SIDE_TRANSPORT_MAGIC.len()] != SIDE_TRANSPORT_MAGIC {
-        return Ok(None);
-    }
-    let data_len = bytes.len() - wire_format::CRC32_BYTES;
-    let expected = u32::from_le_bytes([
-        bytes[data_len],
-        bytes[data_len + 1],
-        bytes[data_len + 2],
-        bytes[data_len + 3],
-    ]);
-    let data = &bytes[..data_len];
-    if crc32_bytes(data) != expected {
-        return Err(TelemetryError::Unpack("side transport crc32 mismatch"));
-    }
-    let kind = data[SIDE_TRANSPORT_MAGIC.len()];
-    Ok(Some((kind, &data[SIDE_TRANSPORT_MAGIC.len() + 1..])))
 }
 
-pub(crate) fn extract_side_header_template(
-    bytes: &[u8],
-) -> TelemetryResult<SideTemplateExtract<'_>> {
-    let (view, ty, flags, size, timestamp, nonce, reliable, payload) =
-        extract_side_header_template_view(bytes)?;
-    Ok((
-        view.into_owned(),
-        ty,
-        flags,
-        size,
-        timestamp,
-        nonce,
-        reliable,
-        payload,
-    ))
+/// Prefix of a FULL frame: kind, template id and generation, and the zigzag
+/// delta from the frame's timestamp to the template's base timestamp.
+pub(crate) fn full_frame_prefix(template_id: u32, generation: u8, base_delta: i64) -> SideHeaderBytes {
+    let mut prefix = SideHeaderBytes::default();
+    prefix.push(SIDE_TRANSPORT_KIND_FULL);
+    prefix.uleb128((u64::from(template_id) << TEMPLATE_GEN_BITS) | u64::from(generation & TEMPLATE_GEN_MASK));
+    prefix.uleb128(zigzag(base_delta));
+    prefix
 }
-pub(crate) fn extract_side_header_template_view(
-    bytes: &[u8],
-) -> TelemetryResult<SideTemplateViewExtract<'_>> {
-    if bytes.len() < wire_format::CRC32_BYTES + 4 {
+
+/// A FULL frame for canonical `raw`: its prefix and the canonical data, then
+/// the CRC32 of the whole frame.
+pub(crate) fn encode_full_frame(raw: &[u8], template_id: u32, generation: u8, base_delta: i64) -> crate::SharedBytes {
+    let prefix = full_frame_prefix(template_id, generation, base_delta);
+    let data_len = raw.len() - wire_format::CRC32_BYTES;
+    crate::shared_bytes::convert(frame_with_crc_from_parts(&[prefix.as_slice(), &raw[..data_len]]))
+}
+
+/// The CRC32 trailer of a side frame matches all its prior bytes.
+pub(crate) fn check_frame_crc(bytes: &[u8]) -> TelemetryResult<()> {
+    let data_len = bytes
+        .len()
+        .checked_sub(wire_format::CRC32_BYTES)
+        .ok_or(TelemetryError::Unpack("short side frame"))?;
+    if crc32_bytes(&bytes[..data_len]).to_le_bytes() != bytes[data_len..] {
+        return Err(TelemetryError::Unpack("side frame crc32 mismatch"));
+    }
+    Ok(())
+}
+
+/// Template id and generation of a FULL or COMPACT frame, and the offset
+/// after them.
+pub(crate) fn template_id_and_gen(bytes: &[u8]) -> TelemetryResult<(u32, u8, usize)> {
+    let mut off = 1;
+    let field = read_uleb128_local(bytes, &mut off)?;
+    let id = u32::try_from(field >> TEMPLATE_GEN_BITS)
+        .map_err(|_| TelemetryError::Unpack("side template id too large"))?;
+    Ok((id, (field as u8) & TEMPLATE_GEN_MASK, off))
+}
+
+/// A decoded FULL frame (its CRC32 checked here): template id, generation,
+/// base delta and the canonical frame with its own CRC32.
+pub(crate) fn decode_full_frame(bytes: &[u8]) -> TelemetryResult<(u32, u8, i64, Arc<[u8]>)> {
+    let (template_id, generation, base_delta, view) = decode_full_frame_view(bytes)?;
+    Ok((template_id, generation, base_delta, canonical_from_full_view(view)))
+}
+
+/// A FULL frame's template id, generation and base delta, and a borrowed
+/// view of the canonical frame it carries: the canonical bytes followed by
+/// the FULL frame's own CRC32 in place of the canonical CRC. The FULL CRC is
+/// checked here, so the view is verified data for unchecked readers (type,
+/// discovery and admission peeks) without allocating;
+/// [`canonical_from_full_view`] builds the canonical frame itself.
+pub(crate) fn decode_full_frame_view(bytes: &[u8]) -> TelemetryResult<(u32, u8, i64, &[u8])> {
+    const SHORT: TelemetryError = TelemetryError::Unpack("short side full frame");
+    if bytes.first() != Some(&SIDE_TRANSPORT_KIND_FULL) {
+        return Err(SHORT);
+    }
+    check_frame_crc(bytes)?;
+    let (template_id, generation, mut off) = template_id_and_gen(bytes)?;
+    let base_delta = unzigzag(read_uleb128_local(bytes, &mut off)?);
+    if template_id == 0 || bytes.len() < off + 1 + wire_format::CRC32_BYTES {
+        return Err(SHORT);
+    }
+    Ok((template_id, generation, base_delta, &bytes[off..]))
+}
+
+/// The canonical frame (with its own CRC32) of a [`decode_full_frame_view`] view.
+pub(crate) fn canonical_from_full_view(view: &[u8]) -> Arc<[u8]> {
+    frame_with_crc_from_parts(&[&view[..view.len() - wire_format::CRC32_BYTES]])
+}
+
+pub(crate) fn extract_side_header_template(bytes: &[u8]) -> TelemetryResult<SideFramePartsOwned<'_>> {
+    let parts = extract_side_header_template_view(bytes)?;
+    Ok(SideFramePartsOwned {
+        template: parts.template.into_owned(),
+        timestamp: parts.timestamp,
+        parts,
+    })
+}
+
+/// Split an admitted canonical frame (CRC included, not re-verified) into its
+/// template and per-packet fields. Frames with a reliable header have no
+/// template.
+pub(crate) fn extract_side_header_template_view(bytes: &[u8]) -> TelemetryResult<SideFrameParts<'_>> {
+    if bytes.len() < wire_format::CRC32_BYTES + 3 {
         return Err(TelemetryError::Unpack("short buffer"));
     }
     let data_len = bytes.len() - wire_format::CRC32_BYTES;
     let data = &bytes[..data_len];
-    let mut off = 0usize;
-    let flags = *data
-        .get(off)
-        .ok_or(TelemetryError::Unpack("short prelude"))?;
-    off += 1;
-    let nep = *data
-        .get(off)
-        .ok_or(TelemetryError::Unpack("short prelude"))? as usize;
-    off += 1; // NEP
-    let ty_u64 = read_uleb128_local(data, &mut off)?;
-    let ty_u32 = u32::try_from(ty_u64).map_err(|_| TelemetryError::Unpack("bad data type"))?;
-    let ty = DataType(ty_u32);
-    let data_size_off = off;
-    let data_size = read_uleb128_local(data, &mut off)?;
-    let timestamp = read_uleb128_local(data, &mut off)?;
-    let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-        u16::try_from(read_uleb128_local(data, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("packet nonce too large"))?
-    } else {
-        0
-    };
-    let between_start = off;
-    let _source_address = u32::try_from(read_uleb128_local(data, &mut off)?)
-        .map_err(|_| TelemetryError::Unpack("source address too large"))?;
-    let endpoint_bitmap_bytes = if (flags & SIDE_TRANSPORT_FLAG_ENDPOINT_BITMAP_PRESENT) != 0 {
-        SIDE_TRANSPORT_EP_BITMAP_BYTES
-    } else {
-        0
-    };
-    if data.len() < off + endpoint_bitmap_bytes {
-        return Err(TelemetryError::Unpack("short buffer"));
+    let header = wire_format::parse_frame_header(data)?;
+    if header.reliable.is_some() {
+        return Err(TelemetryError::Unpack("reliable frames have no side template"));
     }
-    off += endpoint_bitmap_bytes;
-    if flags & SIDE_TRANSPORT_FLAG_ENDPOINT_LIST_PRESENT != 0 {
-        if endpoint_bitmap_bytes != 0 {
-            return Err(TelemetryError::Unpack("ambiguous endpoint encoding"));
-        }
-        let mut previous = None;
-        for _ in 0..nep {
-            let id = u32::try_from(read_uleb128_local(data, &mut off)?)
-                .map_err(|_| TelemetryError::Unpack("endpoint too large"))?;
-            if previous.is_some_and(|previous| id <= previous) {
-                return Err(TelemetryError::Unpack(
-                    "endpoint list is not unique and sorted",
-                ));
-            }
-            previous = Some(id);
-        }
-    }
-    if (flags & SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) != 0 {
-        let contract_len = usize::try_from(read_uleb128_local(data, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("wire contract length"))?;
-        // A zero length is an epoch-only contract: the epoch follows.
-        if contract_len == 0 {
-            read_uleb128_local(data, &mut off)?;
-        }
-        if data.len() < off + contract_len {
-            return Err(TelemetryError::Unpack("short buffer"));
-        }
-        off += contract_len;
-    }
-    // Without the reliable-header flag or a wire contract (which may announce
-    // one) there is no reliable header: skip re-parsing the prelude for it.
-    let reliable_span = if flags & (SIDE_TRANSPORT_FLAG_RELIABLE_HEADER | SIDE_TRANSPORT_FLAG_WIRE_CONTRACT) == 0 {
-        None
-    } else {
-        wire_format::reliable_header_span(bytes)?
-    };
-    let (reliable_flags, reliable_seq_ack, reliable_compact, payload_off) =
-        if let Some((rel_off, rel_len, hdr)) = reliable_span {
-            if data.len() < rel_off + rel_len {
-                return Err(TelemetryError::Unpack("short buffer"));
-            }
-            (
-                Some(hdr.flags),
-                Some((hdr.seq, hdr.ack)),
-                (flags & SIDE_TRANSPORT_FLAG_COMPACT_RELIABLE_HEADER) != 0,
-                rel_off + rel_len,
-            )
-        } else {
-            (None, None, false, off)
-        };
-    if payload_off > data.len() {
-        return Err(TelemetryError::Unpack("short buffer"));
-    }
-    let payload = &data[payload_off..];
-    let prefix = &data[1..data_size_off];
-    let between_end = reliable_span
-        .map(|(rel_off, _, _)| rel_off)
-        .unwrap_or(payload_off);
-    let between = &data[between_start..between_end];
+    let flags = header.flags;
     let base_flags =
         flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE);
+    let static_header = &data[1..header.static_end];
     let mut hash = 0xD1B5_4A32_9C7E_01F3u64;
     hash = hash_bytes_u64(hash, &[base_flags]);
-    hash = hash_bytes_u64(hash, prefix);
-    hash = hash_bytes_u64(hash, between);
-    if let Some(rel_flags) = reliable_flags {
-        hash = hash_bytes_u64(hash, &[rel_flags]);
-    }
-    let template = SideHeaderTemplateView {
-        hash,
-        base_flags,
-        prefix,
-        between,
-        reliable_flags,
-        reliable_compact,
-    };
-    Ok((
-        template,
-        ty,
+    hash = hash_bytes_u64(hash, static_header);
+    Ok(SideFrameParts {
+        template: SideHeaderTemplateView {
+            hash,
+            base_flags,
+            header: static_header,
+        },
+        ty: DataType(header.ty),
         flags,
-        data_size,
-        timestamp,
-        nonce,
-        reliable_seq_ack,
-        payload,
-    ))
+        timestamp: header.timestamp_ms,
+        size: header.size,
+        nonce: header.nonce,
+        payload: &data[header.payload_off..],
+    })
 }
 
-pub(crate) fn reconstruct_side_compact_frame(
+/// The per-packet head of a COMPACT frame (kind, template id and
+/// generation, timestamp delta, size, nonce); the payload and the frame's
+/// CRC32 follow it.
+pub(crate) fn compact_frame_head(
+    parts: &SideFrameParts<'_>,
+    template_id: u32,
+    generation: u8,
+    base: u64,
+) -> SideHeaderBytes {
+    let mut head = SideHeaderBytes::default();
+    let mut kind = SIDE_TRANSPORT_KIND_COMPACT;
+    if parts.flags & SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED != 0 {
+        kind |= SIDE_TRANSPORT_COMPACT_COMPRESSED;
+    }
+    if parts.flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
+        kind |= SIDE_TRANSPORT_COMPACT_NONCE;
+    }
+    head.push(kind);
+    head.uleb128((u64::from(template_id) << TEMPLATE_GEN_BITS) | u64::from(generation & TEMPLATE_GEN_MASK));
+    head.uleb128(zigzag(parts.timestamp.wrapping_sub(base) as i64));
+    if let Some(size) = parts.size {
+        head.uleb128(size as u64);
+    }
+    if parts.flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
+        head.uleb128(u64::from(parts.nonce));
+    }
+    head
+}
+
+/// Per-packet fields of a COMPACT frame as the canonical frame encodes them:
+/// (canonical flags, timestamp/size/nonce bytes, payload offset).
+fn compact_fields(
     template: &SideHeaderTemplate,
-    flags: u8,
-    body: &[u8],
-    timestamp_mode: SideCompactTimestampMode,
-    timestamp_base: Option<u64>,
-) -> TelemetryResult<(crate::SharedBytes, u64)> {
-    if body.is_empty() {
+    bytes: &[u8],
+    off: usize,
+    base: u64,
+) -> TelemetryResult<(u8, SideHeaderBytes, usize)> {
+    let kind = *bytes.first().ok_or(TelemetryError::Unpack("short side compact frame"))?;
+    let mut off = off;
+    let delta = unzigzag(read_uleb128_local(bytes, &mut off)?);
+    let timestamp = base.wrapping_add(delta as u64);
+    let mut flags = template.base_flags;
+    if kind & SIDE_TRANSPORT_COMPACT_COMPRESSED != 0 {
+        flags |= SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED;
+    }
+    if kind & SIDE_TRANSPORT_COMPACT_NONCE != 0 {
+        flags |= SIDE_TRANSPORT_FLAG_PACKET_NONCE;
+    }
+    let mut fields = SideHeaderBytes::default();
+    fields.uleb128(timestamp);
+    if flags & SIDE_TRANSPORT_FLAGS_SIZED != 0 {
+        fields.uleb128(read_uleb128_local(bytes, &mut off)?);
+    }
+    if flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
+        fields.uleb128(read_uleb128_local(bytes, &mut off)?);
+    }
+    if bytes.len() < off + wire_format::CRC32_BYTES {
         return Err(TelemetryError::Unpack("short side compact frame"));
     }
-    let mut off = 0usize;
-    if (flags & !(SIDE_TRANSPORT_FLAG_PAYLOAD_COMPRESSED | SIDE_TRANSPORT_FLAG_PACKET_NONCE))
-        != template.base_flags
-    {
-        return Err(TelemetryError::Unpack("side compact flags mismatch"));
-    }
-    let data_size = read_uleb128_local(body, &mut off)?;
-    let timestamp = match timestamp_mode {
-        SideCompactTimestampMode::Absolute => read_uleb128_local(body, &mut off)?,
-        SideCompactTimestampMode::Delta => {
-            let timestamp_field = read_uleb128_local(body, &mut off)?;
-            let base = timestamp_base.ok_or(TelemetryError::Unpack(
-                "missing side compact timestamp context",
-            ))?;
-            base.checked_add(timestamp_field)
-                .ok_or(TelemetryError::Unpack(
-                    "side compact timestamp delta overflow",
-                ))?
-        }
-        SideCompactTimestampMode::Omitted => timestamp_base.ok_or(TelemetryError::Unpack(
-            "missing side compact timestamp context",
-        ))?,
-    };
-    let nonce = if (flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE) != 0 {
-        Some(read_uleb128_local(body, &mut off)?)
-    } else {
-        None
-    };
-    let reliable_seq_ack = if template.reliable_flags.is_some() {
-        let seq = u32::try_from(read_uleb128_local(body, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("side compact reliable seq too large"))?;
-        let ack = u32::try_from(read_uleb128_local(body, &mut off)?)
-            .map_err(|_| TelemetryError::Unpack("side compact reliable ack too large"))?;
-        Some((seq, ack))
-    } else {
-        None
-    };
-    let payload = &body[off..];
-    if template.reliable_flags.is_none() {
-        // Without a reliable header every field is a byte string or a
-        // ULEB128: write the canonical frame straight into its allocation.
-        let mut fields = SideHeaderBytes::default();
-        fields.uleb128(data_size);
-        fields.uleb128(timestamp);
-        if let Some(nonce) = nonce {
-            fields.uleb128(nonce);
-        }
-        let frame = frame_with_crc_from_parts(&[
-            &[flags],
-            template.prefix(),
-            fields.as_slice(),
-            template.between(),
-            payload,
-        ]);
-        return Ok((crate::shared_bytes::convert(frame), timestamp));
-    }
-    let mut raw = Vec::with_capacity(
-        1 + template.prefix().len() + template.between().len() + payload.len() + 32,
-    );
-    raw.push(flags);
-    raw.extend_from_slice(template.prefix());
-    write_uleb128_local(data_size, &mut raw);
-    write_uleb128_local(timestamp, &mut raw);
-    if let Some(nonce) = nonce {
-        write_uleb128_local(nonce, &mut raw);
-    }
-    raw.extend_from_slice(template.between());
-    if let Some(rel_flags) = template.reliable_flags {
-        let (seq, ack) =
-            reliable_seq_ack.ok_or(TelemetryError::Unpack("missing side compact reliable"))?;
-        wire_format::write_reliable_header_encoded(
-            wire_format::ReliableHeader {
-                flags: rel_flags,
-                seq,
-                ack,
-            },
-            template.reliable_compact,
-            &mut raw,
-        );
-    }
-    raw.extend_from_slice(payload);
-    let crc = crc32_bytes(&raw);
-    raw.extend_from_slice(&crc.to_le_bytes());
-    Ok((
-        crate::shared_bytes::convert(Arc::<[u8]>::from(raw)),
-        timestamp,
-    ))
+    Ok((flags, fields, off))
+}
+
+/// Rebuild the canonical frame a COMPACT frame (CRC32 already checked)
+/// stands for. `off` is the offset after the template id; `base` the
+/// template's base timestamp.
+pub(crate) fn reconstruct_side_compact_frame(
+    template: &SideHeaderTemplate,
+    bytes: &[u8],
+    off: usize,
+    base: u64,
+) -> TelemetryResult<crate::SharedBytes> {
+    let (flags, fields, off) = compact_fields(template, bytes, off, base)?;
+    let crc_at = bytes.len() - wire_format::CRC32_BYTES;
+    Ok(crate::shared_bytes::convert(frame_with_crc_from_parts(&[
+        &[flags],
+        template.header(),
+        fields.as_slice(),
+        &bytes[off..crc_at],
+    ])))
 }
 
 pub(crate) fn canonical_packet_progress_key(packet_id: u64, max_frame_bytes: usize) -> u64 {
@@ -877,40 +954,41 @@ pub(crate) fn send_packet_chunks(
         let crc = crc.finalize().to_le_bytes();
         let parts = [header, payload, &crc];
         let len = header.len() + payload.len() + crc.len();
-        let budget = max_frame_bytes - SIDE_TRANSPORT_CHUNK_OVERHEAD;
-        let total = len.div_ceil(budget);
-        let total_u16 =
-            u16::try_from(total).map_err(|_| TelemetryError::PacketTooLarge("too many chunks"))?;
+        let (budget, total_u16) = chunk_layout(len, max_frame_bytes)?;
+        let total = usize::from(total_u16);
         let mut hash = hash_bytes_u64(0x517C_C1B7_2722_0A95, sender);
         for part in parts {
             hash = hash_bytes_u64(hash, part);
         }
-        let transfer = ((hash >> 32) as u32 ^ hash as u32).max(1).to_le_bytes();
+        let transfer = chunk_transfer_id(hash);
         if *next_chunk > total {
             return Err(TelemetryError::BadArg);
         }
         for index in *next_chunk..total {
             let start = index * budget;
             let end = (start + budget).min(len);
-            let index_bytes = (index as u16).to_le_bytes();
-            let total_bytes = total_u16.to_le_bytes();
-            let mut slices: [&[u8]; 6] = [&transfer, &index_bytes, &total_bytes, &[], &[], &[]];
+            let mut chunk_header = SideHeaderBytes::default();
+            chunk_header.push(SIDE_TRANSPORT_KIND_CHUNK);
+            chunk_header.push(transfer[0]);
+            chunk_header.push(transfer[1]);
+            chunk_header.uleb128(chunk_position(index as u16, total_u16));
+            let mut slices: [&[u8]; 4] = [chunk_header.as_slice(), &[], &[], &[]];
             let mut offset = 0;
             for (i, part) in parts.iter().enumerate() {
                 let low = start.saturating_sub(offset).min(part.len());
                 let high = end.saturating_sub(offset).min(part.len());
-                slices[i + 3] = &part[low..high];
+                slices[i + 1] = &part[low..high];
                 offset += part.len();
             }
             crate::memory_admission::check(
                 max_frame_bytes.saturating_add(256),
                 max_frame_bytes.saturating_add(32),
             )?;
-            let chunk = wrap_side_transport_frame_parts(SIDE_TRANSPORT_KIND_CHUNK, &slices);
+            let chunk = frame_with_crc_from_parts(&slices);
             send(&chunk)?;
             *next_chunk = index + 1;
         }
-        Ok((len, len + total * SIDE_TRANSPORT_CHUNK_OVERHEAD, total))
+        Ok((len, len + chunk_wire_overhead(total_u16), total))
     })
 }
 
@@ -983,6 +1061,32 @@ mod streamed_chunk_tests {
             expected.iter().map(|b| b.as_ref()).collect::<Vec<_>>()
         );
         assert_eq!(next, expected.len());
+    }
+
+    #[test]
+    fn chunk_position_round_trips_and_stays_as_short_as_two_fields() {
+        let uleb = |v: u64| uleb128_len(v);
+        for total in (1u16..=300).chain([1000, 16384, 40000, u16::MAX]) {
+            for index in (0..total).filter(|i| *i < 4 || u32::from(*i) + 4 > u32::from(total) || i % 97 == 0) {
+                let position = chunk_position(index, total);
+                assert_eq!(decode_chunk_position(position), Some((index, total)));
+                // At most one byte longer than separate fields, and never
+                // longer below 23171 chunks.
+                let separate = uleb(index.into()) + uleb(total.into());
+                assert!(uleb(position) <= separate + usize::from(total > 23170));
+            }
+        }
+        assert_eq!(uleb(chunk_position(14, 15)), 1);
+        assert_eq!(decode_chunk_position(chunk_position(u16::MAX - 1, u16::MAX) + 1), None);
+        // Every chunk fits the frame, including multi-byte positions.
+        for (len, max) in [(1, 12), (3000, 1024), (2000, 64), (100_000, 64), (1053, 192)] {
+            let (budget, total) = chunk_layout(len, max).unwrap();
+            let longest = SIDE_TRANSPORT_CHUNK_FIXED_BYTES + uleb(chunk_position(total - 1, total));
+            assert!(budget + longest <= max, "{len} {max}");
+            assert_eq!(usize::from(total), len.div_ceil(budget));
+        }
+        assert_eq!(chunk_layout(1053, 192).unwrap(), (184, 6));
+        assert!(chunk_layout(10, SIDE_TRANSPORT_CHUNK_OVERHEAD).is_err());
     }
 
     #[test]
@@ -1299,32 +1403,91 @@ mod template_storage_tests {
         assert!(size_of::<SideHeaderTemplate>() <= size_of::<Arc<[u8]>>() + 24);
     }
     #[test]
-    fn one_shared_buffer_preserves_both_ranges_and_clone_lifetime() {
-        for (prefix, between) in [
-            (&[][..], &[][..]),
-            (&[1, 2, 3][..], &[9, 8, 7, 6][..]),
-            (&[][..], &[42][..]),
-        ] {
-            let view = SideHeaderTemplateView {
-                hash: 77,
-                base_flags: 5,
-                prefix,
-                between,
-                reliable_flags: Some(1),
-                reliable_compact: true,
-            };
-            let owned = view.into_owned();
-            let clone = owned.clone();
-            assert!(Arc::ptr_eq(&owned.header, &clone.header));
-            assert_eq!(owned.header.len(), prefix.len() + between.len());
-            drop(owned);
-            assert_eq!(clone.prefix(), prefix);
-            assert_eq!(clone.between(), between);
-            assert_eq!(clone.hash, 77);
-            assert_eq!(clone.base_flags, 5);
-            assert_eq!(clone.reliable_flags, Some(1));
-            assert!(clone.reliable_compact);
+    fn clones_share_the_header() {
+        let view = SideHeaderTemplateView {
+            hash: 77,
+            base_flags: 5,
+            header: &[1, 2, 3, 9, 8],
+        };
+        let owned = view.into_owned();
+        let clone = owned.clone();
+        assert!(Arc::ptr_eq(&owned.header, &clone.header));
+        drop(owned);
+        assert_eq!(clone.header(), &[1, 2, 3, 9, 8]);
+        assert_eq!((clone.hash, clone.base_flags), (77, 5));
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod template_codec_tests {
+    use super::*;
+    use crate::packet::Packet;
+
+    fn frame(ts: u64, nonce: u16, payload: &[u8]) -> Arc<[u8]> {
+        let ep = crate::message_meta(DataType::TimeSyncAnnounce).endpoints_ref()[0];
+        let pkt = Packet::new(DataType::TimeSyncAnnounce, &[ep], "CODEC", ts, Arc::from(payload))
+            .unwrap()
+            .with_nonce(nonce)
+            .with_time_epoch(2);
+        wire_format::pack_packet(&pkt)
+    }
+
+    fn compact(raw: &[u8], id: u32, generation: u8, base: u64) -> Vec<u8> {
+        let parts = extract_side_header_template_view(raw).unwrap();
+        let head = compact_frame_head(&parts, id, generation, base);
+        frame_with_crc_from_parts(&[head.as_slice(), parts.payload]).to_vec()
+    }
+
+    fn rebuild(template: &SideHeaderTemplate, bytes: &[u8], base: u64) -> TelemetryResult<Vec<u8>> {
+        check_frame_crc(bytes)?;
+        let (_, _, off) = template_id_and_gen(bytes)?;
+        Ok(reconstruct_side_compact_frame(template, bytes, off, base)?.to_vec())
+    }
+
+    #[test]
+    fn full_frames_round_trip_and_every_byte_is_checked() {
+        let raw = frame(1_795_000_000_000, 300, &[7; 16]);
+        let full = encode_full_frame(&raw, 3, 5, -40).to_vec();
+        assert_eq!(full.len(), raw.len() + 3, "kind, one-byte id/generation, one-byte base delta");
+        // Any hop can check the frame alone.
+        check_frame_crc(&full).unwrap();
+        let (id, generation, delta, back) = decode_full_frame(&full).unwrap();
+        assert_eq!((id, generation, delta, back.as_ref()), (3, 5, -40, raw.as_ref()));
+        for at in 0..full.len() {
+            for bit in 0..8 {
+                let mut bad = full.clone();
+                bad[at] ^= 1 << bit;
+                assert!(decode_full_frame(&bad).is_err(), "corruption at {at}.{bit} accepted");
+            }
         }
+    }
+
+    #[test]
+    fn compact_frames_rebuild_exactly_and_damage_is_detected() {
+        let base = 1_795_000_000_000;
+        let first = frame(base, 300, &[7; 16]);
+        let template = extract_side_header_template(&first).unwrap().template;
+        for (ts, nonce, payload) in [(base + 100, 301, [8u8; 16]), (base - 5, 302, [9; 16]), (base, 1, [0; 16])] {
+            let raw = frame(ts, nonce, &payload);
+            let bytes = compact(&raw, 1, 6, base);
+            assert!(bytes.len() <= 1 + 1 + 3 + 3 + 16 + 4);
+            assert_eq!(side_frame_kind(&bytes), Some(SIDE_TRANSPORT_KIND_COMPACT));
+            assert_eq!(template_id_and_gen(&bytes).unwrap(), (1, 6, 2));
+            assert_eq!(rebuild(&template, &bytes, base).unwrap(), raw.to_vec());
+            for at in 0..bytes.len() {
+                for bit in 0..8 {
+                    let mut bad = bytes.clone();
+                    bad[at] ^= 1 << bit;
+                    assert!(check_frame_crc(&bad).is_err(), "corruption at {at}.{bit} accepted");
+                }
+            }
+        }
+        // Ids above 15 or generations wrap within the field.
+        let raw = frame(base, 7, &[1; 16]);
+        let bytes = compact(&raw, 300, 7, base);
+        assert_eq!(template_id_and_gen(&bytes).unwrap().0, 300);
+        assert_eq!(template_id_and_gen(&bytes).unwrap().1, 7);
+        assert_eq!(unpack_template_base(pack_template_base(base, 5)), (base, 5));
     }
 }
 

@@ -119,7 +119,7 @@ fn shared_bus_switches_to_canonical_frames_without_forgetting_rx_dictionary() {
     {
         let mut st = node.state.lock();
         assert_eq!(st.side_transport[&side].tx_template_count(), 1);
-        let (template, ..) = extract_side_header_template(raw.as_ref()).unwrap();
+        let template = extract_side_header_template(raw.as_ref()).unwrap().template;
         st.side_transport
             .get_mut(&side)
             .unwrap()

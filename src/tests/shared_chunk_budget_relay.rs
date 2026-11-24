@@ -11,14 +11,7 @@ impl Drop for StoreReset {
 }
 
 fn fragment(id: u32, index: u16, total: u16, payload: &[u8]) -> Vec<u8> {
-    let mut wire = b"SDT\x03".to_vec();
-    wire.extend_from_slice(&id.to_le_bytes());
-    wire.extend_from_slice(&index.to_le_bytes());
-    wire.extend_from_slice(&total.to_le_bytes());
-    wire.extend_from_slice(payload);
-    let crc = crc32fast::hash(&wire);
-    wire.extend_from_slice(&crc.to_le_bytes());
-    wire
+    crate::side_transport::test_chunk_frame(id, index, total, payload)
 }
 fn fixture() -> (Relay, usize, usize) {
     let (node, a, b, _) = fixture_with_clock();

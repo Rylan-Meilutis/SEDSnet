@@ -7,7 +7,7 @@ fn relay_chunk_identity_and_loss_are_bounded() {
     let side = relay.add_side_packed_with_options(
         "CAN",
         |_| Ok(()),
-        RelaySideOptions::default().with_template_transport(),
+        RelaySideOptions::default().with_template_transport().with_point_to_point(),
     );
     // Relay full frames include a leading one-byte template ID, then a real
     // frame: a reassembled FULL body is CRC-checked as it enters.
@@ -30,8 +30,8 @@ fn relay_chunk_identity_and_loss_are_bounded() {
         .split_side_transport_frame(side, b, 128)
         .unwrap()
         .collect::<Vec<_>>();
-    assert_eq!(&first[0][4..8], &repeat[0][4..8]);
-    assert_ne!(&first[0][4..8], &second[0][4..8]);
+    assert_eq!(&first[0][1..3], &repeat[0][1..3]);
+    assert_ne!(&first[0][1..3], &second[0][1..3]);
     assert!(
         relay
             .decode_side_transport_frame(side, &first[0])
@@ -144,7 +144,7 @@ fn zero_template_capacity_does_not_retain_timestamp_entries() {
     let rx = Relay::new(Box::new(|| 0));
     let opts = RelaySideOptions {
         max_side_transport_templates: 0,
-        ..RelaySideOptions::default().with_small_packet_transport(0)
+        ..RelaySideOptions::default().with_small_packet_transport(0).with_point_to_point()
     };
     let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
@@ -206,7 +206,7 @@ fn reliable_control_survives_a_missing_compact_dictionary() {
     ] {
         let tx = Relay::new(Box::new(|| 0));
         let rx = Relay::new(Box::new(|| 0));
-        let opts = RelaySideOptions::default().with_small_packet_transport(0);
+        let opts = RelaySideOptions::default().with_small_packet_transport(0).with_point_to_point();
         let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
         let packet = Packet::new(
@@ -263,7 +263,7 @@ fn restarting_peer_refreshes_relay_application_headers_without_erasing_rx() {
     .unwrap();
     for schema_request in [false, true] {
         let tx = Relay::new(Box::new(|| 100));
-        let opts = RelaySideOptions::default().with_small_packet_transport(0);
+        let opts = RelaySideOptions::default().with_small_packet_transport(0).with_point_to_point();
         let side = tx.add_side_packed_with_options("uart", |_| Ok(()), opts.clone());
         let unrelated = tx.add_side_packed_with_options("radio", |_| Ok(()), opts.clone());
         let packet = Packet::new(
@@ -408,7 +408,7 @@ fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
         }
     }
     let rx = Relay::new(Box::new(|| 0));
-    let opts = RelaySideOptions::default().with_small_packet_transport(0);
+    let opts = RelaySideOptions::default().with_small_packet_transport(0).with_point_to_point();
     let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts);
     let packet = Packet::new(
         crate::DataType::ReliableAck,
@@ -423,20 +423,8 @@ fn wrapped_acks_use_reserved_headroom_during_memory_pressure() {
     let mut body = vec![1];
     body.extend_from_slice(&raw);
     let full = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_FULL, &body);
-    let (_, _, flags, size, timestamp, nonce, reliable, payload) =
-        extract_side_header_template(&raw).unwrap();
-    let mut body = vec![flags, 1];
-    write_uleb128_local(size, &mut body);
-    write_uleb128_local(timestamp, &mut body);
-    if flags & SIDE_TRANSPORT_FLAG_PACKET_NONCE != 0 {
-        write_uleb128_local(u64::from(nonce), &mut body);
-    }
-    if let Some((seq, ack)) = reliable {
-        write_uleb128_local(u64::from(seq), &mut body);
-        write_uleb128_local(u64::from(ack), &mut body);
-    }
-    body.extend_from_slice(payload);
-    let compact = wrap_side_transport_frame(SIDE_TRANSPORT_KIND_COMPACT, &body);
+    let timestamp = extract_side_header_template(&raw).unwrap().timestamp;
+    let compact = crate::side_transport::test_compact_frame(&raw, 1, timestamp);
     let ordinary = Packet::new(
         crate::DataType::DiscoverySchema,
         &[crate::DataEndpoint::Discovery],
@@ -840,7 +828,7 @@ fn chunked_schema_resumes_after_transport_backpressure() {
                     .push(Arc::<[u8]>::from(bytes));
                 Ok(())
             },
-            RelaySideOptions::default().with_small_packet_transport(128),
+            RelaySideOptions::default().with_small_packet_transport(128).with_point_to_point(),
         );
         let packet = crate::packet::Packet::new(
             crate::DataType::DiscoverySchema,
@@ -1131,7 +1119,7 @@ fn rejected_first_template_frame_is_retried_self_describing() {
     .unwrap();
     let tx = Relay::new(Box::new(|| 0u64));
     let rx = Relay::new(Box::new(|| 0u64));
-    let opts = RelaySideOptions::default().with_small_packet_transport(0);
+    let opts = RelaySideOptions::default().with_small_packet_transport(0).with_point_to_point();
     let a = tx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     let b = rx.add_side_packed_with_options("wire", |_| Ok(()), opts.clone());
     let packet = Packet::new(
@@ -1157,7 +1145,7 @@ fn rejected_first_template_frame_is_retried_self_describing() {
     let mut received = None;
     tx.send_side_frames_resumable(a, retry, |frame| {
         assert_eq!(
-            frame[3], SIDE_TRANSPORT_KIND_FULL,
+            frame[0], SIDE_TRANSPORT_KIND_FULL,
             "retry requires the unaccepted dictionary bootstrap"
         );
         received = rx.decode_side_transport_frame(b, frame)?;
@@ -1170,7 +1158,7 @@ fn rejected_first_template_frame_is_retried_self_describing() {
         .encode_side_transport_frames(a, opts, crate::shared_bytes::convert(raw.clone()))
         .unwrap();
     tx.send_side_frames_resumable(a, next, |frame| {
-        assert_eq!(frame[3], SIDE_TRANSPORT_KIND_COMPACT);
+        assert_eq!(frame[0] & 0xFC, SIDE_TRANSPORT_KIND_COMPACT);
         assert_eq!(
             rx.decode_side_transport_frame(b, frame)?,
             Some(crate::shared_bytes::convert(raw.clone()))
@@ -1513,6 +1501,7 @@ fn compact_frames_refresh_live_peer_at_ingress_without_dispatch() {
     let source = Relay::new_with_config(RelayConfig::new().with_sender("LIVE"), Box::new(|| 0));
     let opts = RelaySideOptions {
         header_template_enabled: true,
+        point_to_point: true,
         max_frame_bytes: 0,
         ..Default::default()
     };

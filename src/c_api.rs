@@ -8822,6 +8822,20 @@ pub extern "C" fn seds_router_set_side_compact_bundle(
     ok_or_status(unsafe { &(*r).inner }.set_side_compact_bundle(side_id as usize, enabled))
 }
 
+/// Declare a side point to point (one peer): header templates are used
+/// before discovery has heard that peer. See `SideOptions::point_to_point`.
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_router_set_side_point_to_point(
+    r: *mut SedsRouter,
+    side_id: u32,
+    enabled: bool,
+) -> i32 {
+    if r.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    ok_or_status(unsafe { &(*r).inner }.set_side_point_to_point(side_id as usize, enabled))
+}
+
 /// 1 when the side uses compact bundles, 0 when not, negative status for a
 /// bad router.
 #[cfg(feature = "compact-bundle")]
@@ -8884,6 +8898,71 @@ pub extern "C" fn seds_compact_bundle_pack(
     // The input is no longer read: `out` may alias it.
     unsafe { core::ptr::copy(bundle.as_ptr(), out, bundle.len()) };
     bundle.len() as i32
+}
+
+/// Pack frames (frame i at `base + offsets[i]`, `lengths[i]` bytes), in
+/// order, into one bundle of at most `budget` bytes written to `out`
+/// (capacity `cap`; may overlap the input). Packing stops at the first frame
+/// that does not fit; `*packed` receives how many frames the bundle holds
+/// (send the rest in a later bundle). `record_crc` gives every record its
+/// own CRC32 so a damaged record is dropped alone. Returns the bundle
+/// length, 0 when not even the first frame fits, or a negative status
+/// (SEDS_BAD_ARG for bad arguments or a frame that cannot join a bundle).
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn seds_compact_bundle_pack_budget(
+    base: *const u8,
+    offsets: *const u16,
+    lengths: *const u16,
+    count: usize,
+    budget: usize,
+    record_crc: bool,
+    out: *mut u8,
+    cap: usize,
+    packed: *mut usize,
+) -> i32 {
+    if base.is_null() || offsets.is_null() || lengths.is_null() || out.is_null() || packed.is_null() {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    let offsets = unsafe { slice::from_raw_parts(offsets, count) };
+    let lengths = unsafe { slice::from_raw_parts(lengths, count) };
+    let mut writer = crate::wire_bundle::BundleWriter::new(budget.min(cap), record_crc);
+    for i in 0..count {
+        let frame = unsafe {
+            slice::from_raw_parts(base.add(usize::from(offsets[i])), usize::from(lengths[i]))
+        };
+        match writer.try_push(frame) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => return status_from_err(error),
+        }
+    }
+    unsafe { *packed = writer.count() };
+    let Some(bundle) = writer.finish() else {
+        return 0;
+    };
+    if bundle.len() > i32::MAX as usize {
+        return status_from_err(TelemetryError::SizeMismatch { expected: cap, got: bundle.len() });
+    }
+    // The input is no longer read: `out` may alias it.
+    unsafe { core::ptr::copy(bundle.as_ptr(), out, bundle.len()) };
+    bundle.len() as i32
+}
+
+/// Transport priority of a canonical frame (0..=255, higher is more urgent),
+/// for ordering frames before bundling; negative when the frame is not a
+/// canonical frame of a known type.
+#[cfg(feature = "compact-bundle")]
+#[unsafe(no_mangle)]
+pub extern "C" fn seds_frame_priority(frame: *const u8, len: usize) -> i32 {
+    if frame.is_null() || len == 0 {
+        return status_from_err(TelemetryError::BadArg);
+    }
+    match crate::wire_bundle::frame_priority(unsafe { slice::from_raw_parts(frame, len) }) {
+        Some(priority) => i32::from(priority),
+        None => status_from_err(TelemetryError::InvalidType),
+    }
 }
 
 /// Set the shared ordered node-name table for compact bundles (see

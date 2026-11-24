@@ -1,4 +1,6 @@
 #![cfg(all(feature = "std", feature = "discovery"))]
+#[path = "support/side_chunk.rs"]
+mod side_chunk;
 use sedsnet::config::{register_data_type_with_description, register_endpoint_with_description};
 use sedsnet::packet::Packet;
 use sedsnet::router::{EndpointHandler, Router, RouterConfig};
@@ -464,12 +466,7 @@ fn small_wire_packets_do_not_allocate_temporary_contract_buffers() {
     .unwrap();
     let reliable = Packet::from_f32_slice(reliable_ty, &[2.0], &[ep], 127).unwrap();
     // Captured GroundStation receipt with a frozen shape and two targets.
-    let ack = sedsnet::wire_format::unpack_packet(&[
-        0x0c, 0x01, 0x01, 0x08, 0xef, 0x01, 0x95, 0x95, 0x02, 0xcd, 0x8d, 0xbb, 0x3b, 0x14, 0x03,
-        0x44, 0x02, 0x02, 0xee, 0x92, 0x01, 0x79, 0x4a, 0x2b, 0xa4, 0xed, 0x5f, 0x43, 0x92, 0x9e,
-        0x12, 0xbb, 0xfc, 0xa7, 0x16, 0x70, 0x23, 0x4b, 0xe4, 0x25, 0xad, 0x09, 0x34, 0xed, 0x3e,
-        0x2b,
-    ])
+    let ack = sedsnet::wire_format::unpack_packet(&[0x0c, 0x01, 0xcd, 0x8d, 0xbb, 0x3b, 0x14, 0x03, 0x44, 0x02, 0x02, 0xee, 0x92, 0x01, 0x79, 0x4a, 0x2b, 0xa4, 0xed, 0x5f, 0x43, 0x92, 0x9e, 0x12, 0xbb, 0xfc, 0xa7, 0xef, 0x01, 0x95, 0x95, 0x02, 0x16, 0x70, 0x23, 0x4b, 0xe4, 0x25, 0xad, 0x09, 0x55, 0xee, 0x95, 0x21])
     .unwrap();
     for packet in [ack, plain, reliable] {
         // Populate sender-address caches before counting the hot path.
@@ -507,7 +504,7 @@ fn small_wire_packets_do_not_allocate_temporary_contract_buffers() {
 #[test]
 fn frozen_receipt_wire_identity_does_not_allocate_metadata() {
     let _lock = TEST_LOCK.lock().unwrap();
-    let hex = "0c010108ef01959502cd8dbb3b1403440202ee9201794a2ba4ed5f43929e12bbfca71670234be425ad0934ed3e2b";
+    let hex = "0c01cd8dbb3b1403440202ee9201794a2ba4ed5f43929e12bbfca7ef019595021670234be425ad0955ee9521";
     let bytes: Vec<u8> = hex
         .as_bytes()
         .as_chunks::<2>()
@@ -641,8 +638,9 @@ fn malformed_target_count_is_rejected_before_allocation() {
     .unwrap();
     let mut wire = sedsnet::wire_format::pack_packet(&packet).to_vec();
     // Add a CRC-valid contract claiming 127 target hashes but carrying none.
+    // It ends the static header, before the timestamp and nonce.
     wire[0] |= 0x04;
-    let prefix = wire.len() - 4 - packet.payload().len();
+    let prefix = wire.len() - 4 - packet.payload().len() - per_packet_field_len(&packet);
     wire.splice(prefix..prefix, [2, 1, 127]);
     let crc_offset = wire.len() - 4;
     let crc = crc32fast::hash(&wire[..crc_offset]);
@@ -650,10 +648,10 @@ fn malformed_target_count_is_rejected_before_allocation() {
     ALLOCATION_COUNT.with(|count| count.set(Some(0)));
     let result = sedsnet::wire_format::unpack_packet(&wire);
     let allocations = ALLOCATION_COUNT.with(|count| count.replace(None).unwrap());
-    assert!(matches!(
-        result,
-        Err(TelemetryError::Unpack("wire contract target count"))
-    ));
+    assert!(
+        matches!(result, Err(TelemetryError::Unpack("wire contract target count"))),
+        "{result:?}"
+    );
     assert_eq!(
         allocations, 0,
         "untrusted target count allocated scratch storage"
@@ -882,12 +880,27 @@ fn known_peer_restart_does_not_require_a_full_discovery_snapshot_under_pressure(
 
 // Build a real migration-safe wire frame without exposing private Packet
 // constructors. Protocol codes: static flag64, Float32=1, UInt8=2, Data=0.
+/// Bytes of the per-packet fields before the payload (timestamp and nonce):
+/// a contract is inserted before them, at the end of the static header.
+fn per_packet_field_len(packet: &Packet) -> usize {
+    let uleb = |mut v: u64| {
+        let mut n = 1;
+        while v >= 0x80 {
+            v >>= 7;
+            n += 1;
+        }
+        n
+    };
+    uleb(packet.timestamp()) + if packet.nonce() != 0 { uleb(u64::from(packet.nonce())) } else { 0 }
+}
+
 fn cached_inline_test_wire(packet: &Packet, shape: Option<(u8, u8)>) -> Vec<u8> {
     let mut wire = sedsnet::wire_format::pack_packet(packet).to_vec();
     if let Some((primitive, count)) = shape {
         assert_eq!(wire[0] & 0x17, 0, "fixture expects plain best-effort input");
         wire[0] |= 4;
-        let start = wire.len() - 4 - packet.payload().len();
+        // The contract ends the static header, before the timestamp.
+        let start = wire.len() - 4 - packet.payload().len() - per_packet_field_len(packet);
         wire.splice(start..start, [3, 2, 64 | primitive, count]);
         let crc_offset = wire.len() - 4;
         let crc = crc32fast::hash(&wire[..crc_offset]);
@@ -936,7 +949,7 @@ fn cached_bridge_forwards_in_small_fragments_without_admitting_cold_work() {
     .unwrap();
     let sent = Arc::new(AtomicUsize::new(0));
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-    let mut opts = RouterSideOptions::default().with_small_packet_transport(64);
+    let mut opts = RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point();
     opts.max_side_transport_templates = 1;
     let ingress = router.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let output = sent.clone();
@@ -1093,7 +1106,7 @@ fn cached_relay_endpoint_count(endpoint_count: usize, inline_contract: bool, wra
     let clock = Arc::new(AtomicU64::new(0));
     let tick = clock.clone();
     let relay = Relay::new(Box::new(move || tick.load(Ordering::Relaxed)));
-    let mut opts = RelaySideOptions::default().with_small_packet_transport(64);
+    let mut opts = RelaySideOptions::default().with_small_packet_transport(64).with_point_to_point();
     opts.max_side_transport_templates = 1;
     let ingress = relay.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let sent = Arc::new(AtomicUsize::new(0));
@@ -1326,7 +1339,7 @@ fn cached_multi_endpoint_bridge(endpoint_count: usize, inline_contract: bool) {
     .unwrap();
     let sent = Arc::new(AtomicUsize::new(0));
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-    let opts = RouterSideOptions::default().with_small_packet_transport(64);
+    let opts = RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point();
     let ingress = router.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let output = sent.clone();
     let egress = router.add_side_packed_with_options(
@@ -1681,7 +1694,7 @@ fn compact_status_frames(packet: &Packet) -> (Vec<u8>, Vec<u8>) {
             output.lock().unwrap().push(bytes.to_vec());
             Ok(())
         },
-        RouterSideOptions::default().with_small_packet_transport(128),
+        RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point(),
     );
     let bootstrap = Packet::new(
         packet.data_type(),
@@ -1697,11 +1710,8 @@ fn compact_status_frames(packet: &Packet) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(frames.len(), 2);
     let compact = frames.pop().unwrap();
     let full = frames.pop().unwrap();
-    assert!(full.starts_with(b"SDT\x01"));
-    assert!(
-        compact.starts_with(b"SDT\x02"),
-        "expected compact status frame"
-    );
+    assert_eq!(full[0], 0x60, "expected FULL template frame");
+    assert_eq!(compact[0] & 0xFC, 0x70, "expected compact status frame");
     (full, compact)
 }
 
@@ -1745,7 +1755,7 @@ fn router_status_reclaim(compact: bool) {
         Box::new(|| 0),
     );
     let opts = if compact {
-        sedsnet::router::RouterSideOptions::default().with_small_packet_transport(128)
+        sedsnet::router::RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point()
     } else {
         sedsnet::router::RouterSideOptions::default()
     };
@@ -1821,7 +1831,7 @@ fn relay_status_reclaim(compact: bool) {
     let output = seen.clone();
     let relay = Relay::new(Box::new(|| 0));
     let opts = if compact {
-        sedsnet::relay::RelaySideOptions::default().with_small_packet_transport(128)
+        sedsnet::relay::RelaySideOptions::default().with_small_packet_transport(128).with_point_to_point()
     } else {
         sedsnet::relay::RelaySideOptions::default()
     };
@@ -2512,7 +2522,7 @@ fn compact_cached_bridge_admits_only_reconstruction_before_cached_dispatch() {
     .unwrap();
     let sent = Arc::new(AtomicUsize::new(0));
     let router = Router::new_with_clock(RouterConfig::default(), Box::new(|| 0));
-    let mut opts = RouterSideOptions::default().with_small_packet_transport(64);
+    let mut opts = RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point();
     opts.max_side_transport_templates = 1;
     let ingress = router.add_side_packed_with_options("can", |_| Ok(()), opts.clone());
     let output = sent.clone();
@@ -2918,12 +2928,7 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
     .unwrap();
     let control = Packet::from_f32_slice(control_ty, &[1.0], &[ep], 0).unwrap();
     // Same framing and 40-fragment transfer size as the captured gateway rejects.
-    let mut fragment = b"SDT\x03".to_vec();
-    fragment.extend_from_slice(&1234u32.to_le_bytes());
-    fragment.extend_from_slice(&38u16.to_le_bytes());
-    fragment.extend_from_slice(&40u16.to_le_bytes());
-    fragment.extend_from_slice(&[7u8; 94]);
-    fragment.extend_from_slice(&crc32fast::hash(&fragment).to_le_bytes());
+    let mut fragment = side_chunk::chunk_frame(1234, 38, 40, &[7u8; 94]);
     for use_relay in [false, true] {
         sedsnet::memory_admission::set_probe(None);
         ALLOW.store(true, Ordering::Relaxed);
@@ -2971,10 +2976,7 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
         sedsnet::memory_admission::set_probe_v2(Some(retry_chunk_after_reclaim));
         // No reclaimable work: a different fragment is still refused. The
         // accepted assembly is preserved for retry; no relaxed allocation guard.
-        fragment[8..10].copy_from_slice(&39u16.to_le_bytes());
-        let n = fragment.len();
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(1234, 39, 40, &[7u8; 94]);
         let rejected = if use_relay {
             relay.rx_packed_from_side(li, &fragment)
         } else {
@@ -2989,9 +2991,7 @@ fn fragment_pressure_reclaims_bulk_and_accepts_duplicate_without_new_allocation(
             1,
             "protected controls must not be evicted to retry the allocation"
         );
-        fragment[8..10].copy_from_slice(&38u16.to_le_bytes());
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(1234, 38, 40, &[7u8; 94]);
     }
 }
 
@@ -3060,7 +3060,10 @@ fn warmed_relay_transit_dispatch_has_a_bounded_allocation_budget() {
 
 extern "C" fn assembly_headroom_probe(additional: usize, _: usize) -> bool {
     let delta = LIVE_ALLOCATION_DELTA.with(|n| n.get().unwrap_or(0));
-    let available = 6600isize - delta;
+    // 6800 B is short of two working copies of the ~3.6 KB frame (the
+    // allocator's growth pattern varies by a few hundred bytes with the
+    // frame's exact length).
+    let available = 6800isize - delta;
     available >= 0 && additional.saturating_add(4096) <= available as usize
 }
 
@@ -3096,19 +3099,13 @@ fn fragmented_known_topology_recovers_without_two_full_working_copies() {
         .chunks(94)
         .enumerate()
         .map(|(index, bytes)| {
-            let mut out = b"SDT\x03".to_vec();
-            out.extend_from_slice(&8765u32.to_le_bytes());
-            out.extend_from_slice(&(index as u16).to_le_bytes());
-            out.extend_from_slice(&(wire.len().div_ceil(94) as u16).to_le_bytes());
-            out.extend_from_slice(bytes);
-            out.extend_from_slice(&crc32fast::hash(&out).to_le_bytes());
-            out
+            side_chunk::chunk_frame(8765, index as u16, wire.len().div_ceil(94) as u16, bytes)
         })
         .collect::<Vec<_>>();
     for use_relay in [false, true] {
         sedsnet::memory_admission::set_probe(None);
         // This budget isolates working-headroom from retained graph accounting.
-        // The allocator model below, not this queue ceiling, permits only 6600
+        // The allocator model below, not this queue ceiling, permits only 6800
         // free bytes above the already retained fragment/graph baseline.
         let memory = sedsnet::config::RuntimeMemoryConfig::new(65536, 16, 1024, 1.25).unwrap();
         let router = Router::new_with_clock(
@@ -3231,12 +3228,7 @@ fn duplicate_fragment_retries_cannot_keep_stalled_transfers_alive() {
     use std::sync::atomic::AtomicU64;
     let _lock = TEST_LOCK.lock().unwrap();
     let _reset = Reset;
-    let mut fragment = b"SDT\x03".to_vec();
-    fragment.extend_from_slice(&4321u32.to_le_bytes());
-    fragment.extend_from_slice(&0u16.to_le_bytes());
-    fragment.extend_from_slice(&2u16.to_le_bytes());
-    fragment.extend_from_slice(&[5u8; 94]);
-    fragment.extend_from_slice(&crc32fast::hash(&fragment).to_le_bytes());
+    let fragment = side_chunk::chunk_frame(4321, 0, 2, &[5u8; 94]);
     for use_relay in [false, true] {
         sedsnet::memory_admission::set_probe(None);
         ALLOW.store(true, Ordering::Relaxed);
@@ -3475,12 +3467,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
         let ri = router.add_side_packed("can", |_| Ok(()));
         let relay = Relay::new(Box::new(|| 0));
         let li = relay.add_side_packed("can", |_| Ok(()));
-        let mut fragment = b"SDT\x03".to_vec();
-        fragment.extend_from_slice(&12345u32.to_le_bytes());
-        fragment.extend_from_slice(&0u16.to_le_bytes());
-        fragment.extend_from_slice(&65u16.to_le_bytes());
-        fragment.extend_from_slice(&[7u8; 94]);
-        fragment.extend_from_slice(&[0u8; 4]);
+        let mut fragment;
         for index in 0..64u16 {
             // Alternating ends exercises out-of-order B-tree node splits.
             let index = if index % 2 == 0 {
@@ -3488,10 +3475,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
             } else {
                 63 - index / 2
             };
-            fragment[8..10].copy_from_slice(&index.to_le_bytes());
-            let n = fragment.len();
-            let crc = crc32fast::hash(&fragment[..n - 4]);
-            fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+            fragment = side_chunk::chunk_frame(12345, index, 65, &[7u8; 94]);
             LIVE_ALLOCATION_DELTA.with(|v| v.set(Some(0)));
             PEAK_ALLOCATION_DELTA.with(|v| v.set(0));
             MAX_ALLOCATION.with(|v| v.set(Some(0)));
@@ -3519,10 +3503,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
             }
         }
         // Exceeding the bounded tree requires the original full guard too.
-        fragment[8..10].copy_from_slice(&64u16.to_le_bytes());
-        let n = fragment.len();
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(12345, 64, 65, &[7u8; 94]);
         let result = if use_relay {
             relay.rx_packed_from_side(li, &fragment)
         } else {
@@ -3530,10 +3511,7 @@ fn retained_fragment_insertion_does_not_charge_complete_packet_decoder() {
         };
         assert!(matches!(result, Err(TelemetryError::Io("memory pressure"))));
         // A new transfer still needs the full initial allocation guard.
-        fragment[4..8].copy_from_slice(&54321u32.to_le_bytes());
-        let n = fragment.len();
-        let crc = crc32fast::hash(&fragment[..n - 4]);
-        fragment[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        fragment = side_chunk::chunk_frame(54321, 64, 65, &[7u8; 94]);
         let result = if use_relay {
             relay.rx_packed_from_side(li, &fragment)
         } else {

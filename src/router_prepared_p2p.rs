@@ -115,7 +115,7 @@ impl Router {
         stream: crate::SharedBytes,
         budget: usize,
     ) -> TelemetryResult<RouterItem> {
-        let outer = Self::encode_p2p_payload(
+        let outer = Self::encode_p2p_stream_message(
             &local.hostname,
             local.address,
             ports.0,
@@ -128,7 +128,7 @@ impl Router {
             Arc::from([DataEndpoint::Discovery]),
             local.hostname.clone(),
             timestamp,
-            crate::packet::next_packet_nonce(),
+            crate::packet::next_packet_nonce_for(timestamp),
             crate::config::StandardSmallPayload::from_arc(crate::shared_bytes::convert(outer)),
             Some(meta.element),
             Some(Arc::from([target])),
