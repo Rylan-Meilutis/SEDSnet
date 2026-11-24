@@ -126,10 +126,31 @@ class PublisherVerificationTests(unittest.TestCase):
                                        username=None, token=None, artifacts=[Path("fixture.whl")])
 
     def test_registry_lookup_failure_propagates_without_publishing(self):
-        with mock.patch.object(publisher, "cargo_search_output", side_effect=subprocess.CalledProcessError(101, ["cargo", "search"])), \
+        with mock.patch.object(publisher, "sparse_index_versions", return_value=None), \
+             mock.patch.object(publisher, "cargo_search_output", side_effect=subprocess.CalledProcessError(101, ["cargo", "search"])), \
              mock.patch.object(publisher, "run_optional", return_value=subprocess.CompletedProcess([], 0, "")) as upload, self.assertRaises(subprocess.CalledProcessError):
             self.publish(publish=True)
         upload.assert_not_called()
+
+    def test_version_check_reads_every_version_from_the_sparse_index(self):
+        # `cargo search` only lists the newest version; an older one must still count.
+        with mock.patch.object(publisher, "sparse_index_versions", return_value={"2.1.0", "2.2.0", "3.0.0"}), \
+             mock.patch.object(publisher, "cargo_search_output") as search:
+            self.assertTrue(publisher.crate_version_exists("sedsnet_macros", "2.2.0"))
+            self.assertFalse(publisher.crate_version_exists("sedsnet_macros", "2.3.0"))
+        search.assert_not_called()
+
+    def test_sparse_index_paths(self):
+        self.assertEqual(publisher.sparse_index_path("a"), "1/a")
+        self.assertEqual(publisher.sparse_index_path("ab"), "2/ab")
+        self.assertEqual(publisher.sparse_index_path("abc"), "3/a/abc")
+        self.assertEqual(publisher.sparse_index_path("SEDSnet"), "se/ds/sedsnet")
+
+    def test_cargo_index_duplicate_diagnostic_counts_as_already_published(self):
+        out = "   Packaging x\nerror: crate sedsnet_macros@2.2.0 already exists on crates.io index"
+        self.assertTrue(publisher.is_crate_already_published_output(out, "2.2.0"))
+        self.assertFalse(publisher.is_crate_already_published_output(out, "2.2.1"))
+        self.assertFalse(publisher.is_crate_already_published_output(out + "\nerror: network down", "2.2.0"))
 
 
 if __name__ == "__main__":

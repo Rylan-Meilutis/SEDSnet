@@ -10,6 +10,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 import sys
 import tempfile
 import time
@@ -566,7 +568,41 @@ def cargo_search(crate_name: str) -> bool:
     return any(line.startswith(needle) for line in out.splitlines())
 
 
+def sparse_index_path(crate_name: str) -> str:
+    """The crate's file in the crates.io sparse index (https://doc.rust-lang.org/cargo/reference/registry-index.html)."""
+    name = crate_name.lower()
+    if len(name) <= 2:
+        return f"{len(name)}/{name}"
+    if len(name) == 3:
+        return f"3/{name[0]}/{name}"
+    return f"{name[:2]}/{name[2:4]}/{name}"
+
+
+def sparse_index_versions(crate_name: str, timeout_s: float = 20.0) -> set[str] | None:
+    """Every published version of the crate, or None when the index cannot be read."""
+    request = urllib.request.Request(f"https://index.crates.io/{sparse_index_path(crate_name)}",
+                                     headers={"User-Agent": "sedsnet-publish-crates"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            body = response.read().decode()
+    except urllib.error.HTTPError as error:
+        return set() if error.code == 404 else None
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+    versions = set()
+    for line in body.splitlines():
+        try:
+            versions.add(json.loads(line)["vers"])
+        except (ValueError, KeyError, TypeError):
+            continue
+    return versions
+
+
 def crate_version_exists(crate_name: str, version: str) -> bool:
+    # The sparse index lists every version; `cargo search` only shows the newest.
+    versions = sparse_index_versions(crate_name)
+    if versions is not None:
+        return version in versions
     # An unavailable registry is not evidence that a version is absent.
     out = cargo_search_output(crate_name)
     pattern = re.compile(rf"^{re.escape(crate_name)}\s*=\s*\"{re.escape(version)}\"")
@@ -588,7 +624,12 @@ def is_crate_already_published_output(output: str, version: str) -> bool:
         rf"(?:error:\s*)?{registry_response}crate version\s+{quoted_version}"
         r"\s+is already uploaded\.?"
     )
-    return re.fullmatch(diagnostic, lines[-1], re.IGNORECASE) is not None
+    if re.fullmatch(diagnostic, lines[-1], re.IGNORECASE):
+        return True
+    # Newer Cargo checks the index before uploading:
+    # "error: crate NAME@VERSION already exists on crates.io index".
+    index_check = rf"(?:error:\s*)?crate\s+[A-Za-z0-9_-]+@{re.escape(version)}\s+already exists on \S+ index\.?"
+    return re.fullmatch(index_check, lines[-1], re.IGNORECASE) is not None
 
 
 def wait_for_index(crate_name: str, version: str, timeout_s: int, interval_s: int) -> bool:
