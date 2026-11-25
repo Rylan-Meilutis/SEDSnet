@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `zstd-lean` supports zstd 1.6.0 as well as 1.5.7: zstd-safe may resolve to
+  8.4 and zstd-sys to 2.2 again (held below 8.5 and 2.3). The stubs were
+  re-checked against zstd 1.6.0: the replaced structs (`ldmParams_t`,
+  `RawSeqStore_t`), prototypes and disabled-state behaviour are unchanged, and
+  1.6.0's newly extern LDM gear-hash helpers are only called from
+  `zstd_ldm.c`, so that object still stays out of the link. Level-1 frames are
+  byte-identical between the two releases, with and without `zstd-lean`; a new
+  test decodes frames written by the reference zstd 1.5.7 tool. On
+  thumbv7em, an image keeping the whole C API links 336 bytes more flash with
+  zstd 1.6.0 than with 1.5.7 under `zstd-lean` (zstd's own growth); the
+  feature saves 8.8 KB with 1.6.0 (8.5 KB with 1.5.7).
+
 ## 7.0.2
 
 Patch release: no code, wire, API or C ABI change.

@@ -1,10 +1,18 @@
-//! Level-1 zstd frames must not depend on the opt-in `zstd-lean` feature.
+//! Level-1 zstd frames must not depend on the opt-in `zstd-lean` feature or on
+//! which verified zstd release (1.5.7 or 1.6.0) is linked.
 //!
-//! The same digest is asserted with and without the feature, so a build that
-//! omits zstd's LDM/superblock objects is proven to emit byte-identical frames
-//! for SEDSnet's own compression call. Inputs cover the tiny-block path that
-//! calls the LDM skip helpers, ordinary telemetry sizes, and multi-block
-//! frames beyond zstd's 128 KiB block size.
+//! The same digest is asserted with and without the feature and for both
+//! releases, so a build that omits zstd's LDM/superblock objects is proven to
+//! emit byte-identical frames for SEDSnet's own compression call, and nodes
+//! built against either release exchange identical frames. Inputs cover the
+//! tiny-block path that calls the LDM skip helpers, ordinary telemetry sizes,
+//! and multi-block frames beyond zstd's 128 KiB block size.
+//!
+//! `fixtures/zstd-1.5.7-reference-frames.bin` holds frames written by the
+//! reference zstd 1.5.7 command-line tool (`zstd -q -c --check -1` and `-19`)
+//! for [`reference_inputs`], so whichever zstd this build links must decode
+//! frames from an independent 1.5.7 encoder, including checksummed and
+//! higher-level frames SEDSnet itself never writes.
 
 /// FNV-1a over every (input length, frame) pair.
 const GOLDEN_FRAMES_FNV1A: u64 = 0xbfd9_3d78_ad37_443c;
@@ -71,4 +79,42 @@ fn level_one_frames_match_golden_digest_and_roundtrip() {
         hash, GOLDEN_FRAMES_FNV1A,
         "level-1 zstd frames changed: {hash:#018x}"
     );
+}
+
+/// Every corpus entry up to 8 KiB, plus the repetitive text beyond zstd's
+/// 128 KiB block size: the inputs of the reference-frame fixture.
+fn reference_inputs() -> Vec<Vec<u8>> {
+    corpus()
+        .into_iter()
+        .enumerate()
+        .filter(|(index, input)| input.len() <= 8192 || index % 3 == 1)
+        .map(|(_, input)| input)
+        .collect()
+}
+
+#[test]
+fn linked_zstd_is_a_verified_release() {
+    assert!(
+        matches!(zstd_safe::version_number(), 10507 | 10600),
+        "unverified zstd {}",
+        zstd_safe::version_number()
+    );
+}
+
+#[test]
+fn reference_zstd_1_5_7_frames_decode() {
+    let mut frames = &include_bytes!("fixtures/zstd-1.5.7-reference-frames.bin")[..];
+    for input in reference_inputs() {
+        // Each input was written at level 1 and then at level 19.
+        for _level in [1, 19] {
+            let size = zstd_safe::find_frame_compressed_size(frames).expect("frame size");
+            let (frame, rest) = frames.split_at(size);
+            frames = rest;
+            let mut output = vec![0u8; input.len()];
+            let read = zstd_safe::decompress(&mut output[..], frame).expect("decompress");
+            assert_eq!(read, input.len());
+            assert_eq!(output, input);
+        }
+    }
+    assert!(frames.is_empty(), "{} unread fixture bytes", frames.len());
 }
