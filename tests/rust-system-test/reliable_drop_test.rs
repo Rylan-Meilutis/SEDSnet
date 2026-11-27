@@ -4276,7 +4276,6 @@ mod reliable_drop_tests {
 
         exercise_compact_side_transport_in_soak(topology.now.clone());
 
-        #[cfg(feature = "cryptography")]
         {
             sedsnet::crypto::register_software_key(0xC0DE, b"0123456789abcdef0123456789abcdef")
                 .unwrap();

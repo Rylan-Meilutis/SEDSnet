@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 use sedsnet::{
     router::{Router, RouterConfig},
     wire_format,

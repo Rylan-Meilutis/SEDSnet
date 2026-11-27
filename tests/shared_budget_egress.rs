@@ -1,6 +1,6 @@
 //! Incomplete foreign catalogs must share admission with queued work.
 //! All definitions are caller-owned; no application identifiers enter the SDK.
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 #[path = "support/side_chunk.rs"]
 mod side_chunk;
 

@@ -1,4 +1,4 @@
-#![cfg(all(not(feature = "std"), feature = "discovery"))]
+#![cfg(not(feature = "std"))]
 use sedsnet::config::{
     DataEndpoint, DataType, register_data_type_with_description, register_endpoint_with_description,
 };

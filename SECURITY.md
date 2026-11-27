@@ -12,9 +12,9 @@ versions are not supported unless a separate maintenance branch is announced.
 
 ## Security Features in v4.x
 
-Security is part of the v4.x networking stack. With the default `cryptography`
-feature enabled, data types can declare whether end-to-end payload cryptography
-is optional, preferred, or required. Routers can run in `Disabled`,
+Security is part of the v4.x networking stack. End-to-end payload cryptography
+is always built in, and data types can declare whether it is optional,
+preferred, or required. Routers can run in `Disabled`,
 `RequiredOnly`, `Preferred`, or `ForceAll` E2E modes. Required encrypted data is
 rejected when cryptography support is unavailable instead of silently falling
 back to plaintext.

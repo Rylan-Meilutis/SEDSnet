@@ -1,4 +1,4 @@
-#![cfg(all(not(feature = "std"), feature = "discovery"))]
+#![cfg(not(feature = "std"))]
 use sedsnet::config::{self, DataType};
 #[unsafe(no_mangle)]
 extern "C" fn telemetry_lock() {}

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 //! Public preparation/delivery contracts. All names and schema IDs are generic.
 use sedsnet::{
     MessageClass, MessageDataType, MessageElement, ReliableMode,

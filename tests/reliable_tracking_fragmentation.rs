@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 use sedsnet::config::{register_data_type_with_description, register_endpoint};
 use sedsnet::diagnostics::ReliablePendingRow;
 use sedsnet::discovery::{TopologyBoardNode, build_discovery_topology};

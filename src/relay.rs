@@ -1,6 +1,5 @@
 //! Compatibility facade for the forwarding-only role of the shared router.
 //! All queue ownership, transport, discovery and reliability live in `Router`.
-#[cfg(feature = "discovery")]
 use crate::discovery::{ClientStatsSnapshot, TopologySnapshot};
 use crate::{
     RouteSelectionMode, TelemetryError, TelemetryResult,
@@ -270,27 +269,22 @@ impl Relay {
         self.core.clear_route(src, dst)
     }
 
-    #[cfg(feature = "discovery")]
     pub fn announce_discovery(&self) -> TelemetryResult<()> {
         self.core.announce_discovery()
     }
 
-    #[cfg(feature = "discovery")]
     pub fn announce_leave(&self) -> TelemetryResult<()> {
         self.core.announce_leave()
     }
 
-    #[cfg(feature = "discovery")]
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
         self.core.poll_discovery()
     }
 
-    #[cfg(feature = "discovery")]
     pub fn export_topology(&self) -> TopologySnapshot {
         self.core.export_topology()
     }
 
-    #[cfg(feature = "discovery")]
     pub fn client_stats(&self, sender_id: &str) -> Option<ClientStatsSnapshot> {
         self.core.client_stats(sender_id)
     }

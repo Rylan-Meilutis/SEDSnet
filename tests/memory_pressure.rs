@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 #[path = "support/side_chunk.rs"]
 mod side_chunk;
 use sedsnet::config::{register_data_type_with_description, register_endpoint_with_description};
@@ -2741,7 +2741,6 @@ fn relay_full_schema_snapshot_admits_learned_graph_before_allocating() {
     relay.drain_queues_with_timeout(0).unwrap();
 }
 
-#[cfg(feature = "compression")]
 #[test]
 fn compressed_opaque_transit_uses_bounded_admission_on_router_and_relay() {
     use sedsnet::discovery::{
@@ -3627,7 +3626,6 @@ fn full_topology_response_has_bounded_snapshot_allocation_peak() {
     );
 }
 
-#[cfg(feature = "compression")]
 #[test]
 fn codec_metadata_yields_before_physical_route_scratch_admission() {
     use sedsnet::discovery::{self, AddressAdvertisement};

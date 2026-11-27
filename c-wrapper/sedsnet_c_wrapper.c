@@ -14,11 +14,7 @@ SedsWrapperRouterConfig seds_wrapper_router_default_config(void)
 {
     SedsWrapperRouterConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
     cfg.e2e_mode = SEDS_ROUTER_E2E_PREFERRED;
-#else
-    cfg.e2e_mode = SEDS_ROUTER_E2E_DISABLED;
-#endif
     cfg.e2e_key_id = 0U;
     cfg.timesync_source_timeout_ms = 5000ULL;
     cfg.timesync_announce_interval_ms = 2000ULL;

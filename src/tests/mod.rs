@@ -107,9 +107,7 @@ impl Clock for UnixClock {
     }
 }
 
-#[cfg(feature = "compression")]
 mod compression_memory_tests;
-#[cfg(feature = "compression")]
 mod zstd_frame_golden;
 
 fn test_payload_len_for(ty: DataType) -> usize {
@@ -198,7 +196,6 @@ pub(crate) fn count_packed_frames_of_type(frames: &[Vec<u8>], ty: DataType) -> u
         .count()
 }
 
-#[cfg(feature = "discovery")]
 pub(crate) fn count_packets_of_type(pkts: &[Packet], ty: DataType) -> usize {
     pkts.iter().filter(|pkt| pkt.data_type() == ty).count()
 }
@@ -227,7 +224,6 @@ fn recent_rx_cache_preallocates_and_reserves_shared_budget() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn router_sender_id_can_be_updated_at_runtime_for_emitted_packets() {
     use crate::router::{Router, RouterConfig};
@@ -254,7 +250,6 @@ fn router_sender_id_can_be_updated_at_runtime_for_emitted_packets() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn runtime_sender_id_updates_are_reflected_in_topology_exports() {
     use crate::relay::Relay;
@@ -470,9 +465,7 @@ fn helpers_copy_telemetry_packet() {
     assert_eq!(dest.payload(), src.payload());
 }
 
-#[cfg(feature = "discovery")]
 mod p2p_address_tests;
-#[cfg(feature = "discovery")]
 mod p2p_stream_busy_order;
 
 // -----------------------------------------------------------------------------
@@ -538,10 +531,9 @@ fn scheduler_reserves_discovery_and_shared_state_priority_bands() {
     assert!(managed > user);
 }
 
-#[cfg(feature = "discovery")]
 mod borrowed_election;
 
-#[cfg(all(feature = "timesync", feature = "compression"))]
+#[cfg(feature = "timesync")]
 mod timesync_hierarchy;
 
 #[cfg(all(feature = "timesync", feature = "std"))]

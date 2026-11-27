@@ -19,7 +19,6 @@ use crate::config::StandardSmallPayload;
 use crate::packet::{hash_bytes_u64, sender_address_u32};
 #[cfg(feature = "std")]
 use alloc::collections::BTreeMap;
-#[cfg(feature = "cryptography")]
 use alloc::vec;
 use alloc::{sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
@@ -128,9 +127,7 @@ const RELIABLE_WIRE_FLAG_SEQ_PRESENT: u8 = 0x04;
 const RELIABLE_WIRE_FLAG_ACK_PRESENT: u8 = 0x08;
 const RELIABLE_PUBLIC_FLAGS_MASK: u8 =
     RELIABLE_FLAG_ACK_ONLY | RELIABLE_FLAG_UNORDERED | RELIABLE_FLAG_UNSEQUENCED;
-#[cfg(feature = "cryptography")]
 const E2E_NONCE_LEN: usize = 12;
-#[cfg(feature = "cryptography")]
 const E2E_TAG_CAP: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,18 +394,18 @@ fn split_crc32(buf: &[u8]) -> Result<(&[u8], u32), TelemetryError> {
     Ok((&buf[..data_len], crc))
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 std::thread_local! {
     static CRC_VERIFICATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 pub(crate) fn crc_verification_count() -> usize {
     CRC_VERIFICATIONS.with(core::cell::Cell::get)
 }
 
 #[inline]
 fn verify_crc32(buf: &[u8]) -> Result<&[u8], TelemetryError> {
-    #[cfg(all(test, feature = "std", feature = "discovery"))]
+    #[cfg(all(test, feature = "std"))]
     CRC_VERIFICATIONS.with(|count| count.set(count.get().wrapping_add(1)));
     let (data, expected) = split_crc32(buf)?;
     let actual = crc32_bytes(data);
@@ -442,7 +439,6 @@ pub(crate) fn verify_frame_crc(buf: &[u8]) -> TelemetryResult<()> {
     verify_crc32(buf).map(|_| ())
 }
 
-#[cfg(feature = "cryptography")]
 #[inline]
 fn e2e_nonce_for_packet(pkt: &Packet) -> [u8; E2E_NONCE_LEN] {
     // Type and source address, the 48-bit timestamp and the packet nonce: a
@@ -456,7 +452,6 @@ fn e2e_nonce_for_packet(pkt: &Packet) -> [u8; E2E_NONCE_LEN] {
     nonce
 }
 
-#[cfg(feature = "cryptography")]
 fn write_encrypted_payload(
     pkt: &Packet,
     key_id: u32,
@@ -488,7 +483,6 @@ fn write_encrypted_payload(
     Ok(())
 }
 
-#[cfg(feature = "cryptography")]
 fn read_encrypted_payload(
     r: &mut ByteReader,
     aad: &[u8],
@@ -969,13 +963,11 @@ fn payload_for_wire(pkt: &Packet) -> (bool, alloc::borrow::Cow<'_, [u8]>) {
 
 fn payload_for_encoding(
     pkt: &Packet,
-    #[cfg_attr(not(feature = "compression"), allow(unused_variables))] compression_allowed: bool,
+    compression_allowed: bool,
 ) -> (bool, alloc::borrow::Cow<'_, [u8]>) {
-    #[cfg(feature = "compression")]
     if !compression_allowed {
         return (false, alloc::borrow::Cow::Borrowed(pkt.payload()));
     }
-    #[cfg(feature = "discovery")]
     if crate::discovery::is_discovery_type(pkt.data_type()) {
         return (false, alloc::borrow::Cow::Borrowed(pkt.payload()));
     }
@@ -1012,10 +1004,7 @@ fn pack_packet_inner(pkt: &Packet, reliable: Option<ReliableHeader>) -> Arc<[u8]
 /// # Returns
 /// - `Ok(Arc<[u8]>)` containing the packed frame bytes.
 /// - `Err(TelemetryError)` if contract encoding fails.
-#[cfg(any(
-    not(feature = "compression"),
-    all(test, any(feature = "discovery", feature = "latest-value-egress"))
-))]
+#[cfg(test)]
 pub(crate) fn pack_packet_with_wire_contract(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
@@ -1026,21 +1015,10 @@ pub(crate) fn pack_packet_with_wire_contract(
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
 pub(crate) struct E2eSealConfig {
     pub key_id: u32,
 }
 
-#[cfg(all(feature = "cryptography", not(feature = "compression")))]
-pub(crate) fn pack_packet_with_wire_contract_e2e(
-    pkt: &Packet,
-    reliable: Option<ReliableHeader>,
-    shape: Option<MessageElement>,
-    target_senders: &[u64],
-    e2e: E2eSealConfig,
-) -> TelemetryResult<Arc<[u8]>> {
-    pack_packet_inner_with_contract(pkt, reliable, shape, target_senders, Some(e2e))
-}
 
 fn pack_packet_inner_with_contract(
     pkt: &Packet,
@@ -1063,7 +1041,6 @@ fn pack_packet_inner_with_contract(
 /// Router/relay replay basis is independent of the current outgoing peer set.
 /// Sealed packets also keep their inner payload codec-free: transit nodes cannot
 /// rewrite authenticated ciphertext without the recipient's key.
-#[cfg(feature = "compression")]
 pub(crate) fn pack_routed_packet(
     pkt: &Packet,
     reliable: Option<ReliableHeader>,
@@ -1085,7 +1062,6 @@ pub(crate) fn pack_routed_packet(
 /// Re-encode only an ordinary plaintext payload, preserving its complete header,
 /// frozen delivery contract, nonce and reliable sequence. No schema registration
 /// or application decoding is needed. `None` retains the existing shared frame.
-#[cfg(feature = "compression")]
 pub(crate) fn payload_encoding_for_side(
     raw: &[u8],
     allowed: bool,
@@ -1113,10 +1089,7 @@ pub(crate) fn payload_encoding_for_side(
     // Only router-held (admitted) frames are re-encoded for a side.
     let data = admitted_data(raw)?;
     let (envelope, header) = routing_parts(data)?;
-    #[cfg(feature = "discovery")]
     let allowed = allowed && !crate::discovery::is_discovery_type(envelope.ty);
-    #[cfg(not(feature = "discovery"))]
-    let _ = &envelope;
     let payload = &data[header.payload_off..];
     if compressed == allowed {
         return Ok(None);
@@ -1179,7 +1152,6 @@ pub(crate) fn payload_encoding_for_side(
 /// Conservative size credit before retaining a compressed-to-raw conversion.
 /// Includes the complete original header/CRC and the logical payload, so the
 /// bounded queue reservation never depends on optimistic compression ratios.
-#[cfg(feature = "compression")]
 pub(crate) fn decoded_frame_upper_bound(raw: &[u8]) -> TelemetryResult<usize> {
     let header = parse_frame_header(admitted_data(raw)?)?;
     let logical = header.size.unwrap_or(0);
@@ -1191,7 +1163,6 @@ pub(crate) fn decoded_frame_upper_bound(raw: &[u8]) -> TelemetryResult<usize> {
 /// Keep replay ownership independent of a transient side codec choice. Sealed
 /// frames cannot be rewritten without their key; their side compatibility is
 /// checked before dispatch instead.
-#[cfg(feature = "compression")]
 pub(crate) fn payload_encoding_for_retention(
     raw: &[u8],
     budget: usize,
@@ -1261,14 +1232,13 @@ fn with_packet_frame_parts<T>(
     reliable: Option<ReliableHeader>,
     shape: Option<MessageElement>,
     target_senders: &[u64],
-    #[cfg_attr(not(feature = "cryptography"), allow(unused_variables))] e2e: Option<E2eSealConfig>,
+    e2e: Option<E2eSealConfig>,
     compression_allowed: bool,
     consume: impl FnOnce(&[u8], &[u8]) -> TelemetryResult<T>,
 ) -> TelemetryResult<T> {
     // Time sync packets are never sealed end to end: their nonce comes from a
     // short counter (see the router's time sync packets), which must never
     // feed an AEAD nonce.
-    #[cfg(feature = "cryptography")]
     if e2e.is_some()
         && matches!(
             pkt.data_type(),
@@ -1294,10 +1264,7 @@ fn with_packet_frame_parts<T>(
 
     // Decide whether to compress the payload.
     let (payload_compressed, payload_wire) = payload_for_encoding(pkt, compression_allowed);
-    #[cfg(feature = "cryptography")]
     let encrypted = e2e.is_some();
-    #[cfg(not(feature = "cryptography"))]
-    let encrypted = false;
     let sized = payload_compressed || encrypted;
 
     // Size the variable-length prefix exactly. A 16-byte estimate can be
@@ -1316,7 +1283,6 @@ fn with_packet_frame_parts<T>(
         + if sized { uleb128_size(pkt.data_size() as u64) } else { 0 }
         + payload_wire.len()
         + CRC32_BYTES;
-    #[cfg(feature = "cryptography")]
     let capacity = capacity
         + e2e.map_or(0, |seal| {
             uleb128_size(u64::from(seal.key_id))
@@ -1396,7 +1362,6 @@ fn with_packet_frame_parts<T>(
     if let Some(hdr) = reliable {
         write_reliable_header_encoded(hdr, &mut out);
     }
-    #[cfg(feature = "cryptography")]
     if let Some(e2e) = e2e {
         write_encrypted_payload(pkt, e2e.key_id, &payload_wire, &mut out)?;
         return consume(&out, &[]);
@@ -1459,12 +1424,7 @@ fn unpack_packet_frame(buf: &[u8], managed: bool, verify: bool) -> Result<Packet
     let header = parse_frame_header(data)?;
     let flags = header.flags;
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
-    #[cfg(feature = "cryptography")]
     let payload_is_encrypted = (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0;
-    #[cfg(not(feature = "cryptography"))]
-    if (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0 {
-        return Err(TelemetryError::Unpack("e2e crypto unsupported"));
-    }
     if let Some(reliable) = header.reliable
         && (reliable.flags & RELIABLE_FLAG_ACK_ONLY) != 0
     {
@@ -1491,7 +1451,6 @@ fn unpack_packet_frame(buf: &[u8], managed: bool, verify: bool) -> Result<Packet
     // Check again immediately before allocating their logical payload, including
     // decompression/decryption scratch when enabled.
     let payload_copies = if payload_is_compressed { 3 } else { 1 };
-    #[cfg(feature = "cryptography")]
     let payload_copies = payload_copies + usize::from(payload_is_encrypted);
     let small_ack = matches!(ty, DataType::ReliableAck | DataType::ReliablePartialAck)
         && dsz <= 32
@@ -1534,9 +1493,7 @@ fn unpack_packet_frame(buf: &[u8], managed: bool, verify: bool) -> Result<Packet
     }
     // ----- Payload handling -----
     let payload: StandardSmallPayload = {
-        #[cfg(feature = "cryptography")]
         let payload_wire_owned;
-        #[cfg(feature = "cryptography")]
         let payload_wire: &[u8] = if payload_is_encrypted {
             let mut r = ByteReader::new(data);
             r.off = header.payload_off;
@@ -1545,8 +1502,6 @@ fn unpack_packet_frame(buf: &[u8], managed: bool, verify: bool) -> Result<Packet
         } else {
             payload_region
         };
-        #[cfg(not(feature = "cryptography"))]
-        let payload_wire: &[u8] = payload_region;
 
         if payload_is_compressed {
             let decompressed = payload_compression::decompress(payload_wire, dsz)?;
@@ -1671,7 +1626,6 @@ impl Iterator for RoutingEndpointIter<'_> {
 impl RoutingEnvelope<'_> {
     /// The encoded endpoint list, when the frame carries one: equal bytes
     /// decode to equal endpoint sets.
-    #[cfg(feature = "discovery")]
     pub(crate) fn endpoint_list_bytes(&self) -> Option<&[u8]> {
         self.endpoint_list
     }
@@ -1960,7 +1914,6 @@ fn packet_id_with_payload_at(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option
 
 /// `plain_packet_id` for a frame that may carry a reliable header (not an
 /// ACK-only one), as `packet_id_from_wire_unchecked` computes it.
-#[cfg(feature = "discovery")]
 pub(crate) fn framed_packet_id(buf: &[u8], frame: &RoutingFrameInfo<'_>) -> Option<u64> {
     if frame.ack_only() {
         return None;
@@ -1997,7 +1950,6 @@ fn packet_identity_hash(envelope: &RoutingEnvelope<'_>, nonce: u16, dsz: usize, 
 
 /// Type and source address from the first bytes of a frame, without
 /// validating the rest of it.
-#[cfg(feature = "discovery")]
 fn prefix_type_and_source(buf: &[u8]) -> Option<(u32, u32)> {
     let mut reader = ByteReader::new(buf);
     if is_marker_byte(reader.read_bytes(1).ok()?[0]) {
@@ -2026,7 +1978,6 @@ pub(crate) fn scheduling_type(buf: &[u8]) -> Option<DataType> {
 /// Identify only a schema sender in a retained first chunk of a canonical
 /// frame. This borrowed prefix inspection neither validates a complete
 /// canonical CRC nor admits a packet, route, or schema.
-#[cfg(feature = "discovery")]
 pub(crate) fn chunked_schema_source(prefix: &[u8]) -> Option<u32> {
     let (ty, source) = prefix_type_and_source(prefix)?;
     (ty == DataType::DiscoverySchema.as_u32()).then_some(source)
@@ -2059,13 +2010,11 @@ impl TelemetryFrameInfo {
 
 /// Borrow frozen target hashes from a Packet or its little-endian wire header.
 /// Membership never allocates an owner array or changes the frozen cohort.
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy)]
 pub(crate) enum TargetSenderSet<'a> {
     Hashes(&'a [u64]),
     Encoded(&'a [u8]),
 }
-#[cfg(feature = "discovery")]
 impl<'a> TargetSenderSet<'a> {
     pub(crate) fn skip(self, count: usize) -> Self {
         match self {
@@ -2103,7 +2052,6 @@ impl<'a> TargetSenderSet<'a> {
         }
     }
 }
-#[cfg(feature = "discovery")]
 impl<'a> RoutingEnvelope<'a> {
     pub(crate) fn target_sender_set(&self) -> TargetSenderSet<'a> {
         TargetSenderSet::Encoded(self.targets)
@@ -2142,7 +2090,6 @@ fn frame_info_from_parts<'a>(
 /// Borrow an uncompressed discovery payload without owning its envelope or bytes.
 /// Sequenced, piggyback-ACK, compressed, targeted and encrypted frames retain normal processing.
 /// The frame must be admitted: its CRC was verified at router ingress.
-#[cfg(feature = "discovery")]
 pub(crate) fn peek_plain_discovery_payload_unchecked(
     buf: &[u8],
     expected: DataType,
@@ -2434,10 +2381,6 @@ fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
     let (envelope, header) = routing_parts(data)?;
     let flags = header.flags;
     let payload_is_compressed = (flags & FLAG_COMPRESSED_PAYLOAD) != 0;
-    #[cfg(not(feature = "cryptography"))]
-    if (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0 {
-        return Err(TelemetryError::Unpack("e2e crypto unsupported"));
-    }
     if header
         .reliable
         .is_some_and(|hdr| (hdr.flags & RELIABLE_FLAG_ACK_ONLY) != 0)
@@ -2448,9 +2391,7 @@ fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
     let dsz = header.size.unwrap_or(region.len());
 
     // ---- payload bytes (must hash *logical* payload bytes) ----
-    #[cfg(feature = "cryptography")]
     let payload_wire_owned;
-    #[cfg(feature = "cryptography")]
     let payload_wire: &[u8] = if (flags & FLAG_E2E_ENCRYPTED_PAYLOAD) != 0 {
         let mut r = ByteReader::new(data);
         r.off = header.payload_off;
@@ -2459,8 +2400,6 @@ fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
     } else {
         region
     };
-    #[cfg(not(feature = "cryptography"))]
-    let payload_wire: &[u8] = region;
     if payload_is_compressed && payload_wire.is_empty() {
         return Err(TelemetryError::Unpack("short buffer"));
     }
@@ -2480,13 +2419,10 @@ fn packet_id_from_data(data: &[u8]) -> Result<u64, TelemetryError> {
 mod payload_compression {
     use crate::TelemetryError;
     use alloc::borrow::Cow;
-    #[cfg(feature = "compression")]
     use alloc::vec;
     use alloc::vec::Vec;
 
-    #[cfg(feature = "compression")]
     use crate::config::runtime_payload_compress_threshold;
-    #[cfg(feature = "compression")]
     use zstd_safe::CompressionLevel;
 
     /// Compress the given payload if it is beneficial to do so.
@@ -2496,7 +2432,6 @@ mod payload_compression {
     /// - `(bool, Cow<[u8]>)`: Tuple where the first element indicates whether
     ///   compression was applied, and the second element is the resulting
     ///   payload bytes (compressed or original).
-    #[cfg(feature = "compression")]
     pub fn compress_if_beneficial(payload: &'_ [u8]) -> (bool, Cow<'_, [u8]>) {
         if payload.len() < runtime_payload_compress_threshold() {
             return (false, Cow::Borrowed(payload));
@@ -2516,7 +2451,6 @@ mod payload_compression {
         }
     }
 
-    #[cfg(feature = "compression")]
     fn compress_to_vec_bounded(input: &[u8], max_output: usize) -> Option<Vec<u8>> {
         if input.is_empty() || max_output == 0 {
             return None;
@@ -2539,7 +2473,6 @@ mod payload_compression {
     /// # Errors
     /// - `TelemetryError::Unpack` if decompression fails or the size
     ///   does not match `expected_len`.
-    #[cfg(feature = "compression")]
     pub fn decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, TelemetryError> {
         let mut out = vec![0u8; expected_len];
         let written = zstd_safe::decompress(&mut out[..], compressed)
@@ -2548,21 +2481,6 @@ mod payload_compression {
             return Err(TelemetryError::Unpack("decompressed size mismatch"));
         }
         Ok(out)
-    }
-
-    // Stub when compression is disabled (never actually produces compressed payloads).
-    #[cfg(not(feature = "compression"))]
-    /// Returns the original payload unchanged when compression support is disabled.
-    pub fn compress_if_beneficial<'a>(payload: &'a [u8]) -> (bool, Cow<'a, [u8]>) {
-        (false, Cow::Borrowed(payload))
-    }
-
-    #[cfg(not(feature = "compression"))]
-    /// Reports that compressed payloads cannot be decoded when compression support is disabled.
-    pub fn decompress(_compressed: &[u8], _expected_len: usize) -> Result<Vec<u8>, TelemetryError> {
-        Err(TelemetryError::Unpack(
-            "compressed payloads not supported (compression feature disabled)",
-        ))
     }
 }
 
@@ -2996,7 +2914,7 @@ mod endpoint_decode_tests {
     }
 }
 
-#[cfg(all(test, feature = "discovery", feature = "compression"))]
+#[cfg(test)]
 mod bootstrap_compression_tests {
     use super::*;
 

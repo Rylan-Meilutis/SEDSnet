@@ -18,7 +18,7 @@ API docs.
 - **Frame**: A packed packet byte sequence ready to send over a side.
 - **Packet**: The logical telemetry message before packing or after unpacking. It has a sender, time,
   data type, endpoints, and payload.
-- **Payload**: The application data bytes inside a packet. With `cryptography`, these bytes can be
+- **Payload**: The application data bytes inside a packet. With E2E cryptography, these bytes can be
   wrapped by the E2E encrypted payload format.
 - **ULEB**: Unsigned Little Endian Base 128. A compact variable-length integer encoding used in
   parts of the wire format.

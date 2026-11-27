@@ -1,4 +1,4 @@
-"""Send router-owned ordinary data to an independently compiled codec-free receiver."""
+"""Send router-owned ordinary data to an independently compiled minimal no_std receiver."""
 import json
 import os
 import subprocess
@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 class PayloadCodecProcess(unittest.TestCase):
-    def test_unknown_peer_router_data_is_decodable_by_codec_free_profile(self):
+    def test_unknown_peer_router_data_is_decodable_by_minimal_no_std_profile(self):
         def build(extra):
             result=subprocess.run(["cargo","test","--test","payload_codec_process","--no-run",
                 "--message-format=json",*extra],cwd=ROOT,env=os.environ.copy(),text=True,capture_output=True)
@@ -18,7 +18,7 @@ class PayloadCodecProcess(unittest.TestCase):
                     return item["executable"]
             self.fail("missing process executable")
         hosted=build([])
-        minimal=build(["--no-default-features","--features","discovery,timesync,serde,serde_json"])
+        minimal=build(["--no-default-features","--features","timesync,serde,serde_json"])
         with tempfile.TemporaryDirectory()as directory:
             for executable,role in [(hosted,"produce"),(minimal,"receive")]:
                 environment=os.environ.copy();environment.update(CODEC_PROCESS_DIR=directory,CODEC_PROCESS_ROLE=role)

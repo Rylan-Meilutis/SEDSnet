@@ -59,7 +59,7 @@ codebases.
 
 SEDSnet provides Python bindings for Python 3.9 and newer through PyO3. Install maturin to build the package. Wheels use the Python 3.9 stable ABI (`cp39-abi3`), retaining Python 3.9 and 3.10 compatibility while dropping Python 3.8.
 
-With the optional `discovery` feature, routers and relays can exchange built-in discovery packets, learn which
+Routers and relays always exchange built-in discovery packets, learn which
 endpoints are reachable through which sides, adapt the announce rate as the topology changes, and export a live topology
 snapshot for inspection. When `timesync` is also enabled, discovery can advertise concrete time source sender IDs so
 `SEDSNET_TIME_SYNC` requests prefer exact source paths instead of generic endpoint flooding. Once discovery topology exists,
@@ -178,7 +178,7 @@ learned owner path without static fanout or reflecting reachability back toward 
 Successive values from the same authoritative sender are ordered by that sender's wire timestamp. Equal-timestamp
 updates retain arrival order, so rapid toggles made within one clock tick are not discarded. Read-only caches relay refresh
 requests toward an authoritative writer instead of answering with potentially stale persisted state.
-For sensitive state or commands, the default `cryptography` feature lets data types prefer or require end-to-end payload
+For sensitive state or commands, built-in end-to-end cryptography lets data types prefer or require end-to-end payload
 cryptography while the application supplies a C provider, Rust provider, OS/hardware crypto wrapper, or registered software key.
 
 When topology or schema changes are propagating, packets already on the wire now carry a compact frozen delivery and
@@ -944,8 +944,7 @@ cargo bench --bench packet_paths -- --profile-time=5
 
 Use `python3 build.py test --all --full` for the release qualification matrix.
 `--all` selects two profiles: normal packet storage, then experimental compact compression
-with fair admission. Both include cryptography (already a Cargo default), including the
-explicit embedded checks. Common `--features` choices apply to both; the matrix selects
+with fair admission, including the explicit embedded checks. Common `--features` choices apply to both; the matrix selects
 the storage/fair flags. This is not Cargo `--all-features`, which would combine incompatible
 embedded and Python builds. `--full` also runs ignored long-duration tests in both profiles,
 including the full compact memory-pressure campaign.
@@ -1000,7 +999,6 @@ set(SEDSNET_DEVICE_IDENTIFIER "FC26_MAIN" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
-set(SEDSNET_ENABLE_CRYPTOGRAPHY ON CACHE BOOL "" FORCE)
 
 # optional wrapper targets; leave both OFF to use only the raw static ABI header
 set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
@@ -1309,8 +1307,7 @@ Its boolean result reports whether a cached packet existed.
 registration-preserving behavior, but affects **every** cached type, including unrelated variables.
 Use selective invalidation when rejecting one update. These operations also have C ABI and Python
 bindings with the same names (the C functions have the `seds_router_` prefix and optional output
-pointers). C callers receive `SEDS_BAD_ARG` for a null router; Python's network-variable methods are
-available with the `discovery` feature, matching the other Python network-variable methods.
+pointers). C callers receive `SEDS_BAD_ARG` for a null router.
 
 Data types can also choose an E2E payload cryptography policy:
 
@@ -1318,9 +1315,8 @@ Data types can also choose an E2E payload cryptography policy:
 - `PreferOn`: encrypt when router crypto support is available
 - `RequireOn`: reject send/subscribe paths unless cryptography support is available
 
-Router E2E modes are `Disabled`, `RequiredOnly`, `Preferred`, and `ForceAll`. With the default
-`cryptography` feature, the default is `Preferred`; minimal builds that explicitly omit it default
-to `Disabled`. Crypto providers are tried in this order: registered C provider, registered Rust provider, then
+Router E2E modes are `Disabled`, `RequiredOnly`, `Preferred`, and `ForceAll`. The default is
+`Preferred`. Crypto providers are tried in this order: registered C provider, registered Rust provider, then
 registered software fallback key. The provider path is intended for OS crypto, hardware accelerators,
 secure elements, and Rust-only embedded projects. Compact managed credential helpers are available
 for deployments where a master/root node issues short-lived board credentials instead of users

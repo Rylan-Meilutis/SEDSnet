@@ -9,7 +9,6 @@ use crate::{
 };
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-#[cfg(feature = "discovery")]
 use std::sync::Mutex;
 // ---------------- Mock clock ----------------
 
@@ -277,7 +276,6 @@ fn process_all_queues_handles_u64_wraparound() {
     assert!(tx_count.load(Ordering::SeqCst) + rx_count.load(Ordering::SeqCst) >= 1);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn process_all_queues_timeout_does_not_starve_rx_after_slow_tx() {
     crate::tests::ensure_common_test_schema();

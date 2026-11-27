@@ -1,10 +1,7 @@
-//! Optional local transport leases. Absent from codec-free firmware.
-#[cfg(feature = "discovery")]
+//! Local transport leases for the negotiated payload codec.
 use crate::{TelemetryError, TelemetryResult};
-#[cfg(feature = "discovery")]
 use alloc::{sync::Arc, vec::Vec};
 
-#[cfg(feature = "discovery")]
 #[derive(Clone, Debug)]
 struct Peer {
     // Full authoritative identity, not its potentially colliding wire hash.
@@ -17,7 +14,6 @@ struct Peer {
     supported: bool,
     confirmed: bool,
 }
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy, Debug, Default)]
 struct Pending {
     address: u32,
@@ -26,7 +22,6 @@ struct Pending {
 
 /// Fixed unknown-source scratch never allocates on refused ingress. Overflow
 /// conservatively disables the optional codec for one existing liveness lease.
-#[cfg(feature = "discovery")]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Ledger {
     peers: Vec<Peer>,
@@ -39,7 +34,6 @@ pub(crate) struct Ledger {
     next_expiry: u64,
     generation: u64,
 }
-#[cfg(feature = "discovery")]
 impl Ledger {
     pub(crate) fn allowed(&self, now: u64) -> bool {
         self.allowed && now <= self.next_expiry
@@ -456,7 +450,50 @@ impl Ledger {
         self.next_expiry = expiry;
     }
 }
-#[cfg(all(test, feature = "discovery"))]
+/// Queue credit held while an expanded item is outside its queue. This is
+/// separate from allocator admission: a callback may enqueue new work while
+/// the current owner is still waiting to be retried.
+pub(crate) trait QueueBudget {
+    fn codec_reserved(&mut self) -> &mut usize;
+    fn codec_used(&self) -> usize;
+    fn codec_limit(&self) -> usize;
+}
+pub(crate) struct QueueReservation<'a, T: QueueBudget> {
+    state: &'a crate::lock::RouterMutex<T>,
+    bytes: usize,
+}
+impl<'a, T: QueueBudget> QueueReservation<'a, T> {
+    pub(crate) fn acquire(
+        state: &'a crate::lock::RouterMutex<T>,
+        bytes: usize,
+    ) -> crate::TelemetryResult<Self> {
+        let mut locked = state.lock();
+        if locked
+            .codec_used()
+            .checked_add(bytes)
+            .is_none_or(|used| used > locked.codec_limit())
+        {
+            return Err(crate::TelemetryError::Io("memory pressure"));
+        }
+        *locked.codec_reserved() += bytes;
+        Ok(Self { state, bytes })
+    }
+    /// Call under the same lock that immediately admits the retained queue
+    /// owner, so callback/reentrant producers cannot steal its expansion credit.
+    pub(crate) fn release_locked(&mut self, state: &mut T) {
+        *state.codec_reserved() = state.codec_reserved().saturating_sub(self.bytes);
+        self.bytes = 0;
+    }
+}
+impl<T: QueueBudget> Drop for QueueReservation<'_, T> {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            let mut state = self.state.lock();
+            self.release_locked(&mut state);
+        }
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -583,50 +620,6 @@ mod tests {
                 "codec_ledger peers={count} heap_bytes={} peak_upper_bytes={peak} insert_ns={insert} observe_10k_ns={observe} tx_100k_ns={tx}",
                 ledger.heap_bytes()
             );
-        }
-    }
-}
-
-/// Queue credit held while an expanded item is outside its queue. This is
-/// separate from allocator admission: a callback may enqueue new work while
-/// the current owner is still waiting to be retried.
-pub(crate) trait QueueBudget {
-    fn codec_reserved(&mut self) -> &mut usize;
-    fn codec_used(&self) -> usize;
-    fn codec_limit(&self) -> usize;
-}
-pub(crate) struct QueueReservation<'a, T: QueueBudget> {
-    state: &'a crate::lock::RouterMutex<T>,
-    bytes: usize,
-}
-impl<'a, T: QueueBudget> QueueReservation<'a, T> {
-    pub(crate) fn acquire(
-        state: &'a crate::lock::RouterMutex<T>,
-        bytes: usize,
-    ) -> crate::TelemetryResult<Self> {
-        let mut locked = state.lock();
-        if locked
-            .codec_used()
-            .checked_add(bytes)
-            .is_none_or(|used| used > locked.codec_limit())
-        {
-            return Err(crate::TelemetryError::Io("memory pressure"));
-        }
-        *locked.codec_reserved() += bytes;
-        Ok(Self { state, bytes })
-    }
-    /// Call under the same lock that immediately admits the retained queue
-    /// owner, so callback/reentrant producers cannot steal its expansion credit.
-    pub(crate) fn release_locked(&mut self, state: &mut T) {
-        *state.codec_reserved() = state.codec_reserved().saturating_sub(self.bytes);
-        self.bytes = 0;
-    }
-}
-impl<T: QueueBudget> Drop for QueueReservation<'_, T> {
-    fn drop(&mut self) {
-        if self.bytes != 0 {
-            let mut state = self.state.lock();
-            self.release_locked(&mut state);
         }
     }
 }

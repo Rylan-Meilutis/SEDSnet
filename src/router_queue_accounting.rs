@@ -1,7 +1,6 @@
 //! Additive conservative accounting for no-eviction prepared admission.
 use super::*;
 impl RouterInner {
-    #[cfg(feature = "discovery")]
     fn topology_board_byte_cost_saturated(board: &TopologyBoardNode) -> usize {
         board
             .sender_id
@@ -27,7 +26,6 @@ impl RouterInner {
                     .fold(0usize, usize::saturating_add),
             )
     }
-    #[cfg(feature = "discovery")]
     fn discovery_sender_byte_cost_saturated(sender: &str, state: &DiscoverySenderState) -> usize {
         sender
             .len()
@@ -72,7 +70,6 @@ impl RouterInner {
             )
             .saturating_add(crate::peer_record::allocation_bytes::<DiscoverySenderState>())
     }
-    #[cfg(feature = "discovery")]
     fn discovery_route_byte_cost_saturated(
         side: RouterSideId,
         route: &DiscoverySideState,
@@ -115,7 +112,6 @@ impl RouterInner {
             )
             .saturating_add(side.saturating_sub(side))
     }
-    #[cfg(feature = "discovery")]
     fn discovery_bytes_used_saturated(&self) -> usize {
         self.discovery_routes
             .iter()
@@ -132,7 +128,6 @@ impl RouterInner {
             .saturating_add(self.transmit_queue.bytes_used());
         for side in self.side_transport.values() {
             used = used.saturating_add(side.rx_chunk_bytes);
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             {
                 used = used.saturating_add(side.payload_codec.heap_bytes_saturated());
             }
@@ -160,11 +155,9 @@ impl RouterInner {
                 .saturating_add(bytes.len());
         }
         used = used.saturating_add(schema.bytes_used_saturated());
-        #[cfg(feature = "discovery")]
         {
             used = used.saturating_add(self.discovery_bytes_used_saturated());
         }
-        #[cfg(feature = "compression")]
         {
             used = used.saturating_add(self.codec_reserved_bytes);
         }

@@ -1,7 +1,6 @@
 //! Tests for the packed relay fan-out behavior and timeout semantics.
 
 use crate::config::{DataEndpoint, DataType};
-#[cfg(feature = "discovery")]
 use crate::discovery::build_discovery_announce;
 use crate::router::Clock;
 
@@ -17,7 +16,6 @@ fn zero_clock() -> Box<dyn Clock + Send + Sync> {
     Box::new(|| 0u64)
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn relay_routes_targeted_status_to_a_direct_discovery_address_announcer() {
     use crate::config::{register_data_type_with_description, register_endpoint_with_description};
@@ -415,7 +413,6 @@ fn relay_packed_side_templates_preserve_absolute_unchanged_timestamps() {
         },
     );
     *receiver_side_id.lock().unwrap() = Some(rx_side);
-    #[cfg(feature = "discovery")]
     advertise_side(
         &relay,
         _output_side,
@@ -512,7 +509,6 @@ impl SideBus {
     }
 }
 
-#[cfg(feature = "discovery")]
 fn advertise_side(relay: &Relay, side: usize, sender: &str, endpoint: DataEndpoint) {
     let pkt = build_discovery_announce(sender, 0, &[endpoint]).unwrap();
     relay.rx_from_side(side, pkt).unwrap();
@@ -534,9 +530,7 @@ fn relay_basic_fan_out() {
     let _id_b = relay.add_side_packed("B", tx_b);
     let _id_c = relay.add_side_packed("C", tx_c);
 
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _id_b, "SIDE_B", DataEndpoint::named("SD_CARD"));
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _id_c, "SIDE_C", DataEndpoint::named("SD_CARD"));
     relay.process_all_queues().unwrap();
     bus_a.frames.lock().unwrap().clear();
@@ -678,7 +672,6 @@ fn relay_timeout_limits_work_per_call() {
 
     let id_src = relay.add_side_packed("SRC", |_b| Ok(()));
     let _id_dst = relay.add_side_packed("DST", tx);
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _id_dst, "DST_SIDE", DataEndpoint::named("SD_CARD"));
     relay.process_all_queues_with_timeout(0).unwrap();
 
@@ -732,7 +725,6 @@ fn relay_concurrent_rx_is_thread_safe() {
         }
         Ok(())
     });
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _dst, "DST_SIDE", DataEndpoint::named("SD_CARD"));
     relay.process_all_queues_with_timeout(0).unwrap();
 
@@ -803,7 +795,6 @@ fn relay_side_tx_reentry_defers_recursive_queue_drains() {
     assert!(loop_hits.load(Ordering::SeqCst) > 0);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn standalone_relay_advances_weighted_routes_once_per_publication() {
     use crate::{MessageClass, MessageDataType, MessageElement, ReliableMode, RouteSelectionMode};
@@ -861,7 +852,7 @@ fn standalone_relay_advances_weighted_routes_once_per_publication() {
     assert_eq!(*counts.lock().unwrap(), [1, 1, 1, 1]);
 }
 
-#[cfg(all(feature = "timesync", feature = "discovery"))]
+#[cfg(feature = "timesync")]
 #[test]
 fn standalone_relay_clock_allowance_is_committed_only_after_handoff() {
     use std::sync::atomic::{AtomicBool, AtomicU64};

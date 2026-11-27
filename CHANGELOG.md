@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+Breaking build change: the `discovery`, `compression` and `cryptography` Cargo
+features are removed. Discovery, payload compression and end-to-end payload
+cryptography are always built in. Wire format, Rust API and C ABI are
+unchanged for builds that already enabled all three (every default, `embedded`
+and `python` build).
+
+### Changed
+
+- Discovery, compression and cryptography are no longer optional. Every relay
+  computes packet IDs over the logical payload (decompressed and decrypted),
+  so a build without them could not de-duplicate or route compressed or
+  end-to-end-encrypted frames from its peers; like discovery, they are
+  required for routing.
+- Manifests that list `features = ["discovery"]`, `"compression"` or
+  `"cryptography"` must drop those entries: Cargo rejects unknown features,
+  so this is a breaking change for those manifests. The remaining features
+  are `std`, `embedded`, `python`, `timesync`, `compact-bundle`, `zstd-lean`,
+  `fair-admission`, `latest-value-egress`, `ingress-target-filter`,
+  `compact-packet-store` and `compact-packet-compression`.
+- `zstd-safe` and `zstd-sys` are regular dependencies. `zstd-lean`,
+  `compact-bundle` and `compact-packet-compression` no longer imply
+  `compression` or `discovery`.
+- CMake: the `SEDSNET_ENABLE_CRYPTOGRAPHY` option is removed. `sedsnet.h`
+  always declares the cryptography provider APIs and always defines
+  `SEDS_ENABLE_CRYPTOGRAPHY`, so existing `#if defined(SEDS_ENABLE_CRYPTOGRAPHY)`
+  code keeps compiling. The C wrapper's default E2E mode is always
+  `SEDS_ROUTER_E2E_PREFERRED`.
+- `build.py`: `--features cryptography` is no longer accepted, and the
+  minimal std/discovery-off Clippy checks are removed.
+
+### Removed
+
+- The discovery-off, compression-off and cryptography-off code paths (stub
+  codecs, "e2e crypto unsupported" rejections, disabled-E2E fallbacks) and
+  the tests that only ran in those builds, including the hop-failure
+  contract tests and the uncompressed packing/routing memory tests.
+
 ## 7.0.3
 
 Patch release: no wire, API or C ABI change; 7.0.x nodes interoperate.

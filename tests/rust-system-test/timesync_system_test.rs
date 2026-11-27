@@ -816,7 +816,6 @@ mod timesync_system_test {
         );
     }
 
-    #[cfg(feature = "compression")]
     #[test]
     fn compression_mixed_workload_threaded_system_stability() {
         ensure_compression_test_schema();

@@ -1,5 +1,4 @@
 use crate::config::{DataEndpoint, DataType, RELIABLE_RETRANSMIT_MS};
-#[cfg(feature = "discovery")]
 use crate::discovery::build_discovery_announce;
 use crate::relay::{Relay, RelaySideOptions};
 use crate::router::Clock;
@@ -12,7 +11,6 @@ fn zero_clock() -> Box<dyn Clock + Send + Sync> {
     Box::new(|| 0u64)
 }
 
-#[cfg(feature = "discovery")]
 fn advertise_side(relay: &Relay, side: usize) {
     let pkt = build_discovery_announce("DST_SIDE", 0, &[DataEndpoint::named("SD_CARD")]).unwrap();
     relay.rx_from_side(side, pkt).unwrap();
@@ -55,7 +53,6 @@ fn relay_reliable_seq_advances_with_ack() {
             ..RelaySideOptions::default()
         },
     );
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _dst);
     relay.process_all_queues_with_timeout(0).unwrap();
 
@@ -315,7 +312,6 @@ fn relay_reliable_reorders_out_of_order_frames() {
             ..RelaySideOptions::default()
         },
     );
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _dst);
     relay.process_all_queues_with_timeout(0).unwrap();
 

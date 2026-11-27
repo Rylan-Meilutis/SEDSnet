@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 use sedsnet::discovery::{DISCOVERY_ROUTE_TTL_MS, TopologyBoardNode, build_discovery_topology};
 use sedsnet::router::{Router, RouterConfig};
 use std::sync::{

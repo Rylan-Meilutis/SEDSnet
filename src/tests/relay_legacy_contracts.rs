@@ -1,26 +1,25 @@
 //! Existing Relay contracts, exercised against the shared routing engine.
 use super::*;
-#[cfg(feature = "discovery")]
 use crate::relay::RelayConfig;
 use crate::relay::{Relay, RelaySideId, RelaySideOptions};
 
 #[cfg(all(test, feature = "std"))]
 #[path = "independent_side_tx_relay.rs"]
 mod independent_side_tx;
-#[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "payload_codec_relay.rs"]
 mod payload_codec_negotiation;
 #[cfg(all(test, feature = "std"))]
 #[path = "reliable_tx_window_backpressure_relay.rs"]
 mod reliable_tx_window_backpressure_tests;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "shared_chunk_budget_relay.rs"]
 mod shared_chunk_budget_tests;
 // Apply the same cache contract independently to router and relay state.
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "relay_ack_recovery.rs"]
 mod ack_recovery_tests;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "relay_ack_split_horizon.rs"]
 mod ack_split_horizon;
 #[cfg(all(test, feature = "std"))]
@@ -29,7 +28,7 @@ mod control_priority_tests;
 #[cfg(all(test, feature = "std"))]
 #[path = "replay_ownership_relay.rs"]
 mod replay_ownership_tests;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "relay_restart_transport.rs"]
 mod restart_transport_tests;
 #[cfg(test)]
@@ -37,7 +36,7 @@ mod restart_transport_tests;
 #[path = "side_template_index.rs"]
 mod side_template_index_tests;
 
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 mod compact_summary_tests {
     use super::*;
 
@@ -151,7 +150,7 @@ mod compact_summary_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 mod discovery_reclaim_tests {
     use super::*;
     use crate::DataType;
@@ -215,7 +214,7 @@ mod discovery_reclaim_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 mod queued_schema_identity_tests {
     use super::*;
 
@@ -387,15 +386,15 @@ mod queued_schema_identity_tests {
     }
 }
 
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 fn untemplated_test_node() -> Relay {
     Relay::new(Box::new(|| 0))
 }
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 fn untemplated_test_options() -> RelaySideOptions {
     RelaySideOptions::default().with_small_packet_transport(64).with_point_to_point()
 }
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[allow(clippy::duplicate_mod)]
 #[path = "untemplated_transport.rs"]
 mod untemplated_transport_tests;
@@ -904,7 +903,7 @@ mod bounded_fair_queue_tests {
     }
 }
 
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[test]
 fn cow_discovery_rejected_growth_keeps_original_graph_and_routes() {
     crate::tests::ensure_common_test_schema();
@@ -1088,7 +1087,6 @@ impl RouterInner {
     }
 }
 impl Relay {
-    #[cfg(feature = "discovery")]
     fn learn_discovery_item(&self, side: usize, data: &RouterItem) -> TelemetryResult<()> {
         match data {
             RouterItem::Packet(packet) => {
@@ -1112,7 +1110,6 @@ fn queued_data(queued: &TxQueued) -> &RouterItem {
         _ => panic!("expected original publication, found replay marker"),
     }
 }
-#[cfg(feature = "discovery")]
 fn queued_destination(queued: &TxQueued) -> usize {
     match &queued.item {
         RouterTxItem::ToSide { dst, .. } => *dst,
@@ -1121,7 +1118,6 @@ fn queued_destination(queued: &TxQueued) -> usize {
 }
 /// Keep the baseline ACK outstanding: dispatch actual queued originals but do
 /// not generate retries or consume shared replay markers in this cadence test.
-#[cfg(feature = "discovery")]
 fn drain_originals_without_reliable_timeouts(relay: &Relay) -> TelemetryResult<()> {
     loop {
         let queued = {

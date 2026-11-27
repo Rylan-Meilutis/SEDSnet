@@ -215,7 +215,6 @@ impl Scene {
 // to A exhausts while A's link back is down, and must flow again afterwards.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "discovery")]
 mod schema_stream {
     use super::*;
 

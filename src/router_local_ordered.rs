@@ -186,7 +186,6 @@ impl Router {
         ignore_local: bool,
     ) -> TelemetryResult<()> {
         let ty = Self::item_data_type(&data)?;
-        #[cfg(feature = "compression")]
         if let RouterItem::Packed(bytes) = &mut data
             && bytes.first().is_some_and(|flags| flags & 0x11 == 1)
         {
@@ -273,7 +272,7 @@ impl Router {
             armed: true,
             cancel_original: true,
         };
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         if let RouterTxItem::Broadcast(data) = &work.queued.item {
             managed_order_side_gate_causal::after_tail_guard(self, data, false, ignore_local);
         }
@@ -343,7 +342,7 @@ impl Router {
             costs.push(cost);
             children.push((child, cost));
         }
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         managed_order_side_gate_causal::before_local_group_accounting(self, claim);
         let mut st = self.state.lock();
         let Some(index) = st.claim_index(claim.token) else {
@@ -522,7 +521,7 @@ impl Router {
         };
         context.since = current_anchor;
         if let Some(since) = context.since {
-            #[cfg(all(test, feature = "std", feature = "discovery"))]
+            #[cfg(all(test, feature = "std"))]
             managed_order_side_gate_causal::before_local_expiry(self, claim);
             self.expire_local_ordered_claim(ty, since, claim)?;
         }
@@ -539,7 +538,6 @@ impl Router {
             ));
         }
         let admission = self.admit_side_tx(side)?;
-        #[cfg(feature = "compression")]
         {
             let mut reservation = self.prepare_queued_payload(side, &mut data)?;
             if reservation.is_some() {
@@ -614,7 +612,7 @@ impl Router {
         if live_anchor != context.since {
             context.since = live_anchor;
             if let Some(since) = live_anchor {
-                #[cfg(all(test, feature = "std", feature = "discovery"))]
+                #[cfg(all(test, feature = "std"))]
                 managed_order_side_gate_causal::before_local_expiry(self, claim);
                 self.expire_local_ordered_claim(ty, since, claim)?;
             }

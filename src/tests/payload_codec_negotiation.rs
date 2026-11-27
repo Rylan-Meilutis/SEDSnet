@@ -212,7 +212,6 @@ fn reliable_replay_retains_raw_canonical_data_and_preserves_sequence_on_downgrad
     }
 }
 
-#[cfg(feature = "cryptography")]
 #[test]
 fn newly_sealed_router_payload_has_raw_inner_and_opaque_downgrade_is_explicit() {
     let packet = data_packet();

@@ -557,7 +557,6 @@ fn from_none_slice_builds_valid_packet() {
     assert_eq!(pkt.timestamp(), 12345);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn ordinary_application_names_share_the_same_routing_and_receipt_contract() {
     crate::tests::ensure_common_test_schema();

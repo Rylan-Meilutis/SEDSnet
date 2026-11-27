@@ -55,12 +55,11 @@ impl Router {
         item: RouterTxItem,
         priority: u8,
         parent: u64,
-        #[cfg(feature = "compression")] reservation: &mut Option<
+        reservation: &mut Option<
             crate::payload_codec::QueueReservation<'_, RouterInner>,
         >,
     ) -> TelemetryResult<()> {
         let mut st = self.state.lock();
-        #[cfg(feature = "compression")]
         if let Some(reservation) = reservation {
             reservation.release_locked(&mut st);
         }
@@ -132,7 +131,6 @@ impl Router {
         st.refresh_retry_hint();
         Ok(())
     }
-    #[cfg(feature = "compression")]
     pub(super) fn prepare_e2e_child_for_send(
         &self,
         claim: TxClaim,

@@ -1,4 +1,3 @@
-#[cfg(feature = "compression")]
 mod compression_memory_pool_test {
     use sedsnet::config::{DataEndpoint, DataType};
     use sedsnet::packet::Packet;

@@ -25,17 +25,12 @@ class BuildCliTests(unittest.TestCase):
         self.assertEqual(len(native), 2)
         self.assertTrue(all('--include-ignored' in c for c in native))
         profiles = [set(c[c.index('--features') + 1].split(',')) for c in native]
-        self.assertIn('cryptography', profiles[0])
         self.assertIn('ingress-target-filter', profiles[0])
         self.assertNotIn('compact-packet-compression', profiles[0])
         self.assertEqual(profiles[1] - profiles[0], {'compact-packet-compression', 'fair-admission', 'latest-value-egress'})
-        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 8)
-        minimal = [c[c.index('--features') + 1] for c in commands
-                   if c[:2] == ['cargo', 'clippy'] and '--no-default-features' in c
-                   and c[c.index('--features') + 1] in {'std', 'std,latest-value-egress'}]
-        self.assertEqual(minimal, ['std', 'std,latest-value-egress'])
+        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 6)
         self.assertEqual(sum('embedded_memory_behavior_test' in c for c in commands), 2)
-        self.assertEqual(sum('packet_packing_memory' in c for c in commands), 1)
+        self.assertEqual(sum('accepted_queue_delivery' in c and '--no-default-features' in c for c in commands), 1)
         self.assertEqual(sum(c[:2] == ['cargo', 'bench'] for c in commands), 1)
         self.assertEqual(sum(c[:2] == ['cargo', 'build'] for c in commands), 2)
         self.assertEqual(bindings.call_count, 2)
@@ -80,8 +75,8 @@ class BuildCliTests(unittest.TestCase):
 
     def test_matrix_selects_storage_profiles_and_keeps_common_features(self):
         profiles = build.qualification_profiles(['compact-packet-store', 'fair-admission', 'ingress-target-filter'])
-        self.assertEqual(profiles, [['ingress-target-filter', 'cryptography'],
-            ['ingress-target-filter', 'cryptography', 'compact-packet-compression', 'fair-admission', 'latest-value-egress']])
+        self.assertEqual(profiles, [['ingress-target-filter'],
+            ['ingress-target-filter', 'compact-packet-compression', 'fair-admission', 'latest-value-egress']])
 
     def test_latest_feature_is_off_in_reference_and_on_in_compact_profile(self):
         profiles = build.qualification_profiles(['latest-value-egress'])

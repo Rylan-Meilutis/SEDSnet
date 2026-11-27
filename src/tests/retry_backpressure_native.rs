@@ -387,7 +387,6 @@ fn child_retry_reuses_existing_slot_at_exact_shared_and_queue_budget() {
         assert_eq!(owned_count(&f), 1);
     }
 }
-#[cfg(feature = "compression")]
 #[test]
 fn opaque_child_fault_injection_uses_parent_metadata_without_payload_inspection() {
     let f = setup("RETRY_OPAQUE_KEY");
@@ -623,7 +622,6 @@ fn lost_first_owner_ack_replays_receipt_without_reapplying_control() {
     assert_eq!(applied.load(Ordering::SeqCst), 1);
     assert!(f.router.state.lock().end_to_end_reliable_tx.is_empty());
 }
-#[cfg(feature = "compression")]
 #[test]
 fn compressed_downgrade_refusal_keeps_parent_and_publishes_prepared_owner_before_send() {
     let f = setup_element(

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery", feature = "compact-bundle"))]
+#![cfg(all(feature = "std", feature = "compact-bundle"))]
 //! Bytes on the wire per packet kind and per link frame.
 //!
 //! Prints the table behind the wire-format overhead figures in the changelog

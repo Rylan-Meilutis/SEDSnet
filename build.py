@@ -27,16 +27,15 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
-FEATURE_OPTIONS = ("embedded", "python", "timesync", "cryptography", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress", "compact-bundle", "zstd-lean")
+FEATURE_OPTIONS = ("embedded", "python", "timesync", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress", "compact-bundle", "zstd-lean")
 
 def qualification_profiles(features: list[str]) -> list[list[str]]:
     """Exercise feature-OFF normal storage and feature-ON compact/fair storage.
 
     The existing long codec soak runs once, in the compact enabled profile.
-    Shared minimal-std checks independently cover both feature states.
     """
     storage = {"compact-packet-store", "compact-packet-compression", "fair-admission", "latest-value-egress"}
-    common = list(dict.fromkeys([*(f for f in features if f not in storage), "cryptography"]))
+    common = list(dict.fromkeys(f for f in features if f not in storage))
     return [common, [*common, "compact-packet-compression", "fair-admission", "latest-value-egress"]]
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1024,8 +1023,7 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
     build_embedded = "embedded" in args.features
     build_python = "python" in args.features
     build_timesync = "timesync" in args.features
-    build_cryptography = "cryptography" in args.features
-    extra_features = [f for f in args.features if f not in ("embedded", "python", "timesync", "cryptography")]
+    extra_features = [f for f in args.features if f not in ("embedded", "python", "timesync")]
     build_wheel = args.command == "maturin-build"
     develop_wheel = args.command == "maturin-develop"
     release_build = args.release
@@ -1063,8 +1061,6 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
         feature_parts = list(extra_features)
         if build_timesync:
             feature_parts.append("timesync")
-        if build_cryptography:
-            feature_parts.append("cryptography")
         run_clippy_checks(
             env=env,
             repo_root=repo_root,
@@ -1080,8 +1076,6 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
     if tests:
         _banner("TEST MODE")
         feature_parts = ["timesync", *extra_features]
-        if build_cryptography:
-            feature_parts.append("cryptography")
         feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
         embedded_target = target or "thumbv7em-none-eabihf"
         can_check_embedded = has_embedded_c_toolchain(embedded_target, env)
@@ -1105,15 +1099,6 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
             total_steps_override=total_steps,
         )
         _success("Clippy checks passed.")
-        if _shared_test_steps:
-            for minimal_features in ("std", "std,latest-value-egress"):
-                run_cmd(
-                    ["cargo", "clippy", *build_mode, "--no-default-features", "--features", minimal_features, "--lib", "--", "-D", "warnings"],
-                    env=env, repo_root=repo_root,
-                    title="Minimal std/discovery-OFF strict Clippy: " + minimal_features,
-                    release_build=release_build,
-                )
-            _success("Minimal std feature-OFF/ON checks passed.")
 
         runner_name, test_cmds = test_runner_cmds(
             env=env,
@@ -1165,11 +1150,10 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
         if _shared_test_steps:
             run_cmd(
                 ["cargo", "test", *build_mode, "--no-default-features",
-                 "--features", "std,discovery,timesync",
-                 "--test", "packet_packing_memory", "--test", "packet_routing_memory",
+                 "--features", "std,timesync",
                  "--test", "accepted_queue_delivery"],
                 env=env, repo_root=repo_root,
-                title=f"{next_step}/{total_steps} cargo test (uncompressed forwarding memory)",
+                title=f"{next_step}/{total_steps} cargo test (minimal std accepted delivery)",
                 release_build=release_build,
             )
             next_step += 1
@@ -1274,8 +1258,6 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
     feature_parts = list(extra_features)
     if build_timesync:
         feature_parts.append("timesync")
-    if build_cryptography:
-        feature_parts.append("cryptography")
     feature_suffix = ("," + ",".join(feature_parts)) if feature_parts else ""
     build_shared = not build_embedded and not build_python
 

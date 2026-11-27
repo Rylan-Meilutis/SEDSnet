@@ -11,7 +11,7 @@
 
 ## Schema mismatch between systems
 
-Nodes synchronize runtime schema through discovery when that feature is enabled. Compatible
+Nodes synchronize runtime schema through discovery. Compatible
 endpoint/type definitions merge as nodes learn from each other. Direct registration of the same
 name or ID with a different shape returns an error.
 
@@ -42,8 +42,8 @@ String payloads must be valid UTF-8. Trailing NULs are ignored but invalid byte 
 
 ## Compression errors
 
-If a receiver was built without the `compression` feature, it cannot decode compressed payloads. Ensure all nodes share
-the same feature set or disable compression everywhere.
+Compression is always built in, so every node can decode compressed payloads. A decompression
+error means the frame was corrupted or produced by an incompatible SEDSnet version.
 
 ## Packets not forwarding
 

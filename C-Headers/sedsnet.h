@@ -14,6 +14,12 @@
 #include <string.h> /* for strlen in string macros */
 #include <stdbool.h> /* for bool type */
 
+/* Cryptography provider APIs are always built in. The macro stays defined so
+ * existing `#if defined(SEDS_ENABLE_CRYPTOGRAPHY)` application code keeps working. */
+#ifndef SEDS_ENABLE_CRYPTOGRAPHY
+#define SEDS_ENABLE_CRYPTOGRAPHY 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 
@@ -785,8 +791,6 @@ SedsResult seds_router_poll_timesync(SedsRouter * r, bool * out_did_queue);
  *
  * This advertises the router's locally reachable endpoints and, when time sync is
  * enabled, any local time source sender IDs.
- *
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_announce_discovery(SedsRouter * r);
 SedsResult seds_router_announce_leave(SedsRouter * r);
@@ -797,8 +801,6 @@ SedsResult seds_router_announce_leave(SedsRouter * r);
  * This is the non-blocking hook intended for the application's main loop. Call it periodically,
  * then run the normal queue processing functions. If `out_did_queue` is non-NULL, it is set to
  * `true` when a discovery packet was queued during this call.
- *
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_poll_discovery(SedsRouter * r, bool * out_did_queue);
 
@@ -871,7 +873,7 @@ SedsResult seds_router_clear_network_variable_caches(SedsRouter * r, size_t * ou
  * @brief Ask the network to replay the latest cached value for a managed variable data type.
  *
  * Responders send the original value packet, so normal endpoint handlers are invoked exactly as if
- * an update had just occurred. Requires a build with the `discovery` feature.
+ * an update had just occurred.
  */
 SedsResult seds_router_request_managed_variable(SedsRouter * r, SedsDataType ty);
 
@@ -940,7 +942,6 @@ int32_t seds_router_get_network_variable_packed(
  * @brief Return the required buffer length for the router topology export JSON.
  *
  * The returned size includes the trailing NUL byte.
- * Requires a build with the `discovery` feature.
  */
 int32_t seds_router_export_topology_len(SedsRouter * r);
 
@@ -948,7 +949,6 @@ int32_t seds_router_export_topology_len(SedsRouter * r);
  * @brief Export the current router discovery topology as JSON.
  *
  * Use `seds_router_export_topology_len()` to size the destination buffer.
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_export_topology(SedsRouter * r, char * buf, size_t buf_len);
 
@@ -957,7 +957,6 @@ SedsResult seds_router_export_topology(SedsRouter * r, char * buf, size_t buf_le
  *
  * The returned size includes the trailing NUL byte. Unknown senders export as JSON `null`.
  * Packet and byte counters are aggregated from the side(s) currently reaching that client.
- * Requires a build with the `discovery` feature.
  */
 int32_t seds_router_export_client_stats_len(
     SedsRouter * r,
@@ -970,7 +969,6 @@ int32_t seds_router_export_client_stats_len(
  *
  * Use `seds_router_export_client_stats_len()` to size the destination buffer.
  * Unknown senders export as JSON `null`.
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_export_client_stats(
     SedsRouter * r,
@@ -984,7 +982,6 @@ SedsResult seds_router_export_client_stats(
  * @brief Return the required buffer length for the router runtime stats JSON export.
  *
  * The returned size includes the trailing NUL byte.
- * Requires a build with the `discovery` feature.
  */
 int32_t seds_router_export_runtime_stats_len(SedsRouter * r);
 
@@ -994,7 +991,6 @@ int32_t seds_router_export_runtime_stats_len(SedsRouter * r);
  * This includes per-side traffic, retry/failure counters, adaptive link estimates,
  * route policy state, queue usage, and discovery runtime state.
  * Use `seds_router_export_runtime_stats_len()` to size the destination buffer.
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_export_runtime_stats(SedsRouter * r, char * buf, size_t buf_len);
 
@@ -1680,8 +1676,6 @@ SedsResult seds_relay_set_sender_id(SedsRelay * r, const char * sender, size_t s
 
 /**
  * @brief Queue a built-in discovery advertisement immediately for this relay.
- *
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_announce_discovery(SedsRelay * r);
 SedsResult seds_relay_announce_leave(SedsRelay * r);
@@ -1691,8 +1685,6 @@ SedsResult seds_relay_announce_leave(SedsRelay * r);
  *
  * If `out_did_queue` is non-NULL, it is set to `true` when a discovery packet was
  * queued during this call.
- *
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_poll_discovery(SedsRelay * r, bool * out_did_queue);
 
@@ -1700,7 +1692,6 @@ SedsResult seds_relay_poll_discovery(SedsRelay * r, bool * out_did_queue);
  * @brief Return the required buffer length for the relay topology export JSON.
  *
  * The returned size includes the trailing NUL byte.
- * Requires a build with the `discovery` feature.
  */
 int32_t seds_relay_export_topology_len(SedsRelay * r);
 
@@ -1708,7 +1699,6 @@ int32_t seds_relay_export_topology_len(SedsRelay * r);
  * @brief Export the current relay discovery topology as JSON.
  *
  * Use `seds_relay_export_topology_len()` to size the destination buffer.
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_export_topology(SedsRelay * r, char * buf, size_t buf_len);
 
@@ -1717,7 +1707,6 @@ SedsResult seds_relay_export_topology(SedsRelay * r, char * buf, size_t buf_len)
  *
  * The returned size includes the trailing NUL byte. Unknown senders export as JSON `null`.
  * Packet and byte counters are aggregated from the side(s) currently reaching that client.
- * Requires a build with the `discovery` feature.
  */
 int32_t seds_relay_export_client_stats_len(
     SedsRelay * r,
@@ -1730,7 +1719,6 @@ int32_t seds_relay_export_client_stats_len(
  *
  * Use `seds_relay_export_client_stats_len()` to size the destination buffer.
  * Unknown senders export as JSON `null`.
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_export_client_stats(
     SedsRelay * r,
@@ -1744,7 +1732,6 @@ SedsResult seds_relay_export_client_stats(
  * @brief Return the required buffer length for the relay runtime stats JSON export.
  *
  * The returned size includes the trailing NUL byte.
- * Requires a build with the `discovery` feature.
  */
 int32_t seds_relay_export_runtime_stats_len(SedsRelay * r);
 
@@ -1754,7 +1741,6 @@ int32_t seds_relay_export_runtime_stats_len(SedsRelay * r);
  * This includes per-side traffic, retry/failure counters, adaptive link estimates,
  * route policy state, queue usage, and discovery runtime state.
  * Use `seds_relay_export_runtime_stats_len()` to size the destination buffer.
- * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_export_runtime_stats(SedsRelay * r, char * buf, size_t buf_len);
 
@@ -1989,7 +1975,6 @@ SedsResult seds_relay_process_all_queues_with_timeout(SedsRelay * r, uint32_t ti
 /* Drain queued RX/TX without periodic announcements; poll maintenance separately. */
 SedsResult seds_relay_drain_queues_with_timeout(SedsRelay * r, uint32_t timeout_ms);
 
-#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 typedef SedsResult (* SedsCryptoSealFn)(
     uint32_t key_id,
     const uint8_t * nonce,
@@ -2078,7 +2063,6 @@ SedsResult seds_crypto_open(uint32_t key_id,
                             uint8_t * plaintext_out,
                             size_t plaintext_cap,
                             size_t * plaintext_len_out);
-#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

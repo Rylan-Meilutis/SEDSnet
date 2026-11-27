@@ -234,7 +234,6 @@ fn prepared_p2p_relay_role_refuses_before_core_wait() {
     ));
 }
 
-#[cfg(feature = "discovery")]
 struct Pair {
     a: Router,
     b: Router,
@@ -243,7 +242,6 @@ struct Pair {
     aside: usize,
     bside: usize,
 }
-#[cfg(feature = "discovery")]
 impl Pair {
     fn new() -> Self {
         let a = Router::new_with_clock(
@@ -298,7 +296,6 @@ impl Pair {
         }
     }
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_refresh_syn_data_capacity_is_atomic_and_frozen() {
     let pair = Pair::new();
@@ -361,7 +358,6 @@ fn prepared_p2p_refresh_syn_data_capacity_is_atomic_and_frozen() {
         2
     );
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_actual_packed_two_router_and_legacy_races() {
     let pair = Pair::new();
@@ -521,7 +517,6 @@ fn prepared_p2p_concurrent_preparations_have_one_atomic_winner() {
         2
     );
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_actual_incoming_handshake_rejects_old_pair_then_fresh_send_works() {
     let pair = Pair::new();
@@ -637,7 +632,6 @@ fn prepared_p2p_all_controls_busy_leave_live_session_sequence_and_buffers() {
     }
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_rejected_peer_controls_do_not_revoke_prepared_owner() {
     use super::super::published_p2p_tuple_causal::Mesh;
@@ -691,7 +685,6 @@ fn prepared_p2p_rejected_peer_controls_do_not_revoke_prepared_owner() {
         mesh.pump();
     }
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_invalid_synack_is_inert_but_identical_valid_retry_is_progress() {
     use super::super::published_p2p_tuple_causal::Mesh;
@@ -756,7 +749,6 @@ fn prepared_p2p_invalid_synack_is_inert_but_identical_valid_retry_is_progress() 
     assert!(receiver.try_queue_prepared_p2p(&mut fresh).is_ok());
     mesh.pump();
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_inconsistent_packet_name_and_address_never_touch_session() {
     use super::super::published_p2p_tuple_causal::Mesh;
@@ -812,7 +804,6 @@ fn prepared_p2p_inconsistent_packet_name_and_address_never_touch_session() {
     mesh.pump();
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn prepared_p2p_zero_source_synack_cannot_establish_unknown_peer() {
     use super::super::published_p2p_tuple_causal::Mesh;

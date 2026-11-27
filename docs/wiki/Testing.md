@@ -206,7 +206,7 @@ paths, links with different bandwidth budgets, random disconnect/reconnect windo
 disable/enable windows, temporary side add/remove operations, discovery and topology export,
 source and typed route policies, reliable recovery, network-variable cache propagation, large
 dynamic payload forwarding, side-transport compaction/chunking, time-sync configuration, runtime
-stats, memory-layout export, and E2E crypto when the `cryptography` feature is enabled.
+stats, memory-layout export, and E2E crypto.
 
 The soak can be shortened for local iteration:
 

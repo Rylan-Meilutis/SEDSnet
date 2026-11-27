@@ -11,7 +11,6 @@ use crate::{TelemetryResult, wire_format};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "discovery")]
 #[test]
 #[should_panic(expected = "reserved internal endpoint handlers must not be user-registered")]
 fn user_cannot_register_discovery_endpoint_handler() {
@@ -218,10 +217,8 @@ fn rx_packed_delivers_to_packed_handlers() {
     assert_eq!(*got, *bytes);
 }
 
-#[cfg(feature = "discovery")]
 mod discovery_tests;
 
-#[cfg(feature = "discovery")]
 mod schema_sync_tests;
 
 #[cfg(feature = "timesync")]

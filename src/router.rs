@@ -8,7 +8,7 @@
 //! - Local endpoint handlers process packets as before (no side parameter).
 //! - De-duplication remains packet-id based and side-agnostic.
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/scoped_schema_recovery_audit.rs"]
 mod scoped_schema_recovery_audit;
 
@@ -16,43 +16,43 @@ mod scoped_schema_recovery_audit;
 #[path = "tests/relay_legacy_contracts.rs"]
 mod relay_legacy_contracts;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/shared_routing_roles.rs"]
 mod shared_routing_roles;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/schema_prefix_admission.rs"]
 mod schema_prefix_admission;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/schema_receive_progress.rs"]
 mod schema_receive_progress;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/radio_trace_decoder.rs"]
 mod radio_trace_decoder;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/schema_response_admission.rs"]
 mod schema_response_admission_tests;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/accepted_route_ownership.rs"]
 mod accepted_route_ownership;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/unroutable_backoff.rs"]
 mod unroutable_backoff;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/side_busy_skip.rs"]
 mod side_busy_skip;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/plain_transit_differential.rs"]
 mod plain_transit_differential;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/route_plan_cache.rs"]
 mod route_plan_cache;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/fair_victim_differential.rs"]
 mod fair_victim_differential;
 
@@ -61,25 +61,25 @@ mod fair_victim_differential;
 mod independent_side_tx;
 #[path = "router_local_ordered.rs"]
 mod local_ordered;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/crc_once.rs"]
 mod crc_once_tests;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/ingress_target_filter.rs"]
 mod ingress_target_filter_tests;
-#[cfg(all(test, feature = "std", feature = "discovery", feature = "compression"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/payload_codec_negotiation.rs"]
 mod payload_codec_negotiation;
-#[cfg(all(test, feature = "std", feature = "timesync", feature = "cryptography", feature = "compression"))]
+#[cfg(all(test, feature = "std", feature = "timesync"))]
 #[path = "tests/timesync_nonce_e2e.rs"]
 mod timesync_nonce_e2e_tests;
 #[cfg(all(test, feature = "std", feature = "compact-bundle"))]
 #[path = "tests/compact_bundle.rs"]
 mod compact_bundle_tests;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/reliable_tx_window_backpressure.rs"]
 mod reliable_tx_window_backpressure_tests;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/shared_chunk_budget_router.rs"]
 mod shared_chunk_budget_tests;
 // Apply the same cache contract independently to router and relay state.
@@ -87,9 +87,8 @@ mod shared_chunk_budget_tests;
 #[allow(clippy::duplicate_mod)]
 #[path = "tests/side_template_index.rs"]
 mod side_template_index_tests;
-#[cfg(feature = "discovery")]
 use crate::config::runtime_reliable_max_end_to_end_pending;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/replay_ownership_router.rs"]
 mod replay_ownership_tests;
 use crate::side_transport::{
@@ -100,39 +99,39 @@ use crate::side_transport::{
 };
 #[cfg(test)]
 use crate::side_transport::wrap_side_transport_frame;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "tests/ack_return_identity.rs"]
 mod ack_return_identity;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "tests/forget_peer.rs"]
 mod forget_peer;
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/returning_owner.rs"]
 mod returning_owner;
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/silent_station_sim.rs"]
 mod silent_station_sim;
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/proxy_upstream_receipt.rs"]
 mod proxy_upstream_receipt;
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/relay_managed_burst.rs"]
 mod relay_managed_burst;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "tests/side_peek.rs"]
 mod side_peek_tests;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "tests/own_network_variable.rs"]
 mod own_network_variable;
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "tests/ack_split_horizon.rs"]
 mod ack_split_horizon;
 
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[path = "tests/discovery_liveness.rs"]
 mod discovery_liveness;
 
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 mod compact_summary_tests {
     use super::*;
 
@@ -477,9 +476,8 @@ use crate::diagnostics::{
     RouteModeStats, RouteOverrideStats, RoutePriorityStats, RouteWeightStats, RuntimeSideStats,
     RuntimeStatsSnapshot, RuntimeTypeStats, TypedRouteOverrideStats,
 };
-#[cfg(all(feature = "discovery", feature = "timesync"))]
+#[cfg(feature = "timesync")]
 use crate::discovery::TIMESYNC_SLOW_LINK_MIN_INTERVAL_MS;
-#[cfg(feature = "discovery")]
 use crate::discovery::{
     self, ClientStatsSnapshot, DISCOVERY_INCREMENTAL_RETRY_COUNT, DISCOVERY_ROUTE_TTL_MS,
     DISCOVERY_SLOW_LINK_PING_INTERVAL_MS, DiscoveryCadenceState, TopologyAnnouncerRoute,
@@ -562,7 +560,6 @@ impl SideTransportProfile {
         }
     }
 
-    #[cfg(feature = "discovery")]
     #[inline]
     pub const fn discovery_code(self) -> u8 {
         match self {
@@ -730,9 +727,7 @@ struct SideTransportState {
     #[cfg(feature = "std")]
     tx_callback_gate: Arc<ReentryGate>,
     tx_chunk_progress: Option<Box<crate::side_transport::SideTxProgress>>,
-    #[cfg(all(feature = "compression", feature = "discovery"))]
     payload_codec: crate::payload_codec::Ledger,
-    #[cfg(all(feature = "compression", feature = "discovery"))]
     payload_codec_choice: u64,
     tx_template_ids: RouterMap<u64, u32>,
     tx_templates: OrdMap<u64, SideHeaderTemplate>,
@@ -1184,7 +1179,6 @@ impl DispatchContext {
     fn mark_terminal(&mut self) {
         self.completion_flags |= Self::TERMINAL;
     }
-    #[cfg(feature = "discovery")]
     fn mark_owner_transferred(&mut self) {
         self.completion_flags |= Self::OWNER_TRANSFERRED;
     }
@@ -1451,7 +1445,6 @@ impl EndToEndReliableSent {
     // Keeping the retained packet inline makes each B-tree leaf several KiB.
     // Small independent records avoid that contiguous allocation on fragmented
     // embedded heaps. A failed record allocation remains retryable pressure.
-    #[cfg(feature = "discovery")]
     fn try_box(self) -> TelemetryResult<Box<Self>> {
         let layout = core::alloc::Layout::new::<Self>();
         // SAFETY: layout is nonzero and valid for Self. On failure self drops
@@ -1468,7 +1461,6 @@ impl EndToEndReliableSent {
     }
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum ControlRxMode { HopWindow, Reserved, BoundReceipt }
@@ -1477,9 +1469,7 @@ enum ControlRxMode { HopWindow, Reserved, BoundReceipt }
 struct ReliableRxState {
     expected_seq: u32,
     buffered: RouterMap<u32, crate::SharedBytes>,
-    #[cfg(feature = "discovery")]
     control_mode: ControlRxMode,
-    #[cfg(feature = "discovery")]
     control_token: u64,
 }
 
@@ -1583,7 +1573,6 @@ impl Drop for ReliableLocalAdmissionGuard<'_> {
     }
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySenderState {
     /// Numeric identity advertised for this hostname. Compact frames may carry
@@ -1610,7 +1599,6 @@ struct DiscoverySenderState {
     last_seen_ms: u64,
 }
 
-#[cfg(feature="discovery")]
 impl DiscoverySenderState {
     fn observe_hop_local(&mut self, now_ms:u64) {
         self.has_hop_local_evidence=true;
@@ -1624,7 +1612,6 @@ impl DiscoverySenderState {
 
 /// One bounded hop-send grant per requested variable and ingress segment.
 /// It does not create a new value or a new end-to-end reader cohort.
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedVariableSubscription {
     last_seen_ms: u64,
@@ -1638,7 +1625,6 @@ struct ManagedVariableSubscription {
     refresh_pending: bool,
 }
 
-#[cfg(feature = "discovery")]
 fn reserve_managed_subscriptions(
     requests: &mut Vec<ManagedVariableSubscription>,
     additional: usize,
@@ -1659,7 +1645,6 @@ fn reserve_managed_subscriptions(
         .map_err(|_| TelemetryError::Io("memory pressure"))
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoverySideState {
     reachable: Vec<DataEndpoint>,
@@ -1670,7 +1655,6 @@ struct DiscoverySideState {
     announcers: OrdMap<String, Box<DiscoverySenderState>>,
 }
 
-#[cfg(feature = "discovery")]
 impl DiscoverySideState {
     fn try_clone(&self) -> TelemetryResult<Self> {
         // A refused new record leaves the authoritative route unchanged. Clone
@@ -1691,7 +1675,6 @@ impl DiscoverySideState {
     }
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 enum SchemaResponsePhase {
@@ -1703,10 +1686,8 @@ enum SchemaResponsePhase {
     Owned,
 }
 
-#[cfg(feature = "discovery")]
 const HEARD_REQUESTS_MAX: u8 = 3;
 
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Copy, Default)]
 struct HeardSenderState {
     undescribed: Option<(u64, u64)>,
@@ -1719,7 +1700,6 @@ struct HeardSenderState {
     retry_ms: u32,
 }
 
-#[cfg(feature = "discovery")]
 #[inline(never)]
 fn heard_slot(heard: &mut Vec<(RouterSideId, HeardSenderState)>, side: RouterSideId) -> &mut HeardSenderState {
     let index = match heard.iter().position(|(s, _)| *s == side) {
@@ -1732,7 +1712,6 @@ fn heard_slot(heard: &mut Vec<(RouterSideId, HeardSenderState)>, side: RouterSid
     &mut heard[index].1
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Default)]
 struct DiscoverySideThrottleState {
     next_topology_request_ms: u64,
@@ -1752,7 +1731,6 @@ struct DiscoverySideThrottleState {
     last_topology: Vec<TopologyBoardNode>,
 }
 
-#[cfg(feature = "discovery")]
 impl DiscoverySideThrottleState {
     #[inline]
     fn flag(&self, mask: u8) -> bool {
@@ -1814,13 +1792,12 @@ impl DiscoverySideThrottleState {
     }
 }
 
-#[cfg(all(feature = "discovery", feature = "timesync"))]
+#[cfg(feature = "timesync")]
 #[derive(Debug, Clone, Default)]
 struct TimeSyncSideThrottleState {
     next_allowed_ms: u64,
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryAdvertiseLevel {
     MinimalPing,
@@ -2147,14 +2124,8 @@ pub(crate) const fn endpoint_is_router_internal(endpoint: DataEndpoint) -> bool 
     if matches!(endpoint, DataEndpoint::TimeSync) {
         return true;
     }
-    #[cfg(feature = "discovery")]
     {
         discovery::is_discovery_endpoint(endpoint)
-    }
-    #[cfg(not(feature = "discovery"))]
-    {
-        let _ = endpoint;
-        false
     }
 }
 
@@ -2350,7 +2321,6 @@ pub enum AddressAssignmentMode {
 
 impl AddressAssignmentMode {
     #[inline]
-    #[cfg(feature = "discovery")]
     fn mode_code(self) -> u8 {
         match self {
             Self::Dynamic => 0,
@@ -2397,7 +2367,6 @@ pub struct AddressBookEntry {
     pub last_seen_ms: u64,
 }
 
-#[cfg(feature = "discovery")]
 struct PreparedAddressRecords {
     peer: Option<Box<AddressBookEntry>>,
     local: Option<Box<AddressBookEntry>>,
@@ -2544,10 +2513,8 @@ pub struct RouterConfig {
     /// End-to-end cryptography behavior for user data.
     e2e_encryption: RouterE2eEncryptionMode,
     /// Application-defined key id passed to the cryptography provider.
-    #[cfg_attr(not(feature = "cryptography"), allow(dead_code))]
     e2e_key_id: u32,
     memory: RuntimeMemoryConfig,
-    #[cfg(feature = "discovery")]
     preferred_discovery_master: Option<Arc<str>>,
     #[cfg(feature = "timesync")]
     timesync: Option<TimeSyncConfig>,
@@ -2566,19 +2533,11 @@ impl RouterConfig {
             .unwrap_or_else(|| Arc::from(runtime_device_identifier()))
     }
 
-    /// Default router E2E mode for this build.
+    /// Default router E2E mode.
     ///
-    /// Builds with cryptography prefer encrypted payloads automatically for data types that request
-    /// it. Minimal builds without cryptography stay disabled and reject `RequireOn` traffic.
+    /// Routers prefer encrypted payloads automatically for data types that request it.
     pub fn default_e2e_encryption_mode() -> RouterE2eEncryptionMode {
-        #[cfg(feature = "cryptography")]
-        {
-            RouterE2eEncryptionMode::Preferred
-        }
-        #[cfg(not(feature = "cryptography"))]
-        {
-            RouterE2eEncryptionMode::Disabled
-        }
+        RouterE2eEncryptionMode::Preferred
     }
 
     /// Create a new router configuration with the specified local endpoint handlers.
@@ -2603,7 +2562,6 @@ impl RouterConfig {
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
             memory: RuntimeMemoryConfig::default(),
-            #[cfg(feature = "discovery")]
             preferred_discovery_master: None,
             #[cfg(feature = "timesync")]
             timesync: None,
@@ -2682,7 +2640,6 @@ impl RouterConfig {
     /// All routers in a deployment should use the same preference. If that
     /// router is absent, normal topology-based election is used. Discovery
     /// leadership remains independent from time-sync source priority.
-    #[cfg(feature = "discovery")]
     pub fn with_preferred_discovery_master<S: AsRef<str>>(mut self, hostname: S) -> Self {
         let hostname = hostname.as_ref();
         self.preferred_discovery_master = if hostname.is_empty() {
@@ -2724,7 +2681,6 @@ impl RouterConfig {
         self.e2e_encryption
     }
 
-    #[cfg(feature = "cryptography")]
     #[inline]
     fn e2e_key_id(&self) -> u32 {
         self.e2e_key_id
@@ -2754,7 +2710,6 @@ impl Default for RouterConfig {
             e2e_encryption: Self::default_e2e_encryption_mode(),
             e2e_key_id: 0,
             memory: RuntimeMemoryConfig::default(),
-            #[cfg(feature = "discovery")]
             preferred_discovery_master: None,
             #[cfg(feature = "timesync")]
             timesync: None,
@@ -2803,7 +2758,6 @@ impl ActiveRoutingConfig {
                 cfg.e2e_encryption()
             })
     }
-    #[cfg(feature = "cryptography")]
     fn e2e_key_id(&self) -> u32 {
         self.local.as_ref().map_or(0, |cfg| cfg.e2e_key_id())
     }
@@ -3014,7 +2968,6 @@ impl ManagedTypes {
     fn len(&self) -> usize {
         self.set.len()
     }
-    #[cfg(feature = "discovery")]
     fn iter(&self) -> impl Iterator<Item = &u32> + '_ {
         self.set.iter()
     }
@@ -3043,7 +2996,7 @@ struct LocalServicesState {
     managed_registration_epoch: u64,
     #[cfg(feature="std")]
     managed_cache_epoch: u64,
-    #[cfg(all(feature="std",feature="discovery"))]
+    #[cfg(feature = "std")]
     managed_registration_dirty: bool,
     managed_variable_types: ManagedTypes,
     managed_variable_permissions: OrdMap<u32, NetworkVariablePermissions>,
@@ -3077,9 +3030,7 @@ struct ForwardedReceiptCache {
 /// A relay answers a duplicate whose every owner already acknowledged at most
 /// this many times per packet, once per reliable retransmit interval, with at
 /// most `FORWARDED_RECEIPT_REPLAY_OWNERS` cached receipts each time.
-#[cfg(feature = "discovery")]
 const FORWARDED_RECEIPT_REPLAY_MAX: u8 = 4;
-#[cfg(feature = "discovery")]
 const FORWARDED_RECEIPT_REPLAY_OWNERS: usize = 4;
 
 // A send leaf borrows proof of the existing side gate; it never re-enters it.
@@ -3095,14 +3046,13 @@ pub(crate) mod fair_tag_test_switch {
     pub(crate) fn disabled() -> bool {
         DISABLED.with(Cell::get)
     }
-    #[cfg(feature = "discovery")]
     pub(crate) fn set_disabled(disabled: bool) {
         DISABLED.with(|cell| cell.set(disabled));
     }
 }
 
 /// Counts cached route plans that tests re-derived and confirmed.
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 pub(crate) mod route_plan_test_counter {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static VERIFIED: AtomicUsize = AtomicUsize::new(0);
@@ -3136,11 +3086,9 @@ pub(crate) mod plain_transit_test_switch {
         });
     }
     /// Frames that took the plain receive and send paths on this thread.
-    #[cfg(feature = "discovery")]
     pub(crate) fn taken() -> [usize; 2] {
         TAKEN.with(Cell::get)
     }
-    #[cfg(feature = "discovery")]
     pub(crate) fn set_disabled(disabled: bool) {
         DISABLED.with(|cell| cell.set(disabled));
     }
@@ -3306,7 +3254,6 @@ struct Tracked<T> {
 }
 
 impl<T> Tracked<T> {
-    #[cfg(feature = "discovery")]
     #[inline]
     fn generation(&self) -> u32 {
         self.generation
@@ -3329,15 +3276,11 @@ impl<T> DerefMut for Tracked<T> {
     }
 }
 
-/// A queued send's payload-codec reservation (none without compression).
-#[cfg(feature = "compression")]
+/// A queued send's payload-codec reservation, if it holds one.
 type SideReservation<'a> = Option<crate::payload_codec::QueueReservation<'a, RouterInner>>;
-#[cfg(not(feature = "compression"))]
-type SideReservation<'a> = ();
 
 /// A route plan's sides; a cached plan needs no allocation.
 enum PlannedSides {
-    #[cfg(feature = "discovery")]
     One(Option<RouterSideId>),
     Many(Vec<RouterSideId>),
 }
@@ -3345,7 +3288,6 @@ enum PlannedSides {
 impl PlannedSides {
     fn as_slice(&self) -> &[RouterSideId] {
         match self {
-            #[cfg(feature = "discovery")]
             Self::One(side) => side.as_slice(),
             Self::Many(sides) => sides,
         }
@@ -3359,7 +3301,6 @@ type TypedRouteOverrides = RouterMap<(Option<RouterSideId>, u32, RouterSideId), 
 
 /// Everything a cacheable route plan depends on besides the frame and the
 /// clock: the schema, discovered routes, sides and route policies.
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct RoutePlanFingerprint {
     schema: u32,
@@ -3374,7 +3315,6 @@ struct RoutePlanFingerprint {
 /// The frame facts a cacheable route plan is keyed by: an untargeted best
 /// effort application frame with at most `ROUTE_PLAN_KEY_ENDPOINTS` distinct
 /// endpoints.
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct RoutePlanKey {
     ty: u32,
@@ -3385,27 +3325,21 @@ struct RoutePlanKey {
     target_count: u8,
 }
 
-#[cfg(feature = "discovery")]
 const ROUTE_PLAN_KEY_TARGETS: usize = 4;
 
 /// A frame's endpoint set: its encoded ID list, or else its sorted distinct
 /// endpoints. One set in two forms only misses the cache.
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RoutePlanEndpoints {
     Encoded([u8; ROUTE_PLAN_KEY_LIST_BYTES], u8),
     List([u32; ROUTE_PLAN_KEY_ENDPOINTS], u8),
 }
 
-#[cfg(feature = "discovery")]
 const ROUTE_PLAN_KEY_LIST_BYTES: usize = 16;
 
-#[cfg(feature = "discovery")]
 const ROUTE_PLAN_KEY_ENDPOINTS: usize = 4;
-#[cfg(feature = "discovery")]
 const ROUTE_PLAN_SLOTS: usize = 4;
 
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy)]
 struct RoutePlanEntry {
     key: RoutePlanKey,
@@ -3422,14 +3356,12 @@ struct RoutePlanEntry {
 /// had at most one candidate is kept, so serving it again skips no cursor,
 /// weight, or adaptive-statistics update. See
 /// `Router::remote_side_plan_with_selection`.
-#[cfg(feature = "discovery")]
 #[derive(Default)]
 struct RoutePlanCache {
     entries: [Option<RoutePlanEntry>; ROUTE_PLAN_SLOTS],
     next: u8,
 }
 
-#[cfg(feature = "discovery")]
 impl RoutePlanCache {
     fn lookup(
         &self,
@@ -3467,7 +3399,6 @@ impl RoutePlanCache {
 /// Any mutable access invalidates the cached charge. The only exception is
 /// [`DiscoveryRoutes::touch`], for liveness timestamps, which cannot change
 /// it.
-#[cfg(feature = "discovery")]
 #[derive(Default)]
 struct DiscoveryRoutes {
     map: RouterMap<RouterSideId, DiscoverySideState>,
@@ -3477,7 +3408,6 @@ struct DiscoveryRoutes {
     generation: u32,
 }
 
-#[cfg(feature = "discovery")]
 impl core::ops::Deref for DiscoveryRoutes {
     type Target = RouterMap<RouterSideId, DiscoverySideState>;
     fn deref(&self) -> &Self::Target {
@@ -3485,7 +3415,6 @@ impl core::ops::Deref for DiscoveryRoutes {
     }
 }
 
-#[cfg(feature = "discovery")]
 impl core::ops::DerefMut for DiscoveryRoutes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.cost.set(None);
@@ -3494,7 +3423,6 @@ impl core::ops::DerefMut for DiscoveryRoutes {
     }
 }
 
-#[cfg(feature = "discovery")]
 impl<'a> IntoIterator for &'a DiscoveryRoutes {
     type Item = <&'a RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::Item;
     type IntoIter = <&'a RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::IntoIter;
@@ -3503,7 +3431,6 @@ impl<'a> IntoIterator for &'a DiscoveryRoutes {
     }
 }
 
-#[cfg(feature = "discovery")]
 impl<'a> IntoIterator for &'a mut DiscoveryRoutes {
     type Item = <&'a mut RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::Item;
     type IntoIter = <&'a mut RouterMap<RouterSideId, DiscoverySideState> as IntoIterator>::IntoIter;
@@ -3514,7 +3441,6 @@ impl<'a> IntoIterator for &'a mut DiscoveryRoutes {
     }
 }
 
-#[cfg(feature = "discovery")]
 impl DiscoveryRoutes {
     fn byte_cost(&self) -> usize {
         if let Some(cost) = self.cost.get() {
@@ -3582,7 +3508,6 @@ struct RouterInner {
     #[cfg(feature = "std")]
     p2p_revision: u64,
 
-    #[cfg(feature = "compression")]
     codec_reserved_bytes: usize,
     memory: RuntimeMemoryConfig,
     sides: Tracked<Vec<Option<RouterSide>>>,
@@ -3644,7 +3569,6 @@ struct RouterInner {
     forwarded_receipts: Tracked<Option<Box<ForwardedReceiptCache>>>,
     /// `Router::sender_hash` of the current sender, kept with the core state
     /// so route plans can depend on it.
-    #[cfg(feature = "discovery")]
     local_sender_hash: u64,
     end_to_end_reliable_tx: OrdMap<u64, Box<EndToEndReliableSent>>,
     end_to_end_reliable_tx_order: VecDeque<u64>,
@@ -3653,25 +3577,18 @@ struct RouterInner {
     reliable_exhausted: crate::diagnostics::ReliableExhaustionCounts,
     #[cfg(feature = "std")]
     exhausted_recent: VecDeque<crate::diagnostics::ExhaustedReliable>,
-    #[cfg(feature = "discovery")]
     discovery_routes: DiscoveryRoutes,
-    #[cfg(feature = "discovery")]
     route_plans: RoutePlanCache,
-    #[cfg(feature = "discovery")]
     discovery_cadence: DiscoveryCadenceState,
-    #[cfg(feature = "discovery")]
     discovery_side_throttle: RouterMap<RouterSideId, DiscoverySideThrottleState>,
     /// Per side, filled only once data is heard there: a sender no fresh
     /// discovery describes (its name hash and when), so baseline recovery asks
     /// that side for topology; and the last compact sender found described (so
     /// the same sender is not re-checked for a second).
-    #[cfg(feature = "discovery")]
     discovery_heard: Vec<(RouterSideId, HeardSenderState)>,
-    #[cfg(feature = "discovery")]
     schema_response_sequence: u64,
-    #[cfg(feature = "discovery")]
     preferred_discovery_master: Option<Arc<str>>,
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     timesync_side_throttle: RouterMap<RouterSideId, TimeSyncSideThrottleState>,
 }
 #[derive(Debug, Clone)]
@@ -3685,12 +3602,10 @@ struct ManagedVariableCacheEntry {
     // is its own or it never wrote one. A writer answers requests with its
     // own value, never with a value it received.
     own: Option<Box<Packet>>,
-    #[cfg(feature = "discovery")]
     cached_at_ms: u64,
     // First actual ingress for this logical observation. Unlike the bounded
     // ACK return cache, this remains with a quiet stable value. Zero is only
     // the Option niche; a side index is represented by checked index + 1.
-    #[cfg(feature = "discovery")]
     upstream: Option<core::num::NonZeroUsize>,
 }
 
@@ -3771,7 +3686,6 @@ enum RouterQueueKind {
     Transmit,
 }
 
-#[cfg(feature = "compression")]
 impl crate::payload_codec::QueueBudget for RouterInner {
     fn codec_reserved(&mut self) -> &mut usize {
         &mut self.codec_reserved_bytes
@@ -3814,7 +3728,6 @@ impl RouterInner {
             .map_or(0, |local| local.managed_variable_latest.len())
     }
 
-    #[cfg(all(feature = "compression", feature = "discovery"))]
     fn reclaim_codec_metadata(&mut self) -> bool {
         self.side_transport.values_mut().any(|transport| {
             transport
@@ -3827,7 +3740,6 @@ impl RouterInner {
     /// lock prevents another producer taking the checked expanded byte credit.
     /// A refused optional preparation leaves the original accepted work owned;
     /// dispatch will backpressure it until the required decoder scratch fits.
-    #[cfg(feature = "compression")]
     fn prepare_codec_queue_owner(&mut self, side: Option<usize>, data: &mut RouterItem) {
         let RouterItem::Packed(bytes) = data else {
             return;
@@ -3836,17 +3748,11 @@ impl RouterInner {
             return;
         }
         let capable = {
-            #[cfg(feature = "discovery")]
             {
                 side.and_then(|side| self.side_transport.get(&side))
                     .is_some_and(|transport| {
                         transport.payload_codec.retention_can_stay_compressed()
                     })
-            }
-            #[cfg(not(feature = "discovery"))]
-            {
-                let _ = side;
-                false
             }
         };
         if capable {
@@ -3878,7 +3784,6 @@ impl RouterInner {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn schema_response_owner(item: &RouterTxItem) -> Option<(RouterSideId, u64)> {
         match item {
             RouterTxItem::ToSide { dst, data, .. }
@@ -3890,7 +3795,6 @@ impl RouterInner {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn schema_response_owner_lost(
         responses: &mut RouterMap<RouterSideId, DiscoverySideThrottleState>,
         owner: Option<(RouterSideId, u64)>,
@@ -3916,10 +3820,8 @@ impl RouterInner {
     {
         let hop = &mut self.reliable_tx;
         let end = &mut self.end_to_end_reliable_tx;
-        #[cfg(feature = "discovery")]
         let responses = &mut self.discovery_side_throttle;
         self.transmit_queue.retain_observed(keep, |evicted| {
-            #[cfg(feature = "discovery")]
             Self::schema_response_owner_lost(responses, Self::schema_response_owner(&evicted.item));
             if let Some(key) = evicted.item.replay_marker_key() {
                 Self::set_replay_queued(hop, end, key, false);
@@ -4398,7 +4300,6 @@ impl RouterInner {
         Self::pick_bulk_victim(rx, tx)
     }
 
-    #[cfg(feature = "discovery")]
     fn topology_board_byte_cost(board: &TopologyBoardNode) -> usize {
         board
             .sender_id
@@ -4414,7 +4315,6 @@ impl RouterInner {
             .saturating_add(board.connections.iter().map(|s| s.len()).sum::<usize>())
     }
 
-    #[cfg(feature = "discovery")]
     fn discovery_sender_byte_cost(sender: &str, state: &DiscoverySenderState) -> usize {
         sender
             .len()
@@ -4445,7 +4345,6 @@ impl RouterInner {
             .saturating_add(crate::peer_record::allocation_bytes::<DiscoverySenderState>())
     }
 
-    #[cfg(feature = "discovery")]
     fn discovery_route_byte_cost(side: RouterSideId, route: &DiscoverySideState) -> usize {
         size_of::<RouterSideId>()
             .saturating_add(size_of::<DiscoverySideState>())
@@ -4471,7 +4370,6 @@ impl RouterInner {
             .saturating_add(side.saturating_sub(side))
     }
 
-    #[cfg(feature = "discovery")]
     fn discovery_bytes_used(&self) -> usize {
         self.discovery_routes.byte_cost()
     }
@@ -4480,7 +4378,6 @@ impl RouterInner {
     fn reliable_rx_buffered_bytes(&self) -> usize {
         self.reliable_rx.iter().map(|((_side, _ty), state)| {
             let bytes = state.buffered.values().map(|bytes| size_of::<crate::SharedBytes>() + bytes.len()).sum::<usize>();
-            #[cfg(feature = "discovery")]
             {
                 // Charge the added tag/token on every RX row, including ordinary
                 // traffic, plus the finite reserved Schema protocol row.
@@ -4488,8 +4385,6 @@ impl RouterInner {
                     usize::from(is_bound_network_control(DataType(*_ty)) && state.control_mode != ControlRxMode::HopWindow)
                         .saturating_mul(CONTROL_RX_ROW_LOGICAL_BYTES))
             }
-            #[cfg(not(feature = "discovery"))]
-            { bytes }
         }).sum()
     }
 
@@ -4536,7 +4431,6 @@ impl RouterInner {
     // transfers are retryable and must yield before accepted transit is evicted
     // merely to publish required network metadata. Inspect retained ownership
     // fields only: no partial-frame parser, clocks or registry access here.
-    #[cfg(feature = "discovery")]
     fn reclaim_unannounced_incomplete_chunk(&mut self) -> bool {
         let mut victim = None;
         for (&side, state) in &self.side_transport {
@@ -4661,16 +4555,11 @@ impl RouterInner {
         #[cfg(not(feature="std"))]
         {
         let codec_bytes = {
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             {
                 self.side_transport
                     .values()
                     .map(|side| side.payload_codec.heap_bytes())
                     .sum::<usize>()
-            }
-            #[cfg(not(all(feature = "compression", feature = "discovery")))]
-            {
-                0usize
             }
         };
         let completion_bytes = {
@@ -4703,13 +4592,8 @@ impl RouterInner {
                     .saturating_add(self.reliable_rx_buffered_bytes())
                     .saturating_add(crate::config::schema_bytes_used())
                     .saturating_add({
-                        #[cfg(feature = "discovery")]
                         {
                             self.discovery_bytes_used()
-                        }
-                        #[cfg(not(feature = "discovery"))]
-                        {
-                            0
                         }
                     }),
             )
@@ -4718,16 +4602,11 @@ impl RouterInner {
     #[cfg(feature="std")]
     fn protected_metadata_bytes_with_schema(&self, schema_bytes: impl FnOnce() -> usize) -> usize {
         let codec_bytes = {
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             {
                 self.side_transport
                     .values()
                     .map(|side| side.payload_codec.heap_bytes())
                     .sum::<usize>()
-            }
-            #[cfg(not(all(feature = "compression", feature = "discovery")))]
-            {
-                0usize
             }
         };
         let completion_bytes = {
@@ -4760,13 +4639,8 @@ impl RouterInner {
                     .saturating_add(self.reliable_rx_buffered_bytes())
                     .saturating_add(schema_bytes())
                     .saturating_add({
-                        #[cfg(feature = "discovery")]
                         {
                             self.discovery_bytes_used()
-                        }
-                        #[cfg(not(feature = "discovery"))]
-                        {
-                            0
                         }
                     }),
             )
@@ -4780,13 +4654,8 @@ impl RouterInner {
             .saturating_add(self.side_chunk_bytes_used())
             .saturating_add(self.protected_metadata_bytes_used())
             .saturating_add({
-                #[cfg(feature = "compression")]
                 {
                     self.codec_reserved_bytes
-                }
-                #[cfg(not(feature = "compression"))]
-                {
-                    0
                 }
             })
     }
@@ -4839,7 +4708,6 @@ impl RouterInner {
                 let Some(item) = self.transmit_queue.remove_pos(index) else {
                     return false;
                 };
-                #[cfg(feature = "discovery")]
                 Self::schema_response_owner_lost(
                     &mut self.discovery_side_throttle,
                     Self::schema_response_owner(&item.item),
@@ -4941,12 +4809,10 @@ impl RouterInner {
         while self.shared_queue_bytes_used().saturating_add(incoming_cost)
             > self.memory.max_queue_budget
         {
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             if self.reclaim_codec_metadata() {
                 continue;
             }
 
-            #[cfg(feature = "discovery")]
             if incoming_priority >= 200
                 && _incoming.is_some_and(|data| match data {
                     // Only a positively known network-maintenance packet gets
@@ -5018,7 +4884,6 @@ impl RouterInner {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn schema_growth_budget(&self) -> usize {
         // Queued packets are reclaimable. Existing reachability and active
         // reliable reassembly remain protected when admitting a new schema.
@@ -5028,19 +4893,13 @@ impl RouterInner {
             .saturating_add(self.discovery_bytes_used())
             .saturating_add(self.reliable_rx_buffered_bytes())
             .saturating_add({
-                #[cfg(feature = "compression")]
                 {
                     self.codec_reserved_bytes
-                }
-                #[cfg(not(feature = "compression"))]
-                {
-                    0
                 }
             });
         self.memory.max_queue_budget.saturating_sub(protected)
     }
 
-    #[cfg(feature = "discovery")]
     fn cancel_managed_refresh_side(&mut self, side: RouterSideId) {
         for (&ingress, route) in &mut self.discovery_routes {
             for request in &mut route.requested_network_variables {
@@ -5064,7 +4923,6 @@ impl RouterInner {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn commit_discovery_route(
         &mut self,
         side: RouterSideId,
@@ -5081,10 +4939,8 @@ impl RouterInner {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn fit_discovery_budget(&mut self) {
         while self.shared_queue_bytes_used() > self.memory.max_queue_budget {
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             if self.reclaim_codec_metadata() {
                 continue;
             }
@@ -5258,7 +5114,6 @@ impl RouterInner {
         if item.disposable & TX_LATEST_PENDING != 0 && !self.latest_entry_eligible(&item) {
             item.disposable &= !TX_LATEST_PENDING;
         }
-        #[cfg(feature = "compression")]
         match &mut item.item {
             RouterTxItem::Broadcast(data) => self.prepare_codec_queue_owner(None, data),
             RouterTxItem::ToSide { dst, data, .. } => {
@@ -5349,7 +5204,6 @@ impl RouterInner {
         if replay.is_some_and(|key| self.replay_is_queued(key).is_none_or(|queued| queued)) {
             return Ok(());
         }
-        #[cfg(feature = "discovery")]
         if let RouterTxItem::ToSide { dst, data, .. } = &item.item {
             // A new timestamp for the same catalog must not replace the
             // queued packet: a chunked side may already have sent its prefix.
@@ -5398,7 +5252,6 @@ impl RouterInner {
         )?;
         let reliable_tx = &mut self.reliable_tx;
         let end_to_end = &mut self.end_to_end_reliable_tx;
-        #[cfg(feature = "discovery")]
         let responses = &mut self.discovery_side_throttle;
         let result = {
             #[cfg(any(feature = "std", feature = "fair-admission"))]
@@ -5426,7 +5279,6 @@ impl RouterInner {
                         }
                     },
                     |evicted: TxQueued| {
-                        #[cfg(feature = "discovery")]
                         Self::schema_response_owner_lost(
                             responses,
                             Self::schema_response_owner(&evicted.item),
@@ -5444,7 +5296,6 @@ impl RouterInner {
                     |queued| queued.priority,
                     |queue, _| Self::transmit_eviction_candidate(queue),
                     |evicted: TxQueued| {
-                        #[cfg(feature = "discovery")]
                         Self::schema_response_owner_lost(
                             responses,
                             Self::schema_response_owner(&evicted.item),
@@ -5513,9 +5364,7 @@ impl RouterInner {
             .or_insert_with(|| ReliableRxState {
                 expected_seq: 1,
                 buffered: Default::default(),
-                #[cfg(feature = "discovery")]
                 control_mode: ControlRxMode::HopWindow,
-                #[cfg(feature = "discovery")]
                 control_token: 0,
             });
         if rx_state.buffered.len() >= runtime_reliable_max_pending() {
@@ -5769,14 +5618,12 @@ enum RemoteSidePlan {
     Target(Vec<RouterSideId>),
 }
 
-#[cfg(feature = "discovery")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DiscoveryCandidateMatch {
     side: RouterSideId,
     overlap: usize,
 }
 
-#[cfg(feature = "discovery")]
 #[inline]
 const fn discovery_is_hop_local_advertisement(ty: DataType, transparent: bool) -> bool {
     matches!(
@@ -5788,10 +5635,6 @@ const fn discovery_is_hop_local_advertisement(ty: DataType, transparent: bool) -
     ) || (matches!(ty, DataType::DiscoveryAddress) && !transparent)
 }
 
-#[cfg(not(feature = "discovery"))]
-const fn discovery_is_hop_local_advertisement(_ty: DataType, _transparent: bool) -> bool {
-    false
-}
 
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -5855,7 +5698,6 @@ fn is_internal_control_type(ty: DataType) -> bool {
         return true;
     }
 
-    #[cfg(feature = "discovery")]
     if discovery::is_discovery_type(ty) {
         return true;
     }
@@ -5908,7 +5750,6 @@ fn with_retries(
 }
 /// Router implementation
 impl Router {
-    #[cfg(feature = "discovery")]
     const END_TO_END_ACK_SENDER: &'static str = "E2EACK";
     const END_TO_END_ACK_PREFIX: &'static str = "E2EACK:";
 
@@ -5948,16 +5789,13 @@ impl Router {
         attempts: usize,
         now_ms: u64,
     ) {
-        #[cfg(not(feature = "discovery"))]
-        let _ = now_ms;
-        #[cfg(feature = "discovery")]
         if ty == crate::DataType::DiscoveryAnnounce
             && !relayed
             && let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
         {
             throttle.last_liveness_tx_ms = now_ms;
         }
-        #[cfg(all(feature = "discovery", feature = "timesync"))]
+        #[cfg(feature = "timesync")]
         if Self::is_timesync_type(ty) {
             let now = now_ms;
             if Self::side_is_slow_control_link_locked(st, side, now) {
@@ -6010,8 +5848,6 @@ impl Router {
         source_side: Option<RouterSideId>,
         local: bool,
     ) -> TelemetryResult<()> {
-        #[cfg(not(feature = "discovery"))]
-        let _ = source_side;
         let sender_address = pkt
             .sender()
             .strip_prefix("@addr:")
@@ -6048,7 +5884,6 @@ impl Router {
             // returning this exact source observation. That is not a new
             // application revision and must not replay update side effects.
             let changed = existing.is_none_or(|entry| entry.packet.packet_id() != pkt.packet_id());
-            #[cfg(feature = "discovery")]
             let upstream = existing
                 .filter(|_| !changed)
                 .and_then(|entry| entry.upstream)
@@ -6065,9 +5900,7 @@ impl Router {
                 sender_address,
                 packet_is_own,
                 own,
-                #[cfg(feature = "discovery")]
                 cached_at_ms: self.clock.now_ms(),
-                #[cfg(feature = "discovery")]
                 upstream,
             };
             st.local_services.as_mut().expect("local services enabled").note_managed_cache();
@@ -6134,7 +5967,6 @@ impl Router {
             .map(|entry| entry.packet.clone())
     }
 
-    #[cfg(feature = "discovery")]
     fn managed_variable_latest_with_age(&self, ty: DataType) -> Option<(Packet, u64)> {
         let now_ms = self.clock.now_ms();
         let st = self.state.lock();
@@ -6177,7 +6009,6 @@ impl Router {
         Self::managed_variable_permissions_locked(&st, ty).read
     }
 
-    #[cfg(feature = "discovery")]
     fn can_write_managed_variable(&self, ty: DataType) -> bool {
         let st = self.state.lock();
         Self::managed_variable_permissions_locked(&st, ty).write
@@ -6249,7 +6080,6 @@ impl Router {
         true
     }
 
-    #[cfg(feature = "discovery")]
     fn has_typed_route_overrides_locked(
         st: &RouterInner,
         src: Option<RouterSideId>,
@@ -6260,7 +6090,6 @@ impl Router {
             .any(|(typed_src, typed_ty, _)| *typed_src == src && *typed_ty == ty.as_u32())
     }
 
-    #[cfg(feature = "discovery")]
     fn endpoint_overlap_count<I>(reachable: I, eps: &[DataEndpoint]) -> usize
     where
         I: IntoIterator<Item = DataEndpoint>,
@@ -6275,7 +6104,6 @@ impl Router {
     }
 
     #[inline]
-    #[cfg(feature = "discovery")]
     fn preferred_scoring_endpoints<'a>(
         &self,
         eps: &'a [DataEndpoint],
@@ -6364,7 +6192,6 @@ impl Router {
         {
             return Ok(false);
         }
-        #[cfg(feature = "discovery")]
         if Self::prune_discovery_routes_locked(st, now) {
             Self::note_discovery_topology_change_locked(st, now);
             crate::memory_admission::allow_drain(
@@ -6413,7 +6240,6 @@ impl Router {
                 | DataType::ReliablePartialAck
                 | DataType::ReliablePacketRequest,
             ) => true,
-            #[cfg(feature = "discovery")]
             Some(ty) => self.cfg.role.local_services() && discovery::is_discovery_type(ty),
             _ => false,
         }
@@ -6757,7 +6583,6 @@ impl Router {
         for entry in st.address_book.values() {
             consider(entry.hostname.as_ref());
         }
-        #[cfg(feature = "discovery")]
         for route in st.discovery_routes.values() {
             for (announcer, state) in &route.announcers {
                 consider(announcer);
@@ -6777,7 +6602,6 @@ impl Router {
         if collision { None } else { found }
     }
 
-    #[cfg(feature = "discovery")]
     fn address_mode_from_code(mode: u8, requested: NodeAddress) -> AddressAssignmentMode {
         match mode {
             2 => AddressAssignmentMode::Static(if requested == 0 { 1 } else { requested }),
@@ -6786,7 +6610,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn address_winner_pref(entry: &AddressBookEntry) -> (u8, core::cmp::Reverse<u64>, u64) {
         let rank = match entry.mode {
             AddressAssignmentMode::Static(_) => 2,
@@ -6800,7 +6623,6 @@ impl Router {
         )
     }
 
-    #[cfg(feature = "discovery")]
     fn identity_winner_pref(entry: &AddressBookEntry) -> (core::cmp::Reverse<u64>, u64) {
         (
             core::cmp::Reverse(entry.birth_ms),
@@ -6808,7 +6630,6 @@ impl Router {
         )
     }
 
-    #[cfg(feature = "discovery")]
     fn allocate_free_address_locked(st: &RouterInner, seed: NodeAddress) -> NodeAddress {
         let mut candidate = if seed == 0 { 1 } else { seed };
         for _ in 0..u32::MAX {
@@ -6823,7 +6644,6 @@ impl Router {
         1
     }
 
-    #[cfg(feature = "discovery")]
     fn unique_hostname_locked(st: &RouterInner, base: &str, owner_hash: u64) -> String {
         if !st.address_book.contains_key(base) && st.local_address.hostname.as_ref() != base {
             return base.to_string();
@@ -6869,11 +6689,9 @@ impl Router {
         st.address_book.insert(local.hostname.to_string(), record);
         st.local_address = local.clone();
         *self.sender.lock() = local.hostname.clone();
-        #[cfg(feature = "discovery")]
         {
             st.local_sender_hash = Self::sender_hash(local.hostname.as_ref());
         }
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(st, self.clock.now_ms());
         Ok(AddressChange {
             old_hostname: old.hostname,
@@ -6891,7 +6709,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn local_address_advertisement(
         &self,
         reachable_endpoints: Vec<DataEndpoint>,
@@ -6916,7 +6733,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn prepare_address_record(
         st: &RouterInner,
         ad: &discovery::AddressAdvertisement,
@@ -6954,7 +6770,7 @@ impl Router {
         Ok(PreparedAddressRecords { peer, local: spare })
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync", test))]
+    #[cfg(all(feature = "timesync", test))]
     fn ingest_address_advertisement(
         &self,
         ad: discovery::AddressAdvertisement,
@@ -6963,7 +6779,6 @@ impl Router {
         self.ingest_prepared_address(ad, prepared)
     }
 
-    #[cfg(feature = "discovery")]
     fn ingest_prepared_address(
         &self,
         ad: discovery::AddressAdvertisement,
@@ -7081,7 +6896,6 @@ impl Router {
     }
 
     #[inline]
-    #[cfg(feature = "discovery")]
     fn is_end_to_end_ack_sender(sender: &str) -> bool {
         sender == Self::END_TO_END_ACK_SENDER || sender.starts_with(Self::END_TO_END_ACK_PREFIX)
     }
@@ -7120,7 +6934,6 @@ impl Router {
         crate::diag_text::concat(&[Self::END_TO_END_ACK_PREFIX, &sender])
     }
 
-    #[cfg(feature = "discovery")]
     fn is_end_to_end_destination_sender(&self, sender: &str) -> bool {
         sender != self.sender_arc().as_ref() && !Self::is_end_to_end_ack_sender(sender)
     }
@@ -7978,7 +7791,6 @@ impl Router {
         true
     }
 
-    #[cfg(feature = "discovery")]
     fn remember_end_to_end_reliable_tx_locked(st: &mut RouterInner, packet_id: u64) {
         let cap = runtime_reliable_max_end_to_end_pending().max(1);
         st.end_to_end_reliable_tx_order
@@ -7993,7 +7805,6 @@ impl Router {
         st.end_to_end_reliable_tx_order.push_back(packet_id);
     }
 
-    #[cfg(feature = "discovery")]
     fn expected_end_to_end_destinations_locked(
         &self,
         st: &RouterInner,
@@ -8163,7 +7974,6 @@ impl Router {
         Ok(out)
     }
 
-    #[cfg(feature = "discovery")]
     #[allow(clippy::too_many_arguments)]
     fn discovered_route_candidates_locked(
         &self,
@@ -8262,7 +8072,6 @@ impl Router {
     /// must make this choice before adaptive weighting; otherwise an endpoint
     /// learned directly and through a remote bridge can be sent down either
     /// side with equal probability.
-    #[cfg(feature = "discovery")]
     fn retain_shortest_discovery_candidates_locked(
         st: &RouterInner,
         matches: &mut Vec<DiscoveryCandidateMatch>,
@@ -8369,7 +8178,6 @@ impl Router {
     /// Distinct endpoint roles are multicast destinations, not interchangeable
     /// paths. Pick one shortest path per role and reuse an already selected side
     /// when it covers that role; adaptive choice remains within redundant paths.
-    #[cfg(feature = "discovery")]
     fn select_endpoint_role_sides_locked(
         &self,
         st: &mut RouterInner,
@@ -8420,7 +8228,6 @@ impl Router {
         selected
     }
 
-    #[cfg(feature = "discovery")]
     fn select_discovered_candidate_sides_locked(
         &self,
         st: &mut RouterInner,
@@ -8520,7 +8327,6 @@ impl Router {
     /// forwarded-receipt cache): the receipt on its way back was lost. Send the
     /// cached receipts back toward the sender, at most once per reliable
     /// retransmit interval and `FORWARDED_RECEIPT_REPLAY_MAX` times per packet.
-    #[cfg(feature = "discovery")]
     fn replay_forwarded_receipts(
         &self,
         data: &RouterItem,
@@ -8612,14 +8418,12 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     /// For a transport that queues frames itself (a radio or CAN driver
     /// queue): `true` when `frame`, a reliable end-to-end copy this router
     /// handed to `side`, no longer needs sending because every destination
     /// owner behind that side has acknowledged it meanwhile. Call just before
     /// the physical write and drop the frame when `true`. Frames that are not
     /// reliable end-to-end copies, or cannot be parsed, return `false`.
-    #[cfg(feature = "discovery")]
     pub fn relayed_frame_satisfied(&self, side: RouterSideId, frame: &[u8]) -> bool {
         let Ok(Some(decoded)) = self.decode_side_transport_frame(side, frame) else {
             return false;
@@ -8631,7 +8435,6 @@ impl Router {
         is_reliable_type(ty) && self.relayed_copy_satisfied(side, &data, ty)
     }
 
-    #[cfg(feature = "discovery")]
     fn relayed_copy_satisfied(&self, side: RouterSideId, data: &RouterItem, ty: DataType) -> bool {
         let Ok((eps, _)) = self.item_route_info(data) else {
             return false;
@@ -8644,7 +8447,6 @@ impl Router {
             .is_empty()
     }
 
-    #[cfg(feature = "discovery")]
     fn filter_end_to_end_satisfied_sides_locked(
         &self,
         st: &RouterInner,
@@ -8722,7 +8524,6 @@ impl Router {
         filtered
     }
 
-    #[cfg(feature = "discovery")]
     fn reconcile_forwarded_receipts_locked(&self, st: &mut RouterInner) {
         if st.forwarded_receipts.is_none() {
             return;
@@ -8746,7 +8547,6 @@ impl Router {
         replays.retain(|id, _| destinations.contains_key(id));
     }
 
-    #[cfg(feature = "discovery")]
     fn register_end_to_end_reliable_tx(
         &self,
         data: &RouterItem,
@@ -8761,13 +8561,10 @@ impl Router {
             RouterItem::Packed(bytes) => wire_format::peek_routing_envelope_unchecked(bytes.as_ref())?.ty,
         };
         let mut st = self.state.lock();
-        #[cfg(feature = "discovery")]
         let mut pending_destinations = match destinations {
             Some(destinations) => destinations,
             None => self.expected_end_to_end_destinations_locked(&st, data, None, false, false)?,
         };
-        #[cfg(not(feature = "discovery"))]
-        let mut pending_destinations = destinations.unwrap_or_default();
         // Callers pass the destination map used to construct this frozen
         // contract. Re-filtering the same map allocates owner scratch and
         // instantiates a second tree-extraction path on small MCUs.
@@ -8817,7 +8614,6 @@ impl Router {
                 ty.as_u32()
             );
         }
-        #[cfg(feature = "compression")]
         let retained = match data {
             RouterItem::Packed(bytes) => RouterItem::Packed(
                 wire_format::payload_encoding_for_retention(
@@ -8829,8 +8625,6 @@ impl Router {
             ),
             packet => packet.clone(),
         };
-        #[cfg(not(feature = "compression"))]
-        let retained = data.clone();
         #[cfg(feature = "compact-packet-store")]
         let mut retained = retained;
         #[cfg(feature = "compact-packet-store")]
@@ -8937,7 +8731,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn reconcile_end_to_end_reliable_destinations_locked(
         &self,
         st: &mut RouterInner,
@@ -8987,7 +8780,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn active_end_to_end_destinations_locked(
         &self,
         st: &RouterInner,
@@ -9019,7 +8811,6 @@ impl Router {
         out
     }
 
-    #[cfg(feature = "discovery")]
     fn side_supports_end_to_end_tracking_locked(st: &RouterInner, side: RouterSideId) -> bool {
         matches!(
             st.sides
@@ -9031,7 +8822,6 @@ impl Router {
     }
 
     /// Owners a frame was frozen to (its wire target senders).
-    #[cfg(feature = "discovery")]
     fn frozen_owner_count(data: &RouterItem) -> usize {
         match data {
             RouterItem::Packet(packet) => packet.wire_target_senders().len(),
@@ -9040,7 +8830,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn filter_trackable_end_to_end_destinations_locked(
         &self,
         st: &RouterInner,
@@ -9060,7 +8849,6 @@ impl Router {
         });
     }
 
-    #[cfg(feature = "discovery")]
     fn side_has_multiple_announcers_locked(
         &self,
         st: &RouterInner,
@@ -9083,19 +8871,10 @@ impl Router {
             .unwrap_or(false)
     }
 
-    #[cfg(not(feature = "discovery"))]
-    fn side_has_multiple_announcers_locked(
-        &self,
-        _st: &RouterInner,
-        _side: RouterSideId,
-        _now_ms: u64,
-    ) -> bool {
-        false
-    }
 
     // Preserve the existing private route-fixture helper; production guarded
     // receives use the token-bound atomic handoff below.
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     fn queue_end_to_end_reliable_ack(
         &self,
         pkt: &Packet,
@@ -9795,15 +9574,8 @@ impl Router {
     }
 
     fn e2e_crypto_supported(&self) -> bool {
-        #[cfg(feature = "cryptography")]
-        {
-            self.cfg.e2e_encryption() != RouterE2eEncryptionMode::Disabled
-                && crate::crypto::registered_crypto_available()
-        }
-        #[cfg(not(feature = "cryptography"))]
-        {
-            false
-        }
+        self.cfg.e2e_encryption() != RouterE2eEncryptionMode::Disabled
+            && crate::crypto::registered_crypto_available()
     }
 
     fn should_require_e2e_for_type(&self, ty: DataType) -> bool {
@@ -9832,7 +9604,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "cryptography")]
     fn e2e_seal_config_for_type(&self, ty: DataType) -> Option<wire_format::E2eSealConfig> {
         if self.should_require_e2e_for_type(ty) && self.e2e_crypto_supported() {
             Some(wire_format::E2eSealConfig {
@@ -9849,12 +9620,8 @@ impl Router {
         pkt: &Packet,
         reliable: Option<wire_format::ReliableHeader>,
     ) -> TelemetryResult<crate::SharedBytes> {
-        #[cfg(feature = "compression")]
         {
-            #[cfg(feature = "cryptography")]
             let e2e = self.e2e_seal_config_for_type(pkt.data_type());
-            #[cfg(not(feature = "cryptography"))]
-            let e2e = None;
             let reliable = reliable.or_else(|| {
                 is_reliable_type(pkt.data_type()).then_some(wire_format::ReliableHeader {
                     flags: wire_format::RELIABLE_FLAG_UNSEQUENCED,
@@ -9871,26 +9638,6 @@ impl Router {
             )
             .map(crate::shared_bytes::convert)
         }
-        #[cfg(not(feature = "compression"))]
-        {
-            #[cfg(feature = "cryptography")]
-            if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
-                return (wire_format::pack_packet_with_wire_contract_e2e(
-                    pkt,
-                    reliable,
-                    pkt.wire_shape(),
-                    pkt.wire_target_senders(),
-                    e2e,
-                ))
-                .map(crate::shared_bytes::convert);
-            }
-            Ok(match reliable {
-                Some(hdr) => {
-                    crate::shared_bytes::convert(wire_format::pack_packet_with_reliable(pkt, hdr))
-                }
-                None => crate::shared_bytes::convert(wire_format::pack_packet(pkt)),
-            })
-        }
     }
 
     #[inline]
@@ -9901,34 +9648,13 @@ impl Router {
         shape: Option<MessageElement>,
         target_senders: &[u64],
     ) -> TelemetryResult<crate::SharedBytes> {
-        #[cfg(feature = "compression")]
         {
-            #[cfg(feature = "cryptography")]
             let e2e = self.e2e_seal_config_for_type(pkt.data_type());
-            #[cfg(not(feature = "cryptography"))]
-            let e2e = None;
             wire_format::pack_routed_packet(pkt, reliable, shape, target_senders, e2e)
-                .map(crate::shared_bytes::convert)
-        }
-        #[cfg(not(feature = "compression"))]
-        {
-            #[cfg(feature = "cryptography")]
-            if let Some(e2e) = self.e2e_seal_config_for_type(pkt.data_type()) {
-                return (wire_format::pack_packet_with_wire_contract_e2e(
-                    pkt,
-                    reliable,
-                    shape,
-                    target_senders,
-                    e2e,
-                ))
-                .map(crate::shared_bytes::convert);
-            }
-            wire_format::pack_packet_with_wire_contract(pkt, reliable, shape, target_senders)
                 .map(crate::shared_bytes::convert)
         }
     }
 
-    #[cfg(feature = "cryptography")]
     #[inline]
     fn prepare_packed_for_remote(
         &self,
@@ -9972,7 +9698,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn item_target_senders<'a>(
         &self,
         data: &'a RouterItem,
@@ -10110,7 +9835,6 @@ impl Router {
             )?;
             return Ok(None);
         }
-        #[cfg(feature = "discovery")]
         let destinations = {
             let st = self.state.lock();
             let upstream = st
@@ -10125,11 +9849,7 @@ impl Router {
             }
             pending
         };
-        #[cfg(feature = "discovery")]
         let targets: Vec<u64> = destinations.keys().copied().collect();
-        #[cfg(not(feature = "discovery"))]
-        let targets: Vec<u64> = Vec::new();
-        #[cfg(feature = "discovery")]
         if targets.is_empty() {
             if self.packet_has_local_delivery(&pkt) {
                 self.queue_end_to_end_reliable_ack_for_packet_id(
@@ -10149,19 +9869,12 @@ impl Router {
         let forwarded = self.pack_packet_for_contract(&pkt, reliable, shape, &targets)?;
         let downstream_id = wire_format::packet_id_from_wire_unchecked(forwarded.as_ref())?;
         let forwarded = RouterItem::Packed(forwarded);
-        #[cfg(feature = "discovery")]
         let already_pending = self
             .state
             .lock()
             .end_to_end_reliable_tx
             .contains_key(&downstream_id);
-        #[cfg(feature = "discovery")]
         let ready = self.register_end_to_end_reliable_tx(&forwarded, Some(destinations))?;
-        #[cfg(not(feature = "discovery"))]
-        let (ready, already_pending) = {
-            let _ = called_from_queue;
-            (true, false)
-        };
         #[cfg(feature = "std")]
         if reliable_trace_enabled() {
             eprintln!(
@@ -10201,7 +9914,6 @@ impl Router {
         Ok((ready && !already_pending).then_some(forwarded))
     }
 
-    #[cfg(feature = "discovery")]
     fn side_matches_target_senders_locked(
         st: &RouterInner,
         side: RouterSideId,
@@ -10285,32 +9997,14 @@ impl Router {
         data: &RouterItem,
         exclude: Option<RouterSideId>,
     ) -> TelemetryResult<bool> {
-        #[cfg(feature = "discovery")]
         {
             let RemoteSidePlan::Target(sides) =
                 self.remote_side_plan_with_selection(data, exclude, false)?;
             Ok(!sides.is_empty())
         }
 
-        #[cfg(not(feature = "discovery"))]
-        {
-            let (eps, ty) = self.item_route_info(data)?;
-            if !(has_nonlocal_endpoint(&eps, &self.cfg) || force_remote_for_type(ty)) {
-                return Ok(false);
-            }
-            let st = self.state.lock();
-            Ok(!self
-                .eligible_side_ids_locked(
-                    &st,
-                    exclude,
-                    Some(ty),
-                    Self::endpoints_are_link_local_only(&eps),
-                )
-                .is_empty())
-        }
     }
 
-    #[cfg(feature = "discovery")]
     fn has_explicit_route_policy_locked(
         st: &RouterInner,
         src: Option<RouterSideId>,
@@ -10334,7 +10028,6 @@ impl Router {
     /// receipt state the plan of a reliable type depends on; `None` when the
     /// plan may depend on more than the frame's type, endpoints, owner
     /// contract and ingress side (see `remote_side_plan_with_selection`).
-    #[cfg(feature = "discovery")]
     fn route_plan_key(
         data: &RouterItem,
         exclude: Option<RouterSideId>,
@@ -10353,7 +10046,6 @@ impl Router {
         Some((key, receipt))
     }
 
-    #[cfg(feature = "discovery")]
     fn route_plan_key_for(
         env: &wire_format::RoutingEnvelope<'_>,
         exclude: Option<RouterSideId>,
@@ -10393,7 +10085,6 @@ impl Router {
         })
     }
 
-    #[cfg(feature = "discovery")]
     fn route_plan_fingerprint(st: &RouterInner) -> RoutePlanFingerprint {
         RoutePlanFingerprint {
             schema: crate::config::schema_generation(),
@@ -10407,7 +10098,6 @@ impl Router {
 
     /// Whether a reliable packet's plan is free of receipt filtering: no
     /// owner behind this router has acknowledged it yet.
-    #[cfg(feature = "discovery")]
     fn receipts_unfiltered(st: &RouterInner, receipt: Option<u64>) -> bool {
         receipt.is_none_or(|packet_id| {
             st.forwarded_receipts
@@ -10418,7 +10108,6 @@ impl Router {
 
     /// Serve a plain transit frame's plan from `route_plans` under a held
     /// lock. Managed variables keep their per-call owner checks.
-    #[cfg(feature = "discovery")]
     fn cached_route_plan_locked(
         st: &RouterInner,
         key: &RoutePlanKey,
@@ -10447,7 +10136,6 @@ impl Router {
         exclude: Option<RouterSideId>,
         select_routes: bool,
     ) -> TelemetryResult<RemoteSidePlan> {
-        #[cfg(feature = "discovery")]
         if let Some((key, receipt)) = Self::route_plan_key(data, exclude) {
             let now_ms = self.clock.now_ms();
             let fingerprint = {
@@ -10495,7 +10183,6 @@ impl Router {
         data: &RouterItem,
         exclude: Option<RouterSideId>,
     ) -> TelemetryResult<(PlannedSides, crate::lock::RouterMutexGuard<'_, RouterInner>)> {
-        #[cfg(feature = "discovery")]
         if let Some((key, receipt)) = Self::route_plan_key(data, exclude) {
             let now_ms = self.clock.now_ms();
             let st = self.state.lock();
@@ -10515,7 +10202,7 @@ impl Router {
 
     /// Tests recompute every cached plan the full way and require the same
     /// answer: the existing suite then exercises the cache's invalidation.
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     fn verify_cached_route_plan(
         &self,
         data: &RouterItem,
@@ -10544,13 +10231,11 @@ impl Router {
         select_routes: bool,
         pure: &core::cell::Cell<bool>,
     ) -> TelemetryResult<RemoteSidePlan> {
-        #[cfg(feature = "discovery")]
         let (eps, ty) = self.item_route_info(data)?;
         let select_sides = |state: &mut RouterInner, sides: Vec<RouterSideId>, origin| {
             if sides.len() > 1 {
                 pure.set(false);
             }
-            #[cfg(feature = "discovery")]
             let sides = self.filter_end_to_end_satisfied_sides_locked(state, data, sides, &eps, ty);
             if select_routes {
                 self.apply_route_selection_locked(state, exclude, sides, origin)
@@ -10558,7 +10243,6 @@ impl Router {
                 sides
             }
         };
-        #[cfg(feature = "discovery")]
         {
             let target_senders = self.item_target_senders(data)?;
             let resolve_beyond_local_hop =
@@ -10832,39 +10516,8 @@ impl Router {
                 }
             }
         }
-        #[cfg(not(feature = "discovery"))]
-        {
-            let ty = Self::item_data_type(data)?;
-            let mut st = self.state.lock();
-            if let Some(packet_id) = Self::reliable_control_target_packet_id(data)? {
-                let target_side = st
-                    .reliable_return_routes
-                    .get(&packet_id)
-                    .map(|route| route.side);
-                if let Some(side) = target_side
-                    .filter(|side| self.route_allowed_locked(&st, exclude, Some(ty), *side))
-                {
-                    return Ok(RemoteSidePlan::Target(vec![side]));
-                }
-                let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
-                return Ok(RemoteSidePlan::Target(
-                    if exclude.is_some() && sides.len() == 1 {
-                        sides
-                    } else {
-                        Vec::new()
-                    },
-                ));
-            }
-            let sides = self.eligible_side_ids_locked(&st, exclude, Some(ty), false);
-            Ok(RemoteSidePlan::Target(select_sides(
-                &mut st,
-                sides,
-                RouteSelectionOrigin::Flood,
-            )))
-        }
     }
 
-    #[cfg(feature = "discovery")]
     fn local_discovery_endpoints(&self, st: &RouterInner) -> Vec<DataEndpoint> {
         let mut eps: Vec<DataEndpoint> = self.cfg.handlers().iter().map(|h| h.endpoint).collect();
         // Managed-variable ownership has its own discovery field. Its message
@@ -10883,12 +10536,12 @@ impl Router {
         eps
     }
 
-    #[cfg(all(feature = "discovery", not(feature = "timesync")))]
+    #[cfg(not(feature = "timesync"))]
     fn local_discovery_timesync_sources(&self, _now_ms: u64) -> Vec<String> {
         Vec::new()
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     fn local_discovery_timesync_sources(&self, now_ms: u64) -> Vec<String> {
         #[cfg(feature = "timesync")]
         if self.timesync.is_none() {
@@ -10914,7 +10567,7 @@ impl Router {
         Vec::new()
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     fn preferred_timesync_route_source(
         &self,
         data: &RouterItem,
@@ -10953,7 +10606,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn note_discovery_topology_change_locked(st: &mut RouterInner, now_ms: u64) {
         st.wake_unroutable_parked();
         #[cfg(feature = "std")]
@@ -10981,7 +10633,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn sender_topology_board_mut<'a>(
         sender_state: &'a mut DiscoverySenderState,
         sender_id: &str,
@@ -10999,7 +10650,6 @@ impl Router {
         boards.last_mut().expect("inserted above")
     }
 
-    #[cfg(feature = "discovery")]
     fn refresh_sender_topology_state(sender_state: &mut DiscoverySenderState) {
         if let Some(boards) = Arc::get_mut(&mut sender_state.topology_boards) {
             discovery::normalize_topology_boards(boards);
@@ -11021,7 +10671,6 @@ impl Router {
         sender_state.reachable_timesync_sources = reachable_timesync_sources;
     }
 
-    #[cfg(feature = "discovery")]
     fn recompute_discovery_side_state(route: &mut DiscoverySideState) {
         let mut reachable = Vec::new();
         let mut reachable_network_variables = Vec::new();
@@ -11059,7 +10708,6 @@ impl Router {
         route.last_seen_ms = last_seen_ms;
     }
 
-    #[cfg(feature = "discovery")]
     fn local_discovery_topology_board(
         &self,
         st: &RouterInner,
@@ -11092,7 +10740,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn advertised_discovery_topology_for_link_locked(
         &self,
         st: &RouterInner,
@@ -11151,7 +10798,6 @@ impl Router {
     /// Remove `leaving` from every discovery route: its own announcer entry and
     /// every topology mention of it behind another announcer. Returns whether
     /// any route changed.
-    #[cfg(feature = "discovery")]
     fn remove_discovery_peer_locked(st: &mut RouterInner, leaving: &str) -> TelemetryResult<bool> {
         let before = st
             .discovery_routes
@@ -11175,7 +10821,6 @@ impl Router {
         Ok(*st.discovery_routes != before)
     }
 
-    #[cfg(feature = "discovery")]
     fn prune_discovery_routes_locked(st: &mut RouterInner, now_ms: u64) -> bool {
         // Polling runs at the firmware service rate, not the advertisement
         // rate. Never clone the topology just to discover nothing expired.
@@ -11219,7 +10864,6 @@ impl Router {
         changed
     }
 
-    #[cfg(feature = "discovery")]
     fn advertised_summaries_from_topology_locked(
         &self,
         st: &RouterInner,
@@ -11263,7 +10907,6 @@ impl Router {
         (endpoints, sources)
     }
 
-    #[cfg(feature = "discovery")]
     fn advertised_discovery_endpoints_for_link_locked(
         &self,
         st: &RouterInner,
@@ -11304,7 +10947,7 @@ impl Router {
             .collect()
     }
 
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     fn compact_summary_fixture(&self, endpoint: DataEndpoint) {
         let mut sender = DiscoverySenderState {
             advertised_reachable: vec![endpoint],
@@ -11327,7 +10970,6 @@ impl Router {
         self.state.lock().discovery_routes.insert(0, route);
     }
 
-    #[cfg(feature = "discovery")]
     fn advertised_discovery_timesync_sources_for_link_locked(
         &self,
         st: &RouterInner,
@@ -11354,7 +10996,6 @@ impl Router {
         sources
     }
 
-    #[cfg(feature = "discovery")]
     fn advertised_network_variables_for_link_locked(
         &self,
         st: &RouterInner,
@@ -11381,7 +11022,6 @@ impl Router {
         types
     }
 
-    #[cfg(feature = "discovery")]
     fn preferred_discovery_master_present_locked<'a>(
         &self,
         st: &'a RouterInner,
@@ -11421,7 +11061,6 @@ impl Router {
         None
     }
 
-    #[cfg(feature = "discovery")]
     fn discovery_master_sender_locked(&self, st: &RouterInner, now_ms: u64) -> String {
         if let Some(preferred) = self.preferred_discovery_master_present_locked(st, now_ms) {
             return preferred.to_string();
@@ -11430,7 +11069,7 @@ impl Router {
         discovery::elect_discovery_master(self.sender_arc().as_ref(), &boards)
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     #[inline]
     fn side_is_slow_control_link_locked(
         st: &RouterInner,
@@ -11448,7 +11087,6 @@ impl Router {
         })
     }
 
-    #[cfg(feature = "discovery")]
     fn discovery_level_for_side_locked(
         st: &mut RouterInner,
         side_id: RouterSideId,
@@ -11477,7 +11115,7 @@ impl Router {
         None
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     #[inline]
     fn is_timesync_type(ty: DataType) -> bool {
         matches!(
@@ -11486,7 +11124,7 @@ impl Router {
         )
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     #[inline(never)]
     fn timesync_allowed_for_side_locked(
         st: &RouterInner,
@@ -11507,7 +11145,7 @@ impl Router {
             .is_none_or(|throttle| now_ms >= throttle.next_allowed_ms)
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     fn filter_timesync_sides_locked(
         st: &RouterInner,
         ty: DataType,
@@ -11520,7 +11158,7 @@ impl Router {
             .collect()
     }
 
-    #[cfg(all(feature = "discovery", feature = "timesync"))]
+    #[cfg(feature = "timesync")]
     fn filter_timesync_matches_locked(
         st: &RouterInner,
         ty: DataType,
@@ -11533,7 +11171,6 @@ impl Router {
             .collect()
     }
 
-    #[cfg(feature = "discovery")]
     fn refresh_known_discovery_liveness(
         &self,
         pkt: &Packet,
@@ -11586,7 +11223,6 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(feature = "discovery")]
     fn refresh_known_address_payload(
         &self,
         payload: &[u8],
@@ -11663,7 +11299,6 @@ impl Router {
             entry.last_seen_ms = now;
         }
         Self::reconcile_unresolved_hop_alias_locked(&mut st,side,(ad.hostname,ad.address,ad.owner_hash),observed_source,now,&binding);
-        #[cfg(feature = "compression")]
         {
             drop(st);
             self.note_payload_codec_address(side, payload, true);
@@ -11671,7 +11306,6 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(feature="discovery")]
     fn reconcile_unresolved_hop_alias_locked(
         st:&mut RouterInner, side:RouterSideId, identity:(&str,u32,u64),
         observed_source:u32, now:u64, binding:&RouterTxHandlerFn,
@@ -11709,7 +11343,6 @@ impl Router {
         route.announcers.get_mut(alias).expect("same owner retains alias").has_hop_local_evidence=false;
     }
 
-    #[cfg(feature = "discovery")]
     fn queue_pressure_keepalives(
         &self,
         requested_side: Option<RouterSideId>,
@@ -11825,7 +11458,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn emit_discovery_snapshot(
         &self,
         called_from_queue: bool,
@@ -11842,7 +11474,6 @@ impl Router {
         )
     }
 
-    #[cfg(feature = "discovery")]
     fn emit_discovery_snapshot_on_side(
         &self,
         called_from_queue: bool,
@@ -11861,7 +11492,6 @@ impl Router {
         )
     }
 
-    #[cfg(feature = "discovery")]
     fn emit_discovery_snapshot_on_side_claimed(
         &self,
         called_from_queue: bool,
@@ -12282,7 +11912,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn emit_discovery_prefix_item(
         &self,
         item: RouterTxItem,
@@ -12321,7 +11950,6 @@ impl Router {
         })
     }
 
-    #[cfg(feature = "discovery")]
     fn queue_discovery_announce(
         &self,
         include_schema: bool,
@@ -12345,7 +11973,6 @@ impl Router {
         self.emit_discovery_snapshot(true, include_schema, true, skip_in_flight_sides)
     }
 
-    #[cfg(feature = "discovery")]
     fn missing_schema_request_targets(
         st: &RouterInner,
         side: RouterSideId,
@@ -12421,7 +12048,6 @@ impl Router {
     /// again at the baseline retry only makes the peer resend it on the link
     /// for nothing. Back that peer off (doubling per refusal); a lost catalog
     /// on a lossy link is not a refusal and keeps the baseline retry.
-    #[cfg(feature = "discovery")]
     fn note_schema_refused_locked(st: &mut RouterInner, side: RouterSideId, address: u32, now: u64) {
         let Some(route) = st.discovery_routes.get_mut(&side) else {
             return;
@@ -12438,7 +12064,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn note_schema_received(&self, side: RouterSideId, sender: &str) {
         let mut st = self.state.lock();
         // Schema snapshots can be forwarded. They must never introduce a new
@@ -12464,7 +12089,6 @@ impl Router {
 
     /// Claim one generation before building either its prefix or catalog.
     /// The phase byte fits existing throttle padding; no payload lives here.
-    #[cfg(feature = "discovery")]
     fn start_schema_response_generation(
         &self,
         side: RouterSideId,
@@ -12553,14 +12177,12 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(feature = "discovery")]
     fn admit_schema_response_catalog(&self, side: RouterSideId) -> TelemetryResult<bool> {
         self.admit_schema_response_catalog_with(side, || {
             discovery::build_discovery_schema(self.sender_arc().as_ref(), self.clock.now_ms())
         })
     }
 
-    #[cfg(feature = "discovery")]
     fn admit_schema_response_catalog_with(
         &self,
         side: RouterSideId,
@@ -12672,7 +12294,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn poll_schema_response_on_side(&self, side: RouterSideId) -> TelemetryResult<bool> {
         let waiting = {
             let st = self.state.lock();
@@ -12710,7 +12331,6 @@ impl Router {
 
     /// Whether a fresh announcer on `side` is `name`, or describes it (a
     /// topology board with endpoints).
-    #[cfg(feature = "discovery")]
     #[inline(never)]
     fn sender_described_locked(st: &RouterInner, side: RouterSideId, name: u64, now_ms: u64) -> bool {
         st.discovery_routes.get(&side).is_some_and(|route| {
@@ -12730,7 +12350,6 @@ impl Router {
     /// route aged out during a cut longer than the TTL): remember it so the
     /// next poll asks that side for topology instead of waiting for the
     /// sender's next discovery packet (R3-C: 4.7 s).
-    #[cfg(feature = "discovery")]
     #[inline(never)]
     fn note_heard_sender(&self, sender: &str, src: Option<RouterSideId>) {
         if src.is_none() || sender.starts_with("E2EACK:") {
@@ -12741,7 +12360,6 @@ impl Router {
             None => self.note_heard_name(Self::sender_hash(sender), src),
         }
     }
-    #[cfg(feature = "discovery")]
     #[inline(never)]
     fn note_heard_address(&self, address: u32, src: Option<RouterSideId>) {
         let Some(side) = src else { return };
@@ -12763,7 +12381,6 @@ impl Router {
         if slot.undescribed.is_none_or(|(old, _)| old != name) { slot.heard_requests = 0; }
         slot.undescribed = Some((name, now_ms));
     }
-    #[cfg(feature = "discovery")]
     #[inline(never)]
     fn note_heard_name(&self, name: u64, src: Option<RouterSideId>) {
         let Some(side) = src else { return };
@@ -12777,7 +12394,6 @@ impl Router {
         slot.undescribed = Some((name, now_ms));
     }
 
-    #[cfg(feature = "discovery")]
     fn poll_discovery_announce(&self) -> TelemetryResult<bool> {
         let now_ms = self.clock.now_ms();
         #[cfg(feature="std")]
@@ -13001,7 +12617,6 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(feature = "discovery")]
     fn learn_discovery_packet(
         &self,
         pkt: &Packet,
@@ -13013,7 +12628,6 @@ impl Router {
 
     // `handled` reports a locally emitted authoritative value, not whether a
     // fully decoded GET was admitted as a bounded network subscription.
-    #[cfg(feature = "discovery")]
     fn learn_discovery_packet_with_get_admission(
         &self, pkt:&Packet, src:Option<RouterSideId>, called_from_queue:bool,
         get_admitted:&mut bool,
@@ -13025,7 +12639,6 @@ impl Router {
         let Some(side) = src else {
             return Ok(true);
         };
-        #[cfg(feature = "compression")]
         self.note_payload_codec_packet(side, pkt, false);
         if self.refresh_known_discovery_liveness(pkt, side)? {
             return Ok(true);
@@ -13225,7 +12838,6 @@ impl Router {
                 return Err(err);
             }
             let mut st = self.state.lock();
-            #[cfg(feature = "compression")]
             if st.reclaim_codec_metadata() {
                 continue;
             }
@@ -13341,7 +12953,6 @@ impl Router {
                 let mut st=self.state.lock();
                 Self::reconcile_unresolved_hop_alias_locked(&mut st,side,(ad.hostname.as_str(),ad.address,ad.owner_hash),observed_source,now_ms,&binding);
             }
-            #[cfg(feature = "compression")]
             self.note_payload_codec_packet(side, pkt, true);
             for value in replay {
                 self.emit_internal_tx_with_priority(
@@ -13514,11 +13125,8 @@ impl Router {
         }
         #[cfg(feature = "std")]
         if pkt.data_type() == DataType::DiscoverySchema {
-            #[cfg(feature = "compression")]
             let snapshot =
                 self.decode_required_schema(|| discovery::decode_discovery_schema(pkt))?;
-            #[cfg(not(feature = "compression"))]
-            let snapshot = discovery::decode_discovery_schema(pkt)?;
             // The decoded snapshot contains the sender's complete schema, but
             // embedded targets retain only definitions that are not already
             // compiled into their local schema. Charging the complete wire
@@ -13539,7 +13147,6 @@ impl Router {
         }
         if pkt.data_type() == DataType::DiscoveryLinkCapabilities {
             let _ = discovery::decode_discovery_link_capabilities(pkt)?;
-            #[cfg(feature = "compression")]
             self.note_payload_codec_packet(side, pkt, true);
             return Ok(true);
         }
@@ -13560,7 +13167,6 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, now_ms);
                 self.reconcile_end_to_end_reliable_destinations_locked(&mut st)?;
             }
-            #[cfg(feature = "compression")]
             {
                 drop(st);
                 self.note_payload_codec_packet(side, pkt, true);
@@ -13663,15 +13269,6 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(not(feature = "discovery"))]
-    fn learn_discovery_packet(
-        &self,
-        _pkt: &Packet,
-        _src: Option<RouterSideId>,
-        _called_from_queue: bool,
-    ) -> TelemetryResult<bool> {
-        Ok(false)
-    }
 
     #[inline]
     fn reliable_key(side: RouterSideId, ty: DataType) -> (RouterSideId, u32) {
@@ -13707,9 +13304,7 @@ impl Router {
             .or_insert_with(|| ReliableRxState {
                 expected_seq: 1,
                 buffered: Default::default(),
-                #[cfg(feature = "discovery")]
                 control_mode: ControlRxMode::HopWindow,
-                #[cfg(feature = "discovery")]
                 control_token: 0,
             })
     }
@@ -13932,8 +13527,7 @@ impl Router {
     }
 
     #[allow(unused_mut)]
-    #[cfg(feature = "compression")]
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     fn send_queued_to_side(
         &self,
         side: RouterSideId,
@@ -13946,7 +13540,6 @@ impl Router {
         self.send_queued_to_side_with_progress(side, data, relayed, &mut false)
     }
 
-    #[cfg(feature = "compression")]
     fn send_queued_to_side_with_progress(
         &self,
         side: RouterSideId,
@@ -13965,7 +13558,6 @@ impl Router {
             EgressService::default(),
         )
     }
-    #[cfg(feature = "compression")]
     fn send_queued_to_side_with_service(
         &self,
         side: RouterSideId,
@@ -13992,7 +13584,7 @@ impl Router {
     }
 
     /// Fixture-only: real valid schema packet and real transport retention.
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     pub(crate) fn test_hold_schema_owner(&self, side: RouterSideId, at: u64)
         -> TelemetryResult<(u32, crate::SharedBytes)>
     {
@@ -14014,7 +13606,7 @@ impl Router {
         Ok(retained)
     }
 
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     pub(crate) fn test_schema_owner_current(&self, side: RouterSideId, original: &(u32,crate::SharedBytes)) -> bool {
         self.state.lock().reliable_tx.get(&(side,DataType::DiscoverySchema.as_u32()))
             .and_then(|stream|stream.sent.get(&original.0)).is_some_and(|sent|sent.bytes.as_ref()==original.1.as_ref())
@@ -14030,7 +13622,7 @@ impl Router {
         self.send_reliable_to_side_with_progress(side, data, relayed, &mut false)
     }
 
-    #[cfg(any(test, not(feature = "compression")))]
+    #[cfg(test)]
     fn send_reliable_to_side_with_progress(
         &self,
         side: RouterSideId,
@@ -14046,7 +13638,7 @@ impl Router {
             EgressService::default(),
         )
     }
-    #[cfg(any(test, not(feature = "compression")))]
+    #[cfg(test)]
     fn send_reliable_to_side_with_service(
         &self,
         side: RouterSideId,
@@ -14066,12 +13658,9 @@ impl Router {
         admitted: &mut bool,
         service: EgressService,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let side = admission.side;
-        #[cfg(feature = "discovery")]
         let schema_id = (Self::item_data_type(&data).ok() == Some(DataType::DiscoverySchema))
             .then(|| Self::get_hash(&data));
-        #[cfg(feature = "discovery")]
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
             if let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
@@ -14095,7 +13684,6 @@ impl Router {
             }
         }
         let result = self.send_reliable_to_admitted_side_impl(admission, data, relayed, admitted, service);
-        #[cfg(feature = "discovery")]
         if let Some(id) = schema_id {
             let mut st = self.state.lock();
             if let Some(throttle) = st.discovery_side_throttle.get_mut(&side)
@@ -14123,7 +13711,6 @@ impl Router {
             RouterItem::Packet(packet) => self.pack_packet_for_router(&packet,
                 Some(wire_format::ReliableHeader { flags, seq, ack: 0 })).map(Some),
             RouterItem::Packed(bytes) => {
-                #[cfg(feature="cryptography")]
                 if self.e2e_seal_config_for_type(ty).is_some() {
                     return self.prepare_packed_for_remote(bytes,
                         Some(Some(wire_format::ReliableHeader { flags, seq, ack: 0 }))).map(Some);
@@ -14199,10 +13786,7 @@ impl Router {
         };
         let end_to_end_ordered =
             addressed && matches!(reliable_mode(ty), crate::ReliableMode::Ordered);
-        #[cfg(feature = "discovery")]
         let announcer_bootstrap = discovery::is_announcer_bootstrap_type(ty) || discovery::is_periodic_discovery_request_type(ty);
-        #[cfg(not(feature = "discovery"))]
-        let announcer_bootstrap = false;
         let handler = admission.handler.clone();
         let opts = admission.opts.clone();
         let hop_reliable_enabled = opts.reliable_enabled
@@ -14214,7 +13798,7 @@ impl Router {
                 !self.side_has_multiple_announcers_locked(&st, side, self.clock.now_ms())
             };
 
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         managed_order_side_gate_causal::observe(self,"hop_decision",|| serde_json::json!({"side":side,"data":managed_order_side_gate_causal::data_meta(&data),"addressed":addressed,"end_to_end_ordered":end_to_end_ordered,"hop_reliable":hop_reliable_enabled}));
 
         if !matches!(
@@ -14258,7 +13842,6 @@ impl Router {
             return Ok(());
         }
 
-        #[cfg(feature = "compression")]
         let data = match data {
             RouterItem::Packed(bytes) => {
                 let budget = self.state.lock().memory.max_queue_budget;
@@ -14536,7 +14119,6 @@ impl Router {
         SideTransportFrames::split(frame, max_frame_bytes, self.sender_arc().as_bytes())
     }
 
-    #[cfg(all(feature = "compression", feature = "discovery"))]
     fn note_payload_codec_packet(&self, side: RouterSideId, pkt: &Packet, accepted: bool) {
         let now = self.clock.now_ms();
         let mut st = self.state.lock();
@@ -14576,7 +14158,6 @@ impl Router {
             transport.payload_codec.evict(now, DISCOVERY_ROUTE_TTL_MS);
         }
     }
-    #[cfg(all(feature = "compression", feature = "discovery"))]
     fn note_payload_codec_address(&self, side: RouterSideId, payload: &[u8], accepted: bool) {
         let now = self.clock.now_ms();
         let mut st = self.state.lock();
@@ -14608,7 +14189,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "compression")]
     fn payload_for_transport_side(
         &self,
         side: RouterSideId,
@@ -14617,22 +14197,15 @@ impl Router {
         self.payload_for_transport_side_at(side, raw, self.clock.now_ms())
     }
 
-    #[cfg(feature = "compression")]
     fn payload_for_transport_side_at(
         &self,
         side: RouterSideId,
         raw: crate::SharedBytes,
         now_ms: u64,
     ) -> TelemetryResult<crate::SharedBytes> {
-        #[cfg(not(feature = "discovery"))]
-        let _ = (side, now_ms);
         let (allowed, budget) = {
-            #[cfg(feature = "discovery")]
             let mut st = self.state.lock();
-            #[cfg(not(feature = "discovery"))]
-            let st = self.state.lock();
             let budget = st.memory.max_queue_budget;
-            #[cfg(feature = "discovery")]
             let allowed = {
                 let transport = st
                     .side_transport
@@ -14646,8 +14219,6 @@ impl Router {
                 }
                 transport.payload_codec.allowed(now_ms)
             };
-            #[cfg(not(feature = "discovery"))]
-            let allowed = false;
             (allowed, budget)
         };
         Ok(
@@ -14661,7 +14232,6 @@ impl Router {
     /// Persist an admitted downgrade in the queue owner before a handler can
     /// backpressure it. Retrying retained traffic must not need fresh decoder
     /// scratch merely to reproduce the same already-admitted plaintext frame.
-    #[cfg(feature = "compression")]
     fn prepare_queued_payload(
         &self,
         side: RouterSideId,
@@ -14674,17 +14244,12 @@ impl Router {
             return Ok(None);
         }
         let capable = {
-            #[cfg(feature = "discovery")]
             {
                 self.state
                     .lock()
                     .side_transport
                     .get(&side)
                     .is_some_and(|transport| transport.payload_codec.allowed(self.clock.now_ms()))
-            }
-            #[cfg(not(feature = "discovery"))]
-            {
-                false
             }
         };
         if capable {
@@ -14730,9 +14295,7 @@ impl Router {
         raw: crate::SharedBytes,
         known_reliable: Option<bool>,
     ) -> TelemetryResult<SideTransportFrames> {
-        #[cfg(any(feature = "compression", feature = "discovery"))]
         let now_ms = self.clock.now_ms();
-        #[cfg(feature = "compression")]
         let raw = self.payload_for_transport_side_at(side, raw, now_ms)?;
         if !opts.header_template_enabled && opts.max_frame_bytes == 0 {
             return Ok(SideTransportFrames::single(raw));
@@ -14805,13 +14368,8 @@ impl Router {
         // independent producers. Do not build owned templates or wrap
         // canonical bytes when no dictionary can be used.
         let without_dictionary = opts.max_side_transport_templates == 0 || {
-            #[cfg(feature = "discovery")]
             {
                 self.side_has_multiple_announcers_locked(&st, side, now_ms)
-            }
-            #[cfg(not(feature = "discovery"))]
-            {
-                self.side_has_multiple_announcers_locked(&st, side, 0)
             }
         };
         if without_dictionary || reliable {
@@ -14872,11 +14430,7 @@ impl Router {
          * capacity advertised by a live peer on this side. Template
          * IDs otherwise outlive entries on a smaller receiver and
          * later compact values are silently undecodable. */
-        #[cfg(feature = "discovery")]
         let mut effective_template_limit = opts.max_side_transport_templates;
-        #[cfg(not(feature = "discovery"))]
-        let effective_template_limit = opts.max_side_transport_templates;
-        #[cfg(feature = "discovery")]
         {
             /* Template ids are small and side-local, so a receiver cannot
              * tell two producers' templates apart. Use templates only once
@@ -14960,10 +14514,7 @@ impl Router {
                 let mut base = side_state.tx_last_timestamps.get(&id).copied().unwrap_or(timestamp);
                 let compact_uses = side_state.tx_compact_uses.entry(id).or_default();
                 // Discovery must bootstrap even when a receiver lost its dictionary.
-                #[cfg(feature = "discovery")]
                 let discovery_refresh = discovery::is_discovery_type(_ty);
-                #[cfg(not(feature = "discovery"))]
-                let discovery_refresh = false;
                 // Compact timestamps are deltas from the template's base,
                 // which only a FULL frame sets; a delta that no longer fits
                 // moves the base, in a new generation, with the next (now
@@ -15117,7 +14668,6 @@ impl Router {
     fn expire_side_chunks_locked(st: &mut RouterInner, now: u64) {
         for side in st.side_transport.values_mut() {
             let side = side.as_mut();
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             side.payload_codec.expire(now, DISCOVERY_ROUTE_TTL_MS);
             let reclaimed =
                 SideChunkAssembly::expire(&mut side.rx_chunks, &mut side.rx_chunk_bytes, now);
@@ -15128,7 +14678,6 @@ impl Router {
     // A validated frame from a previously discovered direct peer proves that
     // its link is alive, even when allocation admission refuses its payload.
     // Update existing timestamps only: no allocation, schema merge or new route.
-    #[cfg(feature = "discovery")]
     fn refresh_ingress_peer_liveness<'a>(
         &self,
         side: RouterSideId,
@@ -15136,7 +14685,6 @@ impl Router {
     ) -> Option<wire_format::RoutingFrameInfo<'a>> {
         let frame = wire_format::peek_routing_frame_info_unchecked(bytes).ok()?;
         self.refresh_peer_liveness(side, frame.envelope.source_address);
-        #[cfg(feature = "compression")]
         if frame.envelope.ty == crate::DataType::DiscoveryAddress
             && let Ok(Some((_, payload))) =
                 wire_format::peek_plain_discovery_payload_unchecked(bytes, crate::DataType::DiscoveryAddress)
@@ -15146,7 +14694,6 @@ impl Router {
         Some(frame)
     }
 
-    #[cfg(feature = "discovery")]
     #[cfg_attr(not(feature = "std"), inline(never))]
     fn refresh_peer_liveness(&self, side: RouterSideId, address: u32) {
         let now = self.clock.now_ms();
@@ -15154,9 +14701,7 @@ impl Router {
         Self::refresh_peer_liveness_locked(&mut st, side, address, now);
     }
 
-    #[cfg(feature = "discovery")]
     fn refresh_peer_liveness_locked(st: &mut RouterInner, side: RouterSideId, address: u32, now: u64) {
-        #[cfg(feature = "compression")]
         if let Some(transport) = st.side_transport.get_mut(&side) {
             transport
                 .payload_codec
@@ -15195,7 +14740,6 @@ impl Router {
     /// Consume only an exact unsequenced topology retry on its ingress link.
     /// CRC, shape, payload length and reliable-header restrictions are checked
     /// before this path; it cannot bypass receipts, update a graph or allocate.
-    #[cfg(feature = "discovery")]
     fn consume_known_packed_topology(
         &self,
         side: RouterSideId,
@@ -15235,7 +14779,7 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(all(feature = "discovery", not(feature = "std")))]
+    #[cfg(not(feature = "std"))]
     fn consume_known_packed_schema(
         &self,
         side: RouterSideId,
@@ -15260,7 +14804,6 @@ impl Router {
         Ok(true)
     }
 
-    #[cfg(all(feature = "compression", feature = "discovery"))]
     fn decode_required_schema<T>(
         &self,
         mut decode: impl FnMut() -> TelemetryResult<T>,
@@ -15277,15 +14820,12 @@ impl Router {
         }
     }
 
-    #[cfg(all(feature = "discovery", not(feature = "std")))]
+    #[cfg(not(feature = "std"))]
     #[inline(never)]
     fn merge_schema_changes(&self, payload: &[u8]) -> TelemetryResult<()> {
         // Validate the entire catalog, then materialize only changed entries.
         // Packed and already-decoded ingress share one atomic budgeted merge.
-        #[cfg(feature = "compression")]
         let snapshot = self.decode_required_schema(|| discovery::decode_schema_changes(payload))?;
-        #[cfg(not(feature = "compression"))]
-        let snapshot = discovery::decode_schema_changes(payload)?;
         let mut st = self.state.lock();
         let budget = st.schema_growth_budget();
         let report = crate::config::merge_owned_schema_snapshot_with_budget(snapshot, budget)?;
@@ -15299,10 +14839,7 @@ impl Router {
     /// positively known behind its ingress. Unknown/stale routes, runtime
     /// schema changes, managed state, hop receipts and explicit policies keep
     /// the ordinary receive path. No payload copy, queue slot or ACK is owned.
-    #[cfg(all(
-        feature = "discovery",
-        any(feature = "std", feature = "ingress-target-filter")
-    ))]
+    #[cfg(any(feature = "std", feature = "ingress-target-filter"))]
     fn targets_only_ingress(
         &self,
         side: RouterSideId,
@@ -15361,7 +14898,6 @@ impl Router {
 
     // A two-sided, fully warmed packed bridge needs no new large metadata.
     // Re-check before dispatch: schemas/templates/routes can change while queued.
-    #[cfg(feature = "discovery")]
     fn cached_transit_ready(
         &self,
         side: RouterSideId,
@@ -15453,7 +14989,6 @@ impl Router {
             if id == side {
                 continue;
             }
-            #[cfg(feature = "discovery")]
             if !st.discovery_routes.get(&id).is_some_and(|route| {
                 self.clock.now_ms().saturating_sub(route.last_seen_ms) <= DISCOVERY_ROUTE_TTL_MS
                     && frame
@@ -15492,15 +15027,6 @@ impl Router {
             }
         }
         Ok(true)
-    }
-    #[cfg(not(feature = "discovery"))]
-    fn cached_transit_ready(
-        &self,
-        _side: RouterSideId,
-        _bytes: &[u8],
-        _view: Option<&wire_format::RoutingFrameInfo<'_>>,
-    ) -> TelemetryResult<bool> {
-        Ok(false)
     }
     #[cfg(any(feature = "std", feature = "fair-admission"))]
     fn reclaim_for_receive(&self, bytes: &[u8], victim: &mut Option<(u32, u8)>) -> bool {
@@ -15549,7 +15075,6 @@ impl Router {
             && self.cached_transit_ready(side, bytes, view)?
         {
             let result = crate::memory_admission::check_cached_transit(bytes.len());
-            #[cfg(all(feature = "compression", feature = "discovery"))]
             let result = {
                 let mut result = result;
                 while matches!(result, Err(TelemetryError::Io("memory pressure")))
@@ -15579,7 +15104,6 @@ impl Router {
             loop {
                 match crate::memory_admission::check_receive_with_role(bytes, managed) {
                     Err(TelemetryError::Io("memory pressure")) => {
-                        #[cfg(all(feature = "compression", feature = "discovery"))]
                         if self.state.lock().reclaim_codec_metadata() {
                             continue;
                         }
@@ -15621,7 +15145,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     fn consume_known_packed_discovery(
         &self,
         side: RouterSideId,
@@ -15660,7 +15183,6 @@ impl Router {
         result
     }
 
-    #[cfg(any(test, feature = "discovery"))]
     fn decode_side_transport_frame(
         &self,
         side: RouterSideId,
@@ -15738,18 +15260,11 @@ impl Router {
             if !crc_verified {
                 wire_format::verify_frame_crc(bytes)?;
             }
-            #[cfg(feature = "discovery")]
             if self.consume_known_packed_discovery(side, bytes)? {
                 return Ok(None);
             }
-            #[cfg(feature = "discovery")]
             let view = self.refresh_ingress_peer_liveness(side, bytes);
-            #[cfg(not(feature = "discovery"))]
-            let view = None;
-            #[cfg(all(
-                feature = "discovery",
-                any(feature = "std", feature = "ingress-target-filter")
-            ))]
+            #[cfg(any(feature = "std", feature = "ingress-target-filter"))]
             if bytes.first().is_some_and(|flags| flags & 0x10 == 0)
                 && view
                     .as_ref()
@@ -15776,14 +15291,10 @@ impl Router {
                     .and_then(|entry| entry.as_ref())
                     .map(|side| side.opts.header_template_enabled)
                     .unwrap_or(false);
-                #[cfg(feature = "discovery")]
                 if self.consume_known_packed_discovery(side, view_bytes)? {
                     return Ok(None);
                 }
-                #[cfg(feature = "discovery")]
                 let view = self.refresh_ingress_peer_liveness(side, view_bytes);
-                #[cfg(not(feature = "discovery"))]
-                let view = None;
                 self.admit_received_frame_with_view(side, view_bytes, view.as_ref())?;
                 let raw = crate::side_transport::canonical_from_full_view(view_bytes);
                 if header_templates_enabled
@@ -15890,7 +15401,6 @@ impl Router {
                 // keeps its known peer alive.
                 let frame = admitted
                     .and_then(|()| reconstruct_side_compact_frame(&template, bytes, off, base));
-                #[cfg(feature = "discovery")]
                 if !matches!(frame, Err(TelemetryError::Unpack(_)))
                     && let Some(address) = template.source_address()
                 {
@@ -15916,7 +15426,6 @@ impl Router {
                     let now_ms = self.clock.now_ms();
                     // A refusal discards the assembly; name a refused catalog's
                     // sender from its first chunk (this one or the retained one).
-                    #[cfg(feature = "discovery")]
                     let refused_schema = if index == 0 {
                         wire_format::chunked_schema_source(payload)
                     } else {
@@ -15928,7 +15437,6 @@ impl Router {
                     };
                     let room =
                         st.make_side_chunk_room(side, transfer_id, index, total, payload.len());
-                    #[cfg(feature = "discovery")]
                     if let (Err(TelemetryError::PacketTooLarge(_)), Some(address)) =
                         (&room, refused_schema)
                     {
@@ -16067,7 +15575,7 @@ impl Router {
         }
     }
 
-    #[cfg(all(test, feature = "std", feature = "discovery"))]
+    #[cfg(all(test, feature = "std"))]
     fn call_side_tx_handler(
         &self,
         side: RouterSideId,
@@ -16086,7 +15594,7 @@ impl Router {
             && packet.data_size() > max_frame_bytes
     }
 
-    #[cfg(all(test, feature = "std", feature = "discovery"))]
+    #[cfg(all(test, feature = "std"))]
     fn call_side_tx_handler_with_progress(
         &self,
         side: RouterSideId,
@@ -16104,7 +15612,7 @@ impl Router {
             EgressService::default(),
         )
     }
-    #[cfg(all(test, feature = "std", feature = "discovery"))]
+    #[cfg(all(test, feature = "std"))]
     fn call_side_tx_handler_with_service(
         &self,
         side: RouterSideId,
@@ -16132,7 +15640,7 @@ impl Router {
         // Type and priority share one CRC-validated envelope in this call.
         let (ty, priority) = self.item_service_type_priority(data)?;
         // Only time sync frames are throttled per side; others skip the lock.
-        #[cfg(all(feature = "discovery", feature = "timesync"))]
+        #[cfg(feature = "timesync")]
         if Self::is_timesync_type(ty)
             && !Self::timesync_allowed_for_side_locked(
                 &self.state.lock(),
@@ -16166,10 +15674,7 @@ impl Router {
                 packed @ (RouterTxHandlerFn::Packed(_) | RouterTxHandlerFn::PackedWithPriority(_)),
                 RouterItem::Packed(bytes),
             ) => {
-                #[cfg(feature = "cryptography")]
                 let send_bytes = self.prepare_packed_for_remote(bytes.clone(), None)?;
-                #[cfg(not(feature = "cryptography"))]
-                let send_bytes = bytes.clone();
                 let frames = self.encode_side_transport_frames(side, opts, send_bytes)?;
                 let PackedFrameOutcome { result, attempts_total, sent_bytes } =
                     self.offer_packed_side_frames(
@@ -16395,10 +15900,7 @@ impl Router {
     /// failed, as before.
     fn install_hop_probe(&self, side: RouterSideId, ty: DataType, probe: u32,
         first: &crate::SharedBytes, now: u64) {
-        #[cfg(feature = "cryptography")]
         let sealed = self.e2e_seal_config_for_type(ty).is_some();
-        #[cfg(not(feature = "cryptography"))]
-        let sealed = false;
         let renumbered = if sealed {
             None
         } else {
@@ -16589,13 +16091,11 @@ impl Router {
         #[cfg(feature = "std")]
         let progress = self.retry_write_progress();
         {
-            #[cfg_attr(not(feature = "discovery"), allow(unused_mut))]
             let mut st = self.state.lock();
             if st.reliable_tx.is_empty() && st.end_to_end_reliable_tx.is_empty() {
                 // No hop history: the hop service returns at once. No pending
                 // delivery: drained-write progress matches nothing and no
                 // ordered successor can be released; only pruning remains.
-                #[cfg(feature = "discovery")]
                 if Self::prune_discovery_routes_locked(&mut st, now) {
                     Self::note_discovery_topology_change_locked(&mut st, now);
                     crate::memory_admission::allow_drain(
@@ -16623,7 +16123,6 @@ impl Router {
         // Ordered types whose exhausted head was a segment proxy's cohort,
         // with the owners that missed it (see below).
         let mut proxy_gaps: Vec<(u32, Vec<u64>)> = Vec::new();
-        #[cfg(feature = "discovery")]
         let mut silenced: Vec<u64> = Vec::new();
         #[cfg(feature = "std")]
         let (drained, held) = progress;
@@ -16640,7 +16139,6 @@ impl Router {
                     sent.last_send_ms = sent.last_send_ms.max(at);
                 }
             }
-            #[cfg(feature = "discovery")]
             {
                 if Self::prune_discovery_routes_locked(&mut st, now) {
                     Self::note_discovery_topology_change_locked(&mut st, now);
@@ -16689,7 +16187,6 @@ impl Router {
                     // exhaustion, with the owners that missed it, is what the
                     // application re-sends from, e.g. the station's Aborted
                     // FLIGHT_STATE) and never an ABORT or urgent frame.
-                    #[cfg(feature = "discovery")]
                     if sent.ordered_type.is_none()
                         && !Self::item_data_type(&sent.data)
                             .is_ok_and(|ty| crate::type_is_urgent(ty) || *ty.as_str() == *"ABORT")
@@ -16711,15 +16208,9 @@ impl Router {
                         // this one. The gap belongs only to the owners that
                         // missed it: they are retired from the tail below,
                         // the others receive it in order.
-                        #[cfg(feature = "discovery")]
                         let proxied = reliable_return_routes
                             .get(&packet_id)
                             .is_some_and(|route| route.upstream_contract.is_some());
-                        #[cfg(not(feature = "discovery"))]
-                        let proxied = {
-                            let _ = &reliable_return_routes;
-                            false
-                        };
                         if proxied {
                             let owners = sent.pending_destinations.keys().copied().collect();
                             proxy_gaps.push((ty, owners));
@@ -16757,13 +16248,11 @@ impl Router {
             // A proxy's tail continues for the owners that confirmed the
             // exhausted frame; never past the gap for those that missed it.
             proxy_gaps.retain(|(ty, _)| !failed_ordered_types.contains(ty));
-            #[cfg(feature = "discovery")]
             if !proxy_gaps.is_empty() {
                 Self::retire_ordered_gap_owners_locked(&mut st, &proxy_gaps);
             }
         }
 
-        #[cfg(feature = "discovery")]
         if !silenced.is_empty() {
             self.retire_owners_from_pending(&silenced, true)?;
         }
@@ -17759,7 +17248,6 @@ impl Router {
         let timesync_cfg = cfg.timesync_config();
         #[cfg(feature = "timesync")]
         let timesync_epoch = Arc::new(core::sync::atomic::AtomicU16::new(0));
-        #[cfg(feature = "discovery")]
         let preferred_discovery_master = cfg.preferred_discovery_master.clone();
         let memory = cfg.memory_config();
         let local_services_enabled = cfg.role.local_services();
@@ -17791,7 +17279,6 @@ impl Router {
             address_by_value.insert(address, hostname.to_string());
         }
         let managed_filter = Arc::new(AtomicU32::new(0));
-        #[cfg(feature = "discovery")]
         let local_sender_hash = Self::sender_hash(hostname.as_ref());
         Self {
             #[cfg(feature = "std")]
@@ -17801,7 +17288,6 @@ impl Router {
             state: RouterMutex::new(RouterInner {
                 #[cfg(feature = "std")]
                 p2p_revision: 1,
-                #[cfg(feature = "compression")]
                 codec_reserved_bytes: 0,
                 memory,
                 sides: Default::default(),
@@ -17820,7 +17306,7 @@ impl Router {
                         managed_registration_epoch:0,
                         #[cfg(feature="std")]
                         managed_cache_epoch:0,
-                        #[cfg(all(feature="std",feature="discovery"))]
+                        #[cfg(feature = "std")]
                         managed_registration_dirty:false,
                         managed_variable_types: ManagedTypes::new(managed_filter.clone()),
                         managed_variable_permissions: Default::default(),
@@ -17874,7 +17360,6 @@ impl Router {
                 local_admission_sequence: 0,
                 reliable_return_route_order: VecDeque::new(),
                 forwarded_receipts: Default::default(),
-                #[cfg(feature = "discovery")]
                 local_sender_hash,
                 end_to_end_reliable_tx: Default::default(),
                 end_to_end_reliable_tx_order: VecDeque::new(),
@@ -17883,21 +17368,14 @@ impl Router {
                 reliable_exhausted: Default::default(),
                 #[cfg(feature = "std")]
                 exhausted_recent: VecDeque::new(),
-                #[cfg(feature = "discovery")]
                 discovery_routes: Default::default(),
-                #[cfg(feature = "discovery")]
                 route_plans: Default::default(),
-                #[cfg(feature = "discovery")]
                 discovery_cadence: DiscoveryCadenceState::default(),
-                #[cfg(feature = "discovery")]
                 discovery_side_throttle: Default::default(),
-                #[cfg(feature = "discovery")]
                 discovery_heard: Vec::new(),
-                #[cfg(feature = "discovery")]
                 schema_response_sequence: 0,
-                #[cfg(feature = "discovery")]
                 preferred_discovery_master,
-                #[cfg(all(feature = "discovery", feature = "timesync"))]
+                #[cfg(feature = "timesync")]
                 timesync_side_throttle: Default::default(),
             }),
             isr_rx_queue: local_services_enabled.then(|| {
@@ -17951,7 +17429,6 @@ impl Router {
     /// Passing `None` or an empty hostname restores topology-based election.
     /// This does not alter time-sync leadership or source priority.
     pub fn set_preferred_discovery_master(&self, hostname: Option<&str>) {
-        #[cfg(feature = "discovery")]
         {
             let preferred = hostname
                 .filter(|value| !value.is_empty())
@@ -17962,18 +17439,11 @@ impl Router {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
         }
-        #[cfg(not(feature = "discovery"))]
-        let _ = hostname;
     }
 
     /// Return the currently configured preferred discovery master.
     pub fn preferred_discovery_master(&self) -> Option<Arc<str>> {
-        #[cfg(feature = "discovery")]
-        {
-            return self.state.lock().preferred_discovery_master.clone();
-        }
-        #[cfg(not(feature = "discovery"))]
-        None
+        self.state.lock().preferred_discovery_master.clone()
     }
 
     /// Match a packet sender to an expected literal hostname without allocating.
@@ -18051,7 +17521,6 @@ impl Router {
     /// considers) has the compact identity `address`.
     fn other_name_has_address_locked(st: &RouterInner, address: NodeAddress, station: &str) -> bool {
         let other = |candidate: &str| candidate != station && sender_address_u32(candidate) == address;
-        #[cfg(feature = "discovery")]
         for route in st.discovery_routes.values() {
             for (announcer, state) in &route.announcers {
                 if other(announcer) {
@@ -18080,7 +17549,6 @@ impl Router {
         let now_ms = self.clock.now_ms();
         #[allow(unused_mut)]
         let mut st = self.state.lock();
-        #[cfg(feature = "discovery")]
         if Self::prune_discovery_routes_locked(&mut st, now_ms) {
             Self::note_discovery_topology_change_locked(&mut st, now_ms);
         }
@@ -18437,7 +17905,6 @@ impl Router {
         if !self.cfg.role.local_services() {
             // A transparent relay renames its protocol sender without claiming
             // a local application address or changing accepted wire owners.
-            #[cfg(feature = "discovery")]
             {
                 self.state.lock().local_sender_hash = Self::sender_hash(hostname.as_ref());
             }
@@ -18490,10 +17957,7 @@ impl Router {
         {
             None
         } else {
-            #[cfg(any(feature = "discovery", feature = "timesync"))]
             let record = crate::peer_record::try_box(st.local_address.clone())?;
-            #[cfg(not(any(feature = "discovery", feature = "timesync")))]
-            let record = Box::new(st.local_address.clone());
             Some(record)
         };
         let change = self.update_local_identity_locked(
@@ -18579,10 +18043,7 @@ impl Router {
             .insert(id, Box::<SideRuntimeStatsInner>::default());
         st.side_transport
             .insert(id, Box::<SideTransportState>::default());
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
-        #[cfg(not(feature = "discovery"))]
-        st.wake_unroutable_parked();
         id
     }
 
@@ -18622,10 +18083,7 @@ impl Router {
             .insert(id, Box::<SideRuntimeStatsInner>::default());
         st.side_transport
             .insert(id, Box::<SideTransportState>::default());
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
-        #[cfg(not(feature = "discovery"))]
-        st.wake_unroutable_parked();
         id
     }
 
@@ -18674,10 +18132,7 @@ impl Router {
             .insert(id, Box::<SideRuntimeStatsInner>::default());
         st.side_transport
             .insert(id, Box::<SideTransportState>::default());
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
-        #[cfg(not(feature = "discovery"))]
-        st.wake_unroutable_parked();
         id
     }
 
@@ -18686,7 +18141,6 @@ impl Router {
     /// `side` must be an id returned earlier by one of the `add_side_*` calls. Removed side IDs
     /// are tombstoned rather than renumbered so cached IDs for the remaining sides stay valid.
     pub fn remove_side(&self, side: RouterSideId) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         {
             #[cfg(not(feature="std"))]
@@ -18737,9 +18191,8 @@ impl Router {
             st.source_route_modes.remove(&Some(side));
             st.route_selection_cursors.remove(&Some(side));
             st.adaptive_route_stats.remove(&side);
-            #[cfg(feature = "discovery")]
             st.discovery_side_throttle.remove(&side);
-            #[cfg(all(feature = "discovery", feature = "timesync"))]
+            #[cfg(feature = "timesync")]
             st.timesync_side_throttle.remove(&side);
             st.side_runtime_stats.remove(&side);
             st.side_transport.remove(&side);
@@ -18772,7 +18225,6 @@ impl Router {
             st.received_queue.retain(|queued| queued.src != Some(side));
             st.reliable_tx.retain(|(side_id, _), _| *side_id != side);
             st.reliable_rx.retain(|(side_id, _), _| *side_id != side);
-            #[cfg(feature = "discovery")]
             {
                 st.cancel_managed_refresh_side(side);
                 st.discovery_routes.remove(&side);
@@ -18825,7 +18277,6 @@ impl Router {
         side: RouterSideId,
         enabled: bool,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         if !enabled
@@ -18849,11 +18300,9 @@ impl Router {
                 }
             }
         }
-        #[cfg(feature = "discovery")]
         if !enabled {
             st.cancel_managed_refresh_side(side);
         }
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -18906,7 +18355,6 @@ impl Router {
         side: RouterSideId,
         enabled: bool,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let changed = st
@@ -18933,7 +18381,6 @@ impl Router {
             .ok_or(TelemetryError::BadArg)?;
         side_ref.opts.egress_enabled = enabled;
         if !enabled {
-            #[cfg(feature = "discovery")]
             st.cancel_managed_refresh_side(side);
             // Reasserting an unchanged receive-only policy is not a side
             // lifecycle event. Preserve revocation for an actual transition.
@@ -18964,7 +18411,6 @@ impl Router {
                 },
             );
         }
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -18979,7 +18425,6 @@ impl Router {
         src: Option<RouterSideId>,
         mode: RouteSelectionMode,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         if let Some(src) = src {
@@ -18990,14 +18435,12 @@ impl Router {
         // adaptive single-path selection; explicit Fanout must override that.
         st.source_route_modes.insert(src, mode);
         st.route_selection_cursors.remove(&src);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
 
     /// Clear any source-specific route-selection override for `src`.
     pub fn clear_source_route_mode(&self, src: Option<RouterSideId>) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         if let Some(src) = src {
@@ -19005,7 +18448,6 @@ impl Router {
         }
         st.source_route_modes.remove(&src);
         st.route_selection_cursors.remove(&src);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19020,7 +18462,6 @@ impl Router {
         dst: RouterSideId,
         weight: u32,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19029,7 +18470,6 @@ impl Router {
         }
         st.route_weights.insert((src, dst), weight);
         st.route_selection_cursors.remove(&src);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19040,7 +18480,6 @@ impl Router {
         src: Option<RouterSideId>,
         dst: RouterSideId,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19049,7 +18488,6 @@ impl Router {
         }
         st.route_weights.remove(&(src, dst));
         st.route_selection_cursors.remove(&src);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19064,7 +18502,6 @@ impl Router {
         dst: RouterSideId,
         priority: u32,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19072,7 +18509,6 @@ impl Router {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.route_priorities.insert((src, dst), priority);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19083,7 +18519,6 @@ impl Router {
         src: Option<RouterSideId>,
         dst: RouterSideId,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19091,7 +18526,6 @@ impl Router {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.route_priorities.remove(&(src, dst));
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19106,7 +18540,6 @@ impl Router {
         dst: RouterSideId,
         enabled: bool,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19114,7 +18547,6 @@ impl Router {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.route_overrides.insert((src, dst), enabled);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19130,7 +18562,6 @@ impl Router {
         dst: RouterSideId,
         enabled: bool,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19139,7 +18570,6 @@ impl Router {
         }
         st.typed_route_overrides
             .insert((src, ty.as_u32(), dst), enabled);
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
@@ -19151,7 +18581,6 @@ impl Router {
         ty: DataType,
         dst: RouterSideId,
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19159,14 +18588,12 @@ impl Router {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.typed_route_overrides.remove(&(src, ty.as_u32(), dst));
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
 
     /// Clear a non-typed route override so the router falls back to default behavior.
     pub fn clear_route(&self, src: Option<RouterSideId>, dst: RouterSideId) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
         let _ = Self::side_ref(&st, dst).map_err(|_| TelemetryError::BadArg)?;
@@ -19174,19 +18601,16 @@ impl Router {
             let _ = Self::side_ref(&st, src).map_err(|_| TelemetryError::BadArg)?;
         }
         st.route_overrides.remove(&(src, dst));
-        #[cfg(feature = "discovery")]
         Self::note_discovery_topology_change_locked(&mut st, now_ms);
         Ok(())
     }
 
     /// Queue a built-in discovery advertisement describing this router's local endpoints.
-    #[cfg(feature = "discovery")]
     pub fn announce_discovery(&self) -> TelemetryResult<()> {
         self.queue_discovery_announce(true, false)
     }
 
     /// Broadcast that this router is leaving so peers can prune topology immediately.
-    #[cfg(feature = "discovery")]
     pub fn announce_leave(&self) -> TelemetryResult<()> {
         let sender = self.sender_arc();
         let pkt = discovery::build_discovery_leave(sender.as_ref(), self.clock.now_ms())?;
@@ -19207,7 +18631,6 @@ impl Router {
     /// returns with its next discovery announcement.
     ///
     /// Returns the number of pending frames it was retired from.
-    #[cfg(feature = "discovery")]
     pub fn forget_peer(&self, hostname: &str) -> TelemetryResult<usize> {
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
@@ -19228,7 +18651,6 @@ impl Router {
     /// missed it from the later frames of the same stream it still holds, and
     /// drop a frame owed to those owners alone. The remaining frames are
     /// released in order by `release_ordered_successors`.
-    #[cfg(feature = "discovery")]
     fn retire_ordered_gap_owners_locked(st: &mut RouterInner, gaps: &[(u32, Vec<u64>)]) {
         let RouterInner { end_to_end_reliable_tx, reliable_exhausted, .. } = st;
         end_to_end_reliable_tx.retain(|_, sent| {
@@ -19265,7 +18687,6 @@ impl Router {
     /// this way (as with complete_reliable): it keeps such an owner while no
     /// one else still owes it, and retries out its own span. Returns the
     /// number of frames retired from.
-    #[cfg(feature = "discovery")]
     fn retire_owners_from_pending(&self, owners: &[u64], silent: bool) -> TelemetryResult<usize> {
         let mut st = self.state.lock();
         let mut retired = 0;
@@ -19335,7 +18756,6 @@ impl Router {
     }
 
     /// Queue a discovery advertisement if the adaptive cadence says one is due.
-    #[cfg(feature = "discovery")]
     pub fn poll_discovery(&self) -> TelemetryResult<bool> {
         // Keep ordinary route/liveness cadence independent of schema pressure.
         let mut emitted = self.poll_discovery_announce()?;
@@ -19348,7 +18768,6 @@ impl Router {
         Ok(emitted)
     }
 
-    #[cfg(feature = "discovery")]
     pub fn request_topology(&self) -> TelemetryResult<()> {
         let sender = self.sender_arc();
         let pkt =
@@ -19356,7 +18775,6 @@ impl Router {
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
-    #[cfg(feature = "discovery")]
     pub fn request_schema(&self) -> TelemetryResult<()> {
         let sender = self.sender_arc();
         let pkt = discovery::build_discovery_schema_request(sender.as_ref(), self.clock.now_ms())?;
@@ -19387,15 +18805,8 @@ impl Router {
         }
         let mut st = self.state.lock();
         st.local_services.as_mut().expect("local services enabled").note_managed_registration();
-        #[cfg(feature = "discovery")]
         let newly_advertised = st
             .local_services
-            .as_mut()
-            .expect("local services enabled")
-            .managed_variable_types
-            .insert(ty.as_u32());
-        #[cfg(not(feature = "discovery"))]
-        st.local_services
             .as_mut()
             .expect("local services enabled")
             .managed_variable_types
@@ -19405,7 +18816,6 @@ impl Router {
             .expect("local services enabled")
             .managed_variable_permissions
             .insert(ty.as_u32(), permissions);
-        #[cfg(feature = "discovery")]
         if newly_advertised {
             Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         }
@@ -19426,15 +18836,8 @@ impl Router {
         }
         let mut st = self.state.lock();
         st.local_services.as_mut().expect("local services enabled").note_managed_registration();
-        #[cfg(feature = "discovery")]
         let newly_advertised = st
             .local_services
-            .as_mut()
-            .expect("local services enabled")
-            .managed_variable_types
-            .insert(ty.as_u32());
-        #[cfg(not(feature = "discovery"))]
-        st.local_services
             .as_mut()
             .expect("local services enabled")
             .managed_variable_types
@@ -19448,7 +18851,6 @@ impl Router {
             .push(NetworkVariableUpdateHandler {
                 handler: Arc::new(f),
             });
-        #[cfg(feature = "discovery")]
         if newly_advertised {
             Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         }
@@ -19459,15 +18861,8 @@ impl Router {
         let mut st = self.state.lock();
         st.local_services.as_mut().expect("local services enabled").note_managed_registration();
         st.local_services.as_mut().expect("local services enabled").note_managed_cache();
-        #[cfg(feature = "discovery")]
         let was_advertised = st
             .local_services
-            .as_mut()
-            .expect("local services enabled")
-            .managed_variable_types
-            .remove(&ty.as_u32());
-        #[cfg(not(feature = "discovery"))]
-        st.local_services
             .as_mut()
             .expect("local services enabled")
             .managed_variable_types
@@ -19487,7 +18882,6 @@ impl Router {
             .expect("local services enabled")
             .network_variable_update_handlers
             .remove(&ty.as_u32());
-        #[cfg(feature = "discovery")]
         if was_advertised {
             Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
         }
@@ -19535,20 +18929,12 @@ impl Router {
         {
             let mut st = self.state.lock();
             { let local=st.local_services.as_mut().expect("local services enabled"); if !local.managed_variable_types.contains(&pkt.data_type().as_u32()) {local.note_managed_registration();} }
-            #[cfg(feature = "discovery")]
             let newly_advertised = st
                 .local_services
                 .as_mut()
                 .expect("local services enabled")
                 .managed_variable_types
                 .insert(pkt.data_type().as_u32());
-            #[cfg(not(feature = "discovery"))]
-            st.local_services
-                .as_mut()
-                .expect("local services enabled")
-                .managed_variable_types
-                .insert(pkt.data_type().as_u32());
-            #[cfg(feature = "discovery")]
             if newly_advertised {
                 Self::note_discovery_topology_change_locked(&mut st, self.clock.now_ms());
             }
@@ -19586,11 +18972,10 @@ impl Router {
             }
         }
         self.cache_managed_variable_packet(&pkt, false, None, true)?;
-        #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         let item = RouterTxItem::Broadcast(RouterItem::Packet(pkt));
         let side_active = self.side_tx_active();
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         managed_order_side_gate_causal::observe(self, "set_managed_side_active", || serde_json::json!({"active":side_active,"item":managed_order_side_gate_causal::item_meta(&item)}));
         if side_active {
             return self.tx_queue_item_with_priority(
@@ -19612,7 +18997,6 @@ impl Router {
     /// Cache age is local observation age. A refresh reply preserves the
     /// original source timestamp and packet identity; it is not proof of a new
     /// source measurement or a request-correlated application readback.
-    #[cfg(feature = "discovery")]
     pub fn get_network_variable(
         &self,
         ty: DataType,
@@ -19657,7 +19041,6 @@ impl Router {
         Ok(self.managed_variable_latest(ty))
     }
 
-    #[cfg(feature = "discovery")]
     pub fn request_managed_variable(&self, ty: DataType) -> TelemetryResult<()> {
         if is_internal_control_type(ty) {
             return Err(TelemetryError::InvalidType);
@@ -19671,14 +19054,12 @@ impl Router {
         self.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)))
     }
 
-    #[cfg(feature = "discovery")]
     pub fn request_managed_variable_by_name(&self, ty_name: &str) -> TelemetryResult<()> {
         let ty = DataType::try_named(ty_name).ok_or(TelemetryError::InvalidType)?;
         self.request_managed_variable(ty)
     }
 
     /// Export the current discovery-driven network topology view.
-    #[cfg(feature = "discovery")]
     pub fn export_topology(&self) -> TopologySnapshot {
         let now_ms = self.clock.now_ms();
         let mut st = self.state.lock();
@@ -19744,7 +19125,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "discovery")]
     pub fn client_stats(&self, sender_id: &str) -> Option<ClientStatsSnapshot> {
         let now_ms = self.clock.now_ms();
         let st = self.state.lock();
@@ -20073,7 +19453,6 @@ impl Router {
             (item.src_side_id.unwrap_or(usize::MAX), item.dst_side_id)
         });
 
-        #[cfg(feature = "discovery")]
         let discovery = DiscoveryRuntimeStats {
             route_count: st.discovery_routes.len(),
             announcer_count: st
@@ -20083,13 +19462,6 @@ impl Router {
                 .sum(),
             current_announce_interval_ms: Some(st.discovery_cadence.current_interval_ms),
             next_announce_ms: Some(st.discovery_cadence.next_announce_ms),
-        };
-        #[cfg(not(feature = "discovery"))]
-        let discovery = DiscoveryRuntimeStats {
-            route_count: 0,
-            announcer_count: 0,
-            current_announce_interval_ms: None,
-            next_announce_ms: None,
         };
 
         RuntimeStatsSnapshot {
@@ -20394,10 +19766,7 @@ impl Router {
 
     pub fn memory_counters(&self) -> [u32; 16] {
         let st = self.state.lock();
-        #[cfg(feature = "discovery")]
         let discovery = st.discovery_bytes_used();
-        #[cfg(not(feature = "discovery"))]
-        let discovery = 0;
         let templates = st
             .side_transport
             .values()
@@ -20469,10 +19838,7 @@ impl Router {
             .and_then(|queue| queue.snapshot())
             .unwrap_or((0, 0));
         let st = self.state.lock();
-        #[cfg(feature = "discovery")]
         let discovery_bytes = st.discovery_bytes_used();
-        #[cfg(not(feature = "discovery"))]
-        let discovery_bytes = 0usize;
         let schema_bytes = crate::config::schema_bytes_used();
         let network_variable_cache_bytes = st.local_cache_bytes();
         let (replay_len, replay_bytes) = if self.cfg.role.local_services() {
@@ -20534,7 +19900,6 @@ impl Router {
     }
 
     #[cfg(test)]
-    #[cfg(feature = "discovery")]
     pub(crate) fn debug_end_to_end_pending_destination_count(
         &self,
         packet_id: u64,
@@ -20546,14 +19911,12 @@ impl Router {
     }
 
     #[cfg(test)]
-    #[cfg(feature = "discovery")]
     pub(crate) fn debug_end_to_end_tracked_count(&self) -> usize {
         let st = self.state.lock();
         st.end_to_end_reliable_tx.len()
     }
 
     #[cfg(test)]
-    #[cfg(feature = "discovery")]
     pub(crate) fn debug_reliable_return_route_count(&self) -> usize {
         let st = self.state.lock();
         st.reliable_return_routes.len()
@@ -20597,7 +19960,7 @@ impl Router {
                 match wire_format::packet_id_from_wire_unchecked(bytes.as_ref()) {
                     Ok(id) => id,
                     Err(_e) => {
-                        // Fallback: if bytes are malformed (or compression feature mismatch),
+                        // Fallback: if bytes are malformed,
                         // hash raw bytes so we can still dedupe identical network duplicates.
                         let h: u64 = 0x9E37_79B9_7F4A_7C15;
                         hash_bytes_u64(h, bytes.as_ref())
@@ -20824,7 +20187,6 @@ impl Router {
             st.latest_turn_phase = 0;
             st.latest_turn_credit = 0;
         }
-        #[cfg(feature = "discovery")]
         for response in st.discovery_side_throttle.values_mut() {
             if response.schema_response_active() {
                 response.set_schema_response_active(false);
@@ -20860,7 +20222,6 @@ impl Router {
             st.latest_turn_phase = 0;
             st.latest_turn_credit = 0;
         }
-        #[cfg(feature = "discovery")]
         for response in st.discovery_side_throttle.values_mut() {
             if response.schema_response_active() {
                 response.set_schema_response_active(false);
@@ -21153,7 +20514,6 @@ impl Router {
     pub fn process_tx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         #[cfg(feature = "timesync")]
         let _ = crate::memory_admission::allow_drain(self.poll_timesync())?;
-        #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         self.process_tx_queue_with_timeout_impl(timeout_ms)
     }
@@ -21201,7 +20561,6 @@ impl Router {
     pub fn process_rx_queue_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         #[cfg(feature = "timesync")]
         let _ = crate::memory_admission::allow_drain(self.poll_timesync())?;
-        #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         self.process_rx_queue_with_timeout_impl(timeout_ms)
     }
@@ -21329,7 +20688,6 @@ impl Router {
     pub fn process_all_queues_with_timeout(&self, timeout_ms: u32) -> TelemetryResult<()> {
         #[cfg(feature = "timesync")]
         let _ = crate::memory_admission::allow_drain(self.poll_timesync())?;
-        #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         self.process_all_queues_with_timeout_impl(timeout_ms)
     }
@@ -21350,7 +20708,6 @@ impl Router {
         #[cfg(feature = "timesync")]
         let _ = crate::memory_admission::allow_drain(self.poll_timesync())?;
 
-        #[cfg(feature = "discovery")]
         {
             let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         }
@@ -21363,7 +20720,6 @@ impl Router {
     /// Discovery is still polled when that feature is compiled in, then queued TX/RX work is
     /// drained for up to `timeout_ms` milliseconds.
     pub fn periodic_no_timesync(&self, timeout_ms: u32) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
         {
             let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         }
@@ -21381,7 +20737,6 @@ impl Router {
         self.tx_queue_item_with_flags_at(item, ignore_local, 0)
     }
 
-    #[cfg(feature = "compression")]
     fn retry_codec_owner(
         &self,
         item: RouterTxItem,
@@ -21391,7 +20746,6 @@ impl Router {
         self.retry_codec_owner_at_priority(item, ignore_local, reservation, 0, 0, false)
     }
 
-    #[cfg(feature = "compression")]
     fn retry_codec_owner_at_priority(
         &self,
         item: RouterTxItem,
@@ -21405,7 +20759,6 @@ impl Router {
             RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
             _ => return Err(TelemetryError::BadArg),
         });
-        #[cfg(feature = "discovery")]
         let schema_owner = RouterInner::schema_response_owner(&item);
         let mut state = self.state.lock();
         if let Some(reservation) = reservation {
@@ -21421,7 +20774,6 @@ impl Router {
             deferred_since_ms: 0,
             retry_after_ms: self.clock.now_ms().saturating_add(u64::from(!immediate)),
         });
-        #[cfg(feature = "discovery")]
         if result.is_err() {
             RouterInner::schema_response_owner_lost(
                 &mut state.discovery_side_throttle,
@@ -21443,7 +20795,7 @@ impl Router {
         priority_floor: u8,
         turn_flags: u8,
         immediate: bool,
-        #[cfg(feature = "compression")] reservation: &mut Option<
+        reservation: &mut Option<
             crate::payload_codec::QueueReservation<'_, RouterInner>,
         >,
     ) -> TelemetryResult<()> {
@@ -21451,10 +20803,8 @@ impl Router {
             RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
             _ => return Err(TelemetryError::BadArg),
         });
-        #[cfg(feature = "discovery")]
         let schema_owner = RouterInner::schema_response_owner(&item);
         let mut state = self.state.lock();
-        #[cfg(feature = "compression")]
         if let Some(reservation) = reservation {
             reservation.release_locked(&mut state);
         }
@@ -21472,7 +20822,6 @@ impl Router {
             deferred_since_ms: u64::from(order),
             retry_after_ms: self.clock.now_ms().saturating_add(u64::from(!immediate)),
         });
-        #[cfg(feature = "discovery")]
         if result.is_err() {
             RouterInner::schema_response_owner_lost(
                 &mut state.discovery_side_throttle,
@@ -21534,7 +20883,7 @@ impl Router {
     fn dispatch_queued_item_with_origin(&self, work: TxWork, called_from_queue: bool) -> TelemetryResult<()> {
         #[cfg(test)]
         test_dispatch_counter::bump();
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         managed_order_side_gate_causal::observe(self,"dispatch_queued",|| serde_json::json!({"item":managed_order_side_gate_causal::item_meta(&work.queued.item),"delivery":format!("{:?}",work.queued.delivery_state),"claim":work.claim.map(|c|(c.token,c.ordered,c.side_retry))}));
         let owed_turn = work.owed_turn;
         let queued = work.queued;
@@ -21586,7 +20935,7 @@ impl Router {
         let mut local_unwind = local_ordered::ClaimUnwind {
             router: self, claim: work.claim, armed: true, cancel_original: false,
         };
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         if local_side_work {
             managed_order_side_gate_causal::before_local_child_dispatch(self, work.claim.expect("actual local claim"));
         }
@@ -21830,7 +21179,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     #[allow(unused_mut)]
     fn replace_claim_payload(&self, claim: TxClaim, mut data: RouterItem) -> TelemetryResult<()> {
         #[cfg(feature = "compact-packet-store")]
@@ -21869,33 +21217,6 @@ impl Router {
         self.tx_queue_item_with_flags_at(item, ignore_local, self.clock.now_ms().saturating_add(1))
     }
 
-    #[cfg(not(feature = "compression"))]
-    fn tx_queue_item_for_retry_at_priority_with_turn(
-        &self,
-        item: RouterTxItem,
-        ignore_local: bool,
-        priority: u8,
-        turn_flags: u8,
-        immediate: bool,
-    ) -> TelemetryResult<()> {
-        #[cfg(feature = "discovery")]
-        let schema_owner = RouterInner::schema_response_owner(&item);
-        let result = self.tx_queue_item_with_priority_and_turn_at(
-            item,
-            ignore_local,
-            priority,
-            self.clock.now_ms().saturating_add(u64::from(!immediate)),
-            turn_flags,
-        );
-        #[cfg(feature = "discovery")]
-        if result.is_err() {
-            RouterInner::schema_response_owner_lost(
-                &mut self.state.lock().discovery_side_throttle,
-                schema_owner,
-            );
-        }
-        result
-    }
 
     fn tx_queue_item_with_flags_at(
         &self,
@@ -21998,7 +21319,7 @@ impl Router {
     ) -> Option<crate::lock::ActiveSideTxGuard<'_>> {
         let _ = side;
         let result = self.side_tx_activity.try_enter(gate);
-        #[cfg(all(test, feature = "std", feature = "discovery"))]
+        #[cfg(all(test, feature = "std"))]
         managed_order_side_gate_causal::observe(self, "side_gate", || serde_json::json!({"side":side,"entered":result.is_some()}));
         result
     }
@@ -22615,7 +21936,6 @@ impl Router {
     /// proxy again. Queue admission owns only this hop, independently of old
     /// end-to-end ACKs. Source time and identity never change; this is not proof
     /// of a post-request writer revision. A lost response needs another GET.
-    #[cfg(feature = "discovery")]
     fn forward_requested_managed_observation(
         &self,
         item: &RouterRxItem,
@@ -22849,20 +22169,16 @@ impl Router {
                         && self.cfg.reliable_enabled()
                         && !self.side_has_multiple_announcers_locked(&st, src, self.clock.now_ms()),
                     {
-                        #[cfg(feature = "discovery")]
                         {
                             if packed_frame.as_ref().and_then(|frame| frame.as_ref().ok())
                                 .is_some_and(|frame| is_bound_network_control(frame.envelope.ty)) {
                                 Some(side_ref.tx_handler.clone())
                             } else { None }
                         }
-                        #[cfg(not(feature = "discovery"))]
-                        { None::<RouterTxHandlerFn> }
                     },
                 )
             };
 
-            #[cfg(feature = "discovery")]
             if _opts.reliable_enabled && self.cfg.reliable_enabled() && handler_is_packed
                 && packed_frame.as_ref().and_then(|frame| frame.as_ref().ok()).is_some_and(|frame| {
                     is_bound_network_control(frame.envelope.ty)
@@ -22978,7 +22294,7 @@ impl Router {
                             }
 
                             if let Some(ack_seq) = ack_old {
-                                #[cfg(all(test, feature = "std", feature = "discovery"))]
+                                #[cfg(all(test, feature = "std"))]
                                 discovery_bootstrap_causal::observe_ack_old(self, src, frame.envelope.ty,
                                     frame.envelope.source_address, hdr.seq, ack_seq);
                                 self.queue_reliable_ack(
@@ -23044,7 +22360,6 @@ impl Router {
 
         // Exact Schema-hop receipts precede the generic recent-ID cache: an
         // overheard receipt on another side cannot poison its real ingress.
-        #[cfg(feature = "discovery")]
         if let Some(side) = item.src {
             let receipt = match &item.data {
                 RouterItem::Packet(packet) if packet.data_type()==DataType::ReliableAck
@@ -23067,7 +22382,6 @@ impl Router {
         if duplicate && let Some(guard) = _local_admission_guard.as_ref() {
             guard.begin_commit(true)?;
         }
-        #[cfg(feature = "discovery")]
         {
             // Reuse the already CRC-validated header. Ordinary telemetry must
             // not pay another full-frame CRC pass for the managed GET path.
@@ -23086,7 +22400,6 @@ impl Router {
             self.forward_requested_managed_observation(item, duplicate, ty)?;
         }
         if duplicate {
-            #[cfg(feature = "discovery")]
             let shared_pending = if item.src.is_some()
                 // SDK protocols use reliable transport too, but their echoed
                 // identities are not outstanding application-owner retries.
@@ -23106,15 +22419,12 @@ impl Router {
             } else {
                 false
             };
-            #[cfg(not(feature = "discovery"))]
-            let shared_pending = false;
             if shared_pending {
                 self.relay_send(item.data.clone(), item.src, called_from_queue)?;
             }
             // Every owner behind this relay already acknowledged: the sender
             // missed the receipt, so answer with the cached one instead of
             // dropping its copy (bounded, rate-limited).
-            #[cfg(feature = "discovery")]
             if !shared_pending && let Some(src) = item.src {
                 self.replay_forwarded_receipts(&item.data, src, called_from_queue)?;
             }
@@ -23292,7 +22602,6 @@ impl Router {
         let id = wire_format::plain_packet_id(bytes.as_ref(), frame)
             .unwrap_or_else(|| Self::get_hash(&item.data));
         debug_assert_eq!(id, Self::get_hash(&item.data));
-        #[cfg(feature = "discovery")]
         let plan_key = Self::route_plan_key_for(env, Some(src)).map(|key| (key, self.clock.now_ms()));
         let note_epoch = || {
             #[cfg(feature = "timesync")]
@@ -23319,14 +22628,11 @@ impl Router {
             note_epoch();
             return Err(error);
         }
-        #[cfg(feature = "discovery")]
         let cached = if duplicate {
             None
         } else {
             plan_key.and_then(|(key, now_ms)| Self::cached_route_plan_locked(&st, &key, None, now_ms))
         };
-        #[cfg(not(feature = "discovery"))]
-        let cached: Option<Option<RouterSideId>> = None;
         let queued = match cached {
             Some(side) => {
                 let priority = if st.is_managed_variable(ty.as_u32()) {
@@ -23356,7 +22662,7 @@ impl Router {
         };
         drop(st);
         note_epoch();
-        #[cfg(all(test, feature = "discovery"))]
+        #[cfg(test)]
         if let (Some(side), Some((key, _))) = (cached, plan_key) {
             let _ = key;
             self.verify_cached_route_plan(&item.data, Some(src), true, side);
@@ -23377,7 +22683,6 @@ impl Router {
         match &item.data {
             RouterItem::Packet(pkt) => {
                 pkt.validate()?;
-                #[cfg(feature = "discovery")]
                 if let Some(side) = item.src {
                     self.refresh_peer_liveness(side, sender_address_u32(pkt.sender()));
                 }
@@ -23438,7 +22743,6 @@ impl Router {
                     return Ok(());
                 }
 
-                #[cfg(feature = "discovery")]
                 self.note_heard_sender(pkt.sender(), item.src);
                 let mut eps: Vec<DataEndpoint> = pkt.endpoints().to_vec();
                 crate::small_sort::sort(&mut eps);
@@ -23626,7 +22930,6 @@ impl Router {
                     return Ok(());
                 }
 
-                #[cfg(feature = "discovery")]
                 if discovery::is_discovery_type(env.ty) {
                     let pkt = self.unpack_packet_for_role(bytes.as_ref())?;
                     pkt.validate()?;
@@ -23641,7 +22944,6 @@ impl Router {
                     return Ok(());
                 }
 
-                #[cfg(feature = "discovery")]
                 self.note_heard_address(env.source_address, item.src);
                 let any_packet_needed = env
                     .endpoints
@@ -24041,15 +23343,9 @@ impl Router {
         };
         // `prepare_packed_for_remote`: plain frames are sealed only when the
         // type requires it and cryptography is available.
-        #[cfg(feature = "cryptography")]
         let send_bytes = if seal {
             self.prepare_packed_for_remote(bytes.clone(), None)?
         } else {
-            bytes.clone()
-        };
-        #[cfg(not(feature = "cryptography"))]
-        let send_bytes = {
-            let _ = seal;
             bytes.clone()
         };
         let frames =
@@ -24079,8 +23375,6 @@ impl Router {
         context: &mut DispatchContext,
         egress_service: EgressService,
     ) -> TelemetryResult<Option<(TelemetryResult<()>, SideReservation<'_>)>> {
-        #[cfg(not(feature = "compression"))]
-        let reservation = ();
         let ty = Self::item_data_type(data)?;
         self.ensure_e2e_policy_supported_for_type(ty)?;
         if let RouterItem::Packet(pkt) = &*data
@@ -24101,7 +23395,7 @@ impl Router {
             let st = self.state.lock();
             let ty = Some(ty);
             let route_allowed = self.route_allowed_locked(&st, src, ty, dst);
-            #[cfg(all(feature = "discovery", feature = "timesync"))]
+            #[cfg(feature = "timesync")]
             let timesync_allowed = ty
                 .map(|ty| {
                     !Self::is_timesync_type(ty)
@@ -24113,12 +23407,11 @@ impl Router {
                         )
                 })
                 .unwrap_or(true);
-            #[cfg(not(all(feature = "discovery", feature = "timesync")))]
+            #[cfg(not(feature = "timesync"))]
             let timesync_allowed = true;
             route_allowed && timesync_allowed
         };
         if !allowed {
-            #[cfg(feature = "discovery")]
             if ty == DataType::DiscoverySchema {
                 RouterInner::schema_response_owner_lost(
                     &mut self.state.lock().discovery_side_throttle,
@@ -24127,7 +23420,6 @@ impl Router {
             }
             return Ok(None);
         }
-        #[cfg(feature = "compression")]
         let (send_result, reservation) =
             if let Some(claim) = context.claim.filter(|claim| claim.side_retry) {
                 let send_result = self.admit_side_tx(dst).and_then(|admission| {
@@ -24150,14 +23442,6 @@ impl Router {
                     egress_service,
                 )
             };
-        #[cfg(not(feature = "compression"))]
-        let send_result = self.send_reliable_to_side_with_service(
-            dst,
-            data.clone(),
-            src.is_some(),
-            &mut context.admitted,
-            egress_service,
-        );
         Ok(Some((send_result, reservation)))
     }
 
@@ -24199,7 +23483,7 @@ impl Router {
                     && claim.is_none()
                     && matches!({
                         let mode = reliable_mode(ty);
-                        #[cfg(all(test, feature = "std", feature = "discovery"))]
+                        #[cfg(all(test, feature = "std"))]
                         managed_order_side_gate_causal::observe(self,"original_reliability_decision",|| serde_json::json!({"type":ty.as_u32(),"mode":format!("{mode:?}")}));
                         mode
                     }, crate::ReliableMode::Ordered)
@@ -24213,7 +23497,7 @@ impl Router {
                     return self.tx_queue_item_with_flags(RouterTxItem::Broadcast(data), ignore_local);
                 }
 
-                #[cfg(all(test, feature = "std", feature = "discovery"))]
+                #[cfg(all(test, feature = "std"))]
                 managed_order_side_gate_causal::after_tail_guard(self, &data, called_from_queue, ignore_local);
 
                 self.ensure_e2e_policy_supported_for_type(ty)?;
@@ -24222,28 +23506,13 @@ impl Router {
                 {
                     self.remember_managed_variable_packet(pkt, true)?;
                 }
-                #[cfg(feature = "discovery")]
                 let is_discovery = discovery::is_discovery_type(ty);
                 if !ignore_local {
                     if self.is_duplicate_pkt(&data)? {
                         return Ok(());
                     }
-                    #[cfg(feature = "discovery")]
                     if !is_discovery
                         && !is_internal_control_type(ty)
-                        && let Err(error) = self.dispatch_local_for_item(&data, called_from_queue)
-                    {
-                        // Never repeat a partially applied local side effect.
-                        if claim.is_some() {
-                            context.mark_terminal();
-                            if called_from_queue {
-                                return Err(TelemetryError::HandlerError("accepted local delivery failed"));
-                            }
-                        }
-                        return Err(error);
-                    }
-                    #[cfg(not(feature = "discovery"))]
-                    if !is_internal_control_type(ty)
                         && let Err(error) = self.dispatch_local_for_item(&data, called_from_queue)
                     {
                         // Never repeat a partially applied local side effect.
@@ -24280,19 +23549,15 @@ impl Router {
                 // all of it for dispatch. Reuse this per-dispatch plan when no
                 // delivery contract can change its destination set. It is not
                 // a persistent topology/schema cache.
-                #[cfg(feature = "discovery")]
                 let cached_plan = if freezes_contract {
                     None
                 } else {
                     Some(self.remote_side_plan(&data, None)?)
                 };
-                #[cfg(feature = "discovery")]
                 let send_remote = match &cached_plan {
                     Some(RemoteSidePlan::Target(sides)) => !sides.is_empty(),
                     None => self.should_route_remote(&data, None)?,
                 };
-                #[cfg(not(feature = "discovery"))]
-                let send_remote = self.should_route_remote(&data, None)?;
 
                 if !send_remote {
                     let (endpoints, ty) = self.item_route_info(&data)?;
@@ -24312,10 +23577,8 @@ impl Router {
                     }
                     return Ok(());
                 }
-                #[cfg(feature = "discovery")]
                 let mut data = data;
                 if freezes_contract {
-                    #[cfg(feature = "discovery")]
                     {
                         let pending = {
                             let st = self.state.lock();
@@ -24368,13 +23631,10 @@ impl Router {
                         }
                     }
                 }
-                #[cfg(feature = "discovery")]
                 let plan = match cached_plan {
                     Some(plan) => plan,
                     None => self.remote_side_plan(&data, None)?,
                 };
-                #[cfg(not(feature = "discovery"))]
-                let plan = self.remote_side_plan(&data, None)?;
                 let RemoteSidePlan::Target(sides) = plan;
                 if context.claim.is_some_and(|claim| claim.ordered)
                     && !context.owner_transferred()
@@ -24407,24 +23667,14 @@ impl Router {
                             0,
                             0,
                             true,
-                            #[cfg(feature = "compression")]
                             &mut None,
                         )?;
                         continue;
                     }
-                    #[cfg(feature = "compression")]
                     let mut side_data = data.clone();
-                    #[cfg(feature = "compression")]
                     let (send_result, mut reservation) = self.send_queued_to_side_with_progress(
                         side,
                         &mut side_data,
-                        false,
-                        &mut context.admitted,
-                    );
-                    #[cfg(not(feature = "compression"))]
-                    let send_result = self.send_reliable_to_side_with_progress(
-                        side,
-                        data.clone(),
                         false,
                         &mut context.admitted,
                     );
@@ -24436,14 +23686,10 @@ impl Router {
                                     RouterTxItem::ToSide {
                                         src: None,
                                         dst: side,
-                                        #[cfg(feature = "compression")]
                                         data: side_data,
-                                        #[cfg(not(feature = "compression"))]
-                                        data: data.clone(),
                                     },
                                     Self::router_item_priority(&data)?,
                                     parent,
-                                    #[cfg(feature = "compression")]
                                     &mut reservation,
                                 )?;
                             } else if let Some(ordered) = ordered_side {
@@ -24451,21 +23697,16 @@ impl Router {
                                     RouterTxItem::ToSide {
                                         src: None,
                                         dst: side,
-                                        #[cfg(feature = "compression")]
                                         data: side_data,
-                                        #[cfg(not(feature = "compression"))]
-                                        data: data.clone(),
                                     },
                                     ordered,
                                     None,
                                     0,
                                     0,
                                     false,
-                                    #[cfg(feature = "compression")]
                                     &mut reservation,
                                 )?;
                             } else {
-                                #[cfg(feature = "compression")]
                                 self.retry_codec_owner(
                                     RouterTxItem::ToSide {
                                         src: None,
@@ -24475,17 +23716,8 @@ impl Router {
                                     true,
                                     &mut reservation,
                                 )?;
-                                #[cfg(not(feature = "compression"))]
-                                self.tx_queue_item_for_retry(
-                                    RouterTxItem::ToSide {
-                                        src: None,
-                                        dst: side,
-                                        data: data.clone(),
-                                    },
-                                    true,
-                                )?;
                             }
-                            #[cfg(all(test, feature = "std", feature = "discovery"))]
+                            #[cfg(all(test, feature = "std"))]
                             managed_order_side_gate_causal::observe(self,"broadcast_side_retry_enqueued",|| serde_json::json!({"data":managed_order_side_gate_causal::data_meta(&data),"e2e_parent":e2e_parent}));
                             continue;
                         }
@@ -24546,10 +23778,7 @@ impl Router {
                 let Some((send_result, reservation)) = sent else {
                     return Ok(());
                 };
-                #[cfg(feature = "compression")]
                 let mut reservation = reservation;
-                #[cfg(not(feature = "compression"))]
-                let () = reservation;
                 if let Err(e) = send_result {
                     if Self::is_transient_tx_error(&e) {
                         context.mark_refused();
@@ -24572,23 +23801,13 @@ impl Router {
                                 retry_priority,
                                 turn_flags,
                                 immediate,
-                                #[cfg(feature = "compression")]
                                 &mut reservation,
                             );
                         }
-                        #[cfg(feature = "compression")]
                         self.retry_codec_owner_at_priority(
                             RouterTxItem::ToSide { src, dst, data },
                             true,
                             &mut reservation,
-                            retry_priority,
-                            turn_flags,
-                            immediate,
-                        )?;
-                        #[cfg(not(feature = "compression"))]
-                        self.tx_queue_item_for_retry_at_priority_with_turn(
-                            RouterTxItem::ToSide { src, dst, data },
-                            true,
                             retry_priority,
                             turn_flags,
                             immediate,
@@ -24635,19 +23854,10 @@ impl Router {
                     });
                 }
                 for side in sides.iter().copied() {
-                    #[cfg(feature = "compression")]
                     let mut side_data = data.clone();
-                    #[cfg(feature = "compression")]
                     let (send_result, mut reservation) = self.send_queued_to_side_with_progress(
                         side,
                         &mut side_data,
-                        false,
-                        &mut context.admitted,
-                    );
-                    #[cfg(not(feature = "compression"))]
-                    let send_result = self.send_reliable_to_side_with_progress(
-                        side,
-                        data.clone(),
                         false,
                         &mut context.admitted,
                     );
@@ -24660,14 +23870,10 @@ impl Router {
                                 RouterTxItem::ToSide {
                                     src: None,
                                     dst: side,
-                                    #[cfg(feature = "compression")]
                                     data: side_data,
-                                    #[cfg(not(feature = "compression"))]
-                                    data: data.clone(),
                                 },
                                 retry_priority,
                                 packet_id,
-                                #[cfg(feature = "compression")]
                                 &mut reservation,
                             )?;
                             continue;
@@ -24859,7 +24065,7 @@ impl Router {
         }
     }
 
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     pub(crate) fn debug_end_to_end_acked_destination_count(&self, id: u64) -> Option<usize> {
         self.state
             .lock()
@@ -24869,7 +24075,7 @@ impl Router {
             .get(&id)
             .map(OrdSet::len)
     }
-    #[cfg(all(test, feature = "discovery"))]
+    #[cfg(test)]
     pub(crate) fn debug_end_to_end_acked_packet_count(&self) -> usize {
         self.state
             .lock()
@@ -24888,7 +24094,6 @@ impl Router {
     pub fn tx(&self, mut pkt: Packet) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
         self.stamp_origin_epoch(&mut pkt);
-        #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
             return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packet(pkt)));
@@ -24904,7 +24109,6 @@ impl Router {
     pub fn tx_packed(&self, pkt: Arc<[u8]>) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
         wire_format::verify_frame_crc(&pkt)?;
-        #[cfg(feature = "discovery")]
         let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
         if self.side_tx_active() {
             return self.tx_queue_item(RouterTxItem::Broadcast(RouterItem::Packed(
@@ -24987,7 +24191,6 @@ impl Router {
     ) -> TelemetryResult<()> {
         self.ensure_application_origin_allowed()?;
         if !queued {
-            #[cfg(feature = "discovery")]
             let _ = crate::memory_admission::allow_drain(self.poll_discovery())?;
             queued = self.side_tx_active();
         }
@@ -25041,7 +24244,7 @@ impl Router {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 mod queued_schema_identity_tests {
     use super::*;
 
@@ -25828,20 +25031,20 @@ mod queued_schema_identity_tests {
     }
 }
 
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 fn untemplated_test_node() -> Router {
     Router::new_with_clock(RouterConfig::default(), Box::new(|| 0))
 }
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 fn untemplated_test_options() -> RouterSideOptions {
     RouterSideOptions::default().with_small_packet_transport(64).with_point_to_point()
 }
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[allow(clippy::duplicate_mod)]
 #[path = "tests/untemplated_transport.rs"]
 mod untemplated_transport_tests;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 mod queued_producer_maintenance_tests {
     use super::*;
     #[test]
@@ -26210,7 +25413,7 @@ mod bounded_fair_queue_tests {
     }
 }
 
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 #[test]
 fn cow_discovery_rejected_growth_keeps_original_graph_and_routes() {
     crate::tests::ensure_common_test_schema();
@@ -26355,7 +25558,7 @@ mod bounded_rx_priority_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/accepted_tx_ownership.rs"]
 mod accepted_tx_ownership;
 
@@ -26363,7 +25566,7 @@ mod accepted_tx_ownership;
 #[path = "router_latest.rs"]
 mod latest;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/retry_backpressure_native.rs"]
 mod retry_backpressure_native;
 
@@ -26374,7 +25577,7 @@ mod e2e_backpressure;
 mod timesync_v2;
 #[cfg(all(test, feature = "timesync"))]
 pub(crate) use timesync_v2::seed_timesync_nonce;
-#[cfg(all(test, feature = "std", feature = "discovery", feature = "timesync"))]
+#[cfg(all(test, feature = "std", feature = "timesync"))]
 #[path = "tests/peer_record_footprint.rs"]
 mod peer_record_footprint;
 
@@ -26384,30 +25587,30 @@ mod completion;
 #[cfg(feature = "std")]
 pub use completion::{PackedWriteLease, RetryTracker, RetryTrackerLimits, WriteStart};
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/actual_bootstrap_arbitration.rs"]
 mod actual_bootstrap_arbitration;
 
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/router_managed_refresh.rs"]
 mod managed_refresh_tests;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/pending_type_metadata.rs"]
 mod pending_type_metadata;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/sender_identity_match.rs"]
 mod sender_identity_match;
 
-#[cfg(all(test, feature = "discovery", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/router_cold_cycle_trace.rs"]
 mod router_cold_cycle_trace;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/toside_inspection_metadata.rs"]
 mod toside_inspection_metadata;
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/active_queued_types.rs"]
 mod active_queued_types;
 
@@ -26452,7 +25655,7 @@ mod prepared_p2p;
 #[cfg(feature = "std")]
 pub use prepared_p2p::{P2pAdmission, P2pStreamOperation, P2pTarget, PreparedP2p, TryP2pError};
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="published_p2p_tuple_causal.rs"]
 mod published_p2p_tuple_causal;
 
@@ -26462,7 +25665,7 @@ mod prepared_queue;
 #[cfg(feature = "std")]
 pub use prepared_queue::{PrepareQueuedPacketFailure, PreparedQueuedPacket, TryPendingTypeError, TryQueuedPacketError};
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "router_topology_binding_tests.rs"]
 mod topology_binding_tests;
 
@@ -26472,7 +25675,7 @@ mod prepared_managed;
 #[cfg(feature="std")]
 pub use prepared_managed::{ManagedBatchPreparationLimits, PrepareManagedBatchFailure, PreparedManagedBatch, TryManagedBatchError, ManagedBatchAccepted};
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/discovery_bootstrap_causal.rs"]
 mod discovery_bootstrap_causal;
 
@@ -26484,21 +25687,15 @@ static HOP_FAILURE_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod hop_timeout_causal_tests;
 // Contract-specific hop controls need actual hop sequencing; discovery's
 // addressed E2E bypass is covered by the unchanged default delivery cases.
-#[cfg(all(test, feature = "std", not(feature = "discovery")))]
-#[path = "router_hop_failure_contract_tests.rs"]
-mod hop_failure_contract_tests;
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/managed_order_side_gate_causal.rs"]
 mod managed_order_side_gate_causal;
 
 // Explicit Schema receipt state has a finite, charged lifetime. This is a
 // memory-admission estimate, not an allocator reservation/OOM guarantee.
-#[cfg(feature = "discovery")]
 const CONTROL_RX_TAG_LOGICAL_BYTES: usize = size_of::<u64>() + size_of::<ControlRxMode>() + core::mem::align_of::<u64>() - 1;
-#[cfg(feature = "discovery")]
 const CONTROL_RX_ROW_LOGICAL_BYTES: usize = size_of::<ReliableRxState>() + size_of::<(RouterSideId,u32)>() + 2 * size_of::<usize>();
 
-#[cfg(feature = "discovery")]
 impl Router {
     fn same_control_side_owner(left: &RouterTxHandlerFn, right: &RouterTxHandlerFn) -> bool {
         match (left,right) {
@@ -26707,30 +25904,29 @@ impl Router {
     }
 }
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/schema_bound_receipt_tests.rs"]
 mod schema_bound_receipt_tests;
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/schema_bound_receipt_relay.rs"]
 mod schema_bound_receipt_relay;
 
-#[cfg(feature="discovery")]
 const fn is_bound_network_control(ty:DataType)->bool {
     matches!(ty,DataType::DiscoverySchema|DataType::ManagedVariableRequest)
 }
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/network_control_receipt_tests.rs"]
 mod network_control_receipt_tests;
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/network_request_periodic_loss.rs"]
 mod network_request_periodic_loss;
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/physical_hop_witness.rs"]
 mod physical_hop_witness;
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/hop_first_offer_ownership.rs"]
 mod hop_first_offer_ownership;
 
@@ -26746,7 +25942,7 @@ fn canonical_queued_cost_propagates_max_without_outer_wrap() {
     assert_eq!(TxQueued::cost_with_item(usize::MAX-overhead-1),usize::MAX-1);
 }
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[test]
 fn string_sort_capacity_duplicates_preserve_tracked_budget_and_release() {
     fn text(value:&str,capacity:usize)->String {let mut out=String::with_capacity(capacity);out.push_str(value);out}
@@ -26777,7 +25973,7 @@ fn string_sort_capacity_duplicates_preserve_tracked_budget_and_release() {
     assert_eq!(st.queued_packet_budget_used(&schema),baseline);
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/failover_min_selection.rs"]
 mod failover_min_selection;
 
@@ -26793,11 +25989,11 @@ impl Router {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/packed_offer_sharing_trace.rs"]
 mod packed_offer_sharing_trace;
 
-#[cfg(all(test,feature="std",feature="discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path="tests/cold_control_codegen_equivalence.rs"]
 mod cold_control_codegen_equivalence;
 

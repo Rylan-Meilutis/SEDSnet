@@ -1,4 +1,4 @@
-#![cfg(all(not(feature = "std"), feature = "discovery"))]
+#![cfg(not(feature = "std"))]
 #[path = "support/side_chunk.rs"]
 mod side_chunk;
 use std::alloc::{GlobalAlloc, Layout, System};

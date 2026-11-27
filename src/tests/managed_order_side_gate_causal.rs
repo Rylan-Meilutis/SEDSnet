@@ -732,14 +732,12 @@ fn constrained_ring_group_refusal_has_no_output_or_hidden_reservation() {
         st.transmit_queue=BoundedDeque::new(st.memory.max_queue_budget,size_of::<TxQueued>(),1.0);
         assert_eq!(st.transmit_queue.capacity(),1);
     }
-    #[cfg(feature="compression")]
     let reservation_before=f.writer.state.lock().codec_reserved_bytes;
     f.writer.tx_item(RouterTxItem::Broadcast(RouterItem::Packet(p))).unwrap();
     assert!(got.lock().unwrap().is_empty());assert!(f.seen.lock().unwrap().is_empty());
     let anchor={let st=f.writer.state.lock();let rows=st.transmit_queue.iter().filter(|r|r.accepted_type==ty.as_u32()).collect::<Vec<_>>();
         assert_eq!(rows.len(),1);assert_eq!(rows[0].delivery_state,QueuedDelivery::DeferredOrdered);assert!(rows[0].ignore_local);
         assert!(!RouterInner::local_ordered_side(rows[0]));rows[0].deferred_since_ms};
-    #[cfg(feature="compression")]
     assert_eq!(f.writer.state.lock().codec_reserved_bytes,reservation_before);
     let lifetime=runtime_reliable_retransmit_ms().saturating_mul(u64::from(runtime_reliable_max_retries())+1);
     f.clock.store(anchor+lifetime,Ordering::Relaxed);
@@ -848,15 +846,10 @@ fn retired_known_local_work_never_falls_back_to_ordinary_send() {
     assert_eq!(ids,expected,"fresh same-type head/tail must survive retired old work");
 }
 
-#[cfg(feature="compression")]
 static CODEC_PROBE_ROUTER:OnceLock<Mutex<Weak<Router>>>=OnceLock::new();
-#[cfg(feature="compression")]
 static CODEC_PROBE_CALLS:AtomicU64=AtomicU64::new(0);
-#[cfg(feature="compression")]
 static CODEC_PROBE_HELD:AtomicU64=AtomicU64::new(0);
-#[cfg(feature="compression")]
 static CODEC_PROBE_REFUSE:AtomicBool=AtomicBool::new(false);
-#[cfg(feature="compression")]
 extern "C" fn codec_owner_probe(additional:usize,_largest:usize)->bool {
     if additional>=2000 {
         let router=CODEC_PROBE_ROUTER.get_or_init(||Mutex::new(Weak::new())).lock().unwrap().upgrade();
@@ -868,11 +861,8 @@ extern "C" fn codec_owner_probe(additional:usize,_largest:usize)->bool {
     }
     true
 }
-#[cfg(feature="compression")]
 struct CodecProbeReset;
-#[cfg(feature="compression")]
 impl Drop for CodecProbeReset {fn drop(&mut self){crate::memory_admission::set_probe(None);*CODEC_PROBE_ROUTER.get().unwrap().lock().unwrap()=Weak::new();}}
-#[cfg(feature="compression")]
 #[test]
 fn compressed_direct_local_stages_plaintext_outside_core() {
     let mut f=Fixture::new();

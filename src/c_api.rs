@@ -16,7 +16,6 @@
 mod cache_invalidation_tests;
 
 use crate::binding_options::{relay_side_options_for_profile, router_side_options_for_profile};
-#[cfg(feature = "discovery")]
 use crate::config::known_endpoints;
 #[cfg(target_endian = "big")]
 use crate::do_vec_log_typed;
@@ -49,13 +48,10 @@ use crate::{
 #[cfg(target_endian = "big")]
 use crate::{MessageDataType::NoData, get_data_type};
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-#[cfg(feature = "discovery")]
 use crate::OrdMap;
-#[cfg(feature = "discovery")]
 use alloc::format;
 use core::{ffi::c_char, ffi::c_void, mem::size_of, ptr, slice, str::from_utf8};
 
-#[cfg(feature = "cryptography")]
 use crate::crypto::{
     CCryptographyProvider, MANAGED_CREDENTIAL_LEN, ManagedCredential,
     clear_c_cryptography_provider, clear_software_keys, issue_managed_credential,
@@ -413,7 +409,6 @@ pub struct SedsP2pStreamEventView {
     payload_len: usize,
 }
 
-#[cfg(feature = "cryptography")]
 #[repr(C)]
 pub struct SedsManagedCredentialInfo {
     subject_id: u64,
@@ -527,7 +522,6 @@ unsafe fn write_str_to_buf(s: &str, buf: *mut c_char, buf_len: usize) -> i32 {
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "discovery")]
 fn json_push_escaped(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
@@ -546,7 +540,6 @@ fn json_push_escaped(out: &mut String, s: &str) {
     out.push('"');
 }
 
-#[cfg(feature = "discovery")]
 fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> String {
     fn push_endpoint_name<S: AsRef<str>>(
         out: &mut String,
@@ -735,7 +728,6 @@ fn topology_snapshot_to_json(snap: &crate::discovery::TopologySnapshot) -> Strin
     out
 }
 
-#[cfg(feature = "discovery")]
 fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) -> String {
     fn push_optional_u64(out: &mut String, val: Option<u64>) {
         match val {
@@ -839,7 +831,6 @@ fn client_stats_snapshot_to_json(stats: &crate::discovery::ClientStatsSnapshot) 
     out
 }
 
-#[cfg(feature = "discovery")]
 fn route_selection_mode_name(mode: RouteSelectionMode) -> &'static str {
     match mode {
         RouteSelectionMode::Fanout => "Fanout",
@@ -848,7 +839,6 @@ fn route_selection_mode_name(mode: RouteSelectionMode) -> &'static str {
     }
 }
 
-#[cfg(feature = "discovery")]
 fn runtime_stats_snapshot_to_json(snap: &crate::diagnostics::RuntimeStatsSnapshot) -> String {
     fn push_bool(out: &mut String, val: bool) {
         out.push_str(if val { "true" } else { "false" });
@@ -1608,7 +1598,6 @@ pub extern "C" fn seds_router_free(r: *mut SedsRouter) {
     if r.is_null() {
         return;
     }
-    #[cfg(feature = "discovery")]
     {
         let router = unsafe { &(*r).inner };
         let _ = router.announce_leave();
@@ -2473,7 +2462,6 @@ pub extern "C" fn seds_router_complete_reliable(r: *mut SedsRouter, packet_id: u
 /// For a driver that queues frames itself: true when `bytes` (a frame this
 /// router handed to `side_id`) is a relayed reliable copy every destination
 /// owner has already acknowledged. Drop it instead of writing it.
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_relayed_frame_satisfied(
     r: *mut SedsRouter,
@@ -2516,7 +2504,6 @@ pub extern "C" fn seds_router_poll_timesync(r: *mut SedsRouter, out_did_queue: *
     }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_announce_discovery(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -2526,7 +2513,6 @@ pub extern "C" fn seds_router_announce_discovery(r: *mut SedsRouter) -> i32 {
     ok_or_status(router.announce_discovery())
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_announce_leave(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -2536,7 +2522,6 @@ pub extern "C" fn seds_router_announce_leave(r: *mut SedsRouter) -> i32 {
     ok_or_status(router.announce_leave())
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_poll_discovery(r: *mut SedsRouter, out_did_queue: *mut bool) -> i32 {
     if r.is_null() {
@@ -2652,7 +2637,6 @@ pub extern "C" fn seds_router_clear_network_variable_caches(
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_request_managed_variable(r: *mut SedsRouter, ty: DataType) -> i32 {
     if r.is_null() {
@@ -2717,7 +2701,6 @@ pub extern "C" fn seds_router_cached_managed_variable_packed_len(
     i32::try_from(pack_packet(&pkt).len()).unwrap_or(i32::MAX)
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_get_network_variable_packed_len(
     r: *mut SedsRouter,
@@ -2769,7 +2752,6 @@ pub extern "C" fn seds_router_cached_managed_variable_packed(
     i32::try_from(bytes.len()).unwrap_or(i32::MAX)
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_get_network_variable_packed(
     r: *mut SedsRouter,
@@ -4122,7 +4104,6 @@ pub extern "C" fn seds_relay_free(r: *mut SedsRelay) {
     if r.is_null() {
         return;
     }
-    #[cfg(feature = "discovery")]
     {
         let relay = unsafe { &(*r).inner };
         let _ = relay.announce_leave();
@@ -4156,7 +4137,6 @@ pub extern "C" fn seds_relay_set_sender_id(
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_announce_discovery(r: *mut SedsRelay) -> i32 {
     if r.is_null() {
@@ -4166,7 +4146,6 @@ pub extern "C" fn seds_relay_announce_discovery(r: *mut SedsRelay) -> i32 {
     ok_or_status(relay.announce_discovery())
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_announce_leave(r: *mut SedsRelay) -> i32 {
     if r.is_null() {
@@ -4176,7 +4155,6 @@ pub extern "C" fn seds_relay_announce_leave(r: *mut SedsRelay) -> i32 {
     ok_or_status(relay.announce_leave())
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_poll_discovery(r: *mut SedsRelay, out_did_queue: *mut bool) -> i32 {
     if r.is_null() {
@@ -4194,7 +4172,6 @@ pub extern "C" fn seds_relay_poll_discovery(r: *mut SedsRelay, out_did_queue: *m
     }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_topology_len(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -4205,7 +4182,6 @@ pub extern "C" fn seds_router_export_topology_len(r: *mut SedsRouter) -> i32 {
     (json.len() + 1) as i32
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_topology(
     r: *mut SedsRouter,
@@ -4220,7 +4196,6 @@ pub extern "C" fn seds_router_export_topology(
     unsafe { write_str_to_buf(&json, buf, buf_len) }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_client_stats_len(
     r: *mut SedsRouter,
@@ -4246,7 +4221,6 @@ pub extern "C" fn seds_router_export_client_stats_len(
     }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_client_stats(
     r: *mut SedsRouter,
@@ -4277,7 +4251,6 @@ pub extern "C" fn seds_router_export_client_stats(
     }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_runtime_stats_len(r: *mut SedsRouter) -> i32 {
     if r.is_null() {
@@ -4288,7 +4261,6 @@ pub extern "C" fn seds_router_export_runtime_stats_len(r: *mut SedsRouter) -> i3
     (json.len() + 1) as i32
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_router_export_runtime_stats(
     r: *mut SedsRouter,
@@ -4415,7 +4387,6 @@ pub extern "C" fn seds_router_export_memory_layout(
     unsafe { write_str_to_buf(&json, buf, buf_len) }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_topology_len(r: *mut SedsRelay) -> i32 {
     if r.is_null() {
@@ -4426,7 +4397,6 @@ pub extern "C" fn seds_relay_export_topology_len(r: *mut SedsRelay) -> i32 {
     (json.len() + 1) as i32
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_topology(
     r: *mut SedsRelay,
@@ -4441,7 +4411,6 @@ pub extern "C" fn seds_relay_export_topology(
     unsafe { write_str_to_buf(&json, buf, buf_len) }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_client_stats_len(
     r: *mut SedsRelay,
@@ -4467,7 +4436,6 @@ pub extern "C" fn seds_relay_export_client_stats_len(
     }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_client_stats(
     r: *mut SedsRelay,
@@ -4498,7 +4466,6 @@ pub extern "C" fn seds_relay_export_client_stats(
     }
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_runtime_stats_len(r: *mut SedsRelay) -> i32 {
     if r.is_null() {
@@ -4509,7 +4476,6 @@ pub extern "C" fn seds_relay_export_runtime_stats_len(r: *mut SedsRelay) -> i32 
     (json.len() + 1) as i32
 }
 
-#[cfg(feature = "discovery")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_relay_export_runtime_stats(
     r: *mut SedsRelay,
@@ -6362,7 +6328,6 @@ pub extern "C" fn seds_owned_header_view(
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_register_provider(
     seal: Option<crate::crypto::CSealFn>,
@@ -6376,13 +6341,11 @@ pub extern "C" fn seds_crypto_register_provider(
     status_from_result_code(SedsResult::SedsOk)
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_clear_provider() {
     clear_c_cryptography_provider();
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_register_software_key(
     key_id: u32,
@@ -6396,13 +6359,11 @@ pub extern "C" fn seds_crypto_register_software_key(
     ok_or_status(register_software_key(key_id, key))
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_clear_software_keys() {
     clear_software_keys();
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_issue_managed_credential(
     root_key: *const u8,
@@ -6439,7 +6400,6 @@ pub extern "C" fn seds_crypto_issue_managed_credential(
     }
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_verify_managed_credential(
     root_key: *const u8,
@@ -6474,7 +6434,6 @@ pub extern "C" fn seds_crypto_verify_managed_credential(
     }
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_seal(
     key_id: u32,
@@ -6516,7 +6475,6 @@ pub extern "C" fn seds_crypto_seal(
     }
 }
 
-#[cfg(feature = "cryptography")]
 #[unsafe(no_mangle)]
 pub extern "C" fn seds_crypto_open(
     key_id: u32,
@@ -6555,7 +6513,7 @@ pub extern "C" fn seds_crypto_open(
     }
 }
 
-#[cfg(all(test, feature = "discovery"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::discovery::{DISCOVERY_FAST_INTERVAL_MS, build_discovery_announce};
@@ -7158,7 +7116,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "discovery")]
     #[test]
     fn router_c_abi_rejects_reserved_discovery_endpoint_handler() {
         let desc = SedsLocalEndpointDesc {
@@ -8772,7 +8729,7 @@ mod pending_copy_contract_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/best_effort_endpoint_fanout.rs"]
 mod best_effort_endpoint_fanout;
 
@@ -8796,7 +8753,7 @@ pub extern "C" fn seds_relay_set_latest_value_side(r: *mut SedsRelay, side: i32)
     ok_or_status(unsafe { &(*r).inner }.set_latest_value_side((side >= 0).then_some(side as usize)))
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 #[path = "tests/c_api_sender_identity_match.rs"]
 mod sender_identity_match_tests;
 

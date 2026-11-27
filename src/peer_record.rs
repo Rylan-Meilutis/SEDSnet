@@ -2,7 +2,6 @@
 //! across metadata types. Stage new allocations before changing authoritative peer state.
 use crate::{TelemetryError, TelemetryResult};
 use alloc::boxed::Box;
-#[cfg(any(feature = "discovery", feature = "timesync"))]
 use crate::OrdMap;
 use alloc::string::String;
 
@@ -80,7 +79,6 @@ impl<T> Prepared<'_, T> {
     }
 }
 
-#[cfg(feature = "discovery")]
 pub(crate) fn try_clone_map<T: Clone>(
     map: &OrdMap<String, Box<T>>,
 ) -> TelemetryResult<OrdMap<String, Box<T>>> {

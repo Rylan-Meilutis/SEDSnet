@@ -156,7 +156,6 @@ fn rejected_packed_value_can_reach_the_same_callback_again_without_rebinding() {
     assert_eq!(node.cached_managed_variable(ty), Some(value));
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn actual_discovery_advertisements_keep_invalidated_variables_registered() {
     let (a, ep_a) = schema("CACHE_ONLY_ADVERTISEMENT_A");

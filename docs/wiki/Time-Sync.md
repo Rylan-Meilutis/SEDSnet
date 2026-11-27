@@ -54,7 +54,7 @@ Use `encode_timesync_priority` / `decode_timesync_quality` or `TimeSyncSource::q
 A request sent to a source learned on a known side carries that source's tag in the upper 32 bits of
 `seq`. Servers answer only untargeted requests or requests naming them; legacy servers echo the word.
 
-With the `discovery` feature enabled, discovery also adds a built-in
+Discovery also adds a built-in
 `SEDSNET_DISCOVERY_TIMESYNC_SOURCES` control packet that advertises concrete time source sender IDs.
 The richer `SEDSNET_DISCOVERY_TOPOLOGY` packet then attributes those source IDs to specific remote routers
 and carries their inter-router connections.
@@ -307,7 +307,7 @@ When a complete date+time base exists, the router advances it forward using the 
 
 ## Discovery integration
 
-With both `timesync` and `discovery` enabled:
+With `timesync` enabled:
 
 - discovery advertisements include `SEDSNET_TIME_SYNC` endpoint reachability
 - routers and relays also advertise reachable time source sender IDs
