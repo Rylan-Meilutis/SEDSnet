@@ -27,6 +27,20 @@ RELEASE_CONFIG_FILE = ".sedsnet-release.toml"
 PYPI_LEGACY_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 
 
+# Strict Clippy over every target for std plus one opt-in feature at a time,
+# so test and helper code stays correct without the default feature bundle.
+# compact-packet-compression is covered by the compact qualification profile.
+MINIMAL_STD_FEATURE_SETS = (
+    "std",
+    "std,timesync",
+    "std,compact-bundle",
+    "std,latest-value-egress",
+    "std,ingress-target-filter",
+    "std,fair-admission",
+    "std,compact-packet-store",
+    "std,zstd-lean",
+)
+
 FEATURE_OPTIONS = ("embedded", "python", "timesync", "fair-admission", "ingress-target-filter", "compact-packet-store", "compact-packet-compression", "latest-value-egress", "compact-bundle", "zstd-lean")
 
 def qualification_profiles(features: list[str]) -> list[list[str]]:
@@ -1099,6 +1113,18 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
             total_steps_override=total_steps,
         )
         _success("Clippy checks passed.")
+        if _shared_test_steps:
+            for minimal_features in MINIMAL_STD_FEATURE_SETS:
+                run_cmd(
+                    cargo_clippy_cmd(
+                        build_mode=build_mode,
+                        build_args=["--no-default-features", "--features", minimal_features],
+                    ),
+                    env=env, repo_root=repo_root,
+                    title="Minimal std feature combination strict Clippy: " + minimal_features,
+                    release_build=release_build,
+                )
+            _success("Minimal std feature combination checks passed.")
 
         runner_name, test_cmds = test_runner_cmds(
             env=env,
@@ -1151,9 +1177,10 @@ def main(argv: list[str], *, _qualification_profile: list[str] | None = None,
             run_cmd(
                 ["cargo", "test", *build_mode, "--no-default-features",
                  "--features", "std,timesync",
+                 "--test", "packet_packing_memory", "--test", "packet_routing_memory",
                  "--test", "accepted_queue_delivery"],
                 env=env, repo_root=repo_root,
-                title=f"{next_step}/{total_steps} cargo test (minimal std accepted delivery)",
+                title=f"{next_step}/{total_steps} cargo test (minimal std forwarding memory)",
                 release_build=release_build,
             )
             next_step += 1

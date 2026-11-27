@@ -2656,18 +2656,21 @@ mod endpoint_decode_tests {
 
         // Compact bundles rebuild the canonical frames byte for byte.
         let a = pack_packet(&plain.clone().with_time_epoch(3));
-        let b = pack_packet(&frozen);
-        let c = pack_packet(&plain);
-        let bundle = crate::wire_bundle::pack_bundle(&[&a, &b, &c]).unwrap();
-        let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
-        assert_eq!(frames, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
-        // Consecutive epoch-only contracts (the second one elided), a
-        // two-byte epoch, and a full contract between them.
-        let a2 = pack_packet(&plain.clone().with_time_epoch(3).with_nonce(78));
         let d = pack_packet(&plain.clone().with_time_epoch(200));
-        let bundle = crate::wire_bundle::pack_bundle(&[&a, &a2, &d, &b, &a]).unwrap();
-        let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
-        assert_eq!(frames, vec![a.to_vec(), a2.to_vec(), d.to_vec(), b.to_vec(), a.to_vec()]);
+        #[cfg(feature = "compact-bundle")]
+        {
+            let b = pack_packet(&frozen);
+            let c = pack_packet(&plain);
+            let bundle = crate::wire_bundle::pack_bundle(&[&a, &b, &c]).unwrap();
+            let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
+            assert_eq!(frames, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+            // Consecutive epoch-only contracts (the second one elided), a
+            // two-byte epoch, and a full contract between them.
+            let a2 = pack_packet(&plain.clone().with_time_epoch(3).with_nonce(78));
+            let bundle = crate::wire_bundle::pack_bundle(&[&a, &a2, &d, &b, &a]).unwrap();
+            let frames = crate::wire_bundle::unpack_bundle_frames(&bundle).unwrap();
+            assert_eq!(frames, vec![a.to_vec(), a2.to_vec(), d.to_vec(), b.to_vec(), a.to_vec()]);
+        }
         // The side transport reads past an epoch-only contract.
         for frame in [&a, &d] {
             assert!(crate::side_transport::extract_side_header_template(frame).is_ok());

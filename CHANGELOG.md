@@ -29,15 +29,28 @@ and `python` build).
   `SEDS_ENABLE_CRYPTOGRAPHY`, so existing `#if defined(SEDS_ENABLE_CRYPTOGRAPHY)`
   code keeps compiling. The C wrapper's default E2E mode is always
   `SEDS_ROUTER_E2E_PREFERRED`.
-- `build.py`: `--features cryptography` is no longer accepted, and the
-  minimal std/discovery-off Clippy checks are removed.
+- `build.py`: `--features cryptography` is no longer accepted. The minimal
+  std/discovery-off Clippy checks are replaced by strict `--all-targets`
+  Clippy over `--no-default-features` with `std` alone and with `std` plus
+  each cheap opt-in feature (timesync, compact-bundle, latest-value-egress,
+  ingress-target-filter, fair-admission, compact-packet-store, zstd-lean).
 
 ### Removed
 
 - The discovery-off, compression-off and cryptography-off code paths (stub
   codecs, "e2e crypto unsupported" rejections, disabled-E2E fallbacks) and
   the tests that only ran in those builds, including the hop-failure
-  contract tests and the uncompressed packing/routing memory tests.
+  contract tests.
+
+### Tests
+
+- The packing/routing memory tests now run in the always-compressing build
+  with incompressible payloads. A compression-eligible type pays one
+  transient payload-sized zstd output buffer before the frame is built; the
+  tests bound it to that one buffer, freed before the frame.
+- Tests that use compact bundles or the packet arena are gated on
+  `compact-bundle` / `compact-packet-store`, so every minimal std feature
+  combination builds warning-free.
 
 ## 7.0.3
 

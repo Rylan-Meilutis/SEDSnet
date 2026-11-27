@@ -47,7 +47,8 @@ const MAX_SEQUENCED_NONCE: u32 = 16_383;
 
 /// Test only: restart the packet nonce sequence from `seed`, so a test can
 /// replay a scenario under the nonce sequences other test orders produce.
-#[cfg(test)]
+/// Only the time-sync radio simulation uses it.
+#[cfg(all(test, feature = "timesync", feature = "std"))]
 pub(crate) fn seed_packet_nonce(seed: u32) {
     PACKET_NONCE_COUNTER.store(seed, Ordering::Relaxed);
 }

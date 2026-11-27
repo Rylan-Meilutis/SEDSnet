@@ -28,9 +28,21 @@ class BuildCliTests(unittest.TestCase):
         self.assertIn('ingress-target-filter', profiles[0])
         self.assertNotIn('compact-packet-compression', profiles[0])
         self.assertEqual(profiles[1] - profiles[0], {'compact-packet-compression', 'fair-admission', 'latest-value-egress'})
-        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 6)
+        minimal = [c[c.index('--features') + 1] for c in commands
+                   if c[:2] == ['cargo', 'clippy'] and '--no-default-features' in c
+                   and c[c.index('--features') + 1].split(',')[0] == 'std']
+        self.assertEqual(minimal, list(build.MINIMAL_STD_FEATURE_SETS))
+        self.assertIn('std', minimal)
+        self.assertIn('std,timesync', minimal)
+        self.assertIn('std,compact-bundle', minimal)
+        self.assertIn('std,latest-value-egress', minimal)
+        self.assertTrue(all('--all-targets' in c and c[-2:] == ['-D', 'warnings'] for c in commands
+                            if c[:2] == ['cargo', 'clippy'] and '--no-default-features' in c
+                            and c[c.index('--features') + 1].split(',')[0] == 'std'))
+        self.assertEqual(sum(c[:2] == ['cargo', 'clippy'] for c in commands), 6 + len(minimal))
         self.assertEqual(sum('embedded_memory_behavior_test' in c for c in commands), 2)
-        self.assertEqual(sum('accepted_queue_delivery' in c and '--no-default-features' in c for c in commands), 1)
+        self.assertEqual(sum('packet_packing_memory' in c for c in commands), 1)
+        self.assertEqual(sum('packet_routing_memory' in c for c in commands), 1)
         self.assertEqual(sum(c[:2] == ['cargo', 'bench'] for c in commands), 1)
         self.assertEqual(sum(c[:2] == ['cargo', 'build'] for c in commands), 2)
         self.assertEqual(bindings.call_count, 2)

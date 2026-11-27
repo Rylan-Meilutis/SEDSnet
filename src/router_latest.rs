@@ -2986,6 +2986,7 @@ mod tests {
         let other = crate::config::register_endpoint("SCOPED_ID_OTHER_ENDPOINT", false).unwrap();
         for size in [0, 1, 16, 128, 4096] {
             for timestamp in [0, 127, 65536, 1_767_225_600_000] {
+                #[cfg_attr(not(feature = "compact-packet-store"), allow(unused_mut))]
                 let mut original = Packet::new_with_nonce(
                     ty,
                     &[other, ep, other],
@@ -2996,6 +2997,8 @@ mod tests {
                 )
                 .unwrap();
                 let expected = original.packet_id();
+                // Parking moves the payload into the packet arena when it exists.
+                #[cfg(feature = "compact-packet-store")]
                 original.park_for_queue().unwrap();
                 assert_eq!(original.scoped_packet_id().unwrap(), expected);
                 let raw = wire_format::pack_packet(&original);
