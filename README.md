@@ -201,6 +201,17 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 7.0.3 highlights
+
+- Patch release, no wire, API or C ABI change: frames of one P2P stream
+  keep their send order when a side refuses one ("side tx busy") and the
+  next is sent from another thread.
+- Ordered hop streams (Schema, managed variables, Ordered data on hop-only
+  links) resume after an outage longer than their retry window instead of
+  failing for good with one error per later frame.
+- `zstd-lean` is verified against zstd 1.6.0 too; zstd-sys 2.2 is allowed
+  again.
+
 ### Version 7.0.2 highlights
 
 - Patch release, no code or wire change: holds zstd-sys below 2.2 (zstd 1.6)

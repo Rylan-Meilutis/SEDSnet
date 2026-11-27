@@ -411,8 +411,9 @@ Two opt-in zstd size options leave compressed frames byte-for-byte unchanged:
   KB on Cortex-M, 7.6 KB together with `SEDSNET_ZSTD_LTO`). The definitions behave
   exactly like zstd's with LDM off and an empty external sequence store; anything that
   would need the omitted code (an application enabling LDM, `ZSTD_c_targetCBlockSize`
-  or external sequences through the same zstd library) panics instead. It is pinned to
-  zstd 1.5.7 internals and stops compiling on another zstd version until re-verified.
+  or external sequences through the same zstd library) panics instead. It is verified
+  against zstd 1.5.7 (zstd-sys 2.1) and 1.6.0 (zstd-sys 2.2) internals, which emit
+  identical level-1 frames, and stops compiling on another zstd version until re-verified.
 - `SEDSNET_ZSTD_LTO=ON` (CMake; `build.py --env SEDSNET_EMBEDDED_ZSTD_LTO=1`): compile
   zstd as fat GCC LTO objects with the parent project's `CMAKE_C_COMPILER`. A firmware
   linked with `-flto` then optimises zstd together with its callers (8.7-9.7 KB on the

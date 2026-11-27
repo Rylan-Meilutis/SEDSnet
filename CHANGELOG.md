@@ -1,5 +1,57 @@
 # Changelog
 
+## 7.0.3
+
+Patch release: no wire, API or C ABI change; 7.0.x nodes interoperate.
+
+### Fixed
+
+- Frames of one P2P stream leave in the order the application sent them.
+  When a side refused a frame ("side tx busy": another thread was inside
+  that side's TX callback), the frame was queued for retry and the next
+  frame of the stream, sent from another thread once the side was free,
+  went out ahead of it: a stream CANCEL refused this way reached the peer
+  after the HASH sent behind it. The guard that keeps new frames behind
+  queued ones did not see side retries and was skipped for frames sent
+  without local delivery, which every P2P send is. Now a refused frame of
+  an Ordered type keeps its place toward that side, later frames of the
+  type for that side queue behind it, and a direct send also follows a
+  frame of the same type already queued (for example by
+  `try_queue_prepared_p2p`). This covers every Ordered type without an
+  end-to-end receipt owner, including SEDSnet's own Ordered control
+  traffic; other types and other sides are not held back, and a refusing
+  side is still passed over as in 7.0.1.
+- An Ordered hop stream resumes after an outage longer than its retry window
+  (8 retries, about 2 s). It used to give up on the frames in flight and then
+  stay failed until the side was removed: every later frame of that type on
+  that side was refused, one "tx handler failed" error per frame. This hit
+  SEDSnet's own Schema and managed-variable streams (and application Ordered
+  types on hop-only links); on a radio, a station's Schema stream to a
+  gateway could stay dead after a few seconds of outage. The exhaustion is
+  still reported once and counted, but the stream now asks the receiver where
+  it stands (a probe it discards, answered by its cumulative ACK) and resumes
+  right after the receiver's last delivered frame once the link is back.
+  Frames sent meanwhile wait in the queue in order; nothing is repeated or
+  sent into a gap. A frame the side refuses outright and end-to-end sealed
+  payloads keep the old failed state.
+- The rocket-topology churn soak draws frame loss and outage placement from
+  separate random streams, forces an outage longer than the hop retry window,
+  and checks that hop streams resume instead of assuming they never give up.
+
+### Changed
+
+- `zstd-lean` supports zstd 1.6.0 as well as 1.5.7: zstd-safe may resolve to
+  8.4 and zstd-sys to 2.2 again (held below 8.5 and 2.3). The stubs were
+  re-checked against zstd 1.6.0: the replaced structs (`ldmParams_t`,
+  `RawSeqStore_t`), prototypes and disabled-state behaviour are unchanged, and
+  1.6.0's newly extern LDM gear-hash helpers are only called from
+  `zstd_ldm.c`, so that object still stays out of the link. Level-1 frames are
+  byte-identical between the two releases, with and without `zstd-lean`; a new
+  test decodes frames written by the reference zstd 1.5.7 tool. On
+  thumbv7em, an image keeping the whole C API links 336 bytes more flash with
+  zstd 1.6.0 than with 1.5.7 under `zstd-lean` (zstd's own growth); the
+  feature saves 8.8 KB with 1.6.0 (8.5 KB with 1.5.7).
+
 ## 7.0.2
 
 Patch release: no code, wire, API or C ABI change.

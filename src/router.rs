@@ -1117,6 +1117,9 @@ struct DispatchContext {
     // Retain a denied queued replay's service band across side-owned retries.
     priority: u8,
     claim: Option<TxClaim>,
+    /// A deferred original's first deferral time; for a dispatched Ordered
+    /// side retry (no claim), its order number, kept when the side refuses
+    /// it again (see `RouterInner::ordered_side_retry`).
     since: Option<u64>,
     completion_flags: u8,
     admitted: bool,
@@ -1370,10 +1373,33 @@ impl ByteCost for u64 {
 
 #[derive(Debug, Clone)]
 struct ReliableTxState {
-    // Zero is a sticky exhausted Ordered hop. Never serialized on the wire.
+    // Zero is a sticky failed Ordered hop (the side refused a frame for
+    // good). Never serialized on the wire.
     next_seq: u32,
     sent_order: VecDeque<u32>,
     sent: OrdMap<u32, ReliableSent>,
+    /// An Ordered hop that gave up on its frames in flight and is finding
+    /// where the receiver stands before it sends again.
+    resync: Option<HopResync>,
+}
+
+/// After an Ordered hop exhausts its retries (an outage longer than the retry
+/// window), the receiver may hold any prefix of the frames given up on: their
+/// ACKs may be what was lost. The sender keeps one probe in history: the
+/// first given-up frame renumbered to the sequence just below it, which the
+/// receiver has already passed, so it discards the probe and answers with its
+/// cumulative ACK (the last sequence it delivered). Once ACKs have settled
+/// for one retry interval the stream resumes right after that ACK; new frames
+/// wait meanwhile (the side reports a transient refusal), so nothing is
+/// reordered or sent into a gap. A receiver taking network-control receipts
+/// instead of hop sequences confirms the probe itself, and the stream resumes
+/// where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HopResync {
+    probe: u32,
+    /// Highest ACK at or above `probe` seen so far, and when.
+    ack: Option<u32>,
+    ack_at_ms: u64,
 }
 
 /// A tentative ACK has authority only for this exact currently active offer;
@@ -3593,6 +3619,9 @@ struct RouterInner {
     #[cfg(feature = "latest-value-egress")]
     latest_service_seq: u32,
     ordered_claim_seq: u32,
+    /// Last order number given to a side retry of an Ordered type
+    /// (see `RouterInner::ordered_side_retry`); never zero once used.
+    ordered_side_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
     /// Reliable end-to-end packets delivered within the senders' retry
@@ -5091,6 +5120,44 @@ impl RouterInner {
             QueuedDelivery::Ordered | QueuedDelivery::OrderedTail
                 | QueuedDelivery::DeferredOrdered | QueuedDelivery::ClaimedOrdered
         ).then_some(DataType(item.accepted_type))
+    }
+
+    /// A frame of an Ordered type that a side refused, queued to retry toward
+    /// that side: `(side, type, order)`. Such retries carry an order number in
+    /// `deferred_since_ms` (unused by untracked side work), so the frames of
+    /// one Ordered type leave toward one side in the order they were sent,
+    /// even though a refused retry is queued again behind newer work.
+    fn ordered_side_retry(item: &TxQueued) -> Option<(RouterSideId, u32, u32)> {
+        match &item.item {
+            RouterTxItem::ToSide { src: None, dst, .. }
+                if item.disposable & TX_E2E_CHILD == 0
+                    && item.delivery_state == QueuedDelivery::Untracked
+                    && item.deferred_since_ms != 0 =>
+            {
+                Some((*dst, item.accepted_type, item.deferred_since_ms as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// True when an older retry of the same Ordered type toward the same side
+    /// is still queued: `item` must wait for it.
+    fn ordered_side_retry_waits(queue: &VecDeque<TxQueued>, item: &TxQueued) -> bool {
+        let Some((side, ty, order)) = Self::ordered_side_retry(item) else {
+            return false;
+        };
+        queue.iter().any(|queued| {
+            Self::ordered_side_retry(queued).is_some_and(|(s, t, o)| {
+                s == side && t == ty && (o.wrapping_sub(order) as i32) < 0
+            })
+        })
+    }
+
+    /// True when a retry of Ordered type `ty` toward `side` is queued.
+    fn ordered_side_retry_queued(&self, side: RouterSideId, ty: u32) -> bool {
+        self.transmit_queue.iter().any(|queued| {
+            Self::ordered_side_retry(queued).is_some_and(|(s, t, _)| s == side && t == ty)
+        })
     }
 
     fn pop_received_fair(&mut self) -> Option<RouterRxItem> {
@@ -13624,6 +13691,7 @@ impl Router {
                 next_seq: 1,
                 sent_order: VecDeque::new(),
                 sent: Default::default(),
+                resync: None,
             })
     }
 
@@ -13735,6 +13803,15 @@ impl Router {
             } else {
                 stream.sent.remove(&ack);
                 stream.sent_order.retain(|seq| *seq != ack);
+            }
+            return;
+        }
+        if let Some(resync) = stream.resync.as_mut() {
+            // The receiver's cumulative ACK: where the stream resumes once
+            // late ACKs from before the outage have drained.
+            if ack >= resync.probe {
+                resync.ack = Some(resync.ack.map_or(ack, |seen| seen.max(ack)));
+                resync.ack_at_ms = self.clock.now_ms();
             }
             return;
         }
@@ -14090,6 +14167,7 @@ impl Router {
             Err(_) => {
                 if ordered {
                     stream.next_seq = 0;
+                    stream.resync = None;
                     stream.sent.clear();
                     stream.sent_order.clear();
                 } else {
@@ -14229,6 +14307,9 @@ impl Router {
             match state.reliable_tx.get(&key) {
                 Some(stream) => {
                     if stream.next_seq == 0 {return Err(TelemetryError::HandlerError("ordered hop stream failed"))}
+                    // A resynchronising stream takes nothing new until it
+                    // knows where the receiver stands; the frame waits.
+                    if stream.resync.is_some() {return Err(TelemetryError::Io("reliable window full"))}
                     if stream.sent.len() >= runtime_reliable_max_pending() {return Err(TelemetryError::Io("reliable window full"))}
                     (stream.next_seq,stream.sent.len())
                 }
@@ -14260,6 +14341,7 @@ impl Router {
                 return Err(TelemetryError::Io("memory pressure"));
             }
             let stream = self.reliable_tx_state_mut(&mut state,side,ty);
+            if stream.resync.is_some() {return Err(TelemetryError::Io("reliable window full"))}
             if stream.next_seq != seq || stream.sent.contains_key(&seq) {
                 return Err(TelemetryError::Io("reliable owner changed"));
             }
@@ -16307,6 +16389,53 @@ impl Router {
         self.state.lock().exhausted_recent.drain(..).collect()
     }
 
+    /// Store the resync probe for an Ordered hop that just gave up: `first`
+    /// (its first given-up frame) renumbered to `probe`. A frame that cannot
+    /// be renumbered here (an end-to-end sealed payload) leaves the stream
+    /// failed, as before.
+    fn install_hop_probe(&self, side: RouterSideId, ty: DataType, probe: u32,
+        first: &crate::SharedBytes, now: u64) {
+        #[cfg(feature = "cryptography")]
+        let sealed = self.e2e_seal_config_for_type(ty).is_some();
+        #[cfg(not(feature = "cryptography"))]
+        let sealed = false;
+        let renumbered = if sealed {
+            None
+        } else {
+            crate::shared_bytes::with_slice(first, |wire| {
+                wire_format::rewrite_reliable_header_owned(wire, 0, probe, 0)
+            })
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(crate::shared_bytes::convert::<_, crate::SharedBytes>)
+        };
+        #[cfg(feature = "compact-packet-store")]
+        let renumbered = renumbered.map(|mut bytes| {
+            let _ = bytes.park_for_queue();
+            bytes
+        });
+        let mut state = self.state.lock();
+        let Some(stream) = state.reliable_tx.get_mut(&Self::reliable_key(side, ty)) else {return};
+        if stream.resync.is_none_or(|resync| resync.probe != probe) || !stream.sent.is_empty() {
+            return;
+        }
+        match renumbered {
+            Some(bytes) => {
+                // Sent at the next retransmit interval.
+                stream.sent.insert(probe, ReliableSent {
+                    bytes, offer_stamp: now, first_offer: FirstHopOffer::Complete,
+                    retries: 0, queued: false, partial_acked: false,
+                });
+                stream.sent_order.push_back(probe);
+            }
+            None => {
+                stream.resync = None;
+                stream.next_seq = 0;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn process_reliable_timeouts(&self) -> TelemetryResult<()> {
         self.process_reliable_timeouts_at(self.clock.now_ms())
@@ -16315,6 +16444,9 @@ impl Router {
     fn process_reliable_timeouts_at(&self, now: u64) -> TelemetryResult<()> {
         let mut requeue: Vec<(RouterSideId, DataType, u32)> = Vec::new();
         let mut failed_ordered = false;
+        // Ordered hops that just gave up: (side, type, probe sequence, the
+        // first given-up frame). Probes are built outside Core.
+        let mut resyncs: Vec<(RouterSideId, DataType, u32, crate::SharedBytes)> = Vec::new();
 
         {
             let mut st = self.state.lock();
@@ -16327,13 +16459,38 @@ impl Router {
                 let Some(ty) = DataType::try_from_u32(*ty_u32) else {
                     continue;
                 };
+                let interval = runtime_reliable_retransmit_ms();
+                if let Some(resync) = tx_state.resync {
+                    if let Some(ack) = resync.ack
+                        && now.wrapping_sub(resync.ack_at_ms) >= interval
+                    {
+                        // ACKs have settled: resume right after the
+                        // receiver's last delivered sequence.
+                        let next = ack.wrapping_add(1);
+                        tx_state.next_seq = if next == 0 { 1 } else { next };
+                        tx_state.resync = None;
+                        tx_state.sent.clear();
+                        tx_state.sent_order.clear();
+                        continue;
+                    }
+                    // Re-send the probe with backoff (up to 8 intervals), and
+                    // never give up on it: it only asks where the receiver is.
+                    if let Some(probe) = tx_state.sent.get(&resync.probe)
+                        && !probe.queued
+                        && now.wrapping_sub(probe.offer_stamp)
+                            >= interval.saturating_mul(u64::from(probe.retries.saturating_add(1).min(8)))
+                    {
+                        requeue.push((*side, ty, resync.probe));
+                    }
+                    continue;
+                }
                 let sent_order: Vec<u32> = tx_state.sent_order.iter().copied().collect();
                 for seq in sent_order {
                     let Some(sent) = tx_state.sent.get_mut(&seq) else {
                         continue;
                     };
                     if sent.queued
-                        || (!sent.first_offer.pending() && now.wrapping_sub(sent.offer_stamp) < runtime_reliable_retransmit_ms())
+                        || (!sent.first_offer.pending() && now.wrapping_sub(sent.offer_stamp) < interval)
                     {
                         continue;
                     }
@@ -16357,10 +16514,23 @@ impl Router {
                             crate::diagnostics::ExhaustedReliable { data_type: Some(ty), packet_id: u64::from(seq), ordered, end_to_end: false },
                         );
                         if ordered {
-                            tx_state.next_seq = 0;
+                            // The frames in flight are given up and reported
+                            // once. The stream resynchronises (`HopResync`)
+                            // instead of failing for good; the probe is the
+                            // first given-up frame one sequence lower.
+                            let base = tx_state.sent_order.front().copied().unwrap_or(seq);
+                            let first = tx_state.sent.get(&base).map(|row| row.bytes.clone());
                             tx_state.sent.clear();
                             tx_state.sent_order.clear();
                             requeue.retain(|(s, t, _)| *s != *side || *t != ty);
+                            match first {
+                                Some(bytes) => {
+                                    let probe = base.wrapping_sub(1);
+                                    tx_state.resync = Some(HopResync { probe, ack: None, ack_at_ms: 0 });
+                                    resyncs.push((*side, ty, probe, bytes));
+                                }
+                                None => tx_state.next_seq = 0,
+                            }
                             failed_ordered = true;
                             break;
                         }
@@ -16371,6 +16541,10 @@ impl Router {
                     requeue.push((*side, ty, seq));
                 }
             }
+        }
+
+        for (side, ty, probe, first) in resyncs {
+            self.install_hop_probe(side, ty, probe, &first, now);
         }
 
         let mut requeue_error = None;
@@ -17684,6 +17858,7 @@ impl Router {
                 #[cfg(feature = "latest-value-egress")]
                 latest_service_seq: 0,
                 ordered_claim_seq: 0,
+                ordered_side_seq: 0,
                 rx_priority_burst: 0,
                 e2e_rx_seen: VecDeque::new(),
 
@@ -20733,7 +20908,7 @@ impl Router {
         // After a refusal, work for other sides goes first; when nothing else
         // can go, the refusing sides are offered their frames again.
         let passing_over = core::cell::Cell::new(busy.due(now_ms));
-        let mut eligible = |_queue: &VecDeque<TxQueued>, item: &TxQueued| {
+        let mut eligible = |queue: &VecDeque<TxQueued>, item: &TxQueued| {
             !matches!(
                 item.delivery_state,
                 QueuedDelivery::ClaimedOrdered
@@ -20744,12 +20919,13 @@ impl Router {
             ) && item.retry_after_ms <= now_ms
                 && (!control_only || item.priority >= 200)
                 && !(passing_over.get() && busy.passes_over(item))
+                && !RouterInner::ordered_side_retry_waits(queue, item)
                 && {
                     #[cfg(feature = "latest-value-egress")]
                     {
                         let turn_ready = latest_turn.is_none_or(|index| {
                             !latest::managed_turn_item(item, latest_side, latest_frame)
-                                || _queue
+                                || queue
                                     .get(index)
                                     .is_some_and(|chosen| core::ptr::eq(chosen, item))
                         });
@@ -21255,6 +21431,57 @@ impl Router {
         result
     }
 
+    /// Queue side work `item` as a retry of Ordered type `ty` toward its side.
+    /// `order` keeps a refused retry's place among that type's frames for the
+    /// side; `None` places it behind every one already queued.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_ordered_side_retry(
+        &self,
+        item: RouterTxItem,
+        ty: u32,
+        order: Option<u32>,
+        priority_floor: u8,
+        turn_flags: u8,
+        immediate: bool,
+        #[cfg(feature = "compression")] reservation: &mut Option<
+            crate::payload_codec::QueueReservation<'_, RouterInner>,
+        >,
+    ) -> TelemetryResult<()> {
+        let priority = priority_floor.max(match &item {
+            RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
+            _ => return Err(TelemetryError::BadArg),
+        });
+        #[cfg(feature = "discovery")]
+        let schema_owner = RouterInner::schema_response_owner(&item);
+        let mut state = self.state.lock();
+        #[cfg(feature = "compression")]
+        if let Some(reservation) = reservation {
+            reservation.release_locked(&mut state);
+        }
+        let order = order.unwrap_or_else(|| {
+            state.ordered_side_seq = state.ordered_side_seq.wrapping_add(1).max(1);
+            state.ordered_side_seq
+        });
+        let result = state.push_transmit(TxQueued {
+            disposable: TX_DISPOSABLE | turn_flags,
+            item,
+            ignore_local: true,
+            priority,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: ty,
+            deferred_since_ms: u64::from(order),
+            retry_after_ms: self.clock.now_ms().saturating_add(u64::from(!immediate)),
+        });
+        #[cfg(feature = "discovery")]
+        if result.is_err() {
+            RouterInner::schema_response_owner_lost(
+                &mut state.discovery_side_throttle,
+                schema_owner,
+            );
+        }
+        result
+    }
+
     fn claim_schema_is_current(
         &self,
         ty: DataType,
@@ -21318,7 +21545,8 @@ impl Router {
             QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
                 | QueuedDelivery::DeferredLocalOrderedSide
         )
-        .then_some(queued.deferred_since_ms);
+        .then_some(queued.deferred_since_ms)
+        .or_else(|| RouterInner::ordered_side_retry(&queued).map(|(_, _, order)| u64::from(order)));
         let mut context = DispatchContext {
             priority: queued.priority,
             claim: work.claim,
@@ -23964,9 +24192,11 @@ impl Router {
                     context.mark_terminal();
                     return Err(error);
                 }
+                // A new original of an Ordered type queues behind that type's
+                // queued originals, also when it skips local delivery (P2P and
+                // other router-originated frames): it keeps that flag.
                 if !called_from_queue
                     && claim.is_none()
-                    && !ignore_local
                     && matches!({
                         let mode = reliable_mode(ty);
                         #[cfg(all(test, feature = "std", feature = "discovery"))]
@@ -23980,7 +24210,7 @@ impl Router {
                         .iter()
                         .any(|queued| RouterInner::ordered_original_type(queued) == Some(ty))
                 {
-                    return self.tx_queue_item(RouterTxItem::Broadcast(data));
+                    return self.tx_queue_item_with_flags(RouterTxItem::Broadcast(data), ignore_local);
                 }
 
                 #[cfg(all(test, feature = "std", feature = "discovery"))]
@@ -24156,9 +24386,30 @@ impl Router {
                 #[cfg(feature = "std")]
                 let _retry_intent = self.retry_intent(e2e_parent, false);
                 let _parent_lease = self.lease_e2e_send(e2e_parent);
+                // Frames of an Ordered type without an end-to-end owner leave
+                // toward each side in order: one a side refused waits in the
+                // queue, and later ones for that side queue behind it.
+                let ordered_side = (e2e_parent.is_none()
+                    && matches!(reliable_mode(ty), crate::ReliableMode::Ordered))
+                .then_some(ty.as_u32());
                 for side in sides.iter().copied() {
                     #[cfg(feature = "latest-value-egress")]
                     if self.queue_latest_egress(side, None, &data)? {
+                        continue;
+                    }
+                    if let Some(ordered) = ordered_side
+                        && self.state.lock().ordered_side_retry_queued(side, ordered)
+                    {
+                        self.queue_ordered_side_retry(
+                            RouterTxItem::ToSide { src: None, dst: side, data: data.clone() },
+                            ordered,
+                            None,
+                            0,
+                            0,
+                            true,
+                            #[cfg(feature = "compression")]
+                            &mut None,
+                        )?;
                         continue;
                     }
                     #[cfg(feature = "compression")]
@@ -24192,6 +24443,24 @@ impl Router {
                                     },
                                     Self::router_item_priority(&data)?,
                                     parent,
+                                    #[cfg(feature = "compression")]
+                                    &mut reservation,
+                                )?;
+                            } else if let Some(ordered) = ordered_side {
+                                self.queue_ordered_side_retry(
+                                    RouterTxItem::ToSide {
+                                        src: None,
+                                        dst: side,
+                                        #[cfg(feature = "compression")]
+                                        data: side_data,
+                                        #[cfg(not(feature = "compression"))]
+                                        data: data.clone(),
+                                    },
+                                    ordered,
+                                    None,
+                                    0,
+                                    0,
+                                    false,
                                     #[cfg(feature = "compression")]
                                     &mut reservation,
                                 )?;
@@ -24291,6 +24560,22 @@ impl Router {
                         let retry_priority =
                             context.priority.max(self.item_service_priority(&data)?);
                         let (turn_flags, immediate) = self.current_egress_requeue(context);
+                        if src.is_none()
+                            && context.claim.is_none()
+                            && let Some(order) = context.since
+                        {
+                            let ty = Self::item_data_type(&data)?.as_u32();
+                            return self.queue_ordered_side_retry(
+                                RouterTxItem::ToSide { src, dst, data },
+                                ty,
+                                Some(order as u32),
+                                retry_priority,
+                                turn_flags,
+                                immediate,
+                                #[cfg(feature = "compression")]
+                                &mut reservation,
+                            );
+                        }
                         #[cfg(feature = "compression")]
                         self.retry_codec_owner_at_priority(
                             RouterTxItem::ToSide { src, dst, data },
@@ -26412,6 +26697,11 @@ impl Router {
             }
             stream.sent.remove(&seq);
             stream.sent_order.retain(|candidate| *candidate != seq);
+            if stream.resync.is_some() && stream.sent.is_empty() {
+                // The receiver confirmed the probe by receipt; it does not
+                // track hop sequences, so the stream resumes where it was.
+                stream.resync = None;
+            }
             return Ok(true);
         }
     }
@@ -26490,6 +26780,10 @@ fn string_sort_capacity_duplicates_preserve_tracked_budget_and_release() {
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/failover_min_selection.rs"]
 mod failover_min_selection;
+
+#[cfg(all(test, feature = "std"))]
+#[path = "tests/hop_outage_resync.rs"]
+mod hop_outage_resync;
 
 #[cfg(all(test, feature = "std"))]
 impl Router {

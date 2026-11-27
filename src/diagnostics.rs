@@ -138,9 +138,11 @@ pub struct ReliableRuntimeStats {
 }
 
 /// Reliable deliveries given up after the last retry, by path and mode. An
-/// Ordered one also fails the stream's queued tail (not counted here), except
-/// at a segment proxy, where the tail continues for the owners that confirmed
-/// it; an Unordered one is dropped alone.
+/// Ordered end-to-end one also fails the stream's queued tail (not counted
+/// here), except at a segment proxy, where the tail continues for the owners
+/// that confirmed it. An Ordered hop gives up on the frames it had in flight
+/// and then resynchronises with the receiver: later frames wait and flow in
+/// order once the peer answers again. An Unordered one is dropped alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReliableExhaustionCounts {
     pub end_to_end_ordered: u64,

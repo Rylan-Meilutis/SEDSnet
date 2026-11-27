@@ -20,14 +20,29 @@
 //! of returning plausible but wrong data.
 //!
 //! The signatures are zstd's private ABI, so they are pinned to the verified
-//! release below. A zstd update fails to compile here until it is re-checked.
+//! releases below. A zstd update fails to compile here until it is re-checked.
+//!
+//! Verified releases:
+//! - 1.5.7 (zstd-sys 2.1.x).
+//! - 1.6.0 (zstd-sys 2.2.x). Against 1.5.7: `ldmParams_t`, `RawSeqStore_t`,
+//!   `ZSTD_ParamSwitch_e` and every stubbed prototype are unchanged, and the
+//!   stubbed bodies for the disabled state (`ZSTD_ldm_getTableSize`,
+//!   `ZSTD_ldm_getMaxNbSeq`, `ZSTD_ldm_skipSequences`,
+//!   `ZSTD_ldm_skipRawSeqStoreBytes`) are identical. 1.6.0 makes the gear hash
+//!   helpers `ZSTD_ldm_gear_reset`/`ZSTD_ldm_gear_feed` extern, but only
+//!   `zstd_ldm.c` calls them, so nothing pulls that object in. The new
+//!   `ZSTD_ldm_adjustParameters` calls in the `ZSTD_estimateC*Size*` functions
+//!   are guarded by `enableLdm == ZSTD_ps_enable`, like the existing ones. The
+//!   superblock and `ZSTD_ldm_adjustParameters` changes only affect paths
+//!   these stubs reject. zstd-sys's build script is unchanged (one object per
+//!   source file), which is what lets the linker drop the two objects.
 
 use core::ffi::c_void;
 
-// zstd_compress_internal.h / zstd_ldm.h, zstd 1.5.7.
+// zstd_compress_internal.h / zstd_ldm.h / zstd_compress_superblock.h.
 const _: () = assert!(
-    zstd_safe::zstd_sys::ZSTD_VERSION_NUMBER == 10507,
-    "zstd-lean stubs are verified against zstd 1.5.7 internals; re-check them for this zstd"
+    matches!(zstd_safe::zstd_sys::ZSTD_VERSION_NUMBER, 10507 | 10600),
+    "zstd-lean stubs are verified against zstd 1.5.7 and 1.6.0 internals; re-check them for this zstd"
 );
 
 /// `ZSTD_ps_enable` from `ZSTD_ParamSwitch_e`.
