@@ -472,6 +472,8 @@ fn helpers_copy_telemetry_packet() {
 
 #[cfg(feature = "discovery")]
 mod p2p_address_tests;
+#[cfg(feature = "discovery")]
+mod p2p_stream_busy_order;
 
 // -----------------------------------------------------------------------------
 // Error propagation & handler-failure tests

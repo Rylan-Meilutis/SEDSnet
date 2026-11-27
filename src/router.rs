@@ -1117,6 +1117,9 @@ struct DispatchContext {
     // Retain a denied queued replay's service band across side-owned retries.
     priority: u8,
     claim: Option<TxClaim>,
+    /// A deferred original's first deferral time; for a dispatched Ordered
+    /// side retry (no claim), its order number, kept when the side refuses
+    /// it again (see `RouterInner::ordered_side_retry`).
     since: Option<u64>,
     completion_flags: u8,
     admitted: bool,
@@ -3593,6 +3596,9 @@ struct RouterInner {
     #[cfg(feature = "latest-value-egress")]
     latest_service_seq: u32,
     ordered_claim_seq: u32,
+    /// Last order number given to a side retry of an Ordered type
+    /// (see `RouterInner::ordered_side_retry`); never zero once used.
+    ordered_side_seq: u32,
     rx_priority_burst: u8,
     recent_rx: BoundedDeque<u64>,
     /// Reliable end-to-end packets delivered within the senders' retry
@@ -5091,6 +5097,44 @@ impl RouterInner {
             QueuedDelivery::Ordered | QueuedDelivery::OrderedTail
                 | QueuedDelivery::DeferredOrdered | QueuedDelivery::ClaimedOrdered
         ).then_some(DataType(item.accepted_type))
+    }
+
+    /// A frame of an Ordered type that a side refused, queued to retry toward
+    /// that side: `(side, type, order)`. Such retries carry an order number in
+    /// `deferred_since_ms` (unused by untracked side work), so the frames of
+    /// one Ordered type leave toward one side in the order they were sent,
+    /// even though a refused retry is queued again behind newer work.
+    fn ordered_side_retry(item: &TxQueued) -> Option<(RouterSideId, u32, u32)> {
+        match &item.item {
+            RouterTxItem::ToSide { src: None, dst, .. }
+                if item.disposable & TX_E2E_CHILD == 0
+                    && item.delivery_state == QueuedDelivery::Untracked
+                    && item.deferred_since_ms != 0 =>
+            {
+                Some((*dst, item.accepted_type, item.deferred_since_ms as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// True when an older retry of the same Ordered type toward the same side
+    /// is still queued: `item` must wait for it.
+    fn ordered_side_retry_waits(queue: &VecDeque<TxQueued>, item: &TxQueued) -> bool {
+        let Some((side, ty, order)) = Self::ordered_side_retry(item) else {
+            return false;
+        };
+        queue.iter().any(|queued| {
+            Self::ordered_side_retry(queued).is_some_and(|(s, t, o)| {
+                s == side && t == ty && (o.wrapping_sub(order) as i32) < 0
+            })
+        })
+    }
+
+    /// True when a retry of Ordered type `ty` toward `side` is queued.
+    fn ordered_side_retry_queued(&self, side: RouterSideId, ty: u32) -> bool {
+        self.transmit_queue.iter().any(|queued| {
+            Self::ordered_side_retry(queued).is_some_and(|(s, t, _)| s == side && t == ty)
+        })
     }
 
     fn pop_received_fair(&mut self) -> Option<RouterRxItem> {
@@ -17684,6 +17728,7 @@ impl Router {
                 #[cfg(feature = "latest-value-egress")]
                 latest_service_seq: 0,
                 ordered_claim_seq: 0,
+                ordered_side_seq: 0,
                 rx_priority_burst: 0,
                 e2e_rx_seen: VecDeque::new(),
 
@@ -20733,7 +20778,7 @@ impl Router {
         // After a refusal, work for other sides goes first; when nothing else
         // can go, the refusing sides are offered their frames again.
         let passing_over = core::cell::Cell::new(busy.due(now_ms));
-        let mut eligible = |_queue: &VecDeque<TxQueued>, item: &TxQueued| {
+        let mut eligible = |queue: &VecDeque<TxQueued>, item: &TxQueued| {
             !matches!(
                 item.delivery_state,
                 QueuedDelivery::ClaimedOrdered
@@ -20744,12 +20789,13 @@ impl Router {
             ) && item.retry_after_ms <= now_ms
                 && (!control_only || item.priority >= 200)
                 && !(passing_over.get() && busy.passes_over(item))
+                && !RouterInner::ordered_side_retry_waits(queue, item)
                 && {
                     #[cfg(feature = "latest-value-egress")]
                     {
                         let turn_ready = latest_turn.is_none_or(|index| {
                             !latest::managed_turn_item(item, latest_side, latest_frame)
-                                || _queue
+                                || queue
                                     .get(index)
                                     .is_some_and(|chosen| core::ptr::eq(chosen, item))
                         });
@@ -21255,6 +21301,57 @@ impl Router {
         result
     }
 
+    /// Queue side work `item` as a retry of Ordered type `ty` toward its side.
+    /// `order` keeps a refused retry's place among that type's frames for the
+    /// side; `None` places it behind every one already queued.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_ordered_side_retry(
+        &self,
+        item: RouterTxItem,
+        ty: u32,
+        order: Option<u32>,
+        priority_floor: u8,
+        turn_flags: u8,
+        immediate: bool,
+        #[cfg(feature = "compression")] reservation: &mut Option<
+            crate::payload_codec::QueueReservation<'_, RouterInner>,
+        >,
+    ) -> TelemetryResult<()> {
+        let priority = priority_floor.max(match &item {
+            RouterTxItem::ToSide { data, .. } => self.item_service_priority(data)?,
+            _ => return Err(TelemetryError::BadArg),
+        });
+        #[cfg(feature = "discovery")]
+        let schema_owner = RouterInner::schema_response_owner(&item);
+        let mut state = self.state.lock();
+        #[cfg(feature = "compression")]
+        if let Some(reservation) = reservation {
+            reservation.release_locked(&mut state);
+        }
+        let order = order.unwrap_or_else(|| {
+            state.ordered_side_seq = state.ordered_side_seq.wrapping_add(1).max(1);
+            state.ordered_side_seq
+        });
+        let result = state.push_transmit(TxQueued {
+            disposable: TX_DISPOSABLE | turn_flags,
+            item,
+            ignore_local: true,
+            priority,
+            delivery_state: QueuedDelivery::Untracked,
+            accepted_type: ty,
+            deferred_since_ms: u64::from(order),
+            retry_after_ms: self.clock.now_ms().saturating_add(u64::from(!immediate)),
+        });
+        #[cfg(feature = "discovery")]
+        if result.is_err() {
+            RouterInner::schema_response_owner_lost(
+                &mut state.discovery_side_throttle,
+                schema_owner,
+            );
+        }
+        result
+    }
+
     fn claim_schema_is_current(
         &self,
         ty: DataType,
@@ -21318,7 +21415,8 @@ impl Router {
             QueuedDelivery::DeferredOrdered | QueuedDelivery::DeferredUnordered
                 | QueuedDelivery::DeferredLocalOrderedSide
         )
-        .then_some(queued.deferred_since_ms);
+        .then_some(queued.deferred_since_ms)
+        .or_else(|| RouterInner::ordered_side_retry(&queued).map(|(_, _, order)| u64::from(order)));
         let mut context = DispatchContext {
             priority: queued.priority,
             claim: work.claim,
@@ -23964,9 +24062,11 @@ impl Router {
                     context.mark_terminal();
                     return Err(error);
                 }
+                // A new original of an Ordered type queues behind that type's
+                // queued originals, also when it skips local delivery (P2P and
+                // other router-originated frames): it keeps that flag.
                 if !called_from_queue
                     && claim.is_none()
-                    && !ignore_local
                     && matches!({
                         let mode = reliable_mode(ty);
                         #[cfg(all(test, feature = "std", feature = "discovery"))]
@@ -23980,7 +24080,7 @@ impl Router {
                         .iter()
                         .any(|queued| RouterInner::ordered_original_type(queued) == Some(ty))
                 {
-                    return self.tx_queue_item(RouterTxItem::Broadcast(data));
+                    return self.tx_queue_item_with_flags(RouterTxItem::Broadcast(data), ignore_local);
                 }
 
                 #[cfg(all(test, feature = "std", feature = "discovery"))]
@@ -24156,9 +24256,30 @@ impl Router {
                 #[cfg(feature = "std")]
                 let _retry_intent = self.retry_intent(e2e_parent, false);
                 let _parent_lease = self.lease_e2e_send(e2e_parent);
+                // Frames of an Ordered type without an end-to-end owner leave
+                // toward each side in order: one a side refused waits in the
+                // queue, and later ones for that side queue behind it.
+                let ordered_side = (e2e_parent.is_none()
+                    && matches!(reliable_mode(ty), crate::ReliableMode::Ordered))
+                .then_some(ty.as_u32());
                 for side in sides.iter().copied() {
                     #[cfg(feature = "latest-value-egress")]
                     if self.queue_latest_egress(side, None, &data)? {
+                        continue;
+                    }
+                    if let Some(ordered) = ordered_side
+                        && self.state.lock().ordered_side_retry_queued(side, ordered)
+                    {
+                        self.queue_ordered_side_retry(
+                            RouterTxItem::ToSide { src: None, dst: side, data: data.clone() },
+                            ordered,
+                            None,
+                            0,
+                            0,
+                            true,
+                            #[cfg(feature = "compression")]
+                            &mut None,
+                        )?;
                         continue;
                     }
                     #[cfg(feature = "compression")]
@@ -24192,6 +24313,24 @@ impl Router {
                                     },
                                     Self::router_item_priority(&data)?,
                                     parent,
+                                    #[cfg(feature = "compression")]
+                                    &mut reservation,
+                                )?;
+                            } else if let Some(ordered) = ordered_side {
+                                self.queue_ordered_side_retry(
+                                    RouterTxItem::ToSide {
+                                        src: None,
+                                        dst: side,
+                                        #[cfg(feature = "compression")]
+                                        data: side_data,
+                                        #[cfg(not(feature = "compression"))]
+                                        data: data.clone(),
+                                    },
+                                    ordered,
+                                    None,
+                                    0,
+                                    0,
+                                    false,
                                     #[cfg(feature = "compression")]
                                     &mut reservation,
                                 )?;
@@ -24291,6 +24430,22 @@ impl Router {
                         let retry_priority =
                             context.priority.max(self.item_service_priority(&data)?);
                         let (turn_flags, immediate) = self.current_egress_requeue(context);
+                        if src.is_none()
+                            && context.claim.is_none()
+                            && let Some(order) = context.since
+                        {
+                            let ty = Self::item_data_type(&data)?.as_u32();
+                            return self.queue_ordered_side_retry(
+                                RouterTxItem::ToSide { src, dst, data },
+                                ty,
+                                Some(order as u32),
+                                retry_priority,
+                                turn_flags,
+                                immediate,
+                                #[cfg(feature = "compression")]
+                                &mut reservation,
+                            );
+                        }
                         #[cfg(feature = "compression")]
                         self.retry_codec_owner_at_priority(
                             RouterTxItem::ToSide { src, dst, data },
