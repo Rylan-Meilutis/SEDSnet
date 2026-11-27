@@ -249,9 +249,14 @@ impl Scene {
                 .reliable_tx
                 .get(&(self.a_side, DataType::named(ORDERED).as_u32()))
                 .is_some_and(|v| {
-                    v.sent
-                        .values()
-                        .any(|s| crate::wire_format::packet_id_from_wire(&s.bytes).ok() == Some(id))
+                    // A resynchronising stream's probe reuses the first
+                    // given-up frame's bytes under a lower sequence; it asks
+                    // the receiver where it stands and is not that frame's
+                    // retention.
+                    v.sent.iter().any(|(seq, s)| {
+                        v.resync.is_none_or(|r| r.probe != *seq)
+                            && crate::wire_format::packet_id_from_wire(&s.bytes).ok() == Some(id)
+                    })
                 })
     }
     fn snapshot(&self) -> serde_json::Value {

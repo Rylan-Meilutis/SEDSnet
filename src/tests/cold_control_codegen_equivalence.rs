@@ -20,7 +20,7 @@ fn byte_fold_matches_original_empty_mixed_keys_and_phases() {
             sent.insert(seq,owner(phase,&vec![7;len]));
         }
         state.reliable_tx.insert(Router::reliable_key(side,DataType::DiscoverySchema),ReliableTxState {
-            next_seq:0,sent_order:VecDeque::new(),sent });
+            next_seq:0,sent_order:VecDeque::new(),sent,resync:None });
     }
     let old=state.reliable_tx.values().flat_map(|stream|stream.sent.values())
         .filter(|sent|sent.first_offer.pending()).fold(0usize,|total,sent|
@@ -62,7 +62,7 @@ fn actual_receipt_scan_matches_ordered_cursor_max_and_exact_phase_owner() {
             &&(!row.first_offer.pending()||row.first_offer.active())).min_by_key(|(seq,_)|**seq).map(|(seq,_)|*seq);
         assert_eq!(next,expected);cursor=next.or(cursor);
     }
-    node.state.lock().reliable_tx.insert(key,ReliableTxState{next_seq:0,sent_order:VecDeque::from([1,8,u32::MAX]),sent});
+    node.state.lock().reliable_tx.insert(key,ReliableTxState{next_seq:0,sent_order:VecDeque::from([1,8,u32::MAX]),sent,resync:None});
     assert!(!node.retire_bound_control_hop_type(side,ty,publisher,other.packet_id()).unwrap());
     assert!(node.retire_bound_control_hop_type(side,ty,publisher,pid).unwrap());
     {

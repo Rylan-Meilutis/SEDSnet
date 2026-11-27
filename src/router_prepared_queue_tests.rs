@@ -311,6 +311,7 @@ fn atomic_queue_pending_active_unknown_packed_replay_and_owner_matrix() {
             next_seq: 2,
             sent_order: VecDeque::from([1]),
             sent,
+            resync: None,
         },
     );
     assert_pending(&r, signal, true);

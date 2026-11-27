@@ -1373,10 +1373,33 @@ impl ByteCost for u64 {
 
 #[derive(Debug, Clone)]
 struct ReliableTxState {
-    // Zero is a sticky exhausted Ordered hop. Never serialized on the wire.
+    // Zero is a sticky failed Ordered hop (the side refused a frame for
+    // good). Never serialized on the wire.
     next_seq: u32,
     sent_order: VecDeque<u32>,
     sent: OrdMap<u32, ReliableSent>,
+    /// An Ordered hop that gave up on its frames in flight and is finding
+    /// where the receiver stands before it sends again.
+    resync: Option<HopResync>,
+}
+
+/// After an Ordered hop exhausts its retries (an outage longer than the retry
+/// window), the receiver may hold any prefix of the frames given up on: their
+/// ACKs may be what was lost. The sender keeps one probe in history: the
+/// first given-up frame renumbered to the sequence just below it, which the
+/// receiver has already passed, so it discards the probe and answers with its
+/// cumulative ACK (the last sequence it delivered). Once ACKs have settled
+/// for one retry interval the stream resumes right after that ACK; new frames
+/// wait meanwhile (the side reports a transient refusal), so nothing is
+/// reordered or sent into a gap. A receiver taking network-control receipts
+/// instead of hop sequences confirms the probe itself, and the stream resumes
+/// where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HopResync {
+    probe: u32,
+    /// Highest ACK at or above `probe` seen so far, and when.
+    ack: Option<u32>,
+    ack_at_ms: u64,
 }
 
 /// A tentative ACK has authority only for this exact currently active offer;
@@ -13668,6 +13691,7 @@ impl Router {
                 next_seq: 1,
                 sent_order: VecDeque::new(),
                 sent: Default::default(),
+                resync: None,
             })
     }
 
@@ -13779,6 +13803,15 @@ impl Router {
             } else {
                 stream.sent.remove(&ack);
                 stream.sent_order.retain(|seq| *seq != ack);
+            }
+            return;
+        }
+        if let Some(resync) = stream.resync.as_mut() {
+            // The receiver's cumulative ACK: where the stream resumes once
+            // late ACKs from before the outage have drained.
+            if ack >= resync.probe {
+                resync.ack = Some(resync.ack.map_or(ack, |seen| seen.max(ack)));
+                resync.ack_at_ms = self.clock.now_ms();
             }
             return;
         }
@@ -14134,6 +14167,7 @@ impl Router {
             Err(_) => {
                 if ordered {
                     stream.next_seq = 0;
+                    stream.resync = None;
                     stream.sent.clear();
                     stream.sent_order.clear();
                 } else {
@@ -14273,6 +14307,9 @@ impl Router {
             match state.reliable_tx.get(&key) {
                 Some(stream) => {
                     if stream.next_seq == 0 {return Err(TelemetryError::HandlerError("ordered hop stream failed"))}
+                    // A resynchronising stream takes nothing new until it
+                    // knows where the receiver stands; the frame waits.
+                    if stream.resync.is_some() {return Err(TelemetryError::Io("reliable window full"))}
                     if stream.sent.len() >= runtime_reliable_max_pending() {return Err(TelemetryError::Io("reliable window full"))}
                     (stream.next_seq,stream.sent.len())
                 }
@@ -14304,6 +14341,7 @@ impl Router {
                 return Err(TelemetryError::Io("memory pressure"));
             }
             let stream = self.reliable_tx_state_mut(&mut state,side,ty);
+            if stream.resync.is_some() {return Err(TelemetryError::Io("reliable window full"))}
             if stream.next_seq != seq || stream.sent.contains_key(&seq) {
                 return Err(TelemetryError::Io("reliable owner changed"));
             }
@@ -16351,6 +16389,53 @@ impl Router {
         self.state.lock().exhausted_recent.drain(..).collect()
     }
 
+    /// Store the resync probe for an Ordered hop that just gave up: `first`
+    /// (its first given-up frame) renumbered to `probe`. A frame that cannot
+    /// be renumbered here (an end-to-end sealed payload) leaves the stream
+    /// failed, as before.
+    fn install_hop_probe(&self, side: RouterSideId, ty: DataType, probe: u32,
+        first: &crate::SharedBytes, now: u64) {
+        #[cfg(feature = "cryptography")]
+        let sealed = self.e2e_seal_config_for_type(ty).is_some();
+        #[cfg(not(feature = "cryptography"))]
+        let sealed = false;
+        let renumbered = if sealed {
+            None
+        } else {
+            crate::shared_bytes::with_slice(first, |wire| {
+                wire_format::rewrite_reliable_header_owned(wire, 0, probe, 0)
+            })
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(crate::shared_bytes::convert::<_, crate::SharedBytes>)
+        };
+        #[cfg(feature = "compact-packet-store")]
+        let renumbered = renumbered.map(|mut bytes| {
+            let _ = bytes.park_for_queue();
+            bytes
+        });
+        let mut state = self.state.lock();
+        let Some(stream) = state.reliable_tx.get_mut(&Self::reliable_key(side, ty)) else {return};
+        if stream.resync.is_none_or(|resync| resync.probe != probe) || !stream.sent.is_empty() {
+            return;
+        }
+        match renumbered {
+            Some(bytes) => {
+                // Sent at the next retransmit interval.
+                stream.sent.insert(probe, ReliableSent {
+                    bytes, offer_stamp: now, first_offer: FirstHopOffer::Complete,
+                    retries: 0, queued: false, partial_acked: false,
+                });
+                stream.sent_order.push_back(probe);
+            }
+            None => {
+                stream.resync = None;
+                stream.next_seq = 0;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn process_reliable_timeouts(&self) -> TelemetryResult<()> {
         self.process_reliable_timeouts_at(self.clock.now_ms())
@@ -16359,6 +16444,9 @@ impl Router {
     fn process_reliable_timeouts_at(&self, now: u64) -> TelemetryResult<()> {
         let mut requeue: Vec<(RouterSideId, DataType, u32)> = Vec::new();
         let mut failed_ordered = false;
+        // Ordered hops that just gave up: (side, type, probe sequence, the
+        // first given-up frame). Probes are built outside Core.
+        let mut resyncs: Vec<(RouterSideId, DataType, u32, crate::SharedBytes)> = Vec::new();
 
         {
             let mut st = self.state.lock();
@@ -16371,13 +16459,38 @@ impl Router {
                 let Some(ty) = DataType::try_from_u32(*ty_u32) else {
                     continue;
                 };
+                let interval = runtime_reliable_retransmit_ms();
+                if let Some(resync) = tx_state.resync {
+                    if let Some(ack) = resync.ack
+                        && now.wrapping_sub(resync.ack_at_ms) >= interval
+                    {
+                        // ACKs have settled: resume right after the
+                        // receiver's last delivered sequence.
+                        let next = ack.wrapping_add(1);
+                        tx_state.next_seq = if next == 0 { 1 } else { next };
+                        tx_state.resync = None;
+                        tx_state.sent.clear();
+                        tx_state.sent_order.clear();
+                        continue;
+                    }
+                    // Re-send the probe with backoff (up to 8 intervals), and
+                    // never give up on it: it only asks where the receiver is.
+                    if let Some(probe) = tx_state.sent.get(&resync.probe)
+                        && !probe.queued
+                        && now.wrapping_sub(probe.offer_stamp)
+                            >= interval.saturating_mul(u64::from(probe.retries.saturating_add(1).min(8)))
+                    {
+                        requeue.push((*side, ty, resync.probe));
+                    }
+                    continue;
+                }
                 let sent_order: Vec<u32> = tx_state.sent_order.iter().copied().collect();
                 for seq in sent_order {
                     let Some(sent) = tx_state.sent.get_mut(&seq) else {
                         continue;
                     };
                     if sent.queued
-                        || (!sent.first_offer.pending() && now.wrapping_sub(sent.offer_stamp) < runtime_reliable_retransmit_ms())
+                        || (!sent.first_offer.pending() && now.wrapping_sub(sent.offer_stamp) < interval)
                     {
                         continue;
                     }
@@ -16401,10 +16514,23 @@ impl Router {
                             crate::diagnostics::ExhaustedReliable { data_type: Some(ty), packet_id: u64::from(seq), ordered, end_to_end: false },
                         );
                         if ordered {
-                            tx_state.next_seq = 0;
+                            // The frames in flight are given up and reported
+                            // once. The stream resynchronises (`HopResync`)
+                            // instead of failing for good; the probe is the
+                            // first given-up frame one sequence lower.
+                            let base = tx_state.sent_order.front().copied().unwrap_or(seq);
+                            let first = tx_state.sent.get(&base).map(|row| row.bytes.clone());
                             tx_state.sent.clear();
                             tx_state.sent_order.clear();
                             requeue.retain(|(s, t, _)| *s != *side || *t != ty);
+                            match first {
+                                Some(bytes) => {
+                                    let probe = base.wrapping_sub(1);
+                                    tx_state.resync = Some(HopResync { probe, ack: None, ack_at_ms: 0 });
+                                    resyncs.push((*side, ty, probe, bytes));
+                                }
+                                None => tx_state.next_seq = 0,
+                            }
                             failed_ordered = true;
                             break;
                         }
@@ -16415,6 +16541,10 @@ impl Router {
                     requeue.push((*side, ty, seq));
                 }
             }
+        }
+
+        for (side, ty, probe, first) in resyncs {
+            self.install_hop_probe(side, ty, probe, &first, now);
         }
 
         let mut requeue_error = None;
@@ -26567,6 +26697,11 @@ impl Router {
             }
             stream.sent.remove(&seq);
             stream.sent_order.retain(|candidate| *candidate != seq);
+            if stream.resync.is_some() && stream.sent.is_empty() {
+                // The receiver confirmed the probe by receipt; it does not
+                // track hop sequences, so the stream resumes where it was.
+                stream.resync = None;
+            }
             return Ok(true);
         }
     }
@@ -26645,6 +26780,10 @@ fn string_sort_capacity_duplicates_preserve_tracked_budget_and_release() {
 #[cfg(all(test, feature = "std", feature = "discovery"))]
 #[path = "tests/failover_min_selection.rs"]
 mod failover_min_selection;
+
+#[cfg(all(test, feature = "std"))]
+#[path = "tests/hop_outage_resync.rs"]
+mod hop_outage_resync;
 
 #[cfg(all(test, feature = "std"))]
 impl Router {

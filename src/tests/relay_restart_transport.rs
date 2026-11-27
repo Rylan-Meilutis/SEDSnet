@@ -1213,6 +1213,7 @@ fn relay_tx_service_consumes_queued_receipt_before_retry() {
             next_seq: 2,
             sent_order: VecDeque::from([1]),
             sent,
+            resync: None,
         },
     );
     let mut payload = Vec::new();

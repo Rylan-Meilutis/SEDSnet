@@ -3226,7 +3226,11 @@ mod reliable_drop_tests {
     #[derive(Debug)]
     struct SoakLinkPolicy {
         inject_loss: bool,
+        /// Frame loss. A separate stream from `outage_rng`, so a change in how
+        /// many frames cross a link cannot move where the outages fall.
         rng: u64,
+        /// Outage placement and length.
+        outage_rng: u64,
         down_until_tick: [usize; 14],
         delivered: usize,
         dropped: usize,
@@ -3239,6 +3243,7 @@ mod reliable_drop_tests {
             Self {
                 inject_loss: true,
                 rng: 0x5ED5_2026_CAFE_BABE,
+                outage_rng: 0x0A7A_6E5E_ED5D_2026,
                 down_until_tick: [0; 14],
                 delivered: 0,
                 dropped: 0,
@@ -3247,12 +3252,19 @@ mod reliable_drop_tests {
             }
         }
 
-        fn next_u32(&mut self) -> u32 {
-            self.rng = self
-                .rng
+        fn lcg(state: &mut u64) -> u32 {
+            *state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            (self.rng >> 32) as u32
+            (*state >> 32) as u32
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            Self::lcg(&mut self.rng)
+        }
+
+        fn next_outage_u32(&mut self) -> u32 {
+            Self::lcg(&mut self.outage_rng)
         }
 
         fn budget(&self, link: usize) -> usize {
@@ -3275,9 +3287,19 @@ mod reliable_drop_tests {
                 self.down_until_tick[3] = tick + 45;
                 self.planned_disconnects += 1;
             }
+            // Only the Gateway's replies to the station are lost, for longer
+            // than the hop retry window (8 retries, about 2 s): the Gateway's
+            // Ordered Schema stream to the station gives up on its frames and
+            // must resynchronise once the link returns.
+            if tick == SOAK_REPLY_OUTAGE_TICK {
+                self.down_until_tick[1] = tick + 15;
+                self.planned_disconnects += 1;
+            }
+            // Random outages last 3-11 ticks (0.75-2.75 s): some outlast the
+            // hop retry window too.
             if tick.is_multiple_of(37) {
-                let link = (self.next_u32() as usize) % self.down_until_tick.len();
-                self.down_until_tick[link] = tick + 3 + ((self.next_u32() as usize) % 9);
+                let link = (self.next_outage_u32() as usize) % self.down_until_tick.len();
+                self.down_until_tick[link] = tick + 3 + ((self.next_outage_u32() as usize) % 9);
                 self.random_disconnects += 1;
             }
         }
@@ -3341,6 +3363,8 @@ mod reliable_drop_tests {
     }
 
     static SOAK_ORDERED_FAILURES: AtomicU64 = AtomicU64::new(0);
+    static SOAK_HOP_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+    const SOAK_REPLY_OUTAGE_TICK: usize = 200;
 
     fn tolerate_soak_backpressure(result: TelemetryResult<()>) {
         match result {
@@ -3353,6 +3377,15 @@ mod reliable_drop_tests {
                 "ordered end-to-end delivery exhausted retries",
             )) => {
                 SOAK_ORDERED_FAILURES.fetch_add(1, Ordering::SeqCst);
+            }
+            // An outage longer than a hop's retry window gives up on the
+            // frames in flight (reported once). The stream must resume: a
+            // later "ordered hop stream failed" / "tx handler failed" is not
+            // tolerated, and the recovery checks below require it to flow.
+            Err(sedsnet::TelemetryError::HandlerError(
+                "ordered hop delivery exhausted retries",
+            )) => {
+                SOAK_HOP_EXHAUSTED.fetch_add(1, Ordering::SeqCst);
             }
             Err(err) => panic!("unexpected soak processing error: {err:?}"),
         }
@@ -3827,6 +3860,10 @@ mod reliable_drop_tests {
                     .unwrap();
                 policy.planned_disconnects += 1;
             }
+            if tick == SOAK_REPLY_OUTAGE_TICK {
+                // Ask for the peers' Schema while the Gateway cannot answer.
+                topology.gs.request_schema().unwrap();
+            }
             if tick == 155 {
                 topology
                     .gs
@@ -4062,6 +4099,63 @@ mod reliable_drop_tests {
         eprintln!(
             "fault-injection ordered delivery failures: {}; post-recovery delivery: PASS",
             SOAK_ORDERED_FAILURES.load(Ordering::SeqCst)
+        );
+
+        // Hop streams that gave up during an outage resumed. The planned
+        // reply outage makes at least one give up; once links are clean,
+        // fresh Schema rounds cross every hop, nothing gives up again, and
+        // every queue drains (a stream still stuck would hold its frames).
+        let hop_exhausted = |topology: &RocketTopology| -> u64 {
+            [
+                topology.gs.export_runtime_stats(),
+                topology.gw.export_runtime_stats(),
+                topology.rf.export_runtime_stats(),
+                topology.actuator.export_runtime_stats(),
+                topology.valve.export_runtime_stats(),
+                topology.daq.export_runtime_stats(),
+                topology.power.export_runtime_stats(),
+                topology.flight.export_runtime_stats(),
+            ]
+            .iter()
+            .map(|stats| stats.reliable.exhausted.hop_ordered)
+            .sum()
+        };
+        let exhausted_in_faults = hop_exhausted(&topology);
+        assert!(
+            exhausted_in_faults >= 1 && SOAK_HOP_EXHAUSTED.load(Ordering::SeqCst) >= 1,
+            "an outage longer than the hop retry window must have exercised hop resynchronisation"
+        );
+        for round in 0..3 {
+            topology.gs.request_schema().unwrap();
+            for resume_tick in 0..40 {
+                pump_soak_topology(&topology, tick_count + 1_400 + round * 40 + resume_tick, &mut policy);
+                topology.advance(RELIABLE_RETRANSMIT_MS);
+            }
+        }
+        assert_eq!(
+            hop_exhausted(&topology),
+            exhausted_in_faults,
+            "a hop stream gave up again on clean links: it did not resume"
+        );
+        for (name, stats) in [
+            ("GS", topology.gs.export_runtime_stats()),
+            ("GW", topology.gw.export_runtime_stats()),
+            ("RF", topology.rf.export_runtime_stats()),
+            ("AB", topology.actuator.export_runtime_stats()),
+            ("VB", topology.valve.export_runtime_stats()),
+            ("DAQ", topology.daq.export_runtime_stats()),
+            ("PB", topology.power.export_runtime_stats()),
+            ("FC", topology.flight.export_runtime_stats()),
+        ] {
+            assert_eq!(
+                (stats.queues.tx_len, stats.queues.replay_len),
+                (0, 0),
+                "{name} still holds frames after recovery on clean links: {:?}",
+                stats.queues
+            );
+        }
+        eprintln!(
+            "hop resynchronisations during faults: {exhausted_in_faults}; post-recovery resumption: PASS"
         );
         let actuator_hits = topology.actuator_hits.lock().unwrap().clone();
         assert!(
