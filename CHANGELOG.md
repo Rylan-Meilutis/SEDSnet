@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 8.0.0
 
 Breaking build change: the `discovery`, `compression` and `cryptography` Cargo
 features are removed. Discovery, payload compression and end-to-end payload
