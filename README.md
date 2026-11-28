@@ -201,6 +201,22 @@ frame rather than a fatal link error, so loss of the initial template frame heal
 
 ## Recent changelog milestones
 
+### Version 8.0.0 highlights
+
+- Breaking build change: the `discovery`, `compression` and `cryptography`
+  Cargo features are removed; all three are always built in. Manifests that
+  list them must drop those entries. Wire format, Rust API and C ABI are
+  unchanged for builds that already enabled all three (every default,
+  `embedded` and `python` build).
+- Relays compute packet IDs over the decompressed, decrypted payload, so
+  every node needs all three to route; the discovery-off code paths and their
+  tests are gone.
+- CMake's `SEDSNET_ENABLE_CRYPTOGRAPHY` option is removed; `sedsnet.h` always
+  declares the crypto API, and the C wrapper's default E2E mode is
+  `SEDS_ROUTER_E2E_PREFERRED`.
+- CI clippy now covers `std` with each optional feature on its own; memory
+  bounds are tested for incompressible payloads.
+
 ### Version 7.0.3 highlights
 
 - Patch release, no wire, API or C ABI change: frames of one P2P stream
