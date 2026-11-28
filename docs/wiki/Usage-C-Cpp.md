@@ -30,11 +30,9 @@ set(SEDSNET_MAX_STACK_PAYLOAD "256" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_QUEUE_BUDGET "65536" CACHE STRING "" FORCE)
 set(SEDSNET_MAX_RECENT_RX_IDS "256" CACHE STRING "" FORCE)
 
-# Optional wrappers and feature-gated cryptography provider support.
-# Leave wrappers OFF when you only want the raw ABI header/library.
+# Optional wrappers. Leave them OFF when you only want the raw ABI header/library.
 set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE)
 # set(SEDSNET_ENABLE_CPP_WRAPPER ON CACHE BOOL "" FORCE)
-# set(SEDSNET_ENABLE_CRYPTOGRAPHY ON CACHE BOOL "" FORCE)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/sedsnet sedsnet_build)
 
@@ -90,7 +88,6 @@ Important CMake variables:
 - `SEDSNET_FORCE_RELEASE` (ON/OFF)
 - `SEDSNET_ENABLE_C_WRAPPER` (ON/OFF)
 - `SEDSNET_ENABLE_CPP_WRAPPER` (ON/OFF)
-- `SEDSNET_ENABLE_CRYPTOGRAPHY` (ON/OFF)
 - `SEDSNET_TARGET` (Rust target triple)
 - `SEDSNET_DEVICE_IDENTIFIER`
 - `SEDSNET_MAX_STACK_PAYLOAD`
@@ -476,11 +473,10 @@ cfg.e2e_key_id = 7U;
 (void)seds_global_router_init(&cfg);
 ```
 
-Routers created without crypto support reject sends/subscriptions for data types marked
-`SEDS_E2E_REQUIRE_ON`. `SEDS_ROUTER_E2E_PREFERRED` encrypts both preferred and required data types,
-while `SEDS_ROUTER_E2E_FORCE_ALL` encrypts all non-control user data. When
-`SEDS_ENABLE_CRYPTOGRAPHY` is defined, the convenience wrapper default is
-`SEDS_ROUTER_E2E_PREFERRED`; builds without it default to `SEDS_ROUTER_E2E_DISABLED`.
+Routers with E2E disabled, or with no crypto provider or key available, reject sends/subscriptions
+for data types marked `SEDS_E2E_REQUIRE_ON`. `SEDS_ROUTER_E2E_PREFERRED` encrypts both preferred and
+required data types, while `SEDS_ROUTER_E2E_FORCE_ALL` encrypts all non-control user data. The
+convenience wrapper default is `SEDS_ROUTER_E2E_PREFERRED`.
 
 ## Optional C++ Wrapper
 
@@ -500,16 +496,14 @@ void publish_state(SedsRouter *router, uint8_t state)
 }
 ```
 
-## Optional Cryptography Provider
+## Cryptography Provider
 
-Enable the cryptography provider APIs with Cargo feature `cryptography`, build.py option `--features cryptography`, or
-CMake option `SEDSNET_ENABLE_CRYPTOGRAPHY`. C/C++ builds receive the
-`SEDS_ENABLE_CRYPTOGRAPHY` define automatically when the CMake option is enabled.
+The cryptography provider APIs are always built in. `sedsnet.h` always defines
+`SEDS_ENABLE_CRYPTOGRAPHY`, so existing `#if defined(SEDS_ENABLE_CRYPTOGRAPHY)` code keeps compiling.
 
 For C firmware, register board-specific crypto callbacks:
 
 ```C
-#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 static SedsResult seal_cb(
     uint32_t key_id,
     const uint8_t *nonce, size_t nonce_len,
@@ -543,7 +537,6 @@ void crypto_init(void)
 {
     (void)seds_crypto_register_provider(seal_cb, open_cb, NULL);
 }
-#endif
 ```
 
 Registered callbacks are preferred over the built-in fallback, so std applications can wrap OS
@@ -551,7 +544,6 @@ crypto APIs and embedded applications can wrap hardware accelerators or secure e
 callback is available, register a software fallback key for the `key_id` used by the router:
 
 ```C
-#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 static const uint8_t fallback_key[32] = {
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
     0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -563,17 +555,14 @@ void crypto_fallback_init(void)
 {
     (void)seds_crypto_register_software_key(7, fallback_key, sizeof(fallback_key));
 }
-#endif
 ```
 
 For embedded Rust-only projects, implement `sedsnet::crypto::CryptographyProvider` directly and register
 it globally. This avoids exporting a C ABI when the whole firmware is Rust:
 
 ```rust
-#[cfg(feature = "cryptography")]
 struct BoardCrypto;
 
-#[cfg(feature = "cryptography")]
 impl sedsnet::crypto::CryptographyProvider for BoardCrypto {
     fn seal(
         &self,
@@ -600,10 +589,8 @@ impl sedsnet::crypto::CryptographyProvider for BoardCrypto {
     }
 }
 
-#[cfg(feature = "cryptography")]
 static BOARD_CRYPTO: BoardCrypto = BoardCrypto;
 
-#[cfg(feature = "cryptography")]
 fn crypto_init() {
     sedsnet::crypto::register_rust_cryptography_provider(&BOARD_CRYPTO);
 }
@@ -753,7 +740,7 @@ enabled, call `seds_router_periodic_no_timesync(...)` instead.
 `seds_router_poll_timesync(...)` remains available as a lower-level non-blocking hook when you
 want to manage maintenance phases manually.
 
-With `discovery` enabled, `seds_router_poll_discovery(...)` remains available as a lower-level
+`seds_router_poll_discovery(...)` remains available as a lower-level
 hook to queue due discovery advertisements, and `seds_router_announce_discovery(...)` still forces
 an immediate announce. Relays now expose `seds_relay_periodic(...)` for the normal main-loop path,
 alongside the lower-level `seds_relay_poll_discovery(...)` and `seds_relay_announce_discovery(...)`

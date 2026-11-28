@@ -246,11 +246,9 @@ Router modes are:
 - `Preferred`: encrypt required and preferred data types
 - `ForceAll`: encrypt every non-control user data type
 
-`RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically with the
-default `cryptography` feature; minimal builds that explicitly omit `cryptography` default to
-`Disabled`.
+`RouterConfig::default()` and `RouterConfig::new(...)` use `Preferred` automatically.
 
-The `cryptography` feature uses this provider order:
+Cryptography is always built in and uses this provider order:
 
 - registered C provider, for C firmware, OS crypto, secure elements, or hardware accelerators
 - registered Rust provider, for Rust-only firmware or std applications wrapping OS crypto
@@ -261,7 +259,6 @@ header is authenticated as AAD so header tampering fails during open. The built-
 provisioned key for authenticated cryptography, but it does not create identity by itself.
 
 ```rust
-#[cfg(feature = "cryptography")]
 sedsnet::crypto::register_software_key(
     7,
     b"32-byte minimum deployment secret....",
@@ -275,7 +272,7 @@ credentials, and peer/session keys are accepted only when the key exchange trans
 to that root. Without that authenticated root, an active attacker can substitute keys before the
 AEAD layer ever sees a packet.
 
-The `cryptography` feature includes a compact 80-byte managed credential helper for this
+SEDSnet includes a compact 80-byte managed credential helper for this
 master-root model. The master issues a `ManagedCredential` containing subject id, key id, epoch,
 validity window, and permission bits; peers verify it against the provisioned root key before
 accepting issued session/group keys.
@@ -337,8 +334,7 @@ router.set_side_egress_enabled(side_c, false)?; // ingress only
 
 ## Discovery and multi-path routing
 
-With the `discovery` feature enabled, routers and relays learn which endpoints are reachable
-through which sides.
+Routers and relays learn which endpoints are reachable through which sides.
 
 - known paths are used directly
 - unknown user-data paths are not flooded by fallback; discovery/control traffic still bootstraps

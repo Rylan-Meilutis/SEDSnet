@@ -144,7 +144,7 @@ Router:
 - TX queue: holds items queued for sending.
 - Recent-ID cache: preallocated `BoundedDeque<u64>` used for dedupe.
 - Reliable out-of-order and retransmit buffers.
-- Discovery route/topology state when the `discovery` feature is enabled.
+- Discovery route/topology state.
 
 Relay:
 
@@ -153,7 +153,7 @@ Relay:
 - Replay queue: explicit reliable retransmits requested by peers.
 - Recent-ID cache: similar to Router.
 - Reliable out-of-order buffers.
-- Discovery route/topology state when the `discovery` feature is enabled.
+- Discovery route/topology state.
 
 ## Configuration knobs
 

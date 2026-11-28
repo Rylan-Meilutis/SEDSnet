@@ -1,4 +1,3 @@
-#![cfg(feature = "discovery")]
 
 #[cfg(not(feature = "std"))]
 #[unsafe(no_mangle)]

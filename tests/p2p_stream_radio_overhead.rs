@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 //! Bytes on air for bulk P2P stream messages over a constrained radio path.
 //!
 //! Models a leaf node (`LEAF`) behind a two-sided bridge (`BRIDGE`) that

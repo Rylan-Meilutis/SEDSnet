@@ -13,7 +13,6 @@ pub(crate) fn sort<T: Ord>(values: &mut [T]) {
 
 /// Unstable sort by comparator; embedded builds use the same constant-scratch
 /// heapsort instead of instantiating the standard pattern-defeating quicksort.
-#[cfg(feature = "discovery")]
 pub(crate) fn sort_by<T, F: FnMut(&T, &T) -> core::cmp::Ordering>(values: &mut [T], compare: F) {
     #[cfg(not(feature = "embedded"))]
     values.sort_unstable_by(compare);

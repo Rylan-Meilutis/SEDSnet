@@ -37,10 +37,10 @@ class RuntimeSchemaProcessTests(unittest.TestCase):
             embedded_environment = environment.copy()
             embedded_environment["SEDSNET_EMBEDDED_SCHEMA_PATH"] = str(Path(scratch) / "no-schema.json")
             embedded = build(["--no-default-features", "--features", "embedded"], embedded_environment)
-            # Production MCU recipes omit optional compression/crypto. Exercise
-            # that wire capability independently from the bundled feature group.
+            # Exercise the minimal no_std feature set independently from the
+            # bundled embedded feature group.
             minimal = build(["--no-default-features", "--features",
-                "discovery,timesync,serde,serde_json"], embedded_environment)
+                "timesync,serde,serde_json"], embedded_environment)
             selected_seed = Path(scratch) / "selected-seed.json"
             selected_seed.write_text(json.dumps({
                 "endpoints": [{"rust": "SelectedSeed", "name": "BUNDLED_PROCESS_SEED"}],

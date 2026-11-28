@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 #[path = "support/side_chunk.rs"]
 mod side_chunk;
 use sedsnet::{

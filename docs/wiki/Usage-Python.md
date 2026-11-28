@@ -162,9 +162,7 @@ setters/seeds update the cache without firing that callback.
 
 E2E policy values are `0=PreferOff`, `1=PreferOn`, and `2=RequireOn`. Router E2E modes are
 `0=Disabled`, `1=RequiredOnly`, `2=Preferred`, and `3=ForceAll`. The constructor default
-`e2e_mode=255` means "build default": `Preferred` for normal Python builds because `cryptography`
-is part of the `python` feature. Custom extensions built without cryptography default to `Disabled`
-and reject `RequireOn` traffic instead of silently downgrading it.
+`e2e_mode=255` means "build default", which is `Preferred`.
 
 Key exchange is board/application owned. Run your quantum-resistant asynchronous exchange when
 discovery learns a peer, derive symmetric traffic keys, and have the cryptography provider select those keys by
@@ -196,7 +194,7 @@ Use `None` for `src_side_id` when controlling locally-originated traffic.
 
 ## Discovery and reliability
 
-With `discovery` enabled:
+Discovery is always built in:
 
 - routers and relays learn endpoint reachability per side
 - discovery also propagates a transitive router graph, not just flattened endpoint sets

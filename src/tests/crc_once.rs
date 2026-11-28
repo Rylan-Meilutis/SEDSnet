@@ -244,11 +244,13 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
             })
             .collect()
     };
+    #[cfg(feature = "compact-bundle")]
     let bundle = corrupt(&crate::wire_bundle::pack_bundle(&[&good, &good]).unwrap());
     let wrapper = corrupt(&crate::side_transport::encode_full_frame(&good, 1, 0, 0));
 
     type Ingress = fn(&Node, &[u8]) -> TelemetryResult<()>;
-    let paths: [(&str, &[u8], Ingress); 15] = [
+    #[cfg_attr(not(feature = "compact-bundle"), allow(unused_mut))]
+    let mut paths: Vec<(&str, &[u8], Ingress)> = vec![
         ("rx_packed", &bad, |n, b| n.node.rx_packed(b)),
         ("rx_packed_queue", &bad, |n, b| n.node.rx_packed_queue(b)),
         ("rx_packed_queue_isr", &bad, |n, b| n.node.rx_packed_queue_isr(b)),
@@ -262,8 +264,6 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
         ("side FULL", &full, |n, b| n.node.rx_packed_from_side(b, n.ingress)),
         ("side FULL queued", &full, |n, b| n.node.rx_packed_queue_from_side(b, n.ingress)),
         ("side wrapper", &wrapper, |n, b| n.node.rx_packed_from_side(b, n.ingress)),
-        ("bundle", &bundle, |n, b| n.node.rx_packed_from_side(b, n.ingress)),
-        ("bundle queued", &bundle, |n, b| n.node.rx_packed_queue_from_side(b, n.ingress)),
         ("chunks", &chunks[0], |n, b| {
             n.node.rx_packed_from_side(b, n.ingress)?;
             n.node.rx_packed_from_side(&corrupt_chunk_tail(b), n.ingress)
@@ -275,6 +275,12 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
         ("tx_packed", &bad, |n, b| n.node.tx_packed(Arc::from(b))),
         ("tx_packed_queue", &bad, |n, b| n.node.tx_packed_queue(Arc::from(b))),
     ];
+    // Compact bundles exist only with that feature.
+    #[cfg(feature = "compact-bundle")]
+    paths.extend([
+        ("bundle", &bundle[..], (|n, b| n.node.rx_packed_from_side(b, n.ingress)) as Ingress),
+        ("bundle queued", &bundle[..], |n, b| n.node.rx_packed_queue_from_side(b, n.ingress)),
+    ]);
     // The second chunk is looked up by content rather than captured.
     CHUNK_TAIL.with(|tail| *tail.borrow_mut() = chunks[1].clone());
     for (path, bytes, ingress) in paths {
@@ -289,6 +295,7 @@ fn corrupted_frames_are_rejected_at_every_ingress() {
                 crate::side_transport::encode_full_frame(&good, 1, 0, 0)
                 .to_vec()
             }
+            #[cfg(feature = "compact-bundle")]
             "bundle" | "bundle queued" => crate::wire_bundle::pack_bundle(&[&good]).unwrap(),
             _ if path.starts_with("chunks") => continue,
             _ => good.to_vec(),

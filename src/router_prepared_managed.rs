@@ -273,8 +273,6 @@ impl Router {
                 local.managed_variable_latest.clone(),
             )
         };
-        #[cfg(not(feature = "discovery"))]
-        let _ = prepared.age_anchor_ms;
         let mut adds_registration = false;
         for item in &prepared.items {
             let packet = item.packet.as_ref().expect("unadmitted");
@@ -285,7 +283,6 @@ impl Router {
             }) {
                 return Err(TryManagedBatchError::OriginalValueObsolete);
             }
-            #[cfg(feature = "discovery")]
             let upstream = old
                 .filter(|e| e.packet.packet_id() == packet.packet_id())
                 .and_then(|e| e.upstream);
@@ -297,9 +294,7 @@ impl Router {
                     sender_address: item.sender_address,
                     packet_is_own: true,
                     own: None,
-                    #[cfg(feature = "discovery")]
                     cached_at_ms: prepared.age_anchor_ms,
-                    #[cfg(feature = "discovery")]
                     upstream,
                 }),
             );
@@ -367,7 +362,6 @@ impl Router {
         } else {
             local.managed_registration_epoch
         };
-        #[cfg(feature = "discovery")]
         let next_p2p = if prepared.adds_registration {
             st.p2p_revision
                 .checked_add(2)
@@ -428,7 +422,6 @@ impl Router {
         );
         local.managed_cache_epoch = next_cache;
         local.managed_registration_epoch = next_registration;
-        #[cfg(feature = "discovery")]
         if prepared.adds_registration {
             local.managed_registration_dirty = true;
             st.p2p_revision = next_p2p;

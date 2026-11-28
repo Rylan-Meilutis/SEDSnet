@@ -14,7 +14,6 @@ use crate::{
 };
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
-#[cfg(any(feature = "std", feature = "discovery"))]
 use alloc::sync::Arc;
 use alloc::{
     string::{String, ToString},
@@ -3271,7 +3270,7 @@ fn effective_embedded_schema() -> OwnedRuntimeSchemaSnapshot {
     OwnedRuntimeSchemaSnapshot { endpoints, types }
 }
 
-#[cfg(all(not(feature = "std"), feature = "discovery"))]
+#[cfg(not(feature = "std"))]
 pub(crate) fn encode_embedded_schema_payload() -> TelemetryResult<Arc<[u8]>> {
     struct SchemaWriter<'a> {
         bytes: Option<&'a mut [core::mem::MaybeUninit<u8>]>,

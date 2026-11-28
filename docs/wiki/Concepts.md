@@ -69,7 +69,7 @@ controls decide which paths are allowed.
 The relay is a simple fan‑out switch. It does not know about the schema. It just forwards packets between sides while
 avoiding duplicates. It is useful when you want to bridge links without decoding payloads.
 
-With the optional `discovery` feature, routers and relays can also exchange built-in discovery packets and learn which
+Routers and relays also exchange built-in discovery packets and learn which
 endpoints are reachable through which sides. When they know a route, they can forward only toward matching sides instead
 of flooding every side. Once topology exists, unknown user-data routes are not blindly flooded; discovery/control
 traffic still propagates and explicit route policy can still select a side.

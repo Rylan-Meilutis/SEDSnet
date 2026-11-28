@@ -203,7 +203,6 @@ impl Router {
             for entry in state.address_book.values() {
                 consider(entry.hostname.as_ref());
             }
-            #[cfg(feature = "discovery")]
             for route in state.discovery_routes.values() {
                 for (announcer, remote) in &route.announcers {
                     consider(announcer);
@@ -286,7 +285,7 @@ impl Router {
     }
 }
 
-#[cfg(all(test, feature = "std", feature = "discovery"))]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

@@ -130,7 +130,6 @@ fn router_sends_and_receives() {
     assert_eq!(seen_vals, data);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn router_load_balancing_smoke_exercises_public_runtime_controls() {
     crate::tests::ensure_common_test_schema();
@@ -199,7 +198,6 @@ fn router_load_balancing_smoke_exercises_public_runtime_controls() {
     assert_eq!(total, 2);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn relay_load_balancing_smoke_exercises_public_runtime_controls() {
     crate::tests::ensure_common_test_schema();
@@ -267,7 +265,6 @@ fn relay_load_balancing_smoke_exercises_public_runtime_controls() {
     assert_eq!(total, 1);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn discovery_prefers_direct_topology_path_over_reflected_route() {
     crate::tests::ensure_common_test_schema();
@@ -391,7 +388,6 @@ fn discovery_prefers_direct_topology_path_over_reflected_route() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn relay_explicit_fanout_overrides_adaptive_discovery_selection() {
     crate::tests::ensure_common_test_schema();

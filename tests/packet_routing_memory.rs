@@ -1,4 +1,7 @@
-#![cfg(all(feature = "std", feature = "discovery", not(feature = "compression")))]
+//! Allocation bounds for forwarding INCOMPRESSIBLE payloads. Compression is
+//! always built in; these frames carry raw payloads (tiny values, or bytes
+//! zstd cannot shrink), so transit must not decode or copy them.
+#![cfg(feature = "std")]
 use sedsnet::config::{register_data_type_with_description, register_endpoint_with_description};
 use sedsnet::discovery::{TopologyBoardNode, build_discovery_topology};
 use sedsnet::packet::Packet;
@@ -174,8 +177,20 @@ fn large_transit_payload_is_not_decoded_by_ack_route_checks() {
     .unwrap();
     router.rx_from_side(&topology, egress).unwrap();
     router.process_all_queues().unwrap();
-    let packet = Packet::new(ty, &[ep], "DAQ", 1, Arc::from(vec![0x5a; 3600])).unwrap();
+    let mut state = 0x0bad_5eedu32;
+    let payload: Arc<[u8]> = (0..3600)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let packet = Packet::new(ty, &[ep], "DAQ", 1, payload.clone()).unwrap();
     let packed = sedsnet::wire_format::pack_packet(&packet);
+    // A frame that kept its payload raw is longer than the payload itself.
+    assert!(packed.len() > payload.len(), "fixture payload must be incompressible");
     let before = count.load(Ordering::Relaxed);
     LARGE.with(|n| n.set(Some(0)));
     router.rx_packed_from_side(&packed, ingress).unwrap();

@@ -1,7 +1,6 @@
 //! Tests specifically for RX/relay deduplication behavior.
 
 use crate::config::{DataEndpoint, DataType};
-#[cfg(feature = "discovery")]
 use crate::discovery::build_discovery_announce;
 use crate::relay::Relay;
 use crate::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
@@ -51,7 +50,6 @@ fn wire_for_value(v: u64) -> Arc<[u8]> {
     wire_format::pack_packet(&pkt)
 }
 
-#[cfg(feature = "discovery")]
 fn advertise_side(relay: &Relay, side: usize, sender: &str) {
     crate::tests::ensure_common_test_schema();
     let pkt = build_discovery_announce(sender, 0, &[DataEndpoint::named("SD_CARD")]).unwrap();
@@ -418,7 +416,6 @@ fn compact_templates_from_multiple_bus_producers_do_not_alias() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn compact_templates_are_disabled_after_shared_bus_discovery() {
     crate::tests::ensure_common_test_schema();
@@ -940,7 +937,6 @@ fn bounded_side_template_dictionaries_remain_synchronized() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn packed_sender_honors_smaller_discovered_peer_template_capacity() {
     crate::tests::ensure_common_test_schema();
@@ -1169,10 +1165,8 @@ fn compact_side_recovers_when_initial_full_template_is_lost() {
     assert_eq!(side.side_transport_compact_frames, 9);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn topology_change_resynchronizes_a_missing_compact_template_immediately() {
-    #[cfg(feature = "discovery")]
     use crate::discovery::build_discovery_announce;
 
     crate::tests::ensure_common_test_schema();
@@ -1474,9 +1468,7 @@ fn relay_deduplicates_identical_frames_per_side() {
     relay
         .set_source_route_mode(Some(id_src), crate::RouteSelectionMode::Fanout)
         .unwrap();
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _side_b, "SIDE_B");
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _side_c, "SIDE_C");
     relay.process_all_queues_with_timeout(0).unwrap();
 
@@ -1523,7 +1515,6 @@ fn relay_dedup_persists_across_time_advance() {
         }
         Ok(())
     });
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _dst, "DST_SIDE");
     relay.process_all_queues_with_timeout(0).unwrap();
 
@@ -1568,7 +1559,6 @@ fn relay_does_not_dedupe_different_frames_from_same_side() {
         }
         Ok(())
     });
-    #[cfg(feature = "discovery")]
     advertise_side(&relay, _dst, "DST_SIDE");
     relay.process_all_queues_with_timeout(0).unwrap();
 

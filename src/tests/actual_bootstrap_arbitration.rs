@@ -285,10 +285,7 @@ fn model_profile(period: u64, latest_enabled: bool, data_start: u64) -> serde_js
                 .get(&side)
                 .and_then(|t| t.tx_chunk_progress.as_ref())
         );
-        #[cfg(feature = "compression")]
         let generation = Some(st.side_transport[&side].payload_codec.generation());
-        #[cfg(not(feature = "compression"))]
-        let generation = None::<u64>;
         if current != last_progress || generation != last_codec_generation {
             progress_events.push(serde_json::json!({"at_ms":ms,"cursors":current,"codec_generation":generation,"phase":diagnostic_turn_phase(&st)}));
             last_progress = current;

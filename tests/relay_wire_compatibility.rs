@@ -1,5 +1,5 @@
 //! Public-API compatibility with the last standalone Relay implementation.
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 use sedsnet::{
     MessageClass, MessageDataType, MessageElement, ReliableMode,
     config::{self, DataEndpoint, DataType},

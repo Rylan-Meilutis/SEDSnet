@@ -169,17 +169,14 @@ mod binding_options;
 mod c_api;
 pub mod config;
 pub mod crc32;
-#[cfg(feature = "cryptography")]
 pub mod crypto;
 pub mod diagnostics;
 mod diag_text;
-#[cfg(feature = "discovery")]
 pub mod discovery;
 mod lock;
 mod macros;
 pub mod memory_admission;
 pub mod packet;
-#[cfg(feature = "compression")]
 mod payload_codec;
 // zstd internals SEDSnet never enables; see the module for the contract.
 #[cfg(feature = "zstd-lean")]
@@ -1229,5 +1226,4 @@ pub fn try_enum_from_i32<E: ReprI32Enum>(x: i32) -> Option<E> {
     Some(e)
 }
 
-#[cfg(any(feature = "discovery", feature = "timesync"))]
 mod peer_record;

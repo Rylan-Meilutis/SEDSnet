@@ -488,7 +488,6 @@ fn shared_chunk_budget_busy_preserves_already_received_fragments() {
     );
 }
 
-#[cfg(feature = "discovery")]
 fn admitted_probe(name: &str, priority: u8) -> Packet {
     let endpoint = crate::config::register_endpoint_with_description(&format!("{name}_ENDPOINT"),"caller-owned endpoint",false).unwrap();
     let ty = crate::config::register_data_type_with_description(
@@ -499,7 +498,6 @@ fn admitted_probe(name: &str, priority: u8) -> Packet {
 }
 
 #[test]
-#[cfg(feature = "discovery")]
 fn metadata_prefers_unknown_partial_and_preserves_known_peer_catalog() {
     let _store_reset = StoreReset;
     let (node, unknown, known) = fixture();
@@ -527,7 +525,6 @@ fn metadata_prefers_unknown_partial_and_preserves_known_peer_catalog() {
 }
 
 #[test]
-#[cfg(feature = "discovery")]
 fn ordinary_admission_does_not_gain_control_partial_reclamation() {
     let _store_reset=StoreReset;
     let (node,unknown,_)=fixture();
@@ -539,7 +536,6 @@ fn ordinary_admission_does_not_gain_control_partial_reclamation() {
 }
 
 #[test]
-#[cfg(feature = "discovery")]
 fn high_priority_application_data_keeps_existing_queue_victim_policy() {
     let _store_reset=StoreReset;
     let (node,unknown,_)=fixture();

@@ -148,7 +148,6 @@ fn compact_topology_identifies_sender_by_embedded_board_name() {
     assert_eq!(remote.hostname.as_ref(), "PB");
 }
 
-#[cfg(feature = "cryptography")]
 fn crypto_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap();
@@ -4808,7 +4807,7 @@ fn relay_slow_links_get_only_liveness_between_topology_changes() {
     );
 }
 
-#[cfg(all(feature = "timesync", feature = "discovery"))]
+#[cfg(feature = "timesync")]
 #[test]
 fn timesync_announces_throttle_only_the_measured_slow_side() {
     let now_ms = Arc::new(AtomicU64::new(5_000));
@@ -5992,7 +5991,6 @@ fn queued_timesync_packets_precede_normal_telemetry() {
     assert!(request_idx < gps_idx);
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn queued_discovery_packets_precede_normal_telemetry() {
     crate::tests::ensure_common_test_schema();
@@ -6650,7 +6648,7 @@ fn discovery_keeps_timesync_endpoint_out_of_user_reachability_when_enabled() {
     assert!(!topo.advertised_endpoints.contains(&DataEndpoint::TimeSync));
 }
 
-#[cfg(all(feature = "timesync", feature = "discovery"))]
+#[cfg(feature = "timesync")]
 #[test]
 fn timesync_packets_use_discovery_candidates_instead_of_flooding() {
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -6690,7 +6688,7 @@ fn timesync_packets_use_discovery_candidates_instead_of_flooding() {
     );
 }
 
-#[cfg(all(feature = "timesync", feature = "discovery"))]
+#[cfg(feature = "timesync")]
 #[test]
 fn timesync_announcements_propagate_away_from_the_source() {
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -6749,7 +6747,7 @@ fn discovery_advertises_local_timesync_source_ids() {
     assert!(sources.contains(&crate::config::DEVICE_IDENTIFIER.to_string()));
 }
 
-#[cfg(all(feature = "timesync", feature = "discovery"))]
+#[cfg(feature = "timesync")]
 #[test]
 fn timesync_requests_prefer_exact_discovered_source_route() {
     let seen_a: Arc<Mutex<Vec<Packet>>> = Arc::new(Mutex::new(Vec::new()));
@@ -7411,7 +7409,6 @@ fn relay_runtime_memory_budget_caps_queued_state() {
 
 #[test]
 fn required_e2e_type_rejects_tx_without_crypto_support() {
-    #[cfg(feature = "cryptography")]
     let _crypto_guard = crypto_test_guard();
     crate::tests::ensure_common_test_schema();
     let ep = DataEndpoint::named("RADIO");
@@ -7437,7 +7434,6 @@ fn required_e2e_type_rejects_tx_without_crypto_support() {
 
 #[test]
 fn forced_e2e_router_rejects_plain_user_data_without_crypto_support() {
-    #[cfg(feature = "cryptography")]
     let _crypto_guard = crypto_test_guard();
     crate::tests::ensure_common_test_schema();
     let ty = DataType::named("GPS_DATA");
@@ -7451,7 +7447,6 @@ fn forced_e2e_router_rejects_plain_user_data_without_crypto_support() {
     );
 }
 
-#[cfg(feature = "cryptography")]
 unsafe extern "C" fn test_crypto_seal(
     key_id: u32,
     _nonce: *const u8,
@@ -7494,7 +7489,6 @@ unsafe extern "C" fn test_crypto_seal(
     0
 }
 
-#[cfg(feature = "cryptography")]
 unsafe extern "C" fn test_crypto_open(
     key_id: u32,
     _nonce: *const u8,
@@ -7537,7 +7531,6 @@ unsafe extern "C" fn test_crypto_open(
     0
 }
 
-#[cfg(feature = "cryptography")]
 fn refresh_crc32(bytes: &mut [u8]) {
     let data_len = bytes.len() - 4;
     let mut hasher = crc32fast::Hasher::new();
@@ -7546,7 +7539,6 @@ fn refresh_crc32(bytes: &mut [u8]) {
     bytes[data_len..].copy_from_slice(&crc.to_le_bytes());
 }
 
-#[cfg(feature = "cryptography")]
 fn register_test_encryption() {
     crate::crypto::register_c_cryptography_provider(crate::crypto::CCryptographyProvider {
         seal: Some(test_crypto_seal),
@@ -7555,7 +7547,6 @@ fn register_test_encryption() {
     });
 }
 
-#[cfg(feature = "cryptography")]
 #[test]
 fn preferred_e2e_type_seals_packed_side_payload_and_roundtrips() {
     let _crypto_guard = crypto_test_guard();
@@ -7601,7 +7592,6 @@ fn preferred_e2e_type_seals_packed_side_payload_and_roundtrips() {
     crate::crypto::clear_c_cryptography_provider();
 }
 
-#[cfg(feature = "cryptography")]
 #[test]
 fn software_crypto_fallback_seals_payload_when_no_shim_is_registered() {
     let _crypto_guard = crypto_test_guard();
@@ -7652,7 +7642,6 @@ fn software_crypto_fallback_seals_payload_when_no_shim_is_registered() {
     let _ = remove_data_type(ty);
 }
 
-#[cfg(feature = "cryptography")]
 #[test]
 fn encrypted_payload_rejects_authenticated_header_tamper() {
     let _crypto_guard = crypto_test_guard();
@@ -7696,7 +7685,6 @@ fn encrypted_payload_rejects_authenticated_header_tamper() {
     crate::crypto::clear_c_cryptography_provider();
 }
 
-#[cfg(feature = "cryptography")]
 #[test]
 fn preferred_e2e_fanout_reaches_three_boards_with_same_endpoint_and_rejects_mods() {
     let _crypto_guard = crypto_test_guard();

@@ -234,7 +234,6 @@ fn managed_batch_cache_rebase_preserves_ids_time_and_initial_age_anchor() {
     for original in input {
         let e = &l.managed_variable_latest[&original.data_type().as_u32()];
         assert_eq!(e.packet, original);
-        #[cfg(feature = "discovery")]
         assert_eq!(e.cached_at_ms, anchor);
     }
 }
@@ -400,7 +399,6 @@ fn managed_batch_actual_schema_change_refuses_all_and_discovery_dirty_deferred()
     r.try_commit_network_variable_batch_unless_pending_type(&mut p, blocked)
         .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), before_clock);
-    #[cfg(feature = "discovery")]
     {
         assert!(
             r.state
@@ -426,7 +424,6 @@ fn managed_batch_p2p_and_registration_exhaustion_preflight_no_partial_cache() {
     let (ep, blocked, types) = schema();
     let (r, _, _) = node();
     let mut p = prepared(&r, originals(ep, &types[..1]));
-    #[cfg(feature = "discovery")]
     {
         r.state.lock().p2p_revision = u64::MAX - 1;
         let before = counts(&r);
@@ -496,7 +493,6 @@ fn managed_batch_exact_duplicate_preserves_upstream_and_local_callback_suppressi
     r.process_all_queues_with_timeout(0).unwrap();
     let initial_effects = effects.load(Ordering::Relaxed);
     assert_eq!(initial_effects, 1);
-    #[cfg(feature = "discovery")]
     let upstream = r
         .state
         .lock()
@@ -511,7 +507,6 @@ fn managed_batch_exact_duplicate_preserves_upstream_and_local_callback_suppressi
         .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), before);
     assert_eq!(effects.load(Ordering::Relaxed), initial_effects);
-    #[cfg(feature = "discovery")]
     assert_eq!(
         r.state
             .lock()
@@ -530,7 +525,6 @@ fn managed_batch_exact_duplicate_preserves_upstream_and_local_callback_suppressi
         Some(original)
     );
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn managed_batch_actual_get_refresh_returns_original_committed_packet() {
     let (ep, blocked, types) = schema();
@@ -593,7 +587,6 @@ fn managed_batch_preparation_budget_and_type_size_receipt() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn managed_batch_discovery_outage_matches_existing_bounded_cadence() {
     use std::sync::atomic::AtomicBool;
@@ -677,7 +670,6 @@ fn managed_batch_discovery_outage_matches_existing_bounded_cadence() {
     // not guaranteed physical delivery on a one-way inert link.
     // Both legacy and prepared retained the cache above; no new retry timing.
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn managed_batch_single_discovery_refusal_retains_existing_retry_work() {
     use std::sync::atomic::AtomicBool;
@@ -734,7 +726,6 @@ fn managed_batch_single_discovery_refusal_retains_existing_retry_work() {
     );
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn managed_batch_age_delayed_ordinary_drain_refreshes_observation_not_original_or_owner() {
     let (ep, blocked, types) = schema();
@@ -794,7 +785,6 @@ fn managed_batch_age_delayed_ordinary_drain_refreshes_observation_not_original_o
     );
     assert_eq!(counts(&r), before);
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn managed_batch_age_same_id_broadcast_and_ingress_duplicates_keep_source_time() {
     let (ep, blocked, types) = schema();
@@ -846,7 +836,6 @@ fn managed_batch_age_same_id_broadcast_and_ingress_duplicates_keep_source_time()
     assert_eq!(ingress.packet.timestamp(), source_utc);
     assert_eq!(ingress.packet.payload(), original.payload());
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn managed_batch_age_fresh_observation_does_not_renew_caller_deadline_or_bypass_pending_stop() {
     use std::time::{Duration, Instant};

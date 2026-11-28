@@ -153,13 +153,9 @@ impl Router {
         if require_crypto && !self.e2e_crypto_supported() {
             return Err(TelemetryError::BadArg);
         }
-        #[cfg(feature = "cryptography")]
         let seal = require_crypto.then_some(wire_format::E2eSealConfig {
             key_id: self.cfg.e2e_key_id(),
         });
-        #[cfg(not(feature = "cryptography"))]
-        let seal: Option<wire_format::E2eSealConfig> = None;
-        #[cfg(feature = "compression")]
         let bytes = wire_format::pack_routed_packet(
             &packet,
             reliable,
@@ -167,44 +163,11 @@ impl Router {
             &[target],
             seal,
         )?;
-        #[cfg(not(feature = "compression"))]
-        let bytes = {
-            #[cfg(feature = "cryptography")]
-            if let Some(seal) = seal {
-                wire_format::pack_packet_with_wire_contract_e2e(
-                    &packet,
-                    reliable,
-                    Some(meta.element),
-                    &[target],
-                    seal,
-                )?
-            } else {
-                wire_format::pack_packet_with_wire_contract(
-                    &packet,
-                    reliable,
-                    Some(meta.element),
-                    &[target],
-                )?
-            }
-            #[cfg(not(feature = "cryptography"))]
-            {
-                let _ = seal;
-                wire_format::pack_packet_with_wire_contract(
-                    &packet,
-                    reliable,
-                    Some(meta.element),
-                    &[target],
-                )?
-            }
-        };
         let bytes: crate::SharedBytes = crate::shared_bytes::convert(bytes);
-        #[cfg(feature = "compression")]
         let bytes = match wire_format::payload_encoding_for_retention(bytes.as_ref(), budget)? {
             Some(raw) => crate::shared_bytes::convert(raw),
             None => bytes,
         };
-        #[cfg(not(feature = "compression"))]
-        let _ = budget;
         let item = RouterItem::Packed(bytes);
         #[cfg(feature = "compact-packet-store")]
         let item = {

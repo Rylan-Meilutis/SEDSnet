@@ -652,7 +652,6 @@ mod tests {
         assert_eq!(ticks(&st), [1]);
         assert_eq!(st.transmit_queue.bytes_used(), before);
     }
-    #[cfg(feature = "discovery")]
     #[test]
     fn discovery_ack_and_ordered_schema_never_enter_latest_policy() {
         let (ordered, ep) = schema("LATEST_ORDERED", crate::ReliableMode::Ordered, 0);
@@ -910,7 +909,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn canonical_catalog_chunks_do_not_block_independent_latest_reports() {
         use std::sync::{
             Mutex,
@@ -1010,7 +1008,6 @@ mod tests {
         assert_eq!(reports, [(2, vec![2])]);
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn schema_service_keeps_two_five_hz_flows_fresh_under_finite_capacity() {
         use std::sync::{
             Mutex,
@@ -1153,7 +1150,6 @@ mod tests {
         }
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn canonical_stream_proof_retains_unknown_and_stateful_first_refusals() {
         let (router, side) = setup();
         router.set_latest_value_side(Some(side)).unwrap();
@@ -1815,7 +1811,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cryptography")]
     fn actual_hop_reliable_and_force_all_schema_paths_preserve_their_encoding_and_ack_owner() {
         use std::sync::Mutex;
         for force_all in [false, true] {
@@ -2163,7 +2158,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "discovery")]
     fn five_concurrent_catalogs_retain_all_owners_under_fresh_report_pressure() {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -2293,7 +2287,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn late_fragmented_fresh_report_survives_four_existing_catalog_prefixes() {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -2510,7 +2503,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn startup_optin_fixed_time_late_fragmented_fresh_report_keeps_all_originals() {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -2747,7 +2739,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn partially_admitted_report_with_three_catalogs_keeps_cursor_ownership() {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -2995,6 +2986,7 @@ mod tests {
         let other = crate::config::register_endpoint("SCOPED_ID_OTHER_ENDPOINT", false).unwrap();
         for size in [0, 1, 16, 128, 4096] {
             for timestamp in [0, 127, 65536, 1_767_225_600_000] {
+                #[cfg_attr(not(feature = "compact-packet-store"), allow(unused_mut))]
                 let mut original = Packet::new_with_nonce(
                     ty,
                     &[other, ep, other],
@@ -3005,6 +2997,8 @@ mod tests {
                 )
                 .unwrap();
                 let expected = original.packet_id();
+                // Parking moves the payload into the packet arena when it exists.
+                #[cfg(feature = "compact-packet-store")]
                 original.park_for_queue().unwrap();
                 assert_eq!(original.scoped_packet_id().unwrap(), expected);
                 let raw = wire_format::pack_packet(&original);
@@ -3129,7 +3123,6 @@ mod tests {
         assert_eq!(store.stats().pinned_bytes, 0);
     }
 
-    #[cfg(feature = "discovery")]
     fn fragmented_forwarding_control_and_latest_share_capacity(control_first: bool) {
         use std::sync::{
             Mutex,
@@ -3386,12 +3379,10 @@ mod tests {
         // fabricated and this fixture makes no end-to-end confirmation claim.
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn protected_fragmented_control_before_large_fresh_retains_all_owned_bytes() {
         fragmented_forwarding_control_and_latest_share_capacity(true);
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn protected_fragmented_control_after_large_fresh_retains_all_owned_bytes() {
         fragmented_forwarding_control_and_latest_share_capacity(false);
     }

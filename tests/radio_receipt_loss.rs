@@ -1,4 +1,4 @@
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 use sedsnet::config::{
     register_data_type_with_description, register_endpoint_with_description, runtime_tuning_config,
     set_runtime_tuning_config,

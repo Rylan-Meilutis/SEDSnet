@@ -1,6 +1,6 @@
 //! Accepted reliable commands keep one owner through route churn and callbacks.
 //! Each case uses a fresh process because the runtime schema is process-wide.
-#![cfg(all(feature = "std", feature = "discovery"))]
+#![cfg(feature = "std")]
 #[path = "fixtures/accepted_queue/handoff.rs"]
 mod handoff;
 #[path = "fixtures/accepted_queue/route_churn.rs"]

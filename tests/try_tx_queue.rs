@@ -142,7 +142,6 @@ fn managed_type_priority_and_deferred_callback_match_blocking_queue() {
 }
 
 #[test]
-#[cfg(feature = "discovery")]
 fn held_public_core_refuses_without_waiting_or_admitting_then_retries_exact_packet() {
     let (seed_ty, seed_endpoint) = schema("TRY_TX_QUEUE_HELD_SEED");
     let (ty, endpoint) = schema("TRY_TX_QUEUE_HELD_CONTROL");
@@ -229,7 +228,6 @@ fn held_public_core_refuses_without_waiting_or_admitting_then_retries_exact_pack
 }
 
 #[test]
-#[cfg(feature = "discovery")]
 fn poisoned_public_core_panics_instead_of_reporting_retryable_busy() {
     let (ty, endpoint) = schema("TRY_TX_QUEUE_POISON_CORE");
     let armed = Arc::new(AtomicBool::new(false));

@@ -60,7 +60,7 @@ If a side is already reliable (e.g., TCP), disable reliability on that side to a
 
 ## Discovery
 
-With the `discovery` feature enabled, the router has a built-in internal control path:
+The router has a built-in internal control path for discovery:
 
 - `SEDSNET_DISCOVERY` endpoint and `SEDSNET_DISCOVERY_ANNOUNCE` type are built in.
 - When `timesync` is also enabled, `SEDSNET_DISCOVERY_TIMESYNC_SOURCES` is also built in.

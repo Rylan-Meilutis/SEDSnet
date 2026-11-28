@@ -386,7 +386,6 @@ impl SideHeaderTemplate {
 
     /// Sender identity belongs to the retained, validated full header. Reading
     /// it requires no payload expansion, new cached fields or CRC pass.
-    #[cfg(any(feature = "discovery", feature = "std", feature = "fair-admission"))]
     pub(crate) fn source_address(&self) -> Option<u32> {
         let mut off = 0;
         read_uleb128_local(&self.header, &mut off).ok()?;
@@ -1142,7 +1141,6 @@ pub(crate) struct SideChunkAssembly {
 impl SideChunkAssembly {
     /// Unique admitted fragments already own the bounded progress clock.
     /// A duplicate cannot extend it; missing first chunks prove no peer/type.
-    #[cfg(feature = "discovery")]
     pub(crate) fn schema_progress_for(&self, address: u32, now: u64) -> bool {
         now.saturating_sub(self.last_seen_ms) <= 2000
             && self

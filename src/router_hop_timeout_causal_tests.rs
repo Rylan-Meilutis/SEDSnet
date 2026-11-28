@@ -375,12 +375,10 @@ fn actual_ordered_hop_healthy() {
 fn actual_ordered_hop_recoverable_loss() {
     scene("recoverable")
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn actual_ordered_hop_cold_exhaustion() {
     scene("cold_exhaustion")
 }
-#[cfg(feature = "discovery")]
 #[test]
 fn actual_ordered_hop_warm_exhaustion() {
     scene("warm_exhaustion")

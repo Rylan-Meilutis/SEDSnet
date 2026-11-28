@@ -105,7 +105,6 @@ fn public_identity_matches_actual_canonical_header_and_alias_packet_id() {
     }
 }
 
-#[cfg(feature = "discovery")]
 #[test]
 fn compact_wire_identity_is_not_assigned_node_address_or_route_discovery() {
     use sedsnet::router::{Router, RouterConfig};

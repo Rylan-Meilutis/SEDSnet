@@ -404,7 +404,6 @@ impl Router {
         tracker.invalidate_generation()?;
         Ok((side, tracker))
     }
-    #[cfg(feature = "discovery")]
     pub(super) fn retry_birth(&self) -> u64 {
         if self
             .retry_trackers
@@ -590,7 +589,6 @@ mod tests {
             WriteStart::Ready
         );
     }
-    #[cfg(feature = "discovery")]
     fn parent(limits: RetryTrackerLimits) -> (Router, RetryTracker, RouterItem, u64) {
         crate::tests::ensure_common_test_schema();
         let router =
@@ -625,7 +623,6 @@ mod tests {
             .unwrap();
         (router, tracker, item, id)
     }
-    #[cfg(feature = "discovery")]
     fn offered(
         router: &Router,
         tracker: &RetryTracker,
@@ -640,7 +637,6 @@ mod tests {
         tracker.offer(&wire_format::pack_packet(packet))
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn admission_after_final_receipt_cutoff_before_scan_is_retained() {
         let (router, tracker, item, id) = parent(RetryTrackerLimits::default());
         let first = offered(&router, &tracker, &item, id, false);
@@ -664,7 +660,6 @@ mod tests {
         assert_eq!(late.try_start(), WriteStart::Ready);
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn bounded_pending_drop_releases_once_and_drain_history_is_idempotent() {
         let (router, tracker, item, id) = parent(RetryTrackerLimits {
             max_pending: 1,
@@ -691,7 +686,6 @@ mod tests {
         assert_eq!(tracker.0.ledger.lock().pending.len(), 1);
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn same_bytes_new_logical_send_and_old_generation_drain_are_not_retry_evidence() {
         let (router, tracker, item, id) = parent(RetryTrackerLimits::default());
         let first = offered(&router, &tracker, &item, id, false);
@@ -712,7 +706,6 @@ mod tests {
         assert!(tracker.0.ledger.lock().history.is_empty());
     }
     #[test]
-    #[cfg(feature = "discovery")]
     fn changed_contract_or_encoded_bytes_never_match_completion() {
         let (_router, _tracker, item, id) = parent(RetryTrackerLimits::default());
         let RouterItem::Packet(p) = &item else {

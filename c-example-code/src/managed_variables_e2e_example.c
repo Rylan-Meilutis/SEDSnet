@@ -8,7 +8,6 @@ static SedsResult radio_tx(const uint8_t * bytes, size_t len, void * user)
     return SEDS_OK;
 }
 
-#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
 static SedsResult seal_cb(uint32_t key_id,
                           const uint8_t * nonce,
                           size_t nonce_len,
@@ -70,7 +69,6 @@ static SedsResult open_cb(uint32_t key_id,
     (void)user;
     return SEDS_ERR; /* Replace with board AEAD open. */
 }
-#endif
 
 void managed_variables_e2e_example(void)
 {
@@ -79,9 +77,7 @@ void managed_variables_e2e_example(void)
     uint8_t state = 3U;
     uint32_t endpoints[] = { 101U };
 
-#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
     (void)seds_crypto_register_provider(seal_cb, open_cb, NULL);
-#endif
 
     (void)seds_endpoint_register(101U, "RADIO", 5U, false);
     (void)seds_dtype_register(3100U,

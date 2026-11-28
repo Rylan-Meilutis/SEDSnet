@@ -43,7 +43,6 @@ Useful options:
 - `--max-stack-payload <n>` sets `MAX_STACK_PAYLOAD` for inline payload storage.
 - `--env SCHEMA_JSON_CHUNK_BYTES=<n>` selects the fixed host/std JSON file read buffer (512 bytes by
   default). It does not apply to `no_std` builds, which allocate no file-read buffer.
-- `cryptography` is enabled by default and provides the cryptography provider APIs.
 - `--env KEY=VALUE` passes any compile-time env var used by
   src/config.rs ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/src/config.rs)).
 - `--target <triple>` sets the Rust target triple for embedded builds.
@@ -68,23 +67,22 @@ Cargo.toml ([source](https://github.com/Rylan-Meilutis/sedsnet/blob/main/Cargo.t
 - `std` (default): host build with std.
 - `embedded`: enables embedded defaults, `timesync`, and no_std-friendly behavior.
 - `python`: enables pyo3 bindings.
-- `compression` (default): enables payload compression (implemented with `zstd-safe`).
 - `timesync`: enables time sync helpers and built-in time sync packet types.
-- `cryptography` (default): enables Rust cryptography provider helpers plus optional C callback registration APIs.
-- `zstd-lean` (opt-in, implies `compression`): leaves zstd's long-distance matcher and
+- `zstd-lean` (opt-in): leaves zstd's long-distance matcher and
   target-block-size compressor out of the link (see "Embedded flash size").
 
-Examples:
-
-- Disable compression: `default-features = false` and omit `compression`.
-- Embedded + compression: enable both `embedded` and `compression`.
+Discovery, payload compression (implemented with `zstd-safe`) and end-to-end cryptography
+(Rust provider helpers plus C callback registration APIs) are always built in; they are not
+Cargo features. Every relay computes packet IDs over the logical payload (decompressed and
+decrypted), so a node without them could not de-duplicate or route compressed or end-to-end
+encrypted frames from its peers.
 
 Compression notes:
 
 - Compression is opportunistic (only used when it reduces size).
 - Backend is fixed to `zstd-safe` for simplicity/consistency across builds.
 - There is no compression-level build option.
-- For cross-target embedded builds, enabling `compression` requires a usable target C toolchain
+- Cross-target embedded builds require a usable target C toolchain
   (for `zstd-sys`, e.g. `arm-none-eabi-gcc` or `CC_<target>` override).
 
 When `timesync` is enabled, the build adds the `SEDSNET_TIME_SYNC` endpoint and
@@ -323,7 +321,6 @@ Common CMake variables:
 - `SEDSNET_MAX_STACK_PAYLOAD`
 - `SEDSNET_ENABLE_C_WRAPPER` (ON/OFF, builds `sedsnet::c_wrapper`)
 - `SEDSNET_ENABLE_CPP_WRAPPER` (ON/OFF, exposes `sedsnet::cpp_wrapper`)
-- `SEDSNET_ENABLE_CRYPTOGRAPHY` (ON/OFF, enables `cryptography` and defines `SEDS_ENABLE_CRYPTOGRAPHY`)
 - `SEDSNET_ENV_<KEY>` for any config env var
 
 After `add_subdirectory`, link the target:

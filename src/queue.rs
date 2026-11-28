@@ -951,7 +951,7 @@ impl<T: ByteCost> BoundedDeque<T> {
         }
     }
 
-    #[cfg(all(test, feature = "std", feature = "discovery"))]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) fn priority_fair_cursor(&self) -> u8 {
         self.fair_priority_cursor
     }
@@ -1015,7 +1015,6 @@ impl<T: ByteCost> BoundedDeque<T> {
     }
 
     #[inline]
-    #[cfg(any(feature = "compression", feature = "discovery", feature = "latest-value-egress"))]
     pub(crate) fn update_admitted<F>(
         &mut self,
         index: usize,

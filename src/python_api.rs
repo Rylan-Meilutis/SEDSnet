@@ -378,7 +378,6 @@ fn vectorize_data<T: LeBytes + Copy>(
     Ok(())
 }
 
-#[cfg(feature = "discovery")]
 fn topology_snapshot_to_pydict(
     py: Python<'_>,
     snap: crate::discovery::TopologySnapshot,
@@ -540,7 +539,6 @@ fn topology_snapshot_to_pydict(
     Ok(out.unbind())
 }
 
-#[cfg(feature = "discovery")]
 fn client_stats_snapshot_to_pydict(
     py: Python<'_>,
     stats: crate::discovery::ClientStatsSnapshot,
@@ -588,7 +586,6 @@ fn client_stats_snapshot_to_pydict(
     Ok(out.unbind())
 }
 
-#[cfg(feature = "discovery")]
 fn route_selection_mode_name(mode: RouteSelectionMode) -> &'static str {
     match mode {
         RouteSelectionMode::Fanout => "Fanout",
@@ -609,7 +606,6 @@ fn side_transport_profile_from_name(profile: &str) -> PyResult<SideTransportProf
     }
 }
 
-#[cfg(feature = "discovery")]
 fn runtime_stats_snapshot_to_pydict(
     py: Python<'_>,
     snap: crate::diagnostics::RuntimeStatsSnapshot,
@@ -2020,31 +2016,26 @@ impl PyRouter {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn announce_discovery(&self) -> PyResult<()> {
         let rtr = self.inner.as_ref();
         rtr.announce_discovery().map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn announce_leave(&self) -> PyResult<()> {
         let rtr = self.inner.as_ref();
         rtr.announce_leave().map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
         let rtr = self.inner.as_ref();
         rtr.poll_discovery().map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn export_topology(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let rtr = self.inner.as_ref();
         topology_snapshot_to_pydict(py, rtr.export_topology())
     }
 
-    #[cfg(feature = "discovery")]
     fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
         let rtr = self.inner.as_ref();
         rtr.client_stats(sender_id)
@@ -2052,13 +2043,11 @@ impl PyRouter {
             .transpose()
     }
 
-    #[cfg(feature = "discovery")]
     fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let rtr = self.inner.as_ref();
         runtime_stats_snapshot_to_pydict(py, rtr.export_runtime_stats())
     }
 
-    #[cfg(feature = "discovery")]
     fn enable_network_variable(&self, ty: u32, can_read: bool, can_write: bool) -> PyResult<()> {
         let rtr = self.inner.as_ref();
         rtr.enable_network_variable(
@@ -2071,7 +2060,6 @@ impl PyRouter {
         .map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn on_network_variable_update(
         &mut self,
         py: Python<'_>,
@@ -2102,14 +2090,12 @@ impl PyRouter {
         Ok(())
     }
 
-    #[cfg(feature = "discovery")]
     fn set_network_variable(&self, pkt: &PyPacket) -> PyResult<()> {
         let rtr = self.inner.as_ref();
         rtr.set_network_variable(pkt.inner.clone())
             .map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn seed_managed_variable(&self, pkt: &PyPacket) -> PyResult<()> {
         let rtr = self.inner.as_ref();
         rtr.seed_managed_variable(pkt.inner.clone())
@@ -2119,7 +2105,6 @@ impl PyRouter {
     /// Forget one cached observation without changing its registration.
     ///
     /// Returns whether a cached value was removed. No refresh request is sent.
-    #[cfg(feature = "discovery")]
     fn invalidate_network_variable_cache(&self, ty: u32) -> PyResult<bool> {
         Ok(self.inner.invalidate_network_variable_cache(
             DataType::try_from_u32(ty).ok_or_else(|| PyValueError::new_err("bad data type"))?,
@@ -2129,12 +2114,10 @@ impl PyRouter {
     /// Forget every cached observation, including unrelated variable types.
     ///
     /// Permissions, callbacks and advertised services remain registered.
-    #[cfg(feature = "discovery")]
     fn clear_network_variable_caches(&self) -> usize {
         self.inner.clear_network_variable_caches()
     }
 
-    #[cfg(feature = "discovery")]
     fn request_managed_variable(&self, ty: u32) -> PyResult<()> {
         let rtr = self.inner.as_ref();
         rtr.request_managed_variable(
@@ -2143,7 +2126,6 @@ impl PyRouter {
         .map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn get_network_variable(
         &self,
         ty: u32,
@@ -2159,7 +2141,6 @@ impl PyRouter {
             .map(|inner| PyPacket { inner }))
     }
 
-    #[cfg(feature = "discovery")]
     fn cached_network_variable(&self, ty: u32) -> PyResult<Option<PyPacket>> {
         let rtr = self.inner.as_ref();
         Ok(rtr
@@ -2904,27 +2885,22 @@ impl PyRelay {
         self.inner.periodic(timeout_ms).map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn announce_discovery(&self) -> PyResult<()> {
         self.inner.announce_discovery().map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn announce_leave(&self) -> PyResult<()> {
         self.inner.announce_leave().map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn poll_discovery(&self) -> PyResult<bool> {
         self.inner.poll_discovery().map_err(py_err_from)
     }
 
-    #[cfg(feature = "discovery")]
     fn export_topology(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         topology_snapshot_to_pydict(py, self.inner.export_topology())
     }
 
-    #[cfg(feature = "discovery")]
     fn client_stats(&self, py: Python<'_>, sender_id: &str) -> PyResult<Option<Py<PyDict>>> {
         self.inner
             .client_stats(sender_id)
@@ -2932,7 +2908,6 @@ impl PyRelay {
             .transpose()
     }
 
-    #[cfg(feature = "discovery")]
     fn export_runtime_stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         runtime_stats_snapshot_to_pydict(py, self.inner.export_runtime_stats())
     }

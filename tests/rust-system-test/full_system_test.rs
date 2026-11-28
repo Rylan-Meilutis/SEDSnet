@@ -340,7 +340,6 @@ mod mega_library_system_tests {
 
         // Exercise learned routing, not silent success before any destination
         // exists. Each physical node needs a distinct discovery identity.
-        #[cfg(feature = "discovery")]
         {
             for router in [&node_a_router, &node_b_router, &node_c_router, &hub_router] {
                 router.announce_discovery().unwrap();

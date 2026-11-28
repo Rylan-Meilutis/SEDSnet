@@ -1,7 +1,6 @@
 //! Configuration shared by every routing role.
 
 use crate::DataType;
-#[cfg(feature = "discovery")]
 use crate::discovery;
 use crate::router::{
     CompactTimestampOmissionPolicy, DEFAULT_SIDE_TRANSPORT_TEMPLATE_LIMIT,
@@ -183,7 +182,6 @@ impl SideOptions {
         }
     }
 
-    #[cfg(feature = "discovery")]
     #[inline]
     pub fn link_capabilities(&self) -> discovery::LinkCapabilities {
         let mut flags = discovery::LINK_CAPABILITY_END_TO_END_RELIABILITY;
@@ -201,11 +199,9 @@ impl SideOptions {
         {
             flags |= discovery::LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS;
         }
-        #[cfg(feature = "cryptography")]
         {
             flags |= discovery::LINK_CAPABILITY_CRYPTO;
         }
-        #[cfg(feature = "compression")]
         {
             flags |= discovery::LINK_CAPABILITY_PAYLOAD_COMPRESSION;
         }
